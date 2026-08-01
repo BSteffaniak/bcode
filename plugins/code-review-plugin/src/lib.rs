@@ -19,30 +19,34 @@ pub mod tui_host_types;
 
 use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, CreateReviewWorkspaceRequest,
-    CreateReviewWorkspaceResponse, DeleteDraftRequest, DeleteDraftResponse, DraftAnchor,
-    DraftComment, ExternalReviewImportRecord, GetReviewDiffRequest, GetReviewThreadRequest,
+    CreateReviewWorkspaceResponse, DeleteDraftRequest, DeleteDraftResponse,
+    DeleteReviewAiExchangeRequest, DeleteReviewAiExchangeResponse, DraftAnchor, DraftComment,
+    ExternalReviewImportRecord, GetReviewDiffRequest, GetReviewThreadRequest,
     GetReviewWorkspaceRequest, GetReviewWorkspaceResponse, LinkThreadSessionRequest,
     LinkThreadSessionResponse, ListDraftsRequest, ListDraftsResponse,
     ListExternalReviewImportsRequest, ListExternalReviewImportsResponse, ListPublishRecordsRequest,
-    ListPublishRecordsResponse, ListReviewPublishersResponse, ListReviewSuggestionsRequest,
-    ListReviewSuggestionsResponse, ListReviewWorkspacesRequest, ListReviewWorkspacesResponse,
-    MaterializeReviewWorkspaceRequest, MaterializeReviewWorkspaceResponse,
-    OP_REVIEW_EXTERNAL_IMPORT_SAVE, OP_REVIEW_EXTERNAL_IMPORTS_LIST, OP_REVIEW_PUBLISH_RECORD_SAVE,
-    OP_REVIEW_PUBLISH_RECORDS_LIST, OP_REVIEW_REPO_FILE_GET, OP_REVIEW_WORKSPACE_ARCHIVE,
-    OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET, OP_REVIEW_WORKSPACE_LIST,
-    OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse,
-    PublishReviewRequest, PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse,
-    ResolveThreadRequest, ResolveThreadResponse, ReviewAnchorKind, ReviewBundle, ReviewBundleLine,
-    ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
-    ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublishRecord, ReviewPublisherCapabilities,
-    ReviewPublisherManifest, ReviewRepositoryCommit, ReviewScope, ReviewSource,
-    ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSuggestion,
-    ReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind,
-    ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization,
-    SaveDraftRequest, SaveDraftResponse, SaveExternalReviewImportRequest,
-    SaveExternalReviewImportResponse, SavePublishRecordRequest, SavePublishRecordResponse,
-    SaveReviewSuggestionRequest, SaveReviewSuggestionResponse, UpdateDraftRequest,
-    UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    ListPublishRecordsResponse, ListReviewAiExchangesRequest, ListReviewAiExchangesResponse,
+    ListReviewPublishersResponse, ListReviewSuggestionsRequest, ListReviewSuggestionsResponse,
+    ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, MaterializeReviewWorkspaceRequest,
+    MaterializeReviewWorkspaceResponse, OP_REVIEW_EXTERNAL_IMPORT_SAVE,
+    OP_REVIEW_EXTERNAL_IMPORTS_LIST, OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_PUBLISH_RECORDS_LIST,
+    OP_REVIEW_REPO_FILE_GET, OP_REVIEW_WORKSPACE_ARCHIVE, OP_REVIEW_WORKSPACE_CREATE,
+    OP_REVIEW_WORKSPACE_GET, OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_MATERIALIZE,
+    OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse, PublishReviewRequest,
+    PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse, ResolveThreadRequest,
+    ResolveThreadResponse, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind,
+    ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
+    ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
+    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
+    ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
+    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSuggestion, ReviewSuggestionStatus,
+    ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind, ReviewThreadSeverity,
+    ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization, SaveDraftRequest,
+    SaveDraftResponse, SaveExternalReviewImportRequest, SaveExternalReviewImportResponse,
+    SavePublishRecordRequest, SavePublishRecordResponse, SaveReviewAiExchangeRequest,
+    SaveReviewAiExchangeResponse, SaveReviewSuggestionRequest, SaveReviewSuggestionResponse,
+    UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
+    UpdateReviewWorkspaceResponse,
 };
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
@@ -175,6 +179,9 @@ impl RustPlugin for CodeReviewPlugin {
             OP_DRAFT_UPDATE => update_draft(&context),
             bcode_code_review_models::OP_REVIEW_SUGGESTIONS_LIST => list_suggestions(&context),
             bcode_code_review_models::OP_REVIEW_SUGGESTION_SAVE => save_suggestion(&context),
+            bcode_code_review_models::OP_REVIEW_AI_EXCHANGES_LIST => list_ai_exchanges(&context),
+            bcode_code_review_models::OP_REVIEW_AI_EXCHANGE_SAVE => save_ai_exchange(&context),
+            bcode_code_review_models::OP_REVIEW_AI_EXCHANGE_DELETE => delete_ai_exchange(&context),
             OP_THREAD_LINK_SESSION => link_thread_session(&context),
             OP_THREAD_RESOLVE => resolve_thread(&context),
             OP_REVIEW_CONTEXT_GET => review_context_get(&context),
@@ -596,6 +603,60 @@ fn save_suggestion(context: &NativeServiceContext) -> ServiceResponse {
     match save_suggestion_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("suggestion_save_failed", error.to_string()),
+    }
+}
+
+fn list_ai_exchanges(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<ListReviewAiExchangesRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match list_ai_exchanges_for_request(&request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("ai_exchange_list_failed", error.to_string()),
+    }
+}
+
+fn save_ai_exchange(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<SaveReviewAiExchangeRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match save_ai_exchange_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("ai_exchange_save_failed", error.to_string()),
+    }
+}
+
+fn delete_ai_exchange(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<DeleteReviewAiExchangeRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match delete_ai_exchange_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("ai_exchange_delete_failed", error.to_string()),
     }
 }
 
@@ -1682,6 +1743,7 @@ fn create_review_workspace_for_request(
         updated_at_ms: Some(now),
         viewed_files: BTreeSet::new(),
         archived_at_ms: None,
+        presentation_state: None,
     };
     let saved = workspace.clone();
     with_database(&repo_root, config, move |database| {
@@ -2056,6 +2118,73 @@ fn list_drafts_for_request(
         Box::pin(async move { CodeReviewDb::new(database).list_drafts(&review_key).await })
     })?;
     Ok(ListDraftsResponse { drafts })
+}
+
+fn list_ai_exchanges_for_request(
+    request: &ListReviewAiExchangesRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<ListReviewAiExchangesResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
+    let exchanges = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .list_ai_exchanges(&review_key)
+                .await
+        })
+    })?;
+    Ok(ListReviewAiExchangesResponse { exchanges })
+}
+
+fn save_ai_exchange_for_request(
+    request: SaveReviewAiExchangeRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<SaveReviewAiExchangeResponse, ReviewError> {
+    if request.exchange.schema_version
+        != bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION
+    {
+        return Err(ReviewError::InvalidRequest(format!(
+            "unsupported review AI exchange schema version: {}",
+            request.exchange.schema_version
+        )));
+    }
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let db_repo_root = repo_root.clone();
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
+    let target_kind = target_kind(&request.target).to_string();
+    let target_json = serde_json::to_string(&request.target)?;
+    let exchange = request.exchange;
+    let exchange = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .save_ai_exchange(
+                    &review_key,
+                    &db_repo_root,
+                    &target_kind,
+                    &target_json,
+                    exchange,
+                )
+                .await
+        })
+    })?;
+    Ok(SaveReviewAiExchangeResponse { exchange })
+}
+
+fn delete_ai_exchange_for_request(
+    request: DeleteReviewAiExchangeRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<DeleteReviewAiExchangeResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
+    let exchange_id = request.exchange_id;
+    let deleted = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .delete_ai_exchange(&review_key, &exchange_id)
+                .await
+        })
+    })?;
+    Ok(DeleteReviewAiExchangeResponse { deleted })
 }
 
 fn list_suggestions_for_request(
@@ -2571,6 +2700,7 @@ impl<'a> CodeReviewDb<'a> {
                 "updated_at_ms",
                 "archived_at_ms",
                 "viewed_files_json",
+                "presentation_state_json",
             ])
             .filter(Box::new(where_eq(
                 "repo_root",
@@ -2606,6 +2736,7 @@ impl<'a> CodeReviewDb<'a> {
                 "updated_at_ms",
                 "archived_at_ms",
                 "viewed_files_json",
+                "presentation_state_json",
             ])
             .filter(Box::new(where_eq("workspace_id", workspace_id)))
             .execute_first(self.db)
@@ -2619,6 +2750,11 @@ impl<'a> CodeReviewDb<'a> {
     async fn save_workspace(&self, workspace: &ReviewWorkspace) -> Result<(), ReviewError> {
         let sources_json = serde_json::to_string(&workspace.sources)?;
         let viewed_files_json = serde_json::to_string(&workspace.viewed_files)?;
+        let presentation_state_json = workspace
+            .presentation_state
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         if self.get_workspace(&workspace.id).await?.is_some() {
             self.db
                 .update("review_workspaces")
@@ -2626,6 +2762,7 @@ impl<'a> CodeReviewDb<'a> {
                 .value("title", workspace.title.clone())
                 .value("sources_json", sources_json)
                 .value("viewed_files_json", viewed_files_json.clone())
+                .value("presentation_state_json", presentation_state_json.clone())
                 .value(
                     "updated_at_ms",
                     u64_to_i64(workspace.updated_at_ms.unwrap_or_else(now_ms)),
@@ -2643,6 +2780,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("title", workspace.title.clone())
             .value("sources_json", sources_json)
             .value("viewed_files_json", viewed_files_json)
+            .value("presentation_state_json", presentation_state_json)
             .value(
                 "created_at_ms",
                 u64_to_i64(workspace.created_at_ms.unwrap_or_else(now_ms)),
@@ -2818,6 +2956,119 @@ impl<'a> CodeReviewDb<'a> {
             .execute(self.db)
             .await?;
         Ok(true)
+    }
+
+    async fn list_ai_exchanges(
+        &self,
+        review_key: &str,
+    ) -> Result<Vec<ReviewAiExchange>, ReviewError> {
+        let rows = self
+            .db
+            .select("review_ai_exchanges")
+            .columns(&[
+                "schema_version",
+                "exchange_id",
+                "anchor_json",
+                "question",
+                "session_id",
+                "status",
+                "error",
+                "created_at_ms",
+                "updated_at_ms",
+            ])
+            .filter(Box::new(where_eq("review_key", review_key)))
+            .execute(self.db)
+            .await?;
+        let mut exchanges = rows
+            .iter()
+            .map(ai_exchange_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        exchanges.sort_by_key(|exchange| (exchange.created_at_ms, exchange.exchange_id.clone()));
+        Ok(exchanges)
+    }
+
+    async fn delete_ai_exchange(
+        &self,
+        review_key: &str,
+        exchange_id: &str,
+    ) -> Result<bool, ReviewError> {
+        let existing = self
+            .db
+            .select("review_ai_exchanges")
+            .columns(&["exchange_id"])
+            .filter(Box::new(where_eq("review_key", review_key.to_string())))
+            .filter(Box::new(where_eq("exchange_id", exchange_id.to_string())))
+            .execute_first(self.db)
+            .await?;
+        if existing.is_none() {
+            return Ok(false);
+        }
+        self.db
+            .delete("review_ai_exchanges")
+            .filter(Box::new(where_eq("review_key", review_key.to_string())))
+            .filter(Box::new(where_eq("exchange_id", exchange_id.to_string())))
+            .execute(self.db)
+            .await?;
+        Ok(true)
+    }
+
+    async fn save_ai_exchange(
+        &self,
+        review_key: &str,
+        repo_root: &Path,
+        target_kind: &str,
+        target_json: &str,
+        mut exchange: ReviewAiExchange,
+    ) -> Result<ReviewAiExchange, ReviewError> {
+        let now = now_ms();
+        self.ensure_review(review_key, repo_root, target_kind, target_json, now)
+            .await?;
+        let existing = self
+            .db
+            .select("review_ai_exchanges")
+            .columns(&["exchange_id", "created_at_ms"])
+            .filter(Box::new(where_eq(
+                "exchange_id",
+                exchange.exchange_id.clone(),
+            )))
+            .execute_first(self.db)
+            .await?;
+        exchange.updated_at_ms = now;
+        if let Some(row) = existing {
+            exchange.created_at_ms = i64_to_u64(required_i64(&row, "created_at_ms")?);
+            self.db
+                .update("review_ai_exchanges")
+                .value("schema_version", i64::from(exchange.schema_version))
+                .value("anchor_json", serde_json::to_string(&exchange.anchor)?)
+                .value("question", exchange.question.clone())
+                .value("session_id", exchange.session_id.clone())
+                .value("status", ai_exchange_status_to_str(exchange.status))
+                .value("error", exchange.error.clone())
+                .value("updated_at_ms", u64_to_i64(now))
+                .filter(Box::new(where_eq(
+                    "exchange_id",
+                    exchange.exchange_id.clone(),
+                )))
+                .execute(self.db)
+                .await?;
+        } else {
+            exchange.created_at_ms = now;
+            self.db
+                .insert("review_ai_exchanges")
+                .value("schema_version", i64::from(exchange.schema_version))
+                .value("exchange_id", exchange.exchange_id.clone())
+                .value("review_key", review_key.to_string())
+                .value("anchor_json", serde_json::to_string(&exchange.anchor)?)
+                .value("question", exchange.question.clone())
+                .value("session_id", exchange.session_id.clone())
+                .value("status", ai_exchange_status_to_str(exchange.status))
+                .value("error", exchange.error.clone())
+                .value("created_at_ms", u64_to_i64(now))
+                .value("updated_at_ms", u64_to_i64(now))
+                .execute(self.db)
+                .await?;
+        }
+        Ok(exchange)
     }
 
     async fn list_suggestions(
@@ -3654,7 +3905,44 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(review_suggestions_table_migration());
     source.add_migration(publish_record_thread_anchors_migration());
     source.add_migration(external_review_imports_table_migration());
+    source.add_migration(review_ai_exchanges_table_migration());
+    source.add_migration(workspace_presentation_state_column_migration());
     source
+}
+
+fn workspace_presentation_state_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "017_workspace_presentation_state_column".to_string(),
+        Box::new(alter_table("review_workspaces").add_column(
+            "presentation_state_json".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    )
+}
+
+fn review_ai_exchanges_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "016_review_ai_exchanges_table".to_string(),
+        Box::new(
+            create_table("review_ai_exchanges")
+                .if_not_exists(true)
+                .column(int_column("schema_version"))
+                .column(text_column("exchange_id"))
+                .column(text_column("review_key"))
+                .column(text_column("anchor_json"))
+                .column(text_column("question"))
+                .column(nullable_text_column("session_id"))
+                .column(text_column("status"))
+                .column(nullable_text_column("error"))
+                .column(int_column("created_at_ms"))
+                .column(int_column("updated_at_ms"))
+                .primary_key("exchange_id"),
+        ),
+        None,
+    )
 }
 
 fn external_review_imports_table_migration() -> CodeMigration<'static> {
@@ -3786,6 +4074,47 @@ fn publish_record_from_row(row: &Row) -> Result<ReviewPublishRecord, ReviewError
     })
 }
 
+fn ai_exchange_from_row(row: &Row) -> Result<ReviewAiExchange, ReviewError> {
+    let schema_version = u16::try_from(required_i64(row, "schema_version")?).map_err(|_| {
+        ReviewError::InvalidRequest("review AI exchange schema version is out of range".to_string())
+    })?;
+    if schema_version != bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION {
+        return Err(ReviewError::InvalidRequest(format!(
+            "unsupported review AI exchange schema version: {schema_version}"
+        )));
+    }
+    Ok(ReviewAiExchange {
+        schema_version,
+        exchange_id: required_text(row, "exchange_id")?,
+        anchor: serde_json::from_str(&required_text(row, "anchor_json")?)?,
+        question: required_text(row, "question")?,
+        session_id: optional_text(row, "session_id"),
+        status: ai_exchange_status_from_str(&required_text(row, "status")?)?,
+        error: optional_text(row, "error"),
+        created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
+        updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
+    })
+}
+
+const fn ai_exchange_status_to_str(status: ReviewAiExchangeStatus) -> &'static str {
+    match status {
+        ReviewAiExchangeStatus::Pending => "pending",
+        ReviewAiExchangeStatus::Linked => "linked",
+        ReviewAiExchangeStatus::Failed => "failed",
+    }
+}
+
+fn ai_exchange_status_from_str(value: &str) -> Result<ReviewAiExchangeStatus, ReviewError> {
+    match value {
+        "pending" => Ok(ReviewAiExchangeStatus::Pending),
+        "linked" => Ok(ReviewAiExchangeStatus::Linked),
+        "failed" => Ok(ReviewAiExchangeStatus::Failed),
+        _ => Err(ReviewError::InvalidRequest(format!(
+            "unsupported review AI exchange status: {value}"
+        ))),
+    }
+}
+
 fn suggestion_from_row(row: &Row) -> Result<ReviewSuggestion, ReviewError> {
     Ok(ReviewSuggestion {
         suggestion_id: required_text(row, "suggestion_id")?,
@@ -3833,6 +4162,8 @@ fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, ReviewError> {
         updated_at_ms: Some(i64_to_u64(required_i64(row, "updated_at_ms")?)),
         viewed_files,
         archived_at_ms: optional_i64(row, "archived_at_ms").map(i64_to_u64),
+        presentation_state: optional_text(row, "presentation_state_json")
+            .map_or_else(|| Ok(None), |json| serde_json::from_str(&json).map(Some))?,
     })
 }
 
@@ -4564,6 +4895,7 @@ mod tests {
             updated_at_ms: None,
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
+            presentation_state: None,
         }
     }
 
@@ -4790,6 +5122,7 @@ mod tests {
             updated_at_ms: None,
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
+            presentation_state: None,
         };
         let anchor = DraftAnchor {
             kind: ReviewAnchorKind::Review,
@@ -4896,6 +5229,214 @@ mod tests {
         )
         .expect("bundle");
 
+        assert!(bundle.threads.is_empty());
+    }
+
+    #[test]
+    fn ai_exchange_delete_is_explicit_and_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        git_test(&repo, &["init", "--quiet"]);
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(temp.path().join("state")),
+        };
+        let exchange = ReviewAiExchange {
+            schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
+            exchange_id: "exchange-delete".to_string(),
+            anchor: DraftAnchor {
+                kind: ReviewAnchorKind::Review,
+                file_path: "<review>".to_string(),
+                diff_row: 0,
+                start_diff_row: None,
+                end_diff_row: None,
+                old_start: None,
+                old_end: None,
+                new_start: None,
+                new_end: None,
+                old_line: None,
+                new_line: None,
+                line_kind: ReviewLineKind::Context,
+                is_file_anchor: false,
+                surface_id: None,
+                source_id: None,
+            },
+            question: "delete me".to_string(),
+            session_id: None,
+            status: ReviewAiExchangeStatus::Pending,
+            error: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        save_ai_exchange_for_request(
+            SaveReviewAiExchangeRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::Repository,
+                scope: None,
+                exchange,
+            },
+            &config,
+        )
+        .expect("save exchange");
+        let request = || DeleteReviewAiExchangeRequest {
+            repo_path: repo.clone(),
+            target: ReviewTarget::Repository,
+            scope: None,
+            exchange_id: "exchange-delete".to_string(),
+        };
+        assert!(
+            delete_ai_exchange_for_request(request(), &config)
+                .expect("delete")
+                .deleted
+        );
+        assert!(
+            !delete_ai_exchange_for_request(request(), &config)
+                .expect("duplicate delete")
+                .deleted
+        );
+    }
+
+    #[test]
+    fn workspace_presentation_state_round_trips_and_defaults_for_legacy_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        git_test(&repo, &["init", "--quiet"]);
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(temp.path().join("state")),
+        };
+        let mut workspace = test_workspace(&repo, Vec::new());
+        workspace.presentation_state =
+            Some(bcode_code_review_models::ReviewWorkspacePresentationState {
+                schema_version:
+                    bcode_code_review_models::REVIEW_WORKSPACE_PRESENTATION_SCHEMA_VERSION,
+                selected_path: Some("src/lib.rs".to_string()),
+                selected_thread_key: Some("thread:1".to_string()),
+                selected_line: Some(42),
+                sidebar_mode: "threads".to_string(),
+                sidebar_visible: true,
+                thread_filter: "open".to_string(),
+                show_resolved_threads: false,
+                hide_viewed_files: true,
+                collapsed_thread_keys: BTreeSet::from(["thread:2".to_string()]),
+                expanded_agent_answer_keys: BTreeSet::from(["thread:1".to_string()]),
+            });
+
+        update_review_workspace_for_request(
+            UpdateReviewWorkspaceRequest {
+                repo_path: repo.clone(),
+                workspace: workspace.clone(),
+            },
+            &config,
+        )
+        .expect("save workspace");
+        let loaded = get_review_workspace_for_request(
+            GetReviewWorkspaceRequest {
+                repo_path: repo,
+                workspace_id: workspace.id.clone(),
+            },
+            &config,
+        )
+        .expect("get workspace")
+        .workspace
+        .expect("workspace");
+        assert_eq!(loaded.presentation_state, workspace.presentation_state);
+
+        let legacy: ReviewWorkspace = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "title": "Legacy",
+            "repo_root": "/repo",
+            "sources": [],
+            "viewed_files": []
+        }))
+        .expect("legacy workspace");
+        assert!(legacy.presentation_state.is_none());
+    }
+
+    #[test]
+    fn ai_exchange_persistence_is_separate_from_publishable_drafts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repo)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(temp.path().join("state")),
+        };
+        let anchor = DraftAnchor {
+            kind: ReviewAnchorKind::Review,
+            file_path: "<review>".to_string(),
+            diff_row: 0,
+            start_diff_row: None,
+            end_diff_row: None,
+            old_start: None,
+            old_end: None,
+            new_start: None,
+            new_end: None,
+            old_line: None,
+            new_line: None,
+            line_kind: ReviewLineKind::Context,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let exchange = ReviewAiExchange {
+            schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
+            exchange_id: "exchange-1".to_string(),
+            anchor,
+            question: "Is this safe?".to_string(),
+            session_id: Some("session-1".to_string()),
+            status: ReviewAiExchangeStatus::Linked,
+            error: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+
+        let saved = save_ai_exchange_for_request(
+            SaveReviewAiExchangeRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::Repository,
+                scope: None,
+                exchange,
+            },
+            &config,
+        )
+        .expect("save exchange")
+        .exchange;
+        assert!(saved.created_at_ms > 0);
+
+        let listed = list_ai_exchanges_for_request(
+            &ListReviewAiExchangesRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::Repository,
+                scope: None,
+            },
+            &config,
+        )
+        .expect("list exchanges");
+        assert_eq!(listed.exchanges, vec![saved]);
+
+        let bundle = review_bundle_for_request(
+            PublishReviewRequest {
+                repo_path: repo,
+                target: ReviewTarget::Repository,
+                workspace: None,
+                excluded_thread_anchors: Vec::new(),
+                publisher_id: "local_markdown".to_string(),
+                options: serde_json::Value::Null,
+            },
+            &config,
+        )
+        .expect("bundle");
         assert!(bundle.threads.is_empty());
     }
 

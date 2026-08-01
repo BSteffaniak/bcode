@@ -106,6 +106,13 @@ Plugins own domain schemas and renderer-neutral interaction controllers. A rende
 
 Full snapshots are the correctness baseline. `SessionViewPatch` is an optional later optimization after identity, revision, reconnect, and cumulative-live semantics are stable.
 
+Native plugin surfaces use the same boundary through `PluginTuiHost::subscribe_session_view`.
+The renderer host owns bounded projection attachment and one `SessionView` per observed session; it
+emits complete schema-versioned `SessionViewSnapshot` values and replaces the view after reconnect
+or resynchronization. Plugin surfaces may adapt those semantic snapshots into domain-owned compact
+presentation, but they never receive or reinterpret raw durable/live session events. Several
+plugin-domain anchors that reference one session share the same observer state.
+
 Web updates use HyperChad's update/action mechanisms. Missing browser transport, routing, asset, or server capabilities belong upstream in HyperChad rather than in Bcode-specific JavaScript or WebSocket/SSE plumbing.
 
 ## Live request drafts and execution progress

@@ -231,6 +231,7 @@ impl InteractiveSurfaceState {
         let resolution = match self.surface.handle_event(event, &self.host) {
             PluginTuiAction::None
             | PluginTuiAction::Redraw
+            | PluginTuiAction::OpenSession { .. }
             | PluginTuiAction::OpenSurface { .. } => None,
             PluginTuiAction::Close { outcome } => {
                 Some(outcome.map_or_else(user_dismissed, |payload| {

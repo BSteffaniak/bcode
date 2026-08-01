@@ -10,34 +10,45 @@ use std::sync::{Arc, RwLock};
 use crate::async_values::{AsyncValue, AsyncValueStore};
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
-    CODE_REVIEW_SERVICE_INTERFACE_ID, DraftAnchor as ModelDraftAnchor, ExternalAnchorMappingStatus,
+    CODE_REVIEW_SERVICE_INTERFACE_ID, DeleteReviewAiExchangeRequest,
+    DeleteReviewAiExchangeResponse, DraftAnchor as ModelDraftAnchor, ExternalAnchorMappingStatus,
     ExternalReviewImportRecord, ExternalReviewImportRequest, ExternalReviewImportResponse,
     ExternalReviewThreadState, ListExternalReviewImportsRequest, ListExternalReviewImportsResponse,
-    ListPublishRecordsRequest, ListPublishRecordsResponse, ListReviewSuggestionsRequest,
-    ListReviewSuggestionsResponse, MaterializeReviewWorkspaceRequest,
-    MaterializeReviewWorkspaceResponse, OP_REVIEW_BUNDLE_GET, OP_REVIEW_EXTERNAL_IMPORT_SAVE,
-    OP_REVIEW_EXTERNAL_IMPORTS_LIST, OP_REVIEW_IMPORTER_IMPORT, OP_REVIEW_IMPORTER_MANIFEST,
-    OP_REVIEW_PUBLISH_PREVIEW, OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_PUBLISH_RECORDS_LIST,
-    OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
-    OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
-    OP_REVIEW_SUGGESTION_SAVE, OP_REVIEW_SUGGESTIONS_LIST, OP_REVIEW_WORKSPACE_MATERIALIZE,
-    OP_REVIEW_WORKSPACE_UPDATE, REVIEW_IMPORTER_INTERFACE_ID, REVIEW_PUBLISHER_INTERFACE_ID,
-    ReviewAnchorKind, ReviewBundle, ReviewImporterManifest, ReviewRepositoryCommit,
-    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
-    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSuggestion as ModelReviewSuggestion,
+    ListPublishRecordsRequest, ListPublishRecordsResponse, ListReviewAiExchangesRequest,
+    ListReviewAiExchangesResponse, ListReviewSuggestionsRequest, ListReviewSuggestionsResponse,
+    MaterializeReviewWorkspaceRequest, MaterializeReviewWorkspaceResponse,
+    OP_REVIEW_AI_EXCHANGE_DELETE, OP_REVIEW_AI_EXCHANGE_SAVE, OP_REVIEW_AI_EXCHANGES_LIST,
+    OP_REVIEW_BUNDLE_GET, OP_REVIEW_EXTERNAL_IMPORT_SAVE, OP_REVIEW_EXTERNAL_IMPORTS_LIST,
+    OP_REVIEW_IMPORTER_IMPORT, OP_REVIEW_IMPORTER_MANIFEST, OP_REVIEW_PUBLISH_PREVIEW,
+    OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_PUBLISH_RECORDS_LIST, OP_REVIEW_PUBLISH_SUBMIT,
+    OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT,
+    OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET, OP_REVIEW_SUGGESTION_SAVE,
+    OP_REVIEW_SUGGESTIONS_LIST, OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE,
+    REVIEW_IMPORTER_INTERFACE_ID, REVIEW_PUBLISHER_INTERFACE_ID,
+    ReviewAiExchange as ModelReviewAiExchange,
+    ReviewAiExchangeStatus as ModelReviewAiExchangeStatus, ReviewAnchorKind, ReviewBundle,
+    ReviewImporterManifest, ReviewRepositoryCommit, ReviewScope as ModelReviewScope, ReviewSource,
+    ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity, ReviewSourceKind,
+    ReviewSuggestion as ModelReviewSuggestion,
     ReviewSuggestionStatus as ModelReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind,
     ReviewTarget as ModelReviewTarget, ReviewTarget as ReviewOpenTarget, ReviewThreadKind,
-    ReviewThreadSeverity, ReviewWorkspace, SaveExternalReviewImportRequest,
-    SaveExternalReviewImportResponse, SavePublishRecordRequest, SavePublishRecordResponse,
+    ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspacePresentationState,
+    SaveExternalReviewImportRequest, SaveExternalReviewImportResponse, SavePublishRecordRequest,
+    SavePublishRecordResponse, SaveReviewAiExchangeRequest, SaveReviewAiExchangeResponse,
     SaveReviewSuggestionRequest, SaveReviewSuggestionResponse, UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_plugin_sdk::tui::{
-    PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
-    PluginSessionEventSubscriptionRequest, PluginTuiAction, PluginTuiHost, PluginTuiSurface,
+    PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest, PluginSessionViewUpdate,
+    PluginTuiAction, PluginTuiHost, PluginTuiSurface,
 };
 use bcode_session_models::{
-    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionLiveEventKind,
+    ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
+    ProjectionWindowRequest, ProjectionWindowTarget, SessionId, SessionProjectionKind,
+};
+use bcode_session_view_models::{
+    SessionConnectionViewStatus, SessionViewSnapshot, TextFormat, ToolInvocationView,
+    ToolInvocationViewStatus, ToolResultView, TranscriptViewItemKind, ViewRevision,
 };
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
@@ -81,7 +92,29 @@ const MAX_AI_THREAD_BODY_CHARS: usize = 160;
 const MAX_AI_SELECTED_LINES: usize = 80;
 const MAX_AI_HUNK_LINES: usize = 120;
 const MAX_AI_CONTEXT_CHARS: usize = 12_000;
+const MAX_LINKED_SESSION_ITEMS: usize = 64;
+const MAX_LINKED_SESSION_EVENTS_SCANNED: usize = 2_048;
+const MAX_LINKED_SESSION_BYTES: usize = 512 * 1024;
 const FILE_SIDEBAR_WIDTH: u16 = 34;
+
+const fn linked_session_projection_request() -> ProjectionWindowRequest {
+    ProjectionWindowRequest {
+        projection: SessionProjectionKind::Transcript,
+        anchor: ProjectionWindowAnchor::Latest,
+        direction: ProjectionWindowDirection::Backward,
+        target: ProjectionWindowTarget {
+            min_items: Some(24),
+            min_estimated_rows: Some(80),
+            min_bytes: None,
+            width_columns: Some(100),
+        },
+        limits: ProjectionWindowLimits {
+            max_items: MAX_LINKED_SESSION_ITEMS,
+            max_events_scanned: MAX_LINKED_SESSION_EVENTS_SCANNED,
+            max_bytes: MAX_LINKED_SESSION_BYTES,
+        },
+    }
+}
 
 #[allow(dead_code)]
 const fn review_open_target_id(target: &ReviewOpenTarget) -> &'static str {
@@ -205,6 +238,7 @@ impl CodeReviewSurface {
         self.agent_streams.ensure_subscriptions(host, &mut self.app)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn drain_inline_effects(&mut self) -> bool {
         let mut needs_redraw = false;
         match drain_pending_workspace_changes(
@@ -254,6 +288,22 @@ impl CodeReviewSurface {
             }
             needs_redraw = true;
         }
+        needs_redraw |= drain_pending_ai_exchange_deletes(
+            &self.client,
+            &self.repo_path,
+            &self.review_target,
+            &mut self.app,
+        )
+        .await;
+        let ai_exchange_save_changed = drain_pending_ai_exchange_saves(
+            &self.client,
+            &self.repo_path,
+            &self.review_target,
+            &mut self.app,
+        )
+        .await;
+        needs_redraw |= ai_exchange_save_changed;
+        let ai_exchange_save_blocked = !self.app.pending_ai_exchange_saves.is_empty();
         needs_redraw |= drain_pending_suggestion_saves(
             &self.client,
             &self.repo_path,
@@ -279,7 +329,7 @@ impl CodeReviewSurface {
             }
             needs_redraw = true;
         }
-        if let Some(ask) = self.app.take_pending_agent_session() {
+        if !ai_exchange_save_blocked && let Some(ask) = self.app.take_pending_agent_session() {
             handle_pending_agent_session(
                 &self.client,
                 self.repo_path.clone(),
@@ -344,16 +394,23 @@ impl PluginTuiSurface for CodeReviewSurface {
         if self.ensure_selected_repository_file_load(host) {
             needs_redraw = true;
         }
-        if self.app.should_exit {
-            let outcome = self
-                .app
-                .take_session_to_open()
-                .map(|session_id| serde_json::json!({ "open_session": session_id }));
-            PluginTuiAction::Close { outcome }
+        if let Some(session_id) = self.app.take_session_to_open() {
+            PluginTuiAction::OpenSession { session_id }
+        } else if self.app.should_exit {
+            PluginTuiAction::Close { outcome: None }
         } else if needs_redraw {
             PluginTuiAction::Redraw
         } else {
             PluginTuiAction::None
+        }
+    }
+
+    fn session_navigation_finished(&mut self, session_id: SessionId, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.app.status_message = Some("returned from linked Bcode session".to_string());
+            }
+            Err(message) => self.app.navigation_failed(session_id, &message),
         }
     }
 
@@ -520,6 +577,11 @@ async fn drain_pending_workspace_changes(
     fallback_target: &ReviewOpenTarget,
     app: &mut ReviewApp,
 ) -> WorkspaceDrainOutcome {
+    app.sync_presentation_state();
+    if app.presentation_state_dirty {
+        app.pending_workspace_save = true;
+        app.presentation_state_dirty = false;
+    }
     let mut changed = false;
     if app.take_pending_workspace_save() {
         match save_workspace(client, app.workspace.clone()).await {
@@ -721,6 +783,13 @@ async fn load_review_app(
         workspace.as_ref().map(review_scope_for_workspace),
     )
     .await;
+    let ai_exchanges = load_ai_exchanges(
+        client,
+        repo_path.clone(),
+        review_target.clone(),
+        workspace.as_ref().map(review_scope_for_workspace),
+    )
+    .await;
     let suggestions = load_suggestions(
         client,
         repo_path.clone(),
@@ -746,6 +815,12 @@ async fn load_review_app(
         Ok(drafts) => app.load_persisted_drafts(drafts),
         Err(error) => {
             app.status_message = Some(format!("failed to load persisted drafts: {error}"));
+        }
+    }
+    match ai_exchanges {
+        Ok(exchanges) => app.load_persisted_ai_exchanges(exchanges),
+        Err(error) => {
+            app.status_message = Some(format!("failed to load review AI exchanges: {error}"));
         }
     }
     match suggestions {
@@ -828,11 +903,13 @@ async fn handle_pending_agent_session(
                     ));
                 }
                 Err(error) => {
+                    app.mark_ai_exchange_failed(&ask.exchange_id, &error.to_string());
                     app.fail_agent_thread(&ask.anchor, format!("follow-up failed: {error}"));
                     app.status_message = Some(format!("failed to send review follow-up: {error}"));
                 }
             }
         } else {
+            app.mark_ai_exchange_failed(&ask.exchange_id, "linked session id is invalid");
             app.fail_agent_thread(&ask.anchor, "linked session id is invalid");
             app.status_message = Some("linked session id is invalid".to_string());
         }
@@ -841,11 +918,12 @@ async fn handle_pending_agent_session(
         app.set_agent_status(&ask.anchor, "creating Bcode session");
         match create_agent_session(client, repo_path, review_target, app, ask.clone()).await {
             Ok(session_id) => {
-                app.mark_thread_session(&ask.anchor, &session_id.to_string());
+                app.mark_thread_session(&ask.exchange_id, &ask.anchor, &session_id.to_string());
                 app.set_agent_status(&ask.anchor, format!("session linked: {session_id}"));
                 app.status_message = Some(format!("created Bcode session {session_id}"));
             }
             Err(error) => {
+                app.mark_ai_exchange_failed(&ask.exchange_id, &error.to_string());
                 app.fail_agent_thread(&ask.anchor, format!("session failed: {error}"));
                 app.status_message = Some(format!("failed to create Bcode session: {error}"));
             }
@@ -1691,6 +1769,159 @@ async fn load_drafts(
     Ok(response.drafts)
 }
 
+async fn load_ai_exchanges(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewOpenTarget,
+    scope: Option<ModelReviewScope>,
+) -> Result<Vec<ModelReviewAiExchange>, TuiError> {
+    let payload = serde_json::to_vec(&ListReviewAiExchangesRequest {
+        repo_path,
+        target,
+        scope,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_AI_EXCHANGES_LIST.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: ListReviewAiExchangesResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.exchanges)
+}
+
+async fn save_ai_exchange(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewOpenTarget,
+    scope: Option<ModelReviewScope>,
+    exchange: ModelReviewAiExchange,
+) -> Result<ModelReviewAiExchange, TuiError> {
+    let payload = serde_json::to_vec(&SaveReviewAiExchangeRequest {
+        repo_path,
+        target,
+        scope,
+        exchange,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_AI_EXCHANGE_SAVE.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: SaveReviewAiExchangeResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.exchange)
+}
+
+async fn delete_ai_exchange(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewOpenTarget,
+    scope: Option<ModelReviewScope>,
+    exchange_id: String,
+) -> Result<bool, TuiError> {
+    let payload = serde_json::to_vec(&DeleteReviewAiExchangeRequest {
+        repo_path,
+        target,
+        scope,
+        exchange_id,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_AI_EXCHANGE_DELETE.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: DeleteReviewAiExchangeResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.deleted)
+}
+
+async fn drain_pending_ai_exchange_deletes(
+    client: &BcodeClient,
+    repo_path: &Path,
+    review_target: &ReviewOpenTarget,
+    app: &mut ReviewApp,
+) -> bool {
+    let Some((exchange_id, anchor)) = app.take_pending_ai_exchange_delete() else {
+        return false;
+    };
+    match delete_ai_exchange(
+        client,
+        repo_path.to_path_buf(),
+        review_target.clone(),
+        Some(review_scope_for_workspace(&app.workspace)),
+        exchange_id.clone(),
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            app.requeue_ai_exchange_delete(exchange_id, anchor);
+            app.status_message = Some(format!("failed to delete AI exchange; will retry: {error}"));
+            true
+        }
+    }
+}
+
+async fn drain_pending_ai_exchange_saves(
+    client: &BcodeClient,
+    repo_path: &Path,
+    review_target: &ReviewOpenTarget,
+    app: &mut ReviewApp,
+) -> bool {
+    let mut changed = false;
+    while let Some(exchange) = app.take_pending_ai_exchange_save() {
+        let exchange_id = exchange.exchange_id.clone();
+        match save_ai_exchange(
+            client,
+            repo_path.to_path_buf(),
+            review_target.clone(),
+            Some(review_scope_for_workspace(&app.workspace)),
+            exchange,
+        )
+        .await
+        {
+            Ok(persisted) => app.mark_ai_exchange_persisted(&persisted),
+            Err(error) => {
+                app.requeue_ai_exchange_save(&exchange_id);
+                app.status_message = Some(format!(
+                    "failed to save review AI exchange; will retry: {error}"
+                ));
+                return true;
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
 async fn drain_pending_suggestion_saves(
     client: &BcodeClient,
     repo_path: &Path,
@@ -2381,6 +2612,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('c') => app.open_comment_editor(),
         KeyCode::Char('e') => app.open_latest_draft_editor(),
         KeyCode::Char('D') => app.delete_latest_draft_at_selection(),
+        KeyCode::Char('d') => app.delete_latest_ai_exchange_at_selection(),
         KeyCode::Char('x') => {
             if app.activate_selected_inline_action() {
                 true
@@ -3878,6 +4110,8 @@ impl ReviewAiCommand {
 /// Pending Bcode agent session request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAgentSession {
+    /// Stable durable exchange id.
+    pub exchange_id: String,
     /// Thread anchor.
     pub anchor: ReviewCommentAnchor,
     /// Optional selected draft body.
@@ -3930,6 +4164,10 @@ pub struct ReviewAgentThreadState {
     pub status: String,
     /// Latest assistant answer preview.
     pub answer: String,
+    /// Ordered bounded semantic mini-session rows.
+    pub session_items: Vec<ReviewAgentSessionItem>,
+    /// Stable revision of the authoritative semantic session snapshot.
+    pub session_revision: ViewRevision,
     /// Latest stream warning, such as dropped live updates.
     pub stream_warning: Option<String>,
     /// Latest compact tool/progress activity.
@@ -3949,6 +4187,8 @@ impl ReviewAgentThreadState {
             context_summary: String::new(),
             status: "looking into this…".to_string(),
             answer: String::new(),
+            session_items: Vec::new(),
+            session_revision: 0,
             stream_warning: None,
             activity: None,
             error: None,
@@ -3992,8 +4232,8 @@ impl ReviewAgentThreadState {
 /// Live subscriptions for linked Bcode review-thread sessions.
 #[derive(Debug, Default)]
 struct ReviewAgentStreamStore {
-    subscriptions: BTreeMap<String, PluginSessionEventSubscription>,
-    session_states: BTreeMap<String, ReviewAgentSessionStreamState>,
+    subscriptions: BTreeMap<String, PluginSessionViewSubscription>,
+    session_states: BTreeMap<String, ReviewAgentSessionViewState>,
     failed_sessions: BTreeSet<String>,
 }
 
@@ -4018,23 +4258,21 @@ impl ReviewAgentStreamStore {
                 changed = true;
                 continue;
             };
-            match host.subscribe_session_events(PluginSessionEventSubscriptionRequest {
+            match host.subscribe_session_view(PluginSessionViewSubscriptionRequest {
                 session_id: parsed_session_id,
-                replay: PluginSessionEventReplay::Recent { limit: 200 },
-                buffer: 512,
+                projection: linked_session_projection_request(),
+                reasoning_policy: bcode_session_view_models::ReasoningPresentationPolicy::Summary,
+                buffer: 32,
             }) {
                 Ok(subscription) => {
                     self.subscriptions.insert(session_id.clone(), subscription);
-                    self.session_states
-                        .entry(session_id.clone())
-                        .or_default()
-                        .status = "listening to linked Bcode session…".to_string();
+                    self.session_states.entry(session_id.clone()).or_default();
                     changed = true;
                 }
                 Err(error) => {
                     app.mark_agent_session_failed(
                         &session_id,
-                        &format!("live session events unavailable: {error}"),
+                        &format!("semantic session observation unavailable: {error}"),
                     );
                     self.failed_sessions.insert(session_id);
                     changed = true;
@@ -4050,12 +4288,18 @@ impl ReviewAgentStreamStore {
         for (session_id, subscription) in &mut self.subscriptions {
             loop {
                 match subscription.receiver.try_recv() {
-                    Ok(event) => {
+                    Ok(PluginSessionViewUpdate::Snapshot(snapshot)) => {
                         let state = self.session_states.entry(session_id.clone()).or_default();
-                        if state.apply_plugin_event(event) {
+                        if state.replace_snapshot(*snapshot) {
                             app.apply_agent_stream_state(session_id, state);
                             changed = true;
                         }
+                    }
+                    Ok(PluginSessionViewUpdate::Disconnected { message }) => {
+                        disconnected.push(session_id.clone());
+                        app.mark_agent_session_failed(session_id, &message);
+                        changed = true;
+                        break;
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -4078,232 +4322,525 @@ impl ReviewAgentStreamStore {
     }
 }
 
-/// Incremental projection of a linked Bcode session.
+/// Semantic category of one bounded linked-session row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewAgentSessionItemKind {
+    /// Assistant response content.
+    Assistant,
+    /// Allowed renderer-selected reasoning or activity.
+    Reasoning,
+    /// Generic tool lifecycle and result summary.
+    Tool,
+    /// Pending permission or interaction requiring the native session.
+    ActionNeeded,
+    /// Stream, connection, cancellation, or failure state.
+    Status,
+}
+
+impl ReviewAgentSessionItemKind {
+    /// Return a compact user-facing row label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Assistant => "answer",
+            Self::Reasoning => "activity",
+            Self::Tool => "tool",
+            Self::ActionNeeded => "action",
+            Self::Status => "status",
+        }
+    }
+}
+
+/// One bounded renderer-neutral row in Code Review's linked-session mini-view.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewAgentSessionStreamState {
-    last_sequence: u64,
-    durable_answer: String,
-    live_answer_by_turn: BTreeMap<String, String>,
-    active_turn_id: Option<String>,
+pub struct ReviewAgentSessionItem {
+    /// Stable identity supplied by the semantic session projection.
+    pub id: String,
+    /// Source semantic item revision.
+    pub revision: ViewRevision,
+    /// Semantic display category.
+    pub kind: ReviewAgentSessionItemKind,
+    /// Compact display label.
+    pub label: String,
+    /// Bounded renderer-safe summary or message content.
+    pub text: String,
+    /// Text format for assistant content.
+    pub format: TextFormat,
+    /// Whether this row is still streaming.
+    pub streaming: bool,
+    /// Whether this row indicates degraded or failed state.
+    pub degraded: bool,
+}
+
+/// Code Review presentation derived only from an authoritative semantic session snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewAgentSessionViewState {
+    snapshot: SessionViewSnapshot,
     phase: ReviewAgentThreadPhase,
     status: String,
     stream_warning: Option<String>,
     activity: Option<String>,
+    answer: String,
+    items: Vec<ReviewAgentSessionItem>,
     error: Option<String>,
 }
 
-impl Default for ReviewAgentSessionStreamState {
+impl Default for ReviewAgentSessionViewState {
     fn default() -> Self {
-        Self {
-            last_sequence: 0,
-            durable_answer: String::new(),
-            live_answer_by_turn: BTreeMap::new(),
-            active_turn_id: None,
-            phase: ReviewAgentThreadPhase::Running,
-            status: "running".to_string(),
-            stream_warning: None,
-            activity: None,
-            error: None,
-        }
+        Self::from_snapshot(SessionViewSnapshot::empty())
     }
 }
 
-impl ReviewAgentSessionStreamState {
-    fn apply_plugin_event(&mut self, event: PluginSessionEvent) -> bool {
-        match event {
-            PluginSessionEvent::Attached { mut history, .. } => {
-                history.sort_by_key(|event| event.sequence);
-                for event in history {
-                    self.apply_durable_event(event);
-                }
-                true
-            }
-            PluginSessionEvent::Session(event) => self.apply_durable_event(event),
-            PluginSessionEvent::SessionLive(event) => self.apply_live_event(event.kind),
-            PluginSessionEvent::Lagged { dropped_count } => {
-                let warning = format!("dropped {dropped_count} live updates");
-                self.status = format!("live updates lagged; {warning}");
-                self.stream_warning = Some(warning.clone());
-                self.activity = Some(warning);
-                true
-            }
-            PluginSessionEvent::Disconnected { message } => {
-                self.phase = ReviewAgentThreadPhase::Failed;
-                self.status = "session event stream disconnected".to_string();
-                self.activity = Some("stream disconnected".to_string());
-                self.error = Some(message);
-                true
-            }
-        }
-    }
-
-    fn apply_durable_event(&mut self, event: SessionEvent) -> bool {
-        if event.sequence <= self.last_sequence {
+impl ReviewAgentSessionViewState {
+    fn replace_snapshot(&mut self, snapshot: SessionViewSnapshot) -> bool {
+        let next = Self::from_snapshot(snapshot);
+        if *self == next {
             return false;
         }
-        self.last_sequence = event.sequence;
-        match event.kind {
-            SessionEventKind::AssistantDelta { text } => {
-                self.append_durable_answer(&text, false);
-                self.phase = ReviewAgentThreadPhase::Complete;
-                self.status = "answered".to_string();
-                self.error = None;
-            }
-            SessionEventKind::AssistantMessage { text } => {
-                self.append_durable_answer(&text, true);
-                self.phase = ReviewAgentThreadPhase::Complete;
-                self.status = "answered".to_string();
-                self.error = None;
-                self.clear_matching_live_answer(&text);
-            }
-            SessionEventKind::ModelTurnStarted { turn_id } => {
-                self.active_turn_id = Some(turn_id);
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = "Bcode is working…".to_string();
-                self.error = None;
-            }
-            SessionEventKind::ModelTurnFinished {
-                turn_id,
-                outcome,
-                message,
-            } => {
-                self.finish_turn(&turn_id, outcome, message);
-            }
-            SessionEventKind::RuntimeWorkProgress { message, .. } => {
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status.clone_from(&message);
-                self.activity = Some(message);
-            }
-            SessionEventKind::ToolCallRequested { tool_name, .. } => {
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = format!("running tool: {tool_name}");
-                self.activity = Some(format!("tool: {tool_name}"));
-            }
-            SessionEventKind::ToolInvocationResultRecorded { record } => {
-                self.activity = Some(if record.is_error {
-                    "tool failed".to_string()
-                } else {
-                    "tool finished".to_string()
-                });
-                self.status = self.activity.clone().unwrap_or_default();
-            }
-            _ => {}
-        }
+        *self = next;
         true
     }
 
-    fn apply_live_event(&mut self, kind: SessionLiveEventKind) -> bool {
-        match kind {
-            SessionLiveEventKind::AssistantTextStreamUpdated {
-                turn_id, update, ..
-            } => {
-                if let bcode_session_models::TextStreamOperation::Append { text, .. } =
-                    update.operation
-                {
-                    self.live_answer_by_turn
-                        .entry(turn_id.clone())
-                        .or_default()
-                        .push_str(&text);
-                }
-                self.active_turn_id = Some(turn_id);
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = "receiving model response…".to_string();
-                self.error = None;
-            }
-            SessionLiveEventKind::AssistantTextDelta { turn_id, text, .. } => {
-                self.live_answer_by_turn
-                    .entry(turn_id.clone())
-                    .or_default()
-                    .push_str(&text);
-                self.active_turn_id = Some(turn_id);
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = "receiving model response…".to_string();
-                self.error = None;
-            }
-            SessionLiveEventKind::AssistantReasoningTextStreamUpdated { turn_id, .. }
-            | SessionLiveEventKind::AssistantReasoningDelta { turn_id, .. }
-            | SessionLiveEventKind::AssistantReasoningActivity { turn_id, .. } => {
-                self.active_turn_id = Some(turn_id);
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = "thinking…".to_string();
-            }
-            SessionLiveEventKind::ToolContributionPlaced { .. }
-            | SessionLiveEventKind::ToolPresentationUpdated { .. }
-            | SessionLiveEventKind::ToolInvocationProgress { .. } => {
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = "running tool…".to_string();
-                self.activity = Some("tool output streaming…".to_string());
-            }
-            SessionLiveEventKind::ToolRequestDraft { event } => {
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = "assembling tool request…".to_string();
-                self.activity = Some(format!("assembling {} arguments…", event.tool_name));
-            }
-            SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
-            SessionLiveEventKind::ProviderStreamProgress { turn_id, .. } => {
-                self.active_turn_id = Some(turn_id);
-                self.phase = ReviewAgentThreadPhase::Running;
-                self.status = "receiving model response…".to_string();
-            }
-        }
-        true
-    }
-
-    fn append_durable_answer(&mut self, text: &str, complete_message: bool) {
-        if text.is_empty() || self.durable_answer.contains(text) {
-            return;
-        }
-        if complete_message
-            && !self.durable_answer.is_empty()
-            && !self.durable_answer.ends_with('\n')
+    #[allow(clippy::too_many_lines)]
+    fn from_snapshot(snapshot: SessionViewSnapshot) -> Self {
+        let answer = latest_completed_assistant_response(&snapshot);
+        let items = bounded_session_items(&snapshot);
+        let failed_outcome = matches!(
+            snapshot.runtime.last_turn_outcome,
+            Some(
+                bcode_session_models::ModelTurnOutcome::Cancelled
+                    | bcode_session_models::ModelTurnOutcome::Error
+                    | bcode_session_models::ModelTurnOutcome::IdleTimeout
+                    | bcode_session_models::ModelTurnOutcome::ProviderUnavailable
+            )
+        );
+        let has_active_work = snapshot.runtime_work.iter().any(|work| !work.is_terminal());
+        let has_streaming_items = snapshot.transcript.items.iter().any(|item| item.streaming);
+        let connection_error = match &snapshot.connection_status {
+            SessionConnectionViewStatus::Error(message) => Some(message.clone()),
+            _ => None,
+        };
+        let phase = if connection_error.is_some() || failed_outcome {
+            ReviewAgentThreadPhase::Failed
+        } else if snapshot.runtime.active_turn_id.is_some()
+            || has_active_work
+            || has_streaming_items
+            || answer.is_empty()
+            || matches!(
+                snapshot.connection_status,
+                SessionConnectionViewStatus::Reconnecting | SessionConnectionViewStatus::Resyncing
+            )
         {
-            self.durable_answer.push('\n');
-        }
-        self.durable_answer.push_str(text);
-    }
-
-    fn clear_matching_live_answer(&mut self, text: &str) {
-        self.live_answer_by_turn
-            .retain(|_, live_text| !text.contains(live_text.as_str()));
-    }
-
-    fn finish_turn(&mut self, turn_id: &str, outcome: ModelTurnOutcome, message: Option<String>) {
-        if matches!(
-            outcome,
-            ModelTurnOutcome::Cancelled
-                | ModelTurnOutcome::Error
-                | ModelTurnOutcome::IdleTimeout
-                | ModelTurnOutcome::ProviderUnavailable
-        ) {
-            let error = message.unwrap_or_else(|| format!("turn {outcome:?}"));
-            self.phase = ReviewAgentThreadPhase::Failed;
-            self.status.clone_from(&error);
-            self.error = Some(error);
-        } else if self.display_answer().is_empty() {
-            self.phase = ReviewAgentThreadPhase::Complete;
-            self.status = "finished".to_string();
-            self.error = None;
+            ReviewAgentThreadPhase::Running
         } else {
-            self.phase = ReviewAgentThreadPhase::Complete;
-            self.status = "answered".to_string();
-            self.error = None;
+            ReviewAgentThreadPhase::Complete
+        };
+        let stream_warning = session_stream_warning(&snapshot);
+        let activity = items
+            .iter()
+            .rev()
+            .find(|item| {
+                matches!(
+                    item.kind,
+                    ReviewAgentSessionItemKind::Reasoning
+                        | ReviewAgentSessionItemKind::Tool
+                        | ReviewAgentSessionItemKind::ActionNeeded
+                )
+            })
+            .map(|item| format!("{}: {}", item.label, item.text));
+        let error = connection_error.or_else(|| {
+            failed_outcome.then(|| {
+                snapshot
+                    .runtime
+                    .last_turn_message
+                    .clone()
+                    .unwrap_or_else(|| "linked Bcode turn failed".to_string())
+            })
+        });
+        let status = if let Some(error) = &error {
+            error.clone()
+        } else if !snapshot.permissions.is_empty() || !snapshot.interactions.is_empty() {
+            "action needed in linked Bcode session".to_string()
+        } else if let Some(progress) = &snapshot.runtime.provider_progress {
+            progress.detail.clone()
+        } else if has_active_work {
+            "running linked Bcode work…".to_string()
+        } else if snapshot.runtime.active_turn_id.is_some() || has_streaming_items {
+            "receiving model response…".to_string()
+        } else if answer.is_empty() {
+            "waiting for Bcode…".to_string()
+        } else {
+            "answered".to_string()
+        };
+        Self {
+            snapshot,
+            phase,
+            status,
+            stream_warning,
+            activity,
+            answer,
+            items,
+            error,
         }
-        if self.active_turn_id.as_deref() == Some(turn_id) {
-            self.active_turn_id = None;
-        }
-        self.live_answer_by_turn.remove(turn_id);
     }
 
     fn display_answer(&self) -> String {
-        let mut answer = self.durable_answer.clone();
-        for text in self.live_answer_by_turn.values() {
-            if text.is_empty() || answer.contains(text) {
-                continue;
-            }
-            answer.push_str(text);
-        }
-        answer
+        self.answer.clone()
     }
+
+    fn session_items(&self) -> &[ReviewAgentSessionItem] {
+        &self.items
+    }
+}
+
+const MAX_REVIEW_SESSION_ITEMS: usize = 24;
+const MAX_REVIEW_SESSION_TEXT_CHARS: usize = 1_200;
+const MAX_REVIEW_TOOL_TEXT_CHARS: usize = 320;
+
+fn latest_completed_assistant_response(snapshot: &SessionViewSnapshot) -> String {
+    snapshot
+        .transcript
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match &item.kind {
+            TranscriptViewItemKind::AssistantMessage { message }
+                if !item.streaming && !message.text.trim().is_empty() =>
+            {
+                Some(message.text.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn semantic_tail_start(items: &[bcode_session_view_models::TranscriptViewItem]) -> usize {
+    let hard_start = items.len().saturating_sub(MAX_REVIEW_SESSION_ITEMS);
+    if hard_start == 0 {
+        return 0;
+    }
+    let boundary_turn = items
+        .get(hard_start)
+        .and_then(|item| item.output_location.as_ref())
+        .map(|location| location.turn_id.as_str());
+    let Some(boundary_turn) = boundary_turn else {
+        return hard_start;
+    };
+    let turn_start = (0..=hard_start)
+        .rev()
+        .take_while(|index| {
+            items[*index]
+                .output_location
+                .as_ref()
+                .is_some_and(|location| location.turn_id == boundary_turn)
+        })
+        .last()
+        .unwrap_or(hard_start);
+    if items.len().saturating_sub(turn_start) <= MAX_REVIEW_SESSION_ITEMS.saturating_mul(2) {
+        turn_start
+    } else {
+        hard_start
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn bounded_session_items(snapshot: &SessionViewSnapshot) -> Vec<ReviewAgentSessionItem> {
+    let start = semantic_tail_start(&snapshot.transcript.items);
+    let mut rows = snapshot.transcript.items[start..]
+        .iter()
+        .filter_map(session_item_from_transcript)
+        .collect::<Vec<_>>();
+    rows.extend(
+        snapshot
+            .permissions
+            .iter()
+            .filter(|permission| !permission.resolved)
+            .map(|permission| ReviewAgentSessionItem {
+                id: format!("permission:{}", permission.permission_id),
+                revision: snapshot.revision,
+                kind: ReviewAgentSessionItemKind::ActionNeeded,
+                label: permission
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("permission for {}", permission.tool_name)),
+                text: bounded_text(
+                    permission
+                        .detail
+                        .as_deref()
+                        .unwrap_or("open the native session to respond"),
+                    MAX_REVIEW_TOOL_TEXT_CHARS,
+                ),
+                format: TextFormat::PlainText,
+                streaming: false,
+                degraded: false,
+            }),
+    );
+    rows.extend(
+        snapshot
+            .interactions
+            .iter()
+            .filter(|interaction| !interaction.resolved)
+            .map(|interaction| ReviewAgentSessionItem {
+                id: format!("interaction:{}", interaction.interaction_id),
+                revision: snapshot.revision,
+                kind: ReviewAgentSessionItemKind::ActionNeeded,
+                label: interaction
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| interaction.kind.clone()),
+                text: bounded_text(
+                    interaction
+                        .status_detail
+                        .as_deref()
+                        .unwrap_or("open the native session to respond"),
+                    MAX_REVIEW_TOOL_TEXT_CHARS,
+                ),
+                format: TextFormat::PlainText,
+                streaming: false,
+                degraded: matches!(
+                    interaction.state,
+                    bcode_session_view_models::InteractionViewState::ValidationError
+                        | bcode_session_view_models::InteractionViewState::ActionError
+                ),
+            }),
+    );
+    rows.extend(
+        snapshot
+            .runtime_work
+            .iter()
+            .filter(|work| !work.is_terminal())
+            .map(|work| ReviewAgentSessionItem {
+                id: format!("runtime-work:{}", work.work_id),
+                revision: snapshot.revision,
+                kind: ReviewAgentSessionItemKind::Tool,
+                label: if work.label.is_empty() {
+                    "runtime work".to_string()
+                } else {
+                    work.label.clone()
+                },
+                text: bounded_text(
+                    work.message.as_deref().unwrap_or("running"),
+                    MAX_REVIEW_TOOL_TEXT_CHARS,
+                ),
+                format: TextFormat::PlainText,
+                streaming: true,
+                degraded: false,
+            }),
+    );
+    if let Some(warning) = session_stream_warning(snapshot) {
+        rows.push(ReviewAgentSessionItem {
+            id: "session:stream-status".to_string(),
+            revision: snapshot.revision,
+            kind: ReviewAgentSessionItemKind::Status,
+            label: "stream".to_string(),
+            text: warning,
+            format: TextFormat::PlainText,
+            streaming: false,
+            degraded: true,
+        });
+    }
+    let excess = rows.len().saturating_sub(MAX_REVIEW_SESSION_ITEMS);
+    if excess > 0 {
+        rows.drain(..excess);
+    }
+    rows
+}
+
+fn session_stream_warning(snapshot: &SessionViewSnapshot) -> Option<String> {
+    match snapshot.connection_status {
+        SessionConnectionViewStatus::Reconnecting => {
+            Some("reconnecting to linked Bcode session".to_string())
+        }
+        SessionConnectionViewStatus::Resyncing => {
+            Some("resynchronizing linked Bcode session".to_string())
+        }
+        SessionConnectionViewStatus::Error(ref message) => Some(message.clone()),
+        _ if snapshot.transcript.has_newer_history => {
+            Some("newer session history is outside this bounded view".to_string())
+        }
+        _ if snapshot.text_streams.values().any(|stream| {
+            matches!(
+                stream.status,
+                bcode_session_view_models::TextStreamViewStatus::Incomplete
+                    | bcode_session_view_models::TextStreamViewStatus::Degraded
+            )
+        }) =>
+        {
+            Some("linked Bcode text stream is incomplete or degraded".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn session_item_from_transcript(
+    item: &bcode_session_view_models::TranscriptViewItem,
+) -> Option<ReviewAgentSessionItem> {
+    let (kind, label, text, format, degraded) = match &item.kind {
+        TranscriptViewItemKind::AssistantMessage { message } => (
+            ReviewAgentSessionItemKind::Assistant,
+            if item.streaming {
+                "answer · streaming"
+            } else {
+                "answer"
+            }
+            .to_string(),
+            bounded_preserving_text(&message.text, MAX_REVIEW_SESSION_TEXT_CHARS),
+            message.format,
+            false,
+        ),
+        TranscriptViewItemKind::ReasoningMessage { message } => (
+            ReviewAgentSessionItemKind::Reasoning,
+            "activity".to_string(),
+            bounded_text(&message.text, MAX_REVIEW_TOOL_TEXT_CHARS),
+            message.format,
+            false,
+        ),
+        TranscriptViewItemKind::ReasoningActivity { activity } => (
+            ReviewAgentSessionItemKind::Reasoning,
+            format!("activity · {:?}", activity.status),
+            bounded_text(&activity.text(), MAX_REVIEW_TOOL_TEXT_CHARS),
+            TextFormat::PlainText,
+            matches!(
+                activity.status,
+                bcode_session_models::ReasoningActivityStatus::Interrupted
+                    | bcode_session_models::ReasoningActivityStatus::Failed
+            ),
+        ),
+        TranscriptViewItemKind::ToolInvocation { tool }
+        | TranscriptViewItemKind::ToolRequest { tool } => tool_session_item(tool),
+        TranscriptViewItemKind::ToolRequestDraft { draft } => (
+            ReviewAgentSessionItemKind::Tool,
+            format!("{} · assembling", draft.tool_name),
+            bounded_text(&draft.preview, MAX_REVIEW_TOOL_TEXT_CHARS),
+            TextFormat::Json,
+            draft.truncated,
+        ),
+        TranscriptViewItemKind::Permission { permission } => (
+            ReviewAgentSessionItemKind::ActionNeeded,
+            permission
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("permission for {}", permission.tool_name)),
+            bounded_text(
+                permission
+                    .detail
+                    .as_deref()
+                    .unwrap_or("open the native session to respond"),
+                MAX_REVIEW_TOOL_TEXT_CHARS,
+            ),
+            TextFormat::PlainText,
+            false,
+        ),
+        TranscriptViewItemKind::Interaction { interaction } => (
+            ReviewAgentSessionItemKind::ActionNeeded,
+            interaction
+                .title
+                .clone()
+                .unwrap_or_else(|| interaction.kind.clone()),
+            bounded_text(
+                interaction
+                    .status_detail
+                    .as_deref()
+                    .unwrap_or("open the native session to respond"),
+                MAX_REVIEW_TOOL_TEXT_CHARS,
+            ),
+            TextFormat::PlainText,
+            matches!(
+                interaction.state,
+                bcode_session_view_models::InteractionViewState::ValidationError
+                    | bcode_session_view_models::InteractionViewState::ActionError
+            ),
+        ),
+        _ => return None,
+    };
+    (!text.is_empty()).then(|| ReviewAgentSessionItem {
+        id: item.id.get().to_string(),
+        revision: item.revision,
+        kind,
+        label,
+        text,
+        format,
+        streaming: item.streaming,
+        degraded,
+    })
+}
+
+fn tool_session_item(
+    tool: &ToolInvocationView,
+) -> (ReviewAgentSessionItemKind, String, String, TextFormat, bool) {
+    let name = tool.tool_name.as_deref().unwrap_or("tool");
+    let mut details = Vec::new();
+    if let Some(arguments) = &tool.arguments_json
+        && !arguments.is_empty()
+    {
+        details.push(format!(
+            "args: {}",
+            bounded_text(arguments, MAX_REVIEW_TOOL_TEXT_CHARS)
+        ));
+    }
+    if let Some(result) = tool_result_summary(tool) {
+        details.push(result);
+    }
+    if let Some(duration_ms) = tool.timing.duration_ms {
+        details.push(format!("{duration_ms} ms"));
+    }
+    (
+        ReviewAgentSessionItemKind::Tool,
+        format!("{name} · {:?}", tool.status),
+        details.join(" · "),
+        TextFormat::PlainText,
+        tool.is_error.unwrap_or(false)
+            || matches!(
+                tool.status,
+                ToolInvocationViewStatus::Cancelled | ToolInvocationViewStatus::Failed
+            ),
+    )
+}
+
+fn tool_result_summary(tool: &ToolInvocationView) -> Option<String> {
+    if let Some(result) = &tool.result {
+        let summary = match result {
+            ToolResultView::Text { text } => bounded_text(text, MAX_REVIEW_TOOL_TEXT_CHARS),
+            ToolResultView::Json { value } => bounded_text(value, MAX_REVIEW_TOOL_TEXT_CHARS),
+            ToolResultView::Artifact { artifact } => {
+                let artifact = &artifact.artifact;
+                format!(
+                    "artifact: {} [{} v{}; {} ref(s)]",
+                    artifact.title.as_deref().unwrap_or(&artifact.artifact_id),
+                    artifact.schema,
+                    artifact.schema_version,
+                    artifact.refs.len()
+                )
+            }
+        };
+        return (!summary.is_empty()).then_some(summary);
+    }
+    tool.result_text
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .map(|text| bounded_text(text, MAX_REVIEW_TOOL_TEXT_CHARS))
+}
+
+fn bounded_preserving_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut bounded = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+fn bounded_text(text: &str, max_chars: usize) -> String {
+    let mut compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    compact = compact.chars().take(max_chars.saturating_sub(1)).collect();
+    compact.push('…');
+    compact
 }
 
 /// Draft comment editor mode.
@@ -4905,6 +5442,12 @@ pub struct ReviewApp {
     pub draft_comments: BTreeMap<ReviewCommentAnchor, Vec<ReviewDraftComment>>,
     /// Local AI-suggested comments keyed by anchor.
     pub suggested_comments: BTreeMap<ReviewCommentAnchor, Vec<ReviewSuggestedComment>>,
+    /// Durable, non-publishable AI exchanges keyed by review anchor.
+    pub ai_exchanges: BTreeMap<ReviewCommentAnchor, Vec<ModelReviewAiExchange>>,
+    /// AI exchanges awaiting durable persistence, keyed by exchange id.
+    pub pending_ai_exchange_saves: BTreeMap<String, ReviewCommentAnchor>,
+    /// AI exchange awaiting explicit durable deletion.
+    pub pending_ai_exchange_delete: Option<(String, ReviewCommentAnchor)>,
     /// Text awaiting a host clipboard write.
     pub pending_clipboard_text: Option<String>,
     /// Suggestions awaiting durable persistence, keyed by suggestion id.
@@ -4999,7 +5542,9 @@ pub struct ReviewApp {
     pub show_resolved_threads: bool,
     /// Whether viewed files are hidden from the file sidebar.
     pub hide_viewed_files: bool,
-    /// Session id to open after leaving review mode.
+    /// Whether stable presentation state has changed since the last workspace save.
+    presentation_state_dirty: bool,
+    /// Session id to open while retaining review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
@@ -5013,7 +5558,7 @@ impl ReviewApp {
     pub fn new(review: ReviewSummary) -> Self {
         let workspace = review.workspace();
         let viewed_files = workspace.viewed_files.clone();
-        Self {
+        let mut app = Self {
             workspace,
             review,
             ux_mode: ReviewUxMode::Review,
@@ -5032,6 +5577,9 @@ impl ReviewApp {
             status_message: None,
             draft_comments: BTreeMap::new(),
             suggested_comments: BTreeMap::new(),
+            ai_exchanges: BTreeMap::new(),
+            pending_ai_exchange_saves: BTreeMap::new(),
+            pending_ai_exchange_delete: None,
             pending_clipboard_text: None,
             pending_suggestion_saves: BTreeMap::new(),
             excluded_publish_threads: BTreeSet::new(),
@@ -5080,12 +5628,15 @@ impl ReviewApp {
             resolved_review_threads: BTreeSet::new(),
             show_resolved_threads: true,
             hide_viewed_files: false,
+            presentation_state_dirty: false,
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
             mouse_regions: Vec::new(),
             view_document_cache: Arc::new(RwLock::new(None)),
-        }
+        };
+        app.restore_presentation_state();
+        app
     }
 
     /// Switch directly to build mode.
@@ -6636,6 +7187,91 @@ impl ReviewApp {
         true
     }
 
+    /// Synchronize stable semantic presentation state into the durable workspace.
+    pub fn sync_presentation_state(&mut self) {
+        let selected_thread_key = match &self.selected_view_target {
+            Some(
+                ReviewViewTarget::Thread { thread_key }
+                | ReviewViewTarget::AgentThread { thread_key }
+                | ReviewViewTarget::Comment { thread_key, .. },
+            ) => Some(thread_key.clone()),
+            _ => None,
+        };
+        let state = ReviewWorkspacePresentationState {
+            schema_version: bcode_code_review_models::REVIEW_WORKSPACE_PRESENTATION_SCHEMA_VERSION,
+            selected_path: self.selected_file_path(),
+            selected_thread_key,
+            selected_line: self
+                .selected_comment_anchor()
+                .and_then(|anchor| anchor.new_start.or(anchor.old_start)),
+            sidebar_mode: self.sidebar_mode.label().to_string(),
+            sidebar_visible: self.sidebar_visible,
+            thread_filter: self.thread_filter.label().to_string(),
+            show_resolved_threads: self.show_resolved_threads,
+            hide_viewed_files: self.hide_viewed_files,
+            collapsed_thread_keys: self.collapsed_review_threads.clone(),
+            expanded_agent_answer_keys: self.expanded_agent_answers.clone(),
+        };
+        if self.workspace.presentation_state.as_ref() != Some(&state) {
+            self.workspace.presentation_state = Some(state);
+            self.review.workspace = Some(self.workspace.clone());
+            self.presentation_state_dirty = true;
+        }
+    }
+
+    fn restore_presentation_state(&mut self) {
+        let Some(state) = self.workspace.presentation_state.clone() else {
+            return;
+        };
+        if state.schema_version
+            != bcode_code_review_models::REVIEW_WORKSPACE_PRESENTATION_SCHEMA_VERSION
+        {
+            self.status_message = Some(format!(
+                "workspace presentation state version {} is unsupported; using default location",
+                state.schema_version
+            ));
+            return;
+        }
+        self.sidebar_visible = state.sidebar_visible;
+        self.sidebar_mode = match state.sidebar_mode.as_str() {
+            "repo" => ReviewSidebarMode::Repository,
+            "threads" => ReviewSidebarMode::Threads,
+            "general" => ReviewSidebarMode::General,
+            "summary" => ReviewSidebarMode::Summary,
+            "sources" => ReviewSidebarMode::Sources,
+            "attention" => ReviewSidebarMode::NeedsAttention,
+            _ => ReviewSidebarMode::Included,
+        };
+        self.thread_filter = match state.thread_filter.as_str() {
+            "open" => ReviewThreadFilter::Open,
+            "resolved" => ReviewThreadFilter::Resolved,
+            _ => ReviewThreadFilter::All,
+        };
+        self.show_resolved_threads = state.show_resolved_threads;
+        self.hide_viewed_files = state.hide_viewed_files;
+        self.collapsed_review_threads = state.collapsed_thread_keys;
+        self.expanded_agent_answers = state.expanded_agent_answer_keys;
+        if let Some(path) = state.selected_path {
+            self.selected_file = self.review_file_index_for_path(&path).unwrap_or(0);
+        }
+        if let Some(line) = state.selected_line {
+            self.selected_diff_line = self
+                .current_review_view_document()
+                .and_then(|document| {
+                    document.rows.iter().position(|row| match row.target {
+                        ReviewViewTarget::SourceLine {
+                            old_line, new_line, ..
+                        } => new_line == Some(line) || old_line == Some(line),
+                        _ => false,
+                    })
+                })
+                .unwrap_or(0);
+        }
+        if let Some(thread_key) = state.selected_thread_key {
+            self.selected_view_target = Some(ReviewViewTarget::Thread { thread_key });
+        }
+    }
+
     /// Take pending workspace save flag.
     pub const fn take_pending_workspace_save(&mut self) -> bool {
         let pending = self.pending_workspace_save;
@@ -7117,33 +7753,54 @@ impl ReviewApp {
     /// Return durable local review threads in deterministic order.
     #[must_use]
     pub fn local_review_threads(&self) -> Vec<LocalReviewThread> {
-        self.draft_comments
-            .iter()
-            .map(|(anchor, comments)| {
-                let key = Self::thread_key_for_anchor(anchor);
+        let anchors = self
+            .draft_comments
+            .keys()
+            .chain(self.ai_exchanges.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        anchors
+            .into_iter()
+            .map(|anchor| {
+                let key = Self::thread_key_for_anchor(&anchor);
                 let status = if self.resolved_review_threads.contains(&key) {
                     LocalReviewThreadStatus::Resolved
                 } else {
                     LocalReviewThreadStatus::Open
                 };
-                let comments = comments
-                    .iter()
+                let comments = self
+                    .draft_comments
+                    .get(&anchor)
+                    .into_iter()
+                    .flatten()
                     .cloned()
                     .map(LocalReviewComment::from)
                     .collect::<Vec<_>>();
-                let session_id = comments
-                    .iter()
-                    .rev()
-                    .find_map(|comment| comment.session_id.clone());
-                let thread_kind = comments
-                    .last()
-                    .map_or(ReviewThreadKind::Note, |comment| comment.thread_kind);
+                let exchange = self
+                    .ai_exchanges
+                    .get(&anchor)
+                    .and_then(|exchanges| exchanges.last());
+                let session_id = exchange
+                    .and_then(|exchange| exchange.session_id.clone())
+                    .or_else(|| {
+                        comments
+                            .iter()
+                            .rev()
+                            .find_map(|comment| comment.session_id.clone())
+                    });
+                let thread_kind = if exchange.is_some() {
+                    ReviewThreadKind::Question
+                } else {
+                    comments
+                        .last()
+                        .map_or(ReviewThreadKind::Note, |comment| comment.thread_kind)
+                };
                 let severity = comments
                     .last()
                     .map_or(ReviewThreadSeverity::Info, |comment| comment.severity);
                 LocalReviewThread {
                     key,
-                    anchor: anchor.clone(),
+                    anchor,
                     comments,
                     status,
                     session_id,
@@ -7195,15 +7852,26 @@ impl ReviewApp {
     pub fn thread_summaries(&self) -> Vec<ReviewThreadSummary> {
         self.local_review_threads()
             .into_iter()
-            .filter_map(|thread| {
-                let latest_body = thread.latest_body()?.to_string();
+            .map(|thread| {
+                let latest_body = thread.latest_body().map_or_else(
+                    || {
+                        self.ai_exchanges
+                            .get(&thread.anchor)
+                            .and_then(|exchanges| exchanges.last())
+                            .map_or_else(
+                                || "Bcode exchange".to_string(),
+                                |exchange| exchange.question.clone(),
+                            )
+                    },
+                    ToString::to_string,
+                );
                 let (
                     pending_suggestion_count,
                     refining_suggestion_count,
                     accepted_suggestion_count,
                     rejected_suggestion_count,
                 ) = self.suggestion_status_counts_for_anchor(&thread.anchor);
-                Some(ReviewThreadSummary {
+                ReviewThreadSummary {
                     anchor: thread.anchor,
                     draft_count: thread.comments.len(),
                     latest_body,
@@ -7217,7 +7885,7 @@ impl ReviewApp {
                     rejected_suggestion_count,
                     external_provider_id: None,
                     external_mapping_status: None,
-                })
+                }
             })
             .chain(self.external_thread_summaries())
             .collect()
@@ -9154,11 +9822,171 @@ impl ReviewApp {
     /// Return linked session id for an anchor.
     #[must_use]
     pub fn session_id_for_anchor(&self, anchor: &ReviewCommentAnchor) -> Option<&str> {
-        self.draft_comments
-            .get(anchor)?
-            .last()?
-            .session_id
-            .as_deref()
+        self.ai_exchanges
+            .get(anchor)
+            .and_then(|exchanges| exchanges.last())
+            .and_then(|exchange| exchange.session_id.as_deref())
+            .or_else(|| {
+                self.draft_comments
+                    .get(anchor)?
+                    .last()?
+                    .session_id
+                    .as_deref()
+            })
+    }
+
+    fn create_ai_exchange(
+        &mut self,
+        anchor: ReviewCommentAnchor,
+        question: String,
+        session_id: Option<String>,
+    ) -> String {
+        let ordinal = self
+            .ai_exchanges
+            .get(&anchor)
+            .map_or(1, |exchanges| exchanges.len().saturating_add(1));
+        let exchange_id = format!(
+            "exchange-{}-{ordinal}",
+            Self::thread_key_for_anchor(&anchor)
+        );
+        let status = if session_id.is_some() {
+            ModelReviewAiExchangeStatus::Linked
+        } else {
+            ModelReviewAiExchangeStatus::Pending
+        };
+        self.ai_exchanges
+            .entry(anchor.clone())
+            .or_default()
+            .push(ModelReviewAiExchange {
+                schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
+                exchange_id: exchange_id.clone(),
+                anchor: anchor.clone().into(),
+                question,
+                session_id,
+                status,
+                error: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        self.pending_ai_exchange_saves
+            .insert(exchange_id.clone(), anchor);
+        exchange_id
+    }
+
+    fn update_ai_exchange(
+        &mut self,
+        exchange_id: &str,
+        update: impl FnOnce(&mut ModelReviewAiExchange),
+    ) {
+        let Some((anchor, exchange)) =
+            self.ai_exchanges
+                .iter_mut()
+                .find_map(|(anchor, exchanges)| {
+                    exchanges
+                        .iter_mut()
+                        .find(|exchange| exchange.exchange_id == exchange_id)
+                        .map(|exchange| (anchor.clone(), exchange))
+                })
+        else {
+            return;
+        };
+        update(exchange);
+        self.pending_ai_exchange_saves
+            .insert(exchange_id.to_string(), anchor);
+    }
+
+    /// Explicitly delete the latest AI exchange for the selected review anchor.
+    pub fn delete_latest_ai_exchange_at_selection(&mut self) -> bool {
+        let selected_thread_key = self.selected_thread_key();
+        let anchor = selected_thread_key.as_ref().and_then(|thread_key| {
+            self.ai_exchanges
+                .keys()
+                .find(|anchor| Self::thread_key_for_anchor(anchor) == *thread_key)
+                .cloned()
+        });
+        let Some(anchor) = anchor.or_else(|| self.selected_comment_anchor()) else {
+            self.status_message = Some("select an AI exchange to delete".to_string());
+            return true;
+        };
+        let Some(exchanges) = self.ai_exchanges.get_mut(&anchor) else {
+            self.status_message = Some("no AI exchange at selected location".to_string());
+            return true;
+        };
+        let Some(exchange) = exchanges.pop() else {
+            self.status_message = Some("no AI exchange at selected location".to_string());
+            return true;
+        };
+        if exchanges.is_empty() {
+            self.ai_exchanges.remove(&anchor);
+        }
+        self.pending_ai_exchange_saves.remove(&exchange.exchange_id);
+        self.pending_ai_exchange_delete = Some((exchange.exchange_id, anchor.clone()));
+        let key = Self::thread_key_for_anchor(&anchor);
+        if !self.ai_exchanges.contains_key(&anchor) {
+            self.agent_thread_states.remove(&key);
+            self.expanded_agent_answers.remove(&key);
+        }
+        self.touch_agent_state();
+        self.status_message = Some("deleted AI exchange; syncing cleanup".to_string());
+        true
+    }
+
+    /// Take an explicit AI exchange deletion request.
+    pub const fn take_pending_ai_exchange_delete(
+        &mut self,
+    ) -> Option<(String, ReviewCommentAnchor)> {
+        self.pending_ai_exchange_delete.take()
+    }
+
+    /// Requeue a failed explicit AI exchange deletion.
+    pub fn requeue_ai_exchange_delete(&mut self, exchange_id: String, anchor: ReviewCommentAnchor) {
+        self.pending_ai_exchange_delete = Some((exchange_id, anchor));
+    }
+
+    /// Take the next AI exchange awaiting durable persistence.
+    pub fn take_pending_ai_exchange_save(&mut self) -> Option<ModelReviewAiExchange> {
+        let exchange_id = self.pending_ai_exchange_saves.keys().next()?.clone();
+        let anchor = self.pending_ai_exchange_saves.remove(&exchange_id)?;
+        self.ai_exchanges
+            .get(&anchor)?
+            .iter()
+            .find(|exchange| exchange.exchange_id == exchange_id)
+            .cloned()
+    }
+
+    /// Requeue a failed AI exchange persistence attempt.
+    pub fn requeue_ai_exchange_save(&mut self, exchange_id: &str) {
+        let Some(anchor) = self.ai_exchanges.iter().find_map(|(anchor, exchanges)| {
+            exchanges
+                .iter()
+                .any(|exchange| exchange.exchange_id == exchange_id)
+                .then(|| anchor.clone())
+        }) else {
+            return;
+        };
+        self.pending_ai_exchange_saves
+            .insert(exchange_id.to_string(), anchor);
+    }
+
+    /// Apply timestamps and lifecycle returned after persisting an AI exchange.
+    pub fn mark_ai_exchange_persisted(&mut self, persisted: &ModelReviewAiExchange) {
+        for exchanges in self.ai_exchanges.values_mut() {
+            if let Some(exchange) = exchanges
+                .iter_mut()
+                .find(|exchange| exchange.exchange_id == persisted.exchange_id)
+            {
+                exchange.clone_from(persisted);
+                return;
+            }
+        }
+    }
+
+    /// Mark an AI exchange as failed without persisting session transcript content.
+    pub fn mark_ai_exchange_failed(&mut self, exchange_id: &str, error: &str) {
+        self.update_ai_exchange(exchange_id, |exchange| {
+            exchange.status = ModelReviewAiExchangeStatus::Failed;
+            exchange.error = Some(error.to_string());
+        });
     }
 
     fn queue_suggestion_save(&mut self, anchor: ReviewCommentAnchor, id: String) {
@@ -9485,29 +10313,18 @@ impl ReviewApp {
         true
     }
 
-    /// Mark the latest draft at an anchor as linked to a Bcode session.
-    pub fn mark_thread_session(&mut self, anchor: &ReviewCommentAnchor, session_id: &str) {
-        if let Some(comment) = self
-            .draft_comments
-            .get_mut(anchor)
-            .and_then(|comments| comments.last_mut())
-        {
-            comment.session_id = Some(session_id.to_string());
-        } else {
-            self.draft_comments
-                .entry(anchor.clone())
-                .or_default()
-                .push(ReviewDraftComment {
-                    id: None,
-                    body: String::new(),
-                    persisted: false,
-                    created_at_ms: None,
-                    updated_at_ms: None,
-                    session_id: Some(session_id.to_string()),
-                    thread_kind: ReviewThreadKind::Question,
-                    severity: ReviewThreadSeverity::Info,
-                });
-        }
+    /// Mark the selected exchange as linked to a Bcode session.
+    pub fn mark_thread_session(
+        &mut self,
+        exchange_id: &str,
+        anchor: &ReviewCommentAnchor,
+        session_id: &str,
+    ) {
+        self.update_ai_exchange(exchange_id, |exchange| {
+            exchange.session_id = Some(session_id.to_string());
+            exchange.status = ModelReviewAiExchangeStatus::Linked;
+            exchange.error = None;
+        });
         let key = Self::thread_key_for_anchor(anchor);
         let state = self
             .agent_thread_states
@@ -9523,6 +10340,13 @@ impl ReviewApp {
     #[must_use]
     pub fn linked_agent_session_ids(&self) -> Vec<String> {
         let mut ids = BTreeSet::new();
+        for exchanges in self.ai_exchanges.values() {
+            for exchange in exchanges {
+                if let Some(session_id) = &exchange.session_id {
+                    ids.insert(session_id.clone());
+                }
+            }
+        }
         for comments in self.draft_comments.values() {
             for comment in comments {
                 if let Some(session_id) = &comment.session_id {
@@ -9533,21 +10357,35 @@ impl ReviewApp {
         ids.into_iter().collect()
     }
 
-    /// Apply a linked-session live stream projection.
+    /// Apply a linked-session semantic snapshot presentation.
     pub fn apply_agent_stream_state(
         &mut self,
         session_id: &str,
-        stream_state: &ReviewAgentSessionStreamState,
+        stream_state: &ReviewAgentSessionViewState,
     ) {
         let mut changed = false;
-        for (anchor, comments) in &self.draft_comments {
-            if !comments
+        let mut anchors = self
+            .ai_exchanges
+            .iter()
+            .filter(|(_, exchanges)| {
+                exchanges
+                    .iter()
+                    .any(|exchange| exchange.session_id.as_deref() == Some(session_id))
+            })
+            .map(|(anchor, _)| anchor.clone())
+            .collect::<BTreeSet<_>>();
+        anchors.extend(
+            self.draft_comments
                 .iter()
-                .any(|comment| comment.session_id.as_deref() == Some(session_id))
-            {
-                continue;
-            }
-            let key = Self::thread_key_for_anchor(anchor);
+                .filter(|(_, comments)| {
+                    comments
+                        .iter()
+                        .any(|comment| comment.session_id.as_deref() == Some(session_id))
+                })
+                .map(|(anchor, _)| anchor.clone()),
+        );
+        for anchor in anchors {
+            let key = Self::thread_key_for_anchor(&anchor);
             let state = self
                 .agent_thread_states
                 .entry(key)
@@ -9559,6 +10397,8 @@ impl ReviewApp {
                 || state.stream_warning != stream_state.stream_warning
                 || state.activity != stream_state.activity
                 || state.answer != answer
+                || state.session_items != stream_state.items
+                || state.session_revision != stream_state.snapshot.revision
                 || state.error != stream_state.error
             {
                 state.session_id = Some(session_id.to_string());
@@ -9569,6 +10409,8 @@ impl ReviewApp {
                     .clone_from(&stream_state.stream_warning);
                 state.activity.clone_from(&stream_state.activity);
                 state.answer = answer;
+                state.session_items = stream_state.session_items().to_vec();
+                state.session_revision = stream_state.snapshot.revision;
                 state.error.clone_from(&stream_state.error);
                 changed = true;
             }
@@ -9580,16 +10422,26 @@ impl ReviewApp {
 
     /// Mark every thread for a linked session as failed.
     pub fn mark_agent_session_failed(&mut self, session_id: &str, error: &str) {
-        let anchors = self
-            .draft_comments
+        let mut anchors = self
+            .ai_exchanges
             .iter()
-            .filter(|(_, comments)| {
-                comments
+            .filter(|(_, exchanges)| {
+                exchanges
                     .iter()
-                    .any(|comment| comment.session_id.as_deref() == Some(session_id))
+                    .any(|exchange| exchange.session_id.as_deref() == Some(session_id))
             })
             .map(|(anchor, _)| anchor.clone())
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
+        anchors.extend(
+            self.draft_comments
+                .iter()
+                .filter(|(_, comments)| {
+                    comments
+                        .iter()
+                        .any(|comment| comment.session_id.as_deref() == Some(session_id))
+                })
+                .map(|(anchor, _)| anchor.clone()),
+        );
         for anchor in anchors {
             self.fail_agent_thread(&anchor, error.to_string());
         }
@@ -10258,13 +11110,20 @@ impl ReviewApp {
         match session_id.parse::<SessionId>() {
             Ok(session_id) => {
                 self.session_to_open = Some(session_id);
-                self.should_exit = true;
+                self.status_message = Some("opening linked Bcode session…".to_string());
             }
             Err(_) => {
                 self.status_message = Some("linked session id is invalid".to_string());
             }
         }
         true
+    }
+
+    /// Report a failed native-session navigation without discarding retained review state.
+    pub fn navigation_failed(&mut self, session_id: SessionId, message: &str) {
+        self.status_message = Some(format!(
+            "could not open linked session {session_id}: {message}"
+        ));
     }
 
     /// Run a structured AI review action at the selected anchor.
@@ -10278,7 +11137,10 @@ impl ReviewApp {
         };
         let question = command.instruction().to_string();
         let existing_session = self.session_id_for_anchor(&anchor).map(ToString::to_string);
+        let exchange_id =
+            self.create_ai_exchange(anchor.clone(), question.clone(), existing_session.clone());
         let ask = PendingAgentSession {
+            exchange_id,
             anchor: anchor.clone(),
             draft_body: Some(question.clone()),
             command,
@@ -10312,20 +11174,10 @@ impl ReviewApp {
 
     fn queue_bcode_question(&mut self, anchor: &ReviewCommentAnchor, question: String) {
         let existing_session = self.session_id_for_anchor(anchor).map(ToString::to_string);
-        self.draft_comments
-            .entry(anchor.clone())
-            .or_default()
-            .push(ReviewDraftComment {
-                id: None,
-                body: question.clone(),
-                persisted: false,
-                created_at_ms: None,
-                updated_at_ms: None,
-                session_id: existing_session.clone(),
-                thread_kind: ReviewThreadKind::Question,
-                severity: ReviewThreadSeverity::Info,
-            });
+        let exchange_id =
+            self.create_ai_exchange(anchor.clone(), question.clone(), existing_session.clone());
         let ask = PendingAgentSession {
+            exchange_id,
             anchor: anchor.clone(),
             draft_body: Some(question.clone()),
             command: ReviewAiCommand::Analyze,
@@ -10439,6 +11291,9 @@ impl ReviewApp {
             Some(ReviewThreadAction::Reply) => self.open_comment_editor(),
             Some(ReviewThreadAction::Edit) => self.open_latest_draft_editor(),
             Some(ReviewThreadAction::Delete) => self.delete_latest_draft_at_selection(),
+            Some(ReviewThreadAction::DeleteExchange) => {
+                self.delete_latest_ai_exchange_at_selection()
+            }
             Some(ReviewThreadAction::AskBcode | ReviewThreadAction::FollowUp) => {
                 self.ask_bcode_about_selection()
             }
@@ -10927,6 +11782,37 @@ impl ReviewApp {
         }
     }
 
+    /// Load persisted, non-publishable AI exchanges into local review state.
+    fn load_persisted_ai_exchanges(&mut self, exchanges: Vec<ModelReviewAiExchange>) {
+        for exchange in exchanges {
+            let draft = DraftComment {
+                comment_id: String::new(),
+                thread_id: String::new(),
+                anchor: exchange.anchor.clone().into(),
+                body: String::new(),
+                created_at_ms: exchange.created_at_ms,
+                updated_at_ms: exchange.updated_at_ms,
+                session_id: exchange.session_id.clone(),
+                resolved_at_ms: None,
+                thread_kind: ReviewThreadKind::Question,
+                severity: ReviewThreadSeverity::Info,
+            };
+            if let Some(anchor) = self.anchor_from_persisted_draft(&draft) {
+                if let Some(session_id) = &exchange.session_id {
+                    let key = Self::thread_key_for_anchor(&anchor);
+                    let state = self.agent_thread_states.entry(key).or_insert_with(|| {
+                        ReviewAgentThreadState::pending(exchange.question.clone())
+                    });
+                    state.session_id = Some(session_id.clone());
+                    state.phase = ReviewAgentThreadPhase::Running;
+                    state.status = "reconnecting linked session…".to_string();
+                }
+                self.ai_exchanges.entry(anchor).or_default().push(exchange);
+            }
+        }
+        self.touch_agent_state();
+    }
+
     /// Load persisted suggested comments into local state.
     fn load_persisted_suggestions(&mut self, suggestions: Vec<ModelReviewSuggestion>) {
         for suggestion in suggestions {
@@ -11320,6 +12206,23 @@ impl ReviewApp {
             return Some(cached.document.clone());
         }
 
+        let mut inline_comments = self.draft_comments.clone();
+        for (anchor, exchanges) in &self.ai_exchanges {
+            inline_comments
+                .entry(anchor.clone())
+                .or_default()
+                .extend(exchanges.iter().map(|exchange| ReviewDraftComment {
+                    id: Some(exchange.exchange_id.clone()),
+                    body: exchange.question.clone(),
+                    persisted: exchange.created_at_ms != 0,
+                    created_at_ms: (exchange.created_at_ms != 0).then_some(exchange.created_at_ms),
+                    updated_at_ms: (exchange.updated_at_ms != 0).then_some(exchange.updated_at_ms),
+                    session_id: exchange.session_id.clone(),
+                    thread_kind: ReviewThreadKind::Question,
+                    severity: ReviewThreadSeverity::Info,
+                }));
+        }
+
         let mut document = if self.review.is_repository_review() {
             let path = self.selected_file_path()?;
             let cached = self.file_cache.get(&path)?;
@@ -11353,7 +12256,7 @@ impl ReviewApp {
         };
         document = document.with_inline_draft_threads(
             self.selected_file,
-            self.draft_comments.iter().map(|(anchor, comments)| {
+            inline_comments.iter().map(|(anchor, comments)| {
                 (
                     ReviewThreadAnchor {
                         file_index: anchor.file_index,
@@ -11460,6 +12363,29 @@ impl ReviewApp {
                 .expect("writing to String cannot fail");
             }
             draft_signature.push(';');
+        }
+        for (anchor, exchanges) in self
+            .ai_exchanges
+            .iter()
+            .filter(|(anchor, _)| anchor.file_index == self.selected_file)
+        {
+            write!(
+                draft_signature,
+                "ai:{}:{}-{:?}:",
+                anchor.path, anchor.diff_row, anchor.end_diff_row
+            )
+            .expect("writing to String cannot fail");
+            for exchange in exchanges {
+                write!(
+                    draft_signature,
+                    "{}:{}:{:?}:{};",
+                    exchange.exchange_id,
+                    exchange.question.len(),
+                    exchange.status,
+                    exchange.session_id.as_deref().unwrap_or_default()
+                )
+                .expect("writing to String cannot fail");
+            }
         }
         for (anchor, suggestions) in self
             .suggested_comments
@@ -12471,6 +13397,85 @@ mod tests {
     }
 
     #[test]
+    fn ai_exchange_failure_retry_follow_up_reopen_and_conversion_remain_isolated() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        let exchange_id =
+            app.create_ai_exchange(anchor.clone(), "first question".to_string(), None);
+        let initial = app
+            .take_pending_ai_exchange_save()
+            .expect("create persistence");
+        app.mark_ai_exchange_persisted(&ModelReviewAiExchange {
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            ..initial
+        });
+        app.mark_ai_exchange_failed(&exchange_id, "provider unavailable");
+        let failed = app
+            .take_pending_ai_exchange_save()
+            .expect("failure persistence");
+        assert_eq!(failed.status, ModelReviewAiExchangeStatus::Failed);
+        app.requeue_ai_exchange_save(&exchange_id);
+        assert!(app.take_pending_ai_exchange_save().is_some());
+
+        let session_id = SessionId::new().to_string();
+        app.mark_thread_session(&exchange_id, &anchor, &session_id);
+        let follow_up_id = app.create_ai_exchange(
+            anchor.clone(),
+            "follow up".to_string(),
+            Some(session_id.clone()),
+        );
+        assert_ne!(follow_up_id, exchange_id);
+        assert_eq!(
+            app.ai_exchanges
+                .get(&anchor)
+                .expect("exchanges")
+                .iter()
+                .filter(|exchange| exchange.session_id.as_deref() == Some(&session_id))
+                .count(),
+            2
+        );
+
+        let persisted = app
+            .ai_exchanges
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reopened = sample_app();
+        reopened.load_persisted_ai_exchanges(persisted);
+        assert_eq!(reopened.ai_exchanges.values().flatten().count(), 2);
+        let key = ReviewApp::thread_key_for_anchor(&anchor);
+        reopened.agent_thread_states.insert(
+            key,
+            ReviewAgentThreadState {
+                phase: ReviewAgentThreadPhase::Complete,
+                session_id: Some(session_id),
+                question: "follow up".to_string(),
+                context_summary: String::new(),
+                status: "answered".to_string(),
+                answer: "Use the checked result.".to_string(),
+                session_items: Vec::new(),
+                session_revision: 0,
+                stream_warning: None,
+                activity: None,
+                error: None,
+            },
+        );
+        reopened.selected_diff_line = 2;
+        reopened.selected_view_target = None;
+        assert!(reopened.convert_agent_answer_to_draft_at_selection());
+        assert!(reopened.delete_latest_ai_exchange_at_selection());
+        let (deleted_id, _) = reopened
+            .take_pending_ai_exchange_delete()
+            .expect("explicit cleanup");
+        assert_eq!(deleted_id, follow_up_id);
+        assert_eq!(reopened.ai_exchanges.values().flatten().count(), 1);
+        assert_eq!(reopened.draft_comment_count(), 1);
+    }
+
+    #[test]
     fn comment_composer_ask_action_queues_bcode_question() {
         let mut app = sample_app();
         app.selected_diff_line = 2;
@@ -12484,7 +13489,17 @@ mod tests {
 
         assert!(app.save_comment_editor());
 
-        assert_eq!(app.draft_comment_count(), 1);
+        assert_eq!(app.draft_comment_count(), 0);
+        assert_eq!(app.ai_exchanges.values().flatten().count(), 1);
+        let exchange = app
+            .ai_exchanges
+            .values()
+            .flatten()
+            .next()
+            .expect("AI exchange should be visible");
+        assert_eq!(exchange.question, "Why this change?");
+        assert_eq!(exchange.status, ModelReviewAiExchangeStatus::Pending);
+        assert!(app.take_pending_ai_exchange_save().is_some());
         let pending = app
             .take_pending_agent_session()
             .expect("ask action should queue an agent session");
@@ -12835,6 +13850,7 @@ mod tests {
                 updated_at_ms: None,
                 viewed_files: BTreeSet::new(),
                 archived_at_ms: None,
+                presentation_state: None,
             }),
             surfaces,
             diagnostics,
@@ -13006,6 +14022,8 @@ mod tests {
                 context_summary: String::new(),
                 status: "answered".to_string(),
                 answer: "Handle this error explicitly.".to_string(),
+                session_items: Vec::new(),
+                session_revision: 0,
                 stream_warning: None,
                 activity: None,
                 error: None,
@@ -13172,6 +14190,7 @@ mod tests {
             }
         }
         let ask = PendingAgentSession {
+            exchange_id: "exchange-1".to_string(),
             anchor,
             draft_body: Some("Review this change".to_string()),
             command: ReviewAiCommand::FindRisk,
@@ -13487,6 +14506,27 @@ mod tests {
     }
 
     #[test]
+    fn ai_exchange_has_an_explicit_inline_delete_action() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.run_ai_command_at_selection(ReviewAiCommand::Analyze));
+        let anchor = app.selected_comment_anchor().expect("anchor");
+
+        let document = app.current_review_view_document().expect("review document");
+        let delete_target = document.rows.iter().find_map(|row| match &row.target {
+            ReviewViewTarget::ThreadAction { action, .. } if action == "delete-exchange" => {
+                Some(row.target.clone())
+            }
+            _ => None,
+        });
+        app.selected_view_target = delete_target;
+
+        assert!(app.activate_selected_inline_action());
+        assert!(!app.ai_exchanges.contains_key(&anchor));
+        assert!(app.take_pending_ai_exchange_delete().is_some());
+    }
+
+    #[test]
     fn structured_ai_commands_queue_expected_action_and_context_metadata() {
         let commands = [
             ReviewAiCommand::ExplainChange,
@@ -13536,6 +14576,8 @@ mod tests {
                 context_summary: String::new(),
                 status: "answered".to_string(),
                 answer: "  Use a clearer error message.  ".to_string(),
+                session_items: Vec::new(),
+                session_revision: 0,
                 stream_warning: None,
                 activity: None,
                 error: None,
@@ -13568,7 +14610,9 @@ mod tests {
             .insert_str("Can Bcode check this?");
         assert!(app.save_comment_editor());
         let anchor = app.selected_comment_anchor().expect("anchor");
-        app.mark_thread_session(&anchor, &SessionId::new().to_string());
+        let exchange_id =
+            app.create_ai_exchange(anchor.clone(), "Can Bcode check this?".to_string(), None);
+        app.mark_thread_session(&exchange_id, &anchor, &SessionId::new().to_string());
         let key = ReviewApp::thread_key_for_anchor(&anchor);
         app.agent_thread_states.insert(
             key,
@@ -13579,6 +14623,8 @@ mod tests {
                 context_summary: String::new(),
                 status: "answered".to_string(),
                 answer: "Use a clearer error message.".to_string(),
+                session_items: Vec::new(),
+                session_revision: 0,
                 stream_warning: None,
                 activity: None,
                 error: None,
@@ -13612,7 +14658,8 @@ mod tests {
             .insert_str("Needs a test");
         assert!(app.save_comment_editor());
         let anchor = app.selected_comment_anchor().expect("anchor");
-        app.mark_thread_session(&anchor, &SessionId::new().to_string());
+        let exchange_id = app.create_ai_exchange(anchor.clone(), "Needs a test".to_string(), None);
+        app.mark_thread_session(&exchange_id, &anchor, &SessionId::new().to_string());
         app.toggle_sidebar_mode();
 
         let preview = app.selected_thread_preview().expect("thread preview");
@@ -14219,8 +15266,6 @@ mod tests {
         assert_eq!(app.sidebar_mode, ReviewSidebarMode::NeedsAttention);
     }
 
-    use bcode_session_models::{SessionSummary, SessionTitleSource};
-
     fn linked_agent_app(session_id: &str) -> (ReviewApp, ReviewCommentAnchor) {
         let mut app = sample_app();
         let anchor = ReviewCommentAnchor {
@@ -14255,69 +15300,105 @@ mod tests {
         (app, anchor)
     }
 
-    fn session_event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
-        SessionEvent {
-            schema_version: 1,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        }
-    }
+    #[test]
+    fn workspace_presentation_state_restores_stable_location_best_effort() {
+        let base = sample_app();
+        let mut review = base.review;
+        let path = review.files[0].display_path().to_string();
+        let mut workspace = review.workspace();
+        workspace.presentation_state = Some(ReviewWorkspacePresentationState {
+            schema_version: bcode_code_review_models::REVIEW_WORKSPACE_PRESENTATION_SCHEMA_VERSION,
+            selected_path: Some(path),
+            selected_thread_key: Some("missing-thread".to_string()),
+            selected_line: Some(1),
+            sidebar_mode: "threads".to_string(),
+            sidebar_visible: false,
+            thread_filter: "open".to_string(),
+            show_resolved_threads: false,
+            hide_viewed_files: true,
+            collapsed_thread_keys: BTreeSet::from(["collapsed".to_string()]),
+            expanded_agent_answer_keys: BTreeSet::from(["expanded".to_string()]),
+        });
+        review.workspace = Some(workspace);
 
-    fn session_summary(session_id: SessionId) -> SessionSummary {
-        SessionSummary {
-            id: session_id,
-            name: None,
-            explicit_name: None,
-            derived_title: None,
-            title_source: SessionTitleSource::EmptyDraft,
-            client_count: 0,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            working_directory: PathBuf::new(),
-            import: None,
-            fork: None,
-            execution: None,
-        }
+        let app = ReviewApp::new(review);
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Threads);
+        assert!(!app.sidebar_visible);
+        assert_eq!(app.thread_filter, ReviewThreadFilter::Open);
+        assert!(app.hide_viewed_files);
+        assert!(app.collapsed_review_threads.contains("collapsed"));
+        assert!(app.expanded_agent_answers.contains("expanded"));
+        assert!(matches!(
+            app.selected_view_target,
+            Some(ReviewViewTarget::Thread { .. })
+        ));
     }
 
     #[test]
-    fn agent_stream_attached_history_populates_answer() {
+    fn navigation_failure_retains_review_state_for_retry() {
+        let session_id = SessionId::new();
+        let mut app = sample_app();
+        app.selected_file = 0;
+        app.selected_diff_line = 2;
+        app.diff_scroll = 7;
+        app.sidebar_mode = ReviewSidebarMode::Threads;
+
+        app.navigation_failed(session_id, "session not found");
+
+        assert_eq!(app.selected_file, 0);
+        assert_eq!(app.selected_diff_line, 2);
+        assert_eq!(app.diff_scroll, 7);
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Threads);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("session not found"))
+        );
+        assert!(!app.should_exit);
+    }
+
+    #[test]
+    fn linked_session_open_queues_navigation_without_exiting_review() {
+        let session_id = SessionId::new();
+        let (mut app, anchor) = linked_agent_app(&session_id.to_string());
+        let exchange_id = app.create_ai_exchange(
+            anchor.clone(),
+            "question".to_string(),
+            Some(session_id.to_string()),
+        );
+        app.mark_thread_session(&exchange_id, &anchor, &session_id.to_string());
+        app.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: ReviewApp::thread_key_for_anchor(&anchor),
+        });
+
+        assert!(app.open_linked_session_at_selection());
+        assert_eq!(app.take_session_to_open(), Some(session_id));
+        assert!(!app.should_exit);
+    }
+
+    #[test]
+    fn semantic_session_snapshot_populates_answer_and_completion() {
         let session_id = SessionId::new();
         let session_key = session_id.to_string();
         let (mut app, anchor) = linked_agent_app(&session_key);
-        let mut state = ReviewAgentSessionStreamState::default();
-
-        assert!(state.apply_plugin_event(PluginSessionEvent::Attached {
-            session: session_summary(session_id),
-            history: vec![
-                session_event(
-                    session_id,
-                    1,
-                    SessionEventKind::ModelTurnStarted {
-                        turn_id: "t1".to_string(),
-                    },
-                ),
-                session_event(
-                    session_id,
-                    2,
-                    SessionEventKind::AssistantMessage {
-                        text: "Looks good".to_string(),
-                    },
-                ),
-                session_event(
-                    session_id,
-                    3,
-                    SessionEventKind::ModelTurnFinished {
-                        turn_id: "t1".to_string(),
-                        outcome: ModelTurnOutcome::Completed,
-                        message: None,
-                    },
-                ),
-            ],
-        }));
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.session_id = Some(session_id);
+        snapshot.connection_status = SessionConnectionViewStatus::Attached;
+        snapshot
+            .transcript
+            .items
+            .push(bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("assistant:1"),
+                revision: 1,
+                sequence: Some(1),
+                timestamp_ms: Some(1),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown("Looks good"),
+                },
+            });
+        let state = ReviewAgentSessionViewState::from_snapshot(snapshot);
         app.apply_agent_stream_state(&session_key, &state);
 
         let thread_state = app
@@ -14329,107 +15410,173 @@ mod tests {
     }
 
     #[test]
-    fn agent_stream_live_delta_updates_running_answer() {
+    fn semantic_session_snapshot_replacement_is_authoritative() {
         let session_id = SessionId::new();
-        let session_key = session_id.to_string();
-        let (mut app, anchor) = linked_agent_app(&session_key);
-        let mut state = ReviewAgentSessionStreamState::default();
-
-        assert!(
-            state.apply_plugin_event(PluginSessionEvent::Session(session_event(
-                session_id,
-                1,
-                SessionEventKind::ModelTurnStarted {
-                    turn_id: "t1".to_string(),
+        let mut first = SessionViewSnapshot::empty();
+        first.session_id = Some(session_id);
+        first.connection_status = SessionConnectionViewStatus::Attached;
+        first
+            .transcript
+            .items
+            .push(bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("assistant:live"),
+                revision: 1,
+                sequence: None,
+                timestamp_ms: None,
+                output_location: None,
+                streaming: true,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown("Hello wor"),
                 },
-            )))
-        );
-        assert!(state.apply_plugin_event(PluginSessionEvent::SessionLive(
-            bcode_session_models::SessionLiveEvent {
-                session_id,
-                kind: SessionLiveEventKind::AssistantTextDelta {
-                    turn_id: "t1".to_string(),
-                    segment_id: "segment-0".to_owned(),
-                    segment_order: 0,
-                    text: "Hello".to_string(),
-                },
-            },
-        )));
-        assert!(state.apply_plugin_event(PluginSessionEvent::SessionLive(
-            bcode_session_models::SessionLiveEvent {
-                session_id,
-                kind: SessionLiveEventKind::AssistantTextDelta {
-                    turn_id: "t1".to_string(),
-                    segment_id: "segment-0".to_owned(),
-                    segment_order: 0,
-                    text: " world".to_string(),
-                },
-            },
-        )));
-        app.apply_agent_stream_state(&session_key, &state);
-
-        let thread_state = app
-            .agent_state_for_anchor(&anchor)
-            .expect("thread should have agent state");
-        assert_eq!(thread_state.phase, ReviewAgentThreadPhase::Running);
-        assert_eq!(thread_state.answer, "Hello world");
-        assert_eq!(thread_state.status, "receiving model response…");
-    }
-
-    #[test]
-    fn agent_stream_durable_event_dedupes_live_answer() {
-        let session_id = SessionId::new();
-        let mut state = ReviewAgentSessionStreamState::default();
-
-        assert!(state.apply_plugin_event(PluginSessionEvent::SessionLive(
-            bcode_session_models::SessionLiveEvent {
-                session_id,
-                kind: SessionLiveEventKind::AssistantTextDelta {
-                    turn_id: "t1".to_string(),
-                    segment_id: "segment-0".to_owned(),
-                    segment_order: 0,
-                    text: "Hello world".to_string(),
-                },
-            },
-        )));
-        assert!(
-            state.apply_plugin_event(PluginSessionEvent::Session(session_event(
-                session_id,
-                1,
-                SessionEventKind::AssistantMessage {
-                    text: "Hello world".to_string(),
-                },
-            )))
+            });
+        first.runtime.active_turn_id = Some("turn-1".to_string());
+        let mut state = ReviewAgentSessionViewState::from_snapshot(first);
+        assert_eq!(state.phase, ReviewAgentThreadPhase::Running);
+        assert!(state.display_answer().is_empty());
+        assert_eq!(
+            state.session_items().last().map(|item| item.text.as_str()),
+            Some("Hello wor")
         );
 
+        let mut durable = SessionViewSnapshot::empty();
+        durable.session_id = Some(session_id);
+        durable.connection_status = SessionConnectionViewStatus::Attached;
+        durable
+            .transcript
+            .items
+            .push(bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("assistant:durable"),
+                revision: 2,
+                sequence: Some(2),
+                timestamp_ms: Some(2),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown("Hello world"),
+                },
+            });
+        assert!(state.replace_snapshot(durable));
+        assert_eq!(state.phase, ReviewAgentThreadPhase::Complete);
         assert_eq!(state.display_answer(), "Hello world");
     }
 
     #[test]
-    fn agent_stream_failed_turn_marks_failed() {
-        let session_id = SessionId::new();
-        let session_key = session_id.to_string();
-        let (mut app, anchor) = linked_agent_app(&session_key);
-        let mut state = ReviewAgentSessionStreamState::default();
-
-        assert!(
-            state.apply_plugin_event(PluginSessionEvent::Session(session_event(
-                session_id,
-                1,
-                SessionEventKind::ModelTurnFinished {
-                    turn_id: "t1".to_string(),
-                    outcome: ModelTurnOutcome::ProviderUnavailable,
-                    message: Some("provider unavailable".to_string()),
+    fn semantic_tail_preserves_a_bounded_turn_boundary() {
+        let items = (0..30)
+            .map(|index| bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new(format!("item:{index}")),
+                revision: index,
+                sequence: Some(index),
+                timestamp_ms: Some(index),
+                output_location: Some(bcode_session_view_models::TurnOutputLocation {
+                    turn_id: if index < 4 { "old" } else { "current" }.to_string(),
+                    position: bcode_session_models::TurnOutputPosition::new(index),
+                }),
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::plain(index.to_string()),
                 },
-            )))
-        );
-        app.apply_agent_stream_state(&session_key, &state);
+            })
+            .collect::<Vec<_>>();
 
-        let thread_state = app
-            .agent_state_for_anchor(&anchor)
-            .expect("thread should have agent state");
-        assert_eq!(thread_state.phase, ReviewAgentThreadPhase::Failed);
-        assert_eq!(thread_state.error.as_deref(), Some("provider unavailable"));
+        assert_eq!(semantic_tail_start(&items), 4);
+    }
+
+    #[test]
+    fn semantic_mini_session_preserves_order_and_bounds_tool_content() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.connection_status = SessionConnectionViewStatus::Attached;
+        snapshot.transcript.items = vec![
+            bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("reasoning:1"),
+                revision: 1,
+                sequence: Some(1),
+                timestamp_ms: Some(1),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::ReasoningMessage {
+                    message: bcode_session_view_models::ChatMessageView::plain("checking tests"),
+                },
+            },
+            bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("tool:1"),
+                revision: 2,
+                sequence: Some(2),
+                timestamp_ms: Some(2),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::ToolInvocation {
+                    tool: Box::new(bcode_session_view_models::ToolInvocationView {
+                        tool_call_id: "tool-1".to_string(),
+                        producer_plugin_id: Some("shell".to_string()),
+                        tool_name: Some("shell.run".to_string()),
+                        arguments_json: Some("x".repeat(600)),
+                        working_directory: None,
+                        request_draft: None,
+                        status: ToolInvocationViewStatus::Finished,
+                        result_text: Some("tests passed".to_string()),
+                        is_error: Some(false),
+                        result: None,
+                        presentation: None,
+                        timing: bcode_session_view_models::ToolTimingView {
+                            duration_ms: Some(25),
+                            ..bcode_session_view_models::ToolTimingView::default()
+                        },
+                    }),
+                },
+            },
+            bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("assistant:1"),
+                revision: 3,
+                sequence: Some(3),
+                timestamp_ms: Some(3),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown(
+                        "## Done\n\n* tests passed",
+                    ),
+                },
+            },
+        ];
+
+        let state = ReviewAgentSessionViewState::from_snapshot(snapshot);
+        assert_eq!(state.session_items().len(), 3);
+        assert_eq!(
+            state.session_items()[0].kind,
+            ReviewAgentSessionItemKind::Reasoning
+        );
+        assert_eq!(
+            state.session_items()[1].kind,
+            ReviewAgentSessionItemKind::Tool
+        );
+        assert!(state.session_items()[1].text.chars().count() < 400);
+        assert_eq!(
+            state.session_items()[2].kind,
+            ReviewAgentSessionItemKind::Assistant
+        );
+        assert_eq!(state.display_answer(), "## Done\n\n* tests passed");
+    }
+
+    #[test]
+    fn semantic_session_snapshot_surfaces_reconnect_and_failure() {
+        let mut reconnecting = SessionViewSnapshot::empty();
+        reconnecting.connection_status = SessionConnectionViewStatus::Reconnecting;
+        let state = ReviewAgentSessionViewState::from_snapshot(reconnecting);
+        assert_eq!(state.phase, ReviewAgentThreadPhase::Running);
+        assert_eq!(
+            state.stream_warning.as_deref(),
+            Some("reconnecting to linked Bcode session")
+        );
+
+        let mut failed = SessionViewSnapshot::empty();
+        failed.connection_status = SessionConnectionViewStatus::Attached;
+        failed.runtime.last_turn_outcome =
+            Some(bcode_session_models::ModelTurnOutcome::ProviderUnavailable);
+        failed.runtime.last_turn_message = Some("provider unavailable".to_string());
+        let state = ReviewAgentSessionViewState::from_snapshot(failed);
+        assert_eq!(state.phase, ReviewAgentThreadPhase::Failed);
+        assert_eq!(state.error.as_deref(), Some("provider unavailable"));
     }
 
     #[test]

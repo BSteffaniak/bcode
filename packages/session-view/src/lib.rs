@@ -211,6 +211,17 @@ impl SessionView {
         self.snapshot
     }
 
+    /// Replace the renderer-neutral daemon/session connection status.
+    pub fn set_connection_status(
+        &mut self,
+        connection_status: bcode_session_view_models::SessionConnectionViewStatus,
+    ) {
+        if self.snapshot.connection_status != connection_status {
+            self.snapshot.connection_status = connection_status;
+            self.bump_revision();
+        }
+    }
+
     /// Apply canonical session metadata from an attach or catalog response.
     pub fn set_session_summary(&mut self, summary: bcode_session_models::SessionSummary) {
         let title = summary.title().map(ToOwned::to_owned);

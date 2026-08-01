@@ -1725,7 +1725,13 @@ fn render_view_row(
         } => {
             let style = Style::new().fg(Color::White).bg(Color::Rgb(20, 20, 20));
             let label = if *body_line_index == 0 {
-                if comment.persisted { "draft" } else { "saving" }
+                if comment.thread_kind == bcode_code_review_models::ReviewThreadKind::Question {
+                    "ask"
+                } else if comment.persisted {
+                    "draft"
+                } else {
+                    "saving"
+                }
             } else {
                 ""
             };
@@ -1878,11 +1884,26 @@ fn render_inline_agent_thread_line(
         .is_some_and(|text| !text.is_empty());
     let has_activity = state.activity.as_ref().is_some_and(|text| !text.is_empty());
     let has_context = !state.context_summary.is_empty();
+    let metadata_count =
+        1 + usize::from(has_context) + usize::from(has_warning) + usize::from(has_activity);
+    let visible_session_items =
+        state
+            .session_items
+            .len()
+            .min(if body_line_count > 12 { 24 } else { 6 });
+    if body_line_index >= metadata_count
+        && body_line_index < metadata_count.saturating_add(visible_session_items)
+    {
+        let item = &state.session_items[state
+            .session_items
+            .len()
+            .saturating_sub(visible_session_items)
+            .saturating_add(body_line_index.saturating_sub(metadata_count))];
+        return render_inline_session_item(item, width, style);
+    }
     let answer_line_index = body_line_index
-        .saturating_sub(1)
-        .saturating_sub(usize::from(has_context))
-        .saturating_sub(usize::from(has_warning))
-        .saturating_sub(usize::from(has_activity));
+        .saturating_sub(metadata_count)
+        .saturating_sub(visible_session_items);
     let prefix = if body_line_index == 0 {
         format!("   │ 🤖 Bcode · {} ", state.live_state_label())
     } else if has_context && body_line_index == 1 {
@@ -1918,17 +1939,75 @@ fn render_inline_agent_thread_line(
             .nth(answer_line_index)
             .unwrap_or_default()
     };
+    let is_answer = body_line_index >= metadata_count.saturating_add(visible_session_items);
     let available = usize::from(
         width.saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX)),
     );
     let mut spans = vec![Span::styled(prefix, prefix_style)];
-    spans.push(Span::styled(
-        truncate_to_display_width(detail, available),
-        style,
-    ));
+    if is_answer {
+        let markdown_width = u16::try_from(available).unwrap_or(u16::MAX).max(1);
+        let markdown_line =
+            render_markdown_lines(&state.answer, MarkdownRenderOptions::new(markdown_width))
+                .get(answer_line_index)
+                .cloned()
+                .unwrap_or_default();
+        spans.extend(markdown_line.spans);
+    } else {
+        spans.push(Span::styled(
+            truncate_to_display_width(detail, available),
+            style,
+        ));
+    }
     if body_line_index.saturating_add(1) == body_line_count && state.answer.lines().count() > 4 {
         spans.push(Span::styled(" …", prefix_style));
     }
+    Line::from_spans(spans)
+}
+
+fn render_inline_session_item(
+    item: &crate::code_review_tui::ReviewAgentSessionItem,
+    width: u16,
+    style: Style,
+) -> Line {
+    let marker = if item.degraded {
+        "⚠"
+    } else if item.streaming {
+        "…"
+    } else {
+        "·"
+    };
+    let prefix = format!("   │  {marker} {} ", item.label);
+    let available = width.saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX));
+    let prefix_style = match item.kind {
+        crate::code_review_tui::ReviewAgentSessionItemKind::Assistant => {
+            Style::new().fg(Color::White).bg(Color::Rgb(18, 18, 18))
+        }
+        crate::code_review_tui::ReviewAgentSessionItemKind::Reasoning => Style::new()
+            .fg(Color::BrightBlack)
+            .bg(Color::Rgb(18, 18, 18)),
+        crate::code_review_tui::ReviewAgentSessionItemKind::Tool => {
+            Style::new().fg(Color::Blue).bg(Color::Rgb(18, 18, 18))
+        }
+        crate::code_review_tui::ReviewAgentSessionItemKind::ActionNeeded => {
+            Style::new().fg(Color::Yellow).bg(Color::Rgb(18, 18, 18))
+        }
+        crate::code_review_tui::ReviewAgentSessionItemKind::Status => {
+            Style::new().fg(Color::Red).bg(Color::Rgb(18, 18, 18))
+        }
+    };
+    let content = if item.format == bcode_session_view_models::TextFormat::Markdown {
+        render_markdown_lines(&item.text, MarkdownRenderOptions::new(available.max(1)))
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    } else {
+        Line::from_spans(vec![Span::styled(
+            truncate_to_display_width(&item.text, usize::from(available)),
+            style,
+        )])
+    };
+    let mut spans = vec![Span::styled(prefix, prefix_style)];
+    spans.extend(content.spans);
     Line::from_spans(spans)
 }
 
@@ -3511,6 +3590,60 @@ mod tests {
     use crate::code_review_tui::ReviewFileStatus;
 
     use super::*;
+
+    #[test]
+    fn linked_session_markdown_renders_across_narrow_and_wide_widths() {
+        let item = crate::code_review_tui::ReviewAgentSessionItem {
+            id: "assistant:1".to_string(),
+            revision: 1,
+            kind: crate::code_review_tui::ReviewAgentSessionItemKind::Assistant,
+            label: "answer".to_string(),
+            text: "## Result\n\n* first\n* second\n\n```rust\nfn main() {}\n```".to_string(),
+            format: bcode_session_view_models::TextFormat::Markdown,
+            streaming: false,
+            degraded: false,
+        };
+
+        let narrow = render_inline_session_item(&item, 24, Style::new());
+        let wide = render_inline_session_item(&item, 100, Style::new());
+        let narrow_text = narrow
+            .spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        let wide_text = wide
+            .spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(!narrow.spans.is_empty());
+        assert!(!wide.spans.is_empty());
+        assert!(display_width(&narrow_text) <= 24);
+        assert!(display_width(&wide_text) <= 100);
+    }
+
+    #[test]
+    fn linked_session_streaming_marker_is_explicit() {
+        let item = crate::code_review_tui::ReviewAgentSessionItem {
+            id: "assistant:live".to_string(),
+            revision: 4,
+            kind: crate::code_review_tui::ReviewAgentSessionItemKind::Assistant,
+            label: "answer · streaming".to_string(),
+            text: "incomplete **markdown".to_string(),
+            format: bcode_session_view_models::TextFormat::Markdown,
+            streaming: true,
+            degraded: false,
+        };
+
+        let rendered = render_inline_session_item(&item, 50, Style::new());
+        let rendered_text = rendered
+            .spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(rendered_text.contains('…'));
+        assert!(display_width(&rendered_text) <= 50);
+    }
 
     #[test]
     fn thread_sidebar_labels_keep_lifecycle_states_explicit() {

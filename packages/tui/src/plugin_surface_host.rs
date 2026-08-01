@@ -5,14 +5,17 @@ use std::io::Write;
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
 use bcode_plugin_sdk::tui::{
-    PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
-    PluginSessionEventSubscriptionRequest, PluginTask, PluginTuiAction, PluginTuiHost,
-    PluginTuiHostError, PluginTuiSurface, PluginWorkflowControlAction, PluginWorkflowControlFuture,
-    PluginWorkflowControlResult, PluginWorkflowInspection, PluginWorkflowInspectionFuture,
-    PluginWorkflowLookup, PluginWorkflowLookupFuture, PluginWorkflowStartFuture,
-    PluginWorkflowStartRequest, PluginWorkflowStartResponse, PluginWorkflowStatus,
-    PluginWorkflowSummary,
+    PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest, PluginSessionViewUpdate,
+    PluginTask, PluginTuiAction, PluginTuiHost, PluginTuiHostError, PluginTuiSurface,
+    PluginWorkflowControlAction, PluginWorkflowControlFuture, PluginWorkflowControlResult,
+    PluginWorkflowInspection, PluginWorkflowInspectionFuture, PluginWorkflowLookup,
+    PluginWorkflowLookupFuture, PluginWorkflowStartFuture, PluginWorkflowStartRequest,
+    PluginWorkflowStartResponse, PluginWorkflowStatus, PluginWorkflowSummary,
 };
+use bcode_session_models::SessionId;
+use bcode_session_view::SessionView;
+use bcode_session_view_models::PermissionView;
+use bcode_session_view_models::SessionConnectionViewStatus;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
@@ -21,8 +24,8 @@ use tokio::sync::mpsc;
 use super::terminal_events::TuiInput;
 use super::{TuiError, helpers};
 
-const DEFAULT_PLUGIN_SESSION_EVENT_BUFFER: usize = 256;
-const MAX_PLUGIN_SESSION_EVENT_BUFFER: usize = 4096;
+const DEFAULT_PLUGIN_SESSION_VIEW_BUFFER: usize = 32;
+const MAX_PLUGIN_SESSION_VIEW_BUFFER: usize = 256;
 
 /// Host services for plugin-owned TUI surfaces running inside Bcode's TUI.
 #[derive(Debug, Clone)]
@@ -175,21 +178,21 @@ impl PluginTuiHost for BcodePluginTuiHost {
         })
     }
 
-    fn subscribe_session_events(
+    fn subscribe_session_view(
         &self,
-        request: PluginSessionEventSubscriptionRequest,
-    ) -> Result<PluginSessionEventSubscription, PluginTuiHostError> {
+        request: PluginSessionViewSubscriptionRequest,
+    ) -> Result<PluginSessionViewSubscription, PluginTuiHostError> {
         let buffer = request
             .buffer
-            .clamp(1, MAX_PLUGIN_SESSION_EVENT_BUFFER)
-            .max(DEFAULT_PLUGIN_SESSION_EVENT_BUFFER.min(MAX_PLUGIN_SESSION_EVENT_BUFFER));
+            .clamp(1, MAX_PLUGIN_SESSION_VIEW_BUFFER)
+            .max(DEFAULT_PLUGIN_SESSION_VIEW_BUFFER.min(MAX_PLUGIN_SESSION_VIEW_BUFFER));
         let (sender, receiver) = mpsc::channel(buffer);
         let client = self.client.clone();
         let redraw_sender = self.redraw_sender.clone();
         drop(self.handle.spawn(async move {
-            stream_plugin_session_events(client, request, sender, redraw_sender).await;
+            stream_plugin_session_view(client, request, sender, redraw_sender).await;
         }));
-        Ok(PluginSessionEventSubscription { receiver })
+        Ok(PluginSessionViewSubscription { receiver })
     }
 }
 
@@ -287,18 +290,18 @@ fn workflow_inspection(
     })
 }
 
-async fn stream_plugin_session_events(
+async fn stream_plugin_session_view(
     client: BcodeClient,
-    request: PluginSessionEventSubscriptionRequest,
-    sender: mpsc::Sender<PluginSessionEvent>,
+    request: PluginSessionViewSubscriptionRequest,
+    sender: mpsc::Sender<PluginSessionViewUpdate>,
     redraw_sender: mpsc::UnboundedSender<()>,
 ) {
     if let Err(error) =
-        stream_plugin_session_events_inner(client, request, sender.clone(), redraw_sender.clone())
+        stream_plugin_session_view_inner(client, request, sender.clone(), redraw_sender.clone())
             .await
     {
         let _ = sender
-            .send(PluginSessionEvent::Disconnected {
+            .send(PluginSessionViewUpdate::Disconnected {
                 message: error.to_string(),
             })
             .await;
@@ -306,40 +309,96 @@ async fn stream_plugin_session_events(
     }
 }
 
-async fn attach_plugin_session(
+async fn attach_plugin_session_view(
+    client: &BcodeClient,
     connection: &mut bcode_client::ClientConnection,
-    session_id: bcode_session_models::SessionId,
-    replay: &PluginSessionEventReplay,
-) -> Result<bcode_client::AttachedSessionHistory, bcode_client::ClientError> {
-    match replay {
-        PluginSessionEventReplay::None => {
-            connection
-                .attach_session_recent_with_input_history(session_id, 0)
-                .await
-        }
-        PluginSessionEventReplay::Recent { limit } => {
-            connection
-                .attach_session_recent_with_input_history(session_id, *limit)
-                .await
-        }
-        PluginSessionEventReplay::ProjectionWindow { request } => {
-            connection
-                .attach_session_projection_window_with_input_history(session_id, request.clone())
-                .await
-        }
+    request: &PluginSessionViewSubscriptionRequest,
+) -> Result<SessionView, bcode_client::ClientError> {
+    let attached = connection
+        .attach_session_projection_window_with_input_history(
+            request.session_id,
+            request.projection.clone(),
+        )
+        .await?;
+    let runtime = attached.runtime_selection;
+    let mut view = SessionView::new();
+    view.set_session_summary(attached.session);
+    view.set_runtime_selection(
+        runtime.provider_plugin_id,
+        runtime.requested_model_id.or(runtime.model_id),
+        runtime.effective_model_id,
+        runtime.reasoning_effort,
+        runtime.reasoning_summary,
+        None,
+    );
+    view.set_agent_id(runtime.agent_id);
+    view.set_reasoning_presentation_policy(request.reasoning_policy);
+    if let Some(window) = attached.projection_window.as_ref() {
+        view.set_history_window_metadata(
+            window.source_range.map(|range| range.start_sequence),
+            window.source_range.map(|range| range.end_sequence),
+            window.has_older,
+            window.has_newer,
+        );
     }
+    view.apply_history(&attached.history);
+    let permissions = client_permission_views(
+        client.list_permissions().await.unwrap_or_default(),
+        request.session_id,
+    );
+    view.set_pending_permissions(permissions);
+    if let Ok(runtime_work) = client.list_runtime_work(request.session_id).await {
+        view.set_runtime_work_snapshots(&runtime_work);
+    }
+    if let Ok(interactions) =
+        super::effects::load_pending_interactions(client, request.session_id).await
+    {
+        view.set_pending_interactions(interactions);
+    }
+    view.set_connection_status(SessionConnectionViewStatus::Attached);
+    Ok(view)
 }
 
-async fn send_plugin_attachment(
-    sender: &mpsc::Sender<PluginSessionEvent>,
+fn client_permission_views(
+    permissions: Vec<bcode_ipc::PermissionSummary>,
+    session_id: SessionId,
+) -> Vec<PermissionView> {
+    permissions
+        .into_iter()
+        .filter(|permission| permission.session_id == session_id)
+        .map(|permission| PermissionView {
+            permission_id: permission.permission_id,
+            session_id: Some(permission.session_id),
+            tool_call_id: permission.tool_call_id,
+            tool_name: permission.tool_name,
+            arguments_json: permission.arguments_json,
+            batch: permission
+                .batch
+                .map(|batch| bcode_session_view_models::PermissionBatchView {
+                    batch_id: batch.batch_id,
+                    call_index: batch.call_index,
+                    call_count: batch.call_count,
+                }),
+            agent_id: permission.agent_id,
+            title: Some("Permission requested".to_string()),
+            policy_source: permission.policy_source,
+            detail: permission.policy_reason,
+            resolved: false,
+            approved: None,
+            can_remember: permission.can_remember_policy,
+        })
+        .collect()
+}
+
+async fn send_plugin_session_snapshot(
+    sender: &mpsc::Sender<PluginSessionViewUpdate>,
     redraw_sender: &mpsc::UnboundedSender<()>,
-    attached: bcode_client::AttachedSessionHistory,
+    view: &SessionView,
 ) -> bool {
     if sender
-        .send(PluginSessionEvent::Attached {
-            session: attached.session,
-            history: attached.history,
-        })
+        .send(PluginSessionViewUpdate::Snapshot(Box::new(
+            view.snapshot().clone(),
+        )))
         .await
         .is_err()
     {
@@ -349,16 +408,16 @@ async fn send_plugin_attachment(
     true
 }
 
-async fn stream_plugin_session_events_inner(
+async fn stream_plugin_session_view_inner(
     client: BcodeClient,
-    request: PluginSessionEventSubscriptionRequest,
-    sender: mpsc::Sender<PluginSessionEvent>,
+    request: PluginSessionViewSubscriptionRequest,
+    sender: mpsc::Sender<PluginSessionViewUpdate>,
     redraw_sender: mpsc::UnboundedSender<()>,
 ) -> Result<(), bcode_client::ClientError> {
     let session_id = request.session_id;
-    let mut connection = client.connect("bcode-plugin-tui-session-events").await?;
-    let attached = attach_plugin_session(&mut connection, session_id, &request.replay).await?;
-    if !send_plugin_attachment(&sender, &redraw_sender, attached).await {
+    let mut connection = client.connect("bcode-plugin-tui-session-view").await?;
+    let mut view = attach_plugin_session_view(&client, &mut connection, &request).await?;
+    if !send_plugin_session_snapshot(&sender, &redraw_sender, &view).await {
         return Ok(());
     }
 
@@ -369,24 +428,25 @@ async fn stream_plugin_session_events_inner(
                 session_id: required,
             }) if required == session_id => true,
             Ok(event) => {
-                let plugin_event = match event {
-                    BcodeEvent::Session(event) if event.session_id == session_id => {
-                        Some(PluginSessionEvent::Session(event))
+                let changed = match event {
+                    BcodeEvent::Session(event) | BcodeEvent::RuntimeWork(event)
+                        if event.session_id == session_id =>
+                    {
+                        view.apply_event(&event);
+                        true
                     }
                     BcodeEvent::SessionLive(event) if event.session_id == session_id => {
-                        Some(PluginSessionEvent::SessionLive(event))
+                        view.apply_live_event(&event);
+                        true
                     }
                     BcodeEvent::Session(_)
                     | BcodeEvent::SessionLive(_)
                     | BcodeEvent::RuntimeWork(_)
                     | BcodeEvent::SessionViewResyncRequired { .. }
-                    | BcodeEvent::SessionCatalogUpdated { .. } => None,
+                    | BcodeEvent::SessionCatalogUpdated { .. } => false,
                 };
-                if let Some(plugin_event) = plugin_event {
-                    if sender.send(plugin_event).await.is_err() {
-                        return Ok(());
-                    }
-                    let _ = redraw_sender.send(());
+                if changed && !send_plugin_session_snapshot(&sender, &redraw_sender, &view).await {
+                    return Ok(());
                 }
                 false
             }
@@ -396,16 +456,21 @@ async fn stream_plugin_session_events_inner(
             continue;
         }
 
+        view.set_connection_status(SessionConnectionViewStatus::Reconnecting);
+        if !send_plugin_session_snapshot(&sender, &redraw_sender, &view).await {
+            return Ok(());
+        }
         drop(connection);
         loop {
             if sender.is_closed() {
                 return Ok(());
             }
-            if let Ok(mut next_connection) = client.connect("bcode-plugin-tui-session-events").await
-                && let Ok(attached) =
-                    attach_plugin_session(&mut next_connection, session_id, &request.replay).await
+            if let Ok(mut next_connection) = client.connect("bcode-plugin-tui-session-view").await
+                && let Ok(next_view) =
+                    attach_plugin_session_view(&client, &mut next_connection, &request).await
             {
-                if !send_plugin_attachment(&sender, &redraw_sender, attached).await {
+                view = next_view;
+                if !send_plugin_session_snapshot(&sender, &redraw_sender, &view).await {
                     return Ok(());
                 }
                 connection = next_connection;
@@ -450,6 +515,15 @@ pub async fn run_plugin_surface_with_input<W: Write>(
     run_plugin_surface_with_input_and_client(terminal, input, surface, client).await
 }
 
+/// Terminal outcome from running a plugin-owned surface until it closes or requests navigation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginSurfaceRunOutcome {
+    /// Surface closed normally.
+    Closed(Option<serde_json::Value>),
+    /// Surface requested temporary navigation to the ordinary native session viewer.
+    OpenSession(SessionId),
+}
+
 /// Run one plugin-owned native TUI surface with an explicit Bcode client.
 ///
 /// # Errors
@@ -462,6 +536,33 @@ pub async fn run_plugin_surface_with_input_and_client<W: Write>(
     surface: &mut dyn PluginTuiSurface,
     client: BcodeClient,
 ) -> Result<Option<serde_json::Value>, TuiError> {
+    match run_plugin_surface_until_navigation_with_input_and_client(
+        terminal, input, surface, client,
+    )
+    .await?
+    {
+        PluginSurfaceRunOutcome::Closed(outcome) => Ok(outcome),
+        PluginSurfaceRunOutcome::OpenSession(session_id) => {
+            Ok(Some(serde_json::json!({ "open_session": session_id })))
+        }
+    }
+}
+
+/// Run a plugin-owned surface until it closes or requests temporary native-session navigation.
+///
+/// The caller retains the surface and input stream across `OpenSession`, allowing it to run the
+/// ordinary session viewer and then invoke this function again to resume exact surface state.
+///
+/// # Errors
+///
+/// Returns an error when terminal I/O or terminal input fails.
+#[allow(clippy::future_not_send)]
+pub async fn run_plugin_surface_until_navigation_with_input_and_client<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    input: &mut TuiInput,
+    surface: &mut dyn PluginTuiSurface,
+    client: BcodeClient,
+) -> Result<PluginSurfaceRunOutcome, TuiError> {
     let (redraw_sender, mut redraw_receiver) = mpsc::unbounded_channel();
     let host = BcodePluginTuiHost::current(redraw_sender, client);
     let mut needs_redraw = true;
@@ -472,21 +573,27 @@ pub async fn run_plugin_surface_with_input_and_client<W: Write>(
         if !cfg!(test) && helpers::resize_from_terminal(terminal)? {
             needs_redraw = true;
         }
-        apply_plugin_surface_action(
+        let action = apply_plugin_surface_action(
             surface.poll(&host),
             &mut needs_redraw,
             &mut close_outcome,
             &mut should_exit,
         );
+        if let PluginSurfaceHostAction::OpenSession(session_id) = action {
+            return Ok(PluginSurfaceRunOutcome::OpenSession(session_id));
+        }
         if should_exit {
             continue;
         }
-        apply_plugin_surface_action(
+        let action = apply_plugin_surface_action(
             surface.drain_effects(&host).await,
             &mut needs_redraw,
             &mut close_outcome,
             &mut should_exit,
         );
+        if let PluginSurfaceHostAction::OpenSession(session_id) = action {
+            return Ok(PluginSurfaceRunOutcome::OpenSession(session_id));
+        }
         if should_exit {
             continue;
         }
@@ -506,12 +613,15 @@ pub async fn run_plugin_surface_with_input_and_client<W: Write>(
                 if handle_host_event(terminal, &event) {
                     needs_redraw = true;
                 }
-                apply_plugin_surface_action(
+                let action = apply_plugin_surface_action(
                     surface.handle_event(&event, &host),
                     &mut needs_redraw,
                     &mut close_outcome,
                     &mut should_exit,
                 );
+                if let PluginSurfaceHostAction::OpenSession(session_id) = action {
+                    return Ok(PluginSurfaceRunOutcome::OpenSession(session_id));
+                }
             }
             redraw = redraw_receiver.recv() => {
                 if redraw.is_some() {
@@ -521,7 +631,14 @@ pub async fn run_plugin_surface_with_input_and_client<W: Write>(
         }
     }
 
-    Ok(close_outcome)
+    Ok(PluginSurfaceRunOutcome::Closed(close_outcome))
+}
+
+/// Host request produced by a plugin surface action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PluginSurfaceHostAction {
+    None,
+    OpenSession(SessionId),
 }
 
 fn apply_plugin_surface_action(
@@ -529,17 +646,25 @@ fn apply_plugin_surface_action(
     needs_redraw: &mut bool,
     close_outcome: &mut Option<serde_json::Value>,
     should_exit: &mut bool,
-) {
+) -> PluginSurfaceHostAction {
     match action {
-        PluginTuiAction::None => {}
-        PluginTuiAction::Redraw | PluginTuiAction::OpenSurface { .. } => *needs_redraw = true,
+        PluginTuiAction::None => PluginSurfaceHostAction::None,
+        PluginTuiAction::Redraw | PluginTuiAction::OpenSurface { .. } => {
+            *needs_redraw = true;
+            PluginSurfaceHostAction::None
+        }
+        PluginTuiAction::OpenSession { session_id } => {
+            PluginSurfaceHostAction::OpenSession(session_id)
+        }
         PluginTuiAction::Close { outcome } => {
             *close_outcome = outcome;
             *should_exit = true;
+            PluginSurfaceHostAction::None
         }
         PluginTuiAction::RunCommand { command } => {
             *close_outcome = Some(serde_json::json!({ "run_command": command }));
             *should_exit = true;
+            PluginSurfaceHostAction::None
         }
     }
 }
@@ -557,7 +682,7 @@ fn handle_host_event<W: Write>(terminal: &mut Terminal<&mut W>, event: &Event) -
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_plugin_surface_action, workflow_start_request};
+    use super::{PluginSurfaceHostAction, apply_plugin_surface_action, workflow_start_request};
     use bcode_plugin_sdk::tui::{
         PluginTuiAction, PluginWorkflowBinding, PluginWorkflowStartRequest,
     };
@@ -737,6 +862,47 @@ mod tests {
         );
         assert!(should_exit);
         assert_eq!(outcome, Some(expected));
+    }
+
+    #[test]
+    fn repeated_open_session_actions_do_not_close_surface_host() {
+        let first = bcode_session_models::SessionId::new();
+        let second = bcode_session_models::SessionId::new();
+        let mut needs_redraw = false;
+        let mut outcome = None;
+        let mut should_exit = false;
+        for session_id in [first, second] {
+            assert_eq!(
+                apply_plugin_surface_action(
+                    PluginTuiAction::OpenSession { session_id },
+                    &mut needs_redraw,
+                    &mut outcome,
+                    &mut should_exit,
+                ),
+                PluginSurfaceHostAction::OpenSession(session_id)
+            );
+            assert!(!should_exit);
+            assert!(outcome.is_none());
+        }
+    }
+
+    #[test]
+    fn open_session_suspends_surface_without_closing_it() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut needs_redraw = false;
+        let mut outcome = None;
+        let mut should_exit = false;
+
+        let action = apply_plugin_surface_action(
+            PluginTuiAction::OpenSession { session_id },
+            &mut needs_redraw,
+            &mut outcome,
+            &mut should_exit,
+        );
+
+        assert_eq!(action, PluginSurfaceHostAction::OpenSession(session_id));
+        assert!(!should_exit);
+        assert!(outcome.is_none());
     }
 
     #[test]

@@ -2513,8 +2513,8 @@ macro_rules! static_concurrent_plugin_vtable {
 pub mod prelude {
     #[cfg(feature = "tui")]
     pub use crate::tui::{
-        PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
-        PluginSessionEventSubscriptionRequest, PluginTuiAction, PluginTuiHost, PluginTuiHostError,
+        PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest,
+        PluginSessionViewUpdate, PluginTuiAction, PluginTuiHost, PluginTuiHostError,
         PluginTuiRegistry, PluginTuiSurface, PluginTuiSurfaceFactory, PluginTuiSurfaceOpenRequest,
         TokioPluginTuiHost,
     };

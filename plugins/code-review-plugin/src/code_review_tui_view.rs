@@ -319,11 +319,13 @@ impl ReviewViewDocument {
                 let has_stream_error = agent_states
                     .get(&thread_key)
                     .is_some_and(|state| state.error.is_some());
+                let has_ai_exchange = agent_states.contains_key(&thread_key);
                 for action in ReviewThreadAction::all_for_state(
                     resolved,
                     has_agent_answer,
                     has_linked_session,
                     has_stream_error,
+                    has_ai_exchange,
                     has_pending_suggestion,
                 ) {
                     rows.push(ReviewViewRow {
@@ -551,13 +553,19 @@ fn agent_thread_visible_line_count(state: &ReviewAgentThreadState, expanded: boo
     let warning_count = usize::from(state.stream_warning.is_some());
     let activity_count = usize::from(state.activity.is_some());
     let context_count = usize::from(!state.context_summary.is_empty());
+    let session_item_count = if expanded {
+        state.session_items.len().min(24)
+    } else {
+        state.session_items.len().min(6)
+    };
     if state.answer.trim().is_empty() {
-        1 + context_count + warning_count + activity_count
+        1 + context_count + warning_count + activity_count + session_item_count
     } else {
         let answer_lines = state.answer.lines().count();
         1 + context_count
             + warning_count
             + activity_count
+            + session_item_count
             + if expanded {
                 answer_lines.max(1)
             } else {
@@ -575,6 +583,8 @@ pub enum ReviewThreadAction {
     Edit,
     /// Delete a draft comment in the thread.
     Delete,
+    /// Delete the latest durable AI exchange in the thread.
+    DeleteExchange,
     /// Ask Bcode about this thread.
     AskBcode,
     /// Ask a follow-up in the linked Bcode session.
@@ -614,9 +624,13 @@ impl ReviewThreadAction {
         has_agent_answer: bool,
         has_linked_session: bool,
         has_stream_error: bool,
+        has_ai_exchange: bool,
         has_pending_suggestion: bool,
     ) -> Vec<Self> {
         let mut actions = vec![Self::Reply, Self::Edit, Self::Delete];
+        if has_ai_exchange {
+            actions.push(Self::DeleteExchange);
+        }
         if has_linked_session {
             actions.push(Self::FollowUp);
             actions.push(Self::OpenSession);
@@ -653,6 +667,7 @@ impl ReviewThreadAction {
             Self::Reply => "reply",
             Self::Edit => "edit",
             Self::Delete => "delete",
+            Self::DeleteExchange => "delete-exchange",
             Self::AskBcode => "ask",
             Self::FollowUp => "follow-up",
             Self::OpenSession => "open-session",
@@ -677,6 +692,7 @@ impl ReviewThreadAction {
             Self::Reply => "c",
             Self::Edit => "e",
             Self::Delete => "D",
+            Self::DeleteExchange => "d",
             Self::AskBcode | Self::FollowUp => "a",
             Self::OpenSession => "o",
             Self::RetrySession => "y",
@@ -698,7 +714,8 @@ impl ReviewThreadAction {
         match self {
             Self::Reply => "reply",
             Self::Edit => "edit",
-            Self::Delete => "delete",
+            Self::Delete => "delete draft",
+            Self::DeleteExchange => "delete AI exchange",
             Self::AskBcode => "ask Bcode",
             Self::FollowUp => "ask follow-up",
             Self::OpenSession => "open session",
@@ -723,6 +740,7 @@ impl ReviewThreadAction {
             b"reply" => Some(Self::Reply),
             b"edit" => Some(Self::Edit),
             b"delete" => Some(Self::Delete),
+            b"delete-exchange" => Some(Self::DeleteExchange),
             b"ask" => Some(Self::AskBcode),
             b"follow-up" => Some(Self::FollowUp),
             b"open-session" => Some(Self::OpenSession),

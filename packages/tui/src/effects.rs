@@ -1863,7 +1863,7 @@ const fn interaction_adapter_for_exchange(
     None
 }
 
-async fn load_pending_interactions(
+pub async fn load_pending_interactions(
     client: &BcodeClient,
     session_id: SessionId,
 ) -> Result<Vec<bcode_session_view_models::InteractionViewSummary>, ClientError> {

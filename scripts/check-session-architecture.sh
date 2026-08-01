@@ -1123,4 +1123,22 @@ if rg -q 'Option<CompactionPlan>' packages/server/src/context_compaction.rs; the
   violations=1
 fi
 
+if rg -n 'PluginSessionEvent|subscribe_session_events' \
+  packages/plugin-sdk/src packages/tui/src/plugin_surface_host.rs plugins/code-review-plugin/src \
+  --glob '*.rs' >/tmp/bcode-plugin-raw-session-events.txt; then
+  echo "Session view architecture violation: plugin surfaces must consume complete semantic SessionView snapshots, not raw session events." >&2
+  cat /tmp/bcode-plugin-raw-session-events.txt >&2
+  violations=1
+fi
+
+if ! rg -q 'subscribe_session_view' packages/plugin-sdk/src/tui.rs \
+  || ! rg -q 'SessionViewSnapshot' packages/plugin-sdk/src/tui.rs \
+  || ! rg -q 'PluginTuiAction::OpenSession' packages/tui/src/plugin_surface_host.rs \
+  || ! rg -q 'run_event_loop_with_input' packages/tui/src/code_review_launcher.rs packages/tui/src/runtime.rs \
+  || ! rg -q 'SessionView::new\(\)' packages/tui/src/plugin_surface_host.rs \
+  || ! rg -q 'PluginSessionViewUpdate::Snapshot' plugins/code-review-plugin/src/code_review_tui.rs; then
+  echo "Session view architecture violation: generic plugin observation must be projected by SessionView and delivered as complete semantic snapshots." >&2
+  violations=1
+fi
+
 exit "$violations"

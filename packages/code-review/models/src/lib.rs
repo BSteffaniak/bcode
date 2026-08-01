@@ -45,6 +45,14 @@ pub const OP_REVIEW_REPO_FILE_GET: &str = "review.repo.file.get";
 pub const OP_REVIEW_SUGGESTIONS_LIST: &str = "review.suggestions.list";
 /// Operation that creates or updates a durable AI-suggested review comment.
 pub const OP_REVIEW_SUGGESTION_SAVE: &str = "review.suggestion.save";
+/// Operation that lists durable, non-publishable review AI exchanges.
+pub const OP_REVIEW_AI_EXCHANGES_LIST: &str = "review.ai_exchanges.list";
+/// Operation that creates or updates a durable, non-publishable review AI exchange.
+pub const OP_REVIEW_AI_EXCHANGE_SAVE: &str = "review.ai_exchange.save";
+/// Operation that explicitly deletes a durable review AI exchange.
+pub const OP_REVIEW_AI_EXCHANGE_DELETE: &str = "review.ai_exchange.delete";
+/// Current persisted schema version for review AI exchanges.
+pub const REVIEW_AI_EXCHANGE_SCHEMA_VERSION: u16 = 1;
 /// Operation that saves a provider-neutral external review import snapshot.
 pub const OP_REVIEW_EXTERNAL_IMPORT_SAVE: &str = "review.external_import.save";
 /// Operation that lists saved external review import snapshots.
@@ -96,6 +104,45 @@ pub enum ReviewTarget {
     Repository,
 }
 
+pub const REVIEW_WORKSPACE_PRESENTATION_SCHEMA_VERSION: u16 = 1;
+
+/// Durable Code Review-owned semantic presentation state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewWorkspacePresentationState {
+    /// Presentation schema version.
+    pub schema_version: u16,
+    /// Stable selected source or file path, when known.
+    #[serde(default)]
+    pub selected_path: Option<String>,
+    /// Stable selected thread identity, when known.
+    #[serde(default)]
+    pub selected_thread_key: Option<String>,
+    /// Semantic selected line within the source, when known.
+    #[serde(default)]
+    pub selected_line: Option<u32>,
+    /// Plugin-owned sidebar mode identifier.
+    #[serde(default)]
+    pub sidebar_mode: String,
+    /// Whether the sidebar is visible.
+    #[serde(default = "default_true")]
+    pub sidebar_visible: bool,
+    /// Plugin-owned thread filter identifier.
+    #[serde(default)]
+    pub thread_filter: String,
+    /// Whether resolved threads are shown.
+    #[serde(default = "default_true")]
+    pub show_resolved_threads: bool,
+    /// Whether viewed files are hidden.
+    #[serde(default)]
+    pub hide_viewed_files: bool,
+    /// Stable collapsed thread identities.
+    #[serde(default)]
+    pub collapsed_thread_keys: BTreeSet<String>,
+    /// Stable expanded linked-session answer identities.
+    #[serde(default)]
+    pub expanded_agent_answer_keys: BTreeSet<String>,
+}
+
 /// Durable review workspace assembled from one or more review sources.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewWorkspace {
@@ -119,6 +166,9 @@ pub struct ReviewWorkspace {
     /// Archived timestamp in milliseconds since Unix epoch, when archived.
     #[serde(default)]
     pub archived_at_ms: Option<u64>,
+    /// Stable semantic presentation state for useful workspace reopen.
+    #[serde(default)]
+    pub presentation_state: Option<ReviewWorkspacePresentationState>,
 }
 
 impl ReviewWorkspace {
@@ -141,6 +191,7 @@ impl ReviewWorkspace {
             updated_at_ms: None,
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
+            presentation_state: None,
         }
     }
 }
@@ -641,6 +692,104 @@ pub struct GetReviewThreadRequest {
     pub thread_id: Option<String>,
     /// Thread anchor to fetch, if thread id is not known.
     pub anchor: Option<DraftAnchor>,
+}
+
+/// Request payload for `review.ai_exchanges.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListReviewAiExchangesRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped exchanges.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+}
+
+/// Request payload for `review.ai_exchange.delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteReviewAiExchangeRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped exchanges.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+    /// Stable exchange identity to delete.
+    pub exchange_id: String,
+}
+
+/// Response payload for `review.ai_exchange.delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteReviewAiExchangeResponse {
+    /// Whether a persisted exchange was deleted.
+    pub deleted: bool,
+}
+
+/// Request payload for `review.ai_exchange.save`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewAiExchangeRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped exchanges.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+    /// Exchange to create or update.
+    pub exchange: ReviewAiExchange,
+}
+
+/// Response payload for `review.ai_exchanges.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListReviewAiExchangesResponse {
+    /// Persisted, non-publishable AI exchanges.
+    pub exchanges: Vec<ReviewAiExchange>,
+}
+
+/// Response payload for `review.ai_exchange.save`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewAiExchangeResponse {
+    /// Persisted exchange.
+    pub exchange: ReviewAiExchange,
+}
+
+/// Durable lifecycle for one reviewer-authored AI exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAiExchangeStatus {
+    /// The question is durable but no linked session has been established yet.
+    Pending,
+    /// The exchange is linked to a Bcode session.
+    Linked,
+    /// The latest attempt to establish or continue the linked session failed.
+    Failed,
+}
+
+/// Provider-neutral durable metadata for a non-publishable review AI exchange.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAiExchange {
+    /// Persisted schema version.
+    pub schema_version: u16,
+    /// Stable exchange identity.
+    pub exchange_id: String,
+    /// Review anchor that owns the exchange.
+    pub anchor: DraftAnchor,
+    /// Reviewer-authored question shown in the review conversation.
+    pub question: String,
+    /// Linked Bcode session id, when established.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Durable exchange lifecycle.
+    pub status: ReviewAiExchangeStatus,
+    /// Normalized failure message for the latest failed attempt.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Creation timestamp in milliseconds since Unix epoch.
+    pub created_at_ms: u64,
+    /// Last update timestamp in milliseconds since Unix epoch.
+    pub updated_at_ms: u64,
 }
 
 /// Request payload for `review.suggestions.list`.
@@ -1476,6 +1625,47 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize import response");
 
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn review_ai_exchange_models_round_trip_json() {
+        let exchange = ReviewAiExchange {
+            schema_version: REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
+            exchange_id: "exchange-1".to_string(),
+            anchor: DraftAnchor {
+                kind: ReviewAnchorKind::Range,
+                file_path: "src/lib.rs".to_string(),
+                diff_row: 3,
+                start_diff_row: Some(3),
+                end_diff_row: Some(4),
+                old_start: Some(2),
+                old_end: Some(2),
+                new_start: Some(3),
+                new_end: Some(4),
+                old_line: None,
+                new_line: None,
+                line_kind: ReviewLineKind::Added,
+                is_file_anchor: false,
+                surface_id: Some("surface-1".to_string()),
+                source_id: Some("source-1".to_string()),
+            },
+            question: "Why is this safe?".to_string(),
+            session_id: Some("session-1".to_string()),
+            status: ReviewAiExchangeStatus::Linked,
+            error: None,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        };
+
+        let json = serde_json::to_string(&exchange).expect("serialize exchange");
+        let round_trip: ReviewAiExchange =
+            serde_json::from_str(&json).expect("deserialize exchange");
+
+        assert_eq!(round_trip, exchange);
+        assert_eq!(
+            serde_json::to_value(ReviewAiExchangeStatus::Failed).expect("status json"),
+            serde_json::json!("failed")
+        );
     }
 
     #[test]

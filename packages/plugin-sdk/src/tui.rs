@@ -9,9 +9,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use crate::interaction::{InteractionInput, InteractionOutput, PluginInteraction};
-use bcode_session_models::{
-    ProjectionWindowRequest, SessionEvent, SessionId, SessionLiveEvent, SessionSummary,
-};
+use bcode_session_models::{ProjectionWindowRequest, SessionId};
+use bcode_session_view_models::{ReasoningPresentationPolicy, SessionViewSnapshot};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
@@ -238,63 +237,37 @@ pub struct PluginWorkflowStartResponse {
     pub runtime_work_id: String,
 }
 
-/// Session history replay requested when subscribing to session events.
+/// Request to observe renderer-neutral semantic state for one explicit Bcode session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PluginSessionEventReplay {
-    /// Do not replay persisted history before streaming live events.
-    None,
-    /// Replay a bounded number of recent session events before streaming live events.
-    Recent { limit: usize },
-    /// Replay a projection-sized history window before streaming live events.
-    ProjectionWindow { request: ProjectionWindowRequest },
-}
-
-/// Request to subscribe to events for one explicit Bcode session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginSessionEventSubscriptionRequest {
+pub struct PluginSessionViewSubscriptionRequest {
     /// Session to observe.
     pub session_id: SessionId,
-    /// Optional persisted history replay to send before live events.
-    pub replay: PluginSessionEventReplay,
-    /// Requested event channel buffer size. Hosts may clamp this value.
+    /// Bounded projection window used for initial attachment and authoritative resynchronization.
+    pub projection: ProjectionWindowRequest,
+    /// Renderer-local reasoning presentation policy. This never changes provider requests or
+    /// durable session history.
+    pub reasoning_policy: ReasoningPresentationPolicy,
+    /// Requested snapshot channel buffer size. Hosts may clamp this value.
     pub buffer: usize,
 }
 
-/// Session events delivered to plugin-owned TUI surfaces.
+/// Semantic session-view updates delivered to plugin-owned TUI surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
-pub enum PluginSessionEvent {
-    /// The session was attached and optional persisted history is available.
-    ///
-    /// Hosts may emit this again after event continuity is lost. Consumers must replace their
-    /// replayed bounded view with the newer attachment before applying subsequent events.
-    Attached {
-        /// Attached session summary.
-        session: SessionSummary,
-        /// Replayed persisted history, according to the subscription request.
-        history: Vec<SessionEvent>,
-    },
-    /// Durable session event.
-    Session(SessionEvent),
-    /// Ephemeral live session event.
-    SessionLive(SessionLiveEvent),
-    /// Events were dropped because the subscriber could not keep up.
-    Lagged {
-        /// Number of events dropped since the previous lag notification.
-        dropped_count: u64,
-    },
-    /// The subscription stopped because the host disconnected or failed.
+pub enum PluginSessionViewUpdate {
+    /// Complete authoritative state. Consumers replace prior state by session id.
+    Snapshot(Box<SessionViewSnapshot>),
+    /// The observer stopped because attachment or daemon connectivity failed.
     Disconnected {
         /// Human-readable failure message.
         message: String,
     },
 }
 
-/// Active subscription to session events.
+/// Active subscription to renderer-neutral semantic session state.
 #[derive(Debug)]
-pub struct PluginSessionEventSubscription {
-    /// Receiver for generic session events.
-    pub receiver: mpsc::Receiver<PluginSessionEvent>,
+pub struct PluginSessionViewSubscription {
+    /// Receiver for complete authoritative snapshots and terminal observer failures.
+    pub receiver: mpsc::Receiver<PluginSessionViewUpdate>,
 }
 
 /// Host services available to native TUI plugin surfaces.
@@ -369,18 +342,22 @@ pub trait PluginTuiHost: Send + Sync {
         })
     }
 
-    /// Subscribe to events for one explicit Bcode session.
+    /// Observe renderer-neutral semantic state for one explicit Bcode session.
+    ///
+    /// The host owns bounded attachment, event projection, reconnect, and resynchronization. Every
+    /// update is a complete `SessionViewSnapshot`, so consumers replace prior state instead of
+    /// interpreting raw durable or live events.
     ///
     /// # Errors
     ///
-    /// Returns an error when the host does not support session subscriptions, permission is
+    /// Returns an error when the host does not support semantic session observation, permission is
     /// denied, or the request is invalid.
-    fn subscribe_session_events(
+    fn subscribe_session_view(
         &self,
-        _request: PluginSessionEventSubscriptionRequest,
-    ) -> Result<PluginSessionEventSubscription, PluginTuiHostError> {
+        _request: PluginSessionViewSubscriptionRequest,
+    ) -> Result<PluginSessionViewSubscription, PluginTuiHostError> {
         Err(PluginTuiHostError::Unsupported(
-            "session event subscriptions are not available from this host".to_string(),
+            "semantic session observation is not available from this host".to_string(),
         ))
     }
 }
@@ -438,6 +415,8 @@ pub enum PluginTuiAction {
     Redraw,
     /// Close the current surface.
     Close { outcome: Option<serde_json::Value> },
+    /// Open an ordinary Bcode session and resume this surface when the native viewer returns.
+    OpenSession { session_id: SessionId },
     /// Open another registered surface.
     OpenSurface { surface_id: String },
     /// Run a host command.
@@ -448,7 +427,7 @@ impl PluginTuiAction {
     /// Return whether this action requests a redraw.
     #[must_use]
     pub const fn requests_redraw(&self) -> bool {
-        matches!(self, Self::Redraw)
+        matches!(self, Self::Redraw | Self::OpenSession { .. })
     }
 }
 
@@ -645,6 +624,10 @@ pub trait PluginTuiSurface: Send {
 
     /// Handle routed terminal input.
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction;
+
+    /// Notify a retained surface that native-session navigation finished or failed.
+    fn session_navigation_finished(&mut self, _session_id: SessionId, _result: Result<(), String>) {
+    }
 
     /// Poll internal async completions without blocking.
     fn poll(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {

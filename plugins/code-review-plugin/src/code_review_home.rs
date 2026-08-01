@@ -29,6 +29,7 @@ use crate::tui_host_types::{TuiError, helpers};
 
 /// Review home outcome.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ReviewHomeOutcome {
     /// Open an existing or newly created review target.
     OpenWorkspace {
@@ -2243,6 +2244,7 @@ mod tests {
             updated_at_ms: Some(2),
             viewed_files: std::collections::BTreeSet::new(),
             archived_at_ms: archived.then_some(3),
+            presentation_state: None,
         }
     }
 

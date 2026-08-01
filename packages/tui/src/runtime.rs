@@ -61,10 +61,46 @@ pub async fn run_event_loop_with_startup<W: Write>(
     .await
 }
 
+/// Attach to a session and run the native viewer using a caller-owned input stream.
+#[allow(clippy::future_not_send)]
+pub async fn run_event_loop_with_input<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TuiInput,
+    session_id: SessionId,
+) -> Result<(), TuiError> {
+    Box::pin(run_event_loop_with_input_and_static_bundled(
+        terminal,
+        terminal_events,
+        Some(session_id),
+        StartupTuiAction::None,
+        &super::static_bundled_plugins(),
+    ))
+    .await
+}
+
 /// Attach to a session, run an optional startup action, and run the active chat loop with caller-provided static bundled plugins.
 #[allow(clippy::future_not_send)]
 pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    session_id: Option<SessionId>,
+    startup_action: StartupTuiAction,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<(), TuiError> {
+    let mut terminal_events = TuiInput::start();
+    Box::pin(run_event_loop_with_input_and_static_bundled(
+        terminal,
+        &mut terminal_events,
+        session_id,
+        startup_action,
+        static_plugins,
+    ))
+    .await
+}
+
+#[allow(clippy::future_not_send)]
+async fn run_event_loop_with_input_and_static_bundled<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TuiInput,
     session_id: Option<SessionId>,
     startup_action: StartupTuiAction,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
@@ -81,7 +117,6 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
         )
         .with_interaction_adapters(super::bundled_interaction_adapters("tui"));
     let daemon_host = super::daemon_host::TuiDaemonHost::new(static_plugins);
-    let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
     match super::plugin_tui::load_default_presentation_with_static_bundled(static_plugins) {
@@ -133,7 +168,7 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     let result = {
         Box::pin(chat_loop::run_with_client(
             terminal,
-            &mut terminal_events,
+            terminal_events,
             &client,
             &mut settings,
             &mut chat,

@@ -12,6 +12,7 @@ use crate::TuiError;
 
 /// Review home outcome returned by the code review home plugin surface.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ReviewHomeOutcome {
     /// Open an existing or newly created review target.
     OpenWorkspace {
@@ -122,12 +123,15 @@ async fn run_with_workspace<W: Write>(
         code: "tui_surface_open_failed".to_string(),
         message: error.to_string(),
     })?;
-    let close_outcome =
-        crate::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
-    let session_to_open = close_outcome
-        .and_then(|outcome| outcome.get("open_session").cloned())
-        .and_then(|value| serde_json::from_value(value).ok());
-    Ok(session_to_open)
+    let mut input = crate::terminal_events::TuiInput::start();
+    let _close_outcome = run_with_retained_surface(
+        terminal,
+        &mut input,
+        surface.as_mut(),
+        bcode_client::BcodeClient::default_endpoint(),
+    )
+    .await?;
+    Ok(None)
 }
 
 fn load_code_review_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {
@@ -139,6 +143,38 @@ fn load_code_review_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, Tui
         code: "plugin_runtime_load_failed".to_string(),
         message: error.to_string(),
     })
+}
+
+#[allow(clippy::future_not_send)]
+pub(crate) async fn run_with_retained_surface<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    input: &mut crate::terminal_events::TuiInput,
+    surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
+    client: bcode_client::BcodeClient,
+) -> Result<Option<serde_json::Value>, TuiError> {
+    loop {
+        match crate::plugin_surface_host::run_plugin_surface_until_navigation_with_input_and_client(
+            terminal,
+            input,
+            surface,
+            client.clone(),
+        )
+        .await?
+        {
+            crate::plugin_surface_host::PluginSurfaceRunOutcome::Closed(outcome) => {
+                return Ok(outcome);
+            }
+            crate::plugin_surface_host::PluginSurfaceRunOutcome::OpenSession(session_id) => {
+                let result = crate::runtime::run_event_loop_with_input(terminal, input, session_id)
+                    .await
+                    .map_err(|error| error.to_string());
+                surface.session_navigation_finished(session_id, result.clone());
+                if let Err(message) = result {
+                    tracing::warn!(%session_id, %message, "linked session navigation failed");
+                }
+            }
+        }
+    }
 }
 
 fn parse_review_home_outcome(outcome: Option<serde_json::Value>) -> ReviewHomeOutcome {
