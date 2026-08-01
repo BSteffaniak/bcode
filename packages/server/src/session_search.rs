@@ -1539,7 +1539,7 @@ pub async fn search_federated_with_policy_and_routes(
     let deadline = Duration::from_millis(request.deadline_ms.unwrap_or(5_000).max(1));
     let started = Instant::now();
     let calls = providers.into_iter().map(|provider| {
-        let provider_request = request_for_provider(request, &provider);
+        let provider_request = request_for_provider(request, &provider, policy);
         async move {
             let provider_started = Instant::now();
             let remaining = deadline.saturating_sub(started.elapsed());
@@ -1746,9 +1746,27 @@ fn provider_request_content_for_failure(
 fn request_for_provider(
     request: &SessionSearchRequest,
     provider: &SessionSearchProviderInfo,
+    policy: &bcode_session_search::SessionSearchPlanPolicy,
 ) -> SessionSearchRequest {
     let mut provider_request = request.clone();
-    if !request.filters.content_kinds.is_empty() {
+    if request.filters.content_kinds.is_empty() {
+        provider_request.filters.content_kinds = provider
+            .capabilities
+            .content_kinds
+            .iter()
+            .copied()
+            .filter(|content| {
+                matches!(
+                    policy.execution_class,
+                    bcode_session_search::SessionSearchExecutionClass::Deep
+                ) || !matches!(
+                    content,
+                    bcode_session_search::SearchContentKind::ShellOutput
+                        | bcode_session_search::SearchContentKind::ToolOutput
+                )
+            })
+            .collect();
+    } else {
         provider_request.filters.content_kinds = request
             .filters
             .content_kinds
@@ -2336,6 +2354,62 @@ mod tests {
             excluded_content: Vec::new(),
             message: None,
         }
+    }
+
+    #[test]
+    fn ordinary_empty_content_request_excludes_large_output_from_provider_payload() {
+        let mut provider = bcode_session_search::SessionSearchProviderInfo {
+            plugin_id: "provider".to_owned(),
+            capabilities: provider_capabilities("provider"),
+            status: provider_status("provider"),
+        };
+        provider
+            .capabilities
+            .content_kinds
+            .insert(SearchContentKind::ShellOutput);
+        provider
+            .capabilities
+            .content_kinds
+            .insert(SearchContentKind::ToolOutput);
+        let ordinary =
+            request_for_provider(&request(), &provider, &SessionSearchPlanPolicy::default());
+        assert!(
+            !ordinary
+                .filters
+                .content_kinds
+                .contains(&SearchContentKind::ShellOutput)
+        );
+        assert!(
+            !ordinary
+                .filters
+                .content_kinds
+                .contains(&SearchContentKind::ToolOutput)
+        );
+        assert!(
+            ordinary
+                .filters
+                .content_kinds
+                .contains(&SearchContentKind::UserMessage)
+        );
+
+        let deep = request_for_provider(
+            &request(),
+            &provider,
+            &SessionSearchPlanPolicy {
+                execution_class: bcode_session_search::SessionSearchExecutionClass::Deep,
+                ..SessionSearchPlanPolicy::default()
+            },
+        );
+        assert!(
+            deep.filters
+                .content_kinds
+                .contains(&SearchContentKind::ShellOutput)
+        );
+        assert!(
+            deep.filters
+                .content_kinds
+                .contains(&SearchContentKind::ToolOutput)
+        );
     }
 
     #[test]

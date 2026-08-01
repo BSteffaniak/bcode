@@ -255,8 +255,10 @@ exhaustion, corruption, or provider absence never delays or rolls back canonical
 
 Large shell/tool output is an explicit deep-search category. The shared planner rejects requests that
 name `shell_output` or `tool_output` under ordinary execution even if an indexed provider advertises
-those categories; callers must opt into deep policy. This prevents an accidental policy change or
-provider capability expansion from making ordinary transcript search scan or expose large output.
+those categories; callers must opt into deep policy. For an ordinary request with no explicit content
+filter, the coordinator materializes the provider request's content set and removes shell/tool output
+before crossing the plugin boundary. This prevents an accidental policy change or provider capability
+expansion from making ordinary transcript search scan or expose large output.
 
 The first implementation choice remains evidence-gated. Supported canonical export attempts against
 several representative local sessions on 2026-08-01 produced only explicit degraded evidence: the
