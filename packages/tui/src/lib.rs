@@ -179,6 +179,9 @@ pub enum TuiError {
         session_id: SessionId,
         reason: String,
     },
+    /// Session search result could not become canonical navigation.
+    #[error("session search navigation unavailable: {0}")]
+    SessionSearchNavigation(String),
     /// Session selection was canceled.
     #[error("session selection canceled")]
     Canceled,

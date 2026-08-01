@@ -245,6 +245,15 @@ async fn handle_slash_command<W: Write>(
                 session_flow::PickSessionOutcome::Existing(next_session_id) => {
                     session_flow::switch_session(io.terminal, chat, next_session_id)?;
                 }
+                session_flow::PickSessionOutcome::SearchHit(hydrated) => {
+                    let request = session_flow::initial_transcript_window_request(
+                        super::render::transcript_area_for_frame(&chat.app, io.terminal.area()),
+                    );
+                    session_flow::start_switch_session_from_search_hit(chat, &hydrated, request)
+                        .map_err(|reason| {
+                            super::TuiError::SessionSearchNavigation(format!("{reason:?}"))
+                        })?;
+                }
                 session_flow::PickSessionOutcome::Draft => {
                     session_flow::switch_to_draft_session(chat);
                     chat.replace_effect(TuiEffect::LoadDraftStatus {

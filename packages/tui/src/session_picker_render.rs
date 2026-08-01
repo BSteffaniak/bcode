@@ -63,7 +63,7 @@ const fn input_placeholder(mode: SessionPickerMode) -> &'static str {
 fn header_line(mode: SessionPickerMode) -> Line {
     let help = match mode {
         SessionPickerMode::Filter => {
-            "  Enter selects/imports  Ctrl-N creates  Ctrl-R renames  Ctrl-D deletes  Esc cancels/dismisses"
+            "  Enter selects/imports  Ctrl-F searches transcripts  Ctrl-N creates  Ctrl-R renames  Ctrl-D deletes  Esc cancels/dismisses"
         }
         SessionPickerMode::Rename => "  Enter saves rename  Esc cancels",
         SessionPickerMode::DeleteConfirm => "  Y confirms delete  N/Esc cancels",

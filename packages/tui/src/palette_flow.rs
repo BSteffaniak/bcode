@@ -429,6 +429,13 @@ async fn switch_session<W: Write>(
         session_flow::PickSessionOutcome::Existing(selected_session_id) => {
             session_flow::switch_session(io.terminal, chat, selected_session_id)?;
         }
+        session_flow::PickSessionOutcome::SearchHit(hydrated) => {
+            let request = session_flow::initial_transcript_window_request(
+                super::render::transcript_area_for_frame(&chat.app, io.terminal.area()),
+            );
+            session_flow::start_switch_session_from_search_hit(chat, &hydrated, request)
+                .map_err(|reason| TuiError::SessionSearchNavigation(format!("{reason:?}")))?;
+        }
         session_flow::PickSessionOutcome::Draft => start_new_session(chat)?,
     }
     Ok(())

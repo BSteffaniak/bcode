@@ -517,6 +517,7 @@ enum PickerKeyOutcome {
     Create,
     Rename,
     Delete,
+    TranscriptSearch,
     Selected,
     Canceled,
 }
@@ -624,6 +625,63 @@ fn draw_session_picker<W: Write>(
     Ok(())
 }
 
+async fn search_picker_transcript<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+    picker: &mut session_picker::SessionPickerApp,
+    theme: super::render::TuiTheme,
+) -> Result<Option<bcode_session_search::HydratedSessionSearchHit>, TuiError> {
+    let query = picker.filter().buffer().text().trim().to_owned();
+    if query.is_empty() {
+        picker.set_status("Type a transcript query, then press Ctrl-F".to_owned());
+        return Ok(None);
+    }
+    picker.set_status("Searching transcripts…".to_owned());
+    terminal.draw(|frame| session_picker_render::render_picker(picker, frame, theme))?;
+    let request = bcode_session_search::SessionSearchRequest {
+        query: bcode_session_search::SessionSearchQuery::Text {
+            text: query,
+            mode: bcode_session_search::TextMatchMode::Terms,
+            fields: std::collections::BTreeSet::new(),
+        },
+        filters: bcode_session_search::SessionSearchFilters::default(),
+        sort: bcode_session_search::SessionSearchSort::ProviderRelevance,
+        limit: 20,
+        cursor: None,
+        deadline_ms: Some(5_000),
+    };
+    let (response, hydrated) = client
+        .session_search(
+            request,
+            bcode_session_search::SessionSearchPlanPolicy::default(),
+            Vec::new(),
+            true,
+        )
+        .await?;
+    let Some(hit) = response.hits.first() else {
+        picker.set_status(if response.query_complete && response.coverage_complete {
+            "No transcript matches".to_owned()
+        } else {
+            "No transcript matches in incomplete provider coverage".to_owned()
+        });
+        return Ok(None);
+    };
+    let Some(hydrated) = hydrated
+        .into_iter()
+        .find(|candidate| candidate.hit.locator == hit.locator)
+    else {
+        picker.set_status("Search hit was not canonically hydrated".to_owned());
+        return Ok(None);
+    };
+    match super::session_search_effect::canonical_navigation_target(&hydrated) {
+        Ok(_) => Ok(Some(hydrated)),
+        Err(reason) => {
+            picker.set_status(format!("Search hit cannot navigate: {reason:?}"));
+            Ok(None)
+        }
+    }
+}
+
 async fn import_selected_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
@@ -675,10 +733,12 @@ async fn import_selected_session<W: Write>(
 }
 
 /// Session picker result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickSessionOutcome {
     /// An existing session was selected.
     Existing(SessionId),
+    /// One exact canonically hydrated transcript search hit was selected.
+    SearchHit(bcode_session_search::HydratedSessionSearchHit),
     /// A new unpersisted draft session was requested.
     Draft,
 }
@@ -787,6 +847,18 @@ pub async fn pick_session<W: Write>(
                 PickerKeyOutcome::Delete => {
                     delete_picker_session(chat, &mut picker);
                 }
+                PickerKeyOutcome::TranscriptSearch => {
+                    if let Some(hydrated) = search_picker_transcript(
+                        io.terminal,
+                        services.client,
+                        &mut picker,
+                        services.theme,
+                    )
+                    .await?
+                    {
+                        return Ok(PickSessionOutcome::SearchHit(hydrated));
+                    }
+                }
                 PickerKeyOutcome::Selected => {
                     if let Some(session_id) = import_selected_session(
                         io.terminal,
@@ -877,7 +949,8 @@ pub async fn pick_session_for_mutation<W: Write>(
             Event::Key(stroke) => match handle_picker_key(&mut picker, services.keymap, stroke) {
                 PickerKeyOutcome::Continue
                 | PickerKeyOutcome::Create
-                | PickerKeyOutcome::Selected => {}
+                | PickerKeyOutcome::Selected
+                | PickerKeyOutcome::TranscriptSearch => {}
                 PickerKeyOutcome::Rename => {
                     rename_picker_session(chat, &mut picker);
                 }
@@ -928,6 +1001,17 @@ fn handle_picker_filter_key(
     keymap: &BmuxKeyMap,
     stroke: KeyStroke,
 ) -> PickerKeyOutcome {
+    if stroke
+        == KeyStroke::with_modifiers(
+            KeyCode::Char('f'),
+            bmux_keyboard::Modifiers {
+                ctrl: true,
+                ..bmux_keyboard::Modifiers::NONE
+            },
+        )
+    {
+        return PickerKeyOutcome::TranscriptSearch;
+    }
     if let Some(action) = keymap.action_for_key(BmuxScope::SessionPicker, stroke) {
         return match action {
             BmuxAction::SelectCancel => PickerKeyOutcome::Canceled,

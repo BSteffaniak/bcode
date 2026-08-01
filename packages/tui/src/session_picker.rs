@@ -56,6 +56,12 @@ impl SessionPickerApp {
         self.mode
     }
 
+    /// Return the filter input.
+    #[must_use]
+    pub const fn filter(&self) -> &TextInputState {
+        &self.filter
+    }
+
     /// Return the filter input mutably.
     pub const fn filter_mut(&mut self) -> &mut TextInputState {
         &mut self.filter
