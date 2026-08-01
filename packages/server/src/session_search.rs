@@ -981,7 +981,7 @@ async fn invoke_apply_batch(
     request: &ApplySearchRecordsRequest,
     deadline: Option<Instant>,
 ) -> Result<ApplySearchRecordsResponse, IngestionError> {
-    if let Some(deadline) = deadline {
+    let response = if let Some(deadline) = deadline {
         let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
             return Err(IngestionError::retryable(
                 "historical backfill deadline reached",
@@ -998,7 +998,7 @@ async fn invoke_apply_batch(
                 timeout,
             )
             .await
-            .map_err(classify_ingestion_call_error)
+            .map_err(classify_ingestion_call_error)?
     } else {
         state
             .plugins
@@ -1009,8 +1009,45 @@ async fn invoke_apply_batch(
                 request,
             )
             .await
-            .map_err(classify_ingestion_call_error)
+            .map_err(classify_ingestion_call_error)?
+    };
+    validate_apply_batch_response(request, response)
+}
+
+fn validate_apply_batch_response(
+    request: &ApplySearchRecordsRequest,
+    response: ApplySearchRecordsResponse,
+) -> Result<ApplySearchRecordsResponse, IngestionError> {
+    let expected_sequence = request.indexed_through_sequence.unwrap_or_else(|| {
+        request
+            .records
+            .last()
+            .map_or(0, |record| record.locator.sequence)
+    });
+    if response.batch_id != request.batch_id
+        || response.indexed_through_sequence != expected_sequence
+    {
+        return Err(IngestionError::permanent(
+            "provider apply-batch acknowledgment does not match the requested batch",
+        ));
     }
+    match response.outcome {
+        bcode_session_search::ApplyBatchOutcome::Applied
+            if response.applied_records == request.records.len() => {}
+        bcode_session_search::ApplyBatchOutcome::Duplicate if response.applied_records == 0 => {}
+        bcode_session_search::ApplyBatchOutcome::ConflictingDuplicate => {
+            return Err(IngestionError::permanent(
+                "provider rejected a conflicting duplicate batch identity",
+            ));
+        }
+        bcode_session_search::ApplyBatchOutcome::Applied
+        | bcode_session_search::ApplyBatchOutcome::Duplicate => {
+            return Err(IngestionError::permanent(
+                "provider apply-batch acknowledgment has inconsistent record accounting",
+            ));
+        }
+    }
+    Ok(response)
 }
 
 /// Discover loaded session-search providers and query their typed capabilities/status.
@@ -2074,10 +2111,14 @@ mod tests {
                     batch_id: request.batch_id,
                     outcome: bcode_session_search::ApplyBatchOutcome::Applied,
                     applied_records: request.records.len(),
-                    indexed_through_sequence: request
-                        .records
-                        .last()
-                        .map_or(0, |record| record.locator.sequence),
+                    indexed_through_sequence: request.indexed_through_sequence.unwrap_or_else(
+                        || {
+                            request
+                                .records
+                                .last()
+                                .map_or(0, |record| record.locator.sequence)
+                        },
+                    ),
                 })
             }
             OP_REMOVE_SESSION => {
@@ -2620,6 +2661,46 @@ mod tests {
 
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
         assert!(state.session_search_dirty.snapshot().await.0.is_empty());
+    }
+
+    #[test]
+    fn apply_batch_acknowledgment_rejects_conflicts_and_mismatches() {
+        let request = ApplySearchRecordsRequest {
+            provider_id: "provider".to_owned(),
+            batch_id: "batch".to_owned(),
+            generation: SearchCanonicalGeneration {
+                session_id: SessionId::new(),
+                fingerprint: "generation".to_owned(),
+                last_sequence: Some(1),
+            },
+            expected_previous_sequence: None,
+            expected_previous_session_text_bytes: 0,
+            indexed_through_sequence: Some(1),
+            records: Vec::new(),
+        };
+        let valid_duplicate = ApplySearchRecordsResponse {
+            batch_id: "batch".to_owned(),
+            outcome: bcode_session_search::ApplyBatchOutcome::Duplicate,
+            applied_records: 0,
+            indexed_through_sequence: 1,
+        };
+        assert!(validate_apply_batch_response(&request, valid_duplicate).is_ok());
+
+        let conflict = ApplySearchRecordsResponse {
+            batch_id: "batch".to_owned(),
+            outcome: bcode_session_search::ApplyBatchOutcome::ConflictingDuplicate,
+            applied_records: 0,
+            indexed_through_sequence: 1,
+        };
+        assert!(validate_apply_batch_response(&request, conflict).is_err());
+
+        let wrong_batch = ApplySearchRecordsResponse {
+            batch_id: "other".to_owned(),
+            outcome: bcode_session_search::ApplyBatchOutcome::Duplicate,
+            applied_records: 0,
+            indexed_through_sequence: 1,
+        };
+        assert!(validate_apply_batch_response(&request, wrong_batch).is_err());
     }
 
     #[tokio::test]

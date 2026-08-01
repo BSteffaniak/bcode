@@ -206,7 +206,12 @@ size, page events, batch records/text bytes, per-session duration, completion/fa
 requeue without session IDs or provider-controlled labels. Retry classification treats stale generation,
 checkpoint conflict, quota exhaustion, disabled content, invalid requests, and typed response
 incompatibility as terminal for the dirty item; only transient transport/service failures retry.
-Provider-side expected sequence/text checks remain the atomic stale-write guard. Provider coverage
+Provider-side expected sequence/text checks remain the atomic stale-write guard. The host additionally
+validates that every apply-batch acknowledgment has the requested batch identity, requested terminal
+sequence, and outcome-consistent record count; conflicting duplicates are terminal rather than being
+mistaken for successful progress. Canonical deletion commits a durable provider-owned generation
+tombstone with the same Tantivy commit marker as document removal, so in-flight or post-restart stale
+batches for the deleted generation cannot recreate derived records. Provider coverage
 includes retained indexed text bytes alongside the sequence checkpoint so the next bounded batch can
 satisfy cumulative limits.
 That checkpoint is provider-owned durable state, not a reconnect-safe transport cursor; the transport

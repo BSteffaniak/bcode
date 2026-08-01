@@ -108,6 +108,9 @@ struct PersistedProviderState {
     content_kinds: BTreeSet<SearchContentKind>,
     sessions: BTreeMap<SessionId, PersistedSessionState>,
     batch_digests: BTreeMap<String, String>,
+    /// Canonical generations explicitly removed while stale ingestion may still be in flight.
+    #[serde(default)]
+    removed_sessions: BTreeMap<SessionId, Option<String>>,
 }
 
 impl PersistedProviderState {
@@ -122,6 +125,7 @@ impl PersistedProviderState {
             content_kinds: config.allowed_content(),
             sessions: BTreeMap::new(),
             batch_digests: BTreeMap::new(),
+            removed_sessions: BTreeMap::new(),
         }
     }
 
@@ -177,6 +181,8 @@ enum CommitMarker {
     RemoveSession {
         version: u16,
         session_id: SessionId,
+        #[serde(default)]
+        expected_generation_fingerprint: Option<String>,
     },
 }
 
@@ -196,6 +202,7 @@ impl CommitMarker {
                     ));
                 }
                 state.sessions.insert(*session_id, session.clone());
+                state.removed_sessions.remove(session_id);
                 state
                     .batch_digests
                     .insert(batch_id.clone(), operation_digest.clone());
@@ -203,6 +210,7 @@ impl CommitMarker {
             Self::RemoveSession {
                 version,
                 session_id,
+                expected_generation_fingerprint,
             } => {
                 if *version != 1 {
                     return Err(ProviderError::incompatible(
@@ -210,6 +218,9 @@ impl CommitMarker {
                     ));
                 }
                 state.sessions.remove(session_id);
+                state
+                    .removed_sessions
+                    .insert(*session_id, expected_generation_fingerprint.clone());
             }
         }
         Ok(())
@@ -562,6 +573,26 @@ impl TantivySessionSearchPlugin {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .removed_sessions
+            .get(&request.generation.session_id)
+            .is_some_and(|removed_generation| {
+                removed_generation
+                    .as_ref()
+                    .is_none_or(|generation| generation == &request.generation.fingerprint)
+            })
+        {
+            return ServiceResponse::error(
+                "stale_generation",
+                "canonical session was removed; stale ingestion is rejected",
+            );
+        }
+        let last_sequence = request.indexed_through_sequence.unwrap_or_else(|| {
+            request
+                .records
+                .last()
+                .map_or(0, |record| record.locator.sequence)
+        });
         let classification = classify_batch_delivery(
             request,
             state
@@ -575,14 +606,7 @@ impl TantivySessionSearchPlugin {
                     batch_id: request.batch_id.clone(),
                     outcome: ApplyBatchOutcome::Duplicate,
                     applied_records: 0,
-                    indexed_through_sequence: request.indexed_through_sequence.unwrap_or_else(
-                        || {
-                            request
-                                .records
-                                .last()
-                                .map_or(0, |record| record.locator.sequence)
-                        },
-                    ),
+                    indexed_through_sequence: last_sequence,
                 });
             }
             BatchDeliveryClassification::ConflictingDuplicate { .. } => {
@@ -590,10 +614,7 @@ impl TantivySessionSearchPlugin {
                     batch_id: request.batch_id.clone(),
                     outcome: ApplyBatchOutcome::ConflictingDuplicate,
                     applied_records: 0,
-                    indexed_through_sequence: state
-                        .sessions
-                        .get(&request.generation.session_id)
-                        .map_or(0, |session| session.indexed_through_sequence),
+                    indexed_through_sequence: last_sequence,
                 });
             }
             BatchDeliveryClassification::New { operation_digest } => operation_digest,
@@ -647,12 +668,6 @@ impl TantivySessionSearchPlugin {
                 return error_response(&ProviderError::index(error));
             }
         }
-        let last_sequence = request.indexed_through_sequence.unwrap_or_else(|| {
-            request
-                .records
-                .last()
-                .map_or(0, |record| record.locator.sequence)
-        });
         let batch_text_bytes = request.records.iter().fold(0_u64, |total, record| {
             total.saturating_add(record.normalized_bytes)
         });
@@ -773,6 +788,7 @@ impl TantivySessionSearchPlugin {
         let marker = CommitMarker::RemoveSession {
             version: 1,
             session_id: request.session_id,
+            expected_generation_fingerprint: request.expected_generation_fingerprint.clone(),
         };
         let marker_payload = match serde_json::to_string(&marker) {
             Ok(payload) => payload,
@@ -1875,6 +1891,74 @@ mod tests {
         prepared.commit().expect("commit");
         drop(writer);
         marker
+    }
+
+    #[test]
+    fn conflicting_duplicate_reports_the_requested_checkpoint_without_advancing_state() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        let plugin = TantivySessionSearchPlugin::default();
+        let session_id = SessionId::new();
+        let request = apply_batch_request(session_id, "batch-conflict", 1, "original");
+        let first = plugin.apply_batch(&config, &request, &ServiceCancellation::default());
+        assert!(first.error.is_none());
+
+        let mut conflicting = request;
+        conflicting.records[0].text = Some("different".to_owned());
+        conflicting.records[0].indexed_bytes = 9;
+        conflicting.records[0].normalized_bytes = 9;
+        let response = plugin.apply_batch(&config, &conflicting, &ServiceCancellation::default());
+        let acknowledgment: ApplySearchRecordsResponse =
+            response.payload_json().expect("conflict acknowledgment");
+        assert_eq!(
+            acknowledgment.outcome,
+            ApplyBatchOutcome::ConflictingDuplicate
+        );
+        assert_eq!(acknowledgment.indexed_through_sequence, 1);
+        assert_eq!(
+            plugin.status(&config).coverage[0].indexed_through_sequence,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn deletion_tombstone_rejects_stale_inflight_ingestion_across_restart() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        let session_id = SessionId::new();
+        let request = apply_batch_request(session_id, "batch-before-delete", 1, "retained");
+        let plugin = TantivySessionSearchPlugin::default();
+        assert!(
+            plugin
+                .apply_batch(&config, &request, &ServiceCancellation::default())
+                .error
+                .is_none()
+        );
+        assert!(
+            plugin
+                .remove_session(
+                    &config,
+                    &RemoveSessionSearchRequest {
+                        session_id,
+                        expected_generation_fingerprint: Some("generation".to_owned()),
+                    },
+                )
+                .error
+                .is_none()
+        );
+        drop(plugin);
+
+        let restarted = TantivySessionSearchPlugin::default();
+        let mut stale = request;
+        stale.batch_id = "batch-after-delete".to_owned();
+        stale.expected_previous_sequence = None;
+        stale.expected_previous_session_text_bytes = 0;
+        let response = restarted.apply_batch(&config, &stale, &ServiceCancellation::default());
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("stale_generation")
+        );
+        assert!(restarted.status(&config).coverage.is_empty());
     }
 
     #[test]
