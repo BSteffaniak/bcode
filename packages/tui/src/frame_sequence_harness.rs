@@ -12,6 +12,7 @@ pub struct TranscriptFrameSnapshot {
     pub label: String,
     pub text: String,
     pub observation: TranscriptFrameObservation,
+    pub markdown_fresh_equivalent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +67,7 @@ pub enum TranscriptFrameInput {
         has_more: bool,
     },
     DurableBatch(Vec<SessionEvent>),
+    Resize(u16, u16),
     ScrollUp(usize),
     Observe,
 }
@@ -108,6 +110,10 @@ impl TranscriptFrameSequence {
                         self.app.absorb_session_event(&event);
                     }
                 }
+                TranscriptFrameInput::Resize(width, height) => {
+                    self.width = width;
+                    self.height = height;
+                }
                 TranscriptFrameInput::ScrollUp(rows) => {
                     let _ = self.app.scroll_transcript_up(rows);
                 }
@@ -120,6 +126,24 @@ impl TranscriptFrameSequence {
     }
 
     fn capture(&mut self, label: &str) -> TranscriptFrameSnapshot {
+        // The production chat loop accepts background completions between frames. This isolated
+        // application harness has no loop/worker, so synchronously install the same exact
+        // generation before capturing each deterministic accepted frame.
+        let markdown_items = self
+            .app
+            .transcript()
+            .iter()
+            .filter(|item| item.text_format() == bcode_session_view_models::TextFormat::Markdown)
+            .cloned()
+            .collect::<Vec<_>>();
+        for item in &markdown_items {
+            let options = render::markdown_render_options(
+                &self.app,
+                item,
+                self.width.saturating_sub(2).max(1),
+            );
+            self.app.transcript_markdown_cache().project(item, options);
+        }
         let mut buffer = Buffer::empty(Rect::new(0, 0, self.width, self.height));
         let mut frame = Frame::new(&mut buffer);
         render::render(&mut self.app, &mut frame);
@@ -127,10 +151,29 @@ impl TranscriptFrameSequence {
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<Vec<_>>()
             .join("\n");
+        let markdown_fresh_equivalent = self
+            .app
+            .transcript()
+            .iter()
+            .filter(|item| item.text_format() == bcode_session_view_models::TextFormat::Markdown)
+            .all(|item| {
+                let options = render::markdown_render_options(
+                    &self.app,
+                    item,
+                    self.width.saturating_sub(2).max(1),
+                );
+                self.app
+                    .transcript_markdown_cache()
+                    .get(item.id().get(), item.revision(), &options)
+                    .is_some_and(|accepted| {
+                        *accepted == bcode_markdown_render::render_markdown(item.text(), &options)
+                    })
+            });
         TranscriptFrameSnapshot {
             label: label.to_owned(),
             text,
             observation: self.app.frame_observation(),
+            markdown_fresh_equivalent,
         }
     }
 }
@@ -339,6 +382,108 @@ mod tests {
                 frame.text
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn markdown_stream_scroll_resize_and_terminal_projection_converge_exactly() {
+        let session_id = SessionId::new();
+        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let first = format!("# Streaming report\n\n{}", "context row\n\n".repeat(24));
+        let second = "- [x] retained projection\n- [ ] final convergence\n\n";
+        let final_suffix = "[guide](https://example.com)\n";
+        let first_len = first.len();
+        let second_offset = first_len.saturating_add(second.len());
+        let update = |revision, expected_offset, text: String| {
+            TranscriptFrameInput::Live(SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
+                    turn_id: "turn-markdown".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    update: TextStreamUpdate {
+                        generation: 0,
+                        first_revision: revision,
+                        revision,
+                        operation: TextStreamOperation::Append {
+                            expected_offset,
+                            text,
+                        },
+                    },
+                },
+            })
+        };
+        let terminal = TranscriptFrameInput::Live(SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
+                turn_id: "turn-markdown".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                update: TextStreamUpdate {
+                    generation: 0,
+                    first_revision: 4,
+                    revision: 4,
+                    operation: TextStreamOperation::Terminal {
+                        status: bcode_session_models::TextStreamTerminalStatus::Completed,
+                    },
+                },
+            },
+        });
+        let frames = TranscriptFrameSequence::new(app, 72, 14).run([
+            TranscriptFrameStep {
+                label: "first-formatted-projection",
+                input: update(1, 0, first),
+            },
+            TranscriptFrameStep {
+                label: "detached-during-stream",
+                input: TranscriptFrameInput::ScrollUp(5),
+            },
+            TranscriptFrameStep {
+                label: "second-formatted-projection",
+                input: update(2, first_len, second.to_owned()),
+            },
+            TranscriptFrameStep {
+                label: "narrow-projection",
+                input: TranscriptFrameInput::Resize(38, 14),
+            },
+            TranscriptFrameStep {
+                label: "final-streaming-projection",
+                input: update(3, second_offset, final_suffix.to_owned()),
+            },
+            TranscriptFrameStep {
+                label: "terminal-projection",
+                input: terminal,
+            },
+        ]);
+
+        assert!(frames[0].text.contains("context row"));
+        for frame in &frames[1..] {
+            assert_eq!(frame.observation.scroll_mode, "manual_detached");
+        }
+        assert!(
+            frames[2].observation.terminal_rows.len() >= frames[1].observation.terminal_rows.len()
+        );
+        assert_eq!(frames[2].observation.anchor, frames[1].observation.anchor);
+        assert_eq!(frames[3].observation.anchor, frames[1].observation.anchor);
+        let terminal_item = frames
+            .last()
+            .and_then(|frame| frame.observation.terminal_items.last())
+            .expect("terminal Markdown item");
+        let semantic_item = frames
+            .last()
+            .and_then(|frame| frame.observation.semantic_items.last())
+            .expect("semantic Markdown item");
+        assert_eq!(terminal_item.2, Some(semantic_item.1));
+        assert!(
+            frames
+                .last()
+                .is_some_and(|frame| frame.markdown_fresh_equivalent)
+        );
+        assert!(frames.last().is_some_and(|frame| {
+            frame.text.contains("guide") || frame.observation.anchor.is_some()
+        }));
     }
 
     #[test]
@@ -1153,6 +1298,7 @@ mod tests {
                     scroll_mode: "bottom_follow",
                     anchor: None,
                 },
+                markdown_fresh_equivalent: true,
             },
             TranscriptFrameSnapshot {
                 label: "flash".to_owned(),
@@ -1166,6 +1312,7 @@ mod tests {
                     scroll_mode: "bottom_follow",
                     anchor: None,
                 },
+                markdown_fresh_equivalent: true,
             },
         ];
         let error = assert_no_forbidden_frames(&frames, |frame| {

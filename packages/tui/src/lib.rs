@@ -34,6 +34,7 @@ pub(crate) mod markdown_activation;
 pub mod markdown_image;
 pub(crate) mod markdown_interaction;
 pub mod markdown_mermaid;
+pub(crate) mod markdown_projection_coordinator;
 pub mod metrics_launcher;
 pub(crate) mod model_flow;
 pub(crate) mod model_picker;

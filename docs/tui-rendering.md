@@ -19,6 +19,28 @@ Incomplete Markdown is renderer-local. Streaming projections visibly preserve ac
 content, redact unsafe unfinished destinations, and converge to the normal projection once syntax is
 complete. Semantic text remains unchanged in `SessionView`.
 
+## Accepted Markdown projection scheduling
+
+Transcript Markdown has one TUI-owned accepted projection per resident item. Rows, contribution
+geometry, anchors, focus reconciliation, hit testing, and rich-presentation discovery all consume
+that same retained result; consumers must not independently reparse transcript source. During a
+stream, the previous accepted projection remains readable while a dedicated worker prepares the
+latest item revision and complete render-options generation.
+
+The worker mailbox contains at most one active request and one replaceable pending request. New
+revisions, width changes, details state, finalization, or other option changes replace obsolete
+pending work. Completion wakes the chat loop directly. The loop installs a result only when item ID,
+item revision, and every render option still match, then marks only that transcript item dirty.
+Stale results have no layout, focus, rich-presentation, or viewport effect. Renderer panics are
+normalized without source text or private error details; retained content remains visible and a
+later generation retries on the same worker.
+
+Accepted row-count changes use the existing stable item/intra-item viewport anchor. Following and
+manual detachment therefore remain application policies rather than worker behavior. Session switch,
+shutdown, and resident eviction invalidate pending generations. The cache retains only one current
+projection per resident item, so neither streaming revision count nor terminal resize history grows
+retained state.
+
 ## Draw cadence
 `[tui.render]` controls terminal draw cadence.
 

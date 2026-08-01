@@ -38,6 +38,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     fmt::Write as _,
+    hash::{Hash, Hasher},
     ops::Range,
     rc::Rc,
 };
@@ -59,8 +60,66 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+struct MarkdownRenderStageDiagnostics {
+    semantic_parse: u64,
+    fallback_projection: u64,
+    hyperchad_conversion: u64,
+    syntax_highlighting: u64,
+    terminal_layout: u64,
+    geometry: u64,
+    anchors: u64,
+    signature: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MARKDOWN_PARSE_COUNT: Cell<usize> = const { Cell::new(0) };
+    static MARKDOWN_PROJECTION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static MARKDOWN_STAGE_DIAGNOSTICS: RefCell<MarkdownRenderStageDiagnostics> =
+        const { RefCell::new(MarkdownRenderStageDiagnostics {
+            semantic_parse: 0,
+            fallback_projection: 0,
+            hyperchad_conversion: 0,
+            syntax_highlighting: 0,
+            terminal_layout: 0,
+            geometry: 0,
+            anchors: 0,
+            signature: 0,
+        }) };
+}
+
+#[cfg(test)]
+fn record_markdown_stage(
+    update: impl FnOnce(&mut MarkdownRenderStageDiagnostics, u64),
+    started: std::time::Instant,
+) {
+    let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    MARKDOWN_STAGE_DIAGNOSTICS.with(|diagnostics| update(&mut diagnostics.borrow_mut(), elapsed));
+}
+
+#[cfg(test)]
+fn reset_markdown_work_counts() {
+    MARKDOWN_PARSE_COUNT.set(0);
+    MARKDOWN_PROJECTION_COUNT.set(0);
+    MARKDOWN_STAGE_DIAGNOSTICS.with(|diagnostics| {
+        *diagnostics.borrow_mut() = MarkdownRenderStageDiagnostics::default();
+    });
+}
+
+#[cfg(test)]
+fn markdown_stage_diagnostics() -> MarkdownRenderStageDiagnostics {
+    MARKDOWN_STAGE_DIAGNOSTICS.with(|diagnostics| *diagnostics.borrow())
+}
+
+#[cfg(test)]
+fn markdown_work_counts() -> (usize, usize) {
+    (MARKDOWN_PARSE_COUNT.get(), MARKDOWN_PROJECTION_COUNT.get())
+}
+
 /// Terminal styles used for Markdown rendering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MarkdownTheme {
     /// Base text style.
     pub text: Style,
@@ -148,7 +207,7 @@ impl MarkdownTheme {
 }
 
 /// Trusted context for resolving Markdown destinations.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct MarkdownDocumentContext {
     /// Base URL for URL-relative destinations.
     pub base_url: Option<Url>,
@@ -159,7 +218,7 @@ pub struct MarkdownDocumentContext {
 }
 
 /// Explicit GitHub repository identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GitHubRepository {
     /// Repository owner.
     pub owner: String,
@@ -168,7 +227,7 @@ pub struct GitHubRepository {
 }
 
 /// Classified destination suitable for explicit activation handling.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MarkdownDestination {
     /// Safe HTTP(S) URL.
     Web(Url),
@@ -186,7 +245,7 @@ pub enum MarkdownDestination {
 }
 
 /// Reasons a destination is intentionally inert.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarkdownDestinationRejection {
     /// URL scheme is not allowed for activation.
     UnsupportedScheme,
@@ -247,7 +306,7 @@ fn resolve_local_destination(
 }
 
 /// Terminal presentation policy for classified link destinations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum MarkdownLinkDestinationPresentation {
     /// Render only the parser-semantic link label.
     #[default]
@@ -257,7 +316,7 @@ pub enum MarkdownLinkDestinationPresentation {
 }
 
 /// Mermaid contribution behavior for one render.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum MermaidRenderMode {
     /// Preserve highlighted source without a rich contribution request.
     #[default]
@@ -269,7 +328,7 @@ pub enum MermaidRenderMode {
 }
 
 /// Options controlling terminal Markdown rendering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownRenderOptions {
     /// Available terminal width in cells.
     pub width: u16,
@@ -480,14 +539,14 @@ fn collect_html_plain_text(html: &str, output: &mut String) {
 }
 
 /// Semantic Markdown data preserved before terminal projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownDocument {
     /// Source-order parser events carrying only Bcode-owned types.
     pub events: Vec<MarkdownSemanticEvent>,
 }
 
 /// A semantic Markdown event with its byte range in the original source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownSemanticEvent {
     /// Bcode-owned semantic event kind.
     pub kind: MarkdownSemanticEventKind,
@@ -496,7 +555,7 @@ pub struct MarkdownSemanticEvent {
 }
 
 /// Bcode-owned semantic events needed by terminal rendering and interaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MarkdownSemanticEventKind {
     /// Start of a semantic container.
     Start(MarkdownSemanticTag),
@@ -525,7 +584,7 @@ pub enum MarkdownSemanticEventKind {
 }
 
 /// Semantic container tags independent of the parser implementation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MarkdownSemanticTag {
     /// Paragraph.
     Paragraph,
@@ -564,7 +623,7 @@ pub enum MarkdownSemanticTag {
 }
 
 /// End tags for semantic containers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarkdownSemanticTagEnd {
     /// Paragraph.
     Paragraph,
@@ -603,7 +662,7 @@ pub enum MarkdownSemanticTagEnd {
 }
 
 /// GitHub alert kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarkdownAlertKind {
     /// Note.
     Note,
@@ -618,7 +677,7 @@ pub enum MarkdownAlertKind {
 }
 
 /// GFM table cell alignment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarkdownTableAlignment {
     /// No explicit alignment.
     None,
@@ -631,7 +690,7 @@ pub enum MarkdownTableAlignment {
 }
 
 /// Link metadata preserved independently from its rendered label.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownLink {
     /// Destination exactly as parsed.
     pub destination: String,
@@ -644,7 +703,7 @@ pub struct MarkdownLink {
 }
 
 /// Image metadata preserved independently from its alt-text events.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownImage {
     /// Image source exactly as parsed.
     pub source: String,
@@ -657,7 +716,7 @@ pub struct MarkdownImage {
 }
 
 /// Parser-neutral link syntax kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarkdownLinkKind {
     /// Inline destination.
     Inline,
@@ -680,6 +739,8 @@ pub enum MarkdownLinkKind {
 /// Parse Markdown into Bcode-owned source-order semantic events.
 #[must_use]
 pub fn parse_markdown_document(markdown: &str) -> MarkdownDocument {
+    #[cfg(test)]
+    MARKDOWN_PARSE_COUNT.set(MARKDOWN_PARSE_COUNT.get().saturating_add(1));
     let mut options = ParserOptions::empty();
     options.insert(ParserOptions::ENABLE_TABLES);
     options.insert(ParserOptions::ENABLE_STRIKETHROUGH);
@@ -716,7 +777,7 @@ pub struct MarkdownRenderResult {
 }
 
 /// Stable internal document anchor and its rendered row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownDocumentAnchor {
     /// GitHub-compatible fragment identifier without the leading `#`.
     pub fragment: String,
@@ -725,7 +786,7 @@ pub struct MarkdownDocumentAnchor {
 }
 
 /// Document-relative terminal-cell rectangle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MarkdownCellRect {
     /// Zero-based terminal column.
     pub x: u16,
@@ -738,7 +799,7 @@ pub struct MarkdownCellRect {
 }
 
 /// Stable contribution identity and its post-layout rectangles.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownContributionGeometry {
     /// Stable contribution identity matching [`MarkdownContribution::id`].
     pub contribution_id: String,
@@ -747,7 +808,7 @@ pub struct MarkdownContributionGeometry {
 }
 
 /// Stable semantic contribution emitted alongside terminal lines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownContribution {
     /// Stable identity derived from semantic kind and source byte range.
     pub id: String,
@@ -758,7 +819,7 @@ pub struct MarkdownContribution {
 }
 
 /// Rich Markdown contribution payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MarkdownContributionKind {
     /// Link and its semantic label.
     Link {
@@ -836,7 +897,7 @@ pub enum MarkdownContributionKind {
 }
 
 /// Backend-neutral Mermaid contribution rendering state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MermaidContributionRendering {
     /// Rendering is disabled; highlighted source remains the fallback.
     Disabled,
@@ -846,9 +907,151 @@ pub enum MermaidContributionRendering {
     Failed(String),
 }
 
+/// Retained exact renderer state for append-only streaming Markdown.
+///
+/// The state incrementally reuses completed plain-paragraph blocks. Sources
+/// containing Markdown constructs with retroactive or container semantics fall
+/// back to a fresh full render. The retained state is presentation-only and is
+/// bounded by the current source and rendered stable prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkdownStreamingRenderState {
+    source: String,
+    options: Option<MarkdownRenderOptions>,
+    stable_source_len: usize,
+    stable_lines: Vec<Line>,
+    incremental_eligible: bool,
+    processed_source_bytes: usize,
+    result: Option<MarkdownRenderResult>,
+}
+
+impl MarkdownStreamingRenderState {
+    /// Render the latest streaming source, reusing exact stable paragraph rows
+    /// when the source is an eligible append and all render options match.
+    #[must_use]
+    pub fn render(
+        &mut self,
+        markdown: &str,
+        options: &MarkdownRenderOptions,
+    ) -> MarkdownRenderResult {
+        let can_append = options.streaming
+            && self.incremental_eligible
+            && self.options.as_ref() == Some(options)
+            && markdown.starts_with(&self.source)
+            && plain_paragraph_append_is_eligible(&self.source, &markdown[self.source.len()..]);
+        if !can_append {
+            return self.replace_with_full_render(markdown, options);
+        }
+
+        let checkpoint = completed_plain_paragraph_boundary(&self.source)
+            .unwrap_or(self.stable_source_len)
+            .max(self.stable_source_len);
+        if checkpoint > self.stable_source_len {
+            let Some(stable_segment) = self.source.get(self.stable_source_len..checkpoint) else {
+                return self.replace_with_full_render(markdown, options);
+            };
+            let segment = render_markdown(stable_segment, options);
+            self.processed_source_bytes = self
+                .processed_source_bytes
+                .saturating_add(stable_segment.len());
+            append_markdown_blocks(&mut self.stable_lines, &segment.lines);
+            self.stable_source_len = checkpoint;
+        }
+
+        let Some(suffix) = markdown.get(self.stable_source_len..) else {
+            return self.replace_with_full_render(markdown, options);
+        };
+        let suffix_result = render_markdown(suffix, options);
+        self.processed_source_bytes = self.processed_source_bytes.saturating_add(suffix.len());
+        if !suffix_result.contributions.is_empty() || !suffix_result.anchors.is_empty() {
+            return self.replace_with_full_render(markdown, options);
+        }
+        let mut lines = self.stable_lines.clone();
+        append_markdown_blocks(&mut lines, &suffix_result.lines);
+        let result = MarkdownRenderResult {
+            lines,
+            contributions: Vec::new(),
+            geometry: Vec::new(),
+            anchors: Vec::new(),
+            layout_signature: markdown_layout_signature(markdown, options, &[], &[]),
+        };
+        self.source.clear();
+        self.source.push_str(markdown);
+        self.result = Some(result.clone());
+        result
+    }
+
+    /// Return cumulative source bytes parsed by this retained state.
+    #[cfg(test)]
+    #[must_use]
+    const fn processed_source_bytes(&self) -> usize {
+        self.processed_source_bytes
+    }
+
+    fn replace_with_full_render(
+        &mut self,
+        markdown: &str,
+        options: &MarkdownRenderOptions,
+    ) -> MarkdownRenderResult {
+        let result = render_markdown(markdown, options);
+        self.source.clear();
+        self.source.push_str(markdown);
+        self.options = Some(options.clone());
+        self.stable_source_len = 0;
+        self.stable_lines.clear();
+        self.incremental_eligible =
+            options.streaming && plain_paragraph_append_is_eligible("", markdown);
+        self.processed_source_bytes = self.processed_source_bytes.saturating_add(markdown.len());
+        self.result = Some(result.clone());
+        result
+    }
+}
+
+fn append_markdown_blocks(lines: &mut Vec<Line>, appended: &[Line]) {
+    if !lines.is_empty() && !appended.is_empty() {
+        lines.push(Line::default());
+    }
+    lines.extend(appended.iter().cloned());
+}
+
+fn completed_plain_paragraph_boundary(source: &str) -> Option<usize> {
+    source.rmatch_indices("\n\n").next().map(|(index, _)| index)
+}
+
+fn plain_paragraph_append_is_eligible(previous: &str, appended: &str) -> bool {
+    let mut at_line_start = previous.is_empty() || previous.ends_with('\n');
+    let mut ordered_prefix = true;
+    for character in appended.chars() {
+        if matches!(
+            character,
+            '#' | '*' | '_' | '[' | ']' | '<' | '>' | '|' | '`' | '\\'
+        ) {
+            return false;
+        }
+        if at_line_start {
+            if matches!(character, '-' | '+' | '>') {
+                return false;
+            }
+            ordered_prefix = character.is_ascii_digit();
+            at_line_start = character == '\n';
+            continue;
+        }
+        if ordered_prefix {
+            if character == '.' {
+                return false;
+            }
+            ordered_prefix = character.is_ascii_digit();
+        }
+        at_line_start = character == '\n';
+    }
+    true
+}
+
 /// Render Markdown into terminal lines and semantic contributions.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> MarkdownRenderResult {
+    #[cfg(test)]
+    let semantic_started = std::time::Instant::now();
     let document = parse_markdown_document(markdown);
     let details = collect_details_projections(markdown);
     let contributions = markdown_contributions(
@@ -858,40 +1061,106 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         &details,
         options,
     );
+    #[cfg(test)]
+    record_markdown_stage(
+        |diagnostics, elapsed| diagnostics.semantic_parse = elapsed,
+        semantic_started,
+    );
+    #[cfg(test)]
+    let fallback_started = std::time::Instant::now();
     let destination_projection =
         project_link_destination_fallbacks(markdown, &contributions, options);
+    let destination_unchanged = matches!(destination_projection, Cow::Borrowed(_));
     let projected_source = destination_projection.as_ref();
-    let projected_document = parse_markdown_document(projected_source);
-    let projected_details = collect_details_projections(projected_source);
+    let projected_document = if destination_unchanged {
+        document
+    } else {
+        parse_markdown_document(projected_source)
+    };
+    let projected_details_storage;
+    let projected_details = if destination_unchanged {
+        details.as_slice()
+    } else {
+        projected_details_storage = collect_details_projections(projected_source);
+        projected_details_storage.as_slice()
+    };
     let mut projection_options = options.clone();
-    for (original, projected) in details.iter().zip(&projected_details) {
-        let original_id = details_contribution_id(original, options.document_id.as_deref());
-        if let Some(open) = options.details_open.get(&original_id) {
-            let projected_id = details_contribution_id(projected, options.document_id.as_deref());
-            projection_options.details_open.insert(projected_id, *open);
+    if !destination_unchanged {
+        for (original, projected) in details.iter().zip(projected_details) {
+            let original_id = details_contribution_id(original, options.document_id.as_deref());
+            if let Some(open) = options.details_open.get(&original_id) {
+                let projected_id =
+                    details_contribution_id(projected, options.document_id.as_deref());
+                projection_options.details_open.insert(projected_id, *open);
+            }
         }
     }
     let projection = project_semantic_fallbacks(
         projected_source,
         &projected_document,
-        &projected_details,
+        projected_details,
         &projection_options,
     );
+    let mut projection = projection;
+    assign_projected_contribution_ids(&mut projection.contributions, &contributions);
     let projected_markdown = if options.streaming {
         let details_projection = project_incomplete_details_fallback(&projection.markdown);
         Cow::Owned(project_incomplete_unsafe_destination_fallback(&details_projection).into_owned())
     } else {
         Cow::Borrowed(projection.markdown.as_ref())
     };
-    let (lines, mut geometry) = render_markdown_projection(&projected_markdown, options);
+    #[cfg(test)]
+    record_markdown_stage(
+        |diagnostics, elapsed| diagnostics.fallback_projection = elapsed,
+        fallback_started,
+    );
+    #[cfg(test)]
+    let projection_started = std::time::Instant::now();
+    let final_document = if projected_markdown.as_ref() == projected_source {
+        projected_document.clone()
+    } else {
+        parse_markdown_document(&projected_markdown)
+    };
+    let (lines, mut geometry, heading_rows) =
+        render_markdown_projection(&projected_markdown, options);
+    #[cfg(test)]
+    record_markdown_stage(
+        |diagnostics, elapsed| {
+            diagnostics.hyperchad_conversion = elapsed;
+            diagnostics.terminal_layout = elapsed;
+            diagnostics.syntax_highlighting = elapsed;
+        },
+        projection_started,
+    );
+    #[cfg(test)]
+    let geometry_started = std::time::Instant::now();
     geometry.extend(projected_contribution_geometry(
         &projected_markdown,
+        &lines,
         &projection.contributions,
-        options,
     ));
     let geometry = assign_contribution_geometry(geometry, &contributions);
-    let anchors = markdown_document_anchors(markdown, options);
+    #[cfg(test)]
+    record_markdown_stage(
+        |diagnostics, elapsed| diagnostics.geometry = elapsed,
+        geometry_started,
+    );
+    #[cfg(test)]
+    let anchors_started = std::time::Instant::now();
+    let anchors = markdown_document_anchors(&projected_markdown, &final_document, &heading_rows);
+    #[cfg(test)]
+    record_markdown_stage(
+        |diagnostics, elapsed| diagnostics.anchors = elapsed,
+        anchors_started,
+    );
+    #[cfg(test)]
+    let signature_started = std::time::Instant::now();
     let layout_signature = markdown_layout_signature(markdown, options, &contributions, &geometry);
+    #[cfg(test)]
+    record_markdown_stage(
+        |diagnostics, elapsed| diagnostics.signature = elapsed,
+        signature_started,
+    );
     MarkdownRenderResult {
         lines,
         contributions,
@@ -903,13 +1172,13 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
 
 fn markdown_document_anchors(
     source: &str,
-    options: &MarkdownRenderOptions,
+    document: &MarkdownDocument,
+    heading_rows: &[u16],
 ) -> Vec<MarkdownDocumentAnchor> {
-    let document = parse_markdown_document(source);
     let mut headings = Vec::new();
     let mut active: Option<(String, Option<String>)> = None;
-    for event in document.events {
-        match event.kind {
+    for event in &document.events {
+        match &event.kind {
             MarkdownSemanticEventKind::Start(MarkdownSemanticTag::Heading(_)) => {
                 active = Some((
                     String::new(),
@@ -918,14 +1187,14 @@ fn markdown_document_anchors(
             }
             MarkdownSemanticEventKind::Text(text) | MarkdownSemanticEventKind::Code(text) => {
                 if let Some((label, _)) = &mut active {
-                    label.push_str(&text);
+                    label.push_str(text);
                 }
             }
             MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::Heading) => {
                 if let Some((label, explicit)) = active.take() {
                     let fragment = explicit.unwrap_or_else(|| github_heading_slug(&label));
                     if !fragment.is_empty() {
-                        headings.push((event.source_range.end, fragment));
+                        headings.push(fragment);
                     }
                 }
             }
@@ -935,7 +1204,8 @@ fn markdown_document_anchors(
     let mut duplicate_counts = BTreeMap::<String, usize>::new();
     headings
         .into_iter()
-        .filter_map(|(source_end, fragment)| {
+        .zip(heading_rows.iter().copied())
+        .map(|(fragment, row)| {
             let count = duplicate_counts.entry(fragment.clone()).or_default();
             let fragment = if *count == 0 {
                 fragment
@@ -943,17 +1213,7 @@ fn markdown_document_anchors(
                 format!("{fragment}-{count}")
             };
             *count = count.saturating_add(1);
-            let prefix = source.get(..source_end)?;
-            let projected_prefix = project_semantic_fallbacks(
-                prefix,
-                &parse_markdown_document(prefix),
-                &collect_details_projections(prefix),
-                options,
-            );
-            let row =
-                rendered_cursor(&render_markdown_projection(&projected_prefix.markdown, options).0)
-                    .0;
-            Some(MarkdownDocumentAnchor { fragment, row })
+            MarkdownDocumentAnchor { fragment, row }
         })
         .collect()
 }
@@ -1035,109 +1295,184 @@ fn readable_destination_fallback(
         .or_else(|| (fallback != label).then(|| fallback.to_owned()))
 }
 
+fn assign_projected_contribution_ids(
+    projected: &mut [ProjectedContributionRange],
+    contributions: &[MarkdownContribution],
+) {
+    let mut details = contributions.iter().filter(|contribution| {
+        matches!(contribution.kind, MarkdownContributionKind::Details { .. })
+    });
+    let mut references = contributions.iter().filter(|contribution| {
+        matches!(
+            contribution.kind,
+            MarkdownContributionKind::FootnoteReference { .. }
+        )
+    });
+    let mut definitions = contributions.iter().filter(|contribution| {
+        matches!(
+            contribution.kind,
+            MarkdownContributionKind::FootnoteDefinition { .. }
+        )
+    });
+    for item in projected {
+        item.contribution_id = match item.kind {
+            ProjectedContributionKind::Details => details.next(),
+            ProjectedContributionKind::FootnoteReference => references.next(),
+            ProjectedContributionKind::FootnoteDefinition => definitions.next(),
+        }
+        .map(|contribution| contribution.id.clone());
+    }
+}
+
 fn projected_contribution_geometry(
     markdown: &str,
+    lines: &[Line],
     projected: &[ProjectedContributionRange],
-    options: &MarkdownRenderOptions,
 ) -> Vec<MarkdownContributionGeometry> {
+    let display = DisplayedMarkdown::new(lines);
+    let mut search_from = 0;
+    let mut details_from = 0;
     projected
         .iter()
         .filter_map(|item| {
-            let prefix = markdown.get(..item.range.start)?;
-            let target = markdown.get(item.range.clone())?;
-            let through = markdown.get(..item.range.end)?;
-            let prefix_lines = render_markdown_projection(prefix, options).0;
-            let through_lines = render_markdown_projection(through, options).0;
-            let start = projected_range_start(&prefix_lines, target, through, options);
-            let end = rendered_cursor(&through_lines);
-            let rects = rects_between(start, end, options.width.max(1));
-            (!rects.is_empty()).then(|| MarkdownContributionGeometry {
-                contribution_id: match item.kind {
-                    ProjectedContributionKind::Details => "details",
-                    ProjectedContributionKind::FootnoteReference => "footnote-reference",
-                    ProjectedContributionKind::FootnoteDefinition => "footnote-definition",
+            let visible = match item.kind {
+                ProjectedContributionKind::Details => {
+                    let target = markdown.get(item.range.clone())?;
+                    if !target.contains("▶ **") && !target.contains("▼ **") {
+                        target.replace("**", "")
+                    } else {
+                        let suffix = markdown.get(details_from..)?;
+                        let (marker_offset, marker) = [
+                            suffix.find("▶ **").map(|offset| (offset, "▶ ")),
+                            suffix.find("▼ **").map(|offset| (offset, "▼ ")),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .min_by_key(|(offset, _)| *offset)?;
+                        let summary_start = marker_offset.saturating_add("▶ **".len());
+                        let summary_len = suffix.get(summary_start..)?.find("**")?;
+                        details_from = details_from
+                            .saturating_add(summary_start)
+                            .saturating_add(summary_len)
+                            .saturating_add(2);
+                        format!(
+                            "{marker}{}",
+                            suffix.get(summary_start..summary_start.saturating_add(summary_len))?
+                        )
+                    }
                 }
-                .to_owned(),
+                ProjectedContributionKind::FootnoteReference
+                | ProjectedContributionKind::FootnoteDefinition => markdown
+                    .get(item.range.clone())?
+                    .replace("**", "")
+                    .replace('`', ""),
+            };
+            let (range, rects) = display.find_geometry(&visible, search_from)?;
+            search_from = range.end;
+            Some(MarkdownContributionGeometry {
+                contribution_id: item.contribution_id.clone().unwrap_or_else(|| {
+                    match item.kind {
+                        ProjectedContributionKind::Details => "details",
+                        ProjectedContributionKind::FootnoteReference => "footnote-reference",
+                        ProjectedContributionKind::FootnoteDefinition => "footnote-definition",
+                    }
+                    .to_owned()
+                }),
                 rects,
             })
         })
         .collect()
 }
 
-fn projected_range_start(
-    prefix_lines: &[Line],
-    target: &str,
-    through: &str,
-    options: &MarkdownRenderOptions,
-) -> (u16, u16) {
-    let end = rendered_cursor(&render_markdown_projection(through, options).0);
-    let target_width = text_display_width(target);
-    if end.1 >= u16::try_from(target_width).unwrap_or(u16::MAX) {
-        return (
-            end.0,
-            end.1
-                .saturating_sub(u16::try_from(target_width).unwrap_or(u16::MAX)),
-        );
+#[derive(Debug)]
+struct DisplayedMarkdown {
+    text: String,
+    cells: Vec<DisplayedMarkdownCell>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DisplayedMarkdownCell {
+    byte_start: usize,
+    byte_end: usize,
+    row: usize,
+    column: usize,
+    width: usize,
+}
+
+impl DisplayedMarkdown {
+    fn new(lines: &[Line]) -> Self {
+        let mut text = String::new();
+        let mut cells = Vec::new();
+        for (row, line) in lines.iter().enumerate() {
+            let mut column = 0;
+            for span in &line.spans {
+                for grapheme in span.content.graphemes(true) {
+                    let byte_start = text.len();
+                    text.push_str(grapheme);
+                    let byte_end = text.len();
+                    let width = text_display_width(grapheme);
+                    cells.push(DisplayedMarkdownCell {
+                        byte_start,
+                        byte_end,
+                        row,
+                        column,
+                        width,
+                    });
+                    column = column.saturating_add(width);
+                }
+            }
+        }
+        Self { text, cells }
     }
-    rendered_cursor(prefix_lines)
-}
 
-fn rendered_cursor(lines: &[Line]) -> (u16, u16) {
-    let Some(last) = lines.last() else {
-        return (0, 0);
-    };
-    (
-        u16::try_from(lines.len().saturating_sub(1)).unwrap_or(u16::MAX),
-        u16::try_from(spans_width(&last.spans)).unwrap_or(u16::MAX),
-    )
-}
-
-fn rects_between(start: (u16, u16), end: (u16, u16), width: u16) -> Vec<MarkdownCellRect> {
-    let (start_row, start_column) = start;
-    let (end_row, end_column) = end;
-    if start_row == end_row {
-        return (end_column > start_column)
-            .then(|| MarkdownCellRect {
-                x: start_column,
-                y: start_row,
-                width: end_column.saturating_sub(start_column),
-                height: 1,
+    fn find_geometry(
+        &self,
+        target: &str,
+        from: usize,
+    ) -> Option<(Range<usize>, Vec<MarkdownCellRect>)> {
+        if target.is_empty() {
+            return None;
+        }
+        let start = self
+            .text
+            .get(from..)
+            .and_then(|suffix| {
+                suffix
+                    .find(target)
+                    .map(|offset| from.saturating_add(offset))
             })
-            .into_iter()
-            .collect();
+            .or_else(|| self.text.find(target))?;
+        let range = start..start.saturating_add(target.len());
+        let mut rects: Vec<MarkdownCellRect> = Vec::new();
+        for cell in self.cells.iter().filter(|cell| {
+            cell.byte_start < range.end && range.start < cell.byte_end && cell.width > 0
+        }) {
+            if let Some(last) = rects.last_mut()
+                && usize::from(last.y) == cell.row
+                && usize::from(last.x.saturating_add(last.width)) == cell.column
+            {
+                last.width = last
+                    .width
+                    .saturating_add(u16::try_from(cell.width).unwrap_or(u16::MAX));
+                continue;
+            }
+            rects.push(markdown_cell_rect(cell.column, cell.row, cell.width));
+        }
+        (!rects.is_empty()).then_some((range, rects))
     }
-    let mut rects = Vec::new();
-    if width > start_column {
-        rects.push(MarkdownCellRect {
-            x: start_column,
-            y: start_row,
-            width: width.saturating_sub(start_column),
-            height: 1,
-        });
-    }
-    for row in start_row.saturating_add(1)..end_row {
-        rects.push(MarkdownCellRect {
-            x: 0,
-            y: row,
-            width,
-            height: 1,
-        });
-    }
-    if end_column > 0 {
-        rects.push(MarkdownCellRect {
-            x: 0,
-            y: end_row,
-            width: end_column,
-            height: 1,
-        });
-    }
-    rects
 }
 
 fn assign_contribution_geometry(
     mut geometry: Vec<MarkdownContributionGeometry>,
     contributions: &[MarkdownContribution],
 ) -> Vec<MarkdownContributionGeometry> {
+    let contribution_ids = contributions
+        .iter()
+        .map(|contribution| contribution.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let has_projected_details = geometry
+        .iter()
+        .any(|item| item.contribution_id == "details");
     let mut links = contributions.iter().filter_map(|contribution| {
         matches!(contribution.kind, MarkdownContributionKind::Link { .. })
             .then_some(contribution.id.as_str())
@@ -1169,8 +1504,12 @@ fn assign_contribution_geometry(
             .then_some(contribution.id.as_str())
     });
     geometry.retain_mut(|item| {
+        if contribution_ids.contains(item.contribution_id.as_str()) {
+            return true;
+        }
         let id = match item.contribution_id.as_str() {
-            "link" => links.next(),
+            "link" if has_projected_details => links.next(),
+            "link" => links.next().or_else(|| details.next()),
             "image" => images.next(),
             "details" => details.next(),
             "footnote-reference" => footnote_references.next(),
@@ -1194,33 +1533,15 @@ fn markdown_layout_signature(
     contributions: &[MarkdownContribution],
     geometry: &[MarkdownContributionGeometry],
 ) -> String {
-    format!(
-        "markdown-layout-v3:{}:{}:{}:{}:{:?}:{}:{}:{}:{}:{}:{}:{}:{}",
-        options.width,
-        stable_text_hash(markdown),
-        stable_text_hash(&format!("{:?}", options.theme)),
-        stable_text_hash(&format!("{:?}", options.document_context)),
-        options.mermaid,
-        options.mermaid_width,
-        options.image_reserved_rows,
-        options.mermaid_reserved_rows,
-        options.streaming,
-        options.details_interactive,
-        stable_text_hash(&format!("{:?}", options.details_open)),
-        stable_text_hash(&format!("{}:{:?}", options.mermaid_height, contributions)),
-        stable_text_hash(&format!("{geometry:?}"))
-    )
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    markdown.hash(&mut hasher);
+    options.hash(&mut hasher);
+    contributions.hash(&mut hasher);
+    geometry.hash(&mut hasher);
+    format!("markdown-layout-v4:{:016x}", hasher.finish())
 }
 
-fn stable_text_hash(source: &str) -> u64 {
-    const OFFSET: u64 = 14_695_981_039_346_656_037;
-    const PRIME: u64 = 1_099_511_628_211;
-    source.as_bytes().iter().fold(OFFSET, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ProjectedContributionKind {
     Details,
     FootnoteReference,
@@ -1231,6 +1552,7 @@ enum ProjectedContributionKind {
 struct ProjectedContributionRange {
     kind: ProjectedContributionKind,
     range: Range<usize>,
+    contribution_id: Option<String>,
 }
 
 struct ProjectedMarkdown<'a> {
@@ -1420,6 +1742,7 @@ fn project_semantic_fallbacks<'a>(
                 kind,
                 range: range.start.saturating_add(local.start)
                     ..range.start.saturating_add(local.end),
+                contribution_id: None,
             });
         }
     }
@@ -1438,6 +1761,7 @@ fn project_semantic_fallbacks<'a>(
             projected_contributions.push(ProjectedContributionRange {
                 kind: ProjectedContributionKind::FootnoteDefinition,
                 range: start..number_end,
+                contribution_id: None,
             });
             if !definition.reference_numbers.is_empty() {
                 projected.push_str(" ↩");
@@ -2081,7 +2405,9 @@ pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> 
 fn render_markdown_projection(
     markdown: &str,
     options: &MarkdownRenderOptions,
-) -> (Vec<Line>, Vec<MarkdownContributionGeometry>) {
+) -> (Vec<Line>, Vec<MarkdownContributionGeometry>, Vec<u16>) {
+    #[cfg(test)]
+    MARKDOWN_PROJECTION_COUNT.set(MARKDOWN_PROJECTION_COUNT.get().saturating_add(1));
     let table_alignments = table_alignments(markdown);
     let alert_kinds = alert_kinds(markdown);
     let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
@@ -2737,6 +3063,7 @@ struct TerminalMarkdownRenderer {
     current_spans: Vec<Span>,
     current_width: usize,
     geometry: Rc<RefCell<Vec<MarkdownContributionGeometry>>>,
+    heading_rows: Rc<RefCell<Vec<u16>>>,
     origin_x: usize,
     origin_y: usize,
     in_table_collection: bool,
@@ -2764,6 +3091,7 @@ impl TerminalMarkdownRenderer {
             current_spans: Vec::new(),
             current_width: 0,
             geometry: Rc::new(RefCell::new(Vec::new())),
+            heading_rows: Rc::new(RefCell::new(Vec::new())),
             origin_x: 0,
             origin_y: 0,
             in_table_collection: false,
@@ -2784,6 +3112,7 @@ impl TerminalMarkdownRenderer {
             current_spans: Vec::new(),
             current_width: 0,
             geometry: Rc::clone(&self.geometry),
+            heading_rows: Rc::clone(&self.heading_rows),
             origin_x,
             origin_y,
             in_table_collection: false,
@@ -2803,7 +3132,7 @@ impl TerminalMarkdownRenderer {
         self.rows
     }
 
-    fn finish_projection(mut self) -> (Vec<Line>, Vec<MarkdownContributionGeometry>) {
+    fn finish_projection(mut self) -> (Vec<Line>, Vec<MarkdownContributionGeometry>, Vec<u16>) {
         self.flush_line();
         let trimmed_top = self
             .rows
@@ -2811,15 +3140,18 @@ impl TerminalMarkdownRenderer {
             .take_while(|line| line.spans.is_empty())
             .count();
         trim_blank_edges(&mut self.rows);
+        let trimmed_top = u16::try_from(trimmed_top).unwrap_or(u16::MAX);
         let mut geometry = std::mem::take(&mut *self.geometry.borrow_mut());
         for item in &mut geometry {
             for rect in &mut item.rects {
-                rect.y = rect
-                    .y
-                    .saturating_sub(u16::try_from(trimmed_top).unwrap_or(u16::MAX));
+                rect.y = rect.y.saturating_sub(trimmed_top);
             }
         }
-        (self.rows, geometry)
+        let mut heading_rows = std::mem::take(&mut *self.heading_rows.borrow_mut());
+        for row in &mut heading_rows {
+            *row = row.saturating_sub(trimmed_top);
+        }
+        (self.rows, geometry, heading_rows)
     }
 
     fn render_container_children(&mut self, container: &Container, style: TextStyle) {
@@ -2879,6 +3211,10 @@ impl TerminalMarkdownRenderer {
             Element::Table => self.render_table(container, style),
             Element::Heading { .. } => {
                 self.ensure_blank_line();
+                self.heading_rows.borrow_mut().push(
+                    u16::try_from(self.origin_y.saturating_add(self.rows.len()))
+                        .unwrap_or(u16::MAX),
+                );
                 self.render_container_children(
                     container,
                     TextStyle {
@@ -3694,8 +4030,9 @@ mod tests {
 
     use super::{
         MarkdownContribution, MarkdownContributionKind, MarkdownDestination, MarkdownRenderOptions,
-        MarkdownTheme, MermaidContributionRendering, TableRow, aligned_padding,
-        markdown_to_plain_text, render_markdown, render_markdown_lines, table_column_widths,
+        MarkdownStreamingRenderState, MarkdownTheme, MermaidContributionRendering, TableRow,
+        aligned_padding, markdown_stage_diagnostics, markdown_to_plain_text, markdown_work_counts,
+        render_markdown, render_markdown_lines, reset_markdown_work_counts, table_column_widths,
         table_content_line, text_display_width,
     };
     use bmux_tui::prelude::{Color, Modifier, Span, Style};
@@ -3915,7 +4252,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_heading_anchors_use_github_slugs_duplicates_and_explicit_ids() {
+    fn internal_heading_anchorse_github_slugs_duplicates_and_explicit_ids() {
         let source = "# Hello, World!\n\n## Hello World\n\n### Custom {#chosen}";
         let rendered = render_markdown(source, &MarkdownRenderOptions::new(80));
         assert_eq!(
@@ -4124,6 +4461,208 @@ mod tests {
                 .collect::<String>()
                 .contains("Bcode")
         );
+    }
+
+    #[test]
+    fn append_state_matches_full_render_for_plain_paragraph_prefixes() {
+        let source = "First paragraph grows here.\n\nSecond paragraph streams progressively.";
+        let options = MarkdownRenderOptions::new(24).with_streaming(true);
+        let mut state = MarkdownStreamingRenderState::default();
+        for end in source
+            .char_indices()
+            .map(|(index, character)| index.saturating_add(character.len_utf8()))
+        {
+            let prefix = &source[..end];
+            assert_eq!(
+                state.render(prefix, &options),
+                render_markdown(prefix, &options)
+            );
+        }
+    }
+
+    #[test]
+    fn append_state_falls_back_exactly_for_retroactive_or_incompatible_changes() {
+        let cases = [
+            "# heading\n\nparagraph",
+            "paragraph\n\n- list item",
+            "paragraph\n\n1. ordered item",
+            "paragraph\n\n| a | b |\n| - | - |",
+            "paragraph\n\n```rust\nfn main() {}\n```",
+            "paragraph [link](https://example.com)",
+            "paragraph\n\n<details><summary>More</summary>Body</details>",
+            "paragraph[^note]\n\n[^note]: Definition",
+            "paragraph with $x^2$ math",
+            "```mermaid\nflowchart LR\nA --> B\n```",
+            "Unicode 東京 🧪 and é.\n\nNext paragraph.",
+            "hard break  \nnext line",
+        ];
+        for source in cases {
+            let options = MarkdownRenderOptions::new(32).with_streaming(true);
+            let mut state = MarkdownStreamingRenderState::default();
+            for end in source
+                .char_indices()
+                .map(|(index, character)| index.saturating_add(character.len_utf8()))
+            {
+                let prefix = &source[..end];
+                assert_eq!(
+                    state.render(prefix, &options),
+                    render_markdown(prefix, &options)
+                );
+            }
+            let finalized = MarkdownRenderOptions::new(32);
+            assert_eq!(
+                state.render(source, &finalized),
+                render_markdown(source, &finalized)
+            );
+        }
+    }
+
+    #[test]
+    fn append_state_work_scales_with_unstable_suffix_not_total_history() {
+        let paragraph =
+            "a stable paragraph with enough text to represent a realistic streamed block.";
+        let source = (0..64)
+            .map(|index| format!("{paragraph} {index}."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let options = MarkdownRenderOptions::new(80).with_streaming(true);
+        let mut state = MarkdownStreamingRenderState::default();
+        let mut current = String::new();
+        for block in source.split_inclusive("\n\n") {
+            current.push_str(block);
+            let _ = state.render(&current, &options);
+        }
+        let processed = state.processed_source_bytes();
+        assert!(
+            processed <= source.len().saturating_mul(3),
+            "incremental renderer processed {processed} bytes for {} accepted bytes",
+            source.len()
+        );
+    }
+
+    #[test]
+    fn append_state_falls_back_for_replacement_and_width_changes() {
+        let mut state = MarkdownStreamingRenderState::default();
+        let streaming = MarkdownRenderOptions::new(20).with_streaming(true);
+        let _ = state.render("one paragraph", &streaming);
+        let replaced = state.render("replacement", &streaming);
+        assert_eq!(replaced, render_markdown("replacement", &streaming));
+
+        let resized = MarkdownRenderOptions::new(10).with_streaming(true);
+        let result = state.render("replacement grows", &resized);
+        assert_eq!(result, render_markdown("replacement grows", &resized));
+        assert!(state.stable_source_len <= state.source.len());
+    }
+
+    #[test]
+    fn stage_diagnostics_cover_every_full_render_stage() {
+        reset_markdown_work_counts();
+        let _ = render_markdown(
+            "# Heading\n\n[link](https://example.com)\n\n```rust\nfn main() {}\n```",
+            &MarkdownRenderOptions::new(80),
+        );
+        let diagnostics = markdown_stage_diagnostics();
+        assert_eq!(
+            [
+                diagnostics.semantic_parse,
+                diagnostics.fallback_projection,
+                diagnostics.hyperchad_conversion,
+                diagnostics.syntax_highlighting,
+                diagnostics.terminal_layout,
+                diagnostics.geometry,
+                diagnostics.anchors,
+                diagnostics.signature,
+            ]
+            .len(),
+            8
+        );
+        assert_eq!(markdown_work_counts(), (1, 1));
+    }
+
+    #[test]
+    fn plain_document_uses_one_semantic_parse_and_one_terminal_projection() {
+        reset_markdown_work_counts();
+        let result = render_markdown(
+            "# Heading\n\nPlain paragraph with **strong** text.",
+            &MarkdownRenderOptions::new(80),
+        );
+
+        assert!(!result.lines.is_empty());
+        assert_eq!(markdown_work_counts(), (1, 1));
+    }
+
+    #[test]
+    fn heading_and_projected_contribution_density_do_not_add_projection_passes() {
+        for count in [1, 8, 64] {
+            let headings = (0..count)
+                .map(|index| format!("## Heading {index}"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            reset_markdown_work_counts();
+            let result = render_markdown(&headings, &MarkdownRenderOptions::new(80));
+            assert_eq!(result.anchors.len(), count);
+            assert_eq!(markdown_work_counts(), (1, 1));
+
+            let footnotes = (0..count)
+                .map(|index| {
+                    format!("reference [^note-{index}]\n\n[^note-{index}]: definition {index}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            reset_markdown_work_counts();
+            let result = render_markdown(&footnotes, &MarkdownRenderOptions::new(80));
+            assert!(result.geometry.len() >= count.saturating_mul(2));
+            let (parses, projections) = markdown_work_counts();
+            assert!(parses <= 2, "unexpected parse amplification: {parses}");
+            assert_eq!(projections, 1);
+        }
+    }
+
+    #[test]
+    fn representative_geometry_matrix_is_bounded_at_narrow_and_wide_widths() {
+        let source = concat!(
+            "# Heading\n\n",
+            "> [!NOTE]\n> [quoted link](https://example.com).\n\n",
+            "<details><summary>More</summary>Body</details>\n\n",
+            "Text[^note] and ![image](https://example.com/image.png).\n\n",
+            "[^note]: Definition.\n\n",
+            "| left | right |\n| --- | ---: |\n| one | two |\n\n",
+            "Inline $x^2$.\n\n```mermaid\nflowchart LR\nA --> B\n```",
+        );
+        for width in [12, 80] {
+            let result = render_markdown(
+                source,
+                &MarkdownRenderOptions::new(width)
+                    .with_document_id("matrix")
+                    .with_mermaid_contributions(1600, 1200),
+            );
+            assert!(!result.lines.is_empty());
+            assert!(result.geometry.iter().all(|geometry| {
+                !geometry.rects.is_empty()
+                    && geometry.rects.iter().all(|rect| {
+                        rect.width > 0
+                            && rect.height == 1
+                            && usize::from(rect.y) < result.lines.len()
+                    })
+            }));
+            for kind in [
+                "link",
+                "details",
+                "footnote-reference",
+                "footnote-definition",
+                "image",
+                "mermaid",
+            ] {
+                assert!(
+                    result
+                        .geometry
+                        .iter()
+                        .any(|geometry| geometry.contribution_id.contains(&format!(":{kind}:"))),
+                    "missing {kind} geometry at width {width}: {:?}",
+                    result.geometry
+                );
+            }
+        }
     }
 
     #[test]
@@ -4406,7 +4945,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_link_geometry_uses_document_relative_list_and_blockquote_offsets() {
+    fn nested_link_geometryes_document_relative_list_and_blockquote_offsets() {
         let result = render_markdown(
             "* before [list](https://example.com/list)\n\n  > [quote](https://example.com/quote)",
             &MarkdownRenderOptions::new(40),

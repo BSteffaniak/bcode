@@ -455,6 +455,41 @@ fn streamed_text_integrity_is_visible_without_rewriting_source_bytes() {
 
 #[cfg(test)]
 #[test]
+fn transcript_layout_and_semantics_share_one_markdown_projection() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.push_system_markdown("# Heading\n\n[guide](https://example.com)".to_owned());
+    let area = Rect::new(0, 0, 80, 24);
+
+    prepare_frame(&mut app, area).expect("prepared frame");
+    let item = &app.transcript()[0];
+    let first = transcript_markdown_projection(&app, item, area.width);
+    let second = transcript_markdown_projection(&app, item, area.width);
+
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+    assert_eq!(app.transcript_markdown_cache().render_count(), 1);
+}
+
+#[cfg(test)]
+#[test]
+fn pure_scroll_reuses_markdown_projection_without_rendering() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.push_system_markdown(
+        (0..80)
+            .map(|index| format!("## Heading {index}\n\nParagraph {index}."))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    );
+    let area = Rect::new(0, 0, 60, 12);
+
+    prepare_frame(&mut app, area).expect("initial frame");
+    assert_eq!(app.transcript_markdown_cache().render_count(), 1);
+    assert!(app.scroll_transcript_up(4));
+    prepare_frame(&mut app, area).expect("scrolled frame");
+    assert_eq!(app.transcript_markdown_cache().render_count(), 1);
+}
+
+#[cfg(test)]
+#[test]
 fn bottom_dock_never_overlaps_transcript_and_preserves_one_row() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     let terminal = Rect::new(0, 0, 80, 20);
@@ -959,7 +994,7 @@ pub const fn transcript_area_for_body(_app: &BmuxApp, area: Rect) -> Rect {
     area
 }
 
-fn markdown_render_options(
+pub fn markdown_render_options(
     app: &BmuxApp,
     item: &TranscriptItem,
     width: u16,
@@ -1281,15 +1316,30 @@ fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscr
     regions
 }
 
+pub fn transcript_markdown_projection_for_layout(
+    app: &BmuxApp,
+    item: &TranscriptItem,
+    width: u16,
+) -> Option<std::sync::Arc<bcode_markdown_render::MarkdownRenderResult>> {
+    (item.text_format() == TextFormat::Markdown).then(|| {
+        let options = markdown_render_options(app, item, width.saturating_sub(2).max(1));
+        app.transcript_markdown_cache()
+            .get(item.id().get(), item.revision(), &options)
+            .or_else(|| {
+                app.transcript_markdown_cache()
+                    .get_previous_compatible(item.id().get(), &options)
+            })
+            .unwrap_or_else(|| app.transcript_markdown_cache().project(item, options))
+    })
+}
+
 fn transcript_markdown_projection(
     app: &BmuxApp,
     item: &TranscriptItem,
     width: u16,
 ) -> std::sync::Arc<bcode_markdown_render::MarkdownRenderResult> {
-    app.transcript_markdown_cache().project(
-        item,
-        markdown_render_options(app, item, width.saturating_sub(2).max(1)),
-    )
+    transcript_markdown_projection_for_layout(app, item, width)
+        .expect("Markdown projection requested for non-Markdown transcript item")
 }
 
 fn transcript_markdown_content_row_offset(
@@ -1506,15 +1556,26 @@ fn markdown_hit_regions_follow_scroll_resize_and_replacement() {
     }));
 }
 
+#[cfg(test)]
 pub fn transcript_item_rows_from_item(
     item: &TranscriptItem,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
     diff_viewer_config: TuiDiffViewerConfig,
 ) -> Vec<Line> {
+    transcript_item_rows_from_item_with_markdown(item, width, plugin_host, diff_viewer_config, None)
+}
+
+pub fn transcript_item_rows_from_item_with_markdown(
+    item: &TranscriptItem,
+    width: u16,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    diff_viewer_config: TuiDiffViewerConfig,
+    markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
+) -> Vec<Line> {
     DIFF_VIEWER_CONFIG.with(|config| config.set(diff_viewer_config));
     let mut rows = Vec::new();
-    push_transcript_item_rows(&mut rows, item, width, plugin_host);
+    push_transcript_item_rows(&mut rows, item, width, plugin_host, markdown);
     rows
 }
 
@@ -1609,6 +1670,7 @@ fn push_transcript_item_rows(
     item: &TranscriptItem,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
 ) {
     if let Some(integrity) = item.stream_integrity() {
         let message = match integrity {
@@ -1623,21 +1685,32 @@ fn push_transcript_item_rows(
     }
     match item.kind() {
         TranscriptItemKind::UserMessage => {
-            push_formatted_block(
-                rows,
-                &item.display_role(),
-                item.text(),
-                item.text_format(),
-                Color::Blue,
-                true,
-                width,
-            );
+            if let Some(markdown) = markdown {
+                push_markdown_projection_block(
+                    rows,
+                    &item.display_role(),
+                    markdown,
+                    Color::Blue,
+                    width,
+                    true,
+                );
+            } else {
+                push_formatted_block(
+                    rows,
+                    &item.display_role(),
+                    item.text(),
+                    item.text_format(),
+                    Color::Blue,
+                    true,
+                    width,
+                );
+            }
         }
         TranscriptItemKind::AssistantMessage => {
-            push_assistant_rows(rows, item, width);
+            push_assistant_rows(rows, item, width, markdown);
         }
         TranscriptItemKind::ReasoningMessage => {
-            push_reasoning_rows(rows, item, width);
+            push_reasoning_rows(rows, item, width, markdown);
         }
         TranscriptItemKind::ToolRequest {
             tool_call_id: _,
@@ -1697,15 +1770,26 @@ fn push_transcript_item_rows(
             );
         }
         TranscriptItemKind::System => {
-            push_formatted_block(
-                rows,
-                &item.display_role(),
-                item.text(),
-                item.text_format(),
-                Color::BrightBlack,
-                false,
-                width,
-            );
+            if let Some(markdown) = markdown {
+                push_markdown_projection_block(
+                    rows,
+                    &item.display_role(),
+                    markdown,
+                    Color::BrightBlack,
+                    width,
+                    false,
+                );
+            } else {
+                push_formatted_block(
+                    rows,
+                    &item.display_role(),
+                    item.text(),
+                    item.text_format(),
+                    Color::BrightBlack,
+                    false,
+                    width,
+                );
+            }
         }
         TranscriptItemKind::Meta => {
             push_meta_block(rows, item.text(), width);
@@ -1855,7 +1939,12 @@ fn push_transcript_item_rows(
     }
 }
 
-fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
+fn push_assistant_rows(
+    rows: &mut Vec<Line>,
+    item: &TranscriptItem,
+    width: u16,
+    markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
+) {
     let title = if item.streaming() {
         "Bcode …"
     } else {
@@ -1866,7 +1955,9 @@ fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
     } else {
         Color::Green
     };
-    if item.text_format() == TextFormat::Markdown {
+    if let Some(markdown) = markdown {
+        push_markdown_projection_block(rows, title, markdown, color, width, true);
+    } else if item.text_format() == TextFormat::Markdown {
         push_markdown_block_with_streaming(
             rows,
             title,
@@ -1922,6 +2013,42 @@ fn push_markdown_block(
     prominent: bool,
 ) {
     push_markdown_block_with_streaming(rows, title, body, color, width, prominent, false);
+}
+
+fn push_markdown_projection_block(
+    rows: &mut Vec<Line>,
+    title: &str,
+    rendered: &bcode_markdown_render::MarkdownRenderResult,
+    color: Color,
+    width: u16,
+    prominent: bool,
+) {
+    let heading_style = if prominent {
+        Style::new().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(color)
+    };
+    push_wrapped_styled_text(rows, Vec::new(), title, width, heading_style, heading_style);
+    if rendered.lines.is_empty() {
+        rows.push(Line::from_spans(vec![
+            Span::styled("  ", muted_style()),
+            Span::styled(
+                "·",
+                if prominent {
+                    Style::new()
+                } else {
+                    muted_style()
+                },
+            ),
+        ]));
+    } else {
+        for line in &rendered.lines {
+            let mut spans = vec![Span::styled("  ", muted_style())];
+            spans.extend(line.spans.iter().cloned());
+            rows.push(Line::from_spans(spans));
+        }
+    }
+    rows.push(Line::default());
 }
 
 fn push_markdown_block_with_streaming(
@@ -2665,13 +2792,20 @@ fn format_aware_json_pretty_prints_valid_values() {
     );
 }
 
-fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
+fn push_reasoning_rows(
+    rows: &mut Vec<Line>,
+    item: &TranscriptItem,
+    width: u16,
+    markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
+) {
     let title = if item.streaming() {
         "Reasoning …"
     } else {
         "Reasoning"
     };
-    if item.text_format() == TextFormat::Markdown {
+    if let Some(markdown) = markdown {
+        push_markdown_projection_block(rows, title, markdown, Color::BrightBlack, width, false);
+    } else if item.text_format() == TextFormat::Markdown {
         push_markdown_block_with_streaming(
             rows,
             title,

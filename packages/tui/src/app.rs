@@ -290,6 +290,13 @@ impl<'a> TranscriptItems<'a> {
     pub fn iter(self) -> impl DoubleEndedIterator<Item = &'a TranscriptItem> {
         self.canonical.iter().chain(self.notices.iter())
     }
+
+    /// Collect visible items into an owned vector for isolated tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn to_vec(self) -> Vec<TranscriptItem> {
+        self.iter().cloned().collect()
+    }
 }
 
 impl<'a> IntoIterator for TranscriptItems<'a> {
@@ -301,6 +308,13 @@ impl<'a> IntoIterator for TranscriptItems<'a> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.canonical.iter().chain(self.notices.iter())
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<&[TranscriptItem]> for TranscriptItems<'_> {
+    fn eq(&self, other: &&[TranscriptItem]) -> bool {
+        self.iter().eq(other.iter())
     }
 }
 
@@ -1734,6 +1748,15 @@ impl BmuxApp {
             });
         self.token_usage.apply_model_info(model.as_ref());
         self.apply_context_occupancy(status.context_occupancy.map(|occupancy| *occupancy));
+    }
+
+    /// Mark one stable transcript index dirty after a presentation completion.
+    pub fn mark_transcript_item_dirty(&mut self, index: usize) {
+        if index < self.transcript().len() {
+            self.transcript_dirty_items.insert(index);
+            self.transcript_projection_revision =
+                self.transcript_projection_revision.saturating_add(1);
+        }
     }
 
     /// Return pending submissions that have not been committed by the session stream.

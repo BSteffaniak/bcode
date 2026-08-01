@@ -57,6 +57,21 @@ fn max_bottom_overscroll(area: Rect) -> usize {
     usize::from(area.height).saturating_sub(1)
 }
 
+fn transcript_item_rows(
+    app: &BmuxApp,
+    item: &TranscriptItem,
+    input: &TranscriptLayoutInput<'_>,
+) -> Vec<bmux_tui::prelude::Line> {
+    let markdown = render::transcript_markdown_projection_for_layout(app, item, input.width);
+    render::transcript_item_rows_from_item_with_markdown(
+        item,
+        input.width,
+        input.plugin_host,
+        input.diff_viewer_config,
+        markdown.as_deref(),
+    )
+}
+
 fn sync_layout(app: &mut BmuxApp, width: u16) {
     render::set_markdown_details_open(app.markdown_details_open());
     let started = Instant::now();
@@ -80,14 +95,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
             fingerprint,
             &transcript_dirty_items,
             |index| transcript_item_signature(&input.transcript[index], &input),
-            |index| {
-                render::transcript_item_rows_from_item(
-                    &input.transcript[index],
-                    input.width,
-                    input.plugin_host,
-                    input.diff_viewer_config,
-                )
-            },
+            |index| transcript_item_rows(app, &input.transcript[index], &input),
         );
         *app.transcript_layout_mut() = transcript_layout;
         return;
@@ -107,14 +115,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
             fingerprint,
             &dirty_visuals,
             |index| transcript_item_signature(&input.transcript[index], &input),
-            |index| {
-                render::transcript_item_rows_from_item(
-                    &input.transcript[index],
-                    input.width,
-                    input.plugin_host,
-                    input.diff_viewer_config,
-                )
-            },
+            |index| transcript_item_rows(app, &input.transcript[index], &input),
         );
         *app.transcript_layout_mut() = transcript_layout;
         return;
@@ -126,14 +127,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
         transcript_len: input.transcript.len(),
         pending_len: input.pending.len(),
         transcript_signature: |index| transcript_item_signature(&input.transcript[index], &input),
-        transcript_rows: |index| {
-            render::transcript_item_rows_from_item(
-                &input.transcript[index],
-                input.width,
-                input.plugin_host,
-                input.diff_viewer_config,
-            )
-        },
+        transcript_rows: |index| transcript_item_rows(app, &input.transcript[index], &input),
         transcript_invocation_id: |index: usize| {
             input.transcript[index]
                 .visual_invocation_id()

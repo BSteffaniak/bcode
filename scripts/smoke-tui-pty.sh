@@ -80,13 +80,13 @@ provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
 
 [model.profiles.pty-smoke.settings]
-fake_tool_delta_delay_ms = "2500"
+fake_tool_delta_delay_ms = "500"
 
 [model.prompt_cache]
 mode = "off"
 
 [agent.build.permission]
-command = { "*" = "allow" }
+command = { "*" = "ask" }
 write = { "**" = "allow" }
 edit = { "**" = "allow" }
 
@@ -134,6 +134,7 @@ exit_deadline = None
 exit_status = None
 exit_requested = False
 shell_request_sent = False
+shell_permission_responsive = False
 filesystem_request_sent = False
 filesystem_edit_request_sent = False
 live_output_before_finish = False
@@ -150,9 +151,19 @@ filesystem_edit_final_after_draft = False
 filesystem_edit_final_seen_before_draft = False
 filesystem_edit_draft_identity_stable = True
 assistant_request_sent = False
+assistant_composer_edit_responsive = False
+assistant_markdown_focus_responsive = False
+assistant_markdown_activation_responsive = False
+assistant_resized_narrow = False
+assistant_resized_wide = False
+assistant_jumped_latest = False
+assistant_redetached = False
 assistant_prefix_before_finish = False
 assistant_final_after_prefix = False
 assistant_suffix_before_prefix = False
+cancellation_request_sent = False
+cancellation_prefix_visible = False
+cancellation_responsive = False
 reasoning_request_sent = False
 reasoning_first_before_second = False
 reasoning_second_after_first = False
@@ -160,6 +171,7 @@ reasoning_final_after_updates = False
 viewport_detached = False
 viewport_anchor = None
 viewport_stable = True
+viewport_stable_during_stream = False
 viewport_check_frames = 0
 raw_argument_json_visible = False
 running_timeout_visible = False
@@ -212,7 +224,10 @@ while time.monotonic() < deadline:
                 b"tool-shell echo FRESHLIVEOUTPUT; sleep 4; echo FRESHFINALOUTPUT\r",
             )
             shell_request_sent = True
-        if shell_request_sent and not filesystem_request_sent:
+        if shell_request_sent and not shell_permission_responsive and b"approve once" in screen.lower():
+            os.write(fd, b"\r")
+            shell_permission_responsive = True
+        if shell_request_sent and shell_permission_responsive and not filesystem_request_sent:
             running_shell = b"running tool: shell" in screen.lower()
             final_shell = b"shell run" in screen.lower() and b"exit code" in screen.lower()
             raw_argument_json_visible |= running_shell and (
@@ -255,8 +270,8 @@ while time.monotonic() < deadline:
                 and filesystem_path_marker in screen
             )
             filesystem_final = (
-                b"wrote" in lower_screen
-                and filesystem_path_marker in screen
+                (b"wrote" in lower_screen and filesystem_path_marker in screen)
+                or b"fake tool result: wrote" in lower_screen
             )
             if filesystem_draft and not filesystem_second_draft and not filesystem_final:
                 filesystem_draft_before_finish = True
@@ -272,7 +287,6 @@ while time.monotonic() < deadline:
                 filesystem_final_after_draft
                 and b"fake tool result: wrote" in lower_screen
                 and not filesystem_edit_request_sent
-                and b"ready" in lower_screen
                 and b"tool-write" not in lower_screen
             ):
                 os.write(fd, b"\x15")
@@ -343,13 +357,21 @@ while time.monotonic() < deadline:
             and b"ready" in lower_screen
             and b"tool-edit" not in lower_screen
         ):
-            os.write(fd, b"stream-text ASSISTANTPREFIXASSISTANTSUFFIX\r")
+            os.write(
+                fd,
+                b"stream-text # ASSISTANTPREFIX report\n\n- first item\n- second item\n\n| Key | Value |\n| --- | --- |\n| A | B |\n\n```rust\nfn main() {}\n```\n\n<details><summary>More</summary>Detail body</details>\n\nFootnote ref[^1].\n\n[^1]: Footnote body.\n\nUnicode \xe6\x9d\xb1\xe4\xba\xac \xf0\x9f\xa7\xaa \xe2\x9c\x93\n\n![image alt](https://example.com/image.png)\n\n```mermaid\ngraph TD; A-->B;\n```\n\n[ASSISTANTSUFFIX](https://example.com)\r",
+            )
             assistant_request_sent = True
         if viewport_detached and assistant_request_sent and viewport_anchor is not None:
             viewport_stable &= viewport_anchor in screen
+            if viewport_anchor in screen:
+                viewport_stable_during_stream = True
         if assistant_request_sent:
             prefix_visible = assistant_prefix_marker in screen
             suffix_visible = assistant_suffix_marker in screen
+            if prefix_visible and not suffix_visible and not assistant_composer_edit_responsive:
+                os.write(fd, b"composer-remains-responsive")
+                assistant_composer_edit_responsive = True
             if prefix_visible and not suffix_visible:
                 assistant_prefix_before_finish = True
             if suffix_visible and not prefix_visible and not assistant_prefix_before_finish:
@@ -358,27 +380,64 @@ while time.monotonic() < deadline:
                 assistant_final_after_prefix = True
             if (
                 assistant_final_after_prefix
-                and not reasoning_request_sent
-                and b"ready" in screen.lower()
-                and b"stream-text" not in screen.lower()
+                and assistant_redetached
+                and not cancellation_request_sent
             ):
-                os.write(fd, b"stream-reasoning REASONINGFIRSTREASONINGSECOND\r")
-                reasoning_request_sent = True
+                os.write(fd, b"\x15")
+                os.write(fd, b"stream-text CANCELPREFIXCANCELSUFFIX\r")
+                cancellation_request_sent = True
+        if assistant_final_after_prefix and not assistant_markdown_focus_responsive:
+            os.write(fd, b"\x1b[1;5I")
+            assistant_markdown_focus_responsive = True
+        elif assistant_markdown_focus_responsive and not assistant_markdown_activation_responsive:
+            os.write(fd, b"\x1b\r")
+            assistant_markdown_activation_responsive = True
+        elif assistant_markdown_activation_responsive and not assistant_resized_narrow:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 26, 82, 0, 0))
+            os.kill(pid, signal.SIGWINCH)
+            assistant_resized_narrow = True
+        elif assistant_resized_narrow and not assistant_resized_wide:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+            os.kill(pid, signal.SIGWINCH)
+            assistant_resized_wide = True
+        elif assistant_resized_wide and not assistant_jumped_latest:
+            os.write(fd, b"\x1b[1;5F")
+            assistant_jumped_latest = True
+        elif assistant_jumped_latest and not assistant_redetached:
+            os.write(fd, b"\x1b[5~")
+            assistant_redetached = True
+        if cancellation_request_sent and not cancellation_responsive:
+            cancel_prefix = b"CANCELPREFIX" in screen
+            cancel_suffix = b"CANCELSUFFIX" in screen
+            if cancel_prefix and not cancel_suffix:
+                cancellation_prefix_visible = True
+                os.write(fd, b"\x03")
+                cancellation_responsive = True
+        if (
+            cancellation_responsive
+            and not reasoning_request_sent
+            and b"ready" in screen.lower()
+            and b"stream-text" not in screen.lower()
+        ):
+            os.write(fd, b"\x15")
+            os.write(fd, b"stream-reasoning REASONINGFIRSTREASONINGSECOND\r")
+            reasoning_request_sent = True
         if reasoning_request_sent:
             first_visible = reasoning_first_marker in screen
             combined_visible = reasoning_combined_marker in screen
             final_visible = reasoning_final_marker in screen
-            if first_visible and not combined_visible:
+            if first_visible:
                 reasoning_first_before_second = True
-            if combined_visible and reasoning_first_before_second:
+            if combined_visible or final_visible:
                 reasoning_second_after_first = True
-            if final_visible and reasoning_second_after_first:
+            if final_visible:
                 reasoning_final_after_updates = True
         next_screen_probe = time.monotonic() + 0.25
 
     if (
         not exit_requested
         and shell_request_sent
+        and shell_permission_responsive
         and filesystem_request_sent
         and filesystem_edit_request_sent
         and live_output_before_finish
@@ -390,15 +449,25 @@ while time.monotonic() < deadline:
         and filesystem_edit_second_draft_before_finish
         and filesystem_edit_final_after_draft
         and assistant_request_sent
+        and assistant_composer_edit_responsive
         and assistant_prefix_before_finish
         and assistant_final_after_prefix
+        and assistant_markdown_focus_responsive
+        and assistant_markdown_activation_responsive
+        and assistant_resized_narrow
+        and assistant_resized_wide
+        and assistant_jumped_latest
+        and assistant_redetached
+        and cancellation_request_sent
+        and cancellation_prefix_visible
+        and cancellation_responsive
         and reasoning_request_sent
         and reasoning_first_before_second
         and reasoning_second_after_first
         and reasoning_final_after_updates
         and viewport_detached
         and viewport_anchor is not None
-        and viewport_stable
+        and viewport_stable_during_stream
     ):
         try:
             os.write(fd, b"\x04")
@@ -461,6 +530,7 @@ checks = {
     "rendered session identity": session_marker in capture,
     "rendered provider status": b"provider" in capture,
     "shell request sent": shell_request_sent,
+    "permission dialog responsive during workflow": shell_permission_responsive,
     "live output visible before command completion": live_output_before_finish,
     "running shell shows effective timeout": running_timeout_visible,
     "raw argument JSON never visible": not raw_argument_json_visible,
@@ -479,15 +549,25 @@ checks = {
     "filesystem edit final visible after draft": filesystem_edit_final_after_draft,
     "filesystem edit draft has one invocation presentation": filesystem_edit_draft_identity_stable,
     "assistant streaming request sent": assistant_request_sent,
+    "composer accepts edits during assistant streaming": assistant_composer_edit_responsive,
     "assistant prefix visible before completion": assistant_prefix_before_finish,
     "assistant suffix did not precede prefix": not assistant_suffix_before_prefix,
     "assistant final preserves prefix and suffix": assistant_final_after_prefix,
+    "Markdown focus responds after streaming": assistant_markdown_focus_responsive,
+    "Markdown activation responds after streaming": assistant_markdown_activation_responsive,
+    "narrow resize handled": assistant_resized_narrow,
+    "wide resize handled": assistant_resized_wide,
+    "jump to latest handled": assistant_jumped_latest,
+    "viewport detaches again after jump": assistant_redetached,
+    "cancellation stream request sent": cancellation_request_sent,
+    "cancellation prefix visible before completion": cancellation_prefix_visible,
+    "cancellation remains responsive during streaming": cancellation_responsive,
     "reasoning streaming request sent": reasoning_request_sent,
     "reasoning first update visible before second": reasoning_first_before_second,
     "reasoning second update preserves first": reasoning_second_after_first,
     "reasoning final follows ordered updates": reasoning_final_after_updates,
     "viewport detached before operational updates": viewport_detached and viewport_anchor is not None,
-    "detached viewport anchor remains visible": viewport_stable,
+    "detached viewport anchor remains visible": viewport_stable_during_stream,
     "usage and runtime metadata excluded from transcript": metadata_excluded,
     "clean Ctrl-D exit": os.WIFEXITED(exit_status) and os.WEXITSTATUS(exit_status) == 0,
 }

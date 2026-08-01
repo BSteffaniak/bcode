@@ -1,6 +1,6 @@
 //! Retained Markdown projections for transcript entries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use bcode_markdown_render::{MarkdownRenderOptions, MarkdownRenderResult, render_markdown};
@@ -83,6 +83,76 @@ impl TranscriptMarkdownCache {
         result
     }
 
+    /// Install a completed projection after its generation was accepted.
+    pub fn install(
+        &self,
+        item_id: u64,
+        item_revision: u64,
+        options: MarkdownRenderOptions,
+        result: Arc<MarkdownRenderResult>,
+    ) {
+        self.entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                item_id,
+                CachedMarkdownProjection {
+                    item_revision,
+                    options,
+                    result,
+                },
+            );
+    }
+
+    /// Return the retained projection only when the exact generation is cached.
+    #[must_use]
+    pub fn get(
+        &self,
+        item_id: u64,
+        item_revision: u64,
+        options: &MarkdownRenderOptions,
+    ) -> Option<Arc<MarkdownRenderResult>> {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&item_id)
+            .filter(|cached| cached.item_revision == item_revision && &cached.options == options)
+            .map(|cached| Arc::clone(&cached.result))
+    }
+
+    /// Return a retained older revision with compatible render options.
+    ///
+    /// Streaming finalization alone may reuse the previous accepted projection while the exact
+    /// terminal generation is in flight. Width and every other layout-affecting option must match.
+    #[must_use]
+    pub fn get_previous_compatible(
+        &self,
+        item_id: u64,
+        options: &MarkdownRenderOptions,
+    ) -> Option<Arc<MarkdownRenderResult>> {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&item_id)
+            .filter(|cached| {
+                let mut cached_options = cached.options.clone();
+                cached_options.streaming = options.streaming;
+                &cached_options == options
+            })
+            .map(|cached| Arc::clone(&cached.result))
+    }
+
+    /// Return whether the current exact generation is already retained.
+    #[must_use]
+    pub fn contains(
+        &self,
+        item_id: u64,
+        item_revision: u64,
+        options: &MarkdownRenderOptions,
+    ) -> bool {
+        self.get(item_id, item_revision, options).is_some()
+    }
+
     /// Remove stale projections once after the transcript document changes.
     pub fn retain_resident_iter<'a>(
         &self,
@@ -96,21 +166,20 @@ impl TranscriptMarkdownCache {
         {
             return;
         }
-        let resident_revisions = resident_items
-            .map(|item| (item.id().get(), item.revision()))
-            .collect::<BTreeMap<_, _>>();
+        let resident_ids = resident_items
+            .map(|item| item.id().get())
+            .collect::<BTreeSet<_>>();
         self.entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|item_id, cached| {
-                resident_revisions.get(item_id) == Some(&cached.item_revision)
-            });
+            .retain(|item_id, _cached| resident_ids.contains(item_id));
         self.retained_revision
             .store(transcript_revision, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Return the number of actual Markdown renders performed by this cache.
     #[cfg(test)]
-    fn render_count(&self) -> usize {
+    pub fn render_count(&self) -> usize {
         self.render_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -136,6 +205,126 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(cache.render_count(), 1);
+    }
+
+    #[test]
+    fn layout_affecting_option_change_replaces_projection_once() {
+        let cache = TranscriptMarkdownCache::default();
+        let item = TranscriptItem::with_format(
+            "Bcode",
+            "<details><summary>More</summary>Body</details>".to_owned(),
+            TextFormat::Markdown,
+        );
+        let base = MarkdownRenderOptions::new(80)
+            .with_document_id(format!("transcript:{}", item.id().get()))
+            .with_streaming(true);
+        let first = cache.project(&item, base.clone());
+        let second = cache.project(&item, base.with_streaming(false));
+        let repeated = cache.project(
+            &item,
+            MarkdownRenderOptions::new(80)
+                .with_document_id(format!("transcript:{}", item.id().get())),
+        );
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&second, &repeated));
+        assert_eq!(cache.render_count(), 2);
+        assert_eq!(
+            cache
+                .entries
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn nonresident_projection_is_evicted() {
+        let cache = TranscriptMarkdownCache::default();
+        let item = TranscriptItem::with_format(
+            "Bcode",
+            "# Resident projection".to_owned(),
+            TextFormat::Markdown,
+        );
+        cache.project(&item, MarkdownRenderOptions::new(80));
+        cache.retain_resident_iter(std::slice::from_ref(&item).iter(), 1);
+        assert_eq!(
+            cache
+                .entries
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+
+        cache.retain_resident_iter(std::iter::empty(), 2);
+        assert!(
+            cache
+                .entries
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn streaming_revision_retains_previous_projection_until_replacement() {
+        let cache = TranscriptMarkdownCache::default();
+        let mut item = TranscriptItem::with_identity(
+            "Bcode",
+            "first accepted revision".to_owned(),
+            true,
+            TextFormat::Markdown,
+            super::super::transcript::TranscriptItemKind::AssistantMessage,
+        );
+        let options = MarkdownRenderOptions::new(80).with_streaming(true);
+        let first = cache.project(&item, options.clone());
+        item.append_text(" and newer content");
+
+        cache.retain_resident_iter(std::slice::from_ref(&item).iter(), 1);
+
+        let previous = cache
+            .get_previous_compatible(item.id().get(), &options)
+            .expect("previous streaming projection remains resident");
+        assert!(Arc::ptr_eq(&first, &previous));
+        assert!(
+            cache
+                .get(item.id().get(), item.revision(), &options)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn finalization_retains_previous_streaming_projection_until_terminal_replacement() {
+        let cache = TranscriptMarkdownCache::default();
+        let item_id = 42;
+        let streaming = MarkdownRenderOptions::new(80).with_streaming(true);
+        let terminal = MarkdownRenderOptions::new(80).with_streaming(false);
+        let accepted = Arc::new(render_markdown("accepted stream", &streaming));
+        cache.install(item_id, 3, streaming, Arc::clone(&accepted));
+
+        let previous = cache
+            .get_previous_compatible(item_id, &terminal)
+            .expect("streaming projection remains readable during finalization");
+
+        assert!(Arc::ptr_eq(&accepted, &previous));
+    }
+
+    #[test]
+    fn incompatible_width_does_not_reuse_previous_projection() {
+        let cache = TranscriptMarkdownCache::default();
+        let item_id = 42;
+        let wide = MarkdownRenderOptions::new(80).with_streaming(true);
+        let narrow = MarkdownRenderOptions::new(20).with_streaming(true);
+        cache.install(
+            item_id,
+            3,
+            wide.clone(),
+            Arc::new(render_markdown("accepted stream", &wide)),
+        );
+
+        assert!(cache.get_previous_compatible(item_id, &narrow).is_none());
     }
 
     #[test]

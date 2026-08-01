@@ -126,6 +126,7 @@ struct ChatLoopState {
     interactive_surface_queue: InteractiveSurfaceQueue,
     plugin_runtime: Option<PluginRuntimeHost>,
     artifact_stream: ArtifactStreamCoordinator,
+    markdown_projection: super::markdown_projection_coordinator::MarkdownProjectionCoordinator,
     markdown_presentation: Option<super::markdown_image::MarkdownPresentationRuntime>,
     markdown_mermaid: Option<super::markdown_mermaid::MarkdownMermaidRuntime>,
     markdown_image_tasks:
@@ -158,6 +159,8 @@ impl ChatLoopState {
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
             plugin_runtime: None,
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
+            markdown_projection:
+                super::markdown_projection_coordinator::MarkdownProjectionCoordinator::new(),
             markdown_presentation: super::markdown_image::MarkdownPresentationRuntime::new().ok(),
             markdown_mermaid: super::markdown_mermaid::MarkdownMermaidRuntime::packaged().ok(),
             markdown_image_tasks: Vec::new(),
@@ -178,8 +181,110 @@ impl ChatLoopState {
         self.effects.poll_finished().await
     }
 
-    async fn poll_markdown_completions(&mut self) -> bool {
-        let mut changed = false;
+    fn accept_markdown_projection_completion(
+        &mut self,
+        chat: &mut ActiveChat,
+        completion: super::markdown_projection_coordinator::MarkdownProjectionCompletion,
+    ) -> bool {
+        if self.markdown_projection.latest_requested() != Some(&completion.generation) {
+            return false;
+        }
+        let Some((index, item)) = chat
+            .app
+            .transcript()
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.id().get() == completion.generation.item_id)
+        else {
+            return false;
+        };
+        if item.revision() != completion.generation.item_revision {
+            return false;
+        }
+        let render_duration_ms =
+            u64::try_from(completion.render_duration.as_millis()).unwrap_or(u64::MAX);
+        self.telemetry
+            .record_histogram("tui.markdown.projection.render_ms", render_duration_ms);
+        match completion.outcome {
+            super::markdown_projection_coordinator::MarkdownProjectionOutcome::Rendered(result) => {
+                chat.app.transcript_markdown_cache().install(
+                    completion.generation.item_id,
+                    completion.generation.item_revision,
+                    completion.generation.options.clone(),
+                    result,
+                );
+                self.markdown_projection.complete(&completion.generation);
+                self.telemetry
+                    .add_counter("tui.markdown.projection.accepted_total", 1);
+                chat.app.mark_transcript_item_dirty(index);
+                true
+            }
+            super::markdown_projection_coordinator::MarkdownProjectionOutcome::Failed(_) => {
+                self.markdown_projection.complete(&completion.generation);
+                self.telemetry
+                    .add_counter("tui.markdown.projection.failed_total", 1);
+                false
+            }
+        }
+    }
+
+    fn poll_markdown_projection_completion(&mut self, chat: &mut ActiveChat) -> bool {
+        let Some(completion) = self.markdown_projection.try_latest_completion() else {
+            return false;
+        };
+        self.accept_markdown_projection_completion(chat, completion)
+    }
+
+    fn request_latest_markdown_projection(&mut self, chat: &ActiveChat, width: u16) {
+        let Some(item) = chat
+            .app
+            .transcript()
+            .iter()
+            .rev()
+            .find(|item| item.text_format() == bcode_session_view_models::TextFormat::Markdown)
+        else {
+            return;
+        };
+        let options =
+            render::markdown_render_options(&chat.app, item, width.saturating_sub(2).max(1));
+        if chat
+            .app
+            .transcript_markdown_cache()
+            .contains(item.id().get(), item.revision(), &options)
+        {
+            return;
+        }
+        if self
+            .markdown_projection
+            .latest_requested()
+            .is_some_and(|generation| {
+                generation.item_id == item.id().get()
+                    && generation.item_revision == item.revision()
+                    && generation.options == options
+            })
+        {
+            return;
+        }
+        if self.markdown_projection.latest_requested().is_some() {
+            self.telemetry
+                .add_counter("tui.markdown.projection.coalesced_total", 1);
+        }
+        self.telemetry
+            .add_counter("tui.markdown.projection.requested_total", 1);
+        self.markdown_projection.request(
+            super::markdown_projection_coordinator::MarkdownProjectionRequest {
+                generation: super::markdown_projection_coordinator::MarkdownProjectionGeneration {
+                    item_id: item.id().get(),
+                    item_revision: item.revision(),
+                    options,
+                },
+                source: item.text().to_owned(),
+            },
+        );
+    }
+
+    async fn poll_markdown_completions(&mut self, chat: &mut ActiveChat) -> bool {
+        let mut changed = self.poll_markdown_projection_completion(chat);
         let mut index = 0;
         while index < self.markdown_image_tasks.len() {
             if !self.markdown_image_tasks[index].is_finished() {
@@ -211,6 +316,7 @@ impl ChatLoopState {
 
     fn abort_all_effects(&mut self) {
         self.effects.abort_all();
+        self.markdown_projection.invalidate();
         if let Some(markdown) = &mut self.markdown_presentation {
             markdown.cancel_all();
         }
@@ -409,7 +515,11 @@ async fn run_chat_loop<W: Write>(
         if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
             needs_redraw = true;
         }
-        if loop_state.poll_markdown_completions().await {
+        loop_state.request_latest_markdown_projection(
+            chat,
+            render::transcript_area_for_frame(&chat.app, terminal.area()).width,
+        );
+        if loop_state.poll_markdown_completions(chat).await {
             needs_redraw = true;
         }
 
@@ -470,6 +580,7 @@ async fn run_chat_loop<W: Write>(
             &mut invalidation_queue,
             chat,
             &mut loop_state.artifact_stream,
+            &mut loop_state.markdown_projection,
             ChatLoopDeadlines {
                 interaction_retry: loop_state.interactive_surface_queue.next_retry_at(),
                 telemetry_flush: loop_state.telemetry.next_flush_at(),
@@ -538,9 +649,16 @@ async fn run_chat_loop<W: Write>(
                     needs_redraw = true;
                 }
             }
+            ChatLoopEvent::MarkdownProjectionCompleted(completion) => {
+                if let Some(completion) = *completion {
+                    needs_redraw |=
+                        loop_state.accept_markdown_projection_completion(chat, completion);
+                }
+            }
             ChatLoopEvent::Timer => {}
         }
         if before_session_id != chat.session_id {
+            loop_state.markdown_projection.invalidate();
             loop_state.artifact_stream.retain_session(chat.session_id);
             draft_autosave.last_saved_text = None;
             draft_autosave.dirty = true;
@@ -556,6 +674,9 @@ enum ChatLoopEvent {
     SessionStream(Box<history_flow::SessionStreamUpdate>),
     ArtifactFetchCompleted(Box<ActiveArtifactFetchCompletion>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
+    MarkdownProjectionCompleted(
+        Box<Option<super::markdown_projection_coordinator::MarkdownProjectionCompletion>>,
+    ),
     Timer,
 }
 
@@ -2582,6 +2703,7 @@ async fn next_chat_loop_event(
     invalidation_queue: &mut InvalidationQueue,
     chat: &mut ActiveChat,
     artifact_stream: &mut ArtifactStreamCoordinator,
+    markdown_projection: &mut super::markdown_projection_coordinator::MarkdownProjectionCoordinator,
     deadlines: ChatLoopDeadlines,
 ) -> Result<ChatLoopEvent, TuiError> {
     if let Some(event) = try_next_ready_artifact_event(artifact_stream) {
@@ -2606,6 +2728,9 @@ async fn next_chat_loop_event(
     if let Some(next_at) = next_timer_at {
         let delay = next_at.saturating_duration_since(now);
         return tokio::select! {
+            markdown_completion = markdown_projection.next_completion() => {
+                Ok(ChatLoopEvent::MarkdownProjectionCompleted(Box::new(markdown_completion)))
+            },
             artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
             bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
@@ -2629,6 +2754,11 @@ async fn next_chat_loop_event(
         };
     }
     tokio::select! {
+        markdown_completion = markdown_projection.next_completion() => {
+            Ok(ChatLoopEvent::MarkdownProjectionCompleted(Box::new(
+                markdown_completion,
+            )))
+        },
         artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
         bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
             || ChatLoopEvent::TimedInvalidations(Vec::new()),

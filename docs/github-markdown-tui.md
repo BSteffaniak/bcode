@@ -17,6 +17,27 @@ The terminal renderer supports the CommonMark and GitHub-oriented syntax used by
 
 Renderer-owned options are included in a versioned layout signature so width, theme, trusted document context, Mermaid bounds, streaming state, and semantic contributions invalidate retained rows correctly.
 
+## Progressive rendering and exact convergence
+
+The renderer keeps append-aware state only for semantically closed plain-paragraph prefixes whose
+source ranges, terminal rows, contributions, geometry, anchors, and layout signature can be reused
+exactly. The unstable suffix is rendered again and combined with that prefix. Any ambiguous syntax,
+non-append replacement, incompatible option generation, width change, finalization change, heading,
+list, table, fence, link, details, footnote, math, Mermaid, Unicode-break, or other unsupported
+boundary falls back to one fresh full render rather than guessing parser state.
+
+Incremental output is differentially required to equal a fresh render for the same accepted source
+and options. Intermediate revisions may be coalesced by the TUI, but readable accepted content stays
+visible and the latest terminal revision is requested with `streaming = false`, guaranteeing final
+convergence to normal Markdown rendering.
+
+Each resident transcript item owns one accepted projection. Its terminal rows and semantic sidecars
+(contributions, geometry, and anchors) travel together and are shared by layout, navigation, focus,
+hit testing, images, and Mermaid adaptation. The cache replaces rather than accumulates revisions or
+width generations, while append state is similarly bounded to the current document generation.
+Eviction is keyed to the resident transcript window; normal scrolling performs no parse, highlight,
+or Markdown layout work.
+
 ## Terminal differences and fallbacks
 
 A terminal cannot reproduce browser layout or behavior exactly. Bcode uses explicit readable fallbacks rather than silently dropping content:
