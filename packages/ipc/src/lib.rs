@@ -84,7 +84,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 25;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 26;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -284,6 +284,14 @@ pub enum Request {
         skill_id: SkillId,
         arguments: String,
         display_text: String,
+    },
+    /// Invoke a skill with immutable execution options for its admitted turn.
+    InvokeSkillWithExecution {
+        session_id: SessionId,
+        skill_id: SkillId,
+        arguments: String,
+        display_text: String,
+        execution: bcode_session_models::TurnExecutionOptions,
     },
     CancelSessionTurn {
         session_id: SessionId,
@@ -4295,6 +4303,27 @@ mod tests {
             session_id: SessionId::new(),
             text: "continue".to_owned(),
             placement: PromptPlacement::FollowUp,
+            execution: bcode_session_models::TurnExecutionOptions {
+                reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                    effort: Some("high".to_owned()),
+                    summary: Some("detailed".to_owned()),
+                })),
+                ..bcode_session_models::TurnExecutionOptions::default()
+            },
+        };
+
+        let encoded = encode_request(&request).expect("request should encode");
+        let decoded = decode_request(&encoded).expect("request should decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn skill_invocation_execution_request_round_trips_reasoning_options() {
+        let request = Request::InvokeSkillWithExecution {
+            session_id: SessionId::new(),
+            skill_id: SkillId::new("review"),
+            arguments: "staged".to_owned(),
+            display_text: "Invoke skill review: staged".to_owned(),
             execution: bcode_session_models::TurnExecutionOptions {
                 reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
                     effort: Some("high".to_owned()),

@@ -1293,6 +1293,15 @@ fn apply_skill_action_result(
             {
                 previous_task.abort();
             }
+            if result.committed_agent_id.is_some() {
+                let _committed = chat.app.take_pending_agent();
+            }
+            if let Some(generation) = result.committed_reasoning_effort_generation {
+                chat.app.clear_pending_reasoning_effort(generation);
+            }
+            if let Some(release) = result.event_stream_release {
+                let _released = release.send(());
+            }
             match action {
                 super::effects::SkillActionKind::Activate => {
                     chat.app.set_status(format!("activated skill {skill_id}"));
@@ -3393,6 +3402,65 @@ mod scheduler_tests {
         if let Some(event_task) = chat.event_task.take() {
             event_task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn initial_skill_invocation_installs_session_before_releasing_event_stream() {
+        let mut chat = test_chat();
+        let generation = chat.app.set_pending_reasoning_effort("high".to_owned());
+        let session_id = bcode_session_models::SessionId::new();
+        let (release_sender, mut release_receiver) = tokio::sync::oneshot::channel();
+        let event_task = tokio::spawn(std::future::pending());
+
+        apply_skill_action_result(
+            &mut chat,
+            super::super::effects::SkillActionKind::Invoke,
+            &bcode_skill_models::SkillId::new("review"),
+            Ok(super::super::effects::SkillActionResult {
+                session_id,
+                created_session: None,
+                event_task: Some(event_task),
+                acceptance: Some(bcode_client::MessageAcceptance::sent()),
+                committed_agent_id: None,
+                committed_reasoning_effort_generation: Some(generation),
+                event_stream_release: Some(release_sender),
+            }),
+        );
+
+        assert_eq!(chat.session_id, Some(session_id));
+        assert_eq!(chat.app.pending_reasoning_effort_generation(), None);
+        assert!(matches!(
+            release_receiver.try_recv(),
+            Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        if let Some(event_task) = chat.event_task.take() {
+            event_task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_invocation_completion_preserves_newer_reasoning_selection() {
+        let mut chat = test_chat();
+        let captured = chat.app.set_pending_reasoning_effort("low".to_owned());
+        let newer = chat.app.set_pending_reasoning_effort("high".to_owned());
+
+        apply_skill_action_result(
+            &mut chat,
+            super::super::effects::SkillActionKind::Invoke,
+            &bcode_skill_models::SkillId::new("review"),
+            Ok(super::super::effects::SkillActionResult {
+                session_id: bcode_session_models::SessionId::new(),
+                created_session: None,
+                event_task: None,
+                acceptance: Some(bcode_client::MessageAcceptance::sent()),
+                committed_agent_id: None,
+                committed_reasoning_effort_generation: Some(captured),
+                event_stream_release: None,
+            }),
+        );
+
+        assert_eq!(chat.app.reasoning_effort(), Some("high"));
+        assert_eq!(chat.app.pending_reasoning_effort_generation(), Some(newer));
     }
 
     fn interaction(

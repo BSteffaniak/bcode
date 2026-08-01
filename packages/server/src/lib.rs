@@ -641,6 +641,7 @@ enum FollowupCommand {
         arguments: String,
         source: Option<SkillSource>,
         display_text: String,
+        execution: Box<bcode_session_models::TurnExecutionOptions>,
         ownership: bcode_session::SessionOwnershipGuard,
     },
     CompactSession {
@@ -3638,6 +3639,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SendUserMessageWithExecution { session_id, .. }
         | Request::SubmitTurn { session_id, .. }
         | Request::InvokeSkill { session_id, .. }
+        | Request::InvokeSkillWithExecution { session_id, .. }
         | Request::CancelSessionTurn { session_id, .. }
         | Request::CancelRuntimeWork { session_id, .. }
         | Request::CompactSession { session_id }
@@ -3700,6 +3702,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SendUserMessageWithExecution { .. } => "send_user_message_with_execution",
         Request::SubmitTurn { .. } => "submit_turn",
         Request::InvokeSkill { .. } => "invoke_skill",
+        Request::InvokeSkillWithExecution { .. } => "invoke_skill_with_execution",
         Request::CancelSessionTurn { .. } => "cancel_session_turn",
         Request::ListPermissions => "list_permissions",
         Request::ResolvePermission { .. } => "resolve_permission",
@@ -4267,6 +4270,27 @@ async fn handle_request_inner(
                 skill_id,
                 arguments,
                 display_text,
+                bcode_session_models::TurnExecutionOptions::default(),
+            )
+            .await
+        }
+        Request::InvokeSkillWithExecution {
+            session_id,
+            skill_id,
+            arguments,
+            display_text,
+            execution,
+        } => {
+            handle_invoke_skill(
+                request_id,
+                client_id,
+                state,
+                writer,
+                session_id,
+                skill_id,
+                arguments,
+                display_text,
+                execution,
             )
             .await
         }
@@ -9873,6 +9897,7 @@ async fn run_session_runtime(
                 arguments,
                 source,
                 display_text,
+                execution,
                 ownership,
             } => {
                 Box::pin(process_skill_invocation_command(
@@ -9890,6 +9915,7 @@ async fn run_session_runtime(
                     arguments,
                     source,
                     display_text,
+                    *execution,
                 ))
                 .await;
                 drop(ownership);
@@ -10371,7 +10397,7 @@ async fn process_existing_user_event_command(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn process_skill_invocation_command(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
@@ -10387,6 +10413,7 @@ async fn process_skill_invocation_command(
     arguments: String,
     source: Option<SkillSource>,
     display_text: String,
+    execution: bcode_session_models::TurnExecutionOptions,
 ) {
     let invocation = state
         .sessions
@@ -10414,17 +10441,65 @@ async fn process_skill_invocation_command(
     }
 
     let skill_model_policy_applied = !is_skill_active(state, permit.session_id(), &skill_id).await;
-    if skill_model_policy_applied
-        && let Err(error) = apply_skill_model_policy(state, permit.session_id(), &skill_id).await
-    {
-        append_skill_invocation_failed_event(state, permit.session_id(), skill_id, error.message)
-            .await;
+    let skill_effort = if skill_model_policy_applied {
+        match apply_skill_model_policy(state, permit.session_id(), &skill_id).await {
+            Ok(effort) => effort,
+            Err(error) => {
+                append_skill_invocation_failed_event(
+                    state,
+                    permit.session_id(),
+                    skill_id,
+                    error.message,
+                )
+                .await;
+                set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
+                return;
+            }
+        }
+    } else {
+        skill_model_policy_effort(state, &skill_id)
+    };
+
+    let mut execution = execution;
+    let invocation_reasoning = execution.reasoning.take();
+    let skill_selection = session_model_selection(state, permit.session_id()).await;
+    execution.provider_plugin_id = skill_selection.provider_plugin_id.clone();
+    execution.model_id = skill_selection.model_id.clone();
+    execution.reasoning = Some(Box::new(bcode_session_models::TurnReasoningOptions {
+        effort: skill_effort
+            .as_ref()
+            .and_then(skill_thinking_effort_value)
+            .or_else(|| {
+                invocation_reasoning
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.effort.clone())
+            })
+            .or_else(|| skill_selection.reasoning_effort.clone()),
+        summary: invocation_reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.clone())
+            .or_else(|| skill_selection.reasoning_summary.clone()),
+    }));
+    let admission = bcode_session_models::TurnAdmissionMetadata {
+        execution,
+        ..bcode_session_models::TurnAdmissionMetadata::default()
+    };
+    if let Err(error) = admission.validate() {
+        append_skill_invocation_failed_event(
+            state,
+            permit.session_id(),
+            skill_id,
+            error.to_string(),
+        )
+        .await;
         set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
         return;
     }
 
     set_runtime_phase(&phase, SessionRuntimePhase::AppendingUser).await;
-    match append_turn_user_message(state, permit, client_id, display_text).await {
+    match append_turn_user_message_with_admission(state, permit, client_id, display_text, admission)
+        .await
+    {
         Ok(Some(user_event)) => {
             state.turn_skills.lock().await.insert(
                 (permit.session_id(), user_event.sequence),
@@ -10522,19 +10597,20 @@ async fn process_compact_session_command(
     result.map(|completion| completion.message)
 }
 
-async fn append_turn_user_message(
+async fn append_turn_user_message_with_admission(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
     client_id: ClientId,
     text: String,
+    admission: bcode_session_models::TurnAdmissionMetadata,
 ) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
     state
         .sessions
         .require_write_readiness(permit.session_id())
         .await?;
-    let events = state
+    let (_, events) = state
         .sessions
-        .append_user_message(permit.enter_turn(), client_id, text)
+        .admit_turn_with_events(permit.enter_turn(), client_id, text, admission)
         .await?;
     for event in &events {
         publish_session_event(state, event).await;
@@ -10577,6 +10653,7 @@ async fn handle_invoke_skill(
     skill_id: SkillId,
     arguments: String,
     display_text: String,
+    execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<(), ServerError> {
     if let Some(active_namespace) = state
         .active_session_namespace_mismatch(session_id, client_id)
@@ -10604,6 +10681,21 @@ async fn handle_invoke_skill(
         )
         .await;
     };
+    if let Err(error) = (bcode_session_models::TurnAdmissionMetadata {
+        execution: execution.clone(),
+        ..bcode_session_models::TurnAdmissionMetadata::default()
+    })
+    .validate()
+    {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(session_error_response(&bcode_session::SessionError::from(
+                error,
+            ))),
+        )
+        .await;
+    }
     let ownership = state
         .sessions
         .acquire_session_ownership(
@@ -10618,6 +10710,7 @@ async fn handle_invoke_skill(
         arguments,
         source: Some(summary.source),
         display_text,
+        execution: Box::new(execution),
         ownership,
     };
     match enqueue_followup_command(state, session_id, command).await {
@@ -11646,9 +11739,9 @@ async fn apply_skill_model_policy(
     state: &ServerState,
     session_id: SessionId,
     skill_id: &SkillId,
-) -> Result<(), ErrorResponse> {
+) -> Result<Option<bcode_skill_models::SkillThinkingEffort>, ErrorResponse> {
     let Some(registry) = &state.skills else {
-        return Ok(());
+        return Ok(None);
     };
     let manifest = registry.describe(skill_id).map_err(|error| {
         ErrorResponse::new(
@@ -11656,19 +11749,25 @@ async fn apply_skill_model_policy(
             format!("failed to load skill model policy for {skill_id}: {error}"),
         )
     })?;
-    if let Some(required) = manifest.model_policy.required.as_ref() {
+    let standalone_effort = manifest.model_policy.thinking_effort.clone();
+    let applied_request = if let Some(required) = manifest.model_policy.required.as_ref() {
         apply_skill_model_request(state, session_id, skill_id, required, true).await?;
+        Some(required)
     } else if let Some(preferred) = manifest.model_policy.preferred.as_ref()
         && skill_preferred_model_can_apply(state, session_id).await
     {
         apply_skill_model_request(state, session_id, skill_id, preferred, false).await?;
+        Some(preferred)
     } else {
         // Skill declares no required or preferred model.
         // Explicitly ensure the turn uses the user's currently selected model
         // and does not fall back to provider defaults such as default_codex_model_id.
         ensure_skill_turn_respects_active_selection(state, session_id).await?;
-    }
-    Ok(())
+        None
+    };
+    Ok(applied_request
+        .and_then(|request| request.thinking_effort.clone())
+        .or(standalone_effort))
 }
 
 async fn skill_preferred_model_can_apply(state: &ServerState, session_id: SessionId) -> bool {
@@ -11729,6 +11828,32 @@ async fn ensure_skill_turn_respects_active_selection(
     Ok(())
 }
 
+fn skill_model_policy_effort(
+    state: &ServerState,
+    skill_id: &SkillId,
+) -> Option<bcode_skill_models::SkillThinkingEffort> {
+    let policy = state.skills.as_ref()?.describe(skill_id).ok()?.model_policy;
+    policy
+        .required
+        .as_ref()
+        .and_then(|request| request.thinking_effort.clone())
+        .or_else(|| {
+            policy
+                .preferred
+                .as_ref()
+                .and_then(|request| request.thinking_effort.clone())
+        })
+        .or(policy.thinking_effort)
+}
+
+fn skill_thinking_effort_value(effort: &bcode_skill_models::SkillThinkingEffort) -> Option<String> {
+    effort.provider_value.clone().or_else(|| {
+        effort
+            .normalized_level
+            .map(|level| format!("{level:?}").to_lowercase())
+    })
+}
+
 async fn apply_skill_model_request(
     state: &ServerState,
     session_id: SessionId,
@@ -11741,8 +11866,9 @@ async fn apply_skill_model_request(
         handle_unresolved_skill_model(state, skill_id, request, required)?;
         return Ok(());
     };
+    let current_selection = session_model_selection(state, session_id).await;
     if required {
-        let previous_selection = session_model_selection(state, session_id).await;
+        let previous_selection = current_selection.clone();
         let previous_origin = state
             .session_model_selection_origins
             .lock()
@@ -11765,22 +11891,12 @@ async fn apply_skill_model_request(
         .append_model_changed(session_id, provider.clone(), model_id.clone())
         .await
         .map_err(|error| session_error_response(&error))?;
-    let mut selection = SessionModelSelection {
-        provider_plugin_id: provider_to_selection(&provider),
-        requested_model_id: None,
-        model_id: model_to_selection(&model_id),
-        thinking_level: None,
-        reasoning_effort: state.selected_reasoning.effort.clone(),
-        reasoning_summary: state.selected_reasoning.summary.clone(),
-        reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-        provider_context: state.selected_provider_context.clone(),
-    };
+    let mut selection = current_selection;
+    selection.provider_plugin_id = provider_to_selection(&provider);
+    selection.requested_model_id = None;
+    selection.model_id = model_to_selection(&model_id);
     if let Some(effort) = request.thinking_effort.as_ref() {
-        selection.reasoning_effort = effort.provider_value.clone().or_else(|| {
-            effort
-                .normalized_level
-                .map(|level| format!("{level:?}").to_lowercase())
-        });
+        selection.reasoning_effort = skill_thinking_effort_value(effort);
     }
     state
         .session_model_selections
@@ -56900,6 +57016,29 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .filter(|event| matches!(event.kind, SessionEventKind::ReasoningChanged { .. }))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn skill_thinking_effort_overrides_preserved_reasoning_value() {
+        let current = bcode_skill_models::SkillThinkingEffort {
+            source_label: "high".to_owned(),
+            normalized_level: Some(bcode_skill_models::GenericThinkingEffort::High),
+            provider_value: None,
+        };
+        let provider = bcode_skill_models::SkillThinkingEffort {
+            source_label: "xhigh".to_owned(),
+            normalized_level: None,
+            provider_value: Some("xhigh".to_owned()),
+        };
+
+        assert_eq!(
+            skill_thinking_effort_value(&current).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            skill_thinking_effort_value(&provider).as_deref(),
+            Some("xhigh")
         );
     }
 

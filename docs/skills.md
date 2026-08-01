@@ -299,6 +299,12 @@ Flow:
 6. Enforce `max_context_bytes` for active skill context when explicitly configured.
 7. Include provenance in injected context and session events.
 
+* Invoked skill turns capture provider-neutral execution options at admission time. A model-only
+  skill policy preserves the invocation's reasoning effort and summary, while an explicit skill
+  `thinking_effort` overrides the invocation effort for that turn. Preferred-model eligibility is
+  based on model-selection provenance; changing only reasoning settings does not make the model an
+  explicit user selection.
+
 ## Session events and TUI visibility
 
 Durable skill events include:

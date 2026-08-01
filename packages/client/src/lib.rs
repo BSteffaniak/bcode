@@ -3494,15 +3494,43 @@ impl BcodeClient {
         arguments: String,
         display_text: String,
     ) -> Result<MessageAcceptance, ClientError> {
-        match self
-            .send_request(Request::InvokeSkill {
-                session_id,
-                skill_id,
-                arguments,
-                display_text,
-            })
-            .await?
-        {
+        self.invoke_skill_request(Request::InvokeSkill {
+            session_id,
+            skill_id,
+            arguments,
+            display_text,
+        })
+        .await
+    }
+
+    /// Invoke a skill for one model turn with immutable execution options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn invoke_skill_with_execution(
+        &self,
+        session_id: SessionId,
+        skill_id: SkillId,
+        arguments: String,
+        display_text: String,
+        execution: bcode_session_models::TurnExecutionOptions,
+    ) -> Result<MessageAcceptance, ClientError> {
+        self.invoke_skill_request(Request::InvokeSkillWithExecution {
+            session_id,
+            skill_id,
+            arguments,
+            display_text,
+            execution,
+        })
+        .await
+    }
+
+    async fn invoke_skill_request(
+        &self,
+        request: Request,
+    ) -> Result<MessageAcceptance, ClientError> {
+        match self.send_request(request).await? {
             ResponsePayload::MessageAccepted {
                 queued,
                 queue_position,

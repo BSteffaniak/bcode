@@ -15,6 +15,7 @@ use bcode_skill_models::SkillId;
 ///
 /// Returns an error when the daemon cannot be reached, rejects the request, or the action requires
 /// data that was not supplied by the renderer.
+#[allow(clippy::too_many_lines)]
 pub async fn execute_session_view_action(
     client: &BcodeClient,
     action: SessionViewAction,
@@ -33,6 +34,23 @@ pub async fn execute_session_view_action(
                 launch_working_directory,
                 text,
                 placement,
+                *execution,
+            )
+            .await
+        }
+        SessionViewAction::InvokeSkill {
+            session_id,
+            skill_id,
+            arguments,
+            display_text,
+            execution,
+        } => {
+            execute_invoke_skill(
+                client,
+                session_id,
+                skill_id,
+                arguments,
+                display_text,
                 *execution,
             )
             .await
@@ -292,6 +310,26 @@ async fn execute_submit_message(
     };
     let acceptance = client
         .send_user_message_with_execution(session_id, text, prompt_placement(placement), execution)
+        .await?;
+    Ok(message_accepted_outcome(session_id, acceptance))
+}
+
+async fn execute_invoke_skill(
+    client: &BcodeClient,
+    session_id: SessionId,
+    skill_id: String,
+    arguments: String,
+    display_text: String,
+    execution: bcode_session_models::TurnExecutionOptions,
+) -> Result<SessionViewActionOutcome, ClientError> {
+    let acceptance = client
+        .invoke_skill_with_execution(
+            session_id,
+            SkillId::new(skill_id),
+            arguments,
+            display_text,
+            execution,
+        )
         .await?;
     Ok(message_accepted_outcome(session_id, acceptance))
 }

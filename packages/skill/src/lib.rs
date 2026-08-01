@@ -1271,6 +1271,7 @@ fn normalize_model_policy(raw: &RawSkillFrontmatter) -> SkillModelPolicy {
         required: required
             .as_ref()
             .map(|request| normalize_model_request(request, top_level_effort)),
+        thinking_effort: top_level_effort.map(normalize_thinking_effort),
     }
 }
 
@@ -1748,6 +1749,26 @@ allowed-tools: Bash(git:*), Read(*), Edit(*)";
         assert_eq!(
             manifest.permissions.tools,
             vec!["Bash(git:*)", "Read(*)", "Edit(*)"]
+        );
+    }
+
+    #[test]
+    fn standalone_thinking_effort_is_preserved_without_model_policy() {
+        let raw = RawSkillFrontmatter {
+            thinking_effort: Some("high".to_owned()),
+            ..RawSkillFrontmatter::default()
+        };
+
+        let policy = normalize_model_policy(&raw);
+
+        assert!(policy.preferred.is_none());
+        assert!(policy.required.is_none());
+        assert_eq!(
+            policy
+                .thinking_effort
+                .as_ref()
+                .and_then(|effort| effort.normalized_level),
+            Some(GenericThinkingEffort::High)
         );
     }
 

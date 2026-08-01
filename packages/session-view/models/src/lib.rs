@@ -1661,6 +1661,20 @@ pub enum SessionViewAction {
         #[serde(default)]
         execution: Box<bcode_session_models::TurnExecutionOptions>,
     },
+    /// Invoke a skill for one turn.
+    InvokeSkill {
+        /// Target session.
+        session_id: SessionId,
+        /// Skill identifier.
+        skill_id: String,
+        /// Invocation arguments.
+        arguments: String,
+        /// User-visible invocation text.
+        display_text: String,
+        /// Provider-neutral execution options captured for this exact admitted turn.
+        #[serde(default)]
+        execution: Box<bcode_session_models::TurnExecutionOptions>,
+    },
     /// Cancel the active model turn.
     CancelTurn {
         /// Target session.

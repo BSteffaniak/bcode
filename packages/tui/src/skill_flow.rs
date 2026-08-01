@@ -322,13 +322,46 @@ fn start_skill_action(
     skill_id: SkillId,
     arguments: String,
 ) -> Result<(), TuiError> {
+    let session_id = chat.app.session_id();
+    let agent_id = if action == SkillActionKind::Invoke {
+        if session_id.is_some() {
+            chat.app.pending_agent_id().map(ToOwned::to_owned)
+        } else {
+            let current = chat.app.current_agent_id().to_owned();
+            (current != "build").then_some(current)
+        }
+    } else {
+        None
+    };
+    let provider_plugin_id = (action == SkillActionKind::Invoke && session_id.is_none())
+        .then(|| {
+            chat.app
+                .selected_provider_plugin_id()
+                .map(ToOwned::to_owned)
+        })
+        .flatten();
+    let model_id = (action == SkillActionKind::Invoke && session_id.is_none())
+        .then(|| chat.app.selected_model_id().map(ToOwned::to_owned))
+        .flatten();
     chat.start_effect(TuiEffect::SkillAction {
         request: Box::new(SkillActionRequest {
-            session_id: chat.app.session_id(),
+            session_id,
             launch_working_directory: std::env::current_dir()?,
             skill_id,
             action,
             arguments,
+            provider_plugin_id,
+            model_id,
+            agent_id,
+            reasoning_effort: (action == SkillActionKind::Invoke)
+                .then(|| chat.app.reasoning_effort().map(ToOwned::to_owned))
+                .flatten(),
+            reasoning_summary: (action == SkillActionKind::Invoke)
+                .then(|| chat.app.reasoning_summary().map(ToOwned::to_owned))
+                .flatten(),
+            reasoning_effort_generation: (action == SkillActionKind::Invoke)
+                .then(|| chat.app.pending_reasoning_effort_generation())
+                .flatten(),
             event_sender: chat.event_sender.clone(),
         }),
     });

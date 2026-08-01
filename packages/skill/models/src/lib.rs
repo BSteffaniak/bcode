@@ -206,6 +206,9 @@ pub struct SkillModelPolicy {
     pub preferred: Option<SkillModelRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<SkillModelRequest>,
+    /// Skill-wide thinking effort, including skills that do not select a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<SkillThinkingEffort>,
 }
 
 /// Skill-requested model selection.

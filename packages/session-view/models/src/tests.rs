@@ -2,6 +2,28 @@ use super::*;
 use proptest::prelude::*;
 
 #[test]
+fn skill_invocation_action_round_trips_execution_options() {
+    let action = SessionViewAction::InvokeSkill {
+        session_id: SessionId::new(),
+        skill_id: "review".to_owned(),
+        arguments: "staged".to_owned(),
+        display_text: "Invoke skill review: staged".to_owned(),
+        execution: Box::new(bcode_session_models::TurnExecutionOptions {
+            reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                effort: Some("high".to_owned()),
+                summary: None,
+            })),
+            ..bcode_session_models::TurnExecutionOptions::default()
+        }),
+    };
+
+    let encoded = serde_json::to_vec(&action).expect("action should encode");
+    let decoded: SessionViewAction =
+        serde_json::from_slice(&encoded).expect("action should decode");
+    assert_eq!(decoded, action);
+}
+
+#[test]
 fn snapshot_patch_application_rejects_unknown_schema_versions() {
     let mut snapshot = SessionViewSnapshot::empty();
     let mut patch = SessionViewPatch::empty(snapshot.revision, snapshot.revision);

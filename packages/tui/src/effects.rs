@@ -73,6 +73,18 @@ pub struct SkillActionRequest {
     pub action: SkillActionKind,
     /// Arguments for invocation.
     pub arguments: String,
+    /// Provider to apply before invoking a skill, if any.
+    pub provider_plugin_id: Option<String>,
+    /// Model to apply before invoking a skill, if any.
+    pub model_id: Option<String>,
+    /// Agent to apply before invoking a skill, if any.
+    pub agent_id: Option<String>,
+    /// Reasoning effort captured for the invocation.
+    pub reasoning_effort: Option<String>,
+    /// Reasoning summary captured for the invocation.
+    pub reasoning_summary: Option<String>,
+    /// Pending reasoning effort generation captured by the invocation.
+    pub reasoning_effort_generation: Option<u64>,
     /// Event sender for a newly-created session stream.
     pub event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
 }
@@ -592,6 +604,12 @@ pub struct SkillActionResult {
     pub event_task: Option<JoinHandle<()>>,
     /// Invocation acceptance when invoking a skill.
     pub acceptance: Option<MessageAcceptance>,
+    /// Agent committed during invocation.
+    pub committed_agent_id: Option<String>,
+    /// Pending reasoning effort generation committed during invocation.
+    pub committed_reasoning_effort_generation: Option<u64>,
+    /// Releases a newly-created session stream after the TUI installs the session id.
+    pub event_stream_release: Option<oneshot::Sender<()>>,
 }
 
 /// Attached session status hydration payload.
@@ -1462,9 +1480,17 @@ async fn ensure_session_for_foreground_action(
     session_id: Option<SessionId>,
     launch_working_directory: std::path::PathBuf,
     event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
-) -> Result<(SessionId, Option<SessionSummary>, Option<JoinHandle<()>>), ClientError> {
+) -> Result<
+    (
+        SessionId,
+        Option<SessionSummary>,
+        Option<JoinHandle<()>>,
+        Option<oneshot::Sender<()>>,
+    ),
+    ClientError,
+> {
     if let Some(session_id) = session_id {
-        return Ok((session_id, None, None));
+        return Ok((session_id, None, None, None));
     }
     let session = client
         .create_session_in_working_directory(None, launch_working_directory.clone())
@@ -1479,8 +1505,8 @@ async fn ensure_session_for_foreground_action(
         },
     )
     .await;
-    let (attached, task) =
-        history_flow::attach_session_event_stream(client, session.id, event_sender)
+    let (attached, task, release) =
+        history_flow::attach_paused_session_event_stream(client, session.id, event_sender)
             .await
             .map_err(|error| match error {
                 TuiError::Client(error) => error,
@@ -1489,7 +1515,12 @@ async fn ensure_session_for_foreground_action(
                     message: other.to_string(),
                 },
             })?;
-    Ok((session.id, Some(attached.session), Some(task)))
+    Ok((
+        session.id,
+        Some(attached.session),
+        Some(task),
+        Some(release),
+    ))
 }
 
 async fn run_skill_action(client: &BcodeClient, request: SkillActionRequest) -> TuiEffectResult {
@@ -1512,15 +1543,22 @@ async fn skill_action(
         skill_id,
         action,
         arguments,
+        provider_plugin_id,
+        model_id,
+        agent_id,
+        reasoning_effort,
+        reasoning_summary,
+        reasoning_effort_generation,
         event_sender,
     } = request;
-    let (session_id, created_session, event_task) = ensure_session_for_foreground_action(
-        client,
-        session_id,
-        launch_working_directory,
-        event_sender,
-    )
-    .await?;
+    let (session_id, created_session, event_task, event_stream_release) =
+        ensure_session_for_foreground_action(
+            client,
+            session_id,
+            launch_working_directory,
+            event_sender,
+        )
+        .await?;
     let acceptance = match action {
         SkillActionKind::Activate => {
             execute_session_view_action(
@@ -1545,16 +1583,39 @@ async fn skill_action(
             None
         }
         SkillActionKind::Invoke => {
+            apply_submit_runtime_selections(
+                client,
+                session_id,
+                provider_plugin_id,
+                model_id,
+                agent_id.clone(),
+                reasoning_effort.clone(),
+                reasoning_summary.clone(),
+            )
+            .await?;
             let display_text = if arguments.trim().is_empty() {
                 format!("Invoke skill {skill_id}")
             } else {
                 format!("Invoke skill {skill_id}: {arguments}")
             };
-            Some(
-                client
-                    .invoke_skill(session_id, skill_id, arguments, display_text)
-                    .await?,
+            let outcome = execute_session_view_action(
+                client,
+                SessionViewAction::InvokeSkill {
+                    session_id,
+                    skill_id: skill_id.to_string(),
+                    arguments,
+                    display_text,
+                    execution: Box::new(bcode_session_models::TurnExecutionOptions {
+                        reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                            effort: reasoning_effort.clone(),
+                            summary: reasoning_summary.clone(),
+                        })),
+                        ..bcode_session_models::TurnExecutionOptions::default()
+                    }),
+                },
             )
+            .await?;
+            Some(message_acceptance_from_action_outcome(&outcome)?)
         }
     };
     Ok(SkillActionResult {
@@ -1562,6 +1623,13 @@ async fn skill_action(
         created_session,
         event_task,
         acceptance,
+        committed_agent_id: (action == SkillActionKind::Invoke)
+            .then_some(agent_id)
+            .flatten(),
+        committed_reasoning_effort_generation: (action == SkillActionKind::Invoke)
+            .then_some(reasoning_effort_generation)
+            .flatten(),
+        event_stream_release,
     })
 }
 
