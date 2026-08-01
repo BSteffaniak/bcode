@@ -4784,10 +4784,11 @@ fn tool_session_item(
     if let Some(duration_ms) = tool.timing.duration_ms {
         details.push(format!("{duration_ms} ms"));
     }
+    let text = bounded_text(&details.join(" · "), MAX_REVIEW_TOOL_TEXT_CHARS);
     (
         ReviewAgentSessionItemKind::Tool,
         format!("{name} · {:?}", tool.status),
-        details.join(" · "),
+        text,
         TextFormat::PlainText,
         tool.is_error.unwrap_or(false)
             || matches!(
@@ -9835,7 +9836,7 @@ impl ReviewApp {
             })
     }
 
-    fn create_ai_exchange(
+    pub(crate) fn create_ai_exchange(
         &mut self,
         anchor: ReviewCommentAnchor,
         question: String,
@@ -10444,6 +10445,17 @@ impl ReviewApp {
         );
         for anchor in anchors {
             self.fail_agent_thread(&anchor, error.to_string());
+            if let Some(exchanges) = self.ai_exchanges.get_mut(&anchor) {
+                for exchange in exchanges
+                    .iter_mut()
+                    .filter(|exchange| exchange.session_id.as_deref() == Some(session_id))
+                {
+                    exchange.status = ModelReviewAiExchangeStatus::Failed;
+                    exchange.error = Some(error.to_string());
+                    self.pending_ai_exchange_saves
+                        .insert(exchange.exchange_id.clone(), anchor.clone());
+                }
+            }
         }
     }
 
@@ -10616,6 +10628,18 @@ impl ReviewApp {
             "review incomplete: {}; press x again to publish anyway",
             warnings.join(", ")
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_published_thread_for_test(
+        &mut self,
+        anchor: &ReviewCommentAnchor,
+        publisher_id: &str,
+    ) {
+        self.published_review_threads.insert(
+            Self::thread_key_for_anchor(anchor),
+            publisher_id.to_string(),
+        );
     }
 
     /// Return provider-neutral local publish state for a thread.
@@ -12494,7 +12518,7 @@ fn rendered_rows_for_prompt(file: &ReviewFile) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
@@ -12516,7 +12540,7 @@ mod tests {
         }
     }
 
-    fn sample_app() -> ReviewApp {
+    pub fn sample_app() -> ReviewApp {
         ReviewApp::new(ReviewSummary {
             title: "test".to_string(),
             repo_root: PathBuf::from("/repo"),
@@ -14173,6 +14197,99 @@ mod tests {
         );
 
         assert_eq!(app.diagnostic_source_counts(), (1, 1, 1));
+    }
+
+    #[test]
+    fn linked_session_user_action_matrix_queues_each_explicit_transition() {
+        let completed = || {
+            let mut app = sample_app();
+            app.selected_diff_line = 2;
+            let anchor = app.selected_comment_anchor().expect("anchor");
+            let session_id = SessionId::new().to_string();
+            let exchange_id = app.create_ai_exchange(
+                anchor.clone(),
+                "question".to_string(),
+                Some(session_id.clone()),
+            );
+            app.mark_thread_session(&exchange_id, &anchor, &session_id);
+            app.agent_thread_states.insert(
+                ReviewApp::thread_key_for_anchor(&anchor),
+                ReviewAgentThreadState {
+                    phase: ReviewAgentThreadPhase::Complete,
+                    session_id: Some(session_id.clone()),
+                    question: "question".to_string(),
+                    context_summary: String::new(),
+                    status: "answered".to_string(),
+                    answer: "Actionable answer".to_string(),
+                    session_items: Vec::new(),
+                    session_revision: 1,
+                    stream_warning: None,
+                    activity: None,
+                    error: None,
+                },
+            );
+            (app, anchor, session_id)
+        };
+
+        let (mut copy, _, _) = completed();
+        assert!(copy.queue_copy_agent_answer_at_selection());
+        assert_eq!(
+            copy.pending_clipboard_text.as_deref(),
+            Some("Actionable answer")
+        );
+
+        let (mut draft, _, _) = completed();
+        assert!(draft.convert_agent_answer_to_draft_at_selection());
+        assert!(draft.take_pending_draft_save().is_some());
+
+        let (mut accept, _, _) = completed();
+        assert!(accept.suggest_comment_from_agent_answer_at_selection());
+        assert!(accept.take_pending_suggestion_save().is_some());
+        assert!(accept.accept_suggestion_at_selection());
+        assert!(accept.take_pending_draft_save().is_some());
+
+        let (mut refine, _, _) = completed();
+        assert!(refine.suggest_comment_from_agent_answer_at_selection());
+        let _ = refine.take_pending_suggestion_save();
+        assert!(refine.refine_suggestion_at_selection());
+        assert_eq!(
+            refine
+                .take_pending_suggestion_save()
+                .expect("refining transition")
+                .status,
+            ModelReviewSuggestionStatus::Refining
+        );
+
+        let (mut reject, _, _) = completed();
+        assert!(reject.suggest_comment_from_agent_answer_at_selection());
+        let _ = reject.take_pending_suggestion_save();
+        assert!(reject.reject_suggestion_at_selection());
+        assert_eq!(
+            reject
+                .take_pending_suggestion_save()
+                .expect("rejected transition")
+                .status,
+            ModelReviewSuggestionStatus::Rejected
+        );
+
+        let (mut retry, _, session_id) = completed();
+        retry.mark_agent_session_failed(&session_id, "disconnected");
+        assert!(retry.retry_linked_session_stream_at_selection());
+        assert_eq!(
+            retry.take_pending_agent_stream_retries(),
+            vec![session_id.clone()]
+        );
+
+        let (mut follow_up, anchor, session_id) = completed();
+        follow_up.queue_bcode_question(&anchor, "follow up".to_string());
+        let pending = follow_up
+            .take_pending_agent_session()
+            .expect("follow-up request");
+        assert_eq!(pending.draft_body.as_deref(), Some("follow up"));
+        assert_eq!(
+            follow_up.session_id_for_anchor(&anchor),
+            Some(session_id.as_str())
+        );
     }
 
     #[test]
@@ -15883,6 +16000,127 @@ mod tests {
     }
 
     #[test]
+    fn file_modifying_tool_is_bounded_in_mini_view_and_complete_in_canonical_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let changed_file = temp.path().join("changed.rs");
+        let full_contents = "pub fn changed() {\n    println!(\"complete detail\");\n}\n";
+        std::fs::write(&changed_file, full_contents).expect("exercise file-modifying tool");
+        let full_result = format!(
+            "wrote {} bytes to {}\n{}",
+            full_contents.len(),
+            changed_file.display(),
+            "full tool detail ".repeat(80)
+        );
+        let arguments = serde_json::json!({
+            "path": changed_file,
+            "contents": full_contents,
+        })
+        .to_string();
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.revision = 4;
+        snapshot.connection_status = SessionConnectionViewStatus::Attached;
+        snapshot.transcript.items = vec![
+            bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("tool:file-write"),
+                revision: 3,
+                sequence: Some(3),
+                timestamp_ms: Some(3),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::ToolInvocation {
+                    tool: Box::new(bcode_session_view_models::ToolInvocationView {
+                        tool_call_id: "write-1".to_string(),
+                        producer_plugin_id: Some("filesystem".to_string()),
+                        tool_name: Some("filesystem.write".to_string()),
+                        arguments_json: Some(arguments.clone()),
+                        working_directory: Some(temp.path().to_path_buf()),
+                        request_draft: None,
+                        status: ToolInvocationViewStatus::Finished,
+                        result_text: Some(full_result.clone()),
+                        is_error: Some(false),
+                        result: None,
+                        presentation: None,
+                        timing: bcode_session_view_models::ToolTimingView {
+                            duration_ms: Some(8),
+                            ..bcode_session_view_models::ToolTimingView::default()
+                        },
+                    }),
+                },
+            },
+            bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("assistant:file-write"),
+                revision: 4,
+                sequence: Some(4),
+                timestamp_ms: Some(4),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown(
+                        "Updated `changed.rs` and retained complete details in the session.",
+                    ),
+                },
+            },
+        ];
+
+        let state = ReviewAgentSessionViewState::from_snapshot(snapshot);
+        let mini_tool = state
+            .session_items()
+            .iter()
+            .find(|item| item.kind == ReviewAgentSessionItemKind::Tool)
+            .expect("bounded mini-view tool row");
+        assert!(mini_tool.text.chars().count() <= MAX_REVIEW_TOOL_TEXT_CHARS);
+        assert!(mini_tool.label.contains("filesystem.write"));
+        assert_eq!(
+            std::fs::read_to_string(&changed_file).expect("modified file"),
+            full_contents
+        );
+        let TranscriptViewItemKind::ToolInvocation { tool } =
+            &state.snapshot.transcript.items[0].kind
+        else {
+            panic!("canonical tool detail");
+        };
+        assert_eq!(tool.arguments_json.as_deref(), Some(arguments.as_str()));
+        assert_eq!(tool.result_text.as_deref(), Some(full_result.as_str()));
+        assert_eq!(state.snapshot.transcript.items.len(), 2);
+    }
+
+    #[test]
+    fn permission_state_is_action_needed_and_full_control_stays_in_native_session() {
+        let session_id = SessionId::new();
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.session_id = Some(session_id);
+        snapshot.connection_status = SessionConnectionViewStatus::Attached;
+        snapshot
+            .permissions
+            .push(bcode_session_view_models::PermissionView {
+                permission_id: "permission-1".to_string(),
+                session_id: Some(session_id),
+                tool_call_id: "tool-1".to_string(),
+                tool_name: "filesystem.write".to_string(),
+                arguments_json: "{\"path\":\"src/lib.rs\"}".to_string(),
+                batch: None,
+                agent_id: "agent".to_string(),
+                title: Some("Allow file write?".to_string()),
+                policy_source: Some("workspace".to_string()),
+                detail: Some("Open the native session to approve or deny".to_string()),
+                resolved: false,
+                approved: None,
+                can_remember: true,
+            });
+
+        let state = ReviewAgentSessionViewState::from_snapshot(snapshot);
+
+        assert_eq!(state.status, "action needed in linked Bcode session");
+        let action = state
+            .session_items()
+            .iter()
+            .find(|item| item.kind == ReviewAgentSessionItemKind::ActionNeeded)
+            .expect("action-needed row");
+        assert_eq!(action.label, "Allow file write?");
+        assert!(action.text.contains("native session"));
+    }
+
+    #[test]
     fn semantic_session_snapshot_surfaces_reconnect_and_failure() {
         let mut reconnecting = SessionViewSnapshot::empty();
         reconnecting.connection_status = SessionConnectionViewStatus::Reconnecting;
@@ -15977,6 +16215,12 @@ mod tests {
     fn agent_stream_failed_session_marks_linked_thread_failed() {
         let session_id = "not-a-session";
         let (mut app, anchor) = linked_agent_app(session_id);
+        app.create_ai_exchange(
+            anchor.clone(),
+            "question".to_string(),
+            Some(session_id.to_string()),
+        );
+        let _ = app.take_pending_ai_exchange_save();
 
         app.mark_agent_session_failed(session_id, "invalid linked Bcode session id");
 
@@ -15986,6 +16230,14 @@ mod tests {
         assert_eq!(thread_state.phase, ReviewAgentThreadPhase::Failed);
         assert_eq!(
             thread_state.error.as_deref(),
+            Some("invalid linked Bcode session id")
+        );
+        let failed_exchange = app
+            .take_pending_ai_exchange_save()
+            .expect("failed linked exchange should be persisted");
+        assert_eq!(failed_exchange.status, ModelReviewAiExchangeStatus::Failed);
+        assert_eq!(
+            failed_exchange.error.as_deref(),
             Some("invalid linked Bcode session id")
         );
     }

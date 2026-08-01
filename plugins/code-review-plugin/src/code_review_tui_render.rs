@@ -958,7 +958,6 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             };
             let line_label = thread.line_label();
             let body = thread.latest_body.lines().next().unwrap_or_default();
-            let status = if thread.resolved { "RESOLVED" } else { "OPEN" };
             let kind = review_thread_kind_label(thread.thread_kind);
             let severity = review_thread_severity_label(thread.severity);
             let path_label = thread.anchor.scope_label();
@@ -973,16 +972,10 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("  🤖 {}{warning}", state.live_state_label())
                     });
             let suggestion_status = suggestion_sidebar_label(thread);
-            let linked = if thread.session_id.is_some() {
-                " [AI]"
-            } else {
-                ""
-            };
-            let publish_status = app.thread_publish_label(&thread.anchor);
+            let state_tokens = thread_sidebar_state_tokens(app, thread).join("/");
             let external_status = external_sidebar_label(thread);
             let text = format!(
-                " {marker} {status:<8} {kind}/{severity} {path_label}:{line_label} d:{} [{publish_status}] {external_status}{suggestion_status}{linked} {body}{agent_status}",
-                thread.draft_count
+                " {marker} [{state_tokens}] {kind}/{severity} {path_label}:{line_label} {external_status}{suggestion_status} {body}{agent_status}",
             );
             frame.write_line_with_fallback_style(
                 line_area,
@@ -1009,6 +1002,41 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         );
         render_thread_detail(app, detail_area, frame, &threads);
     }
+}
+
+fn thread_sidebar_state_tokens(
+    app: &ReviewApp,
+    thread: &crate::code_review_tui::ReviewThreadSummary,
+) -> Vec<String> {
+    let mut tokens = vec![if thread.resolved {
+        "resolved".to_string()
+    } else {
+        "open".to_string()
+    }];
+    if thread.draft_count > 0 {
+        tokens.push(format!("draft:{}", thread.draft_count));
+    }
+    if app.agent_state_for_anchor(&thread.anchor).is_some() {
+        tokens.push("AI-exchange".to_string());
+    }
+    if thread.pending_suggestion_count
+        + thread.refining_suggestion_count
+        + thread.accepted_suggestion_count
+        + thread.rejected_suggestion_count
+        > 0
+    {
+        tokens.push("suggestion".to_string());
+    }
+    if thread.session_id.is_some() {
+        tokens.push("linked-session".to_string());
+    }
+    if thread.external_provider_id.is_some() {
+        tokens.push("external".to_string());
+    }
+    if app.thread_publish_label(&thread.anchor) == "published" {
+        tokens.push("published".to_string());
+    }
+    tokens
 }
 
 fn external_sidebar_label(thread: &crate::code_review_tui::ReviewThreadSummary) -> String {
@@ -3597,6 +3625,56 @@ mod tests {
     use crate::code_review_tui::ReviewFileStatus;
 
     use super::*;
+
+    #[test]
+    fn sidebar_state_tokens_distinguish_review_lifecycle_dimensions() {
+        let mut app = crate::code_review_tui::tests::sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("composer")
+            .buffer
+            .insert_str("draft");
+        assert!(app.save_comment_editor());
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        let exchange_id = app.create_ai_exchange(
+            anchor.clone(),
+            "question".to_string(),
+            Some("session-1".to_string()),
+        );
+        app.mark_thread_session(&exchange_id, &anchor, "session-1");
+        app.suggested_comments
+            .entry(anchor.clone())
+            .or_default()
+            .push(crate::code_review_tui::ReviewSuggestedComment {
+                id: "suggestion".to_string(),
+                body: "suggestion".to_string(),
+                session_id: Some("session-1".to_string()),
+                status: crate::code_review_tui::ReviewSuggestionStatus::Suggested,
+                rationale: None,
+                created_at_ms: None,
+                updated_at_ms: None,
+            });
+        app.record_published_thread_for_test(&anchor, "github");
+        let thread = app
+            .thread_summaries()
+            .into_iter()
+            .find(|thread| thread.anchor == anchor)
+            .expect("thread");
+
+        assert_eq!(
+            thread_sidebar_state_tokens(&app, &thread),
+            vec![
+                "open",
+                "draft:1",
+                "AI-exchange",
+                "suggestion",
+                "linked-session",
+                "published",
+            ]
+        );
+    }
 
     #[test]
     fn common_composer_title_and_footer_make_each_submit_action_explicit() {
