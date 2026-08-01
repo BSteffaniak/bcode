@@ -11094,6 +11094,50 @@ async fn handle_set_session_model(
 }
 
 #[allow(clippy::significant_drop_tightening)]
+async fn set_session_reasoning_if_changed(
+    state: &ServerState,
+    session_id: SessionId,
+    effort: Option<String>,
+    summary: Option<String>,
+) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
+    if state
+        .sessions
+        .current_reasoning_selection(session_id)
+        .await?
+        == (effort.clone(), summary.clone())
+    {
+        return Ok(None);
+    }
+    let event = state
+        .sessions
+        .append_reasoning_changed(session_id, effort.clone(), summary.clone())
+        .await?;
+    {
+        let mut selections = state.session_model_selections.lock().await;
+        let selection = selections
+            .entry(session_id)
+            .or_insert_with(|| SessionModelSelection {
+                provider_plugin_id: state.selected_provider_plugin_id.clone(),
+                requested_model_id: None,
+                model_id: state.selected_model_id.clone(),
+                thinking_level: None,
+                reasoning_effort: state.selected_reasoning.effort.clone(),
+                reasoning_summary: state.selected_reasoning.summary.clone(),
+                reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
+                provider_context: state.selected_provider_context.clone(),
+            });
+        selection.reasoning_effort = effort;
+        selection.reasoning_summary = summary;
+    }
+    state
+        .session_model_selection_origins
+        .lock()
+        .await
+        .insert(session_id, SessionModelSelectionOrigin::User);
+    Ok(Some(event))
+}
+
+#[allow(clippy::significant_drop_tightening)]
 async fn handle_set_session_reasoning(
     request_id: u64,
     state: &ServerState,
@@ -11102,36 +11146,11 @@ async fn handle_set_session_reasoning(
     effort: Option<String>,
     summary: Option<String>,
 ) -> Result<(), ServerError> {
-    match state
-        .sessions
-        .append_reasoning_changed(session_id, effort.clone(), summary.clone())
-        .await
-    {
+    match set_session_reasoning_if_changed(state, session_id, effort, summary).await {
         Ok(event) => {
-            {
-                let mut selections = state.session_model_selections.lock().await;
-                let selection =
-                    selections
-                        .entry(session_id)
-                        .or_insert_with(|| SessionModelSelection {
-                            provider_plugin_id: state.selected_provider_plugin_id.clone(),
-                            requested_model_id: None,
-                            model_id: state.selected_model_id.clone(),
-                            thinking_level: None,
-                            reasoning_effort: state.selected_reasoning.effort.clone(),
-                            reasoning_summary: state.selected_reasoning.summary.clone(),
-                            reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-                            provider_context: state.selected_provider_context.clone(),
-                        });
-                selection.reasoning_effort = effort;
-                selection.reasoning_summary = summary;
+            if let Some(event) = event {
+                publish_session_event(state, &event).await;
             }
-            state
-                .session_model_selection_origins
-                .lock()
-                .await
-                .insert(session_id, SessionModelSelectionOrigin::User);
-            publish_session_event(state, &event).await;
             send_response(
                 writer,
                 request_id,
@@ -20422,12 +20441,8 @@ fn apply_turn_model_selection(
         selection.model_id = Some(model_id.clone());
     }
     if let Some(reasoning) = &execution.reasoning {
-        if reasoning.effort.is_some() {
-            selection.reasoning_effort.clone_from(&reasoning.effort);
-        }
-        if reasoning.summary.is_some() {
-            selection.reasoning_summary.clone_from(&reasoning.summary);
-        }
+        selection.reasoning_effort.clone_from(&reasoning.effort);
+        selection.reasoning_summary.clone_from(&reasoning.summary);
     }
 }
 
@@ -41905,6 +41920,43 @@ library = "test"
         };
         assert_eq!(turn_execution_options(&user_event), follow_up_execution);
 
+        let low_execution = bcode_session_models::TurnExecutionOptions {
+            reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                effort: Some("low".to_owned()),
+                summary: Some("concise".to_owned()),
+            })),
+            ..bcode_session_models::TurnExecutionOptions::default()
+        };
+        let second_follow_up = enqueue_user_message_command(
+            &state,
+            session.id,
+            client_id,
+            None,
+            "second explicit follow-up".to_owned(),
+            bcode_ipc::PromptPlacement::FollowUp,
+            low_execution.clone(),
+        )
+        .await
+        .expect("second follow-up admission");
+        assert!(second_follow_up.queued);
+        state
+            .session_model_selections
+            .lock()
+            .await
+            .entry(session.id)
+            .or_default()
+            .reasoning_effort = Some("medium".to_owned());
+        let Ok(FollowupCommand::ExecuteTurn {
+            user_event: second_event,
+            queued_steering: None,
+            ..
+        }) = followup_receiver.try_recv()
+        else {
+            panic!("second follow-up should retain its admitted execution options");
+        };
+        assert_eq!(turn_execution_options(&user_event), follow_up_execution);
+        assert_eq!(turn_execution_options(&second_event), low_execution);
+
         *handle.phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
         *handle.current_turn.lock().await = None;
         let applied = enqueue_user_message_command(
@@ -56810,6 +56862,47 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }));
     }
 
+    #[tokio::test]
+    async fn identical_session_reasoning_update_is_a_bounded_noop() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(
+                Some("reasoning dedupe".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let state = test_server_state(sessions.clone());
+
+        let first = set_session_reasoning_if_changed(
+            &state,
+            session.id,
+            Some("high".to_owned()),
+            Some("detailed".to_owned()),
+        )
+        .await
+        .expect("first update");
+        let duplicate = set_session_reasoning_if_changed(
+            &state,
+            session.id,
+            Some("high".to_owned()),
+            Some("detailed".to_owned()),
+        )
+        .await
+        .expect("duplicate update");
+
+        assert!(first.is_some());
+        assert!(duplicate.is_none());
+        let history = sessions.session_history(session.id).await.expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ReasoningChanged { .. }))
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn turn_model_selection_overrides_provider_model_and_reasoning() {
         let mut selection = SessionModelSelection {
@@ -56838,6 +56931,27 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(selection.model_id.as_deref(), Some("model-turn"));
         assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(selection.reasoning_summary.as_deref(), Some("detailed"));
+    }
+
+    #[test]
+    fn turn_reasoning_snapshot_clears_absent_values() {
+        let mut selection = SessionModelSelection {
+            reasoning_effort: Some("high".to_owned()),
+            reasoning_summary: Some("detailed".to_owned()),
+            ..SessionModelSelection::default()
+        };
+        let execution = bcode_session_models::TurnExecutionOptions {
+            reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                effort: Some("low".to_owned()),
+                summary: None,
+            })),
+            ..bcode_session_models::TurnExecutionOptions::default()
+        };
+
+        apply_turn_model_selection(&mut selection, &execution);
+
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(selection.reasoning_summary, None);
     }
 
     #[tokio::test]

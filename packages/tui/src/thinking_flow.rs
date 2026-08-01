@@ -80,6 +80,10 @@ async fn apply_thinking_dialog(
     let summary = dialog.summary().map(ToOwned::to_owned);
     let visible = dialog.visible();
     let mode = dialog.mode();
+    let effort_generation = effort
+        .as_ref()
+        .filter(|effort| chat.app.reasoning_effort() != Some(effort.as_str()))
+        .map(|effort| chat.app.set_pending_reasoning_effort(effort.clone()));
     let Some(session_id) = chat.app.session_id() else {
         chat.app.apply_reasoning_selection(effort, summary);
         chat.app.set_reasoning_visible(visible);
@@ -99,6 +103,9 @@ async fn apply_thinking_dialog(
         },
     )
     .await?;
+    if let Some(generation) = effort_generation {
+        chat.app.clear_pending_reasoning_effort(generation);
+    }
     chat.app.set_reasoning_visible(visible);
     chat.app.set_reasoning_display_mode(mode);
     if let Ok(status) = client.session_model_status(session_id).await {

@@ -190,6 +190,8 @@ pub fn start_switch_session(
         BmuxApp::new_with_history(Some(next_session_id), &[], &[], false),
     );
     chat.app.take_cross_session_state_from(&previous_app);
+    chat.app
+        .take_same_session_reasoning_state_from(&previous_app);
     chat.agents.refresh_app_agent_metadata(&mut chat.app);
     if !draft_text.is_empty() {
         chat.app.replace_composer_with(&draft_text);
@@ -233,6 +235,8 @@ pub fn complete_switch_session(
                 ),
             );
             chat.app.take_cross_session_state_from(&previous_app);
+            chat.app
+                .take_same_session_reasoning_state_from(&previous_app);
             chat.agents.refresh_app_agent_metadata(&mut chat.app);
             if !draft_text.is_empty() {
                 chat.app.replace_composer_with(&draft_text);
@@ -358,6 +362,7 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
         BmuxApp::new_with_history(None, &[], &[], false),
     );
     chat.app.take_cross_session_state_from(&previous_app);
+    chat.app.clear_pending_reasoning_effort_for_session_change();
     chat.agents
         .apply_agent_to_app(&mut chat.app, current_agent_id);
     chat.app.set_status("New draft".to_owned());

@@ -212,6 +212,8 @@ pub enum TuiEffect {
         effort: Option<String>,
         /// Optional reasoning summary.
         summary: Option<String>,
+        /// Pending effort generation staged for this update.
+        effort_generation: Option<u64>,
         /// Success status text.
         status: String,
     },
@@ -465,6 +467,12 @@ pub enum TuiEffectResult {
     },
     /// Session reasoning update completed.
     SetSessionReasoning {
+        /// Session that was updated.
+        session_id: SessionId,
+        /// Effort value requested by the update.
+        effort: Option<String>,
+        /// Pending effort generation staged for the update.
+        effort_generation: Option<u64>,
         /// Success status text.
         status: String,
         /// Daemon response.
@@ -759,7 +767,16 @@ impl TuiEffect {
                 model_id,
                 result: Err(client_error),
             },
-            Self::SetSessionReasoning { status, .. } => TuiEffectResult::SetSessionReasoning {
+            Self::SetSessionReasoning {
+                session_id,
+                effort,
+                effort_generation,
+                status,
+                ..
+            } => TuiEffectResult::SetSessionReasoning {
+                session_id,
+                effort,
+                effort_generation,
                 status,
                 result: Err(client_error),
             },
@@ -1339,8 +1356,12 @@ impl TuiEffect {
                 session_id,
                 effort,
                 summary,
+                effort_generation,
                 status,
             } => TuiEffectResult::SetSessionReasoning {
+                session_id,
+                effort: effort.clone(),
+                effort_generation,
                 status,
                 result: execute_session_view_action(
                     &client,

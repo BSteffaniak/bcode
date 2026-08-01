@@ -555,6 +555,23 @@ impl BmuxApp {
         self.take_theme_transition_state_from(source);
     }
 
+    /// Preserve pending reasoning presentation across a reconnect to the same session.
+    pub(crate) fn take_same_session_reasoning_state_from(&mut self, source: &Self) {
+        if self.session_id == source.session_id {
+            self.pending_reasoning_effort
+                .clone_from(&source.pending_reasoning_effort);
+            self.reasoning_effort_generation = source.reasoning_effort_generation;
+            self.reasoning_effort_values
+                .clone_from(&source.reasoning_effort_values);
+            self.reasoning_support = source.reasoning_support;
+            self.reasoning_default_effort
+                .clone_from(&source.reasoning_default_effort);
+            self.reasoning_default_summary
+                .clone_from(&source.reasoning_default_summary);
+            self.refresh_thinking_label();
+        }
+    }
+
     /// Set the local plugin runtime used for client-side presentation projection.
     #[cfg(test)]
     pub fn set_plugin_host(&mut self, host: Arc<bcode_plugin::PluginHost>) {
@@ -1611,12 +1628,8 @@ impl BmuxApp {
             requested_model_id,
             effective_model_id,
         );
-        if self
-            .pending_reasoning_effort
-            .as_ref()
-            .is_some_and(|pending| status.reasoning_effort.as_deref() == Some(&pending.value))
-        {
-            self.pending_reasoning_effort = None;
+        if let Some(effort) = status.reasoning_effort.as_deref() {
+            self.reconcile_pending_reasoning_effort(effort);
         }
         self.selected_auth_profile.clone_from(&status.auth_profile);
         self.selected_context_format_version = status.context_format_version;
@@ -2097,6 +2110,25 @@ impl BmuxApp {
         self.pending_reasoning_effort
             .as_ref()
             .map(|pending| pending.generation)
+    }
+
+    /// Clear any pending effort when leaving its draft/session scope.
+    pub fn clear_pending_reasoning_effort_for_session_change(&mut self) {
+        if self.pending_reasoning_effort.take().is_some() {
+            self.refresh_thinking_label();
+        }
+    }
+
+    /// Clear a pending effort when canonical state confirms its exact value.
+    pub fn reconcile_pending_reasoning_effort(&mut self, effort: &str) {
+        if self
+            .pending_reasoning_effort
+            .as_ref()
+            .is_some_and(|pending| pending.value == effort)
+        {
+            self.pending_reasoning_effort = None;
+            self.refresh_thinking_label();
+        }
     }
 
     /// Clear the exact pending effort captured by a completed submission.
@@ -2922,12 +2954,8 @@ impl BmuxApp {
                 self.apply_shared_model_changed(provider, model);
             }
             SessionEventKind::ReasoningChanged { effort, .. } => {
-                if self
-                    .pending_reasoning_effort
-                    .as_ref()
-                    .is_some_and(|pending| effort.as_deref() == Some(&pending.value))
-                {
-                    self.pending_reasoning_effort = None;
+                if let Some(effort) = effort {
+                    self.reconcile_pending_reasoning_effort(effort);
                 }
                 self.refresh_thinking_label();
             }
@@ -5714,6 +5742,46 @@ mod tests {
     }
 
     #[test]
+    fn full_effort_range_cycles_two_wraps_without_frame_changes() {
+        let session_id = SessionId::new();
+        let history = [shared_projection_adapter_event(
+            session_id,
+            1,
+            SessionEventKind::AssistantMessage {
+                text: "stable transcript".to_owned(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        app.reasoning_effort_values = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        app.apply_reasoning_selection(Some("none".to_owned()), None);
+        app.last_transcript_damage = TranscriptDocumentDamage::None;
+        let frame = app.frame_observation();
+        let expected = [
+            "minimal", "low", "medium", "high", "xhigh", "max", "none", "minimal", "low", "medium",
+            "high", "xhigh", "max", "none",
+        ];
+
+        for expected in expected {
+            assert_eq!(app.cycle_pending_reasoning_effort(), Some(expected));
+            assert_eq!(app.frame_observation(), frame);
+        }
+    }
+
+    #[test]
+    fn subset_effort_range_skips_unsupported_values_and_wraps() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.reasoning_effort_values = vec!["low".to_owned(), "high".to_owned()];
+        app.apply_reasoning_selection(Some("low".to_owned()), None);
+
+        assert_eq!(app.cycle_pending_reasoning_effort(), Some("high"));
+        assert_eq!(app.cycle_pending_reasoning_effort(), Some("low"));
+        assert_eq!(app.cycle_pending_reasoning_effort(), Some("high"));
+    }
+
+    #[test]
     fn pending_reasoning_cycle_advances_every_rapid_call_and_wraps() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         app.reasoning_effort_values = vec!["none".to_owned(), "low".to_owned(), "high".to_owned()];
@@ -5724,6 +5792,28 @@ mod tests {
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("none"));
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("low"));
         assert_eq!(app.reasoning_effort_generation, 4);
+    }
+
+    #[test]
+    fn session_change_explicitly_clears_pending_reasoning() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_pending_reasoning_effort("high".to_owned());
+
+        app.clear_pending_reasoning_effort_for_session_change();
+
+        assert_eq!(app.pending_reasoning_effort_generation(), None);
+        assert_eq!(app.reasoning_effort(), None);
+    }
+
+    #[test]
+    fn canonical_status_clears_only_matching_pending_reasoning() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_pending_reasoning_effort("high".to_owned());
+        app.reconcile_pending_reasoning_effort("low");
+        assert_eq!(app.reasoning_effort(), Some("high"));
+
+        app.reconcile_pending_reasoning_effort("high");
+        assert_eq!(app.reasoning_effort(), None);
     }
 
     #[test]

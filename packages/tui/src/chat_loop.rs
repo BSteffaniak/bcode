@@ -806,8 +806,21 @@ fn apply_effect_result(
                 result,
             );
         }
-        TuiEffectResult::SetSessionReasoning { status, result } => {
-            apply_set_session_reasoning_result(chat, status, result);
+        TuiEffectResult::SetSessionReasoning {
+            session_id,
+            effort,
+            effort_generation,
+            status,
+            result,
+        } => {
+            apply_set_session_reasoning_result(
+                chat,
+                session_id,
+                effort,
+                effort_generation,
+                status,
+                result,
+            );
         }
         TuiEffectResult::AppendPresentationNote { result } => {
             if let Err(error) = result {
@@ -1333,11 +1346,24 @@ fn apply_set_session_model_result(
 
 fn apply_set_session_reasoning_result(
     chat: &mut ActiveChat,
+    session_id: bcode_session_models::SessionId,
+    effort: Option<String>,
+    effort_generation: Option<u64>,
     status: String,
     result: Result<(), ClientError>,
 ) {
+    if chat.session_id != Some(session_id) {
+        return;
+    }
     match result {
-        Ok(()) => chat.app.set_status(status),
+        Ok(()) => {
+            if let Some(generation) = effort_generation {
+                chat.app.clear_pending_reasoning_effort(generation);
+            } else if let Some(effort) = effort {
+                chat.app.reconcile_pending_reasoning_effort(&effort);
+            }
+            chat.app.set_status(status);
+        }
         Err(error) => {
             daemon_issue::report_client_issue(&mut chat.app, "reasoning setting failed", &error);
         }
@@ -3242,6 +3268,97 @@ mod scheduler_tests {
             opening_session_progress: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
         }
+    }
+
+    #[test]
+    fn explicit_reasoning_completion_preserves_newer_pending_generation() {
+        let mut chat = test_chat();
+        let session_id = bcode_session_models::SessionId::new();
+        chat.session_id = Some(session_id);
+        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let older = chat.app.set_pending_reasoning_effort("low".to_owned());
+        let newer = chat.app.set_pending_reasoning_effort("high".to_owned());
+
+        apply_set_session_reasoning_result(
+            &mut chat,
+            session_id,
+            Some("low".to_owned()),
+            Some(older),
+            "reasoning effort set to low".to_owned(),
+            Ok(()),
+        );
+
+        assert_eq!(chat.app.reasoning_effort(), Some("high"));
+        assert_eq!(chat.app.pending_reasoning_effort_generation(), Some(newer));
+    }
+
+    #[test]
+    fn failed_explicit_reasoning_update_retains_pending_selection() {
+        let mut chat = test_chat();
+        let session_id = bcode_session_models::SessionId::new();
+        chat.session_id = Some(session_id);
+        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let generation = chat.app.set_pending_reasoning_effort("high".to_owned());
+
+        apply_set_session_reasoning_result(
+            &mut chat,
+            session_id,
+            Some("high".to_owned()),
+            Some(generation),
+            "reasoning effort set to high".to_owned(),
+            Err(ClientError::UnexpectedResponse),
+        );
+
+        assert_eq!(chat.app.reasoning_effort(), Some("high"));
+        assert_eq!(
+            chat.app.pending_reasoning_effort_generation(),
+            Some(generation)
+        );
+    }
+
+    #[test]
+    fn successful_submit_clears_only_captured_reasoning_generation() {
+        let mut chat = test_chat();
+        let session_id = bcode_session_models::SessionId::new();
+        chat.session_id = Some(session_id);
+        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let captured = chat.app.set_pending_reasoning_effort("low".to_owned());
+        let newer = chat.app.set_pending_reasoning_effort("high".to_owned());
+
+        apply_submit_message_result(
+            &mut chat,
+            "prompt",
+            Ok(super::super::effects::SubmitMessageResult {
+                session_id,
+                created_session: None,
+                acceptance: bcode_client::MessageAcceptance::sent(),
+                committed_agent_id: None,
+                committed_reasoning_effort_generation: Some(captured),
+                event_task: None,
+                event_stream_release: None,
+            }),
+        );
+
+        assert_eq!(chat.app.reasoning_effort(), Some("high"));
+        assert_eq!(chat.app.pending_reasoning_effort_generation(), Some(newer));
+    }
+
+    #[test]
+    fn same_session_reconnect_preserves_newer_pending_reasoning() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut previous =
+            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let generation = previous.set_pending_reasoning_effort("high".to_owned());
+        let mut reattached =
+            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+        reattached.take_same_session_reasoning_state_from(&previous);
+
+        assert_eq!(reattached.reasoning_effort(), Some("high"));
+        assert_eq!(
+            reattached.pending_reasoning_effort_generation(),
+            Some(generation)
+        );
     }
 
     #[tokio::test]

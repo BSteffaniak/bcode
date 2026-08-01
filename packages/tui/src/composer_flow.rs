@@ -306,10 +306,14 @@ async fn handle_slash_command<W: Write>(
             status,
         } => {
             chat.app.clear_pending_submission(message);
+            let effort_generation = effort
+                .as_ref()
+                .map(|effort| chat.app.set_pending_reasoning_effort(effort.clone()));
             chat.start_effect(TuiEffect::SetSessionReasoning {
                 session_id,
                 effort,
                 summary,
+                effort_generation,
                 status,
             });
             chat.app.set_status("setting thinking…".to_owned());

@@ -305,7 +305,7 @@ async fn thinking_command(
             Ok(SlashCommandOutcome::SetSessionReasoning {
                 session_id,
                 effort: Some(effort.clone()),
-                summary: None,
+                summary: status.reasoning_summary,
                 status: format!("reasoning effort set to {effort}"),
             })
         }
@@ -323,7 +323,7 @@ async fn thinking_command(
             }
             Ok(SlashCommandOutcome::SetSessionReasoning {
                 session_id,
-                effort: None,
+                effort: status.reasoning_effort,
                 summary: Some(summary.clone()),
                 status: format!("visible reasoning summary set to {summary}"),
             })
@@ -345,11 +345,15 @@ async fn thinking_command(
             Ok(SlashCommandOutcome::SetSessionReasoning {
                 session_id,
                 effort: Some(value.to_owned()),
-                summary: None,
+                summary: status.reasoning_summary,
                 status: format!("reasoning effort set to {value}"),
             })
         }
     }
+}
+
+fn supported_reasoning_values(values: &[String]) -> Vec<String> {
+    bcode_model::ordered_reasoning_effort_values(values)
 }
 
 fn unsupported_reasoning_value(
@@ -358,6 +362,13 @@ fn unsupported_reasoning_value(
     supported: Option<&[String]>,
 ) -> Option<String> {
     let supported = supported?;
+    let ordered;
+    let supported = if kind == "effort" {
+        ordered = supported_reasoning_values(supported);
+        ordered.as_slice()
+    } else {
+        supported
+    };
     if supported.is_empty() || supported.iter().any(|candidate| candidate == value) {
         return None;
     }
@@ -409,7 +420,7 @@ fn thinking_status(
             .map_or_else(String::new, |reasoning| format!(
                 "\nsource: {}\navailable effort: {}\navailable visible summaries: {}",
                 reasoning_source_label(reasoning.source),
-                list_or_default(&reasoning.effort_values),
+                list_or_default(&supported_reasoning_values(&reasoning.effort_values)),
                 list_or_default(&reasoning.summary_values)
             ))
     )
@@ -896,6 +907,16 @@ mod tests {
             draft_thinking_command(&["/thinking", "mode", "other"]),
             SlashCommandOutcome::Handled(message) if message.contains("supported: all, summary, raw")
         ));
+    }
+
+    #[test]
+    fn effort_validation_reports_semantic_supported_order() {
+        let supported = vec!["high".to_owned(), "none".to_owned(), "low".to_owned()];
+        assert_eq!(
+            unsupported_reasoning_value("effort", "turbo", Some(&supported)).as_deref(),
+            Some("unsupported reasoning effort 'turbo' (supported: none, low, high)")
+        );
+        assert!(unsupported_reasoning_value("effort", "low", Some(&supported)).is_none());
     }
 
     #[test]
