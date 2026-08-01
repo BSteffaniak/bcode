@@ -253,6 +253,18 @@ exhaustion, corruption, or provider absence never delays or rolls back canonical
 
 ## Large-output search
 
+Large shell/tool output is an explicit deep-search category. The shared planner rejects requests that
+name `shell_output` or `tool_output` under ordinary execution even if an indexed provider advertises
+those categories; callers must opt into deep policy. This prevents an accidental policy change or
+provider capability expansion from making ordinary transcript search scan or expose large output.
+
+The first implementation choice remains evidence-gated. Supported canonical export attempts against
+several representative local sessions on 2026-08-01 produced only explicit degraded evidence: the
+active session was unavailable because its canonical WAL owner held the lock, while other sampled
+sessions reported an unknown migration and required repair. No direct database fallback was used, so
+there is not yet a trustworthy representative output-size/query-frequency corpus from which to select
+a backend.
+
 Large normalized shell/tool output may use a provider specialized for compressed chunks or bounded
 scanning rather than the transcript index. Provider-owned chunks must be independently bounded,
 checksummed, confined, and cancellable to scan. Ordinary search can exclude cold output; explicit

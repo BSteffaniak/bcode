@@ -144,6 +144,12 @@ pub enum SearchContentKind {
     ArtifactMetadata,
 }
 
+impl SearchContentKind {
+    const fn is_large_output(self) -> bool {
+        matches!(self, Self::ShellOutput | Self::ToolOutput)
+    }
+}
+
 /// Stable semantic field that matched inside one derived record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -885,6 +891,33 @@ pub fn plan_session_search_with_policy_and_routes(
             "policy".to_owned(),
             SearchErrorCode::InvalidRequest,
             &error.to_string(),
+        ));
+        return SessionSearchPlan {
+            providers: Vec::new(),
+            failures: discovery.failures,
+            per_provider_deadline_ms: policy.per_provider_deadline_ms,
+        };
+    }
+    if matches!(
+        policy.execution_class,
+        SessionSearchExecutionClass::Ordinary
+    ) && request
+        .filters
+        .content_kinds
+        .iter()
+        .any(|content| content.is_large_output())
+    {
+        discovery.failures.push(planning_failure_with_content(
+            "policy".to_owned(),
+            SearchErrorCode::UnsupportedQuery,
+            "large shell/tool output requires explicit deep search",
+            request
+                .filters
+                .content_kinds
+                .iter()
+                .copied()
+                .filter(|content| content.is_large_output())
+                .collect(),
         ));
         return SessionSearchPlan {
             providers: Vec::new(),
@@ -2088,6 +2121,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn explicit_routes_support_fallback_parallel_and_disjoint_selection() {
         let request = SessionSearchRequest {
             query: text_query("needle"),
@@ -2171,7 +2205,15 @@ mod tests {
                 provider_ids: vec!["shell".to_owned()],
             },
         ];
-        let plan = plan_session_search_with_routes(&request, discovery, &routes);
+        let plan = plan_session_search_with_policy_and_routes(
+            &request,
+            discovery,
+            &SessionSearchPlanPolicy {
+                execution_class: SessionSearchExecutionClass::Deep,
+                ..SessionSearchPlanPolicy::default()
+            },
+            &routes,
+        );
         assert_eq!(
             plan.providers
                 .iter()
@@ -2239,6 +2281,54 @@ mod tests {
         status.state = SearchProviderState::Unavailable;
         status.degraded_reason = Some("configured binary is unavailable".to_owned());
         assert_eq!(status.validate(), Ok(()));
+    }
+
+    #[test]
+    fn ordinary_policy_rejects_explicit_large_output_content() {
+        let mut request = SessionSearchRequest {
+            query: text_query("needle"),
+            filters: SessionSearchFilters::default(),
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 10,
+            cursor: None,
+            deadline_ms: Some(5_000),
+        };
+        request
+            .filters
+            .content_kinds
+            .insert(SearchContentKind::ShellOutput);
+        let discovery = ListSessionSearchProvidersResponse {
+            providers: Vec::new(),
+            failures: Vec::new(),
+        };
+        let ordinary = plan_session_search_with_policy_and_routes(
+            &request,
+            discovery.clone(),
+            &SessionSearchPlanPolicy::default(),
+            &[],
+        );
+        assert!(ordinary.providers.is_empty());
+        assert_eq!(ordinary.failures.len(), 1);
+        assert_eq!(ordinary.failures[0].plugin_id, "policy");
+        assert_eq!(
+            ordinary.failures[0].error.code,
+            SearchErrorCode::UnsupportedQuery
+        );
+        assert_eq!(
+            ordinary.failures[0].content,
+            vec![SearchContentKind::ShellOutput]
+        );
+
+        let deep = plan_session_search_with_policy_and_routes(
+            &request,
+            discovery,
+            &SessionSearchPlanPolicy {
+                execution_class: SessionSearchExecutionClass::Deep,
+                ..SessionSearchPlanPolicy::default()
+            },
+            &[],
+        );
+        assert!(deep.failures.is_empty());
     }
 
     #[test]
@@ -2420,7 +2510,7 @@ mod tests {
             cursor: None,
             deadline_ms: None,
         };
-        let plan = plan_session_search(
+        let plan = plan_session_search_with_policy_and_routes(
             &request,
             ListSessionSearchProvidersResponse {
                 providers: vec![
@@ -2447,6 +2537,11 @@ mod tests {
                 ],
                 failures: Vec::new(),
             },
+            &SessionSearchPlanPolicy {
+                execution_class: SessionSearchExecutionClass::Deep,
+                ..SessionSearchPlanPolicy::default()
+            },
+            &[],
         );
         assert_eq!(
             plan.providers

@@ -71,9 +71,10 @@ bcode session search 'migration' --working-directory /workspace/project \
   --after-timestamp-ms 1767225600000 --before-timestamp-ms 1769817600000 --json
 ```
 
-Sensitive content must be both provider-allowlisted and explicitly targeted. Large shell/tool output
-search is not yet an implemented provider workflow; do not infer deep corpus coverage merely because
-`--deep` is accepted by the backend-neutral planner.
+Sensitive content must be both provider-allowlisted and explicitly targeted. The shared planner
+rejects `shell_output` and `tool_output` in ordinary mode, so those categories always require
+`--deep`. Large shell/tool output search is not yet an implemented provider workflow; do not infer
+deep corpus coverage merely because `--deep` is accepted by the backend-neutral planner.
 
 ```sh
 bcode session search 'credential refresh' --content assistant-reasoning --json
