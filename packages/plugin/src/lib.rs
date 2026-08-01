@@ -135,6 +135,7 @@ pub use bmux_host_adapter::{
 use libloading::Library;
 use semver::Version;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{CStr, CString};
@@ -264,6 +265,44 @@ pub const WORKFLOW_TEMPLATE_CONTRIBUTION_VERSION: u32 = 1;
 
 /// Maximum serialized bytes accepted for one declarative workflow template definition.
 pub const MAX_WORKFLOW_TEMPLATE_DEFINITION_BYTES: usize = 1_048_576;
+/// Maximum bytes read from one plugin-owned external workflow authoring document.
+pub const MAX_WORKFLOW_TEMPLATE_AUTHORING_DOCUMENT_BYTES: usize = 1_048_576;
+
+/// Confined plugin-owned source for one maintainable workflow template.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowTemplateDocumentSource {
+    /// Path relative to the plugin package directory.
+    pub path: PathBuf,
+    /// Expected lowercase SHA-256 digest of the exact file bytes.
+    pub sha256: String,
+}
+
+impl WorkflowTemplateDocumentSource {
+    fn validate(&self) -> Result<(), String> {
+        if self.path.as_os_str().is_empty()
+            || self.path.is_absolute()
+            || self
+                .path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(
+                "template document path must be a confined relative path with normal components"
+                    .to_string(),
+            );
+        }
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("template document sha256 must be lowercase hexadecimal".to_string());
+        }
+        Ok(())
+    }
+}
 
 /// One generic configuration binding applied to an exact template definition before start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,13 +353,22 @@ pub struct WorkflowTemplateContribution {
     pub title: String,
     /// User-facing summary.
     pub description: String,
-    /// Typed configuration schema validated before definition compilation.
-    pub configuration_schema: bcode_workflow::ValueSchema,
+    /// Typed configuration schema validated before definition compilation for inline templates.
+    /// External templates derive this from their normalized authoring document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_schema: Option<bcode_workflow::ValueSchema>,
     /// Generic bounded bindings applied from validated configuration before exact identity is derived.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compilation_bindings: Vec<WorkflowTemplateCompilationBinding>,
-    /// Exact declarative compiled definition for this template version.
-    pub definition: bcode_workflow::WorkflowDefinition,
+    /// Inline exact declarative compiled definition retained for version-1 compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<bcode_workflow::WorkflowDefinition>,
+    /// Confined plugin-owned standard authoring document source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_source: Option<WorkflowTemplateDocumentSource>,
+    /// Normalized authoring document loaded during discovery, never accepted from manifest input.
+    #[serde(skip)]
+    pub authoring_document: Option<bcode_workflow::WorkflowAuthoringDocument>,
     /// Plugin IDs required by the compiled definition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_plugins: Vec<String>,
@@ -337,6 +385,7 @@ pub struct WorkflowTemplateContribution {
 
 fn validate_template_compilation_bindings(
     template: &WorkflowTemplateContribution,
+    definition: &bcode_workflow::WorkflowDefinition,
 ) -> Result<(), String> {
     if template.compilation_bindings.len() > 32 {
         return Err("template compilation binding count exceeds 32".to_string());
@@ -351,7 +400,7 @@ fn validate_template_compilation_bindings(
         )) {
             return Err("template compilation bindings must be unique".to_string());
         }
-        let Some(node) = template.definition.nodes.get(&binding.node_id) else {
+        let Some(node) = definition.nodes.get(&binding.node_id) else {
             return Err(format!(
                 "template compilation binding references missing node '{}'",
                 binding.node_id
@@ -371,8 +420,8 @@ fn validate_template_compilation_bindings(
         }
         if edge.from == binding.node_id
             || edge.to == binding.node_id
-            || !template.definition.nodes.contains_key(&edge.from)
-            || !template.definition.nodes.contains_key(&edge.to)
+            || !definition.nodes.contains_key(&edge.from)
+            || !definition.nodes.contains_key(&edge.to)
             || edge.kind != bcode_workflow::EdgeKind::Direct
         {
             return Err(format!(
@@ -382,7 +431,7 @@ fn validate_template_compilation_bindings(
         }
         if let Some(transform) = &edge.transform {
             transform.validate().map_err(|error| error.to_string())?;
-            if transform.output != template.definition.nodes[&edge.to].input {
+            if transform.output != definition.nodes[&edge.to].input {
                 return Err(format!(
                     "template compilation fallback output does not match target '{}' input",
                     edge.to
@@ -394,12 +443,49 @@ fn validate_template_compilation_bindings(
 }
 
 impl WorkflowTemplateContribution {
+    /// Return the normalized standard authoring document for an external template.
+    #[must_use]
+    pub const fn authoring_document(&self) -> Option<&bcode_workflow::WorkflowAuthoringDocument> {
+        self.authoring_document.as_ref()
+    }
+
+    /// Return the normalized template configuration schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when called on a contribution that has not passed source-form validation.
+    #[must_use]
+    pub fn configuration_schema(&self) -> &bcode_workflow::ValueSchema {
+        self.authoring_document.as_ref().map_or_else(
+            || {
+                self.configuration_schema
+                    .as_ref()
+                    .expect("validated template source")
+            },
+            |document| &document.configuration_schema,
+        )
+    }
+
+    /// Return the exact normalized definition contributed by either template source form.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when called on a contribution that has not passed source-form validation.
+    #[must_use]
+    pub fn definition(&self) -> &bcode_workflow::WorkflowDefinition {
+        self.authoring_document.as_ref().map_or_else(
+            || self.definition.as_ref().expect("validated template source"),
+            |document| &document.definition,
+        )
+    }
+
     /// Validate this contribution without starting or persisting a workflow run.
     ///
     /// # Errors
     ///
     /// Returns an error for unsupported versions, malformed or oversized metadata, duplicate
     /// requirements, invalid configuration schemas, or unsupported compiled definitions.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), bcode_workflow::WorkflowError> {
         let invalid = |message: String| bcode_workflow::WorkflowError::Build {
             path: self.template_id.clone(),
@@ -426,10 +512,45 @@ impl WorkflowTemplateContribution {
                 "template display metadata is empty or oversized".to_string(),
             ));
         }
-        validate_template_compilation_bindings(self).map_err(&invalid)?;
-        if self.configuration_schema.type_name.trim().is_empty()
-            || self.configuration_schema.type_name.len() > 256
-            || !self.configuration_schema.schema.is_object()
+        let definition = match (
+            self.definition.as_ref(),
+            self.document_source.as_ref(),
+            self.authoring_document.as_ref(),
+        ) {
+            (Some(definition), None, None) => definition,
+            (None, Some(source), Some(document)) => {
+                source.validate().map_err(&invalid)?;
+                document.validate()?;
+                &document.definition
+            }
+            (None, Some(_), None) => {
+                return Err(invalid(
+                    "external template document was not resolved during discovery".to_string(),
+                ));
+            }
+            _ => {
+                return Err(invalid(
+                    "template must declare exactly one inline definition or external document source"
+                        .to_string(),
+                ));
+            }
+        };
+        validate_template_compilation_bindings(self, definition).map_err(&invalid)?;
+        let configuration_schema = match (
+            self.configuration_schema.as_ref(),
+            self.authoring_document.as_ref(),
+        ) {
+            (Some(schema), None) => schema,
+            (None, Some(document)) => &document.configuration_schema,
+            _ => {
+                return Err(invalid(
+                    "template configuration schema must match its selected source form".to_string(),
+                ));
+            }
+        };
+        if configuration_schema.type_name.trim().is_empty()
+            || configuration_schema.type_name.len() > 256
+            || !configuration_schema.schema.is_object()
         {
             return Err(invalid(
                 "configuration schema must have a bounded type name and object schema".to_string(),
@@ -448,8 +569,8 @@ impl WorkflowTemplateContribution {
                 "template presentation metadata is invalid or oversized".to_string(),
             ));
         }
-        self.definition.validate()?;
-        let definition_bytes = serde_json::to_vec(&self.definition).map_err(|error| {
+        definition.validate()?;
+        let definition_bytes = serde_json::to_vec(definition).map_err(|error| {
             invalid(format!("template definition cannot be serialized: {error}"))
         })?;
         if definition_bytes.len() > MAX_WORKFLOW_TEMPLATE_DEFINITION_BYTES {
@@ -457,8 +578,7 @@ impl WorkflowTemplateContribution {
                 "template definition exceeds {MAX_WORKFLOW_TEMPLATE_DEFINITION_BYTES} bytes"
             )));
         }
-        let admission = self
-            .definition
+        let admission = definition
             .production_admission(&bcode_workflow::WorkflowProductionCapabilities::current())?;
         if !admission.is_supported() {
             return Err(invalid(format!(
@@ -489,7 +609,7 @@ impl WorkflowTemplateContribution {
                 "{owner_plugin_id}/{}@{}",
                 self.template_id, self.template_version
             ),
-            &self.definition,
+            self.definition(),
         )
     }
 }
@@ -1157,6 +1277,7 @@ pub enum PluginDefaultActivation {
 pub struct StaticBundledPlugin {
     pub manifest_toml: &'static str,
     pub vtable: StaticPluginVtable,
+    package_root: Option<&'static str>,
     default_activation: PluginDefaultActivation,
 }
 
@@ -1167,8 +1288,16 @@ impl StaticBundledPlugin {
         Self {
             manifest_toml,
             vtable,
+            package_root: None,
             default_activation: PluginDefaultActivation::Enabled,
         }
+    }
+
+    /// Attach the trusted build-time plugin package root used for external template sources.
+    #[must_use]
+    pub const fn with_package_root(mut self, package_root: &'static str) -> Self {
+        self.package_root = Some(package_root);
+        self
     }
 
     /// Override whether this available plugin participates in distribution defaults.
@@ -1720,6 +1849,12 @@ pub enum PluginLoadError {
     },
     #[error("manifest ID mismatch: file declared '{file_id}', library exported '{library_id}'")]
     ManifestIdMismatch { file_id: String, library_id: String },
+    #[error("plugin '{plugin_id}' workflow template '{template_id}' source is invalid: {message}")]
+    WorkflowTemplateSource {
+        plugin_id: String,
+        template_id: String,
+        message: String,
+    },
     #[error("plugin '{plugin_id}' has invalid tool presentation for '{tool_name}': {reason}")]
     InvalidToolPresentation {
         plugin_id: String,
@@ -1899,10 +2034,31 @@ pub fn static_bundled_default_plugin_ids(
 fn parse_static_bundled_manifest(
     plugin: &StaticBundledPlugin,
 ) -> Result<PluginManifest, PluginLoadError> {
-    toml::from_str(plugin.manifest_toml).map_err(|source| PluginLoadError::ExportedManifestParse {
-        library: PathBuf::from("<static>"),
-        source,
-    })
+    let mut manifest: PluginManifest = toml::from_str(plugin.manifest_toml).map_err(|source| {
+        PluginLoadError::ExportedManifestParse {
+            library: PathBuf::from("<static>"),
+            source,
+        }
+    })?;
+    if let Some(package_root) = plugin.package_root {
+        resolve_external_workflow_templates(&mut manifest, Path::new(package_root))?;
+    } else if manifest
+        .workflow_templates
+        .iter()
+        .any(|template| template.document_source.is_some())
+    {
+        return Err(PluginLoadError::WorkflowTemplateSource {
+            plugin_id: manifest.id.clone(),
+            template_id: manifest
+                .workflow_templates
+                .iter()
+                .find(|template| template.document_source.is_some())
+                .map_or_else(String::new, |template| template.template_id.clone()),
+            message: "static registration did not provide a trusted plugin package root"
+                .to_string(),
+        });
+    }
+    Ok(manifest)
 }
 
 /// Filter static plugin registrations according to an enable/disable policy.
@@ -1917,13 +2073,7 @@ pub fn filter_selected_static_plugins(
     plugins
         .iter()
         .map(|plugin| {
-            let manifest: PluginManifest =
-                toml::from_str(plugin.manifest_toml).map_err(|source| {
-                    PluginLoadError::ExportedManifestParse {
-                        library: PathBuf::from("<static>"),
-                        source,
-                    }
-                })?;
+            let manifest = parse_static_bundled_manifest(plugin)?;
             Ok((manifest, plugin.vtable))
         })
         .filter(|plugin| match plugin {
@@ -4854,8 +5004,83 @@ fn discover_plugins_in_root(
     Ok(())
 }
 
+/// Resolve confined external workflow authoring documents relative to one trusted plugin package.
+///
+/// # Errors
+///
+/// Returns an error for malformed paths, confinement escape, non-files, oversized content,
+/// digest mismatch, malformed authoring documents, or invalid normalized contributions.
+pub fn resolve_external_workflow_templates(
+    manifest: &mut PluginManifest,
+    package_root: &Path,
+) -> Result<(), PluginLoadError> {
+    let canonical_root = package_root.canonicalize()?;
+    for template in &mut manifest.workflow_templates {
+        let Some(source) = template.document_source.as_ref() else {
+            continue;
+        };
+        let fail = |message: String| PluginLoadError::WorkflowTemplateSource {
+            plugin_id: manifest.id.clone(),
+            template_id: template.template_id.clone(),
+            message,
+        };
+        source.validate().map_err(fail)?;
+        if template.definition.is_some() {
+            return Err(fail(
+                "external document source cannot be combined with an inline definition".to_string(),
+            ));
+        }
+        let path = package_root.join(&source.path);
+        let canonical_path = path
+            .canonicalize()
+            .map_err(|error| fail(format!("source path cannot be resolved: {error}")))?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(fail("source path escapes the plugin package".to_string()));
+        }
+        let metadata = std::fs::metadata(&canonical_path)
+            .map_err(|error| fail(format!("source metadata cannot be read: {error}")))?;
+        let length = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if !metadata.is_file() || length > MAX_WORKFLOW_TEMPLATE_AUTHORING_DOCUMENT_BYTES {
+            return Err(fail(format!(
+                "source must be a regular file no larger than {MAX_WORKFLOW_TEMPLATE_AUTHORING_DOCUMENT_BYTES} bytes"
+            )));
+        }
+        let bytes = std::fs::read(&canonical_path)
+            .map_err(|error| fail(format!("source cannot be read: {error}")))?;
+        if bytes.len() > MAX_WORKFLOW_TEMPLATE_AUTHORING_DOCUMENT_BYTES {
+            return Err(fail(
+                "source grew beyond its bounded size while reading".to_string(),
+            ));
+        }
+        let actual_digest = format!("{:x}", Sha256::digest(&bytes));
+        if actual_digest != source.sha256 {
+            return Err(fail(format!(
+                "source digest mismatch: expected {}, got {actual_digest}",
+                source.sha256
+            )));
+        }
+        let document: bcode_workflow::WorkflowAuthoringDocument = serde_json::from_slice(&bytes)
+            .map_err(|error| fail(format!("source is not a valid authoring document: {error}")))?;
+        document
+            .validate()
+            .map_err(|error| fail(format!("source authoring validation failed: {error}")))?;
+        template.configuration_schema = None;
+        template.required_plugins = document.requirements.plugins.iter().cloned().collect();
+        template.required_skills = document.requirements.skills.iter().cloned().collect();
+        template.authoring_document = Some(document);
+        template
+            .validate()
+            .map_err(|error| fail(format!("normalized template is invalid: {error}")))?;
+    }
+    Ok(())
+}
+
 fn read_registered_plugin(path: &Path) -> Result<RegisteredPlugin, PluginLoadError> {
-    let manifest = read_manifest(path)?;
+    let mut manifest = read_manifest(path)?;
+    resolve_external_workflow_templates(
+        &mut manifest,
+        path.parent().unwrap_or_else(|| Path::new(".")),
+    )?;
     Ok(RegisteredPlugin {
         manifest_path: path.to_path_buf(),
         manifest,
@@ -7717,9 +7942,11 @@ library = "libexample_plugin.dylib"
             template_version: 1,
             title: "Example".to_string(),
             description: "A declarative example workflow.".to_string(),
-            configuration_schema: definition.input.clone(),
+            configuration_schema: Some(definition.input.clone()),
             compilation_bindings: Vec::new(),
-            definition,
+            definition: Some(definition),
+            document_source: None,
+            authoring_document: None,
             required_plugins: Vec::new(),
             required_skills: Vec::new(),
             required_capabilities: vec!["transforms/v1".to_string()],
@@ -7756,7 +7983,8 @@ library = "libexample_plugin.dylib"
         assert!(missing.validate().is_err());
 
         let mut changed = template;
-        changed.definition.name = "changed-topology-policy".to_string();
+        changed.definition.as_mut().expect("inline definition").name =
+            "changed-topology-policy".to_string();
         assert_ne!(
             identity.definition_id,
             changed
@@ -7906,6 +8134,62 @@ library = "libexample_plugin.dylib"
             std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
         }
         SERVICE_STATUS_OK
+    }
+
+    #[test]
+    fn external_template_source_is_confined_digest_verified_and_normalized() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(root.join("templates")).expect("template directory");
+        let mut template = workflow_template();
+        let definition = template.definition.take().expect("inline definition");
+        let document = bcode_workflow::WorkflowAuthoringDocument {
+            schema_version: bcode_workflow::WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+            workflow_id: "external-example".to_string(),
+            metadata: bcode_workflow::WorkflowAuthoringMetadata {
+                title: "External example".to_string(),
+                description: Some("External source".to_string()),
+                labels: BTreeMap::new(),
+            },
+            configuration_schema: template
+                .configuration_schema
+                .clone()
+                .expect("inline configuration schema"),
+            configuration_defaults: None,
+            definition,
+            bindings: Vec::new(),
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            run_limits: bcode_workflow::WorkflowRunLimitPolicy::default(),
+            producer: bcode_workflow::WorkflowProducerProvenance {
+                kind: bcode_workflow::WorkflowProducerKind::Plugin,
+                producer_id: Some("bcode.example".to_string()),
+                source_revision: None,
+            },
+            presentation: None,
+        };
+        let bytes = serde_json::to_vec(&document).expect("document JSON");
+        std::fs::write(root.join("templates/example.json"), &bytes).expect("template source");
+        template.document_source = Some(WorkflowTemplateDocumentSource {
+            path: PathBuf::from("templates/example.json"),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        });
+        let mut manifest = test_manifest("bcode.example");
+        manifest.workflow_templates.push(template);
+
+        resolve_external_workflow_templates(&mut manifest, &root).expect("external template");
+        let normalized = &manifest.workflow_templates[0];
+        assert_eq!(normalized.authoring_document(), Some(&document));
+        normalized.validate().expect("normalized contribution");
+
+        let mut escaped = normalized.clone();
+        escaped.authoring_document = None;
+        escaped.document_source = Some(WorkflowTemplateDocumentSource {
+            path: PathBuf::from("../outside.json"),
+            sha256: "0".repeat(64),
+        });
+        let mut escaped_manifest = test_manifest("bcode.example");
+        escaped_manifest.workflow_templates.push(escaped);
+        assert!(resolve_external_workflow_templates(&mut escaped_manifest, &root).is_err());
+        std::fs::remove_dir_all(root).expect("remove temp root");
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {

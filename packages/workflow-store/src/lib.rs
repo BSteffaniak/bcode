@@ -385,6 +385,13 @@ pub struct NewChildWorkflowRun {
     pub run: NewWorkflowRun,
 }
 
+/// Bounded durable descendant status joined to its immutable parent/child link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDescendantRunSummary {
+    pub link: WorkflowRunLink,
+    pub run: WorkflowRunSummary,
+}
+
 /// Durable workflow run creation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewWorkflowRun {
@@ -519,6 +526,12 @@ pub struct WorkflowGrant {
     pub scope: serde_json::Value,
     pub granted_at_ms: u64,
     pub expires_at_ms: Option<u64>,
+    /// Maximum permitted consumptions for a scoped static plan. `None` retains legacy unlimited use.
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    /// Durable successful consumption count.
+    #[serde(default)]
+    pub uses_consumed: u32,
 }
 
 /// One exact pending workflow mutation approval request.
@@ -3312,6 +3325,66 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Return bounded descendant runs for one root without replaying workflow history.
+    ///
+    /// Results are ordered by durable link creation and include each exact parent/child link so
+    /// clients can reconstruct the bounded hierarchy without private store access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity/limit, malformed persisted targets or run rows,
+    /// missing linked runs, or query failure.
+    pub fn descendant_run_summaries(
+        &self,
+        root_run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowDescendantRunSummary>, WorkflowStoreError> {
+        validate_id("root_run_id", root_run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT l.root_run_id, l.parent_run_id, l.parent_node_id, l.parent_activation_id, \
+             l.parent_attempt, l.child_run_id, l.version, l.target_json, l.depth, l.created_at_ms, \
+             r.run_id, r.definition_id, r.definition_version, r.workspace_snapshot, \
+             r.parent_session_id, r.owner_plugin_id, r.workflow_kind, r.scope_key, r.display_label, \
+             r.single_active, r.authored_provenance_json, r.terminal_output_id, \
+             r.terminal_output_checksum_sha256, r.authorization_ceiling, r.status, \
+             r.cancellation_requested_at_ms, r.created_at_ms, r.updated_at_ms \
+             FROM workflow_run_links l JOIN workflow_runs r ON r.run_id = l.child_run_id \
+             WHERE l.root_run_id = ?1 ORDER BY l.created_at_ms, l.child_run_id LIMIT ?2",
+        )?;
+        statement
+            .query_map((root_run_id, limit), |row| {
+                let link = WorkflowRunLink {
+                    root_run_id: row.get(0)?,
+                    parent_run_id: row.get(1)?,
+                    parent_node_id: row.get(2)?,
+                    parent_activation_id: row.get(3)?,
+                    parent_attempt: row.get(4)?,
+                    child_run_id: row.get(5)?,
+                    version: row.get(6)?,
+                    target: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    depth: row.get(8)?,
+                    created_at_ms: row.get(9)?,
+                };
+                let run = run_summary_from_row_offset(row, 10)?;
+                Ok((link, run))
+            })?
+            .map(|row| {
+                let (link, run) = row?;
+                Ok(WorkflowDescendantRunSummary {
+                    link,
+                    run: parse_run_summary(run)?,
+                })
+            })
+            .collect()
+    }
+
     /// Return the exact parent link for one child without replaying history.
     ///
     /// # Errors
@@ -3502,7 +3575,7 @@ impl WorkflowStore {
         validate_id("run_id", run_id)?;
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
-            "SELECT grant_id, run_id, node_id, scope_json, granted_at_ms, expires_at_ms \
+            "SELECT grant_id, run_id, node_id, scope_json, granted_at_ms, expires_at_ms, max_uses, uses_consumed \
              FROM workflow_grants WHERE run_id = ?1 ORDER BY granted_at_ms, grant_id LIMIT ?2",
         )?;
         statement
@@ -3514,10 +3587,21 @@ impl WorkflowStore {
                     row.get::<_, String>(3)?,
                     row.get::<_, u64>(4)?,
                     row.get::<_, Option<u64>>(5)?,
+                    row.get::<_, Option<u32>>(6)?,
+                    row.get::<_, u32>(7)?,
                 ))
             })?
             .map(|row| {
-                let (grant_id, run_id, node_id, scope_json, granted_at_ms, expires_at_ms) = row?;
+                let (
+                    grant_id,
+                    run_id,
+                    node_id,
+                    scope_json,
+                    granted_at_ms,
+                    expires_at_ms,
+                    max_uses,
+                    uses_consumed,
+                ) = row?;
                 Ok(WorkflowGrant {
                     grant_id,
                     run_id,
@@ -3525,6 +3609,8 @@ impl WorkflowStore {
                     scope: serde_json::from_str(&scope_json)?,
                     granted_at_ms,
                     expires_at_ms,
+                    max_uses,
+                    uses_consumed,
                 })
             })
             .collect()
@@ -3768,8 +3854,8 @@ impl WorkflowStore {
         let transaction = self.connection.transaction()?;
         let changed = transaction.execute(
             "INSERT OR IGNORE INTO workflow_grants \
-             (grant_id, run_id, node_id, scope_json, granted_at_ms, expires_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (grant_id, run_id, node_id, scope_json, granted_at_ms, expires_at_ms, max_uses, uses_consumed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             (
                 &grant.grant_id,
                 &grant.run_id,
@@ -3777,11 +3863,13 @@ impl WorkflowStore {
                 &scope_json,
                 grant.granted_at_ms,
                 grant.expires_at_ms,
+                grant.max_uses,
+                grant.uses_consumed,
             ),
         )?;
         if changed == 0 {
             let existing = transaction.query_row(
-                "SELECT run_id, node_id, scope_json, granted_at_ms, expires_at_ms \
+                "SELECT run_id, node_id, scope_json, granted_at_ms, expires_at_ms, max_uses, uses_consumed \
                  FROM workflow_grants WHERE grant_id = ?1",
                 [&grant.grant_id],
                 |row| {
@@ -3791,6 +3879,8 @@ impl WorkflowStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, u64>(3)?,
                         row.get::<_, Option<u64>>(4)?,
+                        row.get::<_, Option<u32>>(5)?,
+                        row.get::<_, u32>(6)?,
                     ))
                 },
             )?;
@@ -3801,6 +3891,8 @@ impl WorkflowStore {
                     scope_json,
                     grant.granted_at_ms,
                     grant.expires_at_ms,
+                    grant.max_uses,
+                    grant.uses_consumed,
                 )
             {
                 return Err(WorkflowStoreError::InvalidData(format!(
@@ -3819,6 +3911,86 @@ impl WorkflowStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Atomically consume one use of an exact bounded workflow grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the grant is missing, expired, unlimited, exhausted, concurrently
+    /// consumed, malformed, or cannot be persisted.
+    pub fn consume_grant(
+        &mut self,
+        grant_id: &str,
+        consumed_at_ms: u64,
+    ) -> Result<WorkflowGrant, WorkflowStoreError> {
+        validate_id("grant_id", grant_id)?;
+        let transaction = self.connection.transaction()?;
+        let (run_id, node_id, scope_json, granted_at_ms, expires_at_ms, max_uses, uses_consumed) =
+            transaction
+                .query_row(
+                    "SELECT run_id, node_id, scope_json, granted_at_ms, expires_at_ms, max_uses, uses_consumed \
+                     FROM workflow_grants WHERE grant_id = ?1",
+                    [grant_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, u64>(3)?,
+                            row.get::<_, Option<u64>>(4)?,
+                            row.get::<_, Option<u32>>(5)?,
+                            row.get::<_, u32>(6)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| WorkflowStoreError::InvalidData(format!("workflow grant {grant_id} is missing")))?;
+        if expires_at_ms.is_some_and(|expires| expires < consumed_at_ms) {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow grant {grant_id} is expired"
+            )));
+        }
+        let Some(max_uses) = max_uses else {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow grant {grant_id} is not use-counted"
+            )));
+        };
+        if uses_consumed >= max_uses {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow grant {grant_id} use budget is exhausted"
+            )));
+        }
+        let next_uses = uses_consumed.saturating_add(1);
+        let changed = transaction.execute(
+            "UPDATE workflow_grants SET uses_consumed = ?2 \
+             WHERE grant_id = ?1 AND uses_consumed = ?3",
+            (grant_id, next_uses, uses_consumed),
+        )?;
+        if changed != 1 {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow grant {grant_id} consumption raced with another consumer"
+            )));
+        }
+        let grant = WorkflowGrant {
+            grant_id: grant_id.to_string(),
+            run_id,
+            node_id,
+            scope: serde_json::from_str(&scope_json)?,
+            granted_at_ms,
+            expires_at_ms,
+            max_uses: Some(max_uses),
+            uses_consumed: next_uses,
+        };
+        append_event(
+            &transaction,
+            &grant.run_id,
+            "grant_consumed",
+            &serde_json::to_string(&grant)?,
+            consumed_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(grant)
     }
 
     /// Persist one exact mutation approval wait before a mutating activation becomes dispatchable.
@@ -4254,7 +4426,7 @@ impl WorkflowStore {
         validate_id("grant_id", grant_id)?;
         self.connection
             .query_row(
-                "SELECT run_id, node_id, scope_json, granted_at_ms, expires_at_ms \
+                "SELECT run_id, node_id, scope_json, granted_at_ms, expires_at_ms, max_uses, uses_consumed \
                  FROM workflow_grants WHERE grant_id = ?1",
                 [grant_id],
                 |row| {
@@ -4264,12 +4436,22 @@ impl WorkflowStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, u64>(3)?,
                         row.get::<_, Option<u64>>(4)?,
+                        row.get::<_, Option<u32>>(5)?,
+                        row.get::<_, u32>(6)?,
                     ))
                 },
             )
             .optional()?
             .map(
-                |(run_id, node_id, scope_json, granted_at_ms, expires_at_ms)| {
+                |(
+                    run_id,
+                    node_id,
+                    scope_json,
+                    granted_at_ms,
+                    expires_at_ms,
+                    max_uses,
+                    uses_consumed,
+                )| {
                     Ok(WorkflowGrant {
                         grant_id: grant_id.to_string(),
                         run_id,
@@ -4277,6 +4459,8 @@ impl WorkflowStore {
                         scope: serde_json::from_str(&scope_json)?,
                         granted_at_ms,
                         expires_at_ms,
+                        max_uses,
+                        uses_consumed,
                     })
                 },
             )
@@ -8612,25 +8796,32 @@ type RawRunSummary = (
 );
 
 fn run_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRunSummary> {
+    run_summary_from_row_offset(row, 0)
+}
+
+fn run_summary_from_row_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<RawRunSummary> {
     Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-        row.get(11)?,
-        row.get(12)?,
-        row.get(13)?,
-        row.get(14)?,
-        row.get(15)?,
-        row.get(16)?,
-        row.get(17)?,
+        row.get(offset)?,
+        row.get(offset + 1)?,
+        row.get(offset + 2)?,
+        row.get(offset + 3)?,
+        row.get(offset + 4)?,
+        row.get(offset + 5)?,
+        row.get(offset + 6)?,
+        row.get(offset + 7)?,
+        row.get(offset + 8)?,
+        row.get(offset + 9)?,
+        row.get(offset + 10)?,
+        row.get(offset + 11)?,
+        row.get(offset + 12)?,
+        row.get(offset + 13)?,
+        row.get(offset + 14)?,
+        row.get(offset + 15)?,
+        row.get(offset + 16)?,
+        row.get(offset + 17)?,
     ))
 }
 
@@ -9202,6 +9393,15 @@ fn validate_grant(grant: &WorkflowGrant) -> Result<(), WorkflowStoreError> {
     validate_id("grant_id", &grant.grant_id)?;
     validate_id("run_id", &grant.run_id)?;
     validate_id("node_id", &grant.node_id)?;
+    if grant.max_uses == Some(0)
+        || grant
+            .max_uses
+            .is_some_and(|max_uses| grant.uses_consumed > max_uses)
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow grant use accounting is invalid".to_string(),
+        ));
+    }
     if grant
         .expires_at_ms
         .is_some_and(|expires| expires <= grant.granted_at_ms)
@@ -10339,6 +10539,8 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              scope_json TEXT NOT NULL,\
              granted_at_ms INTEGER NOT NULL,\
              expires_at_ms INTEGER,\
+             max_uses INTEGER,\
+             uses_consumed INTEGER NOT NULL DEFAULT 0,\
              FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id)\
          );\
          CREATE TABLE IF NOT EXISTS workflow_mutation_approvals (\
@@ -10395,6 +10597,22 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
     if !columns.iter().any(|column| column == "input_json") {
         transaction.execute(
             "ALTER TABLE workflow_activations ADD COLUMN input_json TEXT",
+            [],
+        )?;
+    }
+    let grant_columns = transaction
+        .prepare("PRAGMA table_info(workflow_grants)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !grant_columns.iter().any(|column| column == "max_uses") {
+        transaction.execute(
+            "ALTER TABLE workflow_grants ADD COLUMN max_uses INTEGER",
+            [],
+        )?;
+    }
+    if !grant_columns.iter().any(|column| column == "uses_consumed") {
+        transaction.execute(
+            "ALTER TABLE workflow_grants ADD COLUMN uses_consumed INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -13172,7 +13390,19 @@ mod tests {
         let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
         assert_eq!(
             reopened.child_run_links("parent-run", 10).expect("links"),
-            [request.link]
+            std::slice::from_ref(&request.link)
+        );
+        assert_eq!(
+            reopened
+                .descendant_run_summaries("parent-run", 10)
+                .expect("descendant status"),
+            [WorkflowDescendantRunSummary {
+                link: request.link,
+                run: reopened
+                    .run_summary(&child_run_id)
+                    .expect("child")
+                    .expect("child"),
+            }]
         );
         assert!(
             reopened
@@ -13180,6 +13410,117 @@ mod tests {
                 .expect("child")
                 .is_some()
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn flagship_restart_preserves_wait_approval_repeat_and_composed_status() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let child_definition = definition("batch");
+        let child_identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "implementation-batch",
+            &child_definition,
+        )
+        .expect("identity");
+        let parent_definition = workflow_call_definition(child_identity.clone());
+        store
+            .persist_definition("delivery-tranche", 1, &parent_definition)
+            .expect("parent definition");
+        store
+            .persist_definition(
+                &child_identity.definition_id,
+                child_identity.definition_version,
+                &child_definition,
+            )
+            .expect("child definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "flagship-root".to_string(),
+                definition_id: "delivery-tranche".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("root");
+        let activation = store
+            .pending_activations(10)
+            .expect("activation")
+            .pop()
+            .expect("activation");
+        store
+            .prepare_pending_activation(
+                "flagship-root",
+                "call",
+                &activation.activation_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"target": child_identity}),
+                2,
+            )
+            .expect("prepared");
+        let target = bcode_workflow::WorkflowCallTarget::Definition {
+            identity: child_identity,
+        };
+        let child_run_id = workflow_child_run_id(
+            "flagship-root",
+            "flagship-root",
+            &activation.activation_id,
+            1,
+            &target,
+        );
+        let link = WorkflowRunLink {
+            version: WORKFLOW_RUN_LINK_VERSION,
+            root_run_id: "flagship-root".to_string(),
+            parent_run_id: "flagship-root".to_string(),
+            parent_node_id: activation.node_id,
+            parent_activation_id: activation.activation_id,
+            parent_attempt: 1,
+            child_run_id: child_run_id.clone(),
+            target,
+            depth: 2,
+            created_at_ms: 2,
+        };
+        store
+            .create_child_run_idempotent(&NewChildWorkflowRun {
+                link: link.clone(),
+                run: NewWorkflowRun {
+                    run_id: child_run_id.clone(),
+                    definition_id: match &link.target {
+                        bcode_workflow::WorkflowCallTarget::Definition { identity } => {
+                            identity.definition_id.clone()
+                        }
+                        bcode_workflow::WorkflowCallTarget::AuthoredRevision { .. } => {
+                            unreachable!("definition target")
+                        }
+                    },
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot".to_string(),
+                    parent_session_id: None,
+                    binding: None,
+                    authored_provenance: None,
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 2,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                    limits: WorkflowRunLimits::default(),
+                },
+            })
+            .expect("child");
+        drop(store);
+
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let descendants = reopened
+            .descendant_run_summaries("flagship-root", 64)
+            .expect("bounded hierarchy");
+        assert_eq!(descendants.len(), 1);
+        assert_eq!(descendants[0].link, link);
+        assert_eq!(descendants[0].run.run_id, child_run_id);
+        assert_eq!(descendants[0].run.status, RunStatus::Running);
     }
 
     #[test]
@@ -14176,7 +14517,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn durable_input_gate_waits_validates_and_activates_successor() {
-        let (_temp, mut store) = initialized_store();
+        let (temp, mut store) = initialized_store();
         let schema = bcode_workflow::ValueSchema {
             type_name: "u32".to_string(),
             schema: serde_json::json!({"type": "integer", "minimum": 0}),
@@ -14243,6 +14584,14 @@ mod tests {
             .pop()
             .expect("wait");
         assert_eq!(wait.kind, WorkflowWaitKind::Input);
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert_eq!(
+            store
+                .waiting_activations("input-run", 10)
+                .expect("reopened wait"),
+            std::slice::from_ref(&wait)
+        );
         assert!(
             store
                 .provide_input(
@@ -14893,6 +15242,8 @@ mod tests {
             scope: serde_json::json!({"workspace": "snapshot-1", "tools": ["git_commit"]}),
             granted_at_ms: 13,
             expires_at_ms: Some(100),
+            max_uses: Some(2),
+            uses_consumed: 0,
         };
         store.persist_grant(&grant).expect("grant");
         store.persist_grant(&grant).expect("idempotent grant");
@@ -14900,6 +15251,30 @@ mod tests {
             store.grant("grant-1").expect("load grant"),
             Some(grant.clone())
         );
+        assert_eq!(
+            store
+                .consume_grant("grant-1", 20)
+                .expect("first consumption")
+                .uses_consumed,
+            1
+        );
+        assert_eq!(
+            store
+                .consume_grant("grant-1", 21)
+                .expect("second consumption")
+                .uses_consumed,
+            2
+        );
+        assert!(store.consume_grant("grant-1", 22).is_err());
+
+        let stale_grant = WorkflowGrant {
+            grant_id: "grant-stale".to_string(),
+            granted_at_ms: 13,
+            expires_at_ms: Some(19),
+            ..grant.clone()
+        };
+        store.persist_grant(&stale_grant).expect("stale grant");
+        assert!(store.consume_grant("grant-stale", 20).is_err());
 
         let read = WorkflowResourceLease {
             lease_id: "lease-read-1".to_string(),

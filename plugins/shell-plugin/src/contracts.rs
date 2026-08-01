@@ -118,6 +118,8 @@ pub struct ShellWorkflowCommandResult {
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlanResult {
     pub version: u32,
+    /// Canonical SHA-256 of the exact normalized command plan executed by the shell owner.
+    pub plan_sha256: String,
     pub passed: bool,
     pub commands: Vec<ShellWorkflowCommandResult>,
     pub artifacts: Vec<bcode_workflow::ArtifactReference>,
@@ -268,6 +270,7 @@ mod tests {
     fn workflow_command_plan_result_carries_terminal_detail_and_artifacts() {
         let result = ShellWorkflowCommandPlanResult {
             version: SHELL_COMMAND_PLAN_VERSION,
+            plan_sha256: "a".repeat(64),
             passed: false,
             commands: vec![ShellWorkflowCommandResult {
                 index: 0,
@@ -291,6 +294,7 @@ mod tests {
         };
         let payload = serde_json::to_value(&result).expect("encode");
         assert_eq!(payload["passed"], false);
+        assert_eq!(payload["plan_sha256"], "a".repeat(64));
         assert_eq!(payload["commands"][0]["status"], "exited");
         assert_eq!(payload["artifacts"][0]["artifact_id"], "stderr-1");
     }

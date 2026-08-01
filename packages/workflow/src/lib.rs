@@ -2747,6 +2747,147 @@ impl From<&WorkflowProductionCapabilities> for WorkflowAuthoringCapabilitySummar
     }
 }
 
+/// Portable schema-form contract version.
+pub const WORKFLOW_SCHEMA_FORM_VERSION: u32 = 1;
+/// Maximum fields projected into one catalog-driven form.
+pub const MAX_WORKFLOW_SCHEMA_FORM_FIELDS: usize = 4_096;
+
+/// Renderer-neutral control kind derived from a supported JSON Schema field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSchemaFormControl {
+    Object,
+    Array,
+    Text,
+    Number,
+    Integer,
+    Boolean,
+    Choice,
+    Json,
+}
+
+/// One source-addressed field description for native frontend form controls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSchemaFormField {
+    pub path: String,
+    pub title: String,
+    pub control: WorkflowSchemaFormControl,
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One catalog-derived portable form description retaining its authoritative schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSchemaFormDescription {
+    pub version: u32,
+    pub type_name: String,
+    pub schema: ValueSchema,
+    pub fields: Vec<WorkflowSchemaFormField>,
+}
+
+impl WorkflowSchemaFormDescription {
+    /// Derive a bounded native-form description from an authoritative runtime schema.
+    ///
+    /// Unsupported compositions remain addressable JSON controls rather than being guessed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema is invalid or the projected field count is excessive.
+    pub fn from_schema(schema: &ValueSchema) -> Result<Self, WorkflowError> {
+        validate_runtime_value_schema("schema_form.schema", schema)?;
+        let mut fields = Vec::new();
+        describe_schema_fields(&schema.schema, "", false, &mut fields)?;
+        Ok(Self {
+            version: WORKFLOW_SCHEMA_FORM_VERSION,
+            type_name: schema.type_name.clone(),
+            schema: schema.clone(),
+            fields,
+        })
+    }
+}
+
+fn describe_schema_fields(
+    schema: &serde_json::Value,
+    path: &str,
+    required: bool,
+    fields: &mut Vec<WorkflowSchemaFormField>,
+) -> Result<(), WorkflowError> {
+    if fields.len() >= MAX_WORKFLOW_SCHEMA_FORM_FIELDS {
+        return Err(authoring_error(
+            "schema_form.fields",
+            format!("schema form exceeds {MAX_WORKFLOW_SCHEMA_FORM_FIELDS} fields"),
+        ));
+    }
+    let object = schema.as_object();
+    let choices = object
+        .and_then(|value| value.get("enum"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let schema_type = object
+        .and_then(|value| value.get("type"))
+        .and_then(serde_json::Value::as_str);
+    let control = if choices.is_empty() {
+        match schema_type {
+            Some("object") => WorkflowSchemaFormControl::Object,
+            Some("array") => WorkflowSchemaFormControl::Array,
+            Some("string") => WorkflowSchemaFormControl::Text,
+            Some("number") => WorkflowSchemaFormControl::Number,
+            Some("integer") => WorkflowSchemaFormControl::Integer,
+            Some("boolean") => WorkflowSchemaFormControl::Boolean,
+            _ => WorkflowSchemaFormControl::Json,
+        }
+    } else {
+        WorkflowSchemaFormControl::Choice
+    };
+    fields.push(WorkflowSchemaFormField {
+        path: path.to_string(),
+        title: object
+            .and_then(|value| value.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or("value"))
+            .to_string(),
+        control,
+        required,
+        choices,
+        description: object
+            .and_then(|value| value.get("description"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    });
+    if let Some(properties) = object
+        .and_then(|value| value.get("properties"))
+        .and_then(serde_json::Value::as_object)
+    {
+        let required_names = object
+            .and_then(|value| value.get("required"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<BTreeSet<_>>();
+        for (name, child) in properties {
+            let child_path = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}.{name}")
+            };
+            describe_schema_fields(
+                child,
+                &child_path,
+                required_names.contains(name.as_str()),
+                fields,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Portable catalog snapshot consumed by pure workflow authoring validation and compilation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2985,6 +3126,355 @@ impl WorkflowCompilationPreview {
     pub const fn is_compiled(&self) -> bool {
         self.compiled.is_some() && self.validation.is_valid()
     }
+}
+
+/// Current renderer-neutral semantic authoring-edit contract version.
+pub const WORKFLOW_AUTHORING_EDIT_VERSION: u32 = 1;
+/// Maximum operations accepted in one atomic semantic edit batch.
+pub const MAX_WORKFLOW_AUTHORING_EDITS_PER_BATCH: usize = 256;
+
+/// Stable selector for one exact edge in the authored graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringEdgeSelector {
+    /// Source node identity.
+    pub from: String,
+    /// Target node identity.
+    pub to: String,
+    /// Zero-based occurrence among edges with this source and target.
+    pub occurrence: usize,
+}
+
+/// One renderer-neutral semantic edit to a [`WorkflowAuthoringDocument`].
+///
+/// Operations describe domain intent rather than arbitrary JSON mutation. Presentation edits are
+/// confined to producer namespaces and never alter executable workflow identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowAuthoringEdit {
+    /// Insert a node whose identity is not already present.
+    AddNode { node: NodeDefinition },
+    /// Replace one existing node while retaining its stable identity.
+    UpdateNode { node: NodeDefinition },
+    /// Remove a node and every edge connected to it.
+    RemoveNode { node_id: String },
+    /// Append one graph edge.
+    AddEdge { edge: EdgeDefinition },
+    /// Replace one exact graph edge occurrence.
+    UpdateEdge {
+        selector: WorkflowAuthoringEdgeSelector,
+        edge: EdgeDefinition,
+    },
+    /// Remove one exact graph edge occurrence.
+    RemoveEdge {
+        selector: WorkflowAuthoringEdgeSelector,
+    },
+    /// Replace the workflow input schema.
+    UpdateWorkflowInput { schema: ValueSchema },
+    /// Replace the workflow output schema.
+    UpdateWorkflowOutput { schema: ValueSchema },
+    /// Replace all generic configuration bindings.
+    UpdateBindings {
+        bindings: Vec<WorkflowConfigurationBinding>,
+    },
+    /// Replace exact declared catalog requirements.
+    UpdateRequirements {
+        requirements: WorkflowRequirementSummary,
+    },
+    /// Replace user-facing workflow metadata.
+    UpdateMetadata { metadata: WorkflowAuthoringMetadata },
+    /// Set or remove one producer-owned presentation namespace.
+    UpdatePresentationNamespace {
+        namespace: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<serde_json::Value>,
+    },
+}
+
+/// One bounded atomic edit batch guarded by an exact draft generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringEditBatch {
+    /// Edit contract version.
+    pub version: u32,
+    /// Exact draft generation against which these operations were authored.
+    pub expected_generation: u64,
+    /// Ordered edits applied atomically by the pure reducer.
+    pub edits: Vec<WorkflowAuthoringEdit>,
+}
+
+impl WorkflowAuthoringEditBatch {
+    /// Validate version, generation, and batch bounds before reduction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, zero generations, or empty/oversized batches.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_AUTHORING_EDIT_VERSION {
+            return Err(authoring_error(
+                "edit_batch.version",
+                format!(
+                    "unsupported authoring edit version {}; expected {WORKFLOW_AUTHORING_EDIT_VERSION}",
+                    self.version
+                ),
+            ));
+        }
+        if self.expected_generation == 0 {
+            return Err(authoring_error(
+                "edit_batch.expected_generation",
+                "expected draft generation must be positive",
+            ));
+        }
+        if self.edits.is_empty() || self.edits.len() > MAX_WORKFLOW_AUTHORING_EDITS_PER_BATCH {
+            return Err(authoring_error(
+                "edit_batch.edits",
+                format!(
+                    "edit batch must contain 1..={MAX_WORKFLOW_AUTHORING_EDITS_PER_BATCH} operations"
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Apply semantic edits to a cloned document without persistence or external effects.
+///
+/// All operations are applied in order and the complete resulting document is validated. The input
+/// document is never modified, so any failure rejects the complete batch.
+///
+/// # Errors
+///
+/// Returns a source-addressed build error when the batch is malformed, a target is missing or
+/// ambiguous, an insertion conflicts, or the resulting document is invalid.
+pub fn apply_workflow_authoring_edits(
+    document: &WorkflowAuthoringDocument,
+    batch: &WorkflowAuthoringEditBatch,
+) -> Result<WorkflowAuthoringDocument, WorkflowError> {
+    batch.validate()?;
+    let mut updated = document.clone();
+    for (index, edit) in batch.edits.iter().enumerate() {
+        apply_workflow_authoring_edit(&mut updated, edit).map_err(|error| match error {
+            WorkflowError::Build { path, message } => WorkflowError::Build {
+                path: format!("edit_batch.edits.{index}.{path}"),
+                message,
+            },
+            other => other,
+        })?;
+    }
+    updated.validate()?;
+    Ok(updated)
+}
+
+fn apply_workflow_authoring_edit(
+    document: &mut WorkflowAuthoringDocument,
+    edit: &WorkflowAuthoringEdit,
+) -> Result<(), WorkflowError> {
+    match edit {
+        WorkflowAuthoringEdit::AddNode { node } => {
+            if document.definition.nodes.contains_key(&node.id) {
+                return Err(authoring_error("node.id", "node identity already exists"));
+            }
+            document
+                .definition
+                .nodes
+                .insert(node.id.clone(), node.clone());
+        }
+        WorkflowAuthoringEdit::UpdateNode { node } => {
+            let Some(existing) = document.definition.nodes.get_mut(&node.id) else {
+                return Err(authoring_error("node.id", "node identity does not exist"));
+            };
+            *existing = node.clone();
+        }
+        WorkflowAuthoringEdit::RemoveNode { node_id } => {
+            if document.definition.nodes.remove(node_id).is_none() {
+                return Err(authoring_error("node_id", "node identity does not exist"));
+            }
+            document
+                .definition
+                .edges
+                .retain(|edge| edge.from != *node_id && edge.to != *node_id);
+            document.definition.entries.retain(|entry| entry != node_id);
+            document.definition.exits.retain(|exit| exit != node_id);
+        }
+        WorkflowAuthoringEdit::AddEdge { edge } => document.definition.edges.push(edge.clone()),
+        WorkflowAuthoringEdit::UpdateEdge { selector, edge } => {
+            let index = authoring_edge_index(&document.definition.edges, selector)?;
+            document.definition.edges[index] = edge.clone();
+        }
+        WorkflowAuthoringEdit::RemoveEdge { selector } => {
+            let index = authoring_edge_index(&document.definition.edges, selector)?;
+            document.definition.edges.remove(index);
+        }
+        WorkflowAuthoringEdit::UpdateWorkflowInput { schema } => {
+            document.definition.input = schema.clone();
+        }
+        WorkflowAuthoringEdit::UpdateWorkflowOutput { schema } => {
+            document.definition.output = schema.clone();
+        }
+        WorkflowAuthoringEdit::UpdateBindings { bindings } => {
+            document.bindings.clone_from(bindings);
+        }
+        WorkflowAuthoringEdit::UpdateRequirements { requirements } => {
+            document.requirements.clone_from(requirements);
+        }
+        WorkflowAuthoringEdit::UpdateMetadata { metadata } => {
+            document.metadata.clone_from(metadata);
+        }
+        WorkflowAuthoringEdit::UpdatePresentationNamespace { namespace, value } => {
+            validate_authoring_id("presentation.namespace", namespace)?;
+            let presentation =
+                document
+                    .presentation
+                    .get_or_insert_with(|| WorkflowAuthoringPresentation {
+                        version: WORKFLOW_AUTHORING_PRESENTATION_VERSION,
+                        namespaces: BTreeMap::new(),
+                    });
+            match value {
+                Some(value) => {
+                    presentation
+                        .namespaces
+                        .insert(namespace.clone(), value.clone());
+                }
+                None => {
+                    presentation.namespaces.remove(namespace);
+                }
+            }
+            if presentation.namespaces.is_empty() {
+                document.presentation = None;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn authoring_edge_index(
+    edges: &[EdgeDefinition],
+    selector: &WorkflowAuthoringEdgeSelector,
+) -> Result<usize, WorkflowError> {
+    validate_authoring_id("edge_selector.from", &selector.from)?;
+    validate_authoring_id("edge_selector.to", &selector.to)?;
+    edges
+        .iter()
+        .enumerate()
+        .filter(|(_, edge)| edge.from == selector.from && edge.to == selector.to)
+        .nth(selector.occurrence)
+        .map(|(index, _)| index)
+        .ok_or_else(|| authoring_error("edge_selector", "edge occurrence does not exist"))
+}
+
+/// Changed authoring-source dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAuthoringChangeKind {
+    Executable,
+    Metadata,
+    Presentation,
+}
+
+/// Semantic and aggregate effect differences between two admitted authored documents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringSemanticDiff {
+    pub version: u32,
+    pub changes: BTreeSet<WorkflowAuthoringChangeKind>,
+    pub added_nodes: BTreeSet<String>,
+    pub removed_nodes: BTreeSet<String>,
+    pub changed_nodes: BTreeSet<String>,
+    pub before_effects: WorkflowEffectSummary,
+    pub after_effects: WorkflowEffectSummary,
+    pub added_effect_classes: BTreeSet<WorkflowBlockEffect>,
+    pub removed_effect_classes: BTreeSet<WorkflowBlockEffect>,
+    pub capability_increased: bool,
+    pub added_resources: BTreeSet<ResourceClaim>,
+    pub removed_resources: BTreeSet<ResourceClaim>,
+}
+
+/// Compare two authored documents through the same portable catalog preview path.
+///
+/// # Errors
+///
+/// Returns an error when either document cannot be compiled and admitted by the supplied catalog.
+pub fn workflow_authoring_semantic_diff(
+    before: &WorkflowAuthoringDocument,
+    after: &WorkflowAuthoringDocument,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<WorkflowAuthoringSemanticDiff, WorkflowError> {
+    let before_compiled = before.compile_for_preview(catalog, None)?;
+    let after_compiled = after.compile_for_preview(catalog, None)?;
+    let before_nodes = &before.definition.nodes;
+    let after_nodes = &after.definition.nodes;
+    let added_nodes = after_nodes
+        .keys()
+        .filter(|node| !before_nodes.contains_key(*node))
+        .cloned()
+        .collect();
+    let removed_nodes = before_nodes
+        .keys()
+        .filter(|node| !after_nodes.contains_key(*node))
+        .cloned()
+        .collect();
+    let changed_nodes = before_nodes
+        .iter()
+        .filter_map(|(node, definition)| {
+            after_nodes
+                .get(node)
+                .filter(|after_definition| *after_definition != definition)
+                .map(|_| node.clone())
+        })
+        .collect();
+    let before_resources = before_compiled
+        .effects
+        .resources
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let after_resources = after_compiled
+        .effects
+        .resources
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut changes = BTreeSet::new();
+    if before.executable_semantics() != after.executable_semantics() {
+        changes.insert(WorkflowAuthoringChangeKind::Executable);
+    }
+    if before.metadata != after.metadata {
+        changes.insert(WorkflowAuthoringChangeKind::Metadata);
+    }
+    if before.presentation != after.presentation {
+        changes.insert(WorkflowAuthoringChangeKind::Presentation);
+    }
+    Ok(WorkflowAuthoringSemanticDiff {
+        version: 1,
+        changes,
+        added_nodes,
+        removed_nodes,
+        changed_nodes,
+        added_effect_classes: after_compiled
+            .effects
+            .block_effects
+            .difference(&before_compiled.effects.block_effects)
+            .copied()
+            .collect(),
+        removed_effect_classes: before_compiled
+            .effects
+            .block_effects
+            .difference(&after_compiled.effects.block_effects)
+            .copied()
+            .collect(),
+        capability_increased: after_compiled.effects.maximum_capability
+            > before_compiled.effects.maximum_capability,
+        added_resources: after_resources
+            .difference(&before_resources)
+            .cloned()
+            .collect(),
+        removed_resources: before_resources
+            .difference(&after_resources)
+            .cloned()
+            .collect(),
+        before_effects: before_compiled.effects,
+        after_effects: after_compiled.effects,
+    })
 }
 
 /// Portable source contract for one runtime-authored workflow.
@@ -4628,6 +5118,9 @@ pub enum WorkflowToolCapability {
     Mutating,
 }
 
+/// Maximum encoded canonical mutation input retained for exact approval review.
+pub const MAX_WORKFLOW_MUTATION_APPROVAL_INPUT_BYTES: usize = 1_048_576;
+
 /// Stable exact mutation-grant scope contract version.
 pub const WORKFLOW_MUTATION_GRANT_SCOPE_VERSION: u32 = 1;
 
@@ -4679,8 +5172,9 @@ impl WorkflowMutationGrantScope {
             || self.block_version == 0
             || self.capability != WorkflowToolCapability::Mutating
             || normalize_resource_claims(self.resource_claims.clone()).is_err()
-            || serde_json::to_vec(&self.input_summary)
-                .map_or(true, |summary| summary.len() > 16_384)
+            || serde_json::to_vec(&self.input_summary).map_or(true, |summary| {
+                summary.len() > MAX_WORKFLOW_MUTATION_APPROVAL_INPUT_BYTES
+            })
             || identities
                 .iter()
                 .any(|value| value.trim().is_empty() || value.len() > 4_096)
@@ -8814,6 +9308,167 @@ mod tests {
                 )]),
             }),
         }
+    }
+
+    #[test]
+    fn semantic_edit_batch_is_atomic_and_presentation_neutral() {
+        let document = authored_document();
+        let executable_digest = document
+            .executable_source_digest_sha256()
+            .expect("executable digest");
+        let batch = WorkflowAuthoringEditBatch {
+            version: WORKFLOW_AUTHORING_EDIT_VERSION,
+            expected_generation: 1,
+            edits: vec![
+                WorkflowAuthoringEdit::UpdateMetadata {
+                    metadata: WorkflowAuthoringMetadata {
+                        title: "Edited workflow".to_string(),
+                        description: None,
+                        labels: BTreeMap::new(),
+                    },
+                },
+                WorkflowAuthoringEdit::UpdatePresentationNamespace {
+                    namespace: "bcode.graph".to_string(),
+                    value: Some(serde_json::json!({"agent": {"x": 40, "y": 80}})),
+                },
+            ],
+        };
+        let updated = apply_workflow_authoring_edits(&document, &batch).expect("semantic edits");
+        assert_eq!(updated.metadata.title, "Edited workflow");
+        assert_eq!(
+            updated.executable_source_digest_sha256().expect("digest"),
+            executable_digest
+        );
+        assert_ne!(
+            updated.source_digest_sha256().expect("source digest"),
+            document.source_digest_sha256().expect("source digest")
+        );
+        assert_eq!(document.metadata.title, "Example workflow");
+    }
+
+    #[test]
+    fn semantic_edit_batch_rejects_complete_batch_on_invalid_result() {
+        let document = authored_document();
+        let batch = WorkflowAuthoringEditBatch {
+            version: WORKFLOW_AUTHORING_EDIT_VERSION,
+            expected_generation: 1,
+            edits: vec![
+                WorkflowAuthoringEdit::UpdateMetadata {
+                    metadata: WorkflowAuthoringMetadata {
+                        title: "Would otherwise apply".to_string(),
+                        description: None,
+                        labels: BTreeMap::new(),
+                    },
+                },
+                WorkflowAuthoringEdit::RemoveNode {
+                    node_id: "agent".to_string(),
+                },
+            ],
+        };
+        assert!(apply_workflow_authoring_edits(&document, &batch).is_err());
+        assert_eq!(document.metadata.title, "Example workflow");
+        assert!(document.definition.nodes.contains_key("agent"));
+    }
+
+    #[test]
+    fn semantic_edit_batch_targets_exact_duplicate_edge_occurrence() {
+        let mut document = authored_document();
+        let repeat_predicate = || PredicateExpression::Equals {
+            version: WORKFLOW_PREDICATE_VERSION,
+            path: String::new(),
+            value: serde_json::json!(true),
+        };
+        document.definition.edges = vec![
+            EdgeDefinition {
+                from: "agent".to_string(),
+                to: "agent".to_string(),
+                kind: EdgeKind::Back {
+                    predicate: repeat_predicate(),
+                    max_iterations: 2,
+                },
+                transform: None,
+            },
+            EdgeDefinition {
+                from: "agent".to_string(),
+                to: "agent".to_string(),
+                kind: EdgeKind::Back {
+                    predicate: repeat_predicate(),
+                    max_iterations: 3,
+                },
+                transform: None,
+            },
+        ];
+        let batch = WorkflowAuthoringEditBatch {
+            version: WORKFLOW_AUTHORING_EDIT_VERSION,
+            expected_generation: 1,
+            edits: vec![WorkflowAuthoringEdit::RemoveEdge {
+                selector: WorkflowAuthoringEdgeSelector {
+                    from: "agent".to_string(),
+                    to: "agent".to_string(),
+                    occurrence: 1,
+                },
+            }],
+        };
+        let updated = apply_workflow_authoring_edits(&document, &batch).expect("remove edge");
+        assert_eq!(updated.definition.edges.len(), 1);
+        assert!(matches!(
+            updated.definition.edges[0].kind,
+            EdgeKind::Back {
+                max_iterations: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn schema_form_description_projects_required_native_controls() {
+        let document = authored_document();
+        let form = WorkflowSchemaFormDescription::from_schema(&document.configuration_schema)
+            .expect("schema form");
+        assert_eq!(form.version, WORKFLOW_SCHEMA_FORM_VERSION);
+        assert_eq!(form.fields[0].control, WorkflowSchemaFormControl::Object);
+        assert!(form.fields.iter().any(|field| {
+            field.path == "message"
+                && field.required
+                && field.control == WorkflowSchemaFormControl::Text
+        }));
+        assert!(form.fields.iter().any(|field| {
+            field.path == "duration_ms"
+                && !field.required
+                && field.control == WorkflowSchemaFormControl::Integer
+        }));
+    }
+
+    #[test]
+    fn semantic_diff_separates_presentation_from_executable_change() {
+        let before = authored_document();
+        let batch = WorkflowAuthoringEditBatch {
+            version: WORKFLOW_AUTHORING_EDIT_VERSION,
+            expected_generation: 1,
+            edits: vec![WorkflowAuthoringEdit::UpdatePresentationNamespace {
+                namespace: "bcode.graph".to_string(),
+                value: Some(serde_json::json!({"agent": {"x": 900, "y": 400}})),
+            }],
+        };
+        let after = apply_workflow_authoring_edits(&before, &batch).expect("presentation edit");
+        let diff = workflow_authoring_semantic_diff(&before, &after, &authoring_catalog())
+            .expect("semantic diff");
+        assert!(
+            !diff
+                .changes
+                .contains(&WorkflowAuthoringChangeKind::Executable)
+        );
+        assert!(
+            diff.changes
+                .contains(&WorkflowAuthoringChangeKind::Presentation)
+        );
+        assert!(
+            !diff
+                .changes
+                .contains(&WorkflowAuthoringChangeKind::Metadata)
+        );
+        assert!(diff.added_nodes.is_empty());
+        assert_eq!(diff.before_effects, diff.after_effects);
     }
 
     fn authoring_catalog() -> WorkflowAuthoringCatalogSnapshot {

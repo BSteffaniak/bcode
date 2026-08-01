@@ -14,11 +14,138 @@ use bcode_command::{
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::{OP_SESSION_STATUS, SESSION_STATUS_INTERFACE_ID};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 const PLUGIN_ID: &str = "bcode.workflow";
 const SURFACE_KIND: &str = "workflow.status";
 const QUERY_LIMIT: usize = 100;
+
+/// Current workflow-plugin coding-state contract version.
+pub const CODING_WORKFLOW_STATE_VERSION: u32 = 1;
+/// Runtime-owned maximum implementation iterations in one batch.
+pub const IMPLEMENTATION_BATCH_ITERATION_LIMIT: u32 = 20;
+/// Runtime-owned maximum implementation batches in one delivery tranche.
+pub const DELIVERY_TRANCHE_BATCH_LIMIT: u32 = 5;
+/// Runtime-owned maximum delivery tranches in one parent run.
+pub const PROGRESS_DRIVEN_TRANCHE_LIMIT: u32 = 10;
+/// Derived maximum implementation batches in one parent run.
+pub const PROGRESS_DRIVEN_BATCH_LIMIT: u32 = 50;
+/// Derived maximum implementation turns in one parent run.
+pub const PROGRESS_DRIVEN_IMPLEMENTATION_TURN_LIMIT: u32 = 1_000;
+/// Exact descendant budget reserved by the three-level flagship hierarchy.
+pub const PROGRESS_DRIVEN_DESCENDANT_LIMIT: u32 = 60;
+const _: () =
+    assert!(PROGRESS_DRIVEN_DESCENDANT_LIMIT <= bcode_workflow::MAX_WORKFLOW_CALL_DESCENDANTS);
+
+/// Exact progress-document reference retained by coding workflows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodingProgressDocumentReference {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest_sha256: Option<String>,
+}
+
+/// Explicit include/exclude policy retained by coding workflows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodingPathPolicy {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+/// Workflow-plugin-owned product phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingWorkflowPhase {
+    Implementing,
+    Verifying,
+    Formatting,
+    PreparingCheckpoint,
+    Evaluating,
+    Completed,
+    Exhausted,
+}
+
+/// Bounded latest product receipts; runtime counters deliberately do not appear here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodingWorkflowLatest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_summary: Option<String>,
+    #[serde(default)]
+    pub repository_snapshots: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_receipt: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formatting_receipt: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_change_set: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_receipt: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_assessment: Option<serde_json::Value>,
+}
+
+/// Versioned workflow-plugin-owned coding product state.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodingWorkflowState {
+    pub version: u32,
+    pub objective: String,
+    pub implementation_prompt: String,
+    pub completion_condition: String,
+    pub progress_document: CodingProgressDocumentReference,
+    pub validation_plan: serde_json::Value,
+    pub formatting_plan: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_fingerprint_sha256: Option<String>,
+    pub path_policy: CodingPathPolicy,
+    pub phase: CodingWorkflowPhase,
+    pub latest: CodingWorkflowLatest,
+    #[serde(default)]
+    pub artifacts: Vec<bcode_workflow::ArtifactReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_context: Option<CodingWorkflowOperationContext>,
+}
+
+/// Bounded transient values used only to construct exact owner requests within one batch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodingWorkflowOperationContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_snapshot: Option<bcode_git_plugin::RepositorySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_snapshot: Option<bcode_git_plugin::RepositorySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_result: Option<bcode_shell_plugin::ShellWorkflowCommandPlanResult>,
+}
+
+/// Stable batch product outcome, separate from runtime-owned iteration facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementationBatchOutcome {
+    Completed,
+    Exhausted,
+}
+
+/// Stable tranche product outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryTrancheOutcome {
+    Completed,
+    Exhausted,
+}
+
+/// Stable parent product outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressDrivenOutcome {
+    Completed,
+    OperatorStopped,
+    HardLimitReached,
+}
 
 #[derive(Default)]
 pub struct WorkflowPlugin;
@@ -33,6 +160,7 @@ impl RustPlugin for WorkflowPlugin {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match (
             context.request.interface_id.as_str(),
@@ -40,6 +168,121 @@ impl RustPlugin for WorkflowPlugin {
         ) {
             (COMMAND_INTERFACE_ID, OP_INVOKE_COMMAND) => invoke_command(&context.request),
             (SESSION_STATUS_INTERFACE_ID, OP_SESSION_STATUS) => session_status(&context.request),
+            (bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID, "workflow.instruction-drift") => {
+                let invocation = match context
+                    .request
+                    .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+                {
+                    Ok(invocation) => invocation,
+                    Err(error) => {
+                        return ServiceResponse::error("invalid_request", error.to_string());
+                    }
+                };
+                let request = match invocation.typed_input::<InstructionDriftReviewRequest>() {
+                    Ok(request) => request,
+                    Err(error) => return ServiceResponse::error("invalid_request", error),
+                };
+                match instruction_drift_receipt(&request) {
+                    Ok(receipt) => json_response(&receipt),
+                    Err(error) => ServiceResponse::error("invalid_drift_review", error),
+                }
+            }
+            (bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID, "workflow.batch-outcome") => {
+                let invocation = match context
+                    .request
+                    .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+                {
+                    Ok(invocation) => invocation,
+                    Err(error) => {
+                        return ServiceResponse::error("invalid_request", error.to_string());
+                    }
+                };
+                let request = match invocation.typed_input::<BatchOutcomeRequest>() {
+                    Ok(request) => request,
+                    Err(error) => return ServiceResponse::error("invalid_request", error),
+                };
+                match batch_outcome(&request) {
+                    Ok(outcome) => json_response(&outcome),
+                    Err(error) => ServiceResponse::error("invalid_batch_outcome", error),
+                }
+            }
+            (bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID, operation)
+                if matches!(
+                    operation,
+                    "workflow.snapshot-input"
+                        | "workflow.validation-input"
+                        | "workflow.formatting-input"
+                        | "workflow.pre-format-verification-input"
+                        | "workflow.post-format-verification-input"
+                        | "workflow.prepare-checkpoint-input"
+                        | "workflow.commit-message-input"
+                        | "workflow.compose-commit-input"
+                ) =>
+            {
+                let invocation = match context
+                    .request
+                    .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+                {
+                    Ok(invocation) => invocation,
+                    Err(error) => {
+                        return ServiceResponse::error("invalid_request", error.to_string());
+                    }
+                };
+                let (mut state, artifacts, current_value) = match invocation
+                    .typed_input::<serde_json::Value>()
+                {
+                    Ok(value) => match bcode_workflow::validate_workflow_state_envelope(&value) {
+                        Ok(parts) => {
+                            let state = match serde_json::from_value(parts.state) {
+                                Ok(state) => state,
+                                Err(error) => {
+                                    return ServiceResponse::error(
+                                        "invalid_request",
+                                        error.to_string(),
+                                    );
+                                }
+                            };
+                            (state, parts.artifacts, Some(parts.value))
+                        }
+                        Err(_) => match serde_json::from_value(value) {
+                            Ok(state) => (state, Vec::new(), None),
+                            Err(error) => {
+                                return ServiceResponse::error(
+                                    "invalid_request",
+                                    error.to_string(),
+                                );
+                            }
+                        },
+                    },
+                    Err(error) => {
+                        return ServiceResponse::error("invalid_request", error);
+                    }
+                };
+                let input_operation = match operation {
+                    "workflow.snapshot-input" => BatchInputOperation::Snapshot,
+                    "workflow.validation-input" => BatchInputOperation::ValidationPlan,
+                    "workflow.formatting-input" => BatchInputOperation::FormattingPlan,
+                    "workflow.pre-format-verification-input" => {
+                        BatchInputOperation::PreFormatVerification
+                    }
+                    "workflow.post-format-verification-input" => {
+                        BatchInputOperation::PostFormatVerification
+                    }
+                    "workflow.prepare-checkpoint-input" => BatchInputOperation::PrepareCheckpoint,
+                    "workflow.commit-message-input" => BatchInputOperation::CommitMessage,
+                    "workflow.compose-commit-input" => BatchInputOperation::ComposeCommit,
+                    _ => unreachable!("guarded workflow batch input operation"),
+                };
+                if let Err(error) =
+                    retain_batch_operation_result(&mut state, input_operation, current_value)
+                {
+                    return ServiceResponse::error("invalid_batch_input", error);
+                }
+                match batch_input(&state, &artifacts, input_operation) {
+                    Ok(input) => json_response(&input),
+                    Err(error) => ServiceResponse::error("invalid_batch_input", error),
+                }
+            }
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported workflow plugin operation",
@@ -153,6 +396,344 @@ fn command_contributions() -> Vec<CommandContribution> {
     .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstructionDriftReviewRequest {
+    version: u32,
+    accepted_instruction_fingerprint_sha256: String,
+    current_instruction_fingerprint_sha256: String,
+    accepted_validation_plan_sha256: String,
+    proposed_validation_plan_sha256: String,
+    accepted_formatting_plan_sha256: String,
+    proposed_formatting_plan_sha256: String,
+    reviewed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum InstructionDriftReceipt {
+    Unchanged {
+        version: u32,
+        instruction_fingerprint_sha256: String,
+    },
+    Blocked {
+        version: u32,
+        accepted_instruction_fingerprint_sha256: String,
+        current_instruction_fingerprint_sha256: String,
+        accepted_validation_plan_sha256: String,
+        proposed_validation_plan_sha256: String,
+        accepted_formatting_plan_sha256: String,
+        proposed_formatting_plan_sha256: String,
+    },
+    ReviewedReplacement {
+        version: u32,
+        instruction_fingerprint_sha256: String,
+        validation_plan_sha256: String,
+        formatting_plan_sha256: String,
+    },
+}
+
+fn instruction_drift_receipt(
+    request: &InstructionDriftReviewRequest,
+) -> Result<InstructionDriftReceipt, String> {
+    if request.version != 1
+        || [
+            &request.accepted_instruction_fingerprint_sha256,
+            &request.current_instruction_fingerprint_sha256,
+            &request.accepted_validation_plan_sha256,
+            &request.proposed_validation_plan_sha256,
+            &request.accepted_formatting_plan_sha256,
+            &request.proposed_formatting_plan_sha256,
+        ]
+        .into_iter()
+        .any(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        return Err("instruction drift review contains invalid version or digest".to_string());
+    }
+    if request.accepted_instruction_fingerprint_sha256
+        == request.current_instruction_fingerprint_sha256
+    {
+        return Ok(InstructionDriftReceipt::Unchanged {
+            version: 1,
+            instruction_fingerprint_sha256: request.current_instruction_fingerprint_sha256.clone(),
+        });
+    }
+    if !request.reviewed {
+        return Ok(InstructionDriftReceipt::Blocked {
+            version: 1,
+            accepted_instruction_fingerprint_sha256: request
+                .accepted_instruction_fingerprint_sha256
+                .clone(),
+            current_instruction_fingerprint_sha256: request
+                .current_instruction_fingerprint_sha256
+                .clone(),
+            accepted_validation_plan_sha256: request.accepted_validation_plan_sha256.clone(),
+            proposed_validation_plan_sha256: request.proposed_validation_plan_sha256.clone(),
+            accepted_formatting_plan_sha256: request.accepted_formatting_plan_sha256.clone(),
+            proposed_formatting_plan_sha256: request.proposed_formatting_plan_sha256.clone(),
+        });
+    }
+    Ok(InstructionDriftReceipt::ReviewedReplacement {
+        version: 1,
+        instruction_fingerprint_sha256: request.current_instruction_fingerprint_sha256.clone(),
+        validation_plan_sha256: request.proposed_validation_plan_sha256.clone(),
+        formatting_plan_sha256: request.proposed_formatting_plan_sha256.clone(),
+    })
+}
+
+fn retain_batch_operation_result(
+    state: &mut CodingWorkflowState,
+    operation: BatchInputOperation,
+    value: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let context = state.operation_context.get_or_insert_with(Default::default);
+    if let Ok(snapshot) =
+        serde_json::from_value::<bcode_git_plugin::RepositorySnapshot>(value.clone())
+    {
+        if context.pre_snapshot.is_none() {
+            context.pre_snapshot = Some(snapshot);
+        } else {
+            context.post_snapshot = Some(snapshot);
+        }
+        return Ok(());
+    }
+    if let Ok(result) =
+        serde_json::from_value::<bcode_shell_plugin::ShellWorkflowCommandPlanResult>(value.clone())
+    {
+        context.command_result = Some(result);
+        return Ok(());
+    }
+    if let Ok(preparation) =
+        serde_json::from_value::<bcode_git_plugin::PrepareResponse>(value.clone())
+    {
+        state.latest.prepared_change_set = Some(
+            serde_json::to_value(preparation)
+                .map_err(|error| format!("prepared change set cannot be retained: {error}"))?,
+        );
+        return Ok(());
+    }
+    if let Ok(commit) = serde_json::from_value::<bcode_git_plugin::CommitResponse>(value.clone()) {
+        state.latest.commit_receipt = Some(
+            serde_json::to_value(commit)
+                .map_err(|error| format!("commit receipt cannot be retained: {error}"))?,
+        );
+        return Ok(());
+    }
+    if operation == BatchInputOperation::CommitMessage {
+        state.latest.completion_assessment = Some(value);
+        return Ok(());
+    }
+    if let Ok(receipt) = serde_json::from_value::<bcode_git_plugin::VerificationReceipt>(value) {
+        state.latest.verification_receipt = Some(
+            serde_json::to_value(receipt)
+                .map_err(|error| format!("verification receipt cannot be retained: {error}"))?,
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn batch_input(
+    state: &CodingWorkflowState,
+    artifacts: &[bcode_workflow::ArtifactReference],
+    operation: BatchInputOperation,
+) -> Result<serde_json::Value, String> {
+    if state.version != CODING_WORKFLOW_STATE_VERSION {
+        return Err("unsupported coding batch input version".to_string());
+    }
+    let fingerprint = state
+        .instruction_fingerprint_sha256
+        .clone()
+        .ok_or_else(|| "coding state has no accepted instruction fingerprint".to_string())?;
+    let value = match operation {
+        BatchInputOperation::Snapshot => serde_json::json!({
+            "version": 1,
+            "include_prefixes": state.path_policy.include.clone(),
+            "exclude_prefixes": state.path_policy.exclude.clone(),
+            "progress_document_path": state.progress_document.path.clone(),
+            "max_paths": 10_000,
+            "project_instruction_fingerprint_sha256": fingerprint,
+        }),
+        BatchInputOperation::ValidationPlan => state.validation_plan.clone(),
+        BatchInputOperation::FormattingPlan => state.formatting_plan.clone(),
+        BatchInputOperation::PreFormatVerification
+        | BatchInputOperation::PostFormatVerification => {
+            let pre_snapshot = state
+                .operation_context
+                .as_ref()
+                .and_then(|context| context.pre_snapshot.as_ref())
+                .cloned()
+                .ok_or_else(|| "verification input has no pre-snapshot".to_string())?;
+            let post_snapshot = state
+                .operation_context
+                .as_ref()
+                .and_then(|context| context.post_snapshot.as_ref())
+                .cloned()
+                .ok_or_else(|| "verification input has no post-snapshot".to_string())?;
+            let command_result = state
+                .operation_context
+                .as_ref()
+                .and_then(|context| context.command_result.as_ref())
+                .ok_or_else(|| "verification input has no shell result".to_string())?;
+            serde_json::to_value(bcode_git_plugin::VerificationReceiptRequest {
+                version: 1,
+                stage: if operation == BatchInputOperation::PreFormatVerification {
+                    bcode_git_plugin::VerificationStage::PreFormat
+                } else {
+                    bcode_git_plugin::VerificationStage::PostFormat
+                },
+                plan_sha256: command_result.plan_sha256.clone(),
+                instruction_fingerprint_sha256: fingerprint,
+                pre_snapshot,
+                post_snapshot,
+                commands_passed: command_result.passed,
+                required_artifacts_complete: command_result.commands.iter().all(|command| {
+                    !command.stdout_truncated && !command.stderr_truncated
+                        || !command_result.artifacts.is_empty()
+                }),
+            })
+            .map_err(|error| error.to_string())?
+        }
+        BatchInputOperation::PrepareCheckpoint => {
+            serde_json::to_value(bcode_git_plugin::PrepareRequest {
+                include_prefixes: state
+                    .path_policy
+                    .include
+                    .clone()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                exclude_prefixes: state
+                    .path_policy
+                    .exclude
+                    .clone()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                progress_document_path: Some(state.progress_document.path.clone().into()),
+                project_instruction_fingerprint_sha256: fingerprint,
+                max_paths: 10_000,
+            })
+            .map_err(|error| error.to_string())?
+        }
+        BatchInputOperation::ComposeCommit => {
+            let preparation: bcode_git_plugin::PrepareResponse = serde_json::from_value(
+                state
+                    .latest
+                    .prepared_change_set
+                    .clone()
+                    .ok_or_else(|| "coding state has no prepared change set".to_string())?,
+            )
+            .map_err(|error| format!("prepared change set is invalid: {error}"))?;
+            let message = state
+                .latest
+                .completion_assessment
+                .as_ref()
+                .ok_or_else(|| "coding state has no structured commit message".to_string())?;
+            serde_json::to_value(bcode_git_plugin::ComposeCommitRequest {
+                preparation,
+                message: bcode_git_plugin::ProposedCommitMessage {
+                    title: message
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "structured commit message has no title".to_string())?
+                        .to_string(),
+                    description: message
+                        .get("description")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                },
+                no_changes: bcode_git_plugin::NoChangesDecision::NoOp,
+            })
+            .map_err(|error| error.to_string())?
+        }
+        BatchInputOperation::CommitMessage => {
+            return Err("commit-message input is produced by exact Git preparation".to_string());
+        }
+    };
+    Ok(serde_json::json!({
+        "schema_version": bcode_workflow::WORKFLOW_STATE_ENVELOPE_VERSION,
+        "state": state,
+        "value": value,
+        "artifacts": artifacts,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BatchInputOperation {
+    Snapshot,
+    ValidationPlan,
+    FormattingPlan,
+    PreFormatVerification,
+    PostFormatVerification,
+    PrepareCheckpoint,
+    CommitMessage,
+    ComposeCommit,
+}
+
+fn batch_outcome(request: &BatchOutcomeRequest) -> Result<BatchOutcomeReceipt, String> {
+    if request.version != 1 || request.state.version != CODING_WORKFLOW_STATE_VERSION {
+        return Err("unsupported coding batch outcome version".to_string());
+    }
+    let deterministic_complete = request
+        .state
+        .latest
+        .verification_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.get("verified"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && request
+            .state
+            .latest
+            .completion_assessment
+            .as_ref()
+            .and_then(|assessment| assessment.get("condition_met"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let outcome = if deterministic_complete {
+        ImplementationBatchOutcome::Completed
+    } else {
+        ImplementationBatchOutcome::Exhausted
+    };
+    let mut state = request.state.clone();
+    state.phase = if deterministic_complete {
+        CodingWorkflowPhase::Completed
+    } else {
+        CodingWorkflowPhase::Exhausted
+    };
+    Ok(BatchOutcomeReceipt {
+        version: 1,
+        outcome,
+        state,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BatchOutcomeRequest {
+    version: u32,
+    state: CodingWorkflowState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BatchOutcomeReceipt {
+    version: u32,
+    outcome: ImplementationBatchOutcome,
+    state: CodingWorkflowState,
+}
+
 fn invoke_command(request: &ServiceRequest) -> ServiceResponse {
     let request = match request.payload_json::<InvokeCommandRequest>() {
         Ok(request) => request,
@@ -251,10 +832,12 @@ pub(crate) async fn execute_command(
                 options.insert("session_id".to_string(), serde_json::json!(session_id));
             }
             if let Some(configuration) = request.args.get("configuration") {
-                let configuration = validate_template_configuration(
-                    &template.template.configuration_schema.schema,
-                    configuration,
-                )?;
+                let configuration_schema = template.authoring_document.as_ref().map_or_else(
+                    || template.template.configuration_schema(),
+                    |document| &document.configuration_schema,
+                );
+                let configuration =
+                    validate_template_configuration(&configuration_schema.schema, configuration)?;
                 options.insert("configuration".to_string(), configuration);
             }
             format!(
@@ -283,8 +866,17 @@ pub(crate) async fn execute_command(
                     .collect::<Vec<_>>()
                     .join("; "));
             }
+            let configuration_schema = described
+                .authoring_document
+                .as_ref()
+                .map_or_else(
+                    || described.template.configuration_schema(),
+                    |document| &document.configuration_schema,
+                )
+                .schema
+                .clone();
             let configuration = validate_template_configuration(
-                &described.template.configuration_schema.schema,
+                &configuration_schema,
                 &required_arg(&request, "configuration")?,
             )?;
             let limits = reference_template_run_limits(&template_id, &configuration)?;
@@ -394,6 +986,18 @@ pub(crate) async fn execute_command(
                     serde_json::json!(inspection.resource_leases),
                 ),
                 ("outputs".to_string(), serde_json::json!(inspection.outputs)),
+                (
+                    "child_run_links".to_string(),
+                    serde_json::json!(inspection.child_run_links),
+                ),
+                (
+                    "descendant_runs".to_string(),
+                    serde_json::json!(inspection.descendant_runs),
+                ),
+                (
+                    "repeat_outcomes".to_string(),
+                    serde_json::json!(inspection.repeat_outcomes),
+                ),
                 (
                     "child_sessions".to_string(),
                     serde_json::json!(inspection.child_sessions),
@@ -670,6 +1274,263 @@ mod tests {
     use super::*;
 
     #[test]
+    fn progress_driven_parent_pins_tranche_and_enforces_all_product_budgets() {
+        let mut manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
+        bcode_plugin::resolve_external_workflow_templates(
+            &mut manifest,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .expect("external flagship templates");
+        let tranche = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "delivery-tranche")
+            .expect("tranche");
+        let parent = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "progress-driven-delivery")
+            .expect("parent");
+        let definition = parent.definition();
+        let call: bcode_workflow::WorkflowCallConfiguration =
+            serde_json::from_value(definition.nodes["delivery_tranche"].configuration.clone())
+                .expect("exact tranche call");
+        assert_eq!(
+            call.target.definition_identity(),
+            &tranche
+                .definition_identity("bcode.workflow")
+                .expect("tranche identity")
+        );
+        assert_eq!(
+            definition.nodes["tranche_repeat"].configuration["max_iterations"],
+            10
+        );
+        assert_eq!(
+            definition.nodes["operator_continuation"].kind,
+            bcode_workflow::NodeKind::Input
+        );
+        let presentation = parent
+            .authoring_document()
+            .and_then(|document| document.presentation.as_ref())
+            .and_then(|presentation| presentation.namespaces.get("bcode.workflow"))
+            .expect("product budgets");
+        assert_eq!(presentation["derived_batch_limit"], 50);
+        assert_eq!(presentation["derived_implementation_turn_limit"], 1_000);
+        assert_eq!(presentation["descendant_limit"], 60);
+        assert_eq!(presentation["platform_descendant_ceiling"], 64);
+        assert_eq!(
+            presentation["default_progress_path_pattern"],
+            "local-<workflow-slug>-progress.md"
+        );
+        let setup: bcode_workflow::WorkflowAgentConfiguration =
+            serde_json::from_value(definition.nodes["progress_setup"].configuration.clone())
+                .expect("progress setup");
+        assert_eq!(setup.skills[0].skill_id, "local-progress-doc");
+    }
+
+    #[test]
+    fn delivery_tranche_pins_exact_batch_and_runtime_owns_five_batches() {
+        let mut manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
+        bcode_plugin::resolve_external_workflow_templates(
+            &mut manifest,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .expect("external flagship templates");
+        let batch = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "implementation-batch")
+            .expect("batch");
+        let tranche = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "delivery-tranche")
+            .expect("tranche");
+        let definition = tranche.definition();
+        let call: bcode_workflow::WorkflowCallConfiguration = serde_json::from_value(
+            definition.nodes["implementation_batch"]
+                .configuration
+                .clone(),
+        )
+        .expect("exact call");
+        let batch_identity = batch
+            .definition_identity("bcode.workflow")
+            .expect("batch identity");
+        assert_eq!(call.target.definition_identity(), &batch_identity);
+        let repeat = &definition.nodes["batch_repeat"];
+        assert_eq!(repeat.configuration["max_iterations"], 5);
+        assert_eq!(repeat.configuration["exhaustion_policy"], "emit_outcome");
+        let refocus: bcode_workflow::WorkflowAgentConfiguration =
+            serde_json::from_value(definition.nodes["refocus"].configuration.clone())
+                .expect("refocus agent");
+        assert_eq!(
+            refocus.skills,
+            [bcode_workflow::AgentSkillSelection {
+                skill_id: "refocus-progress-doc".to_string(),
+                mode: bcode_workflow::AgentSkillActivationMode::Required,
+            }]
+        );
+        assert_eq!(
+            tranche
+                .authoring_document()
+                .expect("tranche document")
+                .run_limits
+                .cycle_cap,
+            5
+        );
+    }
+
+    #[test]
+    fn flagship_batch_template_has_runtime_owned_limit_and_product_outcomes() {
+        let mut manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        bcode_plugin::resolve_external_workflow_templates(&mut manifest, root)
+            .expect("external flagship template");
+        let template = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "implementation-batch")
+            .expect("implementation batch");
+        let definition = template.definition();
+        assert_eq!(definition.entries, ["implementation"]);
+        assert_eq!(definition.exits, ["batch_repeat"]);
+        assert!(definition.nodes.contains_key("implementation"));
+        assert!(definition.nodes.contains_key("validation"));
+        assert!(definition.nodes.contains_key("post_format_validation"));
+        assert!(definition.nodes.contains_key("completion"));
+        for node_id in [
+            "snapshot_before",
+            "snapshot_after",
+            "format",
+            "formatted_snapshot",
+            "final_snapshot",
+            "prepare_checkpoint",
+        ] {
+            assert!(definition.nodes.contains_key(node_id), "{node_id}");
+        }
+        assert_eq!(
+            definition.nodes["snapshot_before"].configuration["block_id"],
+            "git.repository-snapshot"
+        );
+        assert_eq!(
+            definition.nodes["validation"].configuration["block_id"],
+            "shell.command-plan"
+        );
+        assert_eq!(
+            definition.nodes["pre_receipt"].configuration["block_id"],
+            "git.verification-receipt"
+        );
+        assert_eq!(
+            definition.nodes["post_receipt"].configuration["block_id"],
+            "git.verification-receipt"
+        );
+        assert_eq!(
+            definition.nodes["compose_commit"].configuration["block_id"],
+            "git.compose-commit"
+        );
+        assert_eq!(
+            definition.nodes["git_commit"].configuration["block_id"],
+            "git.commit"
+        );
+        assert!(definition.nodes["git_commit"].configuration["authorization"]
+            ["explicit_grant_required"]
+            .as_bool()
+            .unwrap_or(false));
+        assert!(definition.nodes.contains_key("classify"));
+        let repeat = &definition.nodes["batch_repeat"];
+        assert_eq!(repeat.kind, bcode_workflow::NodeKind::Repeat);
+        assert_eq!(
+            repeat.configuration["max_iterations"],
+            IMPLEMENTATION_BATCH_ITERATION_LIMIT
+        );
+        assert_eq!(repeat.configuration["exhaustion_policy"], "emit_outcome");
+        assert!(definition.edges.iter().any(|edge| {
+            edge.from == "batch_repeat"
+                && edge.to == "implementation"
+                && matches!(
+                    edge.kind,
+                    bcode_workflow::EdgeKind::Back {
+                        max_iterations: IMPLEMENTATION_BATCH_ITERATION_LIMIT,
+                        ..
+                    }
+                )
+        }));
+        template.validate().expect("valid flagship template");
+    }
+
+    #[test]
+    fn batch_outcome_requires_deterministic_and_semantic_completion() {
+        let state: CodingWorkflowState = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "objective": "ship",
+            "implementation_prompt": "implement",
+            "completion_condition": "done",
+            "progress_document": {"path": "local-progress.md", "digest_sha256": null},
+            "validation_plan": {},
+            "formatting_plan": {},
+            "instruction_fingerprint_sha256": null,
+            "path_policy": {"include": [], "exclude": ["local-progress.md"]},
+            "phase": "evaluating",
+            "latest": {
+                "implementation_summary": null,
+                "repository_snapshots": [],
+                "verification_receipt": {"verified": true},
+                "formatting_receipt": null,
+                "prepared_change_set": null,
+                "commit_receipt": null,
+                "completion_assessment": {"condition_met": true}
+            },
+            "artifacts": []
+        }))
+        .expect("coding state");
+        let completed = batch_outcome(&BatchOutcomeRequest {
+            version: 1,
+            state: state.clone(),
+        })
+        .expect("completed");
+        assert_eq!(completed.outcome, ImplementationBatchOutcome::Completed);
+        let mut incomplete = state;
+        incomplete.latest.completion_assessment = Some(serde_json::json!({
+            "condition_met": false
+        }));
+        let exhausted = batch_outcome(&BatchOutcomeRequest {
+            version: 1,
+            state: incomplete,
+        })
+        .expect("exhausted");
+        assert_eq!(exhausted.outcome, ImplementationBatchOutcome::Exhausted);
+    }
+
+    #[test]
+    fn instruction_drift_blocks_until_exact_replacement_is_reviewed() {
+        let request = InstructionDriftReviewRequest {
+            version: 1,
+            accepted_instruction_fingerprint_sha256: "a".repeat(64),
+            current_instruction_fingerprint_sha256: "b".repeat(64),
+            accepted_validation_plan_sha256: "c".repeat(64),
+            proposed_validation_plan_sha256: "d".repeat(64),
+            accepted_formatting_plan_sha256: "e".repeat(64),
+            proposed_formatting_plan_sha256: "f".repeat(64),
+            reviewed: false,
+        };
+        assert!(matches!(
+            instruction_drift_receipt(&request).expect("blocked"),
+            InstructionDriftReceipt::Blocked { .. }
+        ));
+        assert!(matches!(
+            instruction_drift_receipt(&InstructionDriftReviewRequest {
+                reviewed: true,
+                ..request
+            })
+            .expect("reviewed"),
+            InstructionDriftReceipt::ReviewedReplacement { .. }
+        ));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn manifest_contributes_bounded_reference_template_configuration() {
         let manifest: bcode_plugin::PluginManifest =
@@ -681,8 +1542,8 @@ mod tests {
             .expect("reference template");
         template.validate().expect("template validates");
         assert_eq!(template.template_version, 1);
-        assert_eq!(template.definition.entries, vec!["implementation"]);
-        let implementation = &template.definition.nodes["implementation"];
+        assert_eq!(template.definition().entries, vec!["implementation"]);
+        let implementation = &template.definition().nodes["implementation"];
         assert_eq!(implementation.kind, bcode_workflow::NodeKind::Agent);
         let configuration: bcode_workflow::WorkflowAgentConfiguration =
             serde_json::from_value(implementation.configuration.clone())
@@ -698,7 +1559,7 @@ mod tests {
             configuration.tool_capability,
             bcode_workflow::WorkflowToolCapability::Mutating
         );
-        let evaluation = &template.definition.nodes["evaluation"];
+        let evaluation = &template.definition().nodes["evaluation"];
         assert_eq!(evaluation.kind, bcode_workflow::NodeKind::Agent);
         let evaluation_configuration: bcode_workflow::WorkflowAgentConfiguration =
             serde_json::from_value(evaluation.configuration.clone())
@@ -711,12 +1572,12 @@ mod tests {
             evaluation_configuration.tool_capability,
             bcode_workflow::WorkflowToolCapability::ReadOnly
         );
-        assert!(template.definition.edges.iter().any(|edge| {
+        assert!(template.definition().edges.iter().any(|edge| {
             edge.from == "implementation"
                 && edge.to == "evaluation"
                 && edge.kind == bcode_workflow::EdgeKind::Direct
         }));
-        let verification = &template.definition.nodes["verification"];
+        let verification = &template.definition().nodes["verification"];
         assert_eq!(verification.kind, bcode_workflow::NodeKind::PluginBlock);
         let verification_block: bcode_workflow::WorkflowBlockDefinition =
             serde_json::from_value(verification.configuration.clone())
@@ -733,12 +1594,19 @@ mod tests {
             .flat_map(|service| &service.workflow_blocks)
             .find(|block| block.block_id == "shell.command-plan")
             .expect("declared shell block");
-        assert_eq!(&verification_block, declared_shell);
+        assert_eq!(verification_block.plugin_id, declared_shell.plugin_id);
+        assert_eq!(verification_block.block_id, declared_shell.block_id);
+        assert_eq!(verification_block.effect, declared_shell.effect);
+        assert_eq!(
+            verification_block.authorization,
+            declared_shell.authorization
+        );
+        assert_eq!(verification_block.resources, declared_shell.resources);
         assert_eq!(verification_block.plugin_id, "bcode.shell");
         assert_eq!(verification_block.block_id, "shell.command-plan");
         assert!(verification_block.authorization.explicit_grant_required);
         let verification_edge = template
-            .definition
+            .definition()
             .edges
             .iter()
             .find(|edge| edge.from == "evaluation" && edge.to == "verification")
@@ -769,7 +1637,7 @@ mod tests {
                 .expect("command plan projection"),
             state["command_plan"]
         );
-        let branch = &template.definition.nodes["verification_decision"];
+        let branch = &template.definition().nodes["verification_decision"];
         assert_eq!(branch.kind, bcode_workflow::NodeKind::Branch);
         assert_eq!(branch.configuration["predicate"]["path"], "passed");
         let passed = serde_json::json!({"passed": true});
@@ -779,7 +1647,7 @@ mod tests {
                 .expect("verification predicate");
         assert!(predicate.evaluate_value(&passed).expect("passed branch"));
         assert!(!predicate.evaluate_value(&failed).expect("failed branch"));
-        let git_prepare = &template.definition.nodes["git_prepare"];
+        let git_prepare = &template.definition().nodes["git_prepare"];
         assert_eq!(git_prepare.kind, bcode_workflow::NodeKind::PluginBlock);
         let git_prepare_block: bcode_workflow::WorkflowBlockDefinition =
             serde_json::from_value(git_prepare.configuration.clone())
@@ -802,7 +1670,7 @@ mod tests {
         );
         assert!(!git_prepare_block.authorization.explicit_grant_required);
         let prepare_transform = template
-            .definition
+            .definition()
             .edges
             .iter()
             .find(|edge| edge.from == "commit_policy" && edge.to == "git_prepare")
@@ -816,7 +1684,7 @@ mod tests {
                 "max_paths": 10_000
             })
         );
-        let git_compose = &template.definition.nodes["git_compose"];
+        let git_compose = &template.definition().nodes["git_compose"];
         assert_eq!(git_compose.kind, bcode_workflow::NodeKind::PluginBlock);
         let git_compose_block: bcode_workflow::WorkflowBlockDefinition =
             serde_json::from_value(git_compose.configuration.clone())
@@ -827,8 +1695,11 @@ mod tests {
             .flat_map(|service| &service.workflow_blocks)
             .find(|block| block.block_id == "git.compose-commit")
             .expect("declared Git compose block");
-        assert_eq!(&git_compose_block, declared_compose);
-        let commit_message = &template.definition.nodes["commit_message"];
+        assert_eq!(git_compose_block.plugin_id, declared_compose.plugin_id);
+        assert_eq!(git_compose_block.block_id, declared_compose.block_id);
+        assert_eq!(git_compose_block.effect, declared_compose.effect);
+        assert_eq!(git_compose_block.resources, declared_compose.resources);
+        let commit_message = &template.definition().nodes["commit_message"];
         assert_eq!(commit_message.kind, bcode_workflow::NodeKind::Agent);
         let commit_message_agent: bcode_workflow::WorkflowAgentConfiguration =
             serde_json::from_value(commit_message.configuration.clone())
@@ -848,7 +1719,7 @@ mod tests {
             bcode_workflow::AgentSkillActivationMode::Required
         );
         let compose_transform = template
-            .definition
+            .definition()
             .edges
             .iter()
             .find(|edge| edge.from == "commit_message" && edge.to == "git_compose")
@@ -876,7 +1747,7 @@ mod tests {
             "Add durable workflow support"
         );
         assert_eq!(composed["no_changes"], "no_op");
-        let git_commit = &template.definition.nodes["git_commit"];
+        let git_commit = &template.definition().nodes["git_commit"];
         assert_eq!(git_commit.kind, bcode_workflow::NodeKind::PluginBlock);
         let git_commit_block: bcode_workflow::WorkflowBlockDefinition =
             serde_json::from_value(git_commit.configuration.clone())
@@ -887,14 +1758,17 @@ mod tests {
             .flat_map(|service| &service.workflow_blocks)
             .find(|block| block.block_id == "git.commit")
             .expect("declared Git commit block");
-        assert_eq!(&git_commit_block, declared_commit);
+        assert_eq!(git_commit_block.plugin_id, declared_commit.plugin_id);
+        assert_eq!(git_commit_block.block_id, declared_commit.block_id);
+        assert_eq!(git_commit_block.effect, declared_commit.effect);
+        assert_eq!(git_commit_block.resources, declared_commit.resources);
         assert!(git_commit_block.authorization.explicit_grant_required);
         assert_eq!(
             git_commit_block.reconciliation,
             bcode_workflow::WorkflowBlockReconciliation::RepairRequired
         );
         let commit_transform = template
-            .definition
+            .definition()
             .edges
             .iter()
             .find(|edge| edge.from == "commit_decision" && edge.to == "git_commit")
@@ -918,18 +1792,18 @@ mod tests {
                 .expect("commit projection"),
             ready["request"]
         );
-        let commit_result = &template.definition.nodes["commit_result"];
+        let commit_result = &template.definition().nodes["commit_result"];
         assert_eq!(commit_result.kind, bcode_workflow::NodeKind::Repeat);
         assert_eq!(
             commit_result.input.type_name,
-            template.configuration_schema.type_name
+            template.configuration_schema().type_name
         );
         assert_eq!(
             commit_result.output.type_name,
-            template.configuration_schema.type_name
+            template.configuration_schema().type_name
         );
         let commit_result_edge = template
-            .definition
+            .definition()
             .edges
             .iter()
             .find(|edge| edge.from == "git_commit" && edge.to == "commit_result")
@@ -981,13 +1855,13 @@ mod tests {
             .expect("commit result merge");
         assert_eq!(merged["commit_completed"], true);
         assert_eq!(merged["commit_result"], committed);
-        assert!(template.definition.edges.iter().any(|edge| {
+        assert!(template.definition().edges.iter().any(|edge| {
             edge.from == "commit_result"
                 && edge.to == "implementation"
                 && matches!(edge.kind, bcode_workflow::EdgeKind::Back { .. })
         }));
         let repeat_edge = template
-            .definition
+            .definition()
             .edges
             .iter()
             .find(|edge| edge.from == "commit_result" && edge.to == "implementation")
@@ -1009,11 +1883,11 @@ mod tests {
             .expect("next iteration state");
         assert_eq!(repeated["commit_completed"], true);
         assert_eq!(repeated["commit_result"], committed);
-        let repeat = &template.definition.nodes["verification_repeat"];
+        let repeat = &template.definition().nodes["verification_repeat"];
         assert_eq!(repeat.kind, bcode_workflow::NodeKind::Repeat);
         assert_eq!(repeat.configuration["max_iterations"], 100);
         let back = template
-            .definition
+            .definition()
             .edges
             .iter()
             .find(|edge| edge.from == "verification_repeat" && edge.to == "implementation")
@@ -1045,11 +1919,14 @@ mod tests {
             "commit_result",
             "no_changes",
         ] {
-            assert!(template.definition.nodes.contains_key(node_id), "{node_id}");
+            assert!(
+                template.definition().nodes.contains_key(node_id),
+                "{node_id}"
+            );
         }
         assert_eq!(
             template
-                .definition
+                .definition()
                 .exits
                 .iter()
                 .cloned()
@@ -1060,7 +1937,7 @@ mod tests {
                 "verification_repeat".to_string(),
             ])
         );
-        let required = template.configuration_schema.schema["required"]
+        let required = template.configuration_schema().schema["required"]
             .as_array()
             .expect("required fields");
         for field in [

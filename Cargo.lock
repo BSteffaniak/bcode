@@ -1465,6 +1465,7 @@ dependencies = [
  "bcode_pi_session_import_plugin",
  "bcode_plugin",
  "bcode_plugin_sdk",
+ "bcode_progress_doc_plugin",
  "bcode_question_plugin",
  "bcode_ralph_plugin",
  "bcode_read_plugin",
@@ -1822,6 +1823,7 @@ dependencies = [
  "bmux_tui",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
  "toml 1.1.3+spec-1.1.0",
@@ -2195,6 +2197,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
@@ -2222,6 +2225,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "trybuild",
+]
+
+[[package]]
+name = "bcode_progress_doc_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin",
+ "bcode_plugin_sdk",
+ "bcode_workflow",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "toml 1.1.3+spec-1.1.0",
 ]
 
 [[package]]
@@ -2376,6 +2394,7 @@ dependencies = [
  "bcode_vim_edit_plugin",
  "bcode_web_search_plugin",
  "bcode_workflow",
+ "bcode_workflow_plugin",
  "bcode_workflow_store",
  "bcode_worktree",
  "bcode_worktree_models",
@@ -2820,10 +2839,12 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
  "bcode_command",
+ "bcode_git_plugin",
  "bcode_ipc",
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_session_models",
+ "bcode_shell_plugin",
  "bcode_workflow",
  "bcode_workflow_store",
  "bmux_keyboard",

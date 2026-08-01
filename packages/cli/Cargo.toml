@@ -109,6 +109,7 @@ static-bundled-plugins = [
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
+    "static-bundled-progress-doc-plugin",
     "static-bundled-question-plugin",
     "static-bundled-ralph-plugin",
     "static-bundled-read-plugin",
@@ -119,6 +120,7 @@ static-bundled-plugins = [
     "static-bundled-workflow-plugin",
     "bcode_tui/static-bundled-plugins",
 ]
+static-bundled-progress-doc-plugin = ["_static-bundled"]
 static-bundled-question-plugin = [
     "_static-bundled",
     "bcode_hyperchad?/static-bundled-question-plugin",

@@ -64,6 +64,10 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 bcode_bundled_plugins = { workspace = true, features = [
+    "static-bundled-default-agents-plugin",
+    "static-bundled-git-plugin",
+    "static-bundled-shell-plugin",
+    "static-bundled-workflow-plugin",
     "static-bundled-question-plugin",
 ] }
 bcode_client = { workspace = true }
@@ -89,6 +93,7 @@ bcode_tantivy_session_search_plugin = { workspace = true, features = [
 ] }
 bcode_vim_edit_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_web_search_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_workflow_plugin = { workspace = true, features = ["static-bundled"] }
 hyperchad = { workspace = true, features = ["router", "router-form"] }
 png = { workspace = true }
 switchy = { workspace = true, features = ["database", "database-schema"] }

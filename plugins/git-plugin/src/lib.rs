@@ -12,8 +12,10 @@ use bcode_tool::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
@@ -21,6 +23,12 @@ use thiserror::Error;
 const GIT_PLUGIN_ID: &str = "bcode.git";
 const GIT_CLONE_REQUEST_SCHEMA: &str = "bcode.git.clone_request";
 const GIT_CLONE_RESULT_SCHEMA: &str = "bcode.git.clone_result";
+const REPOSITORY_SNAPSHOT_VERSION: u32 = 1;
+const VERIFICATION_RECEIPT_VERSION: u32 = 1;
+const MAX_SNAPSHOT_PATHS: usize = 10_000;
+const MAX_SNAPSHOT_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SYMLINK_TARGET_BYTES: usize = 16 * 1024;
 
 /// Git access plugin.
 #[derive(Default)]
@@ -249,11 +257,116 @@ fn decode_optional_owner_context<T: serde::de::DeserializeOwned>(
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct CommitRequest {
-    repo_path: PathBuf,
-    expected_head: String,
-    message: String,
-    paths: Vec<PathBuf>,
+pub struct RepositorySnapshotRequest {
+    pub version: u32,
+    #[serde(default)]
+    pub include_prefixes: Vec<PathBuf>,
+    #[serde(default)]
+    pub exclude_prefixes: Vec<PathBuf>,
+    #[serde(default)]
+    pub progress_document_path: Option<PathBuf>,
+    pub max_paths: u32,
+    pub project_instruction_fingerprint_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryEntryKind {
+    File,
+    Symlink,
+    Submodule,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySnapshotEntry {
+    pub path: PathBuf,
+    pub index_status: char,
+    pub worktree_status: char,
+    pub kind: RepositoryEntryKind,
+    pub base_mode: String,
+    pub index_mode: String,
+    pub worktree_mode: String,
+    pub base_object_id: Option<String>,
+    pub index_object_id: Option<String>,
+    pub worktree_sha256: Option<String>,
+    #[serde(default)]
+    pub worktree_object_id: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
+    #[serde(default)]
+    pub symlink_target_sha256: Option<String>,
+    #[serde(default)]
+    pub submodule_state: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySnapshot {
+    pub version: u32,
+    pub repository_root: PathBuf,
+    pub repository_identity_sha256: String,
+    pub head_object_id: String,
+    pub include_prefixes: Vec<PathBuf>,
+    pub exclude_prefixes: Vec<PathBuf>,
+    pub entries: Vec<RepositorySnapshotEntry>,
+    pub project_instruction_fingerprint_sha256: String,
+    pub aggregate_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStage {
+    PreFormat,
+    PostFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationReceiptRequest {
+    pub version: u32,
+    pub stage: VerificationStage,
+    pub plan_sha256: String,
+    pub instruction_fingerprint_sha256: String,
+    pub pre_snapshot: RepositorySnapshot,
+    pub post_snapshot: RepositorySnapshot,
+    pub commands_passed: bool,
+    pub required_artifacts_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationReceipt {
+    pub version: u32,
+    pub stage: VerificationStage,
+    pub verified: bool,
+    pub plan_sha256: String,
+    pub instruction_fingerprint_sha256: String,
+    pub repository_snapshot_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedCheckpointManifest {
+    pub version: u32,
+    pub repository_identity_sha256: String,
+    pub repository_snapshot_sha256: String,
+    pub head_object_id: String,
+    pub entries: Vec<RepositorySnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitRequest {
+    pub repo_path: PathBuf,
+    pub expected_head: String,
+    pub expected_repository_identity_sha256: String,
+    pub expected_snapshot_sha256: String,
+    pub manifest: VerifiedCheckpointManifest,
+    pub title: String,
+    pub description: String,
+    pub paths: Vec<PathBuf>,
 }
 
 const MAX_COMMIT_MESSAGE_BYTES: usize = 8_192;
@@ -261,38 +374,58 @@ const MAX_COMMIT_PATHS: usize = 10_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ComposeCommitRequest {
-    preparation: PrepareResponse,
-    message: ProposedCommitMessage,
-    no_changes: NoChangesDecision,
+pub struct ComposeCommitRequest {
+    pub preparation: PrepareResponse,
+    pub message: ProposedCommitMessage,
+    pub no_changes: NoChangesDecision,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ProposedCommitMessage {
-    title: String,
-    description: String,
+pub struct ProposedCommitMessage {
+    pub title: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum NoChangesDecision {
+pub enum NoChangesDecision {
     Fail,
     NoOp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum ComposedCommitRequest {
-    Ready { request: CommitRequest },
+pub enum ComposedCommitRequest {
+    Ready { request: Box<CommitRequest> },
     NoChanges,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct CommitResponse {
-    previous_head: String,
-    commit_hash: String,
-    paths: Vec<PathBuf>,
+impl ComposedCommitRequest {
+    #[must_use]
+    pub fn request(&self) -> Option<&CommitRequest> {
+        match self {
+            Self::Ready { request } => Some(request),
+            Self::NoChanges => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CommitResponse {
+    pub previous_head: String,
+    pub commit_hash: String,
+    pub repository_snapshot_sha256: String,
+    pub committed_tree: String,
+    pub paths: Vec<PathBuf>,
+    pub committed_objects: Vec<CommittedObjectIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CommittedObjectIdentity {
+    pub path: PathBuf,
+    pub object_id: String,
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -322,28 +455,45 @@ struct CommitStatusResponse {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PrepareRequest {
+pub struct PrepareRequest {
     #[serde(default)]
-    include_prefixes: Vec<PathBuf>,
+    pub include_prefixes: Vec<PathBuf>,
     #[serde(default)]
-    exclude_prefixes: Vec<PathBuf>,
-    max_paths: u32,
+    pub exclude_prefixes: Vec<PathBuf>,
+    #[serde(default)]
+    pub progress_document_path: Option<PathBuf>,
+    #[serde(default = "zero_sha256")]
+    pub project_instruction_fingerprint_sha256: String,
+    pub max_paths: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-struct PreparedChangedPath {
-    path: PathBuf,
-    status: String,
+pub struct PreparedChangedPath {
+    pub path: PathBuf,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-struct PrepareResponse {
-    repository_root: PathBuf,
-    head: String,
-    changed_paths: Vec<PreparedChangedPath>,
+pub struct PrepareResponse {
+    pub repository_root: PathBuf,
+    pub head: String,
+    pub repository_identity_sha256: String,
+    pub repository_snapshot_sha256: String,
+    pub manifest: VerifiedCheckpointManifest,
+    pub changed_paths: Vec<PreparedChangedPath>,
+}
+
+fn zero_sha256() -> String {
+    "0".repeat(64)
 }
 
 fn invoke_workflow_block(context: &NativeServiceContext) -> ServiceResponse {
+    if context.request.operation == "git.repository-snapshot" {
+        return repository_snapshot_workflow(context);
+    }
+    if context.request.operation == "git.verification-receipt" {
+        return verification_receipt_workflow(context);
+    }
     if context.request.operation == "git.prepare" {
         return prepare_workflow_repository(context);
     }
@@ -449,6 +599,48 @@ fn commit_status(request: &CommitStatusRequest) -> Result<CommitStatusResponse, 
     })
 }
 
+fn repository_snapshot_workflow(context: &NativeServiceContext) -> ServiceResponse {
+    if context.cancellation.is_cancelled() {
+        return ServiceResponse::error("cancelled", "Git repository snapshot cancelled");
+    }
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return invalid_request(&error),
+    };
+    let request = match invocation.typed_input::<RepositorySnapshotRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
+    };
+    match repository_snapshot(&invocation.workspace_root, &request) {
+        Ok(snapshot) => json_response(&snapshot),
+        Err(GitError::ScopeTooLarge) => {
+            ServiceResponse::error("scope_too_large", "repository snapshot scope is too large")
+        }
+        Err(error) => ServiceResponse::error("snapshot_failed", error.to_string()),
+    }
+}
+
+fn verification_receipt_workflow(context: &NativeServiceContext) -> ServiceResponse {
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return invalid_request(&error),
+    };
+    let request = match invocation.typed_input::<VerificationReceiptRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
+    };
+    match build_verification_receipt(&request) {
+        Ok(receipt) => json_response(&receipt),
+        Err(error) => ServiceResponse::error("verification_failed", error.to_string()),
+    }
+}
+
 fn compose_workflow_commit(context: &NativeServiceContext) -> ServiceResponse {
     let invocation = match context
         .request
@@ -470,24 +662,8 @@ fn compose_workflow_commit(context: &NativeServiceContext) -> ServiceResponse {
 fn compose_commit_request(
     request: ComposeCommitRequest,
 ) -> Result<ComposedCommitRequest, GitError> {
-    let title = request.message.title.trim();
-    let description = request.message.description.trim();
-    if title.is_empty()
-        || title.contains(['\r', '\n'])
-        || title.len() > 256
-        || description.len() > 7_935
-    {
-        return Err(GitError::InvalidRequest(
-            "commit message title/description is empty, multiline, or unbounded".to_string(),
-        ));
-    }
-    let message = if description.is_empty() {
-        title.to_string()
-    } else {
-        format!("{title}\n\n{description}")
-    };
-    if message.len() > MAX_COMMIT_MESSAGE_BYTES
-        || request.preparation.head.trim().is_empty()
+    let _message = normalize_commit_message(&request.message.title, &request.message.description)?;
+    if request.preparation.head.trim().is_empty()
         || request.preparation.head.len() > 256
         || request.preparation.changed_paths.len() > MAX_COMMIT_PATHS
     {
@@ -503,7 +679,6 @@ fn compose_commit_request(
             )),
         };
     }
-    let mut paths = Vec::with_capacity(request.preparation.changed_paths.len());
     let mut unique = BTreeSet::new();
     for changed in request.preparation.changed_paths {
         let path = changed.path;
@@ -524,15 +699,23 @@ fn compose_commit_request(
                     .to_string(),
             ));
         }
-        paths.push(path);
     }
     Ok(ComposedCommitRequest::Ready {
-        request: CommitRequest {
-            repo_path: request.preparation.repository_root,
-            expected_head: request.preparation.head,
-            message,
-            paths,
-        },
+        request: Box::new(checkpoint_request(
+            &RepositorySnapshot {
+                version: request.preparation.manifest.version,
+                repository_root: request.preparation.repository_root,
+                repository_identity_sha256: request.preparation.repository_identity_sha256,
+                head_object_id: request.preparation.head,
+                include_prefixes: Vec::new(),
+                exclude_prefixes: Vec::new(),
+                entries: request.preparation.manifest.entries,
+                project_instruction_fingerprint_sha256: zero_sha256(),
+                aggregate_sha256: request.preparation.repository_snapshot_sha256,
+            },
+            request.message.title,
+            request.message.description,
+        )),
     })
 }
 
@@ -554,12 +737,19 @@ fn prepare_workflow_repository(context: &NativeServiceContext) -> ServiceRespons
     }
 }
 
-fn prepare_repository(root: &Path, request: &PrepareRequest) -> Result<PrepareResponse, GitError> {
-    if request.max_paths == 0 || request.max_paths > 10_000 {
+fn repository_snapshot(
+    root: &Path,
+    request: &RepositorySnapshotRequest,
+) -> Result<RepositorySnapshot, GitError> {
+    if request.version != REPOSITORY_SNAPSHOT_VERSION
+        || request.max_paths == 0
+        || usize::try_from(request.max_paths).unwrap_or(usize::MAX) > MAX_SNAPSHOT_PATHS
+    {
         return Err(GitError::InvalidRequest(
-            "git preparation max_paths must be between 1 and 10000".to_string(),
+            "repository snapshot version or path bound is invalid".to_string(),
         ));
     }
+    validate_sha256(&request.project_instruction_fingerprint_sha256)?;
     let repo = root.canonicalize()?;
     let repository_root = PathBuf::from(git_stdout(&repo, ["rev-parse", "--show-toplevel"])?);
     let repository_root = repository_root.canonicalize()?;
@@ -568,11 +758,24 @@ fn prepare_repository(root: &Path, request: &PrepareRequest) -> Result<PrepareRe
             "workflow workspace is outside the resolved repository".to_string(),
         ));
     }
-    let include = normalize_path_prefixes(&request.include_prefixes)?;
-    let exclude = normalize_path_prefixes(&request.exclude_prefixes)?;
+    let include_prefixes = normalize_path_prefixes(&request.include_prefixes)?;
+    let mut exclude_prefixes = normalize_path_prefixes(&request.exclude_prefixes)?;
+    if let Some(progress_document_path) = &request.progress_document_path {
+        exclude_prefixes.extend(normalize_path_prefixes(std::slice::from_ref(
+            progress_document_path,
+        ))?);
+        exclude_prefixes.sort();
+        exclude_prefixes.dedup();
+    }
     let status = Command::new("git")
         .current_dir(&repository_root)
-        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .args([
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ])
         .output()?;
     if !status.status.success() {
         return Err(GitError::CloneFailed {
@@ -580,49 +783,425 @@ fn prepare_repository(root: &Path, request: &PrepareRequest) -> Result<PrepareRe
             stderr: String::from_utf8_lossy(&status.stderr).trim().to_string(),
         });
     }
-    let mut changed_paths = Vec::new();
-    for record in status
-        .stdout
+    let mut entries = parse_porcelain_v2_entries(
+        &repository_root,
+        &status.stdout,
+        &include_prefixes,
+        &exclude_prefixes,
+        usize::try_from(request.max_paths).unwrap_or(usize::MAX),
+    )?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let head_object_id = git_stdout(&repository_root, ["rev-parse", "HEAD"])?;
+    validate_object_id(&head_object_id)?;
+    let git_common_dir = PathBuf::from(git_stdout(
+        &repository_root,
+        ["rev-parse", "--git-common-dir"],
+    )?);
+    let git_common_dir = if git_common_dir.is_absolute() {
+        git_common_dir
+    } else {
+        repository_root.join(git_common_dir)
+    }
+    .canonicalize()?;
+    let repository_identity_sha256 = sha256_hex(git_common_dir.as_os_str().as_encoded_bytes());
+    let mut snapshot = RepositorySnapshot {
+        version: REPOSITORY_SNAPSHOT_VERSION,
+        repository_root,
+        repository_identity_sha256,
+        head_object_id,
+        include_prefixes,
+        exclude_prefixes,
+        entries,
+        project_instruction_fingerprint_sha256: request
+            .project_instruction_fingerprint_sha256
+            .clone(),
+        aggregate_sha256: String::new(),
+    };
+    let canonical = serde_json::to_vec(&snapshot)?;
+    if canonical.len() > MAX_SNAPSHOT_MANIFEST_BYTES {
+        return Err(GitError::ScopeTooLarge);
+    }
+    snapshot.aggregate_sha256 = sha256_hex(&canonical);
+    Ok(snapshot)
+}
+
+fn parse_porcelain_v2_entries(
+    repository_root: &Path,
+    bytes: &[u8],
+    include: &[PathBuf],
+    exclude: &[PathBuf],
+    max_paths: usize,
+) -> Result<Vec<RepositorySnapshotEntry>, GitError> {
+    let fields = bytes
         .split(|byte| *byte == 0)
-        .filter(|row| !row.is_empty())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0_usize;
+    while index < fields.len() {
+        let record = std::str::from_utf8(fields[index]).map_err(|_| {
+            GitError::InvalidRequest("Git status contains a non-portable path".to_string())
+        })?;
+        let kind = record.as_bytes().first().copied();
+        let (entry, consumed) = match kind {
+            Some(b'1') => (parse_ordinary_entry(repository_root, record)?, 1),
+            Some(b'2') => {
+                let source = fields.get(index + 1).ok_or_else(|| {
+                    GitError::InvalidRequest("Git rename/copy record is incomplete".to_string())
+                })?;
+                let source = std::str::from_utf8(source).map_err(|_| {
+                    GitError::InvalidRequest("Git status contains a non-portable path".to_string())
+                })?;
+                (parse_rename_entry(repository_root, record, source)?, 2)
+            }
+            Some(b'u') => {
+                return Err(GitError::InvalidRequest(
+                    "unmerged Git entries are unsupported by repository snapshot v1".to_string(),
+                ));
+            }
+            Some(b'?') => (parse_untracked_entry(repository_root, record)?, 1),
+            Some(b'!') => {
+                index += 1;
+                continue;
+            }
+            _ => {
+                return Err(GitError::InvalidRequest(
+                    "Git status returned an unsupported porcelain-v2 record".to_string(),
+                ));
+            }
+        };
+        index += consumed;
+        if !include.is_empty() && !include.iter().any(|prefix| entry.path.starts_with(prefix)) {
+            continue;
+        }
+        if exclude.iter().any(|prefix| entry.path.starts_with(prefix)) {
+            continue;
+        }
+        entries.push(entry);
+        if entries.len() > max_paths {
+            return Err(GitError::ScopeTooLarge);
+        }
+    }
+    Ok(entries)
+}
+
+fn parse_ordinary_entry(
+    repository_root: &Path,
+    record: &str,
+) -> Result<RepositorySnapshotEntry, GitError> {
+    let fields = record.splitn(9, ' ').collect::<Vec<_>>();
+    if fields.len() != 9 {
+        return Err(GitError::InvalidRequest(
+            "Git ordinary status record is malformed".to_string(),
+        ));
+    }
+    snapshot_entry(
+        repository_root,
+        fields[8],
+        fields[1],
+        fields[2],
+        fields[3],
+        fields[4],
+        fields[5],
+        fields[6],
+        fields[7],
+        None,
+    )
+}
+
+fn parse_rename_entry(
+    repository_root: &Path,
+    record: &str,
+    source: &str,
+) -> Result<RepositorySnapshotEntry, GitError> {
+    let fields = record.splitn(10, ' ').collect::<Vec<_>>();
+    if fields.len() != 10 {
+        return Err(GitError::InvalidRequest(
+            "Git rename/copy status record is malformed".to_string(),
+        ));
+    }
+    let source = normalize_status_path(source)?;
+    snapshot_entry(
+        repository_root,
+        fields[9],
+        fields[1],
+        fields[2],
+        fields[3],
+        fields[4],
+        fields[5],
+        fields[6],
+        fields[7],
+        Some(source),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn snapshot_entry(
+    repository_root: &Path,
+    path: &str,
+    status: &str,
+    submodule: &str,
+    base_mode: &str,
+    index_mode: &str,
+    worktree_mode: &str,
+    base_object_id: &str,
+    index_object_id: &str,
+    source_path: Option<PathBuf>,
+) -> Result<RepositorySnapshotEntry, GitError> {
+    let path = normalize_status_path(path)?;
+    let mut statuses = status.chars();
+    let index_status = statuses
+        .next()
+        .ok_or_else(|| GitError::InvalidRequest("Git status pair is malformed".to_string()))?;
+    let worktree_status = statuses
+        .next()
+        .ok_or_else(|| GitError::InvalidRequest("Git status pair is malformed".to_string()))?;
+    if statuses.next().is_some() {
+        return Err(GitError::InvalidRequest(
+            "Git status pair is malformed".to_string(),
+        ));
+    }
+    let kind = if worktree_status == 'D' || index_status == 'D' || worktree_mode == "000000" {
+        RepositoryEntryKind::Deleted
+    } else if submodule.starts_with('S') {
+        RepositoryEntryKind::Submodule
+    } else if worktree_mode == "120000" || index_mode == "120000" {
+        RepositoryEntryKind::Symlink
+    } else {
+        RepositoryEntryKind::File
+    };
+    let (worktree_sha256, symlink_target_sha256) = worktree_identity(repository_root, &path, kind)?;
+    let worktree_object_id = worktree_git_object_id(repository_root, &path)?;
+    Ok(RepositorySnapshotEntry {
+        path,
+        index_status,
+        worktree_status,
+        kind,
+        base_mode: base_mode.to_string(),
+        index_mode: index_mode.to_string(),
+        worktree_mode: worktree_mode.to_string(),
+        base_object_id: normalized_object_id(base_object_id)?,
+        index_object_id: normalized_object_id(index_object_id)?,
+        worktree_sha256,
+        worktree_object_id,
+        source_path,
+        symlink_target_sha256,
+        submodule_state: submodule.starts_with('S').then(|| submodule.to_string()),
+    })
+}
+
+fn parse_untracked_entry(
+    repository_root: &Path,
+    record: &str,
+) -> Result<RepositorySnapshotEntry, GitError> {
+    let path = record.strip_prefix("? ").ok_or_else(|| {
+        GitError::InvalidRequest("Git untracked status record is malformed".to_string())
+    })?;
+    let path = normalize_status_path(path)?;
+    let metadata = fs::symlink_metadata(repository_root.join(&path))?;
+    let kind = if metadata.file_type().is_symlink() {
+        RepositoryEntryKind::Symlink
+    } else if metadata.is_file() {
+        RepositoryEntryKind::File
+    } else {
+        return Err(GitError::InvalidRequest(
+            "unsupported untracked repository entry kind".to_string(),
+        ));
+    };
+    let (worktree_sha256, symlink_target_sha256) = worktree_identity(repository_root, &path, kind)?;
+    let worktree_object_id = worktree_git_object_id(repository_root, &path)?;
+    Ok(RepositorySnapshotEntry {
+        path,
+        index_status: '?',
+        worktree_status: '?',
+        kind,
+        base_mode: "000000".to_string(),
+        index_mode: "000000".to_string(),
+        worktree_mode: if kind == RepositoryEntryKind::Symlink {
+            "120000"
+        } else {
+            "100644"
+        }
+        .to_string(),
+        base_object_id: None,
+        index_object_id: None,
+        worktree_sha256,
+        worktree_object_id,
+        source_path: None,
+        symlink_target_sha256,
+        submodule_state: None,
+    })
+}
+
+fn worktree_git_object_id(repository_root: &Path, path: &Path) -> Result<Option<String>, GitError> {
+    let output = Command::new("git")
+        .current_dir(repository_root)
+        .arg("hash-object")
+        .arg("--")
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let object_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    validate_object_id(&object_id)?;
+    Ok(Some(object_id))
+}
+
+fn worktree_identity(
+    repository_root: &Path,
+    path: &Path,
+    kind: RepositoryEntryKind,
+) -> Result<(Option<String>, Option<String>), GitError> {
+    let absolute = repository_root.join(path);
+    match kind {
+        RepositoryEntryKind::Deleted | RepositoryEntryKind::Submodule => Ok((None, None)),
+        RepositoryEntryKind::Symlink => {
+            let target = fs::read_link(&absolute)?;
+            let bytes = target.as_os_str().as_encoded_bytes();
+            if bytes.len() > MAX_SYMLINK_TARGET_BYTES {
+                return Err(GitError::ScopeTooLarge);
+            }
+            Ok((None, Some(sha256_hex(bytes))))
+        }
+        RepositoryEntryKind::File => {
+            let metadata = fs::metadata(&absolute)?;
+            if metadata.len() > MAX_SNAPSHOT_FILE_BYTES {
+                return Err(GitError::ScopeTooLarge);
+            }
+            Ok((Some(sha256_hex(&fs::read(absolute)?)), None))
+        }
+    }
+}
+
+fn normalize_status_path(path: &str) -> Result<PathBuf, GitError> {
+    let path = PathBuf::from(path);
+    if path.is_absolute()
+        || path.as_os_str().is_empty()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
     {
-        let record = String::from_utf8_lossy(record);
-        if record.len() < 4 {
+        return Err(GitError::InvalidRequest(
+            "Git status returned an unsafe changed path".to_string(),
+        ));
+    }
+    Ok(path)
+}
+
+fn normalized_object_id(value: &str) -> Result<Option<String>, GitError> {
+    if value.chars().all(|character| character == '0') {
+        return Ok(None);
+    }
+    validate_object_id(value)?;
+    Ok(Some(value.to_string()))
+}
+
+fn validate_object_id(value: &str) -> Result<(), GitError> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(GitError::InvalidRequest(
+            "Git object identity is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> Result<(), GitError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(GitError::InvalidRequest(
+            "SHA-256 identity is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn build_verification_receipt(
+    request: &VerificationReceiptRequest,
+) -> Result<VerificationReceipt, GitError> {
+    if request.version != VERIFICATION_RECEIPT_VERSION {
+        return Err(GitError::InvalidRequest(
+            "verification receipt version is unsupported".to_string(),
+        ));
+    }
+    validate_sha256(&request.plan_sha256)?;
+    validate_sha256(&request.instruction_fingerprint_sha256)?;
+    for snapshot in [&request.pre_snapshot, &request.post_snapshot] {
+        validate_sha256(&snapshot.aggregate_sha256)?;
+        let mut canonical = (*snapshot).clone();
+        canonical.aggregate_sha256.clear();
+        if sha256_hex(&serde_json::to_vec(&canonical)?) != snapshot.aggregate_sha256 {
             return Err(GitError::InvalidRequest(
-                "Git status returned a malformed path record".to_string(),
+                "verification receipt contains an invalid repository snapshot digest".to_string(),
             ));
         }
-        let status = record[..2].to_string();
-        let path = PathBuf::from(&record[3..]);
-        if path.is_absolute()
-            || path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
-                )
-            })
+        if snapshot.version != REPOSITORY_SNAPSHOT_VERSION
+            || snapshot.project_instruction_fingerprint_sha256
+                != request.instruction_fingerprint_sha256
         {
             return Err(GitError::InvalidRequest(
-                "Git status returned an unsafe changed path".to_string(),
-            ));
-        }
-        if !include.is_empty() && !include.iter().any(|prefix| path.starts_with(prefix)) {
-            continue;
-        }
-        if exclude.iter().any(|prefix| path.starts_with(prefix)) {
-            continue;
-        }
-        changed_paths.push(PreparedChangedPath { path, status });
-        if changed_paths.len() > usize::try_from(request.max_paths).unwrap_or(usize::MAX) {
-            return Err(GitError::InvalidRequest(
-                "changed path set exceeds configured max_paths".to_string(),
+                "verification receipt instruction or snapshot identity is inconsistent".to_string(),
             ));
         }
     }
-    changed_paths.sort_by(|left, right| left.path.cmp(&right.path));
+    if !request.commands_passed
+        || !request.required_artifacts_complete
+        || request.pre_snapshot.aggregate_sha256 != request.post_snapshot.aggregate_sha256
+    {
+        return Err(GitError::InvalidRequest(
+            "verification evidence is incomplete or repository state changed".to_string(),
+        ));
+    }
+    Ok(VerificationReceipt {
+        version: VERIFICATION_RECEIPT_VERSION,
+        stage: request.stage,
+        verified: true,
+        plan_sha256: request.plan_sha256.clone(),
+        instruction_fingerprint_sha256: request.instruction_fingerprint_sha256.clone(),
+        repository_snapshot_sha256: request.pre_snapshot.aggregate_sha256.clone(),
+    })
+}
+
+fn prepare_repository(root: &Path, request: &PrepareRequest) -> Result<PrepareResponse, GitError> {
+    let snapshot = repository_snapshot(
+        root,
+        &RepositorySnapshotRequest {
+            version: REPOSITORY_SNAPSHOT_VERSION,
+            include_prefixes: request.include_prefixes.clone(),
+            exclude_prefixes: request.exclude_prefixes.clone(),
+            progress_document_path: request.progress_document_path.clone(),
+            max_paths: request.max_paths,
+            project_instruction_fingerprint_sha256: request
+                .project_instruction_fingerprint_sha256
+                .clone(),
+        },
+    )?;
+    let changed_paths = snapshot
+        .entries
+        .iter()
+        .map(|entry| PreparedChangedPath {
+            path: entry.path.clone(),
+            status: format!("{}{}", entry.index_status, entry.worktree_status),
+        })
+        .collect();
     Ok(PrepareResponse {
-        repository_root,
-        head: git_stdout(&repo, ["rev-parse", "HEAD"])?,
+        repository_root: snapshot.repository_root.clone(),
+        head: snapshot.head_object_id.clone(),
+        repository_identity_sha256: snapshot.repository_identity_sha256.clone(),
+        repository_snapshot_sha256: snapshot.aggregate_sha256.clone(),
+        manifest: verified_checkpoint_manifest(&snapshot),
         changed_paths,
     })
 }
@@ -685,13 +1264,171 @@ fn normalize_commit_paths(paths: &[PathBuf]) -> Result<Vec<String>, GitError> {
     Ok(normalized)
 }
 
-fn commit_repository(request: &CommitRequest) -> Result<CommitResponse, GitError> {
-    let repo = request.repo_path.canonicalize()?;
-    if !repo.is_dir() || request.message.trim().is_empty() || request.paths.is_empty() {
+fn verified_checkpoint_manifest(snapshot: &RepositorySnapshot) -> VerifiedCheckpointManifest {
+    VerifiedCheckpointManifest {
+        version: snapshot.version,
+        repository_identity_sha256: snapshot.repository_identity_sha256.clone(),
+        repository_snapshot_sha256: snapshot.aggregate_sha256.clone(),
+        head_object_id: snapshot.head_object_id.clone(),
+        entries: snapshot.entries.clone(),
+    }
+}
+
+fn checkpoint_request(
+    snapshot: &RepositorySnapshot,
+    title: impl Into<String>,
+    description: impl Into<String>,
+) -> CommitRequest {
+    CommitRequest {
+        repo_path: snapshot.repository_root.clone(),
+        expected_head: snapshot.head_object_id.clone(),
+        expected_repository_identity_sha256: snapshot.repository_identity_sha256.clone(),
+        expected_snapshot_sha256: snapshot.aggregate_sha256.clone(),
+        manifest: verified_checkpoint_manifest(snapshot),
+        title: title.into(),
+        description: description.into(),
+        paths: snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect(),
+    }
+}
+
+fn normalize_commit_message(title: &str, description: &str) -> Result<String, GitError> {
+    let title = title.trim();
+    let description = description.trim();
+    if title.is_empty()
+        || title.contains(['\r', '\n'])
+        || title.len() > 256
+        || description.len() > 7_935
+    {
         return Err(GitError::InvalidRequest(
-            "commit requires a repository, non-empty message, and bounded paths".to_string(),
+            "commit message title/description is empty, multiline, or unbounded".to_string(),
         ));
     }
+    let message = if description.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n\n{description}")
+    };
+    if message.len() > MAX_COMMIT_MESSAGE_BYTES {
+        return Err(GitError::InvalidRequest(
+            "commit message exceeds the bounded size".to_string(),
+        ));
+    }
+    Ok(message)
+}
+
+fn repository_identity_sha256(repository_root: &Path) -> Result<String, GitError> {
+    let git_common_dir = PathBuf::from(git_stdout(
+        repository_root,
+        ["rev-parse", "--git-common-dir"],
+    )?);
+    let git_common_dir = if git_common_dir.is_absolute() {
+        git_common_dir
+    } else {
+        repository_root.join(git_common_dir)
+    }
+    .canonicalize()?;
+    Ok(sha256_hex(git_common_dir.as_os_str().as_encoded_bytes()))
+}
+
+fn validate_checkpoint_request(repo: &Path, request: &CommitRequest) -> Result<(), GitError> {
+    validate_sha256(&request.expected_repository_identity_sha256)?;
+    validate_sha256(&request.expected_snapshot_sha256)?;
+    if request.manifest.version != REPOSITORY_SNAPSHOT_VERSION
+        || request.manifest.repository_identity_sha256
+            != request.expected_repository_identity_sha256
+        || request.manifest.repository_snapshot_sha256 != request.expected_snapshot_sha256
+        || request.manifest.head_object_id != request.expected_head
+        || repository_identity_sha256(repo)? != request.expected_repository_identity_sha256
+    {
+        return Err(GitError::InvalidRequest(
+            "verified checkpoint identity does not match the repository".to_string(),
+        ));
+    }
+    let requested = request.paths.iter().collect::<BTreeSet<_>>();
+    let manifested = request
+        .manifest
+        .entries
+        .iter()
+        .map(|entry| &entry.path)
+        .collect::<BTreeSet<_>>();
+    if requested != manifested {
+        return Err(GitError::InvalidRequest(
+            "checkpoint paths do not match the verified manifest".to_string(),
+        ));
+    }
+    for entry in &request.manifest.entries {
+        let actual = worktree_git_object_id(repo, &entry.path)?;
+        if entry.kind == RepositoryEntryKind::Deleted {
+            if actual.is_some() {
+                return Err(GitError::InvalidRequest(
+                    "verified deletion no longer matches the worktree".to_string(),
+                ));
+            }
+        } else if actual != entry.worktree_object_id {
+            return Err(GitError::InvalidRequest(format!(
+                "worktree object changed after verification: {}",
+                entry.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn staged_object_identities(
+    repo: &Path,
+    paths: &[String],
+) -> Result<Vec<CommittedObjectIdentity>, GitError> {
+    let mut identities = Vec::with_capacity(paths.len());
+    for path in paths {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(["ls-files", "--stage", "--"])
+            .arg(path)
+            .output()?;
+        if !output.status.success() {
+            return Err(GitError::InvalidRequest(
+                "failed to inspect staged object identity".to_string(),
+            ));
+        }
+        let row = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if row.is_empty() {
+            identities.push(CommittedObjectIdentity {
+                path: PathBuf::from(path),
+                object_id: "deleted".to_string(),
+                mode: "000000".to_string(),
+            });
+            continue;
+        }
+        let (metadata, _) = row.split_once('\t').ok_or_else(|| {
+            GitError::InvalidRequest("staged object record is malformed".to_string())
+        })?;
+        let mut metadata = metadata.split_whitespace();
+        let mode = metadata.next().unwrap_or_default().to_string();
+        let object_id = metadata.next().unwrap_or_default().to_string();
+        validate_object_id(&object_id)?;
+        identities.push(CommittedObjectIdentity {
+            path: PathBuf::from(path),
+            object_id,
+            mode,
+        });
+    }
+    Ok(identities)
+}
+
+#[allow(clippy::too_many_lines)]
+fn commit_repository(request: &CommitRequest) -> Result<CommitResponse, GitError> {
+    let repo = request.repo_path.canonicalize()?;
+    let message = normalize_commit_message(&request.title, &request.description)?;
+    if !repo.is_dir() || request.paths.is_empty() {
+        return Err(GitError::InvalidRequest(
+            "commit requires a repository and bounded verified paths".to_string(),
+        ));
+    }
+    validate_checkpoint_request(&repo, request)?;
     let actual_head = git_stdout(&repo, ["rev-parse", "HEAD"])?;
     if actual_head != request.expected_head {
         return Err(GitError::InvalidRequest(format!(
@@ -729,13 +1466,31 @@ fn commit_repository(request: &CommitRequest) -> Result<CommitResponse, GitError
             "staged paths differ from the bounded request: expected {expected:?}, found {actual:?}"
         )));
     }
+    let committed_objects = staged_object_identities(&repo, &normalized)?;
+    for (entry, staged) in request.manifest.entries.iter().zip(&committed_objects) {
+        let expected_object = if entry.kind == RepositoryEntryKind::Deleted {
+            "deleted"
+        } else {
+            entry.worktree_object_id.as_deref().ok_or_else(|| {
+                GitError::InvalidRequest(
+                    "verified entry has no worktree object identity".to_string(),
+                )
+            })?
+        };
+        if staged.path != entry.path || staged.object_id != expected_object {
+            return Err(GitError::InvalidRequest(format!(
+                "staged Git object differs from verified content: {}",
+                entry.path.display()
+            )));
+        }
+    }
     let mut commit = Command::new("git");
     commit
         .current_dir(&repo)
         .arg("commit")
         .arg("--only")
         .arg("-m")
-        .arg(&request.message)
+        .arg(&message)
         .arg("--")
         .args(&normalized);
     run_git(&mut commit, "git commit")?;
@@ -745,10 +1500,32 @@ fn commit_repository(request: &CommitRequest) -> Result<CommitResponse, GitError
             "Git commit did not advance HEAD".to_string(),
         ));
     }
+    let parent = git_stdout(&repo, ["rev-parse", "HEAD^"])?;
+    if parent != actual_head {
+        return Err(GitError::InvalidRequest(
+            "committed checkpoint parent is not the verified HEAD".to_string(),
+        ));
+    }
+    let committed_paths = git_stdout(
+        &repo,
+        ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+    )?
+    .lines()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    if committed_paths != expected {
+        return Err(GitError::InvalidRequest(
+            "committed path set differs from the verified manifest".to_string(),
+        ));
+    }
+    let committed_tree = git_stdout(&repo, ["rev-parse", "HEAD^{tree}"])?;
     Ok(CommitResponse {
         previous_head: actual_head,
         commit_hash,
+        repository_snapshot_sha256: request.expected_snapshot_sha256.clone(),
+        committed_tree,
         paths: normalized.into_iter().map(PathBuf::from).collect(),
+        committed_objects,
     })
 }
 
@@ -802,8 +1579,12 @@ struct CloneResponse {
 enum GitError {
     #[error("{0}")]
     InvalidRequest(String),
+    #[error("repository snapshot scope is too large")]
+    ScopeTooLarge,
     #[error("git clone failed with status {status}: {stderr}")]
     CloneFailed { status: String, stderr: String },
+    #[error("failed to encode repository identity: {0}")]
+    Encode(#[from] serde_json::Error),
     #[error("failed to run git: {0}")]
     GitIo(#[from] std::io::Error),
 }
@@ -1126,6 +1907,149 @@ bcode_plugin_sdk::export_plugin!(GitPlugin, include_str!("../bcode-plugin.toml")
 mod tests {
     use super::*;
 
+    fn init_repository() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("repo");
+        for args in [
+            &["init"][..],
+            &["config", "user.email", "bcode@example.invalid"][..],
+            &["config", "user.name", "Bcode Test"][..],
+        ] {
+            run_git(
+                Command::new("git").current_dir(directory.path()).args(args),
+                "initialize repository",
+            )
+            .expect("initialize repository");
+        }
+        fs::write(directory.path().join("tracked.txt"), "before\n").expect("tracked");
+        run_git(
+            Command::new("git")
+                .current_dir(directory.path())
+                .args(["add", "tracked.txt"]),
+            "stage initial",
+        )
+        .expect("stage initial");
+        run_git(
+            Command::new("git")
+                .current_dir(directory.path())
+                .args(["commit", "-m", "initial"]),
+            "commit initial",
+        )
+        .expect("commit initial");
+        directory
+    }
+
+    fn snapshot_request() -> RepositorySnapshotRequest {
+        RepositorySnapshotRequest {
+            version: REPOSITORY_SNAPSHOT_VERSION,
+            include_prefixes: Vec::new(),
+            exclude_prefixes: Vec::new(),
+            progress_document_path: Some(PathBuf::from("local-progress.md")),
+            max_paths: 100,
+            project_instruction_fingerprint_sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn repository_snapshot_is_ordered_exact_and_excludes_progress_document() {
+        let directory = init_repository();
+        fs::write(directory.path().join("tracked.txt"), "worktree\n").expect("worktree");
+        run_git(
+            Command::new("git")
+                .current_dir(directory.path())
+                .args(["add", "tracked.txt"]),
+            "stage tracked",
+        )
+        .expect("stage tracked");
+        fs::write(directory.path().join("tracked.txt"), "partial\n").expect("partial");
+        fs::write(directory.path().join("untracked.txt"), "new\n").expect("untracked");
+        fs::write(directory.path().join("local-progress.md"), "local\n").expect("progress");
+
+        let first = repository_snapshot(directory.path(), &snapshot_request()).expect("snapshot");
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("tracked.txt"), Path::new("untracked.txt")]
+        );
+        assert_eq!(first.entries[0].index_status, 'M');
+        assert_eq!(first.entries[0].worktree_status, 'M');
+        assert_eq!(first.entries[1].index_status, '?');
+        assert_eq!(first.aggregate_sha256.len(), 64);
+        assert!(
+            first
+                .exclude_prefixes
+                .contains(&PathBuf::from("local-progress.md"))
+        );
+        let second = repository_snapshot(directory.path(), &snapshot_request()).expect("snapshot");
+        assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_snapshot_captures_rename_deletion_and_symlink_identity() {
+        use std::os::unix::fs::symlink;
+        let directory = init_repository();
+        run_git(
+            Command::new("git").current_dir(directory.path()).args([
+                "mv",
+                "tracked.txt",
+                "renamed.txt",
+            ]),
+            "rename",
+        )
+        .expect("rename");
+        symlink("renamed.txt", directory.path().join("linked.txt")).expect("symlink");
+        let snapshot =
+            repository_snapshot(directory.path(), &snapshot_request()).expect("snapshot");
+        assert!(snapshot.entries.iter().any(|entry| {
+            entry.path == Path::new("renamed.txt")
+                && entry.source_path.as_deref() == Some(Path::new("tracked.txt"))
+        }));
+        assert!(snapshot.entries.iter().any(|entry| {
+            entry.path == Path::new("linked.txt")
+                && entry.kind == RepositoryEntryKind::Symlink
+                && entry.symlink_target_sha256.is_some()
+        }));
+    }
+
+    #[test]
+    fn verification_receipt_requires_unchanged_complete_evidence() {
+        let directory = init_repository();
+        fs::write(directory.path().join("tracked.txt"), "changed\n").expect("change");
+        let snapshot =
+            repository_snapshot(directory.path(), &snapshot_request()).expect("snapshot");
+        let request = VerificationReceiptRequest {
+            version: VERIFICATION_RECEIPT_VERSION,
+            stage: VerificationStage::PostFormat,
+            plan_sha256: "b".repeat(64),
+            instruction_fingerprint_sha256: "a".repeat(64),
+            pre_snapshot: snapshot.clone(),
+            post_snapshot: snapshot,
+            commands_passed: true,
+            required_artifacts_complete: true,
+        };
+        let receipt = build_verification_receipt(&request).expect("receipt");
+        assert!(receipt.verified);
+        assert_eq!(receipt.stage, VerificationStage::PostFormat);
+        let mut changed = request.clone();
+        changed.post_snapshot.aggregate_sha256 = "c".repeat(64);
+        assert!(build_verification_receipt(&changed).is_err());
+
+        let mut instruction_drift = request.clone();
+        instruction_drift.instruction_fingerprint_sha256 = "d".repeat(64);
+        assert!(build_verification_receipt(&instruction_drift).is_err());
+
+        let mut failed_command = request.clone();
+        failed_command.commands_passed = false;
+        assert!(build_verification_receipt(&failed_command).is_err());
+
+        let mut missing_artifact = request;
+        missing_artifact.required_artifacts_complete = false;
+        assert!(build_verification_receipt(&missing_artifact).is_err());
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn typed_commit_enforces_snapshot_paths_and_returns_commit_hash() {
@@ -1181,12 +2105,21 @@ mod tests {
         std::fs::write(directory.path().join("tracked.txt"), "after\n").expect("change");
         std::fs::write(directory.path().join("other.txt"), "not committed\n").expect("other");
 
-        let response = commit_repository(&CommitRequest {
-            repo_path: directory.path().to_path_buf(),
-            expected_head: head.clone(),
-            message: "bounded change".to_string(),
-            paths: vec![PathBuf::from("tracked.txt")],
-        })
+        let snapshot =
+            repository_snapshot(directory.path(), &snapshot_request()).expect("snapshot");
+        let response = commit_repository(&checkpoint_request(
+            &RepositorySnapshot {
+                entries: snapshot
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.path == Path::new("tracked.txt"))
+                    .cloned()
+                    .collect(),
+                ..snapshot.clone()
+            },
+            "bounded change",
+            "",
+        ))
         .expect("commit");
         assert_eq!(response.previous_head, head);
         assert_ne!(response.commit_hash, response.previous_head);
@@ -1224,7 +2157,11 @@ mod tests {
             commit_repository(&CommitRequest {
                 repo_path: directory.path().to_path_buf(),
                 expected_head: before_rejected_commit.clone(),
-                message: "reject unrelated staged path".to_string(),
+                expected_repository_identity_sha256: snapshot.repository_identity_sha256.clone(),
+                expected_snapshot_sha256: snapshot.aggregate_sha256.clone(),
+                manifest: verified_checkpoint_manifest(&snapshot),
+                title: "reject unrelated staged path".to_string(),
+                description: String::new(),
                 paths: vec![PathBuf::from("tracked.txt")],
             })
             .is_err()
@@ -1238,7 +2175,11 @@ mod tests {
             commit_repository(&CommitRequest {
                 repo_path: directory.path().to_path_buf(),
                 expected_head: response.previous_head,
-                message: "stale".to_string(),
+                expected_repository_identity_sha256: snapshot.repository_identity_sha256.clone(),
+                expected_snapshot_sha256: snapshot.aggregate_sha256.clone(),
+                manifest: verified_checkpoint_manifest(&snapshot),
+                title: "stale".to_string(),
+                description: String::new(),
                 paths: vec![PathBuf::from("other.txt")],
             })
             .is_err()
@@ -1247,7 +2188,11 @@ mod tests {
             commit_repository(&CommitRequest {
                 repo_path: directory.path().to_path_buf(),
                 expected_head: response.commit_hash.clone(),
-                message: "empty".to_string(),
+                expected_repository_identity_sha256: snapshot.repository_identity_sha256.clone(),
+                expected_snapshot_sha256: snapshot.aggregate_sha256.clone(),
+                manifest: verified_checkpoint_manifest(&snapshot),
+                title: "empty".to_string(),
+                description: String::new(),
                 paths: Vec::new(),
             })
             .is_err()
@@ -1256,7 +2201,11 @@ mod tests {
             commit_repository(&CommitRequest {
                 repo_path: directory.path().to_path_buf(),
                 expected_head: response.commit_hash,
-                message: "escape".to_string(),
+                expected_repository_identity_sha256: snapshot.repository_identity_sha256.clone(),
+                expected_snapshot_sha256: snapshot.aggregate_sha256.clone(),
+                manifest: verified_checkpoint_manifest(&snapshot),
+                title: "escape".to_string(),
+                description: String::new(),
                 paths: vec![PathBuf::from("../outside")],
             })
             .is_err()
@@ -1313,14 +2262,10 @@ mod tests {
             "hooks path",
         )
         .expect("hooks path");
+        let hook_snapshot =
+            repository_snapshot(directory.path(), &snapshot_request()).expect("snapshot");
         assert!(
-            commit_repository(&CommitRequest {
-                repo_path: directory.path().to_path_buf(),
-                expected_head: head.clone(),
-                message: "blocked by hook".to_string(),
-                paths: vec![PathBuf::from("tracked.txt")],
-            })
-            .is_err()
+            commit_repository(&checkpoint_request(&hook_snapshot, "blocked by hook", "")).is_err()
         );
         assert_eq!(
             git_stdout(directory.path(), ["rev-parse", "HEAD"]).expect("head after failure"),
@@ -1330,9 +2275,34 @@ mod tests {
 
     #[test]
     fn compose_commit_preserves_prepared_head_paths_and_no_changes_policy() {
+        let dummy_entry = RepositorySnapshotEntry {
+            path: PathBuf::from("src/lib.rs"),
+            index_status: ' ',
+            worktree_status: 'M',
+            kind: RepositoryEntryKind::File,
+            base_mode: "100644".to_string(),
+            index_mode: "100644".to_string(),
+            worktree_mode: "100644".to_string(),
+            base_object_id: None,
+            index_object_id: None,
+            worktree_sha256: Some("a".repeat(64)),
+            worktree_object_id: Some("a".repeat(40)),
+            source_path: None,
+            symlink_target_sha256: None,
+            submodule_state: None,
+        };
         let preparation = PrepareResponse {
             repository_root: PathBuf::from("/repo"),
-            head: "abc123".to_string(),
+            head: "a".repeat(40),
+            repository_identity_sha256: "b".repeat(64),
+            repository_snapshot_sha256: "c".repeat(64),
+            manifest: VerifiedCheckpointManifest {
+                version: 1,
+                repository_identity_sha256: "b".repeat(64),
+                repository_snapshot_sha256: "c".repeat(64),
+                head_object_id: "a".repeat(40),
+                entries: vec![dummy_entry],
+            },
             changed_paths: vec![PreparedChangedPath {
                 path: PathBuf::from("src/lib.rs"),
                 status: " M".to_string(),
@@ -1351,16 +2321,25 @@ mod tests {
             panic!("expected ready commit");
         };
         assert_eq!(request.repo_path, PathBuf::from("/repo"));
-        assert_eq!(request.expected_head, "abc123");
+        assert_eq!(request.expected_head, "a".repeat(40));
         assert_eq!(request.paths, [PathBuf::from("src/lib.rs")]);
         assert_eq!(
-            request.message,
+            normalize_commit_message(&request.title, &request.description).expect("message"),
             "Implement workflow\n\nPreserve exact preparation facts."
         );
 
         let empty = PrepareResponse {
             repository_root: PathBuf::from("/repo"),
-            head: "abc123".to_string(),
+            head: "a".repeat(40),
+            repository_identity_sha256: "b".repeat(64),
+            repository_snapshot_sha256: "c".repeat(64),
+            manifest: VerifiedCheckpointManifest {
+                version: 1,
+                repository_identity_sha256: "b".repeat(64),
+                repository_snapshot_sha256: "c".repeat(64),
+                head_object_id: "a".repeat(40),
+                entries: Vec::new(),
+            },
             changed_paths: Vec::new(),
         };
         assert_eq!(
@@ -1436,6 +2415,8 @@ mod tests {
             &PrepareRequest {
                 include_prefixes: vec![PathBuf::from("src")],
                 exclude_prefixes: Vec::new(),
+                progress_document_path: None,
+                project_instruction_fingerprint_sha256: zero_sha256(),
                 max_paths: 10,
             },
         )
@@ -1453,6 +2434,8 @@ mod tests {
                 &PrepareRequest {
                     include_prefixes: Vec::new(),
                     exclude_prefixes: Vec::new(),
+                    progress_document_path: None,
+                    project_instruction_fingerprint_sha256: zero_sha256(),
                     max_paths: 1,
                 },
             )
@@ -1464,7 +2447,31 @@ mod tests {
     fn commit_manifest_declares_mutating_repair_and_write_resources() {
         let manifest: bcode_plugin::PluginManifest =
             toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
-        let prepare = &manifest.services[1].workflow_blocks[0];
+        let snapshot = &manifest.services[1].workflow_blocks[0];
+        assert_eq!(snapshot.block_id, "git.repository-snapshot");
+        assert_eq!(
+            snapshot.effect,
+            bcode_workflow::WorkflowBlockEffect::ReadOnly
+        );
+        assert_eq!(
+            snapshot.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay
+        );
+        assert_eq!(
+            snapshot.resources,
+            [bcode_workflow::ResourceClaim::read("repository")]
+        );
+        let receipt = &manifest.services[1].workflow_blocks[1];
+        assert_eq!(receipt.block_id, "git.verification-receipt");
+        assert_eq!(
+            receipt.effect,
+            bcode_workflow::WorkflowBlockEffect::ReadOnly
+        );
+        assert_eq!(
+            receipt.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay
+        );
+        let prepare = &manifest.services[1].workflow_blocks[2];
         assert_eq!(prepare.block_id, "git.prepare");
         assert_eq!(
             prepare.effect,
@@ -1479,7 +2486,7 @@ mod tests {
             prepare.resources,
             [bcode_workflow::ResourceClaim::read("repository")]
         );
-        let compose = &manifest.services[1].workflow_blocks[1];
+        let compose = &manifest.services[1].workflow_blocks[3];
         assert_eq!(compose.block_id, "git.compose-commit");
         assert_eq!(
             compose.effect,
@@ -1490,14 +2497,14 @@ mod tests {
             bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay
         );
         assert!(!compose.authorization.explicit_grant_required);
-        let status = &manifest.services[1].workflow_blocks[2];
+        let status = &manifest.services[1].workflow_blocks[4];
         assert_eq!(status.block_id, "git.commit-status");
         assert_eq!(status.effect, bcode_workflow::WorkflowBlockEffect::ReadOnly);
         assert_eq!(
             status.reconciliation,
             bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay
         );
-        let block = &manifest.services[1].workflow_blocks[3];
+        let block = &manifest.services[1].workflow_blocks[5];
         assert_eq!(block.block_id, "git.commit");
         assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::Mutating);
         assert_eq!(

@@ -446,6 +446,41 @@ fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<S
     append_named_rows(
         &mut lines,
         options,
+        "descendant_runs",
+        "Composed workflow levels",
+        |value| {
+            let link = value.get("link").unwrap_or(&serde_json::Value::Null);
+            let run = value.get("run").unwrap_or(&serde_json::Value::Null);
+            format!(
+                "  depth {} · {} · {} · parent={} · {} v{}",
+                number(link, "depth"),
+                text(run, "run_id"),
+                text(run, "status"),
+                text(link, "parent_run_id"),
+                text(run, "definition_id"),
+                number(run, "definition_version")
+            )
+        },
+    );
+    append_named_rows(
+        &mut lines,
+        options,
+        "repeat_outcomes",
+        "Runtime-owned counters",
+        |value| {
+            format!(
+                "  {} · {}/{} · effective={} · {}",
+                text(value, "node_id"),
+                number(value, "iterations_completed"),
+                number(value, "max_iterations"),
+                number(value, "effective_iteration_bound"),
+                text(value, "outcome")
+            )
+        },
+    );
+    append_named_rows(
+        &mut lines,
+        options,
         "child_sessions",
         "Child sessions",
         |value| format!("  {} · {}", text(value, "id"), text(value, "name")),
@@ -735,6 +770,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn status_lines_render_daemon_backed_sections() {
         let definition = serde_json::json!({
             "nodes": {
@@ -783,6 +819,15 @@ mod tests {
                 "grants": [{"grant_id": "grant-1", "node_id": "review", "scope": {"capability": "read_only"}}],
                 "resource_leases": [{"node_id": "review", "mode": "read", "resource_key": "repo"}],
                 "outputs": [{"node_id": "review", "schema_id": "review/v1", "artifact_reference": "bcode-artifact://result"}],
+                "descendant_runs": [{
+                    "link": {"depth": 2, "parent_run_id": "run-1"},
+                    "run": {"run_id": "tranche-1", "status": "running", "definition_id": "delivery-tranche", "definition_version": 1}
+                }],
+                "repeat_outcomes": [{
+                    "node_id": "batch_repeat", "iterations_completed": 3,
+                    "max_iterations": 5, "effective_iteration_bound": 5,
+                    "outcome": "condition_cleared"
+                }],
                 "child_sessions": [{"id": "session-1", "name": "reviewer"}],
                 "events": [{"event_seq": 3, "event_type": "attempt_succeeded"}],
             }),
@@ -812,6 +857,10 @@ mod tests {
         assert!(rendered.contains("ambiguous accepted execution requires explicit repair"));
         assert!(rendered.contains("Git HEAD diagnostics (1)"));
         assert!(rendered.contains("expected aaaaaaaaaaaa · actual bbbbbbbbbbbb · diverged"));
+        assert!(rendered.contains("Composed workflow levels (1)"));
+        assert!(rendered.contains("depth 2 · tranche-1 · running · parent=run-1"));
+        assert!(rendered.contains("Runtime-owned counters (1)"));
+        assert!(rendered.contains("batch_repeat · 3/5 · effective=5 · condition_cleared"));
         assert!(rendered.contains("explicit repair is required"));
         assert!(rendered.contains("Attempts (1)"));
         assert!(rendered.contains("Grants (1)"));

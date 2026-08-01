@@ -383,6 +383,8 @@ pub enum Request {
     CancelWorkflowComputation {
         operation_id: String,
     },
+    /// Apply one atomic semantic edit batch to an exact draft generation.
+    ApplyWorkflowDraftEdits(ApplyWorkflowDraftEditsRequest),
     /// Replace one exact draft generation.
     UpdateWorkflowDraft(UpdateWorkflowDraftRequest),
     /// Publish one exact draft generation, optionally activating it atomically.
@@ -497,6 +499,8 @@ pub enum Request {
         template_id: String,
         template_version: u32,
     },
+    /// Instantiate one external standard authoring-document template as a mutable draft.
+    InstantiateWorkflowTemplate(WorkflowTemplateInstantiationRequest),
     /// Register and start one exact loaded template with validated configuration.
     StartWorkflowTemplate(WorkflowTemplateStartRequest),
     /// Register one immutable, structurally validated workflow definition.
@@ -1463,9 +1467,25 @@ pub struct WorkflowTemplateDiagnostic {
 pub struct WorkflowTemplateDescription {
     pub owner_plugin_id: String,
     pub template: bcode_plugin::WorkflowTemplateContribution,
+    /// Normalized standard authoring document when the template uses the maintainable source form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoring_document: Option<bcode_workflow::WorkflowAuthoringDocument>,
     pub identity: bcode_workflow::WorkflowDefinitionIdentity,
     #[serde(default)]
     pub diagnostics: Vec<WorkflowTemplateDiagnostic>,
+}
+
+/// Typed request to instantiate a maintainable template as normal mutable authored state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowTemplateInstantiationRequest {
+    pub owner_plugin_id: String,
+    pub template_id: String,
+    pub template_version: u32,
+    /// New stable logical authored-workflow identity.
+    pub workflow_id: String,
+    /// New mutable draft identity.
+    pub draft_id: String,
 }
 
 /// Typed request to start one exact plugin-owned template.
@@ -1688,6 +1708,27 @@ pub struct WorkflowAuthoringConflict {
 pub enum WorkflowDraftUpdateResult {
     Updated(Box<WorkflowDraftSnapshot>),
     Conflict(WorkflowAuthoringConflict),
+}
+
+/// Typed result of an optimistic semantic draft edit batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowDraftEditResult {
+    Updated(Box<WorkflowDraftSnapshot>),
+    Conflict(WorkflowAuthoringConflict),
+    Rejected {
+        diagnostics: Vec<bcode_workflow::WorkflowValidationDiagnostic>,
+    },
+}
+
+/// One generation-checked semantic draft edit request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyWorkflowDraftEditsRequest {
+    pub workflow_id: String,
+    pub draft_id: String,
+    pub batch: bcode_workflow::WorkflowAuthoringEditBatch,
+    pub producer: bcode_workflow::WorkflowProducerProvenance,
 }
 
 /// One typed authored-workflow creation request.
@@ -2029,7 +2070,10 @@ pub struct WorkflowRunInspection {
     /// Bounded direct child-run links.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub child_run_links: Vec<bcode_workflow_store::WorkflowRunLink>,
-    /// Typed repeat outcomes projected by a bounded normalized query.
+    /// Bounded descendants across the complete composed run hierarchy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub descendant_runs: Vec<bcode_workflow_store::WorkflowDescendantRunSummary>,
+    /// Typed repeat outcomes for the root and bounded descendants, projected by normalized queries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repeat_outcomes: Vec<bcode_workflow_store::WorkflowRepeatOutcomeSummary>,
     pub child_sessions: Vec<SessionSummary>,
@@ -2276,6 +2320,9 @@ pub enum ResponsePayload {
     },
     WorkflowComputationCancellationRequested {
         cancelled: bool,
+    },
+    WorkflowDraftEditResult {
+        result: WorkflowDraftEditResult,
     },
     WorkflowDraftUpdateResult {
         result: WorkflowDraftUpdateResult,
@@ -3607,6 +3654,18 @@ mod tests {
             Request::CreateAuthoredWorkflow(CreateAuthoredWorkflowRequest {
                 document: authoring_document.clone(),
                 draft_id: "draft-1".to_string(),
+            }),
+            Request::ApplyWorkflowDraftEdits(ApplyWorkflowDraftEditsRequest {
+                workflow_id: authoring_document.workflow_id.clone(),
+                draft_id: "draft-1".to_string(),
+                batch: bcode_workflow::WorkflowAuthoringEditBatch {
+                    version: bcode_workflow::WORKFLOW_AUTHORING_EDIT_VERSION,
+                    expected_generation: 1,
+                    edits: vec![bcode_workflow::WorkflowAuthoringEdit::UpdateMetadata {
+                        metadata: authoring_document.metadata.clone(),
+                    }],
+                },
+                producer: authoring_document.producer.clone(),
             }),
             Request::UpdateWorkflowDraft(UpdateWorkflowDraftRequest {
                 workflow_id: authoring_document.workflow_id.clone(),

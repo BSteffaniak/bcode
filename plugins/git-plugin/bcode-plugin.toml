@@ -15,6 +15,93 @@ interface_id = "bcode.workflow-block/v1"
 name         = "Git Workflow Blocks"
 
 [[services.workflow_blocks]]
+block_id               = "git.repository-snapshot"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "git.repository-snapshot"
+plugin_id              = "bcode.git"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 30000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "max_paths",
+    "project_instruction_fingerprint_sha256",
+], properties = { version = { const = 1 }, include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, progress_document_path = { type = [
+    "string",
+    "null",
+], maxLength = 4096 }, max_paths = { type = "integer", minimum = 1, maximum = 10000 }, project_instruction_fingerprint_sha256 = { type = "string", pattern = "^[0-9a-fA-F]{64}$" } } }
+type_name = "bcode.git.repository-snapshot-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "repository_root",
+    "repository_identity_sha256",
+    "head_object_id",
+    "include_prefixes",
+    "exclude_prefixes",
+    "entries",
+    "project_instruction_fingerprint_sha256",
+    "aggregate_sha256",
+], properties = { version = { const = 1 }, repository_root = { type = "string" }, repository_identity_sha256 = { type = "string" }, head_object_id = { type = "string" }, include_prefixes = { type = "array", items = { type = "string" } }, exclude_prefixes = { type = "array", items = { type = "string" } }, entries = { type = "array", maxItems = 10000, items = { type = "object" } }, project_instruction_fingerprint_sha256 = { type = "string" }, aggregate_sha256 = { type = "string" } } }
+type_name = "bcode.git.repository-snapshot/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "repository"
+
+[[services.workflow_blocks]]
+block_id               = "git.verification-receipt"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "git.verification-receipt"
+plugin_id              = "bcode.git"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "stage",
+    "plan_sha256",
+    "instruction_fingerprint_sha256",
+    "pre_snapshot",
+    "post_snapshot",
+    "commands_passed",
+    "required_artifacts_complete",
+], properties = { version = { const = 1 }, stage = { type = "string", enum = [
+    "pre_format",
+    "post_format",
+] }, plan_sha256 = { type = "string" }, instruction_fingerprint_sha256 = { type = "string" }, pre_snapshot = { type = "object" }, post_snapshot = { type = "object" }, commands_passed = { type = "boolean" }, required_artifacts_complete = { type = "boolean" } } }
+type_name = "bcode.git.verification-receipt-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "stage",
+    "verified",
+    "plan_sha256",
+    "instruction_fingerprint_sha256",
+    "repository_snapshot_sha256",
+], properties = { version = { const = 1 }, stage = { type = "string", enum = [
+    "pre_format",
+    "post_format",
+] }, verified = { const = true }, plan_sha256 = { type = "string" }, instruction_fingerprint_sha256 = { type = "string" }, repository_snapshot_sha256 = { type = "string" } } }
+type_name = "bcode.git.verification-receipt/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "disabled"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
 block_id               = "git.prepare"
 block_version          = 1
 cancellation_supported = true
@@ -88,9 +175,13 @@ schema = { oneOf = [
     ], properties = { status = { const = "ready" }, request = { type = "object", additionalProperties = false, required = [
         "repo_path",
         "expected_head",
-        "message",
+        "expected_repository_identity_sha256",
+        "expected_snapshot_sha256",
+        "manifest",
+        "title",
+        "description",
         "paths",
-    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
+    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
     { type = "object", additionalProperties = false, required = [
         "status",
     ], properties = { status = { const = "no_changes" } } },
@@ -165,15 +256,18 @@ schema = { type = "object", required = [
     "expected_head",
     "message",
     "paths",
-], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } }
+], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } }
 type_name = "bcode.git.commit-request/v1"
 
 [services.workflow_blocks.output]
 schema = { type = "object", required = [
     "previous_head",
     "commit_hash",
+    "repository_snapshot_sha256",
+    "committed_tree",
     "paths",
-], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, paths = { type = "array", items = { type = "string" } } } }
+    "committed_objects",
+], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, repository_snapshot_sha256 = { type = "string" }, committed_tree = { type = "string" }, paths = { type = "array", items = { type = "string" } }, committed_objects = { type = "array", items = { type = "object" } } } }
 type_name = "bcode.git.commit-result/v1"
 
 [services.workflow_blocks.authorization]

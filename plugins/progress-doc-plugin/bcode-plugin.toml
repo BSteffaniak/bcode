@@ -1,0 +1,204 @@
+id      = "bcode.progress-doc"
+name    = "Bcode Progress Document Plugin"
+version = "0.0.1"
+
+categories = ["workflow", "automation"]
+
+[[services]]
+class        = "service"
+description  = "Confined progress-document workflow blocks"
+interface_id = "bcode.workflow-block/v1"
+name         = "Progress Document Workflow Blocks"
+
+[[services.workflow_blocks]]
+block_id               = "progress-doc.inspect"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "progress-doc.inspect"
+plugin_id              = "bcode.progress-doc"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 30000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "path",
+], properties = { version = { const = 1 }, path = { type = "string", minLength = 1, maxLength = 4096 } } }
+type_name = "bcode.progress-doc.inspect-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "path",
+    "exists",
+    "content_sha256",
+    "byte_length",
+    "checked_task_count",
+    "unchecked_task_count",
+    "total_task_count",
+    "parse_complete",
+    "unresolved_summaries",
+    "truncated",
+], properties = { version = { const = 1 }, path = { type = "string", minLength = 1, maxLength = 4096 }, exists = { type = "boolean" }, content_sha256 = { type = [
+    "string",
+    "null",
+], pattern = "^[0-9a-f]{64}$" }, byte_length = { type = "integer", minimum = 0, maximum = 524288 }, checked_task_count = { type = "integer", minimum = 0, maximum = 4096 }, unchecked_task_count = { type = "integer", minimum = 0, maximum = 4096 }, total_task_count = { type = "integer", minimum = 0, maximum = 4096 }, parse_complete = { type = "boolean" }, unresolved_summaries = { type = "array", maxItems = 128, items = { type = "string", maxLength = 512 } }, truncated = { type = "boolean" } } }
+type_name = "bcode.progress-doc.inspection/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "repository"
+
+[[services.workflow_blocks]]
+block_id               = "progress-doc.create"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "progress-doc.create"
+plugin_id              = "bcode.progress-doc"
+reconciliation         = "repair_required"
+timeout_ms             = 30000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "path",
+    "expected_absent",
+    "desired_content",
+    "desired_sha256",
+    "approval_provenance",
+], properties = { version = { const = 1 }, path = { type = "string", minLength = 1, maxLength = 4096 }, expected_absent = { const = true }, desired_content = { type = "string", maxLength = 524288 }, desired_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, approval_provenance = { type = "string", minLength = 1, maxLength = 4096 } } }
+type_name = "bcode.progress-doc.mutation-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "operation",
+    "path",
+    "previous_sha256",
+    "content_sha256",
+    "byte_length",
+], properties = { version = { const = 1 }, operation = { enum = [
+    "created",
+    "replaced",
+] }, path = { type = "string", minLength = 1, maxLength = 4096 }, previous_sha256 = { type = [
+    "string",
+    "null",
+], pattern = "^[0-9a-f]{64}$" }, content_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, byte_length = { type = "integer", minimum = 0, maximum = 524288 } } }
+type_name = "bcode.progress-doc.mutation-result/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[[services.workflow_blocks.resources]]
+access   = "write"
+resource = "repository"
+
+[[services.workflow_blocks]]
+block_id               = "progress-doc.replace"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "progress-doc.replace"
+plugin_id              = "bcode.progress-doc"
+reconciliation         = "repair_required"
+timeout_ms             = 30000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "path",
+    "expected_sha256",
+    "desired_content",
+    "desired_sha256",
+    "approval_provenance",
+], properties = { version = { const = 1 }, path = { type = "string", minLength = 1, maxLength = 4096 }, expected_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, desired_content = { type = "string", maxLength = 524288 }, desired_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, approval_provenance = { type = "string", minLength = 1, maxLength = 4096 } } }
+type_name = "bcode.progress-doc.mutation-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "operation",
+    "path",
+    "previous_sha256",
+    "content_sha256",
+    "byte_length",
+], properties = { version = { const = 1 }, operation = { enum = [
+    "created",
+    "replaced",
+] }, path = { type = "string", minLength = 1, maxLength = 4096 }, previous_sha256 = { type = [
+    "string",
+    "null",
+], pattern = "^[0-9a-f]{64}$" }, content_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, byte_length = { type = "integer", minimum = 0, maximum = 524288 } } }
+type_name = "bcode.progress-doc.mutation-result/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[[services.workflow_blocks.resources]]
+access   = "write"
+resource = "repository"
+
+[[services.workflow_blocks]]
+block_id               = "progress-doc.reconcile"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "progress-doc.reconcile"
+plugin_id              = "bcode.progress-doc"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 30000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "path",
+    "expected_previous_sha256",
+    "desired_sha256",
+], properties = { version = { const = 1 }, path = { type = "string", minLength = 1, maxLength = 4096 }, expected_previous_sha256 = { type = [
+    "string",
+    "null",
+], pattern = "^[0-9a-f]{64}$" }, desired_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" } } }
+type_name = "bcode.progress-doc.reconcile-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "path",
+    "outcome",
+    "actual_sha256",
+    "byte_length",
+], properties = { version = { const = 1 }, path = { type = "string", minLength = 1, maxLength = 4096 }, outcome = { enum = [
+    "not_applied",
+    "applied",
+    "diverged",
+] }, actual_sha256 = { type = [
+    "string",
+    "null",
+], pattern = "^[0-9a-f]{64}$" }, byte_length = { type = "integer", minimum = 0, maximum = 524288 } } }
+type_name = "bcode.progress-doc.reconciliation/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "repository"
+
+[concurrency]
+max  = 4
+type = "limited"
+
+[runtime]
+abi_version  = 3
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_progress_doc_plugin.dylib"
+type         = "native"

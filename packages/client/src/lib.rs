@@ -2311,6 +2311,24 @@ impl BcodeClient {
         }
     }
 
+    /// Apply one bounded renderer-neutral semantic edit batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the operation boundary.
+    pub async fn apply_workflow_draft_edits(
+        &self,
+        request: bcode_ipc::ApplyWorkflowDraftEditsRequest,
+    ) -> Result<bcode_ipc::WorkflowDraftEditResult, ClientError> {
+        match self
+            .send_request(Request::ApplyWorkflowDraftEdits(request))
+            .await?
+        {
+            ResponsePayload::WorkflowDraftEditResult { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Replace one exact authored-workflow draft generation.
     ///
     /// # Errors
@@ -3020,6 +3038,31 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowTemplateStarted(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Instantiate a maintainable plugin template as a normal mutable authored draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, the template is unavailable, or
+    /// authored-state creation is rejected.
+    pub async fn instantiate_workflow_template(
+        &self,
+        request: bcode_ipc::WorkflowTemplateInstantiationRequest,
+    ) -> Result<
+        (
+            bcode_ipc::AuthoredWorkflowSnapshot,
+            bcode_ipc::WorkflowDraftSnapshot,
+        ),
+        ClientError,
+    > {
+        match self
+            .send_request(Request::InstantiateWorkflowTemplate(request))
+            .await?
+        {
+            ResponsePayload::AuthoredWorkflowCreated { workflow, draft } => Ok((workflow, *draft)),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

@@ -48,6 +48,9 @@ struct WorkflowCli {
     /// Exact pending mutation approval identity for `approve-mutation` or `deny-mutation`.
     #[arg(long)]
     approval: Option<String>,
+    /// Caller-stable run identity for `template-start`.
+    #[arg(long)]
+    run: Option<String>,
     /// Parent session identity required by `run`.
     #[arg(long)]
     session: Option<String>,
@@ -116,6 +119,9 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         }
         if let Some(approval) = cli.approval {
             args.insert("approval_id".to_string(), approval);
+        }
+        if let Some(run) = cli.run {
+            args.insert("run_id".to_string(), run);
         }
         if let Some(session) = cli.session {
             args.insert("session_id".to_string(), session);

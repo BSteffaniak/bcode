@@ -3365,7 +3365,7 @@ async fn run_with_static_bundled_inner(
         "model selection resolved"
     );
     let configured_agent_ids: Vec<String> = config.agent.keys().cloned().collect();
-    let skills = build_skill_registry(&config);
+    let skills = build_skill_registry(&config, &plugins);
     let invariant_selector_model = resolve_invariant_selector_model(&config, &resolved_model);
     let selected_provider_context = bcode_provider_auth::resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
@@ -3902,6 +3902,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
         Request::CreateAuthoredWorkflow(_) => "create_authored_workflow",
         Request::CancelWorkflowComputation { .. } => "cancel_workflow_computation",
+        Request::ApplyWorkflowDraftEdits(_) => "apply_workflow_draft_edits",
         Request::UpdateWorkflowDraft(_) => "update_workflow_draft",
         Request::PublishWorkflowDraft(_) => "publish_workflow_draft",
         Request::PublishAndStartWorkflow(_) => "publish_and_start_workflow",
@@ -3935,6 +3936,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::PreviewWorkflowCompilation { .. } => "preview_workflow_compilation",
         Request::ListWorkflowTemplates { .. } => "list_workflow_templates",
         Request::DescribeWorkflowTemplate { .. } => "describe_workflow_template",
+        Request::InstantiateWorkflowTemplate(_) => "instantiate_workflow_template",
         Request::StartWorkflowTemplate(_) => "start_workflow_template",
         Request::RegisterWorkflowDefinition(_) => "register_workflow_definition",
         Request::StartWorkflow(_) => "start_workflow",
@@ -4520,6 +4522,9 @@ async fn handle_request_inner(
             )
             .await
         }
+        Request::ApplyWorkflowDraftEdits(request) => {
+            handle_apply_workflow_draft_edits(request_id, client_id, state, writer, request).await
+        }
         Request::UpdateWorkflowDraft(request) => {
             handle_update_workflow_draft(request_id, client_id, state, writer, request).await
         }
@@ -4793,6 +4798,10 @@ async fn handle_request_inner(
                 template_version,
             )
             .await
+        }
+        Request::InstantiateWorkflowTemplate(request) => {
+            handle_instantiate_workflow_template(request_id, client_id, state, writer, request)
+                .await
         }
         Request::StartWorkflowTemplate(request) => {
             handle_start_workflow_template(request_id, state, writer, request).await
@@ -13178,6 +13187,104 @@ async fn handle_create_authored_workflow(
     .await
 }
 
+async fn handle_apply_workflow_draft_edits(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::ApplyWorkflowDraftEditsRequest,
+) -> Result<(), ServerError> {
+    request.batch.validate()?;
+    let current = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .workflow_draft(&request.workflow_id, &request.draft_id)?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow draft not found: {}/{}",
+                request.workflow_id, request.draft_id
+            ))
+        })?;
+    let result = if current.generation == request.batch.expected_generation {
+        match bcode_workflow::apply_workflow_authoring_edits(&current.document, &request.batch) {
+            Ok(document) => {
+                state.authorize_local_workflow_application_operation(
+                    client_id,
+                    LocalWorkflowApplicationOperationRequest {
+                        operation: bcode_workflow::WorkflowApplicationOperation::UpdateDraft,
+                        workflow_id: request.workflow_id.clone(),
+                        draft_id: Some(request.draft_id.clone()),
+                        revision: None,
+                        preset_id: None,
+                        producer: Some(request.producer.clone()),
+                        requirements: document.requirements.clone(),
+                        effects: bcode_workflow::WorkflowEffectSummary::default(),
+                        activates: false,
+                        executes: false,
+                    },
+                )?;
+                let update = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .update_workflow_draft(
+                        &request.workflow_id,
+                        &request.draft_id,
+                        request.batch.expected_generation,
+                        &document,
+                        &request.producer,
+                        current_time_ms(),
+                    );
+                match update {
+                    Ok(draft) => bcode_ipc::WorkflowDraftEditResult::Updated(Box::new(
+                        workflow_draft_snapshot(draft),
+                    )),
+                    Err(WorkflowStoreError::AuthoringConflict {
+                        entity_id,
+                        expected,
+                        current,
+                    }) => bcode_ipc::WorkflowDraftEditResult::Conflict(
+                        bcode_ipc::WorkflowAuthoringConflict {
+                            entity_id,
+                            expected_generation: expected,
+                            current_generation: current,
+                        },
+                    ),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(bcode_workflow::WorkflowError::Build { path, message }) => {
+                bcode_ipc::WorkflowDraftEditResult::Rejected {
+                    diagnostics: vec![bcode_workflow::WorkflowValidationDiagnostic {
+                        code: "semantic_edit_rejected".to_string(),
+                        severity: bcode_workflow::WorkflowValidationSeverity::Error,
+                        document_path: path,
+                        message,
+                        remediation: "Revise the addressed semantic edit and retry against the same draft generation."
+                            .to_string(),
+                    }],
+                }
+            }
+            Err(error) => {
+                return Err(ServerError::WorkflowDefinitionUnsupported(error.to_string()));
+            }
+        }
+    } else {
+        bcode_ipc::WorkflowDraftEditResult::Conflict(bcode_ipc::WorkflowAuthoringConflict {
+            entity_id: request.draft_id,
+            expected_generation: request.batch.expected_generation,
+            current_generation: current.generation,
+        })
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowDraftEditResult { result }),
+    )
+    .await
+}
+
 async fn handle_update_workflow_draft(
     request_id: u64,
     client_id: ClientId,
@@ -14935,14 +15042,14 @@ fn compile_workflow_template(
     template: &bcode_plugin::WorkflowTemplateContribution,
     configuration: &serde_json::Value,
 ) -> Result<bcode_workflow::WorkflowDefinition, ServerError> {
-    let mut definition = template.definition.clone();
+    let mut definition = template.definition().clone();
     let uses_configuration_envelope =
-        definition.input.type_name == template.configuration_schema.type_name;
+        definition.input.type_name == template.configuration_schema().type_name;
     if !uses_configuration_envelope {
         return Ok(definition);
     }
-    definition.input = template.configuration_schema.clone();
-    definition.output = template.configuration_schema.clone();
+    definition.input = template.configuration_schema().clone();
+    definition.output = template.configuration_schema().clone();
     for (node_id, node) in &mut definition.nodes {
         if node.kind != bcode_workflow::NodeKind::Agent {
             continue;
@@ -14956,8 +15063,8 @@ fn compile_workflow_template(
                 "workflow template entry agent configuration is invalid: {error}"
             ))
         })?;
-        if original_input.type_name == template.configuration_schema.type_name {
-            node.input = template.configuration_schema.clone();
+        if original_input.type_name == template.configuration_schema().type_name {
+            node.input = template.configuration_schema().clone();
             for edge in definition
                 .edges
                 .iter_mut()
@@ -14966,13 +15073,13 @@ fn compile_workflow_template(
                 if let Some(transform) = &mut edge.transform
                     && transform.output.type_name == original_input.type_name
                 {
-                    transform.output = template.configuration_schema.clone();
+                    transform.output = template.configuration_schema().clone();
                 }
             }
         }
-        if node.output.type_name == template.configuration_schema.type_name {
-            node.output = template.configuration_schema.clone();
-            agent.structured_output.schema = template.configuration_schema.clone();
+        if node.output.type_name == template.configuration_schema().type_name {
+            node.output = template.configuration_schema().clone();
+            agent.structured_output.schema = template.configuration_schema().clone();
         }
         node.configuration = serde_json::to_value(agent).map_err(|error| {
             WorkflowStoreError::InvalidData(format!(
@@ -15128,6 +15235,7 @@ fn workflow_template_description(
             .definition_identity(owner_plugin_id)
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
         template: template.clone(),
+        authoring_document: template.authoring_document().cloned(),
         diagnostics,
     })
 }
@@ -15199,6 +15307,167 @@ async fn handle_describe_workflow_template(
     .await
 }
 
+async fn instantiate_workflow_template(
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    request: bcode_ipc::WorkflowTemplateInstantiationRequest,
+) -> Result<
+    (
+        bcode_workflow_store::AuthoredWorkflow,
+        bcode_workflow_store::WorkflowDraft,
+    ),
+    ServerError,
+> {
+    let template = find_workflow_template(
+        state,
+        &request.owner_plugin_id,
+        &request.template_id,
+        request.template_version,
+    )
+    .ok_or_else(|| {
+        WorkflowStoreError::InvalidData("workflow template not found or disabled".to_string())
+    })?;
+    let description = workflow_template_description(state, &request.owner_plugin_id, template)?;
+    if !description.diagnostics.is_empty() {
+        return Err(ServerError::WorkflowCapabilityUnavailable(
+            description
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let source = template.authoring_document().ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "only standard authoring-document templates can be instantiated as drafts".to_string(),
+        )
+    })?;
+    let mut document = source.clone();
+    document.workflow_id.clone_from(&request.workflow_id);
+    document.definition.name.clone_from(&request.workflow_id);
+    document.producer = bcode_workflow::WorkflowProducerProvenance {
+        kind: bcode_workflow::WorkflowProducerKind::Plugin,
+        producer_id: Some(request.owner_plugin_id.clone()),
+        source_revision: None,
+    };
+    document.validate()?;
+    let catalog = workflow_authoring_catalog_snapshot(state).await?;
+    let preview = document.compilation_preview(&catalog, None);
+    let compiled = preview.compiled.as_ref().ok_or_else(|| {
+        ServerError::WorkflowDefinitionUnsupported(format!(
+            "template instantiation requires a successful compilation preview: {:?}",
+            preview.validation.diagnostics
+        ))
+    })?;
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::CreateWorkflow,
+            workflow_id: request.workflow_id.clone(),
+            draft_id: None,
+            revision: None,
+            preset_id: None,
+            producer: Some(document.producer.clone()),
+            requirements: compiled.requirements.clone(),
+            effects: compiled.effects.clone(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let now = current_time_ms();
+    let workflow = bcode_workflow_store::AuthoredWorkflow {
+        workflow_id: request.workflow_id.clone(),
+        title: document.metadata.title.clone(),
+        description: document.metadata.description.clone(),
+        archived: false,
+        active_revision: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let draft = bcode_workflow_store::WorkflowDraft {
+        workflow_id: request.workflow_id,
+        draft_id: request.draft_id,
+        base_revision: None,
+        generation: 1,
+        checksum_sha256: document.source_digest_sha256()?,
+        producer: document.producer.clone(),
+        document,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .create_authored_workflow_with_initial_draft(&workflow, &draft)?;
+    Ok((workflow, draft))
+}
+
+async fn handle_instantiate_workflow_template(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::WorkflowTemplateInstantiationRequest,
+) -> Result<(), ServerError> {
+    let (workflow, draft) = instantiate_workflow_template(client_id, state, request).await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::AuthoredWorkflowCreated {
+            workflow: authored_workflow_snapshot(workflow),
+            draft: Box::new(workflow_draft_snapshot(draft)),
+        }),
+    )
+    .await
+}
+
+fn persist_exact_template_call_dependencies(
+    state: &ServerState,
+    definition: &bcode_workflow::WorkflowDefinition,
+) -> Result<(), ServerError> {
+    let dependencies = bcode_workflow::workflow_dependency_manifest(definition)?;
+    for dependency in dependencies {
+        let identity = dependency.target.definition_identity();
+        let Some((owner_plugin_id, template)) = state
+            .plugins
+            .registry()
+            .workflow_templates()
+            .into_iter()
+            .find(|(owner, template)| {
+                template
+                    .definition_identity(owner)
+                    .is_ok_and(|candidate| &candidate == identity)
+            })
+        else {
+            continue;
+        };
+        let child_definition = template.definition();
+        let actual = template
+            .definition_identity(owner_plugin_id)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        if &actual != identity {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "template dependency identity mismatch for {}",
+                identity.kind
+            ))
+            .into());
+        }
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist_definition(
+                &actual.definition_id,
+                actual.definition_version,
+                child_definition,
+            )?;
+        persist_exact_template_call_dependencies(state, child_definition)?;
+    }
+    Ok(())
+}
+
 async fn handle_start_workflow_template(
     request_id: u64,
     state: &Arc<ServerState>,
@@ -15226,7 +15495,7 @@ async fn handle_start_workflow_template(
         ));
     }
     let validator =
-        jsonschema::validator_for(&template.configuration_schema.schema).map_err(|error| {
+        jsonschema::validator_for(&template.configuration_schema().schema).map_err(|error| {
             WorkflowStoreError::InvalidData(format!(
                 "invalid template configuration schema: {error}"
             ))
@@ -15239,6 +15508,7 @@ async fn handle_start_workflow_template(
     }
     let binding_kind = description.identity.kind.clone();
     let definition = compile_workflow_template(template, &request.configuration)?;
+    persist_exact_template_call_dependencies(state, &definition)?;
     let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
         description.identity.kind,
         &definition,
@@ -15600,6 +15870,7 @@ async fn workflow_run_inspection(
         resource_leases,
         outputs,
         child_run_links,
+        descendant_runs,
         repeat_outcomes,
     ) = {
         let store = state
@@ -15617,6 +15888,15 @@ async fn workflow_run_inspection(
                     run.definition_id, run.definition_version
                 ))
             })?;
+        let descendant_runs = store.descendant_run_summaries(run_id, limit)?;
+        let mut repeat_outcomes = store.repeat_outcomes(run_id, limit)?;
+        for descendant in &descendant_runs {
+            let remaining = limit.saturating_sub(repeat_outcomes.len());
+            if remaining == 0 {
+                break;
+            }
+            repeat_outcomes.extend(store.repeat_outcomes(&descendant.run.run_id, remaining)?);
+        }
         (
             run,
             definition,
@@ -15630,7 +15910,8 @@ async fn workflow_run_inspection(
             store.resource_leases_for_run(run_id, limit)?,
             store.output_summaries(run_id, limit)?,
             store.child_run_links(run_id, limit)?,
-            store.repeat_outcomes(run_id, limit)?,
+            descendant_runs,
+            repeat_outcomes,
         )
     };
     let child_sessions = state
@@ -15659,6 +15940,7 @@ async fn workflow_run_inspection(
         resource_leases,
         outputs,
         child_run_links,
+        descendant_runs,
         repeat_outcomes,
         child_sessions,
     })
@@ -16129,6 +16411,136 @@ const fn workflow_mutation_approval_decision_label(
     }
 }
 
+const PROGRESS_DOCUMENT_INTERACTION_SCHEMA: &str = "bcode.workflow.progress-document-review";
+const PROGRESS_DOCUMENT_INTERACTION_SCHEMA_VERSION: u32 = 1;
+
+fn progress_document_interaction_action(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .filter(|action| matches!(*action, "apply" | "revise" | "cancel"))
+}
+
+const MAX_PROGRESS_DOCUMENT_INTERACTION_HISTORY_EVENTS: usize = 10_000;
+
+fn progress_document_interaction_request_matches(
+    request: &bcode_session_models::ToolExchangeRequest,
+    interaction_id: &str,
+) -> bool {
+    request.exchange_id == interaction_id
+        && request.producer_id == "bcode.workflow"
+        && request.schema == PROGRESS_DOCUMENT_INTERACTION_SCHEMA
+        && request.schema_version == PROGRESS_DOCUMENT_INTERACTION_SCHEMA_VERSION
+        && request.response_policy == bcode_session_models::ToolExchangeResponsePolicy::Required
+        && request
+            .payload
+            .get("actions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|actions| {
+                actions
+                    == &[
+                        serde_json::json!("apply"),
+                        serde_json::json!("revise"),
+                        serde_json::json!("cancel"),
+                    ]
+            })
+}
+
+fn progress_document_interaction_events_have_apply(
+    events: &[bcode_session_models::SessionEvent],
+    interaction_id: &str,
+) -> bool {
+    let requested = events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            SessionEventKind::ToolExchangeRequested { request }
+                if progress_document_interaction_request_matches(request, interaction_id)
+        )
+    });
+    let applied = events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            SessionEventKind::ToolExchangeResolved { event }
+                if event.exchange_id == interaction_id
+                    && matches!(
+                        &event.resolution,
+                        bcode_session_models::ToolExchangeResolution::Responded { payload }
+                            if progress_document_interaction_action(payload) == Some("apply")
+                    )
+        )
+    });
+    requested && applied
+}
+
+async fn workflow_interaction_provenance_exists(
+    state: &ServerState,
+    session_id: SessionId,
+    interaction_id: &str,
+) -> Result<bool, ServerError> {
+    let mut cursor = None;
+    let mut events = Vec::new();
+    let mut inspected_events = 0_usize;
+    loop {
+        let page = state
+            .sessions
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor,
+                    limit: bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS,
+                    direction: SessionHistoryDirection::Forward,
+                },
+            )
+            .await?;
+        inspected_events = inspected_events.saturating_add(page.events.len());
+        if inspected_events > MAX_PROGRESS_DOCUMENT_INTERACTION_HISTORY_EVENTS {
+            return Err(ServerError::WorkflowDefinitionUnsupported(
+                "progress-document interaction provenance exceeds the bounded history window"
+                    .to_string(),
+            ));
+        }
+        events.extend(page.events);
+        if progress_document_interaction_events_have_apply(&events, interaction_id) {
+            return Ok(true);
+        }
+        if !page.has_more {
+            return Ok(false);
+        }
+        cursor = page.next_cursor;
+    }
+}
+
+fn progress_document_approval_provenance(
+    scope: &bcode_workflow::WorkflowMutationGrantScope,
+) -> Result<Option<String>, ServerError> {
+    if scope.plugin_id != "bcode.progress-doc" {
+        return Ok(None);
+    }
+    let provenance = scope
+        .input_summary
+        .get("approval_provenance")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ServerError::WorkflowDefinitionUnsupported(
+                "progress-document mutation requires exact interaction approval provenance"
+                    .to_string(),
+            )
+        })?;
+    let (kind, identity) = provenance.split_once(':').ok_or_else(|| {
+        ServerError::WorkflowDefinitionUnsupported(
+            "progress-document approval provenance must name an exact durable interaction"
+                .to_string(),
+        )
+    })?;
+    if kind != "interaction" || identity.trim().is_empty() {
+        return Err(ServerError::WorkflowDefinitionUnsupported(
+            "progress-document approval provenance must use interaction:<durable-id>".to_string(),
+        ));
+    }
+    Ok(Some(identity.to_string()))
+}
+
 async fn resolve_workflow_mutation_approval(
     state: &Arc<ServerState>,
     approval_id: &str,
@@ -16146,6 +16558,55 @@ async fn resolve_workflow_mutation_approval(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .mutation_approval_context(approval_id)?;
+    if matches!(
+        decision,
+        bcode_workflow_store::WorkflowMutationApprovalDecision::Approve
+    ) {
+        let (run_id, _) = approval_context.as_ref().ok_or_else(|| {
+            ServerError::WorkflowDefinitionUnsupported(
+                "workflow mutation approval is no longer pending".to_string(),
+            )
+        })?;
+        let approval = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_mutation_approvals(run_id, 1_000)?
+            .into_iter()
+            .find(|approval| approval.approval_id == approval_id)
+            .ok_or_else(|| {
+                ServerError::WorkflowDefinitionUnsupported(
+                    "workflow mutation approval is no longer pending".to_string(),
+                )
+            })?;
+        let parent_session_id = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .run_summary(run_id)?
+            .and_then(|run| run.parent_session_id)
+            .ok_or_else(|| {
+                ServerError::WorkflowDefinitionUnsupported(
+                    "progress-document mutation has no parent interaction session".to_string(),
+                )
+            })?
+            .parse()
+            .map_err(|error| {
+                ServerError::WorkflowDefinitionUnsupported(format!(
+                    "progress-document parent session identity is invalid: {error}"
+                ))
+            })?;
+        let interaction_id = progress_document_approval_provenance(&approval.scope)?;
+        if let Some(interaction_id) = interaction_id
+            && !workflow_interaction_provenance_exists(state, parent_session_id, &interaction_id)
+                .await?
+        {
+            return Err(ServerError::WorkflowDefinitionUnsupported(
+                "progress-document approval provenance is not a durable Apply interaction"
+                    .to_string(),
+            ));
+        }
+    }
     let result = state
         .workflow_store
         .lock()
@@ -26900,6 +27361,13 @@ fn current_unix_millis() -> u64 {
         })
 }
 
+fn sha256_json(value: &serde_json::Value) -> Option<String> {
+    use sha2::Digest as _;
+    serde_json::to_vec(value)
+        .ok()
+        .map(|input| format!("{:x}", sha2::Sha256::digest(input)))
+}
+
 async fn append_tool_invocation_lifecycle_event(
     state: &ServerState,
     session_id: SessionId,
@@ -27779,6 +28247,31 @@ fn authorize_workflow_plugin_block(
             "workflow run not found during block authorization".to_string(),
         )
     })?;
+    let input = activation.input.as_ref().ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "workflow plugin block activation has no approval input".to_string(),
+        )
+    })?;
+    let prepared = bcode_workflow::prepare_workflow_node_dataflow(
+        activation.node.dataflow,
+        &activation.node.input,
+        &block.input,
+        input,
+    )
+    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    let owner_input = prepared.owner_input();
+    let input_json = serde_json::to_vec(owner_input)?;
+    if input_json.len() > bcode_workflow::MAX_WORKFLOW_MUTATION_APPROVAL_INPUT_BYTES {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow mutation approval input summary exceeds {} bytes",
+            bcode_workflow::MAX_WORKFLOW_MUTATION_APPROVAL_INPUT_BYTES
+        )));
+    }
+    let input_checksum_sha256 = sha256_json(owner_input).ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "workflow mutation approval input cannot be encoded".to_string(),
+        )
+    })?;
     let approved = store
         .grants_for_run(&activation.run_id, 1_000)?
         .into_iter()
@@ -27801,6 +28294,8 @@ fn authorize_workflow_plugin_block(
                         && scope.block_id == block.block_id
                         && scope.block_version == block.block_version
                         && scope.operation == block.operation
+                        && scope.input_checksum_sha256 == input_checksum_sha256
+                        && scope.input_summary == *owner_input
                 }) || serde_json::from_value::<bcode_workflow::WorkflowPolicyGrant>(
                     grant.scope,
                 )
@@ -27815,25 +28310,6 @@ fn authorize_workflow_plugin_block(
         });
     drop(store);
     if !approved {
-        let input = activation.input.as_ref().ok_or_else(|| {
-            WorkflowStoreError::InvalidData(
-                "workflow plugin block activation has no approval input".to_string(),
-            )
-        })?;
-        let prepared = bcode_workflow::prepare_workflow_node_dataflow(
-            activation.node.dataflow,
-            &activation.node.input,
-            &block.input,
-            input,
-        )
-        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-        let owner_input = prepared.owner_input();
-        let input_json = serde_json::to_vec(owner_input)?;
-        if input_json.len() > 16_384 {
-            return Err(WorkflowStoreError::InvalidData(
-                "workflow mutation approval input summary exceeds 16384 bytes".to_string(),
-            ));
-        }
         let scope = bcode_workflow::WorkflowMutationGrantScope {
             version: bcode_workflow::WORKFLOW_MUTATION_GRANT_SCOPE_VERSION,
             definition_id: run.definition_id,
@@ -27846,10 +28322,7 @@ fn authorize_workflow_plugin_block(
             block_id: block.block_id.clone(),
             block_version: block.block_version,
             operation: block.operation.clone(),
-            input_checksum_sha256: {
-                use sha2::Digest as _;
-                format!("{:x}", sha2::Sha256::digest(&input_json))
-            },
+            input_checksum_sha256,
             input_summary: owner_input.clone(),
             resource_claims: bcode_workflow::normalize_resource_claims(
                 activation.node.resources.clone(),
@@ -28443,6 +28916,67 @@ fn apply_workflow_skill_model_policy(
     Ok(())
 }
 
+fn workflow_read_only_skill_is_compatible(
+    manifest: &bcode_skill_models::SkillManifest,
+    configuration: &WorkflowAgentConfiguration,
+) -> Result<(), String> {
+    if !configuration.read_only {
+        return Ok(());
+    }
+    let mut references = manifest.permissions.unresolved_tools.clone();
+    references.extend(manifest.permission_policy.tools.iter().cloned());
+    if !manifest.permissions.categories.is_empty()
+        || !manifest.permission_policy.categories.is_empty()
+    {
+        return Err(
+            "read-only workflow skill categories are ambiguous without exact owner operation facts"
+                .to_string(),
+        );
+    }
+    let allowed = configuration
+        .tool_allowlist
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for reference in &references {
+        let bcode_tool::UnresolvedToolReference::Raw { value } = reference else {
+            return Err("read-only workflow skills require exact canonical tool names".to_string());
+        };
+        if !allowed.contains(value.as_str()) {
+            return Err(format!(
+                "read-only workflow skill tool '{value}' is not in the node's exact allowlist"
+            ));
+        }
+    }
+    for tool in &manifest.permissions.tools {
+        if !allowed.contains(tool.as_str()) {
+            return Err(format!(
+                "read-only workflow skill tool '{tool}' is not in the node's exact allowlist"
+            ));
+        }
+    }
+    let mut policy = manifest.permission_policy.clone();
+    policy.tools.extend(references);
+    let available_tools = configuration
+        .tool_allowlist
+        .iter()
+        .map(|name| SkillToolPolicyTarget {
+            name: name.clone(),
+            aliases: Vec::new(),
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
+            permission_category: None,
+        })
+        .collect::<Vec<_>>();
+    let resolved = bcode_skill::resolve_skill_permission_policy(&policy, &available_tools);
+    if !resolved.unknown_references.is_empty() || !resolved.ambiguous_references.is_empty() {
+        return Err(
+            "read-only workflow skill contains unresolved or ambiguous tool references".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn resolve_workflow_agent_skills(
     state: &ServerState,
     configuration: &mut WorkflowAgentConfiguration,
@@ -28486,17 +29020,7 @@ fn resolve_workflow_agent_skills(
                 if summary.disable_model_invocation {
                     return Err("skill disables model invocation".to_string());
                 }
-                if configuration.read_only
-                    && (!manifest.permissions.tools.is_empty()
-                        || !manifest.permissions.categories.is_empty()
-                        || !manifest.permission_policy.tools.is_empty()
-                        || !manifest.permission_policy.categories.is_empty())
-                {
-                    return Err(
-                        "read-only workflow agents cannot attach skills that request tools"
-                            .to_string(),
-                    );
-                }
+                workflow_read_only_skill_is_compatible(&manifest, configuration)?;
                 let bytes_loaded = context.len();
                 if bytes_loaded == 0 {
                     return Err("skill context is empty".to_string());
@@ -30870,11 +31394,47 @@ const fn response_payload_kind(response: &Response) -> &'static str {
     }
 }
 
-fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegistry> {
+fn workflow_plugin_skill_roots(
+    plugins: &bcode_plugin::PluginRuntimeHost,
+) -> Vec<bcode_skill::SkillSourceRoot> {
+    plugins
+        .registry()
+        .manifests()
+        .contains_key("bcode.workflow")
+        .then(|| {
+            let configured = bcode_config::default_config_dir()
+                .join("plugins")
+                .join("bcode.workflow")
+                .join("skills");
+            let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../plugins/workflow-plugin/skills");
+            if configured.is_dir() {
+                configured
+            } else {
+                bundled
+            }
+        })
+        .map(|path| {
+            bcode_skill::SkillSourceRoot::new(
+                path,
+                bcode_skill_models::SkillSourceKind::Plugin,
+                "plugin:bcode.workflow",
+                5,
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+fn build_skill_registry(
+    config: &bcode_config::BcodeConfig,
+    plugins: &bcode_plugin::PluginRuntimeHost,
+) -> Option<SkillRegistry> {
     if !config.skills.enabled {
         return None;
     }
-    let roots = skill_source_roots_from_config(config);
+    let mut roots = skill_source_roots_from_config(config);
+    roots.extend(workflow_plugin_skill_roots(plugins));
     let options = SkillRegistryOptions {
         max_skill_file_bytes: config.skills.max_skill_file_bytes.get(),
         max_context_bytes: config
@@ -32401,11 +32961,58 @@ mod tests {
             .await
             .expect("create");
         assert_eq!(workflow.workflow_id, workflow_id);
+        let edit = client
+            .apply_workflow_draft_edits(bcode_ipc::ApplyWorkflowDraftEditsRequest {
+                workflow_id: workflow_id.clone(),
+                draft_id: draft.identity.draft_id.clone(),
+                batch: bcode_workflow::WorkflowAuthoringEditBatch {
+                    version: bcode_workflow::WORKFLOW_AUTHORING_EDIT_VERSION,
+                    expected_generation: 1,
+                    edits: vec![bcode_workflow::WorkflowAuthoringEdit::UpdateMetadata {
+                        metadata: bcode_workflow::WorkflowAuthoringMetadata {
+                            title: "Edited over IPC".to_string(),
+                            description: document.metadata.description.clone(),
+                            labels: document.metadata.labels.clone(),
+                        },
+                    }],
+                },
+                producer: document.producer.clone(),
+            })
+            .await
+            .expect("semantic edit");
+        let bcode_ipc::WorkflowDraftEditResult::Updated(edited) = edit else {
+            panic!("expected edited draft")
+        };
+        assert_eq!(edited.generation, 2);
+        assert_eq!(edited.document.metadata.title, "Edited over IPC");
+        let conflict = client
+            .apply_workflow_draft_edits(bcode_ipc::ApplyWorkflowDraftEditsRequest {
+                workflow_id: workflow_id.clone(),
+                draft_id: draft.identity.draft_id.clone(),
+                batch: bcode_workflow::WorkflowAuthoringEditBatch {
+                    version: bcode_workflow::WORKFLOW_AUTHORING_EDIT_VERSION,
+                    expected_generation: 1,
+                    edits: vec![bcode_workflow::WorkflowAuthoringEdit::UpdateMetadata {
+                        metadata: document.metadata.clone(),
+                    }],
+                },
+                producer: document.producer.clone(),
+            })
+            .await
+            .expect("semantic conflict");
+        assert!(matches!(
+            conflict,
+            bcode_ipc::WorkflowDraftEditResult::Conflict(bcode_ipc::WorkflowAuthoringConflict {
+                expected_generation: 1,
+                current_generation: 2,
+                ..
+            })
+        ));
         let update = client
             .update_workflow_draft(bcode_ipc::UpdateWorkflowDraftRequest {
                 workflow_id: workflow_id.clone(),
                 draft_id: draft.identity.draft_id,
-                expected_generation: 1,
+                expected_generation: 2,
                 document: document.clone(),
                 producer: document.producer.clone(),
             })
@@ -32473,6 +33080,83 @@ mod tests {
             .await
             .expect("import preview");
         assert!(preview.compilation.is_compiled());
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_semantic_edit_producers_resolve_with_one_typed_conflict() {
+        let sessions = SessionManager::default();
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+            .expect("workflow store");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let creator = bcode_client::BcodeClient::new(endpoint.clone());
+        let document = test_workflow_authoring_document();
+        let workflow_id = document.workflow_id.clone();
+        creator
+            .create_authored_workflow(bcode_ipc::CreateAuthoredWorkflowRequest {
+                document: document.clone(),
+                draft_id: "concurrent-draft".to_string(),
+            })
+            .await
+            .expect("create draft");
+        let request = |producer: &str, title: &str| bcode_ipc::ApplyWorkflowDraftEditsRequest {
+            workflow_id: workflow_id.clone(),
+            draft_id: "concurrent-draft".to_string(),
+            batch: bcode_workflow::WorkflowAuthoringEditBatch {
+                version: bcode_workflow::WORKFLOW_AUTHORING_EDIT_VERSION,
+                expected_generation: 1,
+                edits: vec![bcode_workflow::WorkflowAuthoringEdit::UpdateMetadata {
+                    metadata: bcode_workflow::WorkflowAuthoringMetadata {
+                        title: title.to_string(),
+                        description: None,
+                        labels: BTreeMap::new(),
+                    },
+                }],
+            },
+            producer: bcode_workflow::WorkflowProducerProvenance {
+                kind: bcode_workflow::WorkflowProducerKind::Sdk,
+                producer_id: Some(producer.to_string()),
+                source_revision: None,
+            },
+        };
+        let editor = bcode_client::BcodeClient::new(endpoint.clone());
+        let cli = bcode_client::BcodeClient::new(endpoint);
+        let (editor_result, cli_result) = tokio::join!(
+            editor.apply_workflow_draft_edits(request("editor", "Editor update")),
+            cli.apply_workflow_draft_edits(request("cli", "CLI update"))
+        );
+        let results = [editor_result.expect("editor"), cli_result.expect("cli")];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, bcode_ipc::WorkflowDraftEditResult::Updated(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, bcode_ipc::WorkflowDraftEditResult::Conflict(_)))
+                .count(),
+            1
+        );
         server.abort();
     }
 
@@ -33698,6 +34382,142 @@ mod tests {
         drop(store);
     }
 
+    #[tokio::test]
+    async fn progress_driven_template_persists_exact_transitive_flagship_dependencies() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let sessions = SessionManager::persistent_lazy(session_root.path());
+        let static_plugins = bcode_bundled_plugins::static_bundled_plugins();
+        let selected = BTreeSet::from([
+            "bcode.default-agents".to_string(),
+            "bcode.workflow".to_string(),
+            "bcode.git".to_string(),
+            "bcode.shell".to_string(),
+        ]);
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: selected,
+                disabled: BTreeSet::new(),
+            },
+            &static_plugins,
+        )
+        .expect("flagship plugins");
+        let mut state = test_server_state_with_plugins(sessions, plugins);
+        state.workflow_store = StdMutex::new(
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store"),
+        );
+        let state = Arc::new(state);
+        let parent =
+            find_workflow_template(&state, "bcode.workflow", "progress-driven-delivery", 1)
+                .expect("parent");
+        persist_exact_template_call_dependencies(&state, parent.definition())
+            .expect("transitive dependencies");
+        let tranche = find_workflow_template(&state, "bcode.workflow", "delivery-tranche", 1)
+            .expect("tranche")
+            .definition_identity("bcode.workflow")
+            .expect("tranche identity");
+        let batch = find_workflow_template(&state, "bcode.workflow", "implementation-batch", 1)
+            .expect("batch")
+            .definition_identity("bcode.workflow")
+            .expect("batch identity");
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            store
+                .definition(&tranche.definition_id, tranche.definition_version)
+                .expect("tranche")
+                .is_some()
+        );
+        assert!(
+            store
+                .definition(&batch.definition_id, batch.definition_version)
+                .expect("batch")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn flagship_template_instantiates_and_publishes_as_an_exact_mutable_draft() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let sessions = SessionManager::persistent_lazy(session_root.path());
+        let static_plugins = bcode_bundled_plugins::static_bundled_plugins();
+        let selected = BTreeSet::from([
+            "bcode.default-agents".to_string(),
+            "bcode.workflow".to_string(),
+            "bcode.git".to_string(),
+            "bcode.shell".to_string(),
+        ]);
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: selected,
+                disabled: BTreeSet::new(),
+            },
+            &static_plugins,
+        )
+        .expect("flagship plugins");
+        let mut state = test_server_state_with_plugins(sessions, plugins);
+        state.workflow_store = StdMutex::new(
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store"),
+        );
+        let state = Arc::new(state);
+        let (workflow, draft) = instantiate_workflow_template(
+            ClientId::new(),
+            &state,
+            bcode_ipc::WorkflowTemplateInstantiationRequest {
+                owner_plugin_id: "bcode.workflow".to_string(),
+                template_id: "implementation-batch".to_string(),
+                template_version: 1,
+                workflow_id: "implementation-batch-test".to_string(),
+                draft_id: "draft-1".to_string(),
+            },
+        )
+        .await
+        .expect("instantiate flagship draft");
+        assert_eq!(workflow.workflow_id, "implementation-batch-test");
+        assert_eq!(draft.generation, 1);
+        let publication = publish_workflow_draft(
+            2,
+            ClientId::new(),
+            &state,
+            bcode_ipc::PublishWorkflowDraftRequest {
+                workflow_id: "implementation-batch-test".to_string(),
+                draft_id: "draft-1".to_string(),
+                expected_generation: 1,
+                configuration: None,
+                activate: true,
+                expected_active_revision: None,
+                control: bcode_ipc::WorkflowComputationControl::default(),
+            },
+            bcode_workflow::WorkflowApplicationOperation::PublishDraft,
+        )
+        .await
+        .expect("publish flagship draft");
+        let bcode_ipc::WorkflowPublicationResult::Published {
+            revision,
+            active_revision,
+        } = publication
+        else {
+            panic!("flagship publication conflicted");
+        };
+        assert_eq!(revision.identity.workflow_id, "implementation-batch-test");
+        assert_eq!(active_revision, Some(1));
+        assert!(
+            revision
+                .document
+                .definition
+                .nodes
+                .contains_key("git_commit")
+        );
+        assert_eq!(revision.document.run_limits.cycle_cap, 20);
+    }
+
     #[test]
     fn template_compilation_binds_configuration_envelope_to_agent_contracts() {
         let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -33727,22 +34547,25 @@ mod tests {
                 mode: bcode_workflow::AgentSkillActivationMode::Required,
             }]
         );
-        assert_eq!(definition.input, template.configuration_schema);
-        assert_eq!(definition.output, template.configuration_schema);
+        assert_eq!(definition.input, template.configuration_schema().clone());
+        assert_eq!(definition.output, template.configuration_schema().clone());
         let implementation = &definition.nodes["implementation"];
-        assert_eq!(implementation.input, template.configuration_schema);
+        assert_eq!(
+            implementation.input,
+            template.configuration_schema().clone()
+        );
         let evaluation = &definition.nodes["evaluation"];
-        assert_eq!(evaluation.input, template.configuration_schema);
+        assert_eq!(evaluation.input, template.configuration_schema().clone());
         for node_id in ["implementation", "evaluation"] {
             let node = &definition.nodes[node_id];
-            assert_eq!(node.output, template.configuration_schema);
+            assert_eq!(node.output, template.configuration_schema().clone());
             let agent = serde_json::from_value::<bcode_workflow::WorkflowAgentConfiguration>(
                 node.configuration.clone(),
             )
             .expect("agent contract");
             assert_eq!(
                 agent.structured_output.schema,
-                template.configuration_schema
+                template.configuration_schema().clone()
             );
         }
         assert_ne!(
@@ -43072,6 +43895,140 @@ library = "test"
         );
     }
 
+    #[test]
+    fn progress_document_interaction_actions_are_closed_and_typed() {
+        assert_eq!(
+            progress_document_interaction_action(&serde_json::json!({"action": "apply"})),
+            Some("apply")
+        );
+        assert_eq!(
+            progress_document_interaction_action(&serde_json::json!({"action": "revise"})),
+            Some("revise")
+        );
+        assert_eq!(
+            progress_document_interaction_action(&serde_json::json!({"action": "cancel"})),
+            Some("cancel")
+        );
+        assert_eq!(
+            progress_document_interaction_action(&serde_json::json!({"action": "approve"})),
+            None
+        );
+
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "invocation".to_string(),
+            exchange_id: "interaction-1".to_string(),
+            producer_id: "bcode.workflow".to_string(),
+            schema: PROGRESS_DOCUMENT_INTERACTION_SCHEMA.to_string(),
+            schema_version: PROGRESS_DOCUMENT_INTERACTION_SCHEMA_VERSION,
+            payload: serde_json::json!({"actions": ["apply", "revise", "cancel"]}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        assert!(progress_document_interaction_request_matches(
+            &request,
+            "interaction-1"
+        ));
+        let mut malformed = request;
+        malformed.payload = serde_json::json!({"actions": ["apply", "cancel"]});
+        assert!(!progress_document_interaction_request_matches(
+            &malformed,
+            "interaction-1"
+        ));
+    }
+
+    #[test]
+    fn durable_progress_document_interaction_survives_history_reload() {
+        let session_id = SessionId::new();
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "invocation".to_string(),
+            exchange_id: "interaction-1".to_string(),
+            producer_id: "bcode.workflow".to_string(),
+            schema: PROGRESS_DOCUMENT_INTERACTION_SCHEMA.to_string(),
+            schema_version: PROGRESS_DOCUMENT_INTERACTION_SCHEMA_VERSION,
+            payload: serde_json::json!({"actions": ["apply", "revise", "cancel"]}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let reloaded = vec![
+            event(1, SessionEventKind::ToolExchangeRequested { request }),
+            event(
+                2,
+                SessionEventKind::ToolExchangeResolved {
+                    event: bcode_session_models::ToolExchangeResolutionEvent {
+                        invocation_id: "invocation".to_string(),
+                        exchange_id: "interaction-1".to_string(),
+                        resolution: bcode_session_models::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({"action": "apply"}),
+                        },
+                    },
+                },
+            ),
+        ];
+        assert!(progress_document_interaction_events_have_apply(
+            &reloaded,
+            "interaction-1"
+        ));
+
+        let mut cancelled = reloaded;
+        let SessionEventKind::ToolExchangeResolved { event } = &mut cancelled[1].kind else {
+            panic!("resolution event");
+        };
+        event.resolution = bcode_session_models::ToolExchangeResolution::Responded {
+            payload: serde_json::json!({"action": "cancel"}),
+        };
+        assert!(!progress_document_interaction_events_have_apply(
+            &cancelled,
+            "interaction-1"
+        ));
+    }
+
+    #[test]
+    fn progress_document_approval_requires_exact_interaction_provenance() {
+        let scope = |provenance: Option<&str>| bcode_workflow::WorkflowMutationGrantScope {
+            version: bcode_workflow::WORKFLOW_MUTATION_GRANT_SCOPE_VERSION,
+            definition_id: "definition".to_string(),
+            definition_version: 1,
+            run_id: "run".to_string(),
+            node_id: "node".to_string(),
+            activation_id: "activation".to_string(),
+            workspace_snapshot: "workspace".to_string(),
+            plugin_id: "bcode.progress-doc".to_string(),
+            block_id: "progress-doc.replace".to_string(),
+            block_version: 1,
+            operation: "progress-doc.replace".to_string(),
+            input_checksum_sha256: "0".repeat(64),
+            input_summary: provenance.map_or_else(
+                || serde_json::json!({}),
+                |value| serde_json::json!({"approval_provenance": value}),
+            ),
+            resource_claims: Vec::new(),
+            reconciliation: bcode_workflow::WorkflowBlockReconciliation::RepairRequired,
+            capability: bcode_workflow::WorkflowToolCapability::Mutating,
+        };
+        assert_eq!(
+            progress_document_approval_provenance(&scope(Some("interaction:interaction-1")))
+                .expect("provenance")
+                .as_deref(),
+            Some("interaction-1")
+        );
+        assert!(progress_document_approval_provenance(&scope(None)).is_err());
+        assert!(progress_document_approval_provenance(&scope(Some("interaction:"))).is_err());
+        assert!(progress_document_approval_provenance(&scope(Some("manual:1"))).is_err());
+
+        let mut unrelated = scope(None);
+        unrelated.plugin_id = "bcode.git".to_string();
+        assert_eq!(
+            progress_document_approval_provenance(&unrelated).expect("unrelated"),
+            None
+        );
+    }
+
     fn test_server_state(sessions: SessionManager) -> ServerState {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
@@ -51068,14 +52025,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("reference template");
         assert!(
             template
-                .definition
+                .definition()
                 .edges
                 .iter()
                 .any(|edge| { edge.from == "verification_decision" && edge.to == "commit_policy" })
         );
         assert!(
             !template
-                .definition
+                .definition()
                 .edges
                 .iter()
                 .any(|edge| { edge.from == "verification_decision" && edge.to == "verified" })
@@ -52001,6 +52958,104 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("repeat successor dispatched");
     }
 
+    #[tokio::test]
+    async fn workflow_progress_skills_are_discovered_only_when_workflow_plugin_is_enabled() {
+        let sessions = SessionManager::default();
+        let state = test_server_state(sessions);
+        assert!(workflow_plugin_skill_roots(&state.plugins).is_empty());
+
+        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &[bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
+                bcode_workflow_plugin::static_plugin(),
+            )],
+        )
+        .expect("workflow plugin host");
+        let roots = workflow_plugin_skill_roots(&host);
+        assert_eq!(roots.len(), 1);
+        let registry = SkillRegistry::discover(&roots, SkillRegistryOptions::default())
+            .expect("workflow skill registry");
+        assert!(
+            registry
+                .summary(&SkillId::from_str("local-progress-doc").expect("skill id"))
+                .is_some()
+        );
+        assert!(
+            registry
+                .summary(&SkillId::from_str("refocus-progress-doc").expect("skill id"))
+                .is_some()
+        );
+
+        let disabled = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::All,
+                enabled: BTreeSet::new(),
+                disabled: BTreeSet::from(["bcode.workflow".to_string()]),
+            },
+            &[bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
+                bcode_workflow_plugin::static_plugin(),
+            )],
+        )
+        .expect("disabled workflow plugin host");
+        assert!(workflow_plugin_skill_roots(&disabled).is_empty());
+    }
+
+    #[test]
+    fn workflow_bundled_progress_skills_are_required_read_only_and_exact() {
+        let workflow_manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/workflow-plugin/bcode-plugin.toml"
+        ))
+        .expect("workflow manifest");
+        assert_eq!(workflow_manifest.id, "bcode.workflow");
+        let skill_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/workflow-plugin/skills");
+        let registry = SkillRegistry::discover(
+            &[bcode_skill::SkillSourceRoot::new(
+                skill_root,
+                bcode_skill_models::SkillSourceKind::Plugin,
+                "plugin:bcode.workflow",
+                5,
+            )],
+            SkillRegistryOptions::default(),
+        )
+        .expect("workflow skills");
+        for skill_id in ["local-progress-doc", "refocus-progress-doc"] {
+            let manifest = registry
+                .describe(&SkillId::from_str(skill_id).expect("skill id"))
+                .expect("skill manifest");
+            let configuration = WorkflowAgentConfiguration {
+                version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+                execution_target: bcode_workflow::AgentExecutionTarget::SharedParentSequential,
+                agent_profile: "plan".to_string(),
+                provider: None,
+                model: None,
+                structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                    schema: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
+                    strict: true,
+                },
+                read_only: true,
+                tool_capability: WorkflowToolCapability::ReadOnly,
+                tool_allowlist: vec![
+                    "filesystem.read".to_string(),
+                    "filesystem.find".to_string(),
+                    "filesystem.grep".to_string(),
+                    "question".to_string(),
+                ],
+                timeout_ms: 30_000,
+                skills: vec![bcode_workflow::AgentSkillSelection {
+                    skill_id: skill_id.to_string(),
+                    mode: bcode_workflow::AgentSkillActivationMode::Required,
+                }],
+                prompt_mode: "json_input".to_string(),
+                system_prompt: String::new(),
+            };
+            workflow_read_only_skill_is_compatible(&manifest, &configuration)
+                .expect("read-only skill compatibility");
+        }
+    }
+
     #[test]
     fn workflow_agent_skill_resolution_is_exact_bounded_and_read_only_safe() {
         let sessions = SessionManager::default();
@@ -52037,6 +53092,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             skill_id: "audit-invariants".to_string(),
             mode: bcode_workflow::AgentSkillActivationMode::Required,
         };
+        let unavailable_state = test_server_state(SessionManager::default());
+        let mut unavailable_configuration = configuration(vec![required.clone()], false);
+        assert!(
+            resolve_workflow_agent_skills(&unavailable_state, &mut unavailable_configuration)
+                .is_err(),
+            "required skills fail closed when the registry is unavailable"
+        );
         let mut required_configuration = configuration(vec![required.clone()], false);
         let resolved = resolve_workflow_agent_skills(&state, &mut required_configuration)
             .expect("required skill")
@@ -52061,9 +53123,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(preferred_resolution.contexts.is_empty());
         assert_eq!(preferred_resolution.diagnostics.len(), 1);
         let mut read_only_configuration = configuration(vec![required], true);
+        read_only_configuration.tool_allowlist = vec![
+            "filesystem.read".to_string(),
+            "filesystem.find".to_string(),
+            "filesystem.grep".to_string(),
+            "question".to_string(),
+        ];
         assert!(
             resolve_workflow_agent_skills(&state, &mut read_only_configuration).is_err(),
-            "read-only agent must reject a skill that declares tool access"
+            "compatibility aliases remain ambiguous without canonical exact tool declarations"
         );
     }
 

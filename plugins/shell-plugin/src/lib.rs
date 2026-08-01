@@ -35,11 +35,15 @@ use contracts::{
     DEFAULT_SHELL_TIMEOUT_MS, SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_CONTENT_TYPE,
     SHELL_RECORDING_REF_KEY, SHELL_RUN_SCHEMA, SHELL_RUN_TOOL_NAME, SHELL_SCHEMA_VERSION,
     ShellInvocationAction, ShellLiveRecordingPayload, ShellRunArguments, ShellRunResult,
+    TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
+};
+pub use contracts::{
     ShellWorkflowCommandPlan, ShellWorkflowCommandPlanResult, ShellWorkflowCommandResult,
-    ShellWorkflowCommandStatus, TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
+    ShellWorkflowCommandStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -332,6 +336,12 @@ const SHELL_WORKFLOW_ARTIFACT_CONTENT_TYPE: &str = "application/octet-stream";
 const SHELL_WORKFLOW_STDOUT_SCHEMA: &str = "bcode.shell.command-plan.stdout";
 const SHELL_WORKFLOW_STDERR_SCHEMA: &str = "bcode.shell.command-plan.stderr";
 
+fn canonical_command_plan_sha256(plan: &ShellWorkflowCommandPlan) -> Result<String, String> {
+    let normalized = serde_json::to_vec(plan)
+        .map_err(|error| format!("failed to encode canonical shell command plan: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(normalized)))
+}
+
 fn execute_workflow_command_plan(
     context: &NativeServiceContext,
     invocation: &bcode_workflow::WorkflowBlockInvocation,
@@ -403,6 +413,7 @@ fn execute_workflow_command_plan(
             });
     Ok(ShellWorkflowCommandPlanResult {
         version: plan.version,
+        plan_sha256: canonical_command_plan_sha256(plan)?,
         passed,
         commands,
         artifacts,
@@ -2593,6 +2604,30 @@ mod tests {
     }
 
     #[test]
+    fn workflow_command_plan_digest_is_stable_and_changes_with_exact_plan() {
+        let plan = workflow_command_plan(
+            std::env::temp_dir().as_path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec!["true".to_string()],
+                timeout_ms: 1_000,
+                continue_on_nonzero: false,
+                accepted_exit_codes: Some(vec![0]),
+                continue_on_unaccepted_exit: false,
+            }],
+        )
+        .1;
+        let first = canonical_command_plan_sha256(&plan).expect("digest");
+        assert_eq!(first, canonical_command_plan_sha256(&plan).expect("digest"));
+        assert_eq!(first.len(), 64);
+        let mut changed = plan;
+        changed.commands[0].timeout_ms = 2_000;
+        assert_ne!(
+            first,
+            canonical_command_plan_sha256(&changed).expect("changed digest")
+        );
+    }
+
+    #[test]
     fn nonzero_shell_result_is_branchable_without_provider_dispatch() {
         let predicate = bcode_workflow::PredicateExpression::Equals {
             version: bcode_workflow::WORKFLOW_PREDICATE_VERSION,
@@ -2601,6 +2636,7 @@ mod tests {
         };
         let result = ShellWorkflowCommandPlanResult {
             version: contracts::SHELL_COMMAND_PLAN_VERSION,
+            plan_sha256: "a".repeat(64),
             passed: false,
             commands: vec![ShellWorkflowCommandResult {
                 index: 0,

@@ -16,6 +16,318 @@ description  = "Active workflow status for a session"
 interface_id = "bcode.session-status/v1"
 name         = "Workflow Session Status"
 
+[[services]]
+class        = "service"
+description  = "Workflow-owned deterministic planning and drift blocks"
+interface_id = "bcode.workflow-block/v1"
+name         = "Workflow Planning Blocks"
+
+[[services.workflow_blocks]]
+block_id               = "workflow.instruction-drift"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.instruction-drift"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "accepted_instruction_fingerprint_sha256",
+    "current_instruction_fingerprint_sha256",
+    "accepted_validation_plan_sha256",
+    "proposed_validation_plan_sha256",
+    "accepted_formatting_plan_sha256",
+    "proposed_formatting_plan_sha256",
+    "reviewed",
+], properties = { version = { const = 1 }, accepted_instruction_fingerprint_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, current_instruction_fingerprint_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, accepted_validation_plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, proposed_validation_plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, accepted_formatting_plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, proposed_formatting_plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, reviewed = { type = "boolean" } } }
+type_name = "bcode.workflow.instruction-drift-review/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "status",
+    "version",
+], properties = { status = { type = "string", enum = [
+    "unchanged",
+    "blocked",
+    "reviewed_replacement",
+] }, version = { const = 1 } } }
+type_name = "bcode.workflow.instruction-drift-receipt/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "disabled"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "workflow.batch-outcome"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.batch-outcome"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "state",
+], properties = { version = { const = 1 }, state = { type = "object" } } }
+type_name = "bcode.workflow.batch-outcome-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "outcome",
+    "state",
+], properties = { version = { const = 1 }, outcome = { enum = [
+    "completed",
+    "exhausted",
+] }, state = { type = "object" } } }
+type_name = "bcode.workflow.implementation-batch-result/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "workflow.snapshot-input"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.snapshot-input"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.coding-workflow-state/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "max_paths",
+    "project_instruction_fingerprint_sha256",
+], properties = { version = { const = 1 }, include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, progress_document_path = { type = [
+    "string",
+    "null",
+], maxLength = 4096 }, max_paths = { type = "integer", minimum = 1, maximum = 10000 }, project_instruction_fingerprint_sha256 = { type = "string", pattern = "^[0-9a-fA-F]{64}$" } } }
+type_name = "bcode.git.repository-snapshot-request/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "workflow.validation-input"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.validation-input"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.coding-workflow-state/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "cwd",
+    "commands",
+    "environment",
+    "output",
+], properties = { version = { const = 1 }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, commands = { type = "array", minItems = 1, maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+    "argv",
+    "timeout_ms",
+    "continue_on_nonzero",
+], properties = { argv = { type = "array", minItems = 1, maxItems = 256, items = { type = "string", maxLength = 65536 } }, timeout_ms = { type = "integer", minimum = 1, maximum = 300000 }, continue_on_nonzero = { type = "boolean" } } } }, environment = { type = "object", additionalProperties = false, required = [
+    "inherit",
+    "set",
+], properties = { inherit = { type = "boolean" }, set = { type = "object", maxProperties = 128, additionalProperties = { type = "string", maxLength = 65536 } } } }, output = { type = "object", additionalProperties = false, required = [
+    "preview_bytes",
+    "artifact_spill",
+], properties = { preview_bytes = { type = "integer", minimum = 0, maximum = 65536 }, artifact_spill = { type = "boolean" } } } } }
+type_name = "bcode.shell.command-plan/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "workflow.formatting-input"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.formatting-input"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.coding-workflow-state/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "cwd",
+    "commands",
+    "environment",
+    "output",
+], properties = { version = { const = 1 }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, commands = { type = "array", minItems = 1, maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+    "argv",
+    "timeout_ms",
+    "continue_on_nonzero",
+], properties = { argv = { type = "array", minItems = 1, maxItems = 256, items = { type = "string", maxLength = 65536 } }, timeout_ms = { type = "integer", minimum = 1, maximum = 300000 }, continue_on_nonzero = { type = "boolean" } } } }, environment = { type = "object", additionalProperties = false, required = [
+    "inherit",
+    "set",
+], properties = { inherit = { type = "boolean" }, set = { type = "object", maxProperties = 128, additionalProperties = { type = "string", maxLength = 65536 } } } }, output = { type = "object", additionalProperties = false, required = [
+    "preview_bytes",
+    "artifact_spill",
+], properties = { preview_bytes = { type = "integer", minimum = 0, maximum = 65536 }, artifact_spill = { type = "boolean" } } } } }
+type_name = "bcode.shell.command-plan/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "workflow.pre-format-verification-input"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.pre-format-verification-input"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.coding-workflow-state/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "stage",
+    "plan_sha256",
+    "instruction_fingerprint_sha256",
+    "pre_snapshot",
+    "post_snapshot",
+    "commands_passed",
+    "required_artifacts_complete",
+], properties = { version = { const = 1 }, stage = { type = "string", enum = [
+    "pre_format",
+    "post_format",
+] }, plan_sha256 = { type = "string" }, instruction_fingerprint_sha256 = { type = "string" }, pre_snapshot = { type = "object" }, post_snapshot = { type = "object" }, commands_passed = { type = "boolean" }, required_artifacts_complete = { type = "boolean" } } }
+type_name = "bcode.git.verification-receipt-request/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "workflow.post-format-verification-input"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.post-format-verification-input"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.coding-workflow-state/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "stage",
+    "plan_sha256",
+    "instruction_fingerprint_sha256",
+    "pre_snapshot",
+    "post_snapshot",
+    "commands_passed",
+    "required_artifacts_complete",
+], properties = { version = { const = 1 }, stage = { type = "string", enum = [
+    "pre_format",
+    "post_format",
+] }, plan_sha256 = { type = "string" }, instruction_fingerprint_sha256 = { type = "string" }, pre_snapshot = { type = "object" }, post_snapshot = { type = "object" }, commands_passed = { type = "boolean" }, required_artifacts_complete = { type = "boolean" } } }
+type_name = "bcode.git.verification-receipt-request/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "workflow.prepare-checkpoint-input"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.prepare-checkpoint-input"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.coding-workflow-state/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "max_paths",
+], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } }
+type_name = "bcode.git.prepare-request/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "workflow.compose-commit-input"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.compose-commit-input"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.coding-workflow-state/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "preparation",
+    "message",
+    "no_changes",
+], properties = { preparation = { type = "object", additionalProperties = false, required = [
+    "repository_root",
+    "head",
+    "changed_paths",
+], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
+    "path",
+    "status",
+], properties = { path = { type = "string" }, status = { type = "string" } } } } } }, message = { type = "object", additionalProperties = false, required = [
+    "title",
+    "description",
+], properties = { title = { type = "string", minLength = 1, maxLength = 256 }, description = { type = "string", maxLength = 7935 } } }, no_changes = { enum = [
+    "fail",
+    "no_op",
+] } } }
+type_name = "bcode.git.compose-commit-request/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
 [[workflow_templates]]
 contribution_version  = 1
 description           = "Implement a bounded task, run an exact verification command plan, and optionally create one approved Git commit."
@@ -1291,6 +1603,49 @@ type_name = "bcode.workflow.implementation-verification-commit-config/v1"
 category = "automation"
 icon     = "workflow"
 risk     = "shell and Git mutations require exact approval"
+
+[[workflow_templates]]
+contribution_version  = 1
+description           = "Create a normal mutable authored draft for a bounded coding implementation batch with workflow-plugin-owned state."
+document_source       = { path = "templates/implementation-batch.workflow.json", sha256 = "b1a29d79f288785cbd31e5f27bfabfcdb04305d01b0b68259aa0c6534c15d9d2" }
+required_capabilities = ["workflow-production/v1"]
+template_id           = "implementation-batch"
+template_version      = 1
+title                 = "Implementation batch"
+
+[workflow_templates.presentation]
+category       = "coding"
+workflow_level = "implementation_batch"
+
+[[workflow_templates]]
+contribution_version  = 1
+description           = "Call an exact implementation-batch definition up to five times and refocus the progress document after each exhausted batch."
+document_source       = { path = "templates/delivery-tranche.workflow.json", sha256 = "349975eba812078728d4dd25b402da877ee9cdcc7eee1fa850d0af4a271395aa" }
+required_capabilities = ["workflow-production/v1"]
+required_plugins      = ["bcode.workflow"]
+required_skills       = ["refocus-progress-doc"]
+template_id           = "delivery-tranche"
+template_version      = 1
+title                 = "Delivery tranche"
+
+[workflow_templates.presentation]
+category       = "coding"
+workflow_level = "delivery_tranche"
+
+[[workflow_templates]]
+contribution_version  = 1
+description           = "Create or attach progress, review tranche-scoped plans, call up to ten exact delivery tranches, and wait durably for operator continuation."
+document_source       = { path = "templates/progress-driven-delivery.workflow.json", sha256 = "c38ca7ede3e5b1d24a7b6e773bf44bca1ff7488657ad223c3c2f083bc55fdbf1" }
+required_capabilities = ["workflow-production/v1"]
+required_plugins      = ["bcode.workflow"]
+required_skills       = ["local-progress-doc"]
+template_id           = "progress-driven-delivery"
+template_version      = 1
+title                 = "Progress-driven delivery"
+
+[workflow_templates.presentation]
+category       = "coding"
+workflow_level = "progress_driven"
 
 [[tui_surfaces]]
 description = "Configure and preview a plugin-owned workflow template before start"
