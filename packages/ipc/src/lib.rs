@@ -19,7 +19,6 @@ pub use bcode_worktree_models::{
     WorktreeRemoveRequest, WorktreeRemoveResponse,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-#[cfg(test)]
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::env;
@@ -3368,12 +3367,40 @@ fn endpoint_override_allowed(
 }
 
 #[cfg(unix)]
+const MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES: usize = 103;
+#[cfg(unix)]
+const SOCKET_SCOPE_HEX_BYTES: usize = 32;
+
+#[cfg(unix)]
 fn default_socket_path(endpoint_override_allowed: bool) -> PathBuf {
     if endpoint_override_allowed && let Ok(path) = env::var("BCODE_SOCKET") {
         return PathBuf::from(path);
     }
     let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
-    env::temp_dir().join(format!("bcode-{user}-{}.sock", daemon_namespace()))
+    let namespace = daemon_namespace();
+    let digest = socket_scope_digest(&user, &namespace);
+    socket_path_with_digest(&env::temp_dir(), &digest).unwrap_or_else(|| {
+        socket_path_with_digest(Path::new("/tmp"), &digest)
+            .expect("/tmp can hold a bcode socket path")
+    })
+}
+
+#[cfg(unix)]
+fn socket_scope_digest(user: &str, namespace: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(user.as_bytes());
+    hasher.update([0]);
+    hasher.update(namespace.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..SOCKET_SCOPE_HEX_BYTES].to_owned()
+}
+
+#[cfg(unix)]
+fn socket_path_with_digest(base: &Path, digest: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = base.join(format!("bcode-{digest}.sock"));
+    (path.as_os_str().as_bytes().len() <= MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES).then_some(path)
 }
 
 #[cfg(test)]
@@ -3405,6 +3432,30 @@ mod tests {
             daemon_namespace(),
             daemon_namespace_for(&ArtifactId::current())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_socket_paths_are_bounded_and_namespace_scoped() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let first_digest = socket_scope_digest("example-user", "ipc-v26-artifact-a");
+        let second_digest = socket_scope_digest("example-user", "ipc-v26-artifact-b");
+        let path = socket_path_with_digest(Path::new("/tmp"), &first_digest)
+            .expect("representable socket path");
+
+        assert_eq!(first_digest.len(), SOCKET_SCOPE_HEX_BYTES);
+        assert_ne!(first_digest, second_digest);
+        assert!(path.starts_with("/tmp"));
+        assert!(path.as_os_str().as_bytes().len() <= MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_socket_path_rejects_an_overlong_base() {
+        let digest = socket_scope_digest("user", "namespace");
+        let base = PathBuf::from("/").join("x".repeat(MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES));
+        assert!(socket_path_with_digest(&base, &digest).is_none());
     }
 
     #[test]
