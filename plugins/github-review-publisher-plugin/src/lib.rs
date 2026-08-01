@@ -1483,6 +1483,41 @@ mod tests {
     }
 
     #[test]
+    fn preview_is_local_and_does_not_require_submit_auth_or_http() {
+        let request = ExternalPublishReviewRequest {
+            bundle: ReviewBundle {
+                review_id: "review".to_string(),
+                title: "Review".to_string(),
+                repo_root: PathBuf::from("/repo"),
+                target: ReviewTarget::WorkingTreeUnstaged,
+                surfaces: Vec::new(),
+                files: Vec::new(),
+                threads: vec![review_thread(bundle_line(
+                    "src/lib.rs",
+                    ReviewLineKind::Added,
+                    None,
+                    Some(42),
+                    1,
+                    "added",
+                ))],
+                generated_at_ms: 1,
+            },
+            options: serde_json::json!({
+                "repository": "owner/repo",
+                "pull_request": "123",
+                "token_env": "INTENTIONALLY_MISSING_GITHUB_TOKEN"
+            }),
+        };
+
+        let response = preview_for_request(&request).expect("offline preview");
+
+        assert_eq!(response.publisher_id, PUBLISHER_ID);
+        assert!(response.preview.contains("GitHub PR review preview"));
+        assert!(response.preview.contains("owner/repo"));
+        assert!(response.preview.contains("src/lib.rs"));
+    }
+
+    #[test]
     fn preview_reports_unmappable_comments() {
         let bundle = ReviewBundle {
             review_id: "review".to_string(),

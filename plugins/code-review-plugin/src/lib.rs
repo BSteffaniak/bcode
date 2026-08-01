@@ -5861,6 +5861,86 @@ mod tests {
     }
 
     #[test]
+    fn markdown_export_writes_selected_publish_bundle_to_requested_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("selected-review.md");
+        let bundle = ReviewBundle {
+            review_id: "review-selection".to_string(),
+            title: "Selected review".to_string(),
+            repo_root: temp.path().to_path_buf(),
+            target: ReviewTarget::WorkingTreeUnstaged,
+            surfaces: Vec::new(),
+            files: Vec::new(),
+            threads: vec![ReviewBundleThread {
+                thread_id: "thread-1".to_string(),
+                anchor: DraftAnchor {
+                    kind: ReviewAnchorKind::Range,
+                    file_path: "src/lib.rs".to_string(),
+                    diff_row: 1,
+                    start_diff_row: None,
+                    end_diff_row: None,
+                    old_start: None,
+                    old_end: None,
+                    new_start: Some(42),
+                    new_end: Some(42),
+                    old_line: None,
+                    new_line: Some(42),
+                    line_kind: ReviewLineKind::Added,
+                    is_file_anchor: false,
+                    surface_id: None,
+                    source_id: None,
+                },
+                comments: vec![DraftComment {
+                    comment_id: "comment-1".to_string(),
+                    thread_id: "thread-1".to_string(),
+                    anchor: DraftAnchor {
+                        kind: ReviewAnchorKind::Range,
+                        file_path: "src/lib.rs".to_string(),
+                        diff_row: 1,
+                        start_diff_row: None,
+                        end_diff_row: None,
+                        old_start: None,
+                        old_end: None,
+                        new_start: Some(42),
+                        new_end: Some(42),
+                        old_line: None,
+                        new_line: Some(42),
+                        line_kind: ReviewLineKind::Added,
+                        is_file_anchor: false,
+                        surface_id: None,
+                        source_id: None,
+                    },
+                    body: "Selected actionable comment".to_string(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    session_id: None,
+                    resolved_at_ms: None,
+                    thread_kind: ReviewThreadKind::Finding,
+                    severity: ReviewThreadSeverity::Warning,
+                }],
+                resolved_at_ms: None,
+                session_id: None,
+                selected_lines: Vec::new(),
+                selected_diff_lines: Vec::new(),
+                hunk_context: Vec::new(),
+            }],
+            generated_at_ms: 1,
+        };
+
+        let response = with_publisher("markdown_file", |publisher| {
+            publisher.submit(&bundle, &serde_json::json!({ "output_path": output }))
+        })
+        .expect("markdown export");
+        let exported = std::fs::read_to_string(&output).expect("exported markdown");
+
+        assert!(response.submitted);
+        assert_eq!(response.output.as_deref(), output.to_str());
+        assert!(exported.contains("Selected review"));
+        assert!(exported.contains("Selected actionable comment"));
+        assert!(!exported.contains("review AI exchange"));
+    }
+
+    #[test]
     fn output_path_override_is_used() {
         let bundle = ReviewBundle {
             review_id: "review-1".to_string(),

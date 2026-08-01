@@ -11798,14 +11798,36 @@ impl ReviewApp {
                 severity: ReviewThreadSeverity::Info,
             };
             if let Some(anchor) = self.anchor_from_persisted_draft(&draft) {
-                if let Some(session_id) = &exchange.session_id {
-                    let key = Self::thread_key_for_anchor(&anchor);
-                    let state = self.agent_thread_states.entry(key).or_insert_with(|| {
-                        ReviewAgentThreadState::pending(exchange.question.clone())
-                    });
-                    state.session_id = Some(session_id.clone());
-                    state.phase = ReviewAgentThreadPhase::Running;
-                    state.status = "reconnecting linked session…".to_string();
+                let key = Self::thread_key_for_anchor(&anchor);
+                let state = self
+                    .agent_thread_states
+                    .entry(key)
+                    .or_insert_with(|| ReviewAgentThreadState::pending(exchange.question.clone()));
+                if state.question.is_empty() {
+                    state.question.clone_from(&exchange.question);
+                }
+                match (&exchange.session_id, exchange.status) {
+                    (Some(session_id), _) => {
+                        state.session_id = Some(session_id.clone());
+                        state.phase = ReviewAgentThreadPhase::Running;
+                        state.status = "reconnecting linked session…".to_string();
+                        state.error = None;
+                    }
+                    (None, ModelReviewAiExchangeStatus::Pending) => {
+                        state.phase = ReviewAgentThreadPhase::Pending;
+                        state.status = "question saved; waiting to create session".to_string();
+                        state.error = None;
+                    }
+                    (None, ModelReviewAiExchangeStatus::Failed) => {
+                        state.phase = ReviewAgentThreadPhase::Failed;
+                        state.status = "linked session failed".to_string();
+                        state.error.clone_from(&exchange.error);
+                    }
+                    (None, ModelReviewAiExchangeStatus::Linked) => {
+                        state.phase = ReviewAgentThreadPhase::Failed;
+                        state.status = "linked session metadata is incomplete".to_string();
+                        state.error = Some("linked exchange is missing its session id".to_string());
+                    }
                 }
                 self.ai_exchanges.entry(anchor).or_default().push(exchange);
             }
@@ -12560,6 +12582,59 @@ mod tests {
                 },
             ],
         })
+    }
+
+    #[test]
+    fn large_review_keyboard_and_mouse_navigation_remains_bounded() {
+        let hunks = (0_u32..500)
+            .map(|hunk_index| ReviewHunk {
+                old_start: hunk_index.saturating_mul(20).saturating_add(1),
+                old_count: 10,
+                new_start: hunk_index.saturating_mul(20).saturating_add(1),
+                new_count: 10,
+                heading: Some(format!("section_{hunk_index}")),
+                lines: (0_u32..10)
+                    .map(|line_index| ReviewLine {
+                        kind: ReviewLineKind::Context,
+                        old_line: Some(hunk_index * 20 + line_index + 1),
+                        new_line: Some(hunk_index * 20 + line_index + 1),
+                        content: format!("line_{hunk_index}_{line_index}"),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut app = ReviewApp::new(ReviewSummary {
+            title: "large".to_string(),
+            repo_root: PathBuf::from("/repo"),
+            additions: 0,
+            deletions: 0,
+            workspace: None,
+            surfaces: Vec::new(),
+            diagnostics: Vec::new(),
+            repository_files: Vec::new(),
+            repository_branches: Vec::new(),
+            repository_commits: Vec::new(),
+            files: vec![ReviewFile {
+                old_path: Some("large.rs".to_string()),
+                new_path: Some("large.rs".to_string()),
+                status: ReviewFileStatus::Modified,
+                additions: 0,
+                deletions: 0,
+                is_binary: false,
+                hunks,
+            }],
+        });
+        app.last_diff_area = Some(Rect::new(10, 5, 100, 30));
+
+        assert!(app.select_next_view_row(5_499));
+        assert!(app.selected_diff_visual_row() >= 5_499);
+        assert!(app.diff_scroll <= app.max_diff_scroll());
+        assert!(app.scroll_up(2_000));
+        let before_mouse = app.diff_scroll;
+        assert!(app.scroll_down(3));
+        assert_eq!(app.diff_scroll, before_mouse + 3);
+        assert!(app.diff_line_index_at(20, 5).is_some());
+        assert!(app.commentable_diff_line_index_at(20, 5).is_some());
     }
 
     #[test]
@@ -13397,6 +13472,46 @@ mod tests {
     }
 
     #[test]
+    fn reopen_restores_pending_and_failed_ai_exchange_presentations() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        let model_anchor: ModelDraftAnchor = anchor.clone().into();
+        app.load_persisted_ai_exchanges(vec![
+            ModelReviewAiExchange {
+                schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
+                exchange_id: "pending".to_string(),
+                anchor: model_anchor.clone(),
+                question: "Still pending?".to_string(),
+                session_id: None,
+                status: ModelReviewAiExchangeStatus::Pending,
+                error: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            ModelReviewAiExchange {
+                schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
+                exchange_id: "failed".to_string(),
+                anchor: model_anchor,
+                question: "Why did this fail?".to_string(),
+                session_id: None,
+                status: ModelReviewAiExchangeStatus::Failed,
+                error: Some("daemon unavailable".to_string()),
+                created_at_ms: 2,
+                updated_at_ms: 2,
+            },
+        ]);
+
+        let state = app
+            .agent_state_for_anchor(&anchor)
+            .expect("restored visible exchange state");
+        assert_eq!(state.question, "Still pending?");
+        assert_eq!(state.phase, ReviewAgentThreadPhase::Failed);
+        assert_eq!(state.error.as_deref(), Some("daemon unavailable"));
+        assert_eq!(app.ai_exchanges[&anchor].len(), 2);
+    }
+
+    #[test]
     fn ai_exchange_failure_retry_follow_up_reopen_and_conversion_remain_isolated() {
         let mut app = sample_app();
         app.selected_diff_line = 2;
@@ -13473,6 +13588,64 @@ mod tests {
         assert_eq!(deleted_id, follow_up_id);
         assert_eq!(reopened.ai_exchanges.values().flatten().count(), 1);
         assert_eq!(reopened.draft_comment_count(), 1);
+    }
+
+    #[test]
+    fn ask_bcode_supports_line_range_file_and_review_anchors() {
+        let cases = [
+            ("line", None),
+            ("range", Some(AnchorSetup::Range)),
+            ("file", Some(AnchorSetup::File)),
+            ("review", Some(AnchorSetup::Review)),
+        ];
+        for (label, setup) in cases {
+            let mut app = sample_app();
+            app.selected_diff_line = 2;
+            match setup {
+                None => assert!(app.open_comment_editor()),
+                Some(AnchorSetup::Range) => {
+                    app.selected_diff_line = 1;
+                    assert!(app.toggle_range_selection());
+                    app.selected_diff_line = 2;
+                    assert!(app.open_comment_editor());
+                }
+                Some(AnchorSetup::File) => assert!(app.open_file_comment_editor()),
+                Some(AnchorSetup::Review) => assert!(app.open_review_comment_editor()),
+            }
+            let editor = app.comment_editor.as_mut().expect("composer");
+            editor.action = ReviewCommentAction::AskBcode;
+            editor.buffer.insert_str(&format!("question for {label}"));
+
+            assert!(app.save_comment_editor());
+
+            let pending = app.take_pending_agent_session().expect("queued question");
+            match label {
+                "line" => {
+                    assert!(!pending.anchor.is_file_anchor);
+                    assert_eq!(
+                        pending.anchor.start_diff_row(),
+                        pending.anchor.end_diff_row()
+                    );
+                }
+                "range" => assert!(pending.anchor.end_diff_row() > pending.anchor.start_diff_row()),
+                "file" => assert!(pending.anchor.is_file_anchor),
+                "review" => assert!(pending.anchor.is_review_level()),
+                _ => unreachable!(),
+            }
+            let state = app
+                .agent_state_for_anchor(&pending.anchor)
+                .expect("immediate visible state");
+            assert_eq!(state.question, format!("question for {label}"));
+            assert_eq!(state.phase, ReviewAgentThreadPhase::Pending);
+            assert_eq!(state.status, "looking into this…");
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum AnchorSetup {
+        Range,
+        File,
+        Review,
     }
 
     #[test]
