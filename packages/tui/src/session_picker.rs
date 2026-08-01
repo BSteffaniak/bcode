@@ -18,6 +18,8 @@ pub enum SessionPickerMode {
     Rename,
     /// Confirming deletion of the selected session.
     DeleteConfirm,
+    /// Selecting from portable canonically hydrated transcript-search results.
+    TranscriptSearch,
 }
 
 /// Session picker state.
@@ -30,6 +32,11 @@ pub struct SessionPickerApp {
     status: String,
     empty_message: String,
     last_import: Option<(SessionSummary, Vec<bcode_ipc::SessionImportWarning>)>,
+    search_results: Vec<bcode_session_search::HydratedSessionSearchHit>,
+    search_query_complete: bool,
+    search_coverage_complete: bool,
+    search_provider_reports: usize,
+    search_failures: usize,
     mode: SessionPickerMode,
 }
 
@@ -46,6 +53,11 @@ impl SessionPickerApp {
             status: "Select a session or press Ctrl-N to create one".to_owned(),
             empty_message: "No matching sessions. Press Ctrl-N to create a new session.".to_owned(),
             last_import: None,
+            search_results: Vec::new(),
+            search_query_complete: true,
+            search_coverage_complete: true,
+            search_provider_reports: 0,
+            search_failures: 0,
             mode: SessionPickerMode::Filter,
         }
     }
@@ -81,7 +93,9 @@ impl SessionPickerApp {
     /// Return active text input mutably.
     pub const fn active_input_mut(&mut self) -> &mut TextInputState {
         match self.mode {
-            SessionPickerMode::Filter | SessionPickerMode::DeleteConfirm => &mut self.filter,
+            SessionPickerMode::Filter
+            | SessionPickerMode::DeleteConfirm
+            | SessionPickerMode::TranscriptSearch => &mut self.filter,
             SessionPickerMode::Rename => &mut self.rename,
         }
     }
@@ -141,9 +155,66 @@ impl SessionPickerApp {
         self.refresh_filter();
     }
 
+    /// Install one bounded terminal transcript-search result set.
+    pub fn set_search_results(
+        &mut self,
+        response: &bcode_session_search::FederatedSessionSearchResponse,
+        hydrated: Vec<bcode_session_search::HydratedSessionSearchHit>,
+    ) {
+        self.search_results = hydrated;
+        self.search_query_complete = response.query_complete;
+        self.search_coverage_complete = response.coverage_complete;
+        self.search_provider_reports = response.providers.len();
+        self.search_failures = response.failures.len();
+        self.list = FilteredListState::new(self.search_results.len());
+        self.mode = SessionPickerMode::TranscriptSearch;
+        self.status = format!(
+            "Transcript results: providers={}, failures={}, query_complete={}, coverage_complete={}",
+            self.search_provider_reports,
+            self.search_failures,
+            self.search_query_complete,
+            self.search_coverage_complete
+        );
+    }
+
+    /// Return the selected transcript-search result.
+    #[must_use]
+    pub fn selected_search_result(
+        &self,
+    ) -> Option<&bcode_session_search::HydratedSessionSearchHit> {
+        let index = self.list.selected_source_index()?;
+        self.search_results.get(index)
+    }
+
+    /// Leave transcript-search results and rebuild local catalog filtering.
+    pub fn close_search_results(&mut self) {
+        self.search_results.clear();
+        self.mode = SessionPickerMode::Filter;
+        self.list = FilteredListState::new(self.sessions.len());
+        self.refresh_filter();
+        "Transcript search closed".clone_into(&mut self.status);
+    }
+
     /// Return visible list items.
     #[must_use]
     pub fn list_items(&self) -> Vec<ListItem> {
+        if self.mode == SessionPickerMode::TranscriptSearch {
+            if self.search_results.is_empty() {
+                return vec![empty_item("No transcript matches")];
+            }
+            return self
+                .search_results
+                .iter()
+                .map(|result| {
+                    let title = self
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == result.hit.locator.session_id)
+                        .map(SessionSummary::display_title);
+                    search_result_item(result, title)
+                })
+                .collect();
+        }
         if self.list.indices().is_empty() {
             return vec![empty_item(&self.empty_message)];
         }
@@ -248,6 +319,46 @@ impl SessionPickerApp {
     }
 }
 
+fn search_result_item(
+    result: &bcode_session_search::HydratedSessionSearchHit,
+    canonical_title: Option<&str>,
+) -> ListItem {
+    let preview = result.hit.preview.as_deref().unwrap_or("<no preview>");
+    let timestamp = result
+        .event
+        .as_deref()
+        .map(|event| format!(" @{}", event.timestamp_ms))
+        .unwrap_or_default();
+    let degraded = (result.outcome != bcode_session_search::SearchHitHydrationOutcome::Hydrated)
+        .then_some(format!(" [{:?}]", result.outcome))
+        .unwrap_or_default();
+    let title = canonical_title.unwrap_or("<canonical title unavailable>");
+    ListItem::new(Line::from_spans(vec![
+        Span::styled(
+            format!(
+                "{title}  {} #{} {:?}{timestamp}",
+                result.hit.locator.session_id, result.hit.locator.sequence, result.hit.content_kind
+            ),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!(
+                "{} rank {}{degraded}",
+                result.hit.provider_id, result.hit.provider_rank
+            ),
+            Style::new().fg(Color::BrightBlack),
+        ),
+        Span::raw("  "),
+        Span::raw(preview),
+        Span::raw(if result.hit.preview_truncated {
+            " [truncated]"
+        } else {
+            ""
+        }),
+    ]))
+}
+
 fn session_item(session: &SessionSummary) -> ListItem {
     let name = session.display_title();
     let display_name = session.import.as_ref().map_or_else(
@@ -349,6 +460,86 @@ mod tests {
             fork: None,
             execution: None,
         }
+    }
+
+    fn sample_search_result(
+        outcome: bcode_session_search::SearchHitHydrationOutcome,
+    ) -> bcode_session_search::HydratedSessionSearchHit {
+        let session_id = SessionId::new();
+        bcode_session_search::HydratedSessionSearchHit {
+            hit: bcode_session_search::SessionSearchHit {
+                locator: bcode_session_search::SessionSearchLocator {
+                    session_id,
+                    sequence: 7,
+                    record_id: Some("result".to_owned()),
+                },
+                content_kind: bcode_session_search::SearchContentKind::AssistantMessage,
+                matched_field: bcode_session_search::SearchField::Text,
+                provider_id: "provider".to_owned(),
+                provider_rank: 1,
+                provider_score: None,
+                preview: Some("bounded preview".to_owned()),
+                preview_truncated: false,
+            },
+            outcome,
+            event: (outcome == bcode_session_search::SearchHitHydrationOutcome::Hydrated).then(
+                || {
+                    Box::new(bcode_session_models::SessionEvent {
+                        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                        sequence: 7,
+                        timestamp_ms: 99,
+                        session_id,
+                        provenance: None,
+                        kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                            text: "canonical".to_owned(),
+                        },
+                    })
+                },
+            ),
+            message: None,
+        }
+    }
+
+    #[test]
+    fn transcript_results_preserve_all_rows_coverage_and_selection() {
+        let mut app = SessionPickerApp::new(Vec::new());
+        let first = sample_search_result(bcode_session_search::SearchHitHydrationOutcome::Hydrated);
+        let mut canonical = summary("Canonical title", "/workspace");
+        canonical.id = first.hit.locator.session_id;
+        app.replace_sessions(vec![canonical]);
+        let mut second =
+            sample_search_result(bcode_session_search::SearchHitHydrationOutcome::SessionMissing);
+        second.hit.provider_rank = 2;
+        let response = bcode_session_search::FederatedSessionSearchResponse {
+            hits: vec![first.hit.clone(), second.hit.clone()],
+            query_complete: false,
+            coverage_complete: false,
+            providers: Vec::new(),
+            failures: Vec::new(),
+        };
+        app.set_search_results(&response, vec![first.clone(), second]);
+
+        assert_eq!(app.mode(), SessionPickerMode::TranscriptSearch);
+        let items = app.list_items();
+        assert_eq!(items.len(), 2);
+        let first_text = items[0]
+            .line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(first_text.contains("Canonical title"));
+        assert!(first_text.contains("@99"));
+        assert!(app.status().contains("query_complete=false"));
+        assert_eq!(app.selected_search_result(), Some(&first));
+        app.select_next();
+        assert_eq!(
+            app.selected_search_result()
+                .map(|result| result.hit.provider_rank),
+            Some(2)
+        );
+        app.close_search_results();
+        assert_eq!(app.mode(), SessionPickerMode::Filter);
     }
 
     #[test]

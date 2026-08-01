@@ -56,6 +56,7 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>, theme: T
 const fn input_placeholder(mode: SessionPickerMode) -> &'static str {
     match mode {
         SessionPickerMode::Filter | SessionPickerMode::DeleteConfirm => "Filter sessions",
+        SessionPickerMode::TranscriptSearch => "Transcript query",
         SessionPickerMode::Rename => "New session name",
     }
 }
@@ -63,10 +64,13 @@ const fn input_placeholder(mode: SessionPickerMode) -> &'static str {
 fn header_line(mode: SessionPickerMode) -> Line {
     let help = match mode {
         SessionPickerMode::Filter => {
-            "  Enter selects/imports  Ctrl-F searches transcripts  Ctrl-N creates  Ctrl-R renames  Ctrl-D deletes  Esc cancels/dismisses"
+            "  Enter selects/imports  Ctrl-F searches transcripts (deep:/content:/provider:)  Ctrl-N creates  Ctrl-R renames  Ctrl-D deletes  Esc cancels"
         }
         SessionPickerMode::Rename => "  Enter saves rename  Esc cancels",
         SessionPickerMode::DeleteConfirm => "  Y confirms delete  N/Esc cancels",
+        SessionPickerMode::TranscriptSearch => {
+            "  Enter opens canonical result  Up/Down select  Esc returns to sessions"
+        }
     };
     Line::from_spans(vec![
         Span::styled("Bcode sessions", Style::new().add_modifier(Modifier::BOLD)),
@@ -107,8 +111,8 @@ fn format_import_warnings(
 const fn status_style(mode: SessionPickerMode) -> Style {
     match mode {
         SessionPickerMode::DeleteConfirm => Style::new().fg(Color::Red),
-        SessionPickerMode::Filter | SessionPickerMode::Rename => {
-            Style::new().fg(Color::BrightBlack)
-        }
+        SessionPickerMode::Filter
+        | SessionPickerMode::Rename
+        | SessionPickerMode::TranscriptSearch => Style::new().fg(Color::BrightBlack),
     }
 }

@@ -625,26 +625,93 @@ fn draw_session_picker<W: Write>(
     Ok(())
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PickerTranscriptSearchInput {
+    query: String,
+    execution_class: bcode_session_search::SessionSearchExecutionClass,
+    content_kinds: std::collections::BTreeSet<bcode_session_search::SearchContentKind>,
+    providers: std::collections::BTreeSet<String>,
+}
+
+fn parse_picker_transcript_search_input(
+    input: &str,
+) -> Result<PickerTranscriptSearchInput, String> {
+    let mut parsed = PickerTranscriptSearchInput::default();
+    let mut query = Vec::new();
+    for token in input.split_whitespace() {
+        if token == "deep:" {
+            parsed.execution_class = bcode_session_search::SessionSearchExecutionClass::Deep;
+        } else if let Some(content) = token.strip_prefix("content:") {
+            parsed.content_kinds.insert(match content {
+                "user-message" => bcode_session_search::SearchContentKind::UserMessage,
+                "assistant-message" => bcode_session_search::SearchContentKind::AssistantMessage,
+                "assistant-reasoning" => {
+                    bcode_session_search::SearchContentKind::AssistantReasoning
+                }
+                "shell-command" => bcode_session_search::SearchContentKind::ShellCommand,
+                "shell-output" => bcode_session_search::SearchContentKind::ShellOutput,
+                "tool-output" => bcode_session_search::SearchContentKind::ToolOutput,
+                "tool-error" => bcode_session_search::SearchContentKind::ToolError,
+                _ => return Err(format!("unsupported transcript content control: {content}")),
+            });
+        } else if let Some(provider) = token.strip_prefix("provider:") {
+            if provider.is_empty() {
+                return Err("provider control requires an ID".to_owned());
+            }
+            parsed.providers.insert(provider.to_owned());
+        } else {
+            query.push(token);
+        }
+    }
+    parsed.query = query.join(" ");
+    if parsed.query.is_empty() {
+        return Err("transcript query is empty after controls".to_owned());
+    }
+    if parsed.execution_class == bcode_session_search::SessionSearchExecutionClass::Ordinary
+        && parsed.content_kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                bcode_session_search::SearchContentKind::ShellOutput
+                    | bcode_session_search::SearchContentKind::ToolOutput
+            )
+        })
+    {
+        return Err("shell/tool output requires the explicit deep: control".to_owned());
+    }
+    Ok(parsed)
+}
+
 async fn search_picker_transcript<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     picker: &mut session_picker::SessionPickerApp,
     theme: super::render::TuiTheme,
 ) -> Result<Option<bcode_session_search::HydratedSessionSearchHit>, TuiError> {
-    let query = picker.filter().buffer().text().trim().to_owned();
-    if query.is_empty() {
+    let input = picker.filter().buffer().text().trim();
+    if input.is_empty() {
         picker.set_status("Type a transcript query, then press Ctrl-F".to_owned());
         return Ok(None);
     }
+    let parsed = match parse_picker_transcript_search_input(input) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            picker.set_status(error);
+            return Ok(None);
+        }
+    };
     picker.set_status("Searching transcripts…".to_owned());
     terminal.draw(|frame| session_picker_render::render_picker(picker, frame, theme))?;
     let request = bcode_session_search::SessionSearchRequest {
         query: bcode_session_search::SessionSearchQuery::Text {
-            text: query,
+            text: parsed.query,
             mode: bcode_session_search::TextMatchMode::Terms,
             fields: std::collections::BTreeSet::new(),
         },
-        filters: bcode_session_search::SessionSearchFilters::default(),
+        filters: bcode_session_search::SessionSearchFilters {
+            content_kinds: parsed.content_kinds,
+            providers: parsed.providers,
+            ..bcode_session_search::SessionSearchFilters::default()
+        },
         sort: bcode_session_search::SessionSearchSort::ProviderRelevance,
         limit: 20,
         cursor: None,
@@ -653,33 +720,24 @@ async fn search_picker_transcript<W: Write>(
     let (response, hydrated) = client
         .session_search(
             request,
-            bcode_session_search::SessionSearchPlanPolicy::default(),
+            bcode_session_search::SessionSearchPlanPolicy {
+                execution_class: parsed.execution_class,
+                ..bcode_session_search::SessionSearchPlanPolicy::default()
+            },
             Vec::new(),
             true,
         )
         .await?;
-    let Some(hit) = response.hits.first() else {
+    if response.hits.is_empty() {
         picker.set_status(if response.query_complete && response.coverage_complete {
             "No transcript matches".to_owned()
         } else {
             "No transcript matches in incomplete provider coverage".to_owned()
         });
         return Ok(None);
-    };
-    let Some(hydrated) = hydrated
-        .into_iter()
-        .find(|candidate| candidate.hit.locator == hit.locator)
-    else {
-        picker.set_status("Search hit was not canonically hydrated".to_owned());
-        return Ok(None);
-    };
-    match super::session_search_effect::canonical_navigation_target(&hydrated) {
-        Ok(_) => Ok(Some(hydrated)),
-        Err(reason) => {
-            picker.set_status(format!("Search hit cannot navigate: {reason:?}"));
-            Ok(None)
-        }
     }
+    picker.set_search_results(&response, hydrated);
+    Ok(None)
 }
 
 async fn import_selected_session<W: Write>(
@@ -833,8 +891,10 @@ pub async fn pick_session<W: Write>(
         match event {
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
-                let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
-                picker.refresh_filter();
+                if picker.mode() != session_picker::SessionPickerMode::TranscriptSearch {
+                    let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
+                    picker.refresh_filter();
+                }
             }
             Event::Key(stroke) => match handle_picker_key(&mut picker, services.keymap, stroke) {
                 PickerKeyOutcome::Continue => {}
@@ -848,15 +908,21 @@ pub async fn pick_session<W: Write>(
                     delete_picker_session(chat, &mut picker);
                 }
                 PickerKeyOutcome::TranscriptSearch => {
-                    if let Some(hydrated) = search_picker_transcript(
-                        io.terminal,
-                        services.client,
-                        &mut picker,
-                        services.theme,
-                    )
-                    .await?
-                    {
-                        return Ok(PickSessionOutcome::SearchHit(hydrated));
+                    if picker.mode() == session_picker::SessionPickerMode::TranscriptSearch {
+                        if let Some(hydrated) = picker.selected_search_result().cloned()
+                            && super::session_search_effect::canonical_navigation_target(&hydrated)
+                                .is_ok()
+                        {
+                            return Ok(PickSessionOutcome::SearchHit(hydrated));
+                        }
+                    } else {
+                        let _ = search_picker_transcript(
+                            io.terminal,
+                            services.client,
+                            &mut picker,
+                            services.theme,
+                        )
+                        .await?;
                     }
                 }
                 PickerKeyOutcome::Selected => {
@@ -945,6 +1011,7 @@ pub async fn pick_session_for_mutation<W: Write>(
                     let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
                     picker.refresh_filter();
                 }
+                session_picker::SessionPickerMode::TranscriptSearch => {}
             },
             Event::Key(stroke) => match handle_picker_key(&mut picker, services.keymap, stroke) {
                 PickerKeyOutcome::Continue
@@ -993,6 +1060,35 @@ fn handle_picker_key(
         session_picker::SessionPickerMode::DeleteConfirm => {
             handle_picker_delete_key(picker, stroke)
         }
+        session_picker::SessionPickerMode::TranscriptSearch => {
+            handle_picker_search_key(picker, stroke)
+        }
+    }
+}
+
+fn handle_picker_search_key(
+    picker: &mut session_picker::SessionPickerApp,
+    stroke: KeyStroke,
+) -> PickerKeyOutcome {
+    match stroke.key {
+        KeyCode::Escape => {
+            picker.close_search_results();
+            PickerKeyOutcome::Continue
+        }
+        KeyCode::Enter => picker
+            .selected_search_result()
+            .map_or(PickerKeyOutcome::Continue, |_| {
+                PickerKeyOutcome::TranscriptSearch
+            }),
+        KeyCode::Up if stroke.modifiers.is_empty() => {
+            picker.select_previous();
+            PickerKeyOutcome::Continue
+        }
+        KeyCode::Down if stroke.modifiers.is_empty() => {
+            picker.select_next();
+            PickerKeyOutcome::Continue
+        }
+        _ => PickerKeyOutcome::Continue,
     }
 }
 
@@ -1155,4 +1251,36 @@ fn delete_picker_session(chat: &mut ActiveChat, picker: &mut session_picker::Ses
     };
     chat.start_effect(TuiEffect::DeleteSession { session_id });
     picker.finish_mutation("Deleting session…".to_owned());
+}
+
+#[cfg(test)]
+mod session_search_input_tests {
+    use super::*;
+
+    #[test]
+    fn picker_search_controls_parse_deep_content_and_provider_explicitly() {
+        let parsed = parse_picker_transcript_search_input(
+            "deep: content:shell-output provider:scan-provider needle",
+        )
+        .expect("valid explicit controls");
+        assert_eq!(parsed.query, "needle");
+        assert_eq!(
+            parsed.execution_class,
+            bcode_session_search::SessionSearchExecutionClass::Deep
+        );
+        assert!(
+            parsed
+                .content_kinds
+                .contains(&bcode_session_search::SearchContentKind::ShellOutput)
+        );
+        assert!(parsed.providers.contains("scan-provider"));
+    }
+
+    #[test]
+    fn picker_search_rejects_large_output_without_deep_control() {
+        assert_eq!(
+            parse_picker_transcript_search_input("content:tool-output needle"),
+            Err("shell/tool output requires the explicit deep: control".to_owned())
+        );
+    }
 }
