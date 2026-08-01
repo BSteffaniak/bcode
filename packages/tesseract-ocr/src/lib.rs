@@ -64,8 +64,8 @@ pub enum Error {
     #[error("failed to load bundled tesseract runtime '{version}': {message}")]
     LoadBundledRuntime { version: String, message: String },
 
-    /// A bundled runtime path was not emitted by the build script.
-    #[error("bundled tesseract runtime path is unavailable in this build")]
+    /// A bundled runtime root override was relative, missing, or could not be canonicalized.
+    #[error("bundled tesseract runtime root is invalid or unavailable")]
     BundledRuntimePathUnavailable,
 }
 
@@ -284,11 +284,14 @@ impl TesseractRuntime {
             .ok_or_else(|| Error::BundledRuntimeUnavailable {
                 version: version.to_string(),
             })?;
-        let runtime_dir = bundled_runtime_root()?.join(version);
-        let library_path = runtime_dir
-            .join("lib")
-            .join(dynamic_library_name("tesseract"));
-        let tessdata_dir = runtime_dir.join("tessdata");
+        let runtime_root = bundled_runtime_root()?;
+        let (runtime_dir, library_path, tessdata_dir) =
+            resolve_confined_runtime_paths(&runtime_root, version).map_err(|message| {
+                Error::LoadBundledRuntime {
+                    version: version.to_string(),
+                    message,
+                }
+            })?;
         let library =
             load_bundled_library(&library_path, &runtime_dir.join("lib")).map_err(|error| {
                 Error::LoadBundledRuntime {
@@ -334,9 +337,44 @@ impl TesseractRuntime {
     }
 }
 
+fn resolve_confined_runtime_paths(
+    runtime_root: &Path,
+    version: &str,
+) -> std::result::Result<(PathBuf, PathBuf, PathBuf), String> {
+    let runtime_dir = runtime_root
+        .join(version)
+        .canonicalize()
+        .map_err(|error| format!("runtime directory is unavailable: {error}"))?;
+    if !runtime_dir.starts_with(runtime_root) {
+        return Err("runtime directory escapes the configured runtime root".to_owned());
+    }
+    let library_path = runtime_dir
+        .join("lib")
+        .join(dynamic_library_name("tesseract"))
+        .canonicalize()
+        .map_err(|error| format!("runtime library is unavailable: {error}"))?;
+    if !library_path.starts_with(&runtime_dir) {
+        return Err("runtime library escapes the selected runtime directory".to_owned());
+    }
+    let tessdata_dir = runtime_dir
+        .join("tessdata")
+        .canonicalize()
+        .map_err(|error| format!("runtime tessdata is unavailable: {error}"))?;
+    if !tessdata_dir.starts_with(&runtime_dir) {
+        return Err("runtime tessdata escapes the selected runtime directory".to_owned());
+    }
+    Ok((runtime_dir, library_path, tessdata_dir))
+}
+
 fn bundled_runtime_root() -> Result<PathBuf> {
     if let Some(root) = env::var_os("BCODE_TESSERACT_RUNTIME_ROOT") {
-        return Ok(PathBuf::from(root));
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            return Err(Error::BundledRuntimePathUnavailable);
+        }
+        return root
+            .canonicalize()
+            .map_err(|_| Error::BundledRuntimePathUnavailable);
     }
     if let Some(root) = executable_relative_runtime_root() {
         return Ok(root);
@@ -347,10 +385,11 @@ fn bundled_runtime_root() -> Result<PathBuf> {
 }
 
 fn executable_relative_runtime_root() -> Option<PathBuf> {
-    let exe = env::current_exe().ok()?;
+    let exe = env::current_exe().ok()?.canonicalize().ok()?;
     let exe_dir = exe.parent()?;
     let root = exe_dir.join("bcode-runtimes").join("tesseract");
-    root.is_dir().then_some(root)
+    let canonical = root.canonicalize().ok()?;
+    canonical.starts_with(exe_dir).then_some(canonical)
 }
 
 #[cfg(not(windows))]
@@ -367,11 +406,11 @@ fn load_bundled_library(
     _library_dir: &Path,
 ) -> std::result::Result<libloading::Library, libloading::Error> {
     const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: u32 = 0x0000_0100;
-    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
     let library = unsafe {
         libloading::os::windows::Library::load_with_flags(
             library_path,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
         )?
     };
     Ok(library.into())
@@ -406,7 +445,7 @@ fn platform_loader_hint(library_path: &Path) -> String {
     } else if cfg!(target_os = "linux") {
         format!("run `ldd {}`", display_from_current_dir(library_path))
     } else {
-        "verify the dependent DLLs are next to the runtime library".to_string()
+        "verify the runtime's dependent DLLs are beside it; loading is confined to that directory and System32".to_string()
     }
 }
 
@@ -1002,4 +1041,75 @@ pub fn resolve_tessdata_dir() -> PathBuf {
         |_| PathBuf::from("tessdata"),
         |home| PathBuf::from(home).join(".local/share/bcode/tessdata"),
     )
+}
+
+#[cfg(test)]
+mod runtime_root_tests {
+    use super::{
+        Error, bundled_runtime_root, dynamic_library_name, resolve_confined_runtime_paths,
+    };
+    use std::sync::{Mutex, OnceLock};
+
+    fn environment_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("environment lock")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_version_rejects_linked_library_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("runtime root");
+        let outside = tempfile::tempdir().expect("outside");
+        let runtime = root.path().join("5.5.2");
+        std::fs::create_dir_all(runtime.join("lib")).expect("runtime lib");
+        std::fs::create_dir_all(runtime.join("tessdata")).expect("runtime tessdata");
+        let outside_library = outside.path().join(dynamic_library_name("tesseract"));
+        std::fs::write(&outside_library, b"not a library").expect("outside library");
+        symlink(
+            &outside_library,
+            runtime.join("lib").join(dynamic_library_name("tesseract")),
+        )
+        .expect("library link");
+
+        let error = resolve_confined_runtime_paths(root.path(), "5.5.2")
+            .expect_err("linked runtime library must escape");
+        assert!(error.contains("escapes"), "{error}");
+    }
+
+    #[test]
+    fn runtime_root_override_requires_existing_absolute_directory() {
+        let _lock = environment_lock();
+        let previous = std::env::var_os("BCODE_TESSERACT_RUNTIME_ROOT");
+        // SAFETY: this test serializes access to this process environment variable.
+        unsafe {
+            std::env::set_var("BCODE_TESSERACT_RUNTIME_ROOT", "relative-runtime");
+        }
+        assert!(matches!(
+            bundled_runtime_root(),
+            Err(Error::BundledRuntimePathUnavailable)
+        ));
+
+        let temp = tempfile::tempdir().expect("runtime root");
+        // SAFETY: this test serializes access to this process environment variable.
+        unsafe {
+            std::env::set_var("BCODE_TESSERACT_RUNTIME_ROOT", temp.path());
+        }
+        assert_eq!(
+            bundled_runtime_root().expect("canonical runtime root"),
+            temp.path().canonicalize().expect("canonical temp")
+        );
+
+        // SAFETY: this test serializes access to this process environment variable.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("BCODE_TESSERACT_RUNTIME_ROOT", previous);
+            } else {
+                std::env::remove_var("BCODE_TESSERACT_RUNTIME_ROOT");
+            }
+        }
+    }
 }

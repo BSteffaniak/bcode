@@ -35,13 +35,26 @@ Supported v1 targets:
 * `x86_64-pc-windows-msvc`
 
 Artifacts are written to `target/dist/` with adjacent `sha256` files. macOS and Windows
-artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Every archive contains
+artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Portable ZIP is the complete
+initial Windows distribution format; an installer, Store package, package-manager publication, and
+auto-updater are outside the v1 Windows milestone. Every archive contains
 `bcode` and the process-isolated `bcode-mermaid-worker` (with `.exe` suffixes on Windows), plus
 the bundled Tesseract runtime tree selected by the `distribution` feature. Windows source
 builds use the MSVC Rust target and require Visual Studio Build Tools with C++ support and CMake.
-Windows x64 CI currently uses GitHub's `windows-latest` image. The minimum supported end-user
+CI verifies `cmake`, `cl.exe`, and `link.exe` explicitly and initializes the Visual Studio amd64
+developer shell when those tools are not already in the runner environment.
+Windows named pipes are scoped with a bounded hash of the current access-token user SID (with a
+hashed normalized account/profile fallback); raw usernames are not embedded in endpoint names.
+Windows x64 CI uses GitHub's `windows-latest` image, but Windows support must not be claimed until
+the native workspace checks and extracted distribution smoke suite are green. The minimum supported end-user
 version is Windows 10, version 1809, because Bcode's terminal shell integration depends on ConPTY.
 Windows Server 2019 or newer is the corresponding server baseline.
+
+Windows release, `dev-release`, runtime packaging, and runtime smoke commands are intentionally
+native-only for the Windows target: requesting
+`x86_64-pc-windows-msvc` from a non-Windows host fails before compilation with the current host in
+the diagnostic. This prevents cross-compilation from creating an artifact that skipped mandatory
+native execution and extracted-product validation.
 
 ### Windows source build
 
@@ -59,7 +72,9 @@ Extract the ZIP as a directory and preserve its relative layout: `bcode.exe` and
 `bcode-mermaid-worker.exe` remain at the root, while the versioned OCR DLLs and language data stay
 under `bcode-runtimes\\tesseract`. Run `bcode.exe --version` from the extracted directory as a basic
 installation check. Release verification additionally exercises the Mermaid worker, bundled OCR,
-and named-pipe daemon lifecycle on a native Windows host.
+and named-pipe daemon lifecycle. Verification is successful only when those extracted-product checks
+pass on a native Windows host; creating a ZIP from another host is not evidence that the Windows
+distribution is supported.
 
 ## macOS release signing
 
@@ -141,16 +156,34 @@ Required for macOS jobs:
 * `APPLE_ID`
 * `APPLE_APP_SPECIFIC_PASSWORD`
 
-Linux and Windows jobs do not perform platform binary signing in v1. They build, package,
-checksum, and verify artifacts. Windows provider secrets use current-user DPAPI, and Windows shell
-tool commands currently execute with `cmd.exe /C`; commands written for POSIX shells may need to be
-adapted. Public Windows artifacts are unsigned when no signing certificate is configured. For signed public
+Linux jobs do not perform platform binary signing. Windows release jobs sign when the configured
+certificate secrets are present. Public release workflow runs require Windows Authenticode signing
+by default; an unsigned Windows artifact may be published only when the operator explicitly sets
+`publish_windows_unsigned=true` for that workflow dispatch. An unsigned publication includes a
+`WINDOWS-UNSIGNED.txt` marker beside the release assets so the exception is visible in the published
+release. This override is intended for a deliberate temporary policy exception, not silent fallback.
+Windows provider secrets use current-user DPAPI, and Windows shell tool commands execute with
+`cmd.exe /C`; commands written for POSIX shells may need to be adapted. Build-only or unpublished
+Windows artifacts are unsigned when no signing certificate is configured. For signed public
 releases, configure `WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64` and
 `WINDOWS_CODESIGN_CERTIFICATE_PASSWORD` as GitHub Actions secrets. The workflow decodes the PFX to
 the runner's temporary directory and passes only its path to xtask through
 `WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH`; release automation signs and RFC 3161 timestamps both
-executables with SHA-256 before packaging, verifies both signatures before packaging, and verifies
-them again after extraction. Store the PFX as an Actions secret encoded or supplied in the format
+executables with SHA-256 before packaging, verifies both signatures and their RFC 3161 timestamps
+before packaging, and verifies them again after extraction (`signtool verify /pa /all /tw /v`). The
+workflow writes a versioned `windows-signing-x86_64-pc-windows-msvc.json` provenance record for
+public Windows assets. The publish job requires that record to report either signed, timestamped,
+pre/post-package verification or the explicit unsigned exception before attaching any files.
+Public signing requires an explicit operator decision before credentials are configured: select an
+Authenticode code-signing certificate or managed signing service whose CI interface can preserve
+this workflow's pre-package timestamp and post-extraction verification contract. Record the chosen
+provider, certificate subject/thumbprint ownership, repository or environment secret administrators,
+renewal owner/date, and emergency revocation contact in the release runbook. Do not place PFX bytes,
+passwords, provider tokens, or private-key material in the repository, workflow inputs, artifacts, or
+logs. Until that decision and a successful signed publication exist, use unsigned artifacts only via
+the explicit exception and do not claim production Authenticode coverage.
+
+Store the PFX as an Actions secret encoded or supplied in the format
 expected by the runner secret policy; the workflow rejects incomplete certificate/password secret
 pairs and removes the temporary PFX in an `always()` cleanup step. Rotate or revoke it through the
 certificate authority and replace the repository secrets. Local development remains unsigned unless these variables are set.
@@ -162,6 +195,12 @@ Run **Release** from GitHub Actions with:
 
 * `version`: release tag/version, such as `v0.1.0`
 * `publish`: whether to create/update the GitHub release
+* `publish_windows_unsigned`: explicit exception allowing an unsigned Windows artifact when
+  `publish=true`; leave false to require configured Authenticode credentials
 
-The workflow builds macOS, Linux, and Windows x64 artifacts, uploads all artifacts, and when
-`publish=true` attaches them to a GitHub release.
+The build matrix has read-only repository permissions; only the gated publish job receives
+`contents: write`. The workflow builds macOS, Linux, and Windows x64 artifacts, uploads all artifacts with a 14-day
+retention period, and when `publish=true` attaches them to a GitHub release. Release runs for the
+same version are serialized and are not automatically cancelled, avoiding two publishers racing to
+replace the same assets. Allowing unsigned publication is a fallback: if valid signed provenance is
+present, the signed artifact is published and no unsigned marker is emitted.

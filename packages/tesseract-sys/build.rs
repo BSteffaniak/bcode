@@ -355,8 +355,26 @@ mod bundled {
         runtimes_dir: &Path,
     ) {
         let runtime_dir = runtimes_dir.join(&tesseract.version);
+        if let Ok(metadata) = fs::symlink_metadata(&runtime_dir)
+            && (metadata.file_type().is_symlink() || !metadata.is_dir())
+        {
+            panic!(
+                "refusing unsafe bundled runtime destination {}",
+                runtime_dir.display()
+            );
+        }
         let runtime_lib = runtime_dir.join("lib");
         fs::create_dir_all(&runtime_lib).expect("failed to create bundled runtime lib directory");
+        let canonical_runtime = runtime_dir
+            .canonicalize()
+            .expect("failed to canonicalize bundled runtime directory");
+        let canonical_lib = runtime_lib
+            .canonicalize()
+            .expect("failed to canonicalize bundled runtime library directory");
+        assert!(
+            canonical_lib.starts_with(&canonical_runtime),
+            "bundled runtime library directory escapes its runtime root"
+        );
 
         let leptonica_install = cmake::Config::new(leptonica_source)
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")

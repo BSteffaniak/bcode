@@ -6,6 +6,10 @@ on:
   push:
     branches: [master]
 
+concurrency:
+  group: windows-check-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -18,17 +22,49 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
+      - name: Validate release workflow syntax
+        shell: pwsh
+        run: |
+          $workflow = Get-Content -LiteralPath ".github/workflows/release.yml" -Raw
+          $expressionOpen = '$' + '{{ '
+          $releaseCommand = 'run: cargo xtask release --target ' + $expressionOpen + 'matrix.target }} --version ' + $expressionOpen + 'inputs.version }}'
+          $verifyCommand = 'run: cargo xtask verify-release --target ' + $expressionOpen + 'matrix.target }} --version ' + $expressionOpen + 'inputs.version }}'
+          $runtimeSmokeCommand = 'run: cargo xtask smoke-test-tesseract --target ' + $expressionOpen + 'matrix.target }}'
+          $artifactGlob = 'target/dist/bcode-' + $expressionOpen + 'inputs.version }}-' + $expressionOpen + 'matrix.target }}.*'
+          $artifactCountCheck = 'test "${artifact_count}" -eq "${#expected[@]}"'
+          $checksumCountCheck = 'test "${checksum_count}" -eq "${#expected[@]}"'
+          $required = @(
+            'target: x86_64-pc-windows-msvc',
+            $runtimeSmokeCommand,
+            $releaseCommand,
+            $verifyCommand,
+            'uses: actions/upload-artifact@v7',
+            'uses: actions/download-artifact@v8',
+            $artifactGlob,
+            'merge-multiple: true',
+            $artifactCountCheck,
+            $checksumCountCheck
+          )
+          foreach ($entry in $required) {
+            if (-not $workflow.Contains($entry)) {
+              throw "release workflow is missing required literal: $entry"
+            }
+          }
+
       - name: Verify Windows native build tools
         shell: pwsh
         run: |
           cmake --version
+          Get-Command cmake -ErrorAction Stop | Out-Null
+          $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+          $link = Get-Command link.exe -ErrorAction SilentlyContinue
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path -LiteralPath $vswhere)) {
             throw "Visual Studio Installer discovery tool was not found"
@@ -37,24 +73,58 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($installation)) {
             throw "Visual Studio C++ x64 build tools were not found"
           }
+          $devShell = Join-Path $installation "Common7\Tools\Launch-VsDevShell.ps1"
+          if ($null -eq $cl -or $null -eq $link) {
+            if (-not (Test-Path -LiteralPath $devShell)) {
+              throw "Visual Studio developer shell was not found"
+            }
+            & $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          }
+          Get-Command cl.exe -ErrorAction Stop | Out-Null
+          Get-Command link.exe -ErrorAction Stop | Out-Null
+          ($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH') {
+            "$name=$([Environment]::GetEnvironmentVariable($name))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
 
       - name: Check workspace
+        env:
+          SSHENV_DEVICE_SEAL_BACKEND: windows-dpapi-current-user
         run: cargo check --workspace
 
       - name: Clippy workspace
+        env:
+          SSHENV_DEVICE_SEAL_BACKEND: windows-dpapi-current-user
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test workspace
+        env:
+          SSHENV_DEVICE_SEAL_BACKEND: windows-dpapi-current-user
         run: cargo test --workspace
 
       - name: Run Windows-specific contract tests
         run: |
           cargo test --package bcode_session lease::tests --no-default-features
+          cargo test --package bcode_session idempotent_turn_admission_returns_existing_receipt_without_duplicate_event
+          cargo test --package bcode_session concurrent_duplicate_turn_admission_is_atomic
+          cargo test --package bcode_session_models terminal_projection_is_absorbing_for_late_lifecycle_and_result_events
+          cargo test --package bcode_daemon_lifecycle startup_lock_tests
           cargo test --package bcode_ipc default_windows_endpoint_is_a_namespaced_named_pipe
+          cargo test --package bcode_ocr_plugin ocr_relative_path_rejects_directory_junction_escape
+          cargo test --package bcode_mermaid_render cancellation_is_stable_and_backend_neutral
+          cargo test --package bcode_mermaid_render tiny_deadline_returns_typed_timeout
+          cargo test --package bcode_mermaid_render --no-default-features
           cargo test --package bcode_shell_plugin windows_shell_plan_uses_cmd_contract
           cargo test --package bcode_shell_plugin terminal_mode_executes_cmd_through_native_pty
           cargo test --package bcode_shell_plugin cancellation_terminates_windows_terminal_child_promptly
           cargo test --package bcode_tool_runtime cancellation_terminates_windows_process_tree
+          cargo test --package bcode_mermaid_render --test worker public_worker_adapter_forcefully_terminates_cancelled_worker
+          cargo test --package bcode_mermaid_render --test worker public_worker_adapter_forcefully_terminates_timed_out_worker
+          cargo test --package bcode_tesseract_ocr runtime_root_tests
+          cargo test --package xtask release_artifact_inputs_reject_unsafe_versions_and_output_roots
+          cargo test --package xtask archive_creation_rejects_destination_inside_staging
+          cargo test --package xtask non_host_runtime_search_never_falls_back_to_host_build_outputs
+          cargo check --package bcode_tesseract_ocr --all-targets --features bundled-tesseract-default,fail-on-warnings
           cargo test --package bcode_provider_auth windows_dpapi_device_seal_round_trips_for_current_user
 
       - name: Run Windows path semantics smoke tests
@@ -80,10 +150,16 @@ jobs:
             if (-not $unc.Equals("\\server\share\file.txt", [StringComparison]::OrdinalIgnoreCase)) {
               throw "UNC path normalization produced an unexpected path"
             }
-            Set-Content -LiteralPath $outside -Value "outside"
-            $link = Join-Path $root "escape.txt"
-            New-Item -ItemType SymbolicLink -Path $link -Target $outside | Out-Null
-            if ((Resolve-Path -LiteralPath $link).Path.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            $outside = Join-Path $env:RUNNER_TEMP "bcode-path-outside"
+            $outsideFile = Join-Path $outside "outside.txt"
+            $link = Join-Path $root "escape-directory"
+            New-Item -ItemType Directory -Force -Path $outside | Out-Null
+            Set-Content -LiteralPath $outsideFile -Value "outside"
+            cmd /D /C mklink /J $link $outside
+            if ($LASTEXITCODE -ne 0) {
+              throw "failed to create directory reparse-point fixture"
+            }
+            if ((Resolve-Path -LiteralPath (Join-Path $link "outside.txt")).Path.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
               throw "reparse-point escape unexpectedly resolved inside the authorized root"
             }
           } finally {
@@ -100,7 +176,7 @@ jobs:
 
       - name: Upload Windows CI diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bcode-windows-ci-diagnostics-${{ github.run_id }}
           path: |
@@ -109,12 +185,49 @@ jobs:
             target/debug/build/bcode_tesseract_sys-*/out/bundled-runtimes/*/tessdata/*.traineddata
             target/x86_64-pc-windows-msvc/release/build/bcode_tesseract_sys-*/out/bundled-runtimes/*/tessdata/*.traineddata
           if-no-files-found: ignore
+          retention-days: 14
+          include-hidden-files: false
+
+      - name: Validate Windows CI artifact contents
+        if: success()
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = "target/dist/bcode-ci-x86_64-pc-windows-msvc.zip"
+          $checksum = "$archive.sha256"
+          if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $checksum)) {
+            throw "Windows CI release archive or checksum is missing"
+          }
+          $checksumText = (Get-Content -LiteralPath $checksum -Raw).Trim()
+          $fields = $checksumText -split '\s+'
+          $expectedName = [IO.Path]::GetFileName($archive)
+          if ($fields.Count -ne 2 -or $fields[0] -notmatch '^[0-9a-fA-F]{64}$' -or $fields[1].TrimStart('*') -ne $expectedName) {
+            throw "Windows CI checksum file has invalid or mismatched contents"
+          }
+          $actualDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+          if (-not $actualDigest.Equals($fields[0], [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Windows CI archive checksum does not match"
+          }
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $archive))
+          try {
+            $entries = $zip.Entries.FullName
+            foreach ($required in 'bcode.exe', 'bcode-mermaid-worker.exe', 'bcode-runtimes/tesseract/manifest.json') {
+              if ($entries -notcontains $required) {
+                throw "Windows CI archive is missing $required"
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
 
       - name: Upload Windows CI artifact
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bcode-windows-ci-${{ github.run_id }}
           path: |
             target/dist/bcode-ci-x86_64-pc-windows-msvc.*
-          if-no-files-found: ignore
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false
+          compression-level: 0

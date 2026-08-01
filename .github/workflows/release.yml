@@ -12,9 +12,18 @@ on:
         required: true
         default: false
         type: boolean
+      publish_windows_unsigned:
+        description: "Explicitly allow publishing an unsigned Windows artifact"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -38,20 +47,65 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+
+      - name: Validate release version
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_VERSION) -or $env:RELEASE_VERSION -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+            throw "Release version must start with an ASCII letter or digit and contain only ASCII letters, digits, '.', '-', or '_'"
+          }
+
+      - name: Record Windows signing policy
+        if: inputs.publish && runner.os == 'Windows'
+        shell: bash
+        env:
+          PUBLISH_WINDOWS_UNSIGNED: ${{ inputs.publish_windows_unsigned }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_WINDOWS_UNSIGNED" == 'true' ]]; then
+            printf '%s\n' 'Windows artifact publication policy: unsigned override explicitly approved for this workflow run.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' 'Windows artifact publication policy: Authenticode signing required.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      - name: Validate Windows signing configuration
+        if: runner.os == 'Windows'
+        id: windows_signing
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE_PASSWORD }}
+          PUBLISH_WINDOWS_UNSIGNED: ${{ inputs.publish_windows_unsigned }}
+          PUBLISH_RELEASE: ${{ inputs.publish }}
+        run: |
+          $hasCertificate = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64)
+          $hasPassword = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_CERTIFICATE_PASSWORD)
+          if ($hasCertificate -xor $hasPassword) {
+            throw "Windows signing certificate and password must be configured together"
+          }
+          if ($env:PUBLISH_RELEASE -eq 'true' -and -not $hasCertificate -and $env:PUBLISH_WINDOWS_UNSIGNED -ne 'true') {
+            throw "Public Windows release requires Authenticode signing unless publish_windows_unsigned is explicitly enabled"
+          }
+          "configured=$($hasCertificate.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       - name: Verify Windows native build tools
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_SIGNING_CONFIGURED: ${{ steps.windows_signing.outputs.configured }}
         run: |
           cmake --version
+          Get-Command cmake -ErrorAction Stop | Out-Null
+          $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+          $link = Get-Command link.exe -ErrorAction SilentlyContinue
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path -LiteralPath $vswhere)) {
             throw "Visual Studio Installer discovery tool was not found"
@@ -60,7 +114,20 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($installation)) {
             throw "Visual Studio C++ x64 build tools were not found"
           }
-          if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64)) {
+          $devShell = Join-Path $installation "Common7\Tools\Launch-VsDevShell.ps1"
+          if ($null -eq $cl -or $null -eq $link) {
+            if (-not (Test-Path -LiteralPath $devShell)) {
+              throw "Visual Studio developer shell was not found"
+            }
+            & $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          }
+          Get-Command cl.exe -ErrorAction Stop | Out-Null
+          Get-Command link.exe -ErrorAction Stop | Out-Null
+          ($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH') {
+            "$name=$([Environment]::GetEnvironmentVariable($name))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          if ($env:WINDOWS_SIGNING_CONFIGURED -eq 'true') {
             $signTool = Get-ChildItem -Path "$installation\Windows Kits\10\bin", "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($null -eq $signTool) {
               throw "signtool.exe was not found"
@@ -101,6 +168,8 @@ jobs:
           security import "$CERTIFICATE_PATH" -P "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+          echo "APPLE_RELEASE_CERTIFICATE_PATH=$CERTIFICATE_PATH" >> "$GITHUB_ENV"
+          echo "APPLE_RELEASE_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Validate Windows signing secret pairing
         if: runner.os == 'Windows'
@@ -116,7 +185,7 @@ jobs:
           }
 
       - name: Decode Windows signing certificate
-        if: runner.os == 'Windows' && env.WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64 != ''
+        if: runner.os == 'Windows' && steps.windows_signing.outputs.configured == 'true'
         shell: pwsh
         env:
           WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64 }}
@@ -144,6 +213,47 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo xtask smoke-test-tesseract --target ${{ matrix.target }}
 
+      - name: Verify Windows signature provenance
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PUBLISH_RELEASE: ${{ inputs.publish }}
+          PUBLISH_WINDOWS_UNSIGNED: ${{ inputs.publish_windows_unsigned }}
+          WINDOWS_SIGNING_CONFIGURED: ${{ steps.windows_signing.outputs.configured }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          $signed = $env:WINDOWS_SIGNING_CONFIGURED -eq 'true'
+          if ($signed) {
+            if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH)) {
+              throw "Signed Windows release did not retain its temporary certificate path"
+            }
+            @{
+              schema_version = 1
+              target = $env:RELEASE_TARGET
+              signed = $true
+              timestamped = $true
+              verification = 'pre-and-post-package'
+            } | ConvertTo-Json | Set-Content -LiteralPath "target/dist/windows-signing-$env:RELEASE_TARGET.json" -Encoding utf8
+          } elseif ($env:PUBLISH_RELEASE -eq 'true' -and $env:PUBLISH_WINDOWS_UNSIGNED -eq 'true') {
+            @{
+              schema_version = 1
+              target = $env:RELEASE_TARGET
+              signed = $false
+              timestamped = $false
+              verification = 'explicit-unsigned-publication-exception'
+            } | ConvertTo-Json | Set-Content -LiteralPath "target/dist/windows-signing-$env:RELEASE_TARGET.json" -Encoding utf8
+          }
+
+      - name: Cleanup macOS signing material
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set +e
+          if [[ -n "${APPLE_RELEASE_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$APPLE_RELEASE_KEYCHAIN_PATH"
+          fi
+          rm -f "${APPLE_RELEASE_CERTIFICATE_PATH:-}"
+
       - name: Cleanup Windows signing certificate
         if: always() && runner.os == 'Windows'
         shell: pwsh
@@ -153,24 +263,66 @@ jobs:
           }
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bcode-${{ inputs.version }}-${{ matrix.target }}
           path: |
             target/dist/bcode-${{ inputs.version }}-${{ matrix.target }}.*
+            target/dist/windows-signing-${{ matrix.target }}.json
           if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false
+          compression-level: 0
 
   publish:
     name: Publish GitHub release
     needs: build
     if: inputs.publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: target/dist
           merge-multiple: true
+
+      - name: Verify complete publication set
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          PUBLISH_WINDOWS_UNSIGNED: ${{ inputs.publish_windows_unsigned }}
+        run: |
+          set -euo pipefail
+          version="$RELEASE_VERSION"
+          expected=(
+            "bcode-${version}-aarch64-apple-darwin.zip"
+            "bcode-${version}-x86_64-apple-darwin.zip"
+            "bcode-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "bcode-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "bcode-${version}-x86_64-pc-windows-msvc.zip"
+          )
+          for archive in "${expected[@]}"; do
+            test -f "target/dist/${archive}"
+            test -f "target/dist/${archive}.sha256"
+            (cd target/dist && sha256sum --check "${archive}.sha256")
+          done
+          artifact_count=$(find target/dist -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) | wc -l)
+          checksum_count=$(find target/dist -maxdepth 1 -type f -name '*.sha256' | wc -l)
+          test "${artifact_count}" -eq "${#expected[@]}"
+          test "${checksum_count}" -eq "${#expected[@]}"
+          signing_provenance='target/dist/windows-signing-x86_64-pc-windows-msvc.json'
+          test -f "${signing_provenance}"
+          if jq -e '.schema_version == 1 and .target == "x86_64-pc-windows-msvc" and .signed == true and .timestamped == true and .verification == "pre-and-post-package"' "${signing_provenance}" >/dev/null; then
+            : # A valid signed artifact always satisfies publication policy, even when an unsigned fallback was allowed.
+          elif [[ "$PUBLISH_WINDOWS_UNSIGNED" == 'true' ]]; then
+            jq -e '.schema_version == 1 and .target == "x86_64-pc-windows-msvc" and .signed == false and .timestamped == false and .verification == "explicit-unsigned-publication-exception"' "${signing_provenance}" >/dev/null
+            printf '%s\n' 'Windows artifact is intentionally unsigned for this publication.' > target/dist/WINDOWS-UNSIGNED.txt
+          else
+            printf '%s\n' 'Windows signing provenance does not satisfy publication policy.' >&2
+            exit 1
+          fi
 
       - name: Create or update release
         uses: softprops/action-gh-release@v2

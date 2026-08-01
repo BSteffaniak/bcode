@@ -139,7 +139,35 @@ fn ocr_workspace_root(
     if !root.is_absolute() {
         return Err("OCR workspace working directory must be absolute".to_owned());
     }
-    Ok(Some(root))
+    root.canonicalize().map(Some).map_err(|error| {
+        format!(
+            "failed to canonicalize OCR workspace {}: {error}",
+            root.display()
+        )
+    })
+}
+
+fn canonicalize_confined_ocr_source(workspace_root: &Path, path: &Path) -> Result<PathBuf, String> {
+    let canonical_root = workspace_root.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize OCR workspace {}: {error}",
+            workspace_root.display()
+        )
+    })?;
+    let canonical_path = workspace_root.join(path).canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize OCR source {}: {error}",
+            workspace_root.join(path).display()
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(format!(
+            "OCR source {} escapes workspace {}",
+            canonical_path.display(),
+            canonical_root.display()
+        ));
+    }
+    Ok(canonical_path)
 }
 
 fn ocr_policy_preparation(
@@ -160,14 +188,17 @@ fn ocr_policy_preparation(
                 ),
                 OcrSource::Path(path) => {
                     let path = if path.is_absolute() {
-                        path
+                        path.canonicalize().map_err(|error| {
+                            format!(
+                                "failed to canonicalize OCR source {}: {error}",
+                                path.display()
+                            )
+                        })?
                     } else {
-                        workspace_root
-                            .as_ref()
-                            .ok_or_else(|| {
-                                "OCR relative path requires workspace host context".to_owned()
-                            })?
-                            .join(path)
+                        let workspace_root = workspace_root.as_ref().ok_or_else(|| {
+                            "OCR relative path requires workspace host context".to_owned()
+                        })?;
+                        canonicalize_confined_ocr_source(workspace_root, &path)?
                     };
                     (
                         bcode_plugin_sdk::ToolPolicyOperation::Read {
@@ -1014,11 +1045,19 @@ mod tests {
 
     #[test]
     fn ocr_owner_prepares_exact_local_source_and_preserves_permission_behavior() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let image = workspace.path().join("image.png");
+        std::fs::write(&image, b"fixture").expect("fixture");
+        let canonical_workspace = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let canonical_image = image.canonicalize().expect("canonical image");
         let definition = extract_tool_definition();
         let request = preparation_request(
             &definition,
             serde_json::json!({"path": "image.png"}),
-            workspace_context(Path::new("/tmp/workspace")),
+            workspace_context(workspace.path()),
         );
 
         let prepared = ocr_policy_preparation(&request, &definition).expect("OCR preparation");
@@ -1033,17 +1072,95 @@ mod tests {
         assert_eq!(
             prepared.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Read {
-                paths: vec!["/tmp/workspace/image.png".to_owned()],
+                paths: vec![canonical_image.display().to_string()],
             }
         );
         assert_eq!(
             serde_json::from_value::<OcrPreparationDescriptor>(prepared.descriptor)
                 .expect("OCR descriptor"),
             OcrPreparationDescriptor {
-                workspace_root: Some(PathBuf::from("/tmp/workspace")),
-                source_path: Some(PathBuf::from("/tmp/workspace/image.png")),
+                workspace_root: Some(canonical_workspace),
+                source_path: Some(canonical_image),
             }
         );
+    }
+
+    #[test]
+    fn ocr_relative_path_canonicalizes_within_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let images = workspace.path().join("images");
+        std::fs::create_dir_all(&images).expect("images");
+        let image = images.join("fixture.png");
+        std::fs::write(&image, b"fixture").expect("fixture");
+        let definition = extract_tool_definition();
+        let request = preparation_request(
+            &definition,
+            serde_json::json!({"path": "images/../images/fixture.png"}),
+            workspace_context(workspace.path()),
+        );
+
+        let prepared = ocr_policy_preparation(&request, &definition).expect("OCR preparation");
+        let descriptor = serde_json::from_value::<OcrPreparationDescriptor>(prepared.descriptor)
+            .expect("OCR descriptor");
+
+        assert_eq!(
+            descriptor.source_path,
+            Some(image.canonicalize().expect("canonical fixture"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ocr_relative_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_image = outside.path().join("outside.png");
+        std::fs::write(&outside_image, b"outside").expect("outside fixture");
+        symlink(&outside_image, workspace.path().join("escape.png")).expect("symlink");
+        let definition = extract_tool_definition();
+        let request = preparation_request(
+            &definition,
+            serde_json::json!({"path": "escape.png"}),
+            workspace_context(workspace.path()),
+        );
+
+        let error = ocr_policy_preparation(&request, &definition).expect_err("symlink escape");
+
+        assert!(error.contains("escapes workspace"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ocr_relative_path_rejects_directory_junction_escape() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_image = outside.path().join("outside.png");
+        std::fs::write(&outside_image, b"outside").expect("outside fixture");
+        let junction = workspace.path().join("escape");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/D",
+                "/C",
+                "mklink",
+                "/J",
+                &junction.display().to_string(),
+                &outside.path().display().to_string(),
+            ])
+            .status()
+            .expect("create junction fixture");
+        assert!(status.success(), "directory junction fixture");
+        let definition = extract_tool_definition();
+        let request = preparation_request(
+            &definition,
+            serde_json::json!({"path": "escape/outside.png"}),
+            workspace_context(workspace.path()),
+        );
+
+        let error = ocr_policy_preparation(&request, &definition).expect_err("junction escape");
+
+        assert!(error.contains("escapes workspace"), "{error}");
     }
 
     #[test]

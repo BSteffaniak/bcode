@@ -2392,6 +2392,21 @@ enum AuthCommand {
         #[command(subcommand)]
         command: AuthUsageCommand,
     },
+    /// Inspect the selected profile's vault security as JSON without exposing credentials.
+    Security {
+        /// Optional provider ID. Omit to inspect a declared profile directly.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Explicit auth profile name.
+        #[arg(long)]
+        profile: String,
+        /// Explicit vault path. Defaults to the resolved profile vault.
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        /// Require this device-seal backend for the inspection result.
+        #[arg(long)]
+        require_backend: Option<String>,
+    },
     Login {
         /// Optional provider ID. Omit to retain active-profile enrollment compatibility.
         provider: Option<String>,
@@ -2927,6 +2942,17 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
         AuthCommand::Prime { command } => handle_auth_prime_command(command),
         AuthCommand::Resets { command } => handle_auth_resets_command(command),
         AuthCommand::Usage { command } => handle_auth_usage_command(command),
+        AuthCommand::Security {
+            provider,
+            profile,
+            vault,
+            require_backend,
+        } => auth_security(
+            provider.as_deref(),
+            &profile,
+            vault,
+            require_backend.as_deref(),
+        ),
         AuthCommand::Login {
             provider,
             profile,
@@ -2961,6 +2987,86 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             revoke,
         } => auth_provider_logout(&provider, profile.as_deref(), revoke).await,
     }
+}
+
+fn auth_security_status(
+    provider: Option<&str>,
+    profile_name: &str,
+    explicit_vault: Option<PathBuf>,
+) -> Result<bcode_provider_auth::security::AuthSecurityStatus, CliError> {
+    let config = bcode_config::load_config()?;
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    let mut runtime_profile;
+    let auth_profile = if let Some(profile) = config.auth.profiles.get(profile_name) {
+        profile
+    } else if let Some(profile) = runtime.profiles.get(profile_name) {
+        runtime_profile = bcode_config::AuthProfileConfig {
+            provider_id: Some(profile.provider_id.clone()),
+            owner_plugin_id: Some(profile.owner_plugin_id.clone()),
+            backend: profile.backend.clone(),
+            scheme: Some(profile.scheme.clone()),
+            map: profile.map.clone(),
+            settings: BTreeMap::from([
+                ("profile".to_owned(), profile.storage_profile.clone()),
+                ("vault".to_owned(), profile.vault.display().to_string()),
+            ]),
+        };
+        if let Some(device_seal) = &profile.device_seal {
+            runtime_profile
+                .settings
+                .insert("device_seal".to_owned(), device_seal.clone());
+        }
+        &runtime_profile
+    } else {
+        return Err(CliError::LoginProfile(format!(
+            "Auth profile '{profile_name}' is not declared or registered in runtime state."
+        )));
+    };
+    if let Some(provider) = provider
+        && auth_profile.provider_id.as_deref() != Some(provider)
+    {
+        return Err(CliError::LoginProfile(format!(
+            "Auth profile '{profile_name}' does not belong to provider '{provider}'."
+        )));
+    }
+    if auth_profile.backend != "sshenv" {
+        return Err(CliError::LoginProfile(format!(
+            "Auth profile '{profile_name}' uses backend '{}'; vault security inspection requires sshenv.",
+            auth_profile.backend
+        )));
+    }
+    let storage_profile = auth_profile
+        .settings
+        .get("profile")
+        .map_or(profile_name, String::as_str);
+    let vault = explicit_vault
+        .or_else(|| auth_profile.settings.get("vault").map(PathBuf::from))
+        .unwrap_or_else(bcode_config::default_auth_vault_path);
+    let policy = bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
+    Ok(bcode_provider_auth::security::inspect_auth_vault_security(
+        &vault,
+        storage_profile,
+        policy,
+    ))
+}
+
+fn auth_security(
+    provider: Option<&str>,
+    profile_name: &str,
+    explicit_vault: Option<PathBuf>,
+    required_backend: Option<&str>,
+) -> Result<(), CliError> {
+    let status = auth_security_status(provider, profile_name, explicit_vault)?;
+    if let Some(required_backend) = required_backend
+        && status.device_seal_backend.as_deref() != Some(required_backend)
+    {
+        return Err(CliError::LoginProfile(format!(
+            "Auth profile '{profile_name}' uses device seal backend {:?}; required '{required_backend}'.",
+            status.device_seal_backend
+        )));
+    }
+    println!("{}", serde_json::to_string(&status)?);
+    Ok(())
 }
 
 fn handle_auth_usage_command(command: AuthUsageCommand) -> Result<(), CliError> {
@@ -7588,8 +7694,8 @@ fn daemon_status_matches(
         && status.storage_writer_epoch == record.storage_writer_epoch
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(record: &bcode_daemon_lifecycle::DaemonRecord) {
-    #[cfg(unix)]
     if let bcode_daemon_lifecycle::DaemonEndpointRecord::UnixSocket { path } = &record.endpoint
         && is_bcode_socket_path(path)
         && !unix_socket_has_listener(path)
@@ -7597,6 +7703,9 @@ fn remove_stale_socket(record: &bcode_daemon_lifecycle::DaemonRecord) {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[cfg(not(unix))]
+const fn remove_stale_socket(_record: &bcode_daemon_lifecycle::DaemonRecord) {}
 
 #[cfg(unix)]
 fn is_bcode_socket_path(path: &Path) -> bool {
@@ -10639,6 +10748,102 @@ fn print_model_usage_event(
 #[cfg(test)]
 mod auth_cli_tests {
     use super::*;
+
+    fn parse_auth_command(arguments: &[&str]) -> AuthCommand {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let matches = Cli::command()
+            .try_get_matches_from(arguments)
+            .expect("auth command parses");
+        let cli = Cli::from_arg_matches(&matches).expect("auth command decodes");
+        let Some(Commands::Auth { command }) = cli.command else {
+            panic!("expected auth command");
+        };
+        command
+    }
+
+    #[test]
+    fn auth_security_command_parses_backend_requirement() {
+        let command = parse_auth_command(&[
+            "bcode",
+            "auth",
+            "security",
+            "--provider",
+            "xai",
+            "--profile",
+            "windows-smoke",
+            "--vault",
+            "C:\\smoke\\vault",
+            "--require-backend",
+            "windows-dpapi-current-user",
+        ]);
+        let AuthCommand::Security {
+            provider,
+            profile,
+            vault,
+            require_backend,
+        } = command
+        else {
+            panic!("expected auth security command");
+        };
+        assert_eq!(provider.as_deref(), Some("xai"));
+        assert_eq!(profile, "windows-smoke");
+        assert_eq!(vault.as_deref(), Some(Path::new("C:\\smoke\\vault")));
+        assert_eq!(
+            require_backend.as_deref(),
+            Some("windows-dpapi-current-user")
+        );
+    }
+
+    #[test]
+    fn auth_security_status_reads_runtime_profile_without_exposing_credentials() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let subscriptions = state_dir.join("auth").join("subscriptions.json");
+        std::fs::create_dir_all(subscriptions.parent().expect("subscriptions parent"))
+            .expect("state dir");
+        std::fs::write(
+            &subscriptions,
+            serde_json::to_vec_pretty(&bcode_config::RuntimeAuthSubscriptions {
+                profiles: BTreeMap::from([(
+                    "windows-smoke".to_owned(),
+                    bcode_config::RuntimeAuthProfile {
+                        provider_id: "xai".to_owned(),
+                        owner_plugin_id: "bcode.xai".to_owned(),
+                        backend: "sshenv".to_owned(),
+                        scheme: "api_key".to_owned(),
+                        storage_profile: "windows-smoke".to_owned(),
+                        vault: state_dir.join("vault"),
+                        map: BTreeMap::new(),
+                        device_seal: Some("required".to_owned()),
+                    },
+                )]),
+                ..bcode_config::RuntimeAuthSubscriptions::default()
+            })
+            .expect("runtime auth JSON"),
+        )
+        .expect("runtime auth state");
+        let previous_state = std::env::var_os("BCODE_STATE_DIR");
+        // SAFETY: this test restores the process environment before returning and does not run
+        // concurrently with another environment-mutating test in this module.
+        unsafe {
+            std::env::set_var("BCODE_STATE_DIR", &state_dir);
+        }
+        let status = auth_security_status(Some("xai"), "windows-smoke", None)
+            .expect("runtime profile security status");
+        match previous_state {
+            Some(value) => unsafe { std::env::set_var("BCODE_STATE_DIR", value) },
+            None => unsafe { std::env::remove_var("BCODE_STATE_DIR") },
+        }
+        assert_eq!(status.profile, "windows-smoke");
+        assert_eq!(
+            status.policy,
+            bcode_provider_auth::security::AuthDeviceSealPolicy::Required
+        );
+        assert!(!status.vault_exists);
+        let encoded = serde_json::to_string(&status).expect("security status JSON");
+        assert!(!encoded.contains("api_key"));
+        assert!(!encoded.contains("secret"));
+    }
 
     fn registered_provider(
         methods: Vec<bcode_provider_auth_models::AuthMethodContribution>,

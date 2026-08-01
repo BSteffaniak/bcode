@@ -17,6 +17,9 @@ libloading          = { workspace = true, features = ["std"] }
 thiserror           = { workspace = true }
 toml                = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 bundled-tesseract = ["bundled-tesseract-default"]
 bundled-tesseract-all = [

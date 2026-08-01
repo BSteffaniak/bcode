@@ -620,7 +620,11 @@ fn ensure_current_executable_cached_in_state(
         path: parent.to_path_buf(),
         source,
     })?;
-    let temp = parent.join(format!(".bcode.tmp-{}", std::process::id()));
+    let temp = parent.join(format!(
+        ".bcode.tmp-{}-{}",
+        std::process::id(),
+        next_daemon_image_temp_id()
+    ));
     fs::copy(&source, &temp).map_err(|source_error| DaemonLifecycleError::Io {
         path: temp.clone(),
         source: source_error,
@@ -651,6 +655,13 @@ fn ensure_current_executable_cached_in_state(
             })
         }
     }
+}
+
+fn next_daemon_image_temp_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(unix)]
@@ -946,6 +957,13 @@ mod tests {
             Path::new("/state/daemon-images/legacy/bcode"),
             "abc123"
         ));
+    }
+
+    #[test]
+    fn daemon_image_temporary_names_are_unique_within_a_process() {
+        let first = next_daemon_image_temp_id();
+        let second = next_daemon_image_temp_id();
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -1368,18 +1386,26 @@ async fn cleanup_stale_daemon_records() -> Result<(), DaemonLifecycleError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(record: &DaemonRecord) {
-    #[cfg(unix)]
     if let DaemonEndpointRecord::UnixSocket { path } = &record.endpoint {
         let _ = remove_stale_unix_socket_path(path);
     }
 }
 
+#[cfg(not(unix))]
+const fn remove_stale_socket(_record: &DaemonRecord) {}
+
+#[cfg(unix)]
 fn cleanup_stale_endpoint(endpoint: &IpcEndpoint) -> Result<(), DaemonLifecycleError> {
-    #[cfg(unix)]
     if let Some(path) = endpoint.as_unix_socket() {
         remove_stale_unix_socket_path(path)?;
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+const fn cleanup_stale_endpoint(_endpoint: &IpcEndpoint) -> Result<(), DaemonLifecycleError> {
     Ok(())
 }
 

@@ -408,7 +408,7 @@ fn spawn_worker(
             message: error.to_string(),
         })?;
     let guard = attach_worker_memory_limit(&mut child).map_err(|error| {
-        terminate_worker(&mut child);
+        terminate_uncontained_worker(&mut child);
         MermaidRenderError::WorkerUnavailable {
             message: format!("could not enforce worker memory limit: {error}"),
         }
@@ -504,7 +504,7 @@ pub fn render_mermaid_with_worker(
 ) -> Result<MermaidRendered, MermaidRenderError> {
     validate_request(request, cancellation)?;
     let request_bytes = encode_worker_request(request)?;
-    let (mut child, _memory_guard) = spawn_worker(worker_path)?;
+    let (mut child, memory_guard) = spawn_worker(worker_path)?;
     let write_result = child
         .stdin
         .take()
@@ -513,13 +513,13 @@ pub fn render_mermaid_with_worker(
         })?
         .write_all(&request_bytes);
     if let Err(error) = write_result {
-        terminate_worker(&mut child);
+        terminate_worker(&mut child, &memory_guard);
         return Err(MermaidRenderError::WorkerUnavailable {
             message: error.to_string(),
         });
     }
     let stdout = child.stdout.take().ok_or_else(|| {
-        terminate_worker(&mut child);
+        terminate_worker(&mut child, &memory_guard);
         MermaidRenderError::InvalidWorkerResponse {
             message: "worker stdout unavailable".to_owned(),
         }
@@ -536,12 +536,12 @@ pub fn render_mermaid_with_worker(
     let started = std::time::Instant::now();
     let status = loop {
         if cancellation.is_cancelled() {
-            terminate_worker(&mut child);
+            terminate_worker(&mut child, &memory_guard);
             let _ = reader.join();
             return Err(MermaidRenderError::Cancelled);
         }
         if started.elapsed() >= request.limits.timeout {
-            terminate_worker(&mut child);
+            terminate_worker(&mut child, &memory_guard);
             let _ = reader.join();
             return Err(MermaidRenderError::TimedOut);
         }
@@ -549,7 +549,7 @@ pub fn render_mermaid_with_worker(
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             Err(error) => {
-                terminate_worker(&mut child);
+                terminate_worker(&mut child, &memory_guard);
                 let _ = reader.join();
                 return Err(MermaidRenderError::WorkerUnavailable {
                     message: error.to_string(),
@@ -752,7 +752,25 @@ fn attach_worker_memory_limit(
     child.try_wait().map(|_| WorkerMemoryGuard)
 }
 
-fn terminate_worker(child: &mut std::process::Child) {
+fn terminate_uncontained_worker(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+fn terminate_worker(child: &mut std::process::Child, guard: &WorkerMemoryGuard) {
+    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+    // SAFETY: the guard owns a live Job Object containing the worker process. Terminating the job
+    // atomically ends the worker and any descendants before the process is reaped.
+    unsafe {
+        TerminateJobObject(guard.0, 1);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(windows))]
+fn terminate_worker(child: &mut std::process::Child, _guard: &WorkerMemoryGuard) {
     let _ = child.kill();
     let _ = child.wait();
 }

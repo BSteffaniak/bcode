@@ -150,7 +150,7 @@ impl Options {
             }
         }
 
-        Ok(Self {
+        let options = Self {
             command,
             target,
             version,
@@ -162,7 +162,9 @@ impl Options {
             generated_write_mode,
             prune_tesseract_policy,
             features,
-        })
+        };
+        validate_artifact_inputs(&options)?;
+        Ok(options)
     }
 
     fn help() -> Self {
@@ -180,6 +182,57 @@ impl Options {
             features: None,
         }
     }
+}
+
+fn validate_artifact_inputs(options: &Options) -> Result<()> {
+    if matches!(
+        options.command,
+        CommandName::Release | CommandName::VerifyRelease
+    ) && (options.version.is_empty()
+        || !options
+            .version
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || options.version.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+        }))
+    {
+        return Err(format_error(
+            "release version must start with an ASCII letter or digit and contain only ASCII letters, digits, `.`, `-`, or `_`",
+        ));
+    }
+    if matches!(
+        options.command,
+        CommandName::Release
+            | CommandName::VerifyRelease
+            | CommandName::PackageTesseractRuntimes
+            | CommandName::SmokeTestTesseract
+    ) {
+        let root = workspace_root();
+        let out_dir = if options.out_dir.is_absolute() {
+            options.out_dir.clone()
+        } else {
+            root.join(&options.out_dir)
+        };
+        let canonical_parent =
+            out_dir
+                .parent()
+                .unwrap_or(&root)
+                .canonicalize()
+                .map_err(|error| {
+                    format_error(format!("release output parent is unavailable: {error}"))
+                })?;
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|error| format_error(format!("workspace root is unavailable: {error}")))?;
+        if !canonical_parent.starts_with(&canonical_root) {
+            return Err(format_error(
+                "release output directory must remain under the workspace root",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn main() {
@@ -934,6 +987,7 @@ fn sync_bcode_features(path: &Path, policy: &TesseractSyncPolicy, options: &Opti
 }
 
 fn package_tesseract_runtimes(options: &Options) -> Result<()> {
+    ensure_windows_release_runs_natively(&options.target, "package-tesseract-runtimes")?;
     let target_kind = TargetKind::parse(&options.target)?;
     let source = latest_bundled_runtime_root(&options.target)?;
     let binary = options
@@ -963,6 +1017,7 @@ fn package_tesseract_runtimes(options: &Options) -> Result<()> {
 }
 
 fn smoke_test_tesseract(options: &Options) -> Result<()> {
+    ensure_windows_release_runs_natively(&options.target, "smoke-test-tesseract")?;
     let target_kind = TargetKind::parse(&options.target)?;
     let binary = options
         .dev_binary
@@ -979,6 +1034,14 @@ fn smoke_test_tesseract(options: &Options) -> Result<()> {
     };
     ensure_file(&binary)?;
     ensure_dir(&runtime_root)?;
+    let expected_runtime = latest_bundled_runtime_root(&options.target)?;
+    if runtime_tree_manifest(&runtime_root)? != runtime_tree_manifest(&expected_runtime)? {
+        return Err(format_error(format!(
+            "packaged Tesseract runtime {} does not exactly match built runtime {}",
+            runtime_root.display(),
+            expected_runtime.display()
+        )));
+    }
     run_command(
         Command::new(&binary)
             .arg("--version")
@@ -1003,19 +1066,22 @@ fn smoke_test_tesseract(options: &Options) -> Result<()> {
     Ok(())
 }
 
+fn runtime_build_search_dirs(target: &str, root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![
+        root.join("target")
+            .join(target)
+            .join("release")
+            .join("build"),
+        root.join("target").join(target).join("debug").join("build"),
+    ];
+    if target == host_target() {
+        dirs.push(root.join("target").join("debug").join("build"));
+    }
+    dirs
+}
+
 fn latest_bundled_runtime_root(target: &str) -> Result<PathBuf> {
-    let build_dir = workspace_root()
-        .join("target")
-        .join(target)
-        .join("debug")
-        .join("build");
-    let release_build_dir = workspace_root()
-        .join("target")
-        .join(target)
-        .join("release")
-        .join("build");
-    let fallback_build_dir = workspace_root().join("target").join("debug").join("build");
-    [release_build_dir, build_dir, fallback_build_dir]
+    runtime_build_search_dirs(target, &workspace_root())
         .into_iter()
         .filter(|dir| dir.is_dir())
         .flat_map(|dir| bundled_runtime_roots(&dir).unwrap_or_default())
@@ -1036,6 +1102,40 @@ fn bundled_runtime_roots(build_dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(roots)
+}
+
+fn runtime_tree_manifest(root: &Path) -> Result<BTreeMap<String, (u64, String)>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        manifest: &mut BTreeMap<String, (u64, String)>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(format_error(format!(
+                    "Tesseract runtime contains unsupported symlink {}",
+                    path.display()
+                )));
+            }
+            if file_type.is_dir() {
+                visit(root, &path, manifest)?;
+            } else if file_type.is_file() {
+                let relative = zip_entry_name(path.strip_prefix(root).map_err(|_| {
+                    format_error(format!("runtime path escaped root: {}", path.display()))
+                })?)?;
+                let length = entry.metadata()?.len();
+                manifest.insert(relative, (length, archive_sha256(&path)?));
+            }
+        }
+        Ok(())
+    }
+
+    let mut manifest = BTreeMap::new();
+    visit(root, root, &mut manifest)?;
+    Ok(manifest)
 }
 
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
@@ -1193,10 +1293,14 @@ fn build(options: &Options) -> Result<()> {
 }
 
 fn release(options: &Options) -> Result<()> {
+    ensure_windows_release_runs_natively(&options.target, "release")?;
     let features = selected_features(options, true);
     let include_mermaid_worker = features_enable_mermaid_worker(&features);
     let include_tesseract = features_enable_bundled_tesseract(&features);
     let target_kind = TargetKind::parse(&options.target)?;
+    if target_kind == TargetKind::Windows {
+        windows_signing_configuration()?;
+    }
     build_bcode_release(&options.target, &features)?;
 
     let binary = built_binary(&options.target, target_kind);
@@ -1281,7 +1385,7 @@ fn verify_release(options: &Options) -> Result<()> {
             ensure_file(&mermaid_worker)?;
             verify_macos_signature(&mermaid_worker)?;
         }
-    } else if target_kind == TargetKind::Windows && windows_signing_requested() {
+    } else if target_kind == TargetKind::Windows && windows_signing_requested()? {
         verify_windows_signature(&built_binary(&options.target, target_kind))?;
         if include_mermaid_worker {
             verify_windows_signature(&built_mermaid_worker(&options.target, target_kind))?;
@@ -1306,7 +1410,21 @@ fn verify_release(options: &Options) -> Result<()> {
     Ok(())
 }
 
+fn ensure_windows_release_runs_natively(target: &str, operation: &str) -> Result<()> {
+    if TargetKind::parse(target)? != TargetKind::Windows {
+        return Ok(());
+    }
+    let host = host_target();
+    if target != host {
+        return Err(format_error(format!(
+            "{operation} requires a native Windows host matching target `{target}`; current host is `{host}`"
+        )));
+    }
+    Ok(())
+}
+
 fn dev_release(options: &Options) -> Result<()> {
+    ensure_windows_release_runs_natively(&options.target, "dev-release")?;
     let features = selected_features(options, true);
     let target_kind = TargetKind::parse(&options.target)?;
     build_bcode_release(&options.target, &features)?;
@@ -1785,32 +1903,43 @@ fn sign_macos_dev_binary(binary: &Path, identity: &str, keychain: Option<&Path>)
     run_command(&mut command)
 }
 
-fn windows_signing_requested() -> bool {
-    windows_signing_requested_from(
-        env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH").is_some_and(|value| !value.is_empty()),
+fn windows_signing_configuration() -> Result<Option<(std::ffi::OsString, String)>> {
+    windows_signing_configuration_from(
+        env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH"),
+        env::var("WINDOWS_CODESIGN_CERTIFICATE_PASSWORD").ok(),
     )
 }
 
-const fn windows_signing_requested_from(certificate_path: bool) -> bool {
-    certificate_path
+fn windows_signing_configuration_from(
+    certificate: Option<std::ffi::OsString>,
+    password: Option<String>,
+) -> Result<Option<(std::ffi::OsString, String)>> {
+    let certificate = certificate.filter(|value| !value.is_empty());
+    let password = password.filter(|value| !value.is_empty());
+    match (certificate, password) {
+        (None, None) => Ok(None),
+        (Some(certificate), Some(password)) => Ok(Some((certificate, password))),
+        (Some(_), None) => Err(format_error(
+            "WINDOWS_CODESIGN_CERTIFICATE_PASSWORD is required when Windows signing is configured",
+        )),
+        (None, Some(_)) => Err(format_error(
+            "WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH is required when a Windows signing password is configured",
+        )),
+    }
+}
+
+fn windows_signing_requested() -> Result<bool> {
+    Ok(windows_signing_configuration()?.is_some())
 }
 
 fn sign_windows_release_binary_if_configured(binary: &Path) -> Result<()> {
-    let Some(certificate) = env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH") else {
+    let Some((certificate, password)) = windows_signing_configuration()? else {
         println!(
             "WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH not set; leaving {} unsigned",
             binary.display()
         );
         return Ok(());
     };
-    let password = env::var("WINDOWS_CODESIGN_CERTIFICATE_PASSWORD")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            format_error(
-                "WINDOWS_CODESIGN_CERTIFICATE_PASSWORD is required when Windows signing is configured",
-            )
-        })?;
     run_sensitive_command(
         Command::new("signtool")
             .arg("sign")
@@ -1837,6 +1966,7 @@ fn verify_windows_signature(binary: &Path) -> Result<()> {
             .arg("verify")
             .arg("/pa")
             .arg("/all")
+            .arg("/tw")
             .arg("/v")
             .arg(binary),
     )
@@ -1909,11 +2039,40 @@ fn strip_binary(binary: &Path) {
     }
 }
 
-fn create_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
+fn validate_archive_destination(archive: &Path, staging_dir: &Path) -> Result<()> {
+    let staging = staging_dir.canonicalize().map_err(|error| {
+        format_error(format!(
+            "failed to canonicalize release staging directory {}: {error}",
+            staging_dir.display()
+        ))
+    })?;
+    if archive.exists() {
+        let metadata = fs::symlink_metadata(archive)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format_error(format!(
+                "refusing unsafe release archive destination {}",
+                archive.display()
+            )));
+        }
+    }
     let parent = archive
         .parent()
         .ok_or_else(|| format_error("archive path has no parent directory"))?;
     fs::create_dir_all(parent)?;
+    let parent = parent.canonicalize()?;
+    if parent.starts_with(&staging) {
+        return Err(format_error(
+            "release archive destination must not be inside its staging tree",
+        ));
+    }
+    Ok(())
+}
+
+fn create_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
+    validate_archive_destination(archive, staging_dir)?;
+    let parent = archive
+        .parent()
+        .ok_or_else(|| format_error("archive path has no parent directory"))?;
 
     if archive
         .extension()
@@ -1937,6 +2096,7 @@ fn create_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
 }
 
 fn create_zip_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
+    validate_archive_destination(archive, staging_dir)?;
     let mut paths = archive_source_files(staging_dir)?;
     paths.sort();
     let file = File::create(archive)?;
@@ -2063,10 +2223,30 @@ fn write_checksum(archive: &Path) -> Result<()> {
 fn verify_checksum(archive: &Path) -> Result<()> {
     let checksum_path = checksum_path(archive);
     let checksum_text = fs::read_to_string(&checksum_path)?;
-    let expected = checksum_text
-        .split_whitespace()
+    let mut fields = checksum_text.split_whitespace();
+    let expected = fields
         .next()
         .ok_or_else(|| format_error(format!("empty checksum file {}", checksum_path.display())))?;
+    let listed_name = fields.next().ok_or_else(|| {
+        format_error(format!(
+            "checksum file {} omits its archive filename",
+            checksum_path.display()
+        ))
+    })?;
+    if fields.next().is_some()
+        || expected.len() != 64
+        || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || listed_name.strip_prefix('*').unwrap_or(listed_name)
+            != archive
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+    {
+        return Err(format_error(format!(
+            "checksum file {} has invalid or mismatched contents",
+            checksum_path.display()
+        )));
+    }
     let actual = archive_sha256(archive)?;
     if expected.eq_ignore_ascii_case(&actual) {
         Ok(())
@@ -2129,19 +2309,35 @@ fn verify_tar_archive_contents(
     )
 }
 
+fn verification_extraction_path(archive: &Path) -> PathBuf {
+    archive
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            ".{}-{}-{}.verify",
+            archive
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("archive"),
+            std::process::id(),
+            next_verification_temp_id()
+        ))
+}
+
+fn next_verification_temp_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 fn smoke_test_release_archive(
     archive: &Path,
     target_kind: TargetKind,
     include_mermaid_worker: bool,
     include_tesseract: bool,
 ) -> Result<()> {
-    let extraction = archive.with_extension(format!(
-        "{}.verify",
-        archive
-            .extension()
-            .and_then(OsStr::to_str)
-            .unwrap_or("archive")
-    ));
+    let extraction = verification_extraction_path(archive);
     recreate_dir(&extraction)?;
     let result = smoke_test_release_archive_in(
         archive,
@@ -2179,16 +2375,32 @@ fn smoke_test_release_archive_in(
     }
     let binary = extraction.join(binary_file_name(target_kind));
     ensure_file(&binary)?;
-    run_command(Command::new(&binary).arg("--version"))?;
+    let mut version = Command::new(&binary);
+    version.arg("--version");
+    if target_kind == TargetKind::Windows {
+        let smoke_root = extraction.join("windows version smoke 状态");
+        fs::create_dir_all(smoke_root.join("temp"))?;
+        windows_product_smoke_environment(&mut version, extraction, &smoke_root, None);
+        run_command(&mut version)?;
+        fs::remove_dir_all(smoke_root)?;
+    } else {
+        run_command(&mut version)?;
+    }
     if include_mermaid_worker {
-        smoke_test_mermaid_worker(&extraction.join(mermaid_worker_file_name(target_kind)))?;
+        smoke_test_mermaid_worker(
+            &extraction.join(mermaid_worker_file_name(target_kind)),
+            (target_kind == TargetKind::Windows).then_some(extraction),
+        )?;
     }
     if include_tesseract {
-        smoke_test_extracted_tesseract(extraction)?;
+        smoke_test_extracted_tesseract(extraction, target_kind)?;
     }
     if target_kind == TargetKind::Windows {
+        smoke_test_windows_shell_tool(&binary, extraction)?;
+        smoke_test_windows_path_security(&binary, extraction)?;
+        smoke_test_windows_dpapi(&binary, extraction)?;
         smoke_test_windows_daemon(&binary, extraction)?;
-        if windows_signing_requested() {
+        if windows_signing_requested()? {
             verify_windows_signature(&binary)?;
             if include_mermaid_worker {
                 verify_windows_signature(&extraction.join(mermaid_worker_file_name(target_kind)))?;
@@ -2198,9 +2410,13 @@ fn smoke_test_release_archive_in(
     Ok(())
 }
 
-fn smoke_test_extracted_tesseract(extraction: &Path) -> Result<()> {
+fn smoke_test_extracted_tesseract(extraction: &Path, target_kind: TargetKind) -> Result<()> {
     let runtime_root = extraction.join("bcode-runtimes").join("tesseract");
     ensure_dir(&runtime_root)?;
+    if target_kind == TargetKind::Windows {
+        let binary = extraction.join(binary_file_name(target_kind));
+        smoke_test_windows_bundled_ocr(&binary, extraction, &runtime_root)?;
+    }
     run_command(
         Command::new("cargo")
             .arg("run")
@@ -2213,6 +2429,681 @@ fn smoke_test_extracted_tesseract(extraction: &Path) -> Result<()> {
             .arg("bundled-tesseract-default")
             .env("BCODE_TESSERACT_RUNTIME_ROOT", runtime_root),
     )
+}
+
+fn write_windows_ocr_fixture(path: &Path) -> Result<()> {
+    const SCALE: u32 = 8;
+    const GLYPH_WIDTH: u32 = 5;
+    const GLYPH_HEIGHT: u32 = 7;
+    const GAP: u32 = 2;
+    const MARGIN: u32 = 12;
+    let glyphs = [
+        [
+            "11111", "00100", "00100", "00100", "00100", "00100", "00100",
+        ],
+        [
+            "11111", "10000", "10000", "11110", "10000", "10000", "11111",
+        ],
+        [
+            "11111", "10000", "10000", "11111", "00001", "00001", "11111",
+        ],
+        [
+            "11111", "00100", "00100", "00100", "00100", "00100", "00100",
+        ],
+    ];
+    let width = MARGIN * 2
+        + u32::try_from(glyphs.len()).expect("fixture glyph count fits u32") * GLYPH_WIDTH * SCALE
+        + u32::try_from(glyphs.len().saturating_sub(1)).expect("fixture gap count fits u32")
+            * GAP
+            * SCALE;
+    let height = MARGIN * 2 + GLYPH_HEIGHT * SCALE;
+    let mut image = image::GrayImage::from_pixel(width, height, image::Luma([255]));
+    let mut x = MARGIN;
+    for glyph in glyphs {
+        for (row, pattern) in glyph.iter().enumerate() {
+            for (column, pixel) in pattern.bytes().enumerate() {
+                if pixel != b'1' {
+                    continue;
+                }
+                let row = u32::try_from(row).expect("fixture row fits u32");
+                let column = u32::try_from(column).expect("fixture column fits u32");
+                for dy in 0..SCALE {
+                    for dx in 0..SCALE {
+                        image.put_pixel(
+                            x + column * SCALE + dx,
+                            MARGIN + row * SCALE + dy,
+                            image::Luma([0]),
+                        );
+                    }
+                }
+            }
+        }
+        x += (GLYPH_WIDTH + GAP) * SCALE;
+    }
+    image
+        .save_with_format(path, image::ImageFormat::Png)
+        .map_err(|error| format_error(format!("failed to write OCR smoke fixture: {error}")))
+}
+
+fn tool_preparation_payload(
+    invocation_id: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    working_directory: &Path,
+) -> bcode_tool::ToolPreparationRequest {
+    bcode_tool::ToolPreparationRequest {
+        invocation: bcode_tool::ToolInvocationDescriptor {
+            invocation_id: invocation_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            arguments,
+        },
+        host_context: vec![bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+            schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            payload: serde_json::json!({ "working_directory": working_directory }),
+        }],
+    }
+}
+
+fn smoke_test_windows_bundled_ocr(
+    binary: &Path,
+    extraction: &Path,
+    runtime_root: &Path,
+) -> Result<()> {
+    let smoke_root = extraction.join("windows OCR smoke 状态");
+    fs::create_dir_all(smoke_root.join("temp"))?;
+    let fixture = smoke_root.join("fixture test.png");
+    write_windows_ocr_fixture(&fixture)?;
+    let working_directory = extraction.canonicalize()?;
+    let prepare = tool_preparation_payload(
+        "windows-ocr-smoke",
+        "ocr.extract",
+        serde_json::json!({
+            "path": fixture,
+            "language": "eng",
+            "engine": "tesseract",
+            "max_bytes": 1024,
+            "timeout_ms": 30_000
+        }),
+        &working_directory,
+    );
+    let mut prepare_command = Command::new(binary);
+    prepare_command.args([
+        "plugin",
+        "invoke",
+        "bcode.ocr",
+        bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+        bcode_tool::OP_PREPARE_TOOL,
+        &serde_json::to_string(&prepare)
+            .map_err(|error| format_error(format!("failed to encode OCR preparation: {error}")))?,
+    ]);
+    windows_ocr_smoke_environment(&mut prepare_command, extraction, &smoke_root, runtime_root);
+    let prepared_output = command_output(&mut prepare_command)?;
+    let prepared = decode_tool_preparation_response(&prepared_output)?;
+    verify_ocr_preparation(&prepared)?;
+    let invocation = bcode_tool::ToolInvocationRequest {
+        tool_call_id: "windows-ocr-smoke".to_owned(),
+        name: "ocr.extract".to_owned(),
+        arguments: prepare.invocation.arguments,
+        preparation_descriptor: prepared.descriptor,
+    };
+    let mut invoke_command = Command::new(binary);
+    invoke_command.args([
+        "plugin",
+        "invoke",
+        "bcode.ocr",
+        bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+        bcode_tool::OP_INVOKE_TOOL,
+        &serde_json::to_string(&invocation)
+            .map_err(|error| format_error(format!("failed to encode OCR invocation: {error}")))?,
+    ]);
+    windows_ocr_smoke_environment(&mut invoke_command, extraction, &smoke_root, runtime_root);
+    let invocation_output = command_output(&mut invoke_command)?;
+    let response = decode_tool_invocation_response(&invocation_output)?;
+    if response.is_error || !response.output.to_ascii_lowercase().contains("test") {
+        return Err(format_error(format!(
+            "packaged OCR smoke did not recognize expected text: {}",
+            response.output
+        )));
+    }
+    Ok(())
+}
+
+fn windows_ocr_smoke_environment(
+    command: &mut Command,
+    extraction: &Path,
+    smoke_root: &Path,
+    runtime_root: &Path,
+) {
+    windows_product_smoke_environment(command, extraction, smoke_root, Some(runtime_root));
+}
+
+fn response_json(output: &str) -> Result<&str> {
+    let trimmed = output.trim();
+    if trimmed.starts_with("ERROR\t") {
+        return Err(format_error(format!(
+            "packaged plugin service returned an error: {trimmed}"
+        )));
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err(format_error(
+            "packaged plugin service mixed diagnostics with its JSON payload",
+        ));
+    }
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Err(format_error(
+            "packaged plugin service returned no complete JSON payload",
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn decode_tool_preparation_response(output: &str) -> Result<bcode_tool::ToolPreparationResponse> {
+    serde_json::from_str(response_json(output)?)
+        .map_err(|error| format_error(format!("invalid OCR preparation response: {error}")))
+}
+
+fn verify_ocr_preparation(prepared: &bcode_tool::ToolPreparationResponse) -> Result<()> {
+    let fact = prepared
+        .authorization
+        .iter()
+        .find(|fact| fact.resource.as_deref() == Some("ocr.extract"))
+        .ok_or_else(|| {
+            format_error("packaged OCR preparation emitted no correlated authorization fact")
+        })?;
+    if fact.schema_version == 0 || fact.action.is_empty() || fact.namespace.is_empty() {
+        return Err(format_error(
+            "packaged OCR preparation emitted an incomplete authorization fact",
+        ));
+    }
+    let source_path = prepared
+        .descriptor
+        .get("source_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format_error("packaged OCR preparation omitted its confined source path"))?;
+    if !Path::new(source_path).is_absolute() {
+        return Err(format_error(
+            "packaged OCR preparation source path was not absolute",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_tool_invocation_response(output: &str) -> Result<bcode_tool::ToolInvocationResponse> {
+    serde_json::from_str(response_json(output)?)
+        .map_err(|error| format_error(format!("invalid OCR invocation response: {error}")))
+}
+
+fn smoke_test_windows_shell_tool(binary: &Path, extraction: &Path) -> Result<()> {
+    let smoke_root = extraction.join("windows shell smoke 状态");
+    fs::create_dir_all(smoke_root.join("temp"))?;
+    let working_directory = extraction.canonicalize()?;
+    let arguments = serde_json::json!({
+        "command": "echo packaged-windows-shell-smoke",
+        "cwd": "windows shell smoke 状态",
+        "timeout_ms": 30_000,
+        "columns": 80,
+        "rows": 24,
+        "format_commands": false
+    });
+    let preparation = tool_preparation_payload(
+        "windows-shell-smoke",
+        "shell.run",
+        arguments.clone(),
+        &working_directory,
+    );
+    let mut prepare_command = Command::new(binary);
+    prepare_command.args([
+        "plugin",
+        "invoke",
+        "bcode.shell",
+        bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+        bcode_tool::OP_PREPARE_TOOL,
+        &serde_json::to_string(&preparation).map_err(|error| {
+            format_error(format!("failed to encode Shell preparation: {error}"))
+        })?,
+    ]);
+    windows_product_smoke_environment(&mut prepare_command, extraction, &smoke_root, None);
+    let prepared = decode_tool_preparation_response(&command_output(&mut prepare_command)?)?;
+    verify_shell_preparation(&prepared, &working_directory)?;
+    let invocation = bcode_tool::ToolInvocationRequest {
+        tool_call_id: "windows-shell-smoke".to_owned(),
+        name: "shell.run".to_owned(),
+        arguments,
+        preparation_descriptor: prepared.descriptor,
+    };
+    let mut invoke_command = Command::new(binary);
+    invoke_command.args([
+        "plugin",
+        "invoke",
+        "bcode.shell",
+        bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+        bcode_tool::OP_INVOKE_TOOL,
+        &serde_json::to_string(&invocation)
+            .map_err(|error| format_error(format!("failed to encode Shell invocation: {error}")))?,
+    ]);
+    windows_product_smoke_environment(&mut invoke_command, extraction, &smoke_root, None);
+    let response = decode_tool_invocation_response(&command_output(&mut invoke_command)?)?;
+    verify_shell_invocation_response(&response)?;
+    smoke_test_windows_shell_timeout(binary, extraction, &smoke_root, &working_directory)
+}
+
+fn smoke_test_windows_shell_timeout(
+    binary: &Path,
+    extraction: &Path,
+    smoke_root: &Path,
+    working_directory: &Path,
+) -> Result<()> {
+    let timeout_arguments = serde_json::json!({
+        "command": "ping -n 30 127.0.0.1 >NUL",
+        "cwd": "windows shell smoke 状态",
+        "timeout_ms": 250,
+        "columns": 80,
+        "rows": 24,
+        "format_commands": false
+    });
+    let timeout_preparation = tool_preparation_payload(
+        "windows-shell-timeout-smoke",
+        "shell.run",
+        timeout_arguments,
+        working_directory,
+    );
+    let mut timeout_prepare_command = Command::new(binary);
+    timeout_prepare_command.args([
+        "plugin",
+        "invoke",
+        "bcode.shell",
+        bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+        bcode_tool::OP_PREPARE_TOOL,
+        &serde_json::to_string(&timeout_preparation).map_err(|error| {
+            format_error(format!(
+                "failed to encode Shell timeout preparation: {error}"
+            ))
+        })?,
+    ]);
+    windows_product_smoke_environment(&mut timeout_prepare_command, extraction, smoke_root, None);
+    let timeout_prepared =
+        decode_tool_preparation_response(&command_output(&mut timeout_prepare_command)?)?;
+    verify_shell_timeout_preparation(&timeout_prepared, working_directory)?;
+    let timeout_invocation = bcode_tool::ToolInvocationRequest {
+        tool_call_id: "windows-shell-timeout-smoke".to_owned(),
+        name: "shell.run".to_owned(),
+        arguments: timeout_preparation.invocation.arguments,
+        preparation_descriptor: timeout_prepared.descriptor,
+    };
+    let mut timeout_invoke_command = Command::new(binary);
+    timeout_invoke_command.args([
+        "plugin",
+        "invoke",
+        "bcode.shell",
+        bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+        bcode_tool::OP_INVOKE_TOOL,
+        &serde_json::to_string(&timeout_invocation).map_err(|error| {
+            format_error(format!(
+                "failed to encode Shell timeout invocation: {error}"
+            ))
+        })?,
+    ]);
+    windows_product_smoke_environment(&mut timeout_invoke_command, extraction, smoke_root, None);
+    let timeout_response =
+        decode_tool_invocation_response(&command_output(&mut timeout_invoke_command)?)?;
+    verify_shell_timeout_response(&timeout_response)
+}
+
+fn verify_shell_timeout_preparation(
+    prepared: &bcode_tool::ToolPreparationResponse,
+    expected_workspace: &Path,
+) -> Result<()> {
+    let workspace = prepared
+        .descriptor
+        .get("workspace_root")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format_error("packaged Shell timeout preparation omitted its workspace"))?;
+    if Path::new(workspace) != expected_workspace
+        || prepared
+            .descriptor
+            .get("timeout_ms")
+            .and_then(serde_json::Value::as_u64)
+            != Some(250)
+    {
+        return Err(format_error(
+            "packaged Shell timeout preparation did not retain its confined workspace and timeout",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_shell_timeout_response(response: &bcode_tool::ToolInvocationResponse) -> Result<()> {
+    let Some(bcode_tool::ToolInvocationResult::Artifact { artifact }) = response.result.as_ref()
+    else {
+        return Err(format_error(
+            "packaged Shell timeout smoke returned no semantic artifact",
+        ));
+    };
+    let metadata = &artifact.metadata;
+    if artifact.producer_plugin_id != "bcode.shell"
+        || artifact.schema != "bcode.shell.run"
+        || metadata
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || metadata
+            .get("cancelled")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    {
+        return Err(format_error(format!(
+            "packaged Shell timeout smoke returned an unstable terminal result: {metadata}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_shell_preparation(
+    prepared: &bcode_tool::ToolPreparationResponse,
+    expected_workspace: &Path,
+) -> Result<()> {
+    let fact = prepared
+        .authorization
+        .iter()
+        .find(|fact| fact.resource.as_deref() == Some("shell.run"))
+        .ok_or_else(|| {
+            format_error("packaged Shell preparation emitted no correlated authorization fact")
+        })?;
+    if fact.schema_version == 0 || fact.action.is_empty() || fact.namespace.is_empty() {
+        return Err(format_error(
+            "packaged Shell preparation emitted an incomplete authorization fact",
+        ));
+    }
+    let workspace = prepared
+        .descriptor
+        .get("workspace_root")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format_error("packaged Shell preparation omitted its workspace root"))?;
+    if Path::new(workspace) != expected_workspace {
+        return Err(format_error(format!(
+            "packaged Shell preparation workspace {workspace} did not match {}",
+            expected_workspace.display()
+        )));
+    }
+    if prepared
+        .descriptor
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        != Some(30_000)
+    {
+        return Err(format_error(
+            "packaged Shell preparation did not retain its bounded timeout",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_shell_invocation_response(response: &bcode_tool::ToolInvocationResponse) -> Result<()> {
+    if response.is_error {
+        return Err(format_error(format!(
+            "packaged Shell smoke returned an error: {}",
+            response.output
+        )));
+    }
+    let Some(bcode_tool::ToolInvocationResult::Artifact { artifact }) = response.result.as_ref()
+    else {
+        return Err(format_error(
+            "packaged Shell smoke returned no semantic artifact",
+        ));
+    };
+    if artifact.producer_plugin_id != "bcode.shell" || artifact.schema != "bcode.shell.run" {
+        return Err(format_error(
+            "packaged Shell smoke returned an unexpected artifact contract",
+        ));
+    }
+    let metadata = &artifact.metadata;
+    let output = metadata
+        .get("output_tail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if metadata.get("mode").and_then(serde_json::Value::as_str) != Some("terminal")
+        || metadata
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            != Some(0)
+        || metadata
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || metadata
+            .get("cancelled")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || !output.contains("packaged-windows-shell-smoke")
+    {
+        return Err(format_error(format!(
+            "packaged Shell smoke returned an invalid terminal result: {metadata}"
+        )));
+    }
+    Ok(())
+}
+
+fn windows_product_smoke_environment(
+    command: &mut Command,
+    extraction: &Path,
+    smoke_root: &Path,
+    runtime_root: Option<&Path>,
+) {
+    command
+        .env_clear()
+        .current_dir(extraction)
+        .env("PATH", extraction)
+        .env("SYSTEMROOT", env::var_os("SYSTEMROOT").unwrap_or_default())
+        .env(
+            "WINDIR",
+            env::var_os("WINDIR")
+                .or_else(|| env::var_os("SYSTEMROOT"))
+                .unwrap_or_default(),
+        )
+        .env("BCODE_CONFIG_TOML", "")
+        .env("BCODE_STATE_DIR", smoke_root.join("state"))
+        .env("USERPROFILE", smoke_root)
+        .env("APPDATA", smoke_root.join("appdata"))
+        .env("LOCALAPPDATA", smoke_root.join("local-appdata"))
+        .env("TEMP", smoke_root.join("temp"))
+        .env("TMP", smoke_root.join("temp"));
+    if let Some(runtime_root) = runtime_root {
+        command.env("BCODE_TESSERACT_RUNTIME_ROOT", runtime_root);
+    }
+}
+
+fn smoke_test_windows_path_security(binary: &Path, extraction: &Path) -> Result<()> {
+    let smoke_root = extraction.join("windows path smoke 状态");
+    let workspace = smoke_root.join("authorized workspace");
+    let outside = smoke_root.join("outside fixtures");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&outside)?;
+    write_windows_ocr_fixture(&outside.join("fixture.png"))?;
+    let link = workspace.join("escape directory");
+    let link_status = Command::new("cmd")
+        .args([
+            "/D",
+            "/C",
+            "mklink",
+            "/J",
+            &link.display().to_string(),
+            &outside.display().to_string(),
+        ])
+        .status()?;
+    if !link_status.success() {
+        return Err(format_error(
+            "Windows path smoke could not create the required directory reparse-point fixture",
+        ));
+    }
+    let canonical_workspace = workspace.canonicalize()?;
+    let preparation = tool_preparation_payload(
+        "windows-path-smoke",
+        "ocr.extract",
+        serde_json::json!({
+            "path": "escape directory/fixture.png",
+            "language": "eng",
+            "engine": "tesseract"
+        }),
+        &canonical_workspace,
+    );
+    let mut command = Command::new(binary);
+    command.args([
+        "plugin",
+        "invoke",
+        "bcode.ocr",
+        bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+        bcode_tool::OP_PREPARE_TOOL,
+        &serde_json::to_string(&preparation).map_err(|error| {
+            format_error(format!(
+                "failed to encode path-security preparation: {error}"
+            ))
+        })?,
+    ]);
+    windows_product_smoke_environment(&mut command, extraction, &smoke_root, None);
+    let output = command_output(&mut command)?;
+    if !output.starts_with("ERROR\tinvalid_preparation\t") || !output.contains("escapes workspace")
+    {
+        return Err(format_error(format!(
+            "packaged path-security smoke did not reject reparse-point escape: {output}"
+        )));
+    }
+    fs::remove_dir_all(smoke_root)?;
+    Ok(())
+}
+
+fn smoke_test_windows_dpapi(binary: &Path, extraction: &Path) -> Result<()> {
+    let smoke_root = extraction.join("windows DPAPI smoke 状态");
+    fs::create_dir_all(smoke_root.join("temp"))?;
+    let vault = smoke_root.join("auth vault.age");
+    let config = smoke_root.join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[auth.profiles.windows-smoke]\nprovider_id = \"xai\"\nowner_plugin_id = \"bcode.xai\"\nbackend = \"sshenv\"\nscheme = \"api_key\"\n\n[auth.profiles.windows-smoke.settings]\nprofile = \"windows-smoke\"\nvault = {:?}\ndevice_seal = \"required\"\ndevice_seal_backend = \"windows-dpapi-current-user\"\ndevice_seal_strict = \"true\"\n",
+            vault.display().to_string()
+        ),
+    )?;
+    let mut login = Command::new(binary);
+    login.args([
+        "login",
+        "xai",
+        "--api-key",
+        "bcode-windows-dpapi-smoke-secret",
+        "--profile",
+        "windows-smoke",
+        "--vault",
+        &vault.display().to_string(),
+    ]);
+    windows_auth_smoke_environment(&mut login, extraction, &smoke_root, &config);
+    let login_output = command_output(&mut login)?;
+    if !login_output.contains("Authentication saved") {
+        return Err(format_error(
+            "packaged DPAPI login did not report successful enrollment",
+        ));
+    }
+    let mut inspect = Command::new(binary);
+    inspect.args([
+        "auth",
+        "security",
+        "--provider",
+        "xai",
+        "--profile",
+        "windows-smoke",
+        "--vault",
+        &vault.display().to_string(),
+        "--require-backend",
+        "windows-dpapi-current-user",
+    ]);
+    windows_auth_smoke_environment(&mut inspect, extraction, &smoke_root, &config);
+    let inspect_output = command_output(&mut inspect)?;
+    let status: bcode_provider_auth::security::AuthSecurityStatus =
+        serde_json::from_str(response_json(&inspect_output)?).map_err(|error| {
+            format_error(format!("invalid packaged DPAPI security status: {error}"))
+        })?;
+    if !status.vault_exists
+        || !status.profile_exists
+        || !status.profile_device_sealed
+        || !status.policy_satisfied
+        || status.device_seal_backend.as_deref() != Some("windows-dpapi-current-user")
+    {
+        return Err(format_error(format!(
+            "packaged DPAPI security status was incomplete: {status:?}"
+        )));
+    }
+    if inspect_output.contains("bcode-windows-dpapi-smoke-secret") {
+        return Err(format_error(
+            "packaged DPAPI security output leaked the smoke credential",
+        ));
+    }
+
+    let dpapi_secret = smoke_root.join(".sshenv").join("device-seal-dpapi");
+    ensure_file(&dpapi_secret)?;
+    fs::write(&dpapi_secret, "not-valid-dpapi-ciphertext\n")?;
+    let mut failed_inspect = Command::new(binary);
+    failed_inspect.args([
+        "auth",
+        "security",
+        "--provider",
+        "xai",
+        "--profile",
+        "windows-smoke",
+        "--vault",
+        &vault.display().to_string(),
+        "--require-backend",
+        "windows-dpapi-current-user",
+    ]);
+    windows_auth_smoke_environment(&mut failed_inspect, extraction, &smoke_root, &config);
+    let failure = failed_inspect.output()?;
+    if failure.status.success() {
+        return Err(format_error(
+            "packaged DPAPI failure smoke unexpectedly accepted corrupt sealed state",
+        ));
+    }
+    let failure_stdout = String::from_utf8_lossy(&failure.stdout);
+    let failure_stderr = String::from_utf8_lossy(&failure.stderr);
+    verify_dpapi_failure_diagnostic(&failure_stdout, &failure_stderr, &smoke_root)?;
+
+    fs::remove_dir_all(&smoke_root)?;
+    Ok(())
+}
+
+fn verify_dpapi_failure_diagnostic(stdout: &str, stderr: &str, smoke_root: &Path) -> Result<()> {
+    let combined = format!("{stdout}\n{stderr}").to_lowercase();
+    if !combined.contains("auth vault security")
+        || !(combined.contains("device seal") || combined.contains("dpapi"))
+    {
+        return Err(format_error(format!(
+            "packaged DPAPI failure did not emit a normalized auth-security diagnostic: {combined}"
+        )));
+    }
+    for forbidden in [
+        "bcode-windows-dpapi-smoke-secret".to_owned(),
+        smoke_root.display().to_string().to_lowercase(),
+        "not-valid-dpapi-ciphertext".to_owned(),
+    ] {
+        if combined.contains(&forbidden) {
+            return Err(format_error(
+                "packaged DPAPI failure diagnostic exposed secret or private path data",
+            ));
+        }
+    }
+    if combined.len() > 16 * 1024 {
+        return Err(format_error(
+            "packaged DPAPI failure diagnostic exceeded the bounded output limit",
+        ));
+    }
+    Ok(())
+}
+
+fn windows_auth_smoke_environment(
+    command: &mut Command,
+    extraction: &Path,
+    smoke_root: &Path,
+    config: &Path,
+) {
+    windows_product_smoke_environment(command, extraction, smoke_root, None);
+    command.env("BCODE_CONFIG", config);
 }
 
 fn smoke_test_windows_shell_contract() -> Result<()> {
@@ -2246,25 +3137,153 @@ fn smoke_test_windows_child_termination() -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct WindowsSmokeState {
+    registry_path: String,
+    instance_id: String,
+    executable_path: String,
+    executable_digest: String,
+}
+
+fn read_windows_smoke_records(
+    state_dir: &Path,
+) -> Result<Vec<bcode_daemon_lifecycle::DaemonRecord>> {
+    let registry = bcode_daemon_lifecycle::registry_dir(state_dir);
+    let mut records = Vec::new();
+    for entry in fs::read_dir(&registry)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        {
+            records.push(
+                serde_json::from_slice(&fs::read(entry.path())?).map_err(|error| {
+                    format_error(format!("invalid daemon smoke record: {error}"))
+                })?,
+            );
+        }
+    }
+    Ok(records)
+}
+
+fn windows_smoke_state(
+    binary: &Path,
+    smoke_root: &Path,
+    records: Vec<bcode_daemon_lifecycle::DaemonRecord>,
+) -> Result<WindowsSmokeState> {
+    let state_dir = smoke_root.join("state");
+    let record = records
+        .into_iter()
+        .find(bcode_daemon_lifecycle::DaemonRecord::is_current_namespace)
+        .ok_or_else(|| format_error("Windows smoke daemon registry record was not created"))?;
+    let executable_path = record.executable_path.as_deref().ok_or_else(|| {
+        format_error("Windows smoke daemon registry record has no executable path")
+    })?;
+    let canonical_executable = executable_path.canonicalize()?;
+    let expected_executable = binary.canonicalize()?;
+    let image_root = state_dir.join("daemon-images").canonicalize()?;
+    if !canonical_executable.starts_with(&image_root) {
+        return Err(format_error(format!(
+            "Windows smoke daemon executable {} escaped isolated image root {}",
+            canonical_executable.display(),
+            image_root.display()
+        )));
+    }
+    let executable_digest = record.executable_digest.clone().ok_or_else(|| {
+        format_error("Windows smoke daemon registry record has no executable digest")
+    })?;
+    if executable_digest != archive_sha256(binary)?
+        || executable_digest != archive_sha256(&expected_executable)?
+        || executable_digest != archive_sha256(&canonical_executable)?
+    {
+        return Err(format_error(
+            "Windows smoke daemon executable digest does not match extracted binary",
+        ));
+    }
+    let registry_path = bcode_daemon_lifecycle::record_path(&state_dir, &record.namespace);
+    ensure_file(&registry_path)?;
+    Ok(WindowsSmokeState {
+        registry_path: registry_path.display().to_string(),
+        instance_id: record.instance_id,
+        executable_path: canonical_executable.display().to_string(),
+        executable_digest,
+    })
+}
+
+fn windows_smoke_environment(
+    command: &mut Command,
+    extraction: &Path,
+    smoke_root: &Path,
+    config: &Path,
+) {
+    windows_product_smoke_environment(command, extraction, smoke_root, None);
+    command
+        .env("BCODE_CONFIG", config)
+        .env(
+            "BCODE_TESSERACT_RUNTIME_ROOT",
+            extraction.join("bcode-runtimes").join("tesseract"),
+        )
+        .env("APPDATA", smoke_root.join("appdata"))
+        .env("LOCALAPPDATA", smoke_root.join("local-appdata"))
+        .env("TEMP", smoke_root.join("temp"))
+        .env("TMP", smoke_root.join("temp"))
+        .env("BCODE_DAEMON_LOG", smoke_root.join("daemon.log"));
+}
+
+fn windows_long_smoke_root(extraction: &Path, label: &str) -> PathBuf {
+    let mut root = extraction.join(format!("{label} 状态 with spaces"));
+    let mut index = 0_u8;
+    while root.as_os_str().to_string_lossy().encode_utf16().count() < 280 {
+        root.push(format!("long path segment {index:02} 数据"));
+        index = index.wrapping_add(1);
+    }
+    root
+}
+
 fn smoke_test_windows_daemon(binary: &Path, extraction: &Path) -> Result<()> {
-    let smoke_root = extraction.join("windows smoke 状态");
-    fs::create_dir_all(&smoke_root)?;
+    let smoke_root = windows_long_smoke_root(extraction, "windows daemon smoke");
+    fs::create_dir_all(smoke_root.join("temp"))?;
     let config = smoke_root.join("config.toml");
     fs::write(&config, "")?;
     smoke_test_windows_shell_contract()?;
     let isolated_environment = |command: &mut Command| {
-        command
-            .env("BCODE_CONFIG", &config)
-            .env("APPDATA", smoke_root.join("appdata"))
-            .env("LOCALAPPDATA", smoke_root.join("local-appdata"))
-            .env("BCODE_DAEMON_LOG", smoke_root.join("daemon.log"));
+        windows_smoke_environment(command, extraction, &smoke_root, &config);
     };
     let mut start = Command::new(binary);
     start.args(["server", "start"]);
     isolated_environment(&mut start);
-    run_command(&mut start)?;
+    if let Err(error) = run_command(&mut start) {
+        let mut force_stop = Command::new(binary);
+        force_stop.args(["server", "stop", "--force"]);
+        isolated_environment(&mut force_stop);
+        let _ = force_stop.status();
+        return Err(error);
+    }
 
-    let result = smoke_test_running_windows_daemon(binary, &isolated_environment);
+    let result = smoke_test_running_windows_daemon(binary, &smoke_root, &isolated_environment)
+        .and_then(|first_state| {
+            let mut second_start = Command::new(binary);
+            second_start.args(["server", "start"]);
+            isolated_environment(&mut second_start);
+            run_command(&mut second_start)?;
+            let second_state = windows_smoke_state(
+                binary,
+                &smoke_root,
+                read_windows_smoke_records(&smoke_root.join("state"))?,
+            )?;
+            if first_state.instance_id != second_state.instance_id
+                || first_state.registry_path != second_state.registry_path
+                || first_state.executable_path != second_state.executable_path
+                || first_state.executable_digest != second_state.executable_digest
+            {
+                return Err(format_error(
+                    "second Windows daemon start did not reuse the registered extracted daemon",
+                ));
+            }
+            Ok(first_state)
+        });
     let mut stop = Command::new(binary);
     stop.args(["server", "stop"]);
     isolated_environment(&mut stop);
@@ -2277,19 +3296,58 @@ fn smoke_test_windows_daemon(binary: &Path, extraction: &Path) -> Result<()> {
             let _ = force_stop.status();
             Err(error)
         }
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(state), Ok(())) => {
+            if Path::new(&state.registry_path).exists() {
+                return Err(format_error(
+                    "Windows daemon registry record remained after graceful shutdown",
+                ));
+            }
+            let stale_image = smoke_root
+                .join("state")
+                .join("daemon-images")
+                .join("stale-smoke")
+                .join("obsolete")
+                .join("bcode.exe");
+            if let Some(parent) = stale_image.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&stale_image, b"obsolete Windows daemon smoke image")?;
+            let mut cleanup = Command::new(binary);
+            cleanup.args(["server", "cleanup"]);
+            isolated_environment(&mut cleanup);
+            run_command(&mut cleanup)?;
+            if stale_image.exists() {
+                return Err(format_error(
+                    "Windows daemon cleanup retained an unreferenced stale image",
+                ));
+            }
+            ensure_file(Path::new(&state.executable_path))
+        }
     }
 }
 
 fn smoke_test_running_windows_daemon(
     binary: &Path,
+    smoke_root: &Path,
     isolated_environment: &impl Fn(&mut Command),
-) -> Result<()> {
+) -> Result<WindowsSmokeState> {
     let mut status = Command::new(binary);
     status.args(["server", "status", "--verbose"]);
     isolated_environment(&mut status);
-    run_command(&mut status)
+    let output_text = command_output(&mut status)?;
+    let records = read_windows_smoke_records(&smoke_root.join("state"))?;
+    let state = windows_smoke_state(binary, smoke_root, records)?;
+    if !output_text.contains(&state.instance_id)
+        || !output_text.contains(&state.executable_digest)
+        || !output_text.contains(&state.executable_path)
+        || !output_text.contains("registry identity: consistent")
+    {
+        return Err(format_error(
+            "Windows daemon verbose status did not report the persisted isolated identity",
+        ));
+    }
+    Ok(state)
 }
 
 fn extract_zip_confined<R: io::Read + io::Seek>(
@@ -2315,7 +3373,7 @@ fn extract_zip_confined<R: io::Read + io::Seek>(
     Ok(())
 }
 
-fn smoke_test_mermaid_worker(worker: &Path) -> Result<()> {
+fn smoke_test_mermaid_worker(worker: &Path, windows_extraction: Option<&Path>) -> Result<()> {
     ensure_file(worker)?;
     let source = b"graph TD; A-->B";
     let mut request = Vec::new();
@@ -2330,11 +3388,20 @@ fn smoke_test_mermaid_worker(worker: &Path) -> Result<()> {
             .to_be_bytes(),
     );
     request.extend_from_slice(source);
-    let mut child = Command::new(worker)
+    let mut command = Command::new(worker);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    let windows_smoke_root = windows_extraction.map(|extraction| {
+        let root = extraction.join("windows mermaid smoke 状态");
+        (extraction, root)
+    });
+    if let Some((extraction, smoke_root)) = &windows_smoke_root {
+        fs::create_dir_all(smoke_root.join("temp"))?;
+        windows_product_smoke_environment(&mut command, extraction, smoke_root, None);
+    }
+    let mut child = command.spawn()?;
     child
         .stdin
         .take()
@@ -2351,6 +3418,9 @@ fn smoke_test_mermaid_worker(worker: &Path) -> Result<()> {
             output.status,
             output.stdout.len()
         )));
+    }
+    if let Some((_, smoke_root)) = windows_smoke_root {
+        fs::remove_dir_all(smoke_root)?;
     }
     Ok(())
 }
@@ -2482,8 +3552,29 @@ const fn mermaid_worker_file_name(target_kind: TargetKind) -> &'static str {
 }
 
 fn recreate_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        fs::remove_dir_all(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format_error(format!(
+                    "refusing to replace release directory link {}",
+                    path.display()
+                )));
+            }
+            if !metadata.is_dir() {
+                return Err(format_error(format!(
+                    "refusing to replace non-directory release path {}",
+                    path.display()
+                )));
+            }
+            fs::remove_dir_all(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format_error(format!(
+                "failed to inspect release directory {}: {error}",
+                path.display()
+            )));
+        }
     }
     fs::create_dir_all(path)?;
     Ok(())
@@ -2711,6 +3802,174 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn archive_creation_rejects_link_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(&staging).expect("staging");
+        fs::write(staging.join("bcode"), b"binary").expect("binary");
+        let outside = temp.path().join("outside.zip");
+        fs::write(&outside, b"preserve").expect("outside");
+        let archive = temp.path().join("release.zip");
+        symlink(&outside, &archive).expect("archive link");
+
+        assert!(create_zip_archive(&archive, &staging).is_err());
+        assert_eq!(fs::read(&outside).expect("preserved"), b"preserve");
+    }
+
+    #[test]
+    fn archive_creation_rejects_destination_inside_staging() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(&staging).expect("staging");
+        fs::write(staging.join("bcode"), b"binary").expect("binary");
+
+        assert!(create_zip_archive(&staging.join("release.zip"), &staging).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recreate_dir_rejects_link_destinations() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside");
+        let linked = temp.path().join("linked");
+        symlink(&outside, &linked).expect("directory link");
+
+        assert!(recreate_dir(&linked).is_err());
+        assert!(outside.is_dir());
+    }
+
+    #[test]
+    fn release_artifact_inputs_reject_unsafe_versions_and_output_roots() {
+        let mut options = Options::help();
+        options.command = CommandName::Release;
+        options.version = "../escape".to_owned();
+        assert!(validate_artifact_inputs(&options).is_err());
+        for version in [".hidden", "-option", "_private"] {
+            options.version = version.to_owned();
+            assert!(validate_artifact_inputs(&options).is_err(), "{version}");
+        }
+
+        options.version = "v1.2.3-rc_1".to_owned();
+        assert!(validate_artifact_inputs(&options).is_ok());
+
+        let outside = tempfile::tempdir().expect("outside output");
+        options.out_dir = outside.path().join("dist");
+        assert!(validate_artifact_inputs(&options).is_err());
+    }
+
+    #[test]
+    fn non_host_runtime_search_never_falls_back_to_host_build_outputs() {
+        let root = Path::new("/workspace");
+        let non_host = if host_target() == "x86_64-pc-windows-msvc" {
+            "x86_64-unknown-linux-gnu"
+        } else {
+            "x86_64-pc-windows-msvc"
+        };
+        let dirs = runtime_build_search_dirs(non_host, root);
+        assert_eq!(dirs.len(), 2);
+        assert!(
+            dirs.iter()
+                .all(|path| path.starts_with(root.join("target").join(non_host)))
+        );
+        assert!(!dirs.contains(&root.join("target").join("debug").join("build")));
+    }
+
+    #[test]
+    fn recreate_dir_rejects_non_directory_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let file = temp.path().join("release");
+        std::fs::write(&file, b"do not replace").expect("file");
+
+        assert!(recreate_dir(&file).is_err());
+        assert_eq!(
+            std::fs::read(&file).expect("preserved file"),
+            b"do not replace"
+        );
+    }
+
+    #[test]
+    fn windows_release_requires_native_windows_execution() {
+        let host = host_target();
+        assert!(ensure_windows_release_runs_natively(&host, "release").is_ok());
+        if host != "x86_64-pc-windows-msvc" {
+            let error = ensure_windows_release_runs_natively("x86_64-pc-windows-msvc", "release")
+                .expect_err("cross-host Windows release must fail");
+            assert!(error.0.contains("requires a native Windows host"));
+            assert!(error.0.contains(&host));
+            for operation in ["package-tesseract-runtimes", "smoke-test-tesseract"] {
+                let error =
+                    ensure_windows_release_runs_natively("x86_64-pc-windows-msvc", operation)
+                        .expect_err("cross-host Windows runtime operation must fail");
+                assert!(error.0.contains(operation));
+            }
+        }
+    }
+
+    #[test]
+    fn windows_long_smoke_roots_cover_spaces_unicode_and_legacy_max_path() {
+        let root = windows_long_smoke_root(Path::new(r"C:\\release"), "daemon smoke");
+        let text = root.as_os_str().to_string_lossy();
+        assert!(text.contains(' '));
+        assert!(text.contains("数据"));
+        assert!(text.encode_utf16().count() >= 280);
+    }
+
+    #[test]
+    fn dpapi_failure_diagnostics_are_normalized_bounded_and_secret_safe() {
+        let root = Path::new(r"C:\\private\\windows DPAPI smoke 状态");
+        assert!(
+            verify_dpapi_failure_diagnostic(
+                "ERROR: Auth vault security requirement is not satisfied: device seal unavailable",
+                "",
+                root,
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_dpapi_failure_diagnostic(
+                "Auth vault security DPAPI error: bcode-windows-dpapi-smoke-secret",
+                "",
+                root,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_dpapi_failure_diagnostic(
+                &format!("Auth vault security DPAPI error at {}", root.display()),
+                "",
+                root,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_dpapi_failure_diagnostic(
+                "Auth vault security DPAPI error: not-valid-dpapi-ciphertext",
+                "",
+                root,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_dpapi_failure_diagnostic(
+                &format!(
+                    "Auth vault security device seal error: {}",
+                    "x".repeat(20_000)
+                ),
+                "",
+                root,
+            )
+            .is_err()
+        );
+        assert!(verify_dpapi_failure_diagnostic("unclassified failure", "", root).is_err());
+    }
+
+    #[test]
     fn platform_release_file_names_and_extensions_are_explicit() {
         assert_eq!(binary_file_name(TargetKind::Windows), "bcode.exe");
         assert_eq!(
@@ -2723,9 +3982,38 @@ mod tests {
     }
 
     #[test]
-    fn windows_signing_requires_a_certificate_path() {
-        assert!(!windows_signing_requested_from(false));
-        assert!(windows_signing_requested_from(true));
+    fn windows_signing_configuration_requires_a_complete_secret_pair() {
+        assert!(
+            windows_signing_configuration_from(None, None)
+                .expect("unsigned configuration")
+                .is_none()
+        );
+        assert!(
+            windows_signing_configuration_from(
+                Some(std::ffi::OsString::from("certificate.pfx")),
+                Some("password".to_owned())
+            )
+            .expect("complete signing configuration")
+            .is_some()
+        );
+        let missing_password = windows_signing_configuration_from(
+            Some(std::ffi::OsString::from("certificate.pfx")),
+            None,
+        )
+        .expect_err("certificate without password must fail");
+        assert!(
+            missing_password
+                .0
+                .contains("WINDOWS_CODESIGN_CERTIFICATE_PASSWORD")
+        );
+        let missing_certificate =
+            windows_signing_configuration_from(None, Some("password".to_owned()))
+                .expect_err("password without certificate must fail");
+        assert!(
+            missing_certificate
+                .0
+                .contains("WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH")
+        );
     }
 
     #[test]
@@ -2828,9 +4116,35 @@ mod tests {
         fs::create_dir_all(&staging).expect("staging");
         fs::write(staging.join("not-bcode"), b"invalid").expect("invalid artifact");
         create_zip_archive(&archive, &staging).expect("archive");
-        let extraction = archive.with_extension("zip.verify");
+        let first_extraction = verification_extraction_path(&archive);
+        let second_extraction = verification_extraction_path(&archive);
+        assert_ne!(first_extraction, second_extraction);
         assert!(smoke_test_release_archive(&archive, TargetKind::Windows, true, true).is_err());
-        assert!(!extraction.exists());
+        let leaked = fs::read_dir(temp.path())
+            .expect("temp entries")
+            .filter_map(std::result::Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".verify"));
+        assert!(!leaked);
+    }
+
+    #[test]
+    fn runtime_tree_manifest_detects_content_and_layout_drift() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("source");
+        let packaged = temp.path().join("packaged");
+        fs::create_dir_all(source.join("5.5.2/lib")).expect("source dirs");
+        fs::write(source.join("5.5.2/lib/tesseract.dll"), b"dll").expect("source DLL");
+        copy_dir_recursive(&source, &packaged).expect("copy runtime");
+        assert_eq!(
+            runtime_tree_manifest(&source).expect("source manifest"),
+            runtime_tree_manifest(&packaged).expect("packaged manifest")
+        );
+
+        fs::write(packaged.join("5.5.2/lib/tesseract.dll"), b"changed").expect("change DLL");
+        assert_ne!(
+            runtime_tree_manifest(&source).expect("source manifest"),
+            runtime_tree_manifest(&packaged).expect("changed manifest")
+        );
     }
 
     #[test]
@@ -2840,6 +4154,13 @@ mod tests {
         fs::write(&archive, b"original").expect("archive");
         write_checksum(&archive).expect("write checksum");
         verify_checksum(&archive).expect("valid checksum");
+        let checksum = checksum_path(&archive);
+        let digest = archive_sha256(&archive).expect("digest");
+        fs::write(&checksum, format!("{digest}  other.zip\n")).expect("mismatched name");
+        assert!(verify_checksum(&archive).is_err());
+        fs::write(&checksum, format!("{digest}  release.zip extra\n")).expect("extra field");
+        assert!(verify_checksum(&archive).is_err());
+        write_checksum(&archive).expect("restore checksum");
         fs::write(&archive, b"changed").expect("change archive");
         assert!(verify_checksum(&archive).is_err());
     }

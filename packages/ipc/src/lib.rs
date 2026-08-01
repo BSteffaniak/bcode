@@ -3036,11 +3036,16 @@ fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+#[cfg(unix)]
 fn prepare_endpoint_for_bind(endpoint: &IpcEndpoint) -> Result<(), IpcTransportError> {
-    #[cfg(unix)]
     if let Some(path) = endpoint.as_unix_socket() {
         prepare_unix_socket_path_for_bind(path)?;
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+const fn prepare_endpoint_for_bind(_endpoint: &IpcEndpoint) -> Result<(), IpcTransportError> {
     Ok(())
 }
 
@@ -3170,9 +3175,124 @@ pub fn default_endpoint() -> IpcEndpoint {
     }
     #[cfg(windows)]
     {
-        let user = env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
-        IpcEndpoint::windows_named_pipe(format!(r"\\.\pipe\bcode-{user}-{}", daemon_namespace()))
+        let user_scope = current_windows_user_scope();
+        IpcEndpoint::windows_named_pipe(format!(
+            r"\\.\pipe\bcode-{user_scope}-{}",
+            daemon_namespace()
+        ))
     }
+}
+
+#[cfg(windows)]
+fn current_windows_user_scope() -> String {
+    windows_token_user_scope().unwrap_or_else(|_| {
+        windows_user_scope(
+            env::var("USERDOMAIN").ok().as_deref(),
+            env::var("USERNAME").ok().as_deref(),
+            env::var_os("USERPROFILE").as_deref().map(Path::new),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn windows_token_user_scope() -> std::io::Result<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct Token(HANDLE);
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is an owned token handle returned by `OpenProcessToken`.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: The pseudo process handle is always valid and `token` points to writable storage.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = Token(token);
+    let mut required = 0;
+    // SAFETY: A null output buffer with zero length is the documented size query.
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &raw mut required,
+        );
+    }
+    if required == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let word_size = std::mem::size_of::<usize>();
+    let words = usize::try_from(required)
+        .map_err(|_| std::io::Error::other("Windows token information length overflow"))?
+        .div_ceil(word_size);
+    let mut buffer = vec![0_usize; words];
+    // SAFETY: `buffer` is aligned for `TOKEN_USER`, has at least `required` writable bytes, and the
+    // token remains open for the duration of the query and SID read.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            required,
+            &raw mut required,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: A successful `TokenUser` query writes a `TOKEN_USER` at the start of the buffer.
+    let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    // SAFETY: `token_user.User.Sid` is valid while `buffer` remains alive.
+    let sid_length = unsafe { GetLengthSid(token_user.User.Sid) };
+    if sid_length == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `GetLengthSid` returned the exact readable byte length for this SID.
+    let sid = unsafe {
+        std::slice::from_raw_parts(
+            token_user.User.Sid.cast::<u8>(),
+            usize::try_from(sid_length)
+                .map_err(|_| std::io::Error::other("Windows SID length overflow"))?,
+        )
+    };
+    Ok(short_scope_digest(&[sid]))
+}
+
+#[cfg(any(windows, test))]
+fn windows_user_scope(
+    domain: Option<&str>,
+    username: Option<&str>,
+    profile: Option<&Path>,
+) -> String {
+    let domain = domain.unwrap_or_default().trim().to_lowercase();
+    let username = username.unwrap_or_default().trim().to_lowercase();
+    let profile = profile
+        .map(|path| path.as_os_str().to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    short_scope_digest(&[domain.as_bytes(), username.as_bytes(), profile.as_bytes()])
+}
+
+#[cfg(any(windows, test))]
+fn short_scope_digest(components: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for component in components {
+        hasher.update(component);
+        hasher.update([0]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..16].to_owned()
 }
 
 fn endpoint_override_allowed_for_current_process() -> bool {
@@ -3253,6 +3373,37 @@ mod tests {
     }
 
     #[test]
+    fn windows_user_scope_is_normalized_bounded_and_collision_resistant() {
+        let first = windows_user_scope(
+            Some("Example"),
+            Some("Alice"),
+            Some(Path::new(r"C:\\Users\\Alice")),
+        );
+        let equivalent = windows_user_scope(
+            Some("example"),
+            Some(" alice "),
+            Some(Path::new(r"c:\\users\\alice")),
+        );
+        let other_domain = windows_user_scope(
+            Some("Other"),
+            Some("Alice"),
+            Some(Path::new(r"C:\\Users\\Alice")),
+        );
+        let other_profile = windows_user_scope(
+            Some("Example"),
+            Some("Alice"),
+            Some(Path::new(r"D:\\Profiles\\Alice")),
+        );
+
+        assert_eq!(first, equivalent);
+        assert_ne!(first, other_domain);
+        assert_ne!(first, other_profile);
+        assert_eq!(first.len(), 16);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!first.contains("alice"));
+    }
+
+    #[test]
     #[cfg(windows)]
     fn default_windows_endpoint_is_a_namespaced_named_pipe() {
         let endpoint = default_endpoint();
@@ -3261,6 +3412,13 @@ mod tests {
             .expect("Windows default endpoint must be a named pipe");
         assert!(name.starts_with(r"\\.\pipe\bcode-"));
         assert!(name.ends_with(&daemon_namespace()));
+        let username = env::var("USERNAME")
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        if !username.is_empty() {
+            assert!(!name.to_lowercase().contains(&username));
+        }
     }
 
     #[test]
