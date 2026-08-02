@@ -143,6 +143,64 @@ if ! rg -q 'pub async fn complete_backfill' packages/server/src/session_search.r
   cat /tmp/bcode-session-search-complete-backfill-boundary.txt 2>/dev/null >&2 || true
   fail "complete backfill must remain explicit server-owned bounded coordination"
 fi
+python3 - <<'PY' || fail "startup or ordinary session-search paths invoke historical backfill"
+from pathlib import Path
+import re
+
+source = Path("packages/server/src/lib.rs").read_text()
+for function in (
+    "start_session_search_ingestion",
+    "spawn_session_search_ingestion_worker",
+    "start_catalog_event_forwarder",
+):
+    match = re.search(rf"\n\s*(?:pub\s+)?(?:async\s+)?fn\s+{function}\b", source)
+    if match is None:
+        raise SystemExit(f"missing guarded startup function {function}")
+    brace = source.find("{", match.start())
+    depth = 0
+    end = None
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+    if end is None:
+        raise SystemExit(f"could not bound startup function {function}")
+    body = source[brace:end]
+    if "complete_backfill" in body or "backfill_provider" in body or "session_summaries_page" in body:
+        raise SystemExit(f"{function} invokes historical backfill")
+
+search_source = Path("packages/server/src/session_search.rs").read_text()
+for function in (
+    "list_providers",
+    "search_provider",
+    "search_federated",
+    "search_federated_with_routes",
+    "search_federated_with_policy_and_routes",
+):
+    match = re.search(rf"\n(?:pub\s+)?async\s+fn\s+{function}\b", search_source)
+    if match is None:
+        raise SystemExit(f"missing guarded ordinary function {function}")
+    brace = search_source.find("{", match.start())
+    depth = 0
+    end = None
+    for index in range(brace, len(search_source)):
+        if search_source[index] == "{":
+            depth += 1
+        elif search_source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+    if end is None:
+        raise SystemExit(f"could not bound ordinary function {function}")
+    body = search_source[brace:end]
+    if "complete_backfill" in body or "backfill_provider" in body or "session_summaries_page" in body:
+        raise SystemExit(f"{function} invokes historical backfill")
+PY
 if ! rg -q 'does not promise durable or reconnect-safe resume' \
   packages/session-search/src/lib.rs; then
   fail "backfill operation revisions must explicitly reject durable-resume semantics"

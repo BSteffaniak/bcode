@@ -31226,6 +31226,134 @@ mod tests {
     use switchy::database::{DatabaseValue, query::FilterableQuery};
     use tracing_subscriber::fmt::MakeWriter;
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn real_static_tantivy_and_compressed_providers_complete_and_rerun_idempotently() {
+        let _guard = session_search::tests::lock_search_tests().await;
+        let tantivy_root = tempfile::tempdir().expect("tantivy root");
+        let compressed_root = tempfile::tempdir().expect("compressed root");
+        let tantivy_id = "bcode.tantivy-session-search";
+        let compressed_id = "bcode.compressed-session-search";
+        let manifests = vec![
+            (
+                toml::from_str(include_str!(
+                    "../../../plugins/tantivy-session-search-plugin/bcode-plugin.toml"
+                ))
+                .expect("tantivy manifest"),
+                bcode_tantivy_session_search_plugin::static_plugin(),
+            ),
+            (
+                toml::from_str(include_str!(
+                    "../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"
+                ))
+                .expect("compressed manifest"),
+                bcode_compressed_session_search_plugin::static_plugin(),
+            ),
+        ];
+        let configs = BTreeMap::from([
+            (
+                tantivy_id.to_owned(),
+                bcode_plugin::ResolvedPluginConfig::new(
+                    serde_json::json!({"storage_root": tantivy_root.path()}),
+                    serde_json::json!({"storage_root": tantivy_root.path()}),
+                ),
+            ),
+            (
+                compressed_id.to_owned(),
+                bcode_plugin::ResolvedPluginConfig::new(
+                    serde_json::json!({"storage_root": compressed_root.path()}),
+                    serde_json::json!({"storage_root": compressed_root.path()}),
+                ),
+            ),
+        ]);
+        let state = session_search::tests::state_with_static_provider_vtables(&manifests, configs);
+        let session = state
+            .sessions
+            .create_session(
+                Some("real static providers".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "static provider needle".to_owned(), 0)
+            .await
+            .expect("append event");
+        let request = bcode_session_search::CompleteSessionSearchBackfillRequest {
+            provider_id: None,
+            session_ids: BTreeSet::from([session.id]),
+            after_timestamp_ms: None,
+            before_timestamp_ms: None,
+            slice_deadline_ms: 5_000,
+        };
+
+        let first = session_search::complete_backfill(
+            &state,
+            request.clone(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+        )
+        .await
+        .expect("first real static backfill");
+        assert_eq!(
+            first.provider_ids,
+            vec![compressed_id.to_owned(), tantivy_id.to_owned()]
+        );
+        assert!(first.providers.iter().all(|provider| {
+            provider.completed_sessions == 1
+                && provider.incomplete_sessions == 0
+                && provider.failed_sessions == 0
+                && provider.error.is_none()
+        }));
+        let first_status = session_search::list_providers(&state).await;
+        let first_facts = first_status
+            .providers
+            .iter()
+            .map(|provider| {
+                (
+                    provider.plugin_id.clone(),
+                    (
+                        provider.status.document_count,
+                        provider.status.index_bytes,
+                        provider.status.coverage.clone(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let second = session_search::complete_backfill(
+            &state,
+            request,
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+        )
+        .await
+        .expect("idempotent real static backfill");
+        assert!(
+            second
+                .providers
+                .iter()
+                .all(|provider| provider.completed_sessions == 1)
+        );
+        let second_status = session_search::list_providers(&state).await;
+        let second_facts = second_status
+            .providers
+            .iter()
+            .map(|provider| {
+                (
+                    provider.plugin_id.clone(),
+                    (
+                        provider.status.document_count,
+                        provider.status.index_bytes,
+                        provider.status.coverage.clone(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(second_facts, first_facts);
+    }
+
     #[tokio::test]
     async fn canonical_writes_complete_when_provider_backfill_fails_unavailable() {
         let _guard = session_search::tests::lock_search_tests().await;

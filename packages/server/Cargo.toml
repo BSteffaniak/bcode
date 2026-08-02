@@ -69,6 +69,9 @@ bcode_bundled_plugins = { workspace = true, features = [
 bcode_client = { workspace = true }
 bcode_code_review_models = { workspace = true }
 bcode_code_review_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_compressed_session_search_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_git_plugin = { workspace = true, features = ["static-bundled"] }
@@ -81,6 +84,9 @@ bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_session_view = { workspace = true }
 bcode_session_view_models = { workspace = true }
 bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_tantivy_session_search_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
 bcode_vim_edit_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_web_search_plugin = { workspace = true, features = ["static-bundled"] }
 hyperchad = { workspace = true, features = ["router", "router-form"] }

@@ -2956,6 +2956,46 @@ pub(crate) mod tests {
         SLOW_APPLY_CANCELLED.store(false, Ordering::SeqCst);
     }
 
+    pub fn state_with_static_provider_vtables(
+        providers: &[(PluginManifest, StaticPluginVtable)],
+        configs: BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
+    ) -> crate::ServerState {
+        let static_plugins = providers
+            .iter()
+            .map(|(manifest, vtable)| {
+                bcode_plugin::StaticBundledPlugin::new(
+                    Box::leak(
+                        toml::to_string(manifest)
+                            .expect("static provider manifest serializes")
+                            .into_boxed_str(),
+                    ),
+                    *vtable,
+                )
+            })
+            .collect::<Vec<_>>();
+        let selection = bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::Explicit,
+            enabled: providers
+                .iter()
+                .map(|(manifest, _)| manifest.id.clone())
+                .collect(),
+            disabled: BTreeSet::new(),
+        };
+        let plugins = PluginHost::load_defaults_with_static_bundled_and_config(
+            &selection,
+            &static_plugins,
+            configs,
+        )
+        .expect("load real static providers")
+        .into();
+        crate::tests::test_server_state_with_plugins(
+            bcode_session::SessionManager::persistent_lazy(
+                tempfile::tempdir().expect("session root").keep(),
+            ),
+            plugins,
+        )
+    }
+
     pub fn state_with_providers(
         providers: &[(&'static str, TestProviderBehavior)],
     ) -> crate::ServerState {
