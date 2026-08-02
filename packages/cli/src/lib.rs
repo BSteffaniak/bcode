@@ -8174,6 +8174,18 @@ async fn session_owner_client(session_id: SessionId) -> Result<BcodeClient, CliE
     Ok(client)
 }
 
+async fn session_read_client(session_id: SessionId) -> Result<BcodeClient, CliError> {
+    match session_owner_client(session_id).await {
+        Ok(client) => Ok(client),
+        Err(CliError::InvalidArguments(message))
+            if message.contains("no verified live Bcode daemon owner was found") =>
+        {
+            Ok(BcodeClient::default_endpoint())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn create_session(name: Option<String>) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let session = client.create_session(name).await?;
@@ -8241,15 +8253,7 @@ async fn session_history(
     let cursor = before
         .or(after)
         .map(|sequence| SessionHistoryCursor { sequence });
-    let owner_client = match session_owner_client(session_id).await {
-        Ok(client) => client,
-        Err(CliError::InvalidArguments(message))
-            if message.contains("no verified live Bcode daemon owner was found") =>
-        {
-            BcodeClient::default_endpoint()
-        }
-        Err(error) => return Err(error),
-    };
+    let owner_client = session_read_client(session_id).await?;
     let page = owner_client
         .session_history_page(
             session_id,
@@ -9067,15 +9071,35 @@ async fn session_export(
     session_id: SessionId,
     format: SessionExportFormat,
 ) -> Result<(), CliError> {
-    let events = session_owner_client(session_id)
-        .await?
-        .session_history(session_id)
-        .await?;
-    match format {
-        SessionExportFormat::Jsonl => {
-            for event in events {
-                println!("{}", serde_json::to_string(&event)?);
+    let client = session_read_client(session_id).await?;
+    let mut cursor = Some(SessionHistoryCursor { sequence: 0 });
+    while let Some(page_cursor) = cursor {
+        let page = client
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: Some(page_cursor),
+                    limit: SESSION_CLI_PAGE_LIMIT,
+                    direction: SessionHistoryDirection::Forward,
+                },
+            )
+            .await?;
+        if !page.compatibility_issues.is_empty() {
+            return Err(CliError::InvalidArguments(format!(
+                "session export encountered {} compatibility issue(s); retry with a compatible build",
+                page.compatibility_issues.len()
+            )));
+        }
+        match format {
+            SessionExportFormat::Jsonl => {
+                for event in page.events {
+                    println!("{}", serde_json::to_string(&event)?);
+                }
             }
+        }
+        cursor = page.next_cursor;
+        if !page.has_more {
+            break;
         }
     }
     Ok(())
@@ -9097,7 +9121,7 @@ async fn session_timeline(session_id: SessionId) -> Result<(), CliError> {
 }
 
 async fn paged_session_history(session_id: SessionId) -> Result<PagedSessionHistory, CliError> {
-    let client = session_owner_client(session_id).await?;
+    let client = session_read_client(session_id).await?;
     let mut cursor = Some(SessionHistoryCursor { sequence: 0 });
     let mut history = PagedSessionHistory::default();
     while let Some(page_cursor) = cursor {

@@ -1375,6 +1375,12 @@ pub struct SessionSearchRecord {
     pub source_range_start: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_range_end: Option<u64>,
+    /// Zero-based ordinal when one canonical invocation is split into bounded search chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_ordinal: Option<u32>,
+    /// Total chunk count when known for the finalized canonical invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_count: Option<u32>,
     pub normalization_version: u16,
     pub policy_version: u16,
 }
@@ -1824,6 +1830,15 @@ fn validate_search_record(record: &SessionSearchRecord) -> Result<(), ContractVa
             ));
         }
     }
+    match (record.chunk_ordinal, record.chunk_count) {
+        (Some(ordinal), Some(count)) if count > 0 && ordinal < count => {}
+        (None, None) => {}
+        _ => {
+            return Err(ContractValidationError::InvalidBatch(
+                "record chunk identity is inconsistent",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1848,6 +1863,39 @@ fn validate_nonempty_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_identity_requires_a_bounded_ordinal_and_count_pair() {
+        let mut record = SessionSearchRecord {
+            schema_version: CURRENT_SEARCH_RECORD_VERSION,
+            record_id: "chunk-0".to_owned(),
+            locator: SessionSearchLocator {
+                session_id: SessionId::new(),
+                sequence: 1,
+                record_id: Some("chunk-0".to_owned()),
+            },
+            timestamp_ms: 1,
+            content_kind: SearchContentKind::ShellOutput,
+            field: Some(SearchField::Text),
+            text: Some("chunk".to_owned()),
+            attributes: BTreeMap::new(),
+            source_bytes: 10,
+            normalized_bytes: 5,
+            indexed_bytes: 5,
+            truncated: true,
+            source_range_start: Some(0),
+            source_range_end: Some(5),
+            chunk_ordinal: Some(0),
+            chunk_count: Some(2),
+            normalization_version: CURRENT_NORMALIZATION_VERSION,
+            policy_version: CURRENT_SEARCH_POLICY_VERSION,
+        };
+        assert!(validate_search_record(&record).is_ok());
+        record.chunk_ordinal = Some(2);
+        assert!(validate_search_record(&record).is_err());
+        record.chunk_ordinal = None;
+        assert!(validate_search_record(&record).is_err());
+    }
 
     fn text_query(text: &str) -> SessionSearchQuery {
         SessionSearchQuery::Text {
@@ -1967,6 +2015,8 @@ mod tests {
             truncated: false,
             source_range_start: Some(0),
             source_range_end: Some(5),
+            chunk_ordinal: None,
+            chunk_count: None,
             normalization_version: 1,
             policy_version: 1,
         };
@@ -2022,6 +2072,8 @@ mod tests {
             truncated: false,
             source_range_start: Some(0),
             source_range_end: Some(5),
+            chunk_ordinal: None,
+            chunk_count: None,
             normalization_version: CURRENT_NORMALIZATION_VERSION,
             policy_version: CURRENT_SEARCH_POLICY_VERSION,
         };

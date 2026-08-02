@@ -119,5 +119,14 @@ if rg -n \
   fail "generic plugin infrastructure contains session-search domain semantics"
 fi
 
+# Large-output implementation remains evidence-gated. The transcript provider must fail closed when
+# configured for shell/tool output; synthetic data must not silently select the backend.
+if ! rg -q 'large shell/tool output is not supported by the transcript provider' \
+  plugins/tantivy-session-search-plugin/src/lib.rs \
+  || ! rg -q 'transcript_provider_rejects_unmeasured_large_output_categories' \
+  plugins/tantivy-session-search-plugin/src/lib.rs; then
+  fail "transcript provider must reject unmeasured large-output categories"
+fi
+
 printf 'session-search architecture guard passed (%d concrete provider manifests checked)\n' \
   "${#provider_manifests[@]}"

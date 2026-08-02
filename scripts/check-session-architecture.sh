@@ -771,13 +771,20 @@ if ! rg -q 'let tx = db\.db\.begin_transaction\(\)\.await' packages/session/src/
 fi
 
 if ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
-    | grep -q 'session_owner_client' \
+    | grep -q 'session_read_client' \
   || ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
-    | grep -q 'session_history(session_id)' \
+    | grep -q 'session_history_page' \
+  || ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
+    | grep -q 'SESSION_CLI_PAGE_LIMIT' \
+  || ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
+    | grep -q 'has_more' \
+  || ! rg -q 'async fn session_read_client' packages/cli/src/lib.rs \
+  || ! sed -n '/async fn session_read_client/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_owner_client' \
+  || ! sed -n '/async fn session_read_client/,/^}/p' packages/cli/src/lib.rs | grep -q 'BcodeClient::default_endpoint' \
   || ! rg -q 'async fn session_owner_client' packages/cli/src/lib.rs \
   || ! sed -n '/async fn session_owner_client/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_owner_record' \
   || ! sed -n '/async fn session_owner_client/,/^}/p' packages/cli/src/lib.rs | grep -q 'daemon_status_matches' \
-  || ! sed -n '/async fn session_history(/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_owner_client' \
+  || ! sed -n '/async fn session_history(/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_read_client' \
   || ! sed -n '/async fn session_around(/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_owner_client' \
   || ! sed -n '/async fn session_inspect(/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_owner_client' \
   || rg -q 'session_export_events_from_root|explicit_export_reads_legacy_stream_history_without_migration|ToolInvocationStreamEvent|ToolOutputStream' \

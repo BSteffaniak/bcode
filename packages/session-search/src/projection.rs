@@ -1194,13 +1194,15 @@ fn project_shell_result(
                 sum_optional(stdout_bytes, stderr_bytes),
                 None,
             );
+            let mut stdout_attributes = common.clone();
+            stdout_attributes.insert("stream".to_owned(), "stdout".to_owned());
             let stdout_projection = project_text(
                 event,
                 "shell-stdout",
                 SearchContentKind::ShellOutput,
                 SearchField::StandardOutput,
                 &stdout,
-                common.clone(),
+                stdout_attributes,
                 maximum_bytes,
             );
             append_projected_records(
@@ -1212,13 +1214,15 @@ fn project_shell_result(
                     stdout_truncated,
                 ),
             );
+            let mut stderr_attributes = common;
+            stderr_attributes.insert("stream".to_owned(), "stderr".to_owned());
             let stderr_projection = project_text(
                 event,
                 "shell-stderr",
                 SearchContentKind::ShellOutput,
                 SearchField::StandardError,
                 &stderr,
-                common,
+                stderr_attributes,
                 maximum_bytes,
             );
             append_projected_records(
@@ -1428,6 +1432,8 @@ fn project_text(
         truncated: normalized.source_truncated,
         source_range_start: Some(0),
         source_range_end: Some(source_range_end),
+        chunk_ordinal: None,
+        chunk_count: None,
         normalization_version: CURRENT_NORMALIZATION_VERSION,
         policy_version: CURRENT_SEARCH_POLICY_VERSION,
     }])
@@ -2004,6 +2010,16 @@ mod tests {
         assert!(records[1].truncated);
         assert_eq!(records[1].normalized_bytes, 5);
         assert_eq!(records[1].indexed_bytes, 5);
+        assert_eq!(
+            records[0].attributes.get("stream").map(String::as_str),
+            Some("stdout")
+        );
+        assert_eq!(
+            records[1].attributes.get("stream").map(String::as_str),
+            Some("stderr")
+        );
+        assert_eq!(records[0].record_id, "14:shell-stdout:0");
+        assert_eq!(records[1].record_id, "14:shell-stderr:0");
         assert_eq!(
             records[1]
                 .attributes

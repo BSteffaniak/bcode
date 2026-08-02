@@ -2887,6 +2887,8 @@ pub(crate) mod tests {
             truncated: false,
             source_range_start: Some(0),
             source_range_end: Some(5),
+            chunk_ordinal: None,
+            chunk_count: None,
             normalization_version: CURRENT_NORMALIZATION_VERSION,
             policy_version: CURRENT_SEARCH_POLICY_VERSION,
         };

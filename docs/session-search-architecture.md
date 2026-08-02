@@ -249,8 +249,13 @@ working-directory change receive the new summary directory without rewriting ear
 records. Import completion and fork lineage do change the generation fingerprint because they define
 canonical provenance.
 
-The public client/IPC/CLI boundary exposes provider-scoped purge, empty
-rebuild, and daemon-owned bounded backfill. `session search-backfill` selects either explicitly named
+The public client/IPC/CLI boundary exposes provider-scoped purge, empty rebuild, and daemon-owned
+bounded backfill. Backfill may run synchronously or as an addressable daemon operation with generated
+ID, bounded status, revision-based wait, and idempotent cancellation. Operation IDs/revisions are
+bounded in-process notification state and are intentionally lost across daemon restart; they do not
+provide reconnect-safe replay or durable operation resume. Provider-owned sequence/text checkpoints
+remain the durable continuation boundary, so a caller starts a new bounded operation after restart.
+`session search-backfill` selects either explicitly named
 canonical sessions or at most 256 catalog sessions filtered by summary update timestamps and an
 explicit stable continuation cursor, applies a
 bounded wall-clock deadline, and processes no more than 1,024 provider-sized canonical pages per
@@ -263,7 +268,11 @@ this does not imply transport-level durable resume or replay.
 
 Canonical deletion remains authoritative and occurs first; after success the
 server best-effort invokes each loaded provider's typed `remove_session` with the expected generation,
-without rolling canonical deletion back on provider failure. The Tantivy provider's rebuild operation
+without rolling canonical deletion back on provider failure. The Tantivy provider writes a confined
+provider-owned rebuild marker before destructive reset. If interrupted, status reports `rebuilding`
+and normal use fails closed until the exact confirmed rebuild is retried. Successful rebuild removes
+the marker only after creating a compatible empty index. This marker records lifecycle state only; it
+is not an acknowledgment/replay log. The rebuild operation
 is deliberately provider-local: an exact provider-specific confirmation detaches live reader/writer
 state, removes only the canonicalized confined derived root, and creates an empty index and checkpoint
 at current versions. It does not read
@@ -282,21 +291,58 @@ filter, the coordinator materializes the provider request's content set and remo
 before crossing the plugin boundary. This prevents an accidental policy change or provider capability
 expansion from making ordinary transcript search scan or expose large output.
 
-The first implementation choice remains evidence-gated. Supported canonical export attempts against
-several representative local sessions on 2026-08-01 produced only explicit degraded evidence: the
-active session was unavailable because its canonical WAL owner held the lock, while other sampled
-sessions reported an unknown migration and required repair. No direct database fallback was used, so
-there is not yet a trustworthy representative output-size/query-frequency corpus from which to select
-a backend.
+The first implementation is a separate provider-owned independently compressed chunk scanner. Two
+supported canonical exports supplied 1,835 events and about 1.98 MiB of JSONL; gzip reduced the two
+exports to about 12.0% combined size. Event-line p50/p95/p99/max were 476/2,033/19,726/53,453 bytes,
+and an `rg` troubleshooting-term scan completed in roughly 0.01 seconds with about 6.2 MiB maximum
+RSS. These complete envelopes overstate normalized projection storage, but establish high
+compressibility and scan-shaped queries without direct persistence access.
+
+Bounded Tantivy output indexing would duplicate all accepted text and couple cold output to the
+transcript index; normalized plain text plus `rg` retains linear duplicate storage and process/output
+hardening; database FTS adds another database/index runtime without measured benefit. Independent
+compressed chunks preserve the measured storage advantage while permitting bounded decompression,
+cancellation, per-chunk checksums/corruption isolation, source ranges, and provider-owned quotas. The
+shared contract remains backend-neutral, and transcript Tantivy rejects large-output categories.
 
 Large normalized shell/tool output may use a provider specialized for compressed chunks or bounded
-scanning rather than the transcript index. Provider-owned chunks must be independently bounded,
+scanning rather than the transcript index. Shared records identify each chunk with bounded canonical
+source byte start/end offsets plus a zero-based ordinal and finalized chunk count. Captured stdout and
+stderr remain separate typed records with independent accounting because canonical data does not
+preserve trustworthy interleaving; terminal-mode combined tails remain combined. Provider-owned
+chunks must be independently bounded,
 checksummed, confined, and cancellable to scan. Ordinary search can exclude cold output; explicit
 deep search reports its longer-running providers and partial coverage.
 
-Whether the first implementation uses Tantivy, an in-process compressed scanner, `rg` behind a
-confined adapter, Turso/SQLite FTS, or another backend is an implementation decision. Shared session
-search semantics do not depend on that choice.
+The selected provider format uses independently decompressible chunks of at most 256 KiB
+uncompressed normalized UTF-8 and at most 64 projected records. A finalized invocation is split only
+at UTF-8 boundaries; huge logical lines may span chunks and retain source byte ranges plus ordinal and
+finalized count. Each chunk has a versioned manifest entry containing provider/session/generation,
+canonical sequence and record locators, content/stream identity, source ranges, normalized byte count,
+compressed byte count, compression algorithm/version, and SHA-256 of both normalized and compressed
+bytes. The manifest and chunk index are provider-owned derived state, published atomically only after
+chunk fsync/checksum verification. A corrupt or missing chunk degrades only its advertised range and
+is never interpreted as an empty successful match.
+
+Initial provider limits are 256 KiB uncompressed and 128 records per invocation, 256 MiB normalized
+bytes per session, 8 GiB compressed bytes per provider, 64 MiB decompressed cache, two parallel scans,
+200 hits, 4 KiB previews, and the shared request deadline. Compression-ratio validation rejects a
+chunk whose declared uncompressed size exceeds the bound before allocation; no query allocates from
+compressed metadata alone. Quota exhaustion preserves already-published chunks, refuses advancement,
+and reports incomplete coverage without automatic eviction. Cancellation is checked before opening
+each chunk, before/after decompression, while scanning bounded text, and before returning each hit.
+
+V1 scan semantics are literal terms/phrases and bounded Rust-regex syntax over normalized UTF-8; the
+provider advertises only implemented features and makes no exact `rg` compatibility claim. Regex is
+compiled once under request bounds, rejects unsupported/pathological forms through the existing typed
+unsupported/invalid-request outcomes, and scans no more than the deadline/concurrency/corpus limits.
+There is no age-based tiering or implicit eviction. Transcript and large-output routes remain disjoint
+by content kind; canonical-locator deduplication remains the deterministic defense if a future route
+overlap is explicitly introduced.
+
+The first implementation is independently compressed chunk scanning; Tantivy, external `rg`, and FTS
+remain measured alternatives rather than active large-output backends. Shared session search semantics
+do not depend on that provider-local choice.
 
 ## Privacy and resource controls
 

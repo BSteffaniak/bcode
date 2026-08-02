@@ -44,6 +44,7 @@ const MAX_PREVIEW_BYTES: usize = bcode_session_search::MAX_HIT_PREVIEW_BYTES;
 const PURGE_CONFIRMATION: &str = "purge-bcode.tantivy-session-search";
 const REBUILD_CONFIRMATION: &str = "rebuild-bcode.tantivy-session-search";
 const CHECKPOINT_FILE: &str = "provider-state.json";
+const REBUILD_MARKER_FILE: &str = "rebuild-in-progress";
 const INDEX_DIRECTORY: &str = "index";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +78,16 @@ impl ProviderConfig {
             return Err(ProviderError::configuration(format!(
                 "writer_memory_bytes must be at least {MIN_WRITER_MEMORY_BYTES}"
             )));
+        }
+        if self.sensitive_content.iter().any(|kind| {
+            matches!(
+                kind,
+                SearchContentKind::ShellOutput | SearchContentKind::ToolOutput
+            )
+        }) {
+            return Err(ProviderError::configuration(
+                "large shell/tool output is not supported by the transcript provider; enable a measured deep-search provider instead".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -393,6 +404,14 @@ impl TantivySessionSearchPlugin {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut response = empty_status(config);
+        if let Some(configured_root) = &config.storage_root
+            && let Ok(root) = confined_storage_root(configured_root)
+            && root.join(REBUILD_MARKER_FILE).is_file()
+        {
+            response.state = SearchProviderState::Rebuilding;
+            response.index_bytes = directory_size(&root.join(INDEX_DIRECTORY));
+            return response;
+        }
         if config.storage_root.is_some()
             && let Err(error) = self.ready_engine(config)
         {
@@ -858,8 +877,18 @@ impl TantivySessionSearchPlugin {
         {
             return ServiceResponse::error("rebuild_failed", error.to_string());
         }
-        match SearchEngine::open(root, config) {
+        if let Err(error) = std::fs::create_dir_all(&root)
+            .and_then(|()| std::fs::write(root.join(REBUILD_MARKER_FILE), b"rebuild in progress\n"))
+        {
+            return ServiceResponse::error("rebuild_failed", error.to_string());
+        }
+        match SearchEngine::open(root.clone(), config) {
             Ok(engine) => {
+                if let Err(error) = std::fs::remove_file(root.join(REBUILD_MARKER_FILE)) {
+                    *guard = EngineState::Failed(bounded_message(&error.to_string()));
+                    drop(guard);
+                    return ServiceResponse::error("rebuild_failed", error.to_string());
+                }
                 *guard = EngineState::Ready(Arc::new(engine));
                 drop(guard);
                 json_response(&RebuildSessionSearchResponse {
@@ -919,6 +948,11 @@ impl TantivySessionSearchPlugin {
             ProviderError::configuration("provider storage_root is not configured".to_owned())
         })?;
         let root = confined_storage_root(root)?;
+        if root.join(REBUILD_MARKER_FILE).is_file() {
+            return Err(ProviderError::incompatible(
+                "provider rebuild was interrupted; retry explicit rebuild".to_owned(),
+            ));
+        }
         let mut guard = self
             .engine
             .write()
@@ -1621,6 +1655,8 @@ mod tests {
             truncated: false,
             source_range_start: None,
             source_range_end: None,
+            chunk_ordinal: None,
+            chunk_count: None,
             normalization_version: CURRENT_NORMALIZATION_VERSION,
             policy_version: CURRENT_SEARCH_POLICY_VERSION,
         }
@@ -2399,8 +2435,23 @@ mod tests {
             records > 0 && records <= MAX_RECORDS && records.is_multiple_of(BATCH_SIZE),
             "benchmark record count must be a non-zero multiple of {BATCH_SIZE} no larger than {MAX_RECORDS}"
         );
-        let root = tempfile::tempdir().expect("root");
-        let mut provider_config = config(root.path());
+        let root = std::env::var_os("BCODE_SESSION_SEARCH_BENCH_OUTPUT")
+            .map(PathBuf::from)
+            .map_or_else(
+                || tempfile::tempdir().expect("root").keep(),
+                |root| {
+                    let root = if root.is_absolute() {
+                        root
+                    } else {
+                        std::env::current_dir()
+                            .expect("benchmark current directory")
+                            .join(root)
+                    };
+                    std::fs::create_dir_all(&root).expect("benchmark output root");
+                    root
+                },
+            );
+        let mut provider_config = config(&root);
         provider_config.quota_bytes = DEFAULT_QUOTA_BYTES;
         let plugin = TantivySessionSearchPlugin::default();
         let session_id = SessionId::new();
@@ -2451,7 +2502,7 @@ mod tests {
             previous_session_text_bytes = normalized_bytes;
         }
         let ingestion_us = ingestion_started.elapsed().as_micros();
-        let index_bytes = directory_size(&root.path().join(INDEX_DIRECTORY));
+        let index_bytes = directory_size(&root.join(INDEX_DIRECTORY));
         let amplification_permille = index_bytes
             .saturating_mul(1_000)
             .checked_div(normalized_bytes)
@@ -2479,8 +2530,7 @@ mod tests {
 
         drop(plugin);
         let open_started = Instant::now();
-        let reopened = SearchEngine::open(root.path().to_path_buf(), &provider_config)
-            .expect("reopen benchmark index");
+        let reopened = SearchEngine::open(root, &provider_config).expect("reopen benchmark index");
         let open_us = open_started.elapsed().as_micros();
         let writer_memory_bytes = provider_config.writer_memory_bytes;
         drop(reopened);
@@ -2502,6 +2552,38 @@ mod tests {
             amplification_permille <= MAX_AMPLIFICATION_PERMILLE,
             "index amplification {amplification_permille} permille exceeds 50% budget"
         );
+    }
+
+    #[test]
+    fn interrupted_rebuild_marker_surfaces_rebuilding_and_blocks_use() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(
+            root.path().join(REBUILD_MARKER_FILE),
+            b"rebuild in progress\n",
+        )
+        .expect("marker");
+        let plugin = TantivySessionSearchPlugin::default();
+        let config = config(root.path());
+
+        let status = plugin.status(&config);
+        assert_eq!(status.state, SearchProviderState::Rebuilding);
+        assert!(plugin.ready_engine(&config).is_err());
+    }
+
+    #[test]
+    fn transcript_provider_rejects_unmeasured_large_output_categories() {
+        for content_kind in [
+            SearchContentKind::ShellOutput,
+            SearchContentKind::ToolOutput,
+        ] {
+            let mut config = ProviderConfig::default();
+            config.sensitive_content.insert(content_kind);
+            let error = config
+                .validate()
+                .expect_err("large output must fail closed");
+            assert_eq!(error.code, "invalid_configuration");
+            assert!(error.message.contains("measured deep-search provider"));
+        }
     }
 
     #[test]

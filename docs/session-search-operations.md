@@ -99,12 +99,29 @@ Inspect capabilities, versions, quota, document count, degraded state, and per-s
 bcode session search-status --json
 ```
 
-Historical backfill is explicit and bounded. Select exact sessions when possible:
+Historical backfill is explicit, bounded, and optionally addressable. For a short synchronous request,
+select exact sessions when possible:
 
 ```sh
 bcode session search-backfill --provider bcode.tantivy-session-search \
   --session SESSION_ID --deadline-ms 30000 --json
 ```
+
+For user-cancellable work, start an addressable operation and use its returned operation ID:
+
+```sh
+bcode session search-backfill-start --provider bcode.tantivy-session-search \
+  --session SESSION_ID --deadline-ms 30000 --json
+bcode session search-backfill-status OPERATION_ID --json
+bcode session search-backfill-wait OPERATION_ID \
+  --after-revision REVISION --timeout-ms 30000 --json
+bcode session search-backfill-cancel OPERATION_ID --json
+```
+
+Operation revisions and wait notifications are bounded in-process state. They are intentionally lost
+when the daemon restarts and do not define reconnect-safe or durable resume. Provider-owned sequence
+and text checkpoints are the durable continuation boundary; after restart, issue a new bounded
+backfill operation, which resumes from those checkpoints.
 
 A catalog-wide request selects at most 256 sessions per call. Apply timestamp bounds and continue
 with the returned `next_cursor` (`UPDATED_AT_MS:SESSION_ID`) until `selection_truncated` is false:
@@ -144,6 +161,10 @@ bcode session search-purge --provider bcode.tantivy-session-search \
 * quota exhaustion: increase the configured quota or purge/rebuild intentionally; no automatic
   eviction occurs and completeness remains false.
 * incompatible policy, normalization, record, tokenizer, or index version: rebuild, then backfill.
+* interrupted rebuild: provider status reports `rebuilding` from a confined provider-owned marker and
+  normal provider use fails closed. Retry the exact confirmed rebuild; after it creates a compatible
+  empty index and clears the marker, run bounded backfill. The marker is lifecycle evidence, not a
+  replayable operation log.
 * corrupt/degraded provider state: preserve canonical storage, purge or rebuild only the provider
   root, then backfill.
 * canonical `repair_required` or incompatible hydration: use `session diagnose`, `session doctor`,
@@ -159,6 +180,25 @@ bcode session search-purge --provider bcode.tantivy-session-search \
 
 Provider search, ingestion, corruption, quota, and maintenance failures must never delay, roll back,
 or replace canonical session writes.
+
+## Selected large-output provider limits
+
+The selected deep-search provider is an independently compressed in-process chunk scanner. Before it
+may be enabled, implementation and tests must enforce:
+
+* 256 KiB maximum uncompressed normalized UTF-8 per chunk and 64 records per chunk;
+* 128 records per invocation, 256 MiB normalized text per session, and 8 GiB compressed provider
+  quota;
+* SHA-256 checksums for compressed and normalized bytes plus versioned atomic manifests;
+* 64 MiB decompressed cache, two concurrent scans, 200 hits, 4 KiB previews, and request deadlines;
+* no automatic eviction—quota refusal preserves retained data and reports incomplete coverage;
+* literal/phrase and explicitly advertised bounded Rust-regex semantics, not claimed `rg`
+  compatibility;
+* cancellation checks around chunk open, decompression, scanning, and hit emission;
+* isolated degraded coverage for missing/corrupt/partial chunks rather than silent empty results.
+
+These are provider-owned derived-state limits. They do not expand canonical read bounds or permit the
+provider to open canonical storage.
 
 ## Measured limits
 
