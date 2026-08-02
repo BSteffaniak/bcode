@@ -117,7 +117,7 @@ if ! rg -q 'git\.repository-snapshot' plugins/git-plugin/bcode-plugin.toml \
   || ! rg -q 'InstructionDriftReceipt::Blocked' plugins/workflow-plugin/src/lib.rs \
   || ! rg -q 'ReviewedReplacement' plugins/workflow-plugin/src/lib.rs \
   || ! rg -q 'VerificationStage::PostFormat' plugins/git-plugin/src/lib.rs \
-  || ! rg -q 'stage = \{ type = "string", enum = \["pre_format", "post_format"\]' plugins/git-plugin/bcode-plugin.toml \
+  || ! rg -Uq 'stage = \{ type = "string", enum = \[\s*"pre_format",\s*"post_format",?\s*\]' plugins/git-plugin/bcode-plugin.toml \
   || ! rg -q 'plan_sha256' plugins/shell-plugin/src/contracts.rs \
   || ! rg -q 'canonical_command_plan_sha256' plugins/shell-plugin/src/lib.rs \
   || ! rg -q 'max_uses' packages/workflow-store/src/lib.rs \
