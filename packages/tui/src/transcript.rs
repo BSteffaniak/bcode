@@ -1088,12 +1088,32 @@ fn terminal_permission_item_from_shared(
 }
 
 fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -> TranscriptItem {
-    let state = if interaction.resolved {
-        "resolved"
-    } else if interaction.required {
-        "response required"
-    } else {
-        "optional response pending"
+    let (state, detail) = match interaction.state {
+        bcode_session_view_models::InteractionViewState::Pending if interaction.required => (
+            "response required",
+            "Answer in the active interaction panel.",
+        ),
+        bcode_session_view_models::InteractionViewState::Pending => (
+            "optional response pending",
+            "Answer in the active interaction panel.",
+        ),
+        bcode_session_view_models::InteractionViewState::Submitting => {
+            ("submitting", "Response delivery is in progress.")
+        }
+        bcode_session_view_models::InteractionViewState::ValidationError => (
+            "validation error",
+            "Correct the highlighted interaction fields.",
+        ),
+        bcode_session_view_models::InteractionViewState::ActionError => (
+            "action error",
+            "The response was not delivered; retry is available.",
+        ),
+        bcode_session_view_models::InteractionViewState::Resolved => {
+            ("resolved", "The interaction completed.")
+        }
+        bcode_session_view_models::InteractionViewState::Cancelled => {
+            ("cancelled", "The interaction is closed.")
+        }
     };
     let label = interaction.title.as_deref().unwrap_or(&interaction.kind);
     let text = if interaction.resolved {
@@ -1106,7 +1126,8 @@ fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -
             },
         )
     } else {
-        format!("{label} ({state})\nAnswer in the active interaction panel.")
+        let detail = interaction.status_detail.as_deref().unwrap_or(detail);
+        format!("{label} ({state})\n{detail}")
     };
     TranscriptItem::with_kind(
         "Interaction",
@@ -1311,6 +1332,58 @@ mod tests {
             TranscriptItemKind::Interaction { interaction }
                 if interaction.interaction_id == "question-1"
         ));
+    }
+
+    #[test]
+    fn non_active_interaction_states_render_bounded_explicit_rows() {
+        for (state, status_detail, expected) in [
+            (
+                bcode_session_view_models::InteractionViewState::Pending,
+                None,
+                "response required",
+            ),
+            (
+                bcode_session_view_models::InteractionViewState::Submitting,
+                None,
+                "submitting",
+            ),
+            (
+                bcode_session_view_models::InteractionViewState::ValidationError,
+                Some("Choose one"),
+                "validation error",
+            ),
+            (
+                bcode_session_view_models::InteractionViewState::ActionError,
+                Some("offline; retry"),
+                "action error",
+            ),
+            (
+                bcode_session_view_models::InteractionViewState::Cancelled,
+                None,
+                "cancelled",
+            ),
+        ] {
+            let interaction = InteractionViewSummary {
+                producer_id: Some("future.plugin".to_owned()),
+                exchange_schema: Some("future.request".to_owned()),
+                exchange_schema_version: Some(99),
+                interaction_id: format!("{state:?}"),
+                kind: "future.interaction".to_owned(),
+                tool_call_id: None,
+                title: Some("Future interaction".to_owned()),
+                required: true,
+                snapshot: Some(serde_json::json!({"large": "x".repeat(100_000)})),
+                state,
+                status_detail: status_detail.map(ToOwned::to_owned),
+                resolved: state == bcode_session_view_models::InteractionViewState::Cancelled,
+                resolution: (state == bcode_session_view_models::InteractionViewState::Cancelled)
+                    .then_some(bcode_session_models::ToolExchangeResolution::Cancelled),
+            };
+            let item = terminal_interaction_item_from_shared(&interaction);
+            assert!(item.text().contains(expected));
+            assert!(item.text().len() < 512);
+            assert!(!item.text().contains("100000"));
+        }
     }
 
     #[test]

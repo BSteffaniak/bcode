@@ -513,6 +513,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clipped_surface_rendering_preserves_cursor_for_top_and_bottom_slices() {
+        let mut surface = question_surface(serde_json::json!([{
+            "header": null,
+            "question": "Explain?",
+            "options": [],
+            "control": "radio",
+            "selection_mode": "single",
+            "custom": true,
+            "custom_mode": "additional",
+            "required": true
+        }]))
+        .await;
+        let full_area = Rect::new(0, 0, 30, surface.preferred_height(30));
+        let mut full_buffer = bmux_tui::buffer::Buffer::empty(full_area);
+        let mut full_frame = Frame::new(&mut full_buffer);
+        surface.render(full_area, &mut full_frame);
+        let cursor = full_frame.cursor().expect("focused custom cursor");
+
+        for (offset, height, visible) in [
+            (0, cursor.position.y.saturating_add(1), true),
+            (cursor.position.y, 1, true),
+            (cursor.position.y.saturating_add(1), 1, false),
+        ] {
+            let destination = Rect::new(3, 4, full_area.width, height.max(1));
+            let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 40, 20));
+            let mut frame = Frame::new(&mut buffer);
+            surface.render_clipped(full_area, offset, destination, &mut frame);
+            assert_eq!(frame.cursor().is_some_and(|cursor| cursor.visible), visible);
+        }
+    }
+
+    #[tokio::test]
     async fn clipped_surface_rendering_and_mouse_translation_preserve_full_coordinates() {
         let mut surface = question_surface(serde_json::json!([{
             "header": null,
@@ -552,6 +584,60 @@ mod tests {
             Event::Mouse(mouse)
                 if mouse.position == bmux_tui::geometry::Point::new(2, 3)
         ));
+    }
+
+    #[tokio::test]
+    async fn pinned_surface_repaints_every_cell_after_resize_and_content_shrink() {
+        let mut large = question_surface(serde_json::json!([{
+            "header": null,
+            "question": "A long question that occupies several rows",
+            "options": [
+                {"label": "One", "value": "one", "description": "details"},
+                {"label": "Two", "value": "two", "description": "details"}
+            ],
+            "control": "radio",
+            "selection_mode": "single",
+            "custom": true,
+            "custom_mode": "additional",
+            "required": true
+        }]))
+        .await;
+        let mut small = question_surface(serde_json::json!([{
+            "header": null,
+            "question": "Short?",
+            "options": [{"label": "Yes", "value": "yes", "description": null}],
+            "control": "radio",
+            "selection_mode": "single",
+            "custom": false,
+            "custom_mode": "additional",
+            "required": true
+        }]))
+        .await;
+        let area = Rect::new(2, 3, 24, 8);
+        let sentinel = bmux_tui::style::Style::new().fg(bmux_tui::style::Color::Red);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 30, 15));
+        buffer.fill(area, "x", sentinel);
+        {
+            let mut frame = Frame::new(&mut buffer);
+            frame.fill(area, " ", bmux_tui::prelude::Style::new());
+            large.render(area, &mut frame);
+        }
+        {
+            let mut frame = Frame::new(&mut buffer);
+            frame.fill(area, " ", bmux_tui::prelude::Style::new());
+            small.render(area, &mut frame);
+        }
+        assert!(area_points(area).all(|point| {
+            buffer
+                .get(point)
+                .is_some_and(|cell| cell.symbol != "x" && cell.style != sentinel)
+        }));
+    }
+
+    fn area_points(area: Rect) -> impl Iterator<Item = bmux_tui::geometry::Point> {
+        (area.y..area.bottom()).flat_map(move |y| {
+            (area.x..area.right()).map(move |x| bmux_tui::geometry::Point::new(x, y))
+        })
     }
 
     #[test]

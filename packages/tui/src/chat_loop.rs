@@ -2018,10 +2018,11 @@ fn draw_chat_frame<W: Write>(
             ))
         })
         .flatten();
+    chat.app.set_active_interaction_layout(
+        active_inline_rows.map(|(interaction_id, rows)| (interaction_id.to_owned(), rows)),
+    );
     let prepared =
-        super::transcript_projection::with_active_interaction_rows(active_inline_rows, || {
-            render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height)
-        });
+        render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height);
     let layout = prepared.map(|(layout, _dock)| layout);
     let rich_presentation = layout.map_or_else(
         || MarkdownFramePresentation {

@@ -1126,6 +1126,45 @@ mod tests {
     }
 
     #[test]
+    fn tab_and_shift_tab_visit_options_custom_submit_and_cancel() {
+        let request = NormalizedQuestionRequest {
+            questions: vec![question(
+                "Choose",
+                &[("One", None), ("Two", None)],
+                true,
+                true,
+            )],
+        };
+        let mut controller = QuestionInteractionController::new(request);
+        let expected = [
+            QuestionFocusTarget::Option {
+                question_index: 0,
+                option_index: 0,
+            },
+            QuestionFocusTarget::Option {
+                question_index: 0,
+                option_index: 1,
+            },
+            QuestionFocusTarget::Custom { question_index: 0 },
+            QuestionFocusTarget::Submit,
+            QuestionFocusTarget::Cancel,
+        ];
+        assert_eq!(controller.snapshot().focus, expected[0]);
+        for target in expected.iter().skip(1) {
+            controller.handle_input(InteractionInput::Navigate {
+                direction: InteractionNavigation::Next,
+            });
+            assert_eq!(&controller.snapshot().focus, target);
+        }
+        for target in expected.iter().rev().skip(1) {
+            controller.handle_input(InteractionInput::Navigate {
+                direction: InteractionNavigation::Previous,
+            });
+            assert_eq!(&controller.snapshot().focus, target);
+        }
+    }
+
+    #[test]
     fn clicking_an_unfocused_custom_input_focuses_and_places_cursor_on_first_click() {
         let request = NormalizedQuestionRequest {
             questions: vec![
@@ -1170,6 +1209,57 @@ mod tests {
         );
         assert!(renderer.pending_custom_mouse_focus.is_none());
         assert!(renderer.custom_inputs[&1].buffer().cursor_byte_index() < "abcd".len());
+    }
+
+    #[test]
+    fn first_click_focus_preserves_drag_selection() {
+        let request = NormalizedQuestionRequest {
+            questions: vec![
+                question("First", &[("One", None)], false, false),
+                question("Second", &[], true, true),
+            ],
+        };
+        let mut controller = QuestionInteractionController::new(request);
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(1),
+            value: InteractionValue::String("abcdef".to_owned()),
+        });
+        controller.handle_input(InteractionInput::Focus {
+            control_id: option_control_id(0, 0),
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+        let snapshot = controller.snapshot();
+        let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 40, 30));
+        let area = renderer.custom_inputs[&1].content_area();
+        let focus = renderer
+            .input(
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(area.x, area.y),
+                )),
+                &snapshot,
+                &TEST_HOST,
+            )
+            .expect("focus custom field");
+        controller.handle_input(focus);
+        let focused = controller.snapshot();
+        let _buffer = render_snapshot(&mut renderer, &focused, Rect::new(0, 0, 40, 30));
+        assert!(
+            renderer
+                .input(
+                    &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                        MouseEventKind::Drag(MouseButton::Left),
+                        Point::new(area.x.saturating_add(3), area.y),
+                    )),
+                    &focused,
+                    &TEST_HOST,
+                )
+                .is_none()
+        );
+        assert_eq!(
+            renderer.custom_inputs[&1].buffer().selected_text(),
+            Some("abc".to_owned())
+        );
     }
 
     #[test]

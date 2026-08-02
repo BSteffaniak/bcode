@@ -10,24 +10,7 @@ use super::transcript_layout::{
     TranscriptLayoutFingerprint, TranscriptLayoutSignature, TranscriptLayoutSpec,
 };
 use bcode_config::TuiDiffViewerConfig;
-use std::cell::RefCell;
 use std::time::Instant;
-
-thread_local! {
-    static ACTIVE_INTERACTION_ROWS: RefCell<Option<(String, u16)>> = const { RefCell::new(None) };
-}
-
-pub fn with_active_interaction_rows<T>(
-    active: Option<(&str, u16)>,
-    render: impl FnOnce() -> T,
-) -> T {
-    ACTIVE_INTERACTION_ROWS.with(|state| {
-        let previous = state.replace(active.map(|(id, rows)| (id.to_owned(), rows)));
-        let output = render();
-        state.replace(previous);
-        output
-    })
-}
 
 const MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC: usize = 64;
 
@@ -81,12 +64,10 @@ fn transcript_item_rows(
 ) -> Vec<bmux_tui::prelude::Line> {
     if let Some(interaction) = item.interaction()
         && !interaction.resolved
-        && let Some(height) = ACTIVE_INTERACTION_ROWS.with(|active| {
-            active
-                .borrow()
-                .as_ref()
-                .and_then(|(id, height)| (id == &interaction.interaction_id).then_some(*height))
-        })
+        && let Some(height) = input
+            .active_interaction_layout
+            .filter(|(id, _)| *id == interaction.interaction_id)
+            .map(|(_, height)| height)
     {
         return vec![bmux_tui::prelude::Line::default(); usize::from(height.max(1))];
     }
@@ -185,7 +166,7 @@ struct TranscriptLayoutInput<'a> {
     pending: &'a [PendingSubmission],
     elapsed_layout_revision: u64,
     transcript_projection_revision: u64,
-    interaction_surface_layout_revision: u64,
+    active_interaction_layout: Option<(&'a str, u16)>,
     markdown_presentation_revision: u64,
     pending_submissions_projection_revision: u64,
     has_older_history: bool,
@@ -202,7 +183,7 @@ impl<'a> TranscriptLayoutInput<'a> {
             pending: app.pending_submissions(),
             elapsed_layout_revision: app.elapsed_layout_revision(),
             transcript_projection_revision: app.transcript_projection_revision(),
-            interaction_surface_layout_revision: app.interaction_surface_layout_revision(),
+            active_interaction_layout: app.active_interaction_layout(),
             markdown_presentation_revision: app.markdown_presentation_revision(),
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
             has_older_history: app.has_older_history(),
@@ -235,13 +216,12 @@ impl<'a> TranscriptLayoutInput<'a> {
             |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
         );
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};diff:{:?};history:{}:{};presentation:{presentation};transcript-rev:{};interaction-layout-rev:{};markdown-presentation-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
+            "width:{};diff:{:?};history:{}:{};presentation:{presentation};transcript-rev:{};markdown-presentation-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
             self.width,
             self.diff_viewer_config,
             self.has_older_history,
             self.loading_older_history,
             self.transcript_projection_revision,
-            self.interaction_surface_layout_revision,
             self.markdown_presentation_revision,
             self.transcript.len(),
             self.pending_submissions_projection_revision,
@@ -267,7 +247,7 @@ pub fn test_layout_signature(
         pending: &pending,
         elapsed_layout_revision: 0,
         transcript_projection_revision: 0,
-        interaction_surface_layout_revision: 0,
+        active_interaction_layout: None,
         markdown_presentation_revision: 0,
         pending_submissions_projection_revision: 0,
         has_older_history: false,

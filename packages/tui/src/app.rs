@@ -348,7 +348,7 @@ pub struct BmuxApp {
     transcript: TranscriptDocument,
     local_notices: Vec<TranscriptItem>,
     transcript_projection_revision: u64,
-    interaction_surface_layout_revision: u64,
+    active_interaction_layout: Option<(String, u16)>,
     session_view_terminal_adapter: SessionViewTerminalAdapter,
     session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
@@ -555,7 +555,7 @@ impl BmuxApp {
             transcript: TranscriptDocument::default(),
             local_notices: Vec::new(),
             transcript_projection_revision: 0,
-            interaction_surface_layout_revision: 0,
+            active_interaction_layout: None,
             session_view_terminal_adapter: SessionViewTerminalAdapter::default(),
             session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
@@ -1548,6 +1548,12 @@ impl BmuxApp {
         std::mem::take(&mut self.transcript_dirty_items)
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub const fn transcript_dirty_items_for_test(&self) -> &BTreeSet<usize> {
+        &self.transcript_dirty_items
+    }
+
     pub fn drain_elapsed_dirty_visuals_bounded(&mut self, limit: usize) -> BTreeSet<String> {
         let mut drained = BTreeSet::new();
         for _ in 0..limit {
@@ -1929,16 +1935,41 @@ impl BmuxApp {
         true
     }
 
-    /// Return the active interaction-surface layout revision.
+    /// Return active inline interaction identity and reserved rows.
     #[must_use]
-    pub const fn interaction_surface_layout_revision(&self) -> u64 {
-        self.interaction_surface_layout_revision
+    pub fn active_interaction_layout(&self) -> Option<(&str, u16)> {
+        self.active_interaction_layout
+            .as_ref()
+            .map(|(interaction_id, rows)| (interaction_id.as_str(), *rows))
     }
 
-    /// Mark interaction-surface layout inputs as changed.
-    pub const fn invalidate_interaction_surface_layout(&mut self) {
-        self.interaction_surface_layout_revision =
-            self.interaction_surface_layout_revision.saturating_add(1);
+    /// Set active inline interaction layout state and invalidate only when it changes.
+    pub fn set_active_interaction_layout(&mut self, active: Option<(String, u16)>) {
+        if self.active_interaction_layout == active {
+            return;
+        }
+        let previous_id = self
+            .active_interaction_layout
+            .as_ref()
+            .map(|(interaction_id, _)| interaction_id.clone());
+        let next_id = active
+            .as_ref()
+            .map(|(interaction_id, _)| interaction_id.clone());
+        self.active_interaction_layout = active;
+        for interaction_id in [previous_id, next_id].into_iter().flatten() {
+            if let Some(index) = self.interaction_transcript_index(&interaction_id) {
+                self.mark_transcript_item_dirty(index);
+            }
+        }
+    }
+
+    /// Mark the active interaction transcript entry dirty after renderer-local layout changes.
+    pub fn invalidate_interaction_surface_layout(&mut self) {
+        if let Some((interaction_id, _)) = self.active_interaction_layout.clone()
+            && let Some(index) = self.interaction_transcript_index(&interaction_id)
+        {
+            self.mark_transcript_item_dirty(index);
+        }
     }
 
     /// Return resident transcript-affecting event count.
@@ -2058,6 +2089,7 @@ impl BmuxApp {
         interactions: Vec<bcode_session_view_models::InteractionViewSummary>,
     ) {
         self.session_view.set_pending_interactions(interactions);
+        self.apply_session_view_terminal_adapter();
     }
 
     /// Return active plugin-owned session status contributions.
@@ -4518,6 +4550,44 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 mod tests {
     use super::*;
     use crate::transcript::TranscriptItemKind;
+
+    #[test]
+    fn active_interaction_layout_marks_only_previous_and_next_entries_dirty() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_pending_interactions(vec![interaction("first"), interaction("second")]);
+        let first = app.interaction_transcript_index("first").expect("first");
+        let second = app.interaction_transcript_index("second").expect("second");
+
+        app.set_active_interaction_layout(Some(("first".to_owned(), 5)));
+        assert_eq!(
+            app.transcript_dirty_items_for_test(),
+            &BTreeSet::from([first])
+        );
+        app.drain_transcript_dirty_items();
+        app.set_active_interaction_layout(Some(("second".to_owned(), 7)));
+        assert_eq!(
+            app.transcript_dirty_items_for_test(),
+            &BTreeSet::from([first, second])
+        );
+    }
+
+    fn interaction(id: &str) -> bcode_session_view_models::InteractionViewSummary {
+        bcode_session_view_models::InteractionViewSummary {
+            interaction_id: id.to_owned(),
+            producer_id: Some("example.plugin".to_owned()),
+            exchange_schema: Some("example.request".to_owned()),
+            exchange_schema_version: Some(1),
+            kind: "example.interaction".to_owned(),
+            tool_call_id: Some(format!("call-{id}")),
+            title: Some(id.to_owned()),
+            required: true,
+            snapshot: None,
+            state: bcode_session_view_models::InteractionViewState::Pending,
+            status_detail: None,
+            resolved: false,
+            resolution: None,
+        }
+    }
 
     fn snapshot(
         estimated: bool,

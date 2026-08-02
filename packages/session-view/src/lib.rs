@@ -1726,9 +1726,16 @@ impl SessionView {
                     "{}:{}",
                     resolution.invocation_id, resolution.exchange_id
                 ));
-                self.terminal_interactions
-                    .entry(resolution.exchange_id.clone())
-                    .or_insert_with(|| resolution.resolution.clone());
+                if self
+                    .terminal_interactions
+                    .contains_key(&resolution.exchange_id)
+                {
+                    return;
+                }
+                self.terminal_interactions.insert(
+                    resolution.exchange_id.clone(),
+                    resolution.resolution.clone(),
+                );
                 self.resolve_interaction_item(
                     &resolution.exchange_id,
                     &resolution.resolution,
@@ -5369,6 +5376,43 @@ mod tests {
                     && interaction.resolution
                         == Some(bcode_session_models::ToolExchangeResolution::TimedOut)
         ));
+    }
+
+    #[test]
+    fn duplicate_and_conflicting_terminal_resolutions_keep_first_authoritative_outcome() {
+        let session_id = SessionId::new();
+        let terminal_event = |sequence, resolution| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::ToolExchangeResolved {
+                    event: bcode_session_models::ToolExchangeResolutionEvent {
+                        invocation_id: "call".to_owned(),
+                        exchange_id: "interaction".to_owned(),
+                        resolution,
+                    },
+                },
+            )
+        };
+        let first = bcode_session_models::ToolExchangeResolution::Responded {
+            payload: serde_json::json!({"first": true}),
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&terminal_event(1, first.clone()));
+        view.apply_event(&terminal_event(2, first.clone()));
+        view.apply_event(&terminal_event(
+            3,
+            bcode_session_models::ToolExchangeResolution::Cancelled,
+        ));
+
+        let interaction = view
+            .snapshot()
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == "interaction")
+            .expect("terminal interaction");
+        assert_eq!(interaction.resolution, Some(first));
+        assert_eq!(interaction.state, InteractionViewState::Resolved);
     }
 
     #[test]
