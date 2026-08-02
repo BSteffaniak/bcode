@@ -1773,6 +1773,21 @@ pub struct CompleteSessionSearchBackfillProgress {
     pub catalog_revision_started: u64,
     pub convergence_pass: usize,
     pub providers_completed: usize,
+    /// Sessions selected from bounded catalog pages during this convergence pass.
+    #[serde(default)]
+    pub selected_sessions: usize,
+    /// Selected sessions that reached a complete, incomplete, or failed result.
+    #[serde(default)]
+    pub visited_sessions: usize,
+    #[serde(default)]
+    pub completed_sessions: usize,
+    #[serde(default)]
+    pub incomplete_sessions: usize,
+    #[serde(default)]
+    pub failed_sessions: usize,
+    /// Bounded per-provider progress and failure summaries for this convergence pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<CompleteSessionSearchBackfillProviderResult>,
 }
 
 impl CompleteSessionSearchBackfillProgress {
@@ -1794,9 +1809,53 @@ impl CompleteSessionSearchBackfillProgress {
         if self.convergence_pass == 0
             || self.convergence_pass > MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES
             || self.providers_completed > self.provider_ids.len()
+            || self.providers.len() > self.provider_ids.len()
+            || self.providers_completed > self.providers.len()
+            || self
+                .completed_sessions
+                .saturating_add(self.incomplete_sessions)
+                .saturating_add(self.failed_sessions)
+                != self.visited_sessions
+            || self.visited_sessions > self.selected_sessions
         {
             return Err(ContractValidationError::InvalidFilter(
                 "complete backfill progress counters are inconsistent",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let mut selected_sessions = 0usize;
+        let mut visited_sessions = 0usize;
+        let mut completed_sessions = 0usize;
+        let mut incomplete_sessions = 0usize;
+        let mut failed_sessions = 0usize;
+        for provider in &self.providers {
+            provider.validate()?;
+            if !self.provider_ids.contains(&provider.provider_id)
+                || !seen.insert(provider.provider_id.as_str())
+            {
+                return Err(ContractValidationError::InvalidFilter(
+                    "complete backfill progress providers do not match the snapshot",
+                ));
+            }
+            selected_sessions = selected_sessions.saturating_add(provider.selected_sessions);
+            visited_sessions = visited_sessions.saturating_add(
+                provider
+                    .completed_sessions
+                    .saturating_add(provider.incomplete_sessions)
+                    .saturating_add(provider.failed_sessions),
+            );
+            completed_sessions = completed_sessions.saturating_add(provider.completed_sessions);
+            incomplete_sessions = incomplete_sessions.saturating_add(provider.incomplete_sessions);
+            failed_sessions = failed_sessions.saturating_add(provider.failed_sessions);
+        }
+        if selected_sessions != self.selected_sessions
+            || visited_sessions != self.visited_sessions
+            || completed_sessions != self.completed_sessions
+            || incomplete_sessions != self.incomplete_sessions
+            || failed_sessions != self.failed_sessions
+        {
+            return Err(ContractValidationError::InvalidFilter(
+                "complete backfill progress totals do not match provider summaries",
             ));
         }
         Ok(())
@@ -2124,12 +2183,44 @@ mod tests {
             catalog_revision_started: 7,
             convergence_pass: 2,
             providers_completed: 1,
+            selected_sessions: 3,
+            visited_sessions: 3,
+            completed_sessions: 2,
+            incomplete_sessions: 1,
+            failed_sessions: 0,
+            providers: vec![
+                CompleteSessionSearchBackfillProviderResult {
+                    provider_id: "provider.a".to_owned(),
+                    selected_sessions: 2,
+                    completed_sessions: 2,
+                    incomplete_sessions: 0,
+                    failed_sessions: 0,
+                    catalog_pages: 1,
+                    error: None,
+                },
+                CompleteSessionSearchBackfillProviderResult {
+                    provider_id: "provider.b".to_owned(),
+                    selected_sessions: 1,
+                    completed_sessions: 0,
+                    incomplete_sessions: 1,
+                    failed_sessions: 0,
+                    catalog_pages: 1,
+                    error: None,
+                },
+            ],
         };
         progress.validate().expect("valid progress");
         let encoded = serde_json::to_value(&progress).expect("progress encodes");
         let decoded: CompleteSessionSearchBackfillProgress =
             serde_json::from_value(encoded).expect("progress decodes");
         assert_eq!(decoded, progress);
+
+        let mut mismatched = progress.clone();
+        mismatched.visited_sessions = mismatched.visited_sessions.saturating_add(1);
+        assert!(matches!(
+            mismatched.validate(),
+            Err(ContractValidationError::InvalidFilter(_))
+        ));
 
         let response = CompleteSessionSearchBackfillResponse {
             provider_ids: progress.provider_ids.clone(),

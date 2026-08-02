@@ -82,6 +82,47 @@ pub async fn rebuild_provider(
 const MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES: usize =
     bcode_session_search::MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES;
 
+fn complete_backfill_progress(
+    provider_ids: &[String],
+    current_provider_id: Option<&str>,
+    catalog_revision_started: u64,
+    convergence_pass: usize,
+    completed_providers: &[bcode_session_search::CompleteSessionSearchBackfillProviderResult],
+    current_provider: Option<&bcode_session_search::CompleteSessionSearchBackfillProviderResult>,
+) -> bcode_session_search::CompleteSessionSearchBackfillProgress {
+    let mut providers = completed_providers.to_vec();
+    if let Some(current_provider) = current_provider {
+        providers.push(current_provider.clone());
+    }
+    let selected_sessions = providers.iter().fold(0usize, |total, provider| {
+        total.saturating_add(provider.selected_sessions)
+    });
+    let completed_sessions = providers.iter().fold(0usize, |total, provider| {
+        total.saturating_add(provider.completed_sessions)
+    });
+    let incomplete_sessions = providers.iter().fold(0usize, |total, provider| {
+        total.saturating_add(provider.incomplete_sessions)
+    });
+    let failed_sessions = providers.iter().fold(0usize, |total, provider| {
+        total.saturating_add(provider.failed_sessions)
+    });
+    bcode_session_search::CompleteSessionSearchBackfillProgress {
+        provider_ids: provider_ids.to_vec(),
+        current_provider_id: current_provider_id.map(str::to_owned),
+        catalog_revision_started,
+        convergence_pass,
+        providers_completed: completed_providers.len(),
+        selected_sessions,
+        visited_sessions: completed_sessions
+            .saturating_add(incomplete_sessions)
+            .saturating_add(failed_sessions),
+        completed_sessions,
+        incomplete_sessions,
+        failed_sessions,
+        providers,
+    }
+}
+
 /// Run explicit complete historical backfill across every selected provider.
 ///
 /// Provider and catalog work remains bounded by the existing single-provider request. Reissuing
@@ -170,27 +211,25 @@ pub async fn complete_backfill(
         convergence_passes += 1;
         providers.clear();
         if let Some(progress) = progress {
-            progress(
-                bcode_session_search::CompleteSessionSearchBackfillProgress {
-                    provider_ids: provider_ids.clone(),
-                    current_provider_id: None,
-                    catalog_revision_started: revision_started,
-                    convergence_pass: convergence_passes,
-                    providers_completed: 0,
-                },
-            );
+            progress(complete_backfill_progress(
+                &provider_ids,
+                None,
+                revision_started,
+                convergence_passes,
+                &providers,
+                None,
+            ));
         }
         for provider_id in &provider_ids {
             if let Some(progress) = progress {
-                progress(
-                    bcode_session_search::CompleteSessionSearchBackfillProgress {
-                        provider_ids: provider_ids.clone(),
-                        current_provider_id: Some(provider_id.clone()),
-                        catalog_revision_started: revision_started,
-                        convergence_pass: convergence_passes,
-                        providers_completed: providers.len(),
-                    },
-                );
+                progress(complete_backfill_progress(
+                    &provider_ids,
+                    Some(provider_id),
+                    revision_started,
+                    convergence_passes,
+                    &providers,
+                    None,
+                ));
             }
             let mut cursor = None;
             let mut aggregate = bcode_session_search::CompleteSessionSearchBackfillProviderResult {
@@ -238,27 +277,46 @@ pub async fn complete_backfill(
                             .saturating_add(response.failed_sessions);
                         aggregate.catalog_pages = aggregate.catalog_pages.saturating_add(1);
                         cursor = response.next_cursor;
+                        if let Some(progress) = progress {
+                            progress(complete_backfill_progress(
+                                &provider_ids,
+                                Some(provider_id),
+                                revision_started,
+                                convergence_passes,
+                                &providers,
+                                Some(&aggregate),
+                            ));
+                        }
                         if cursor.is_none() || response.deadline_reached {
                             break;
                         }
                     }
                     Err(error) => {
                         aggregate.error = Some(error);
+                        if let Some(progress) = progress {
+                            progress(complete_backfill_progress(
+                                &provider_ids,
+                                Some(provider_id),
+                                revision_started,
+                                convergence_passes,
+                                &providers,
+                                Some(&aggregate),
+                            ));
+                        }
                         break;
                     }
                 }
             }
             providers.push(aggregate);
             if let Some(progress) = progress {
-                progress(
-                    bcode_session_search::CompleteSessionSearchBackfillProgress {
-                        provider_ids: provider_ids.clone(),
-                        current_provider_id: None,
-                        catalog_revision_started: revision_started,
-                        convergence_pass: convergence_passes,
-                        providers_completed: providers.len(),
-                    },
-                );
+                progress(complete_backfill_progress(
+                    &provider_ids,
+                    None,
+                    revision_started,
+                    convergence_passes,
+                    &providers,
+                    None,
+                ));
             }
             if cancellation.is_cancelled() {
                 break;
@@ -3548,6 +3606,14 @@ pub(crate) mod tests {
                 .iter()
                 .any(|update| update.providers_completed == 2)
         );
+        assert!(progress.iter().all(|update| update.validate().is_ok()));
+        let terminal_progress = progress.last().expect("terminal progress");
+        assert_eq!(terminal_progress.selected_sessions, 2);
+        assert_eq!(terminal_progress.visited_sessions, 2);
+        assert_eq!(terminal_progress.completed_sessions, 2);
+        assert_eq!(terminal_progress.incomplete_sessions, 0);
+        assert_eq!(terminal_progress.failed_sessions, 0);
+        assert_eq!(terminal_progress.providers.len(), 2);
         drop(progress);
     }
 

@@ -466,7 +466,21 @@ paths = ["/path/to/pi/sessions"]
 
 The default Pi path is `~/.pi/agent/sessions`. Use `custom_only` to avoid scanning the default home-directory location. Import warnings are shown when mappings are lossy, such as image blocks that are not yet copied into Bcode artifacts.
 
+### Session search
+
+The standard distribution enables the bundled Tantivy transcript provider by default. Its disposable state root is host-managed beneath the artifact-isolated Bcode state directory, so ordinary local search requires no plugin selection or `storage_root` setting. The bundled compressed deep-output provider remains disabled by default because it indexes high-volume shell/tool output; enable it explicitly only when that coverage is wanted. Set `[session_search].enabled = false` to disable all search providers and ingestion without affecting canonical session commands.
+
+Historical indexing is always explicit:
+
+```sh
+bcode session search-backfill             # all enabled providers
+bcode session search-backfill --provider bcode.tantivy-session-search
+```
+
+Backfill operation IDs and revisions exist only in the current daemon process. After a restart, issue a new command; providers continue safely from their own durable derived checkpoints rather than from transport state. See [`docs/session-search-operations.md`](docs/session-search-operations.md) for storage overrides, cancellation, coverage, and purge/rebuild operations.
+
 ### Client request timeout
+
 
 Local client/daemon IPC requests time out after 15 seconds by default. For slower
 session opens, set a persistent override in `bcode.toml`:

@@ -9015,12 +9015,32 @@ fn print_session_search_backfill_operation(
         );
         if let Some(progress) = &status.complete_progress {
             println!(
-                "progress: pass={}, providers={}/{}, current={}",
+                "progress: pass={}, providers={}/{}, current={}, selected={}, visited={}, complete={}, incomplete={}, failed={}",
                 progress.convergence_pass,
                 progress.providers_completed,
                 progress.provider_ids.len(),
-                progress.current_provider_id.as_deref().unwrap_or("none")
+                progress.current_provider_id.as_deref().unwrap_or("none"),
+                progress.selected_sessions,
+                progress.visited_sessions,
+                progress.completed_sessions,
+                progress.incomplete_sessions,
+                progress.failed_sessions
             );
+            for provider in &progress.providers {
+                println!(
+                    "  {}: selected={}, complete={}, incomplete={}, failed={}, pages={}{}",
+                    provider.provider_id,
+                    provider.selected_sessions,
+                    provider.completed_sessions,
+                    provider.incomplete_sessions,
+                    provider.failed_sessions,
+                    provider.catalog_pages,
+                    provider
+                        .error
+                        .as_ref()
+                        .map_or(String::new(), |error| format!(": {}", error.message))
+                );
+            }
         }
         if let Some(response) = &status.complete_response {
             println!(

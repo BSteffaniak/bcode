@@ -9103,24 +9103,28 @@ async fn start_complete_session_search_backfill(
     tokio::spawn(async move {
         let progress_state = Arc::clone(&state);
         let progress_operation_id = task_operation_id.clone();
-        let report_progress = move |progress| {
-            let state = Arc::clone(&progress_state);
-            let operation_id = progress_operation_id.clone();
-            tokio::spawn(async move {
-                let mut operations = state.session_search_backfills.lock().await;
-                if let Some(operation) = operations.get_mut(&operation_id)
+        let report_progress =
+            move |progress: bcode_session_search::CompleteSessionSearchBackfillProgress| {
+                let state = Arc::clone(&progress_state);
+                let operation_id = progress_operation_id.clone();
+                tokio::spawn(async move {
+                    let mut operations = state.session_search_backfills.lock().await;
+                    if let Some(operation) = operations.get_mut(&operation_id)
                     && matches!(
                         operation.status.state,
                         bcode_session_search::SessionSearchBackfillOperationState::Running
                             | bcode_session_search::SessionSearchBackfillOperationState::CancellationRequested
                     )
                 {
+                    if progress.validate().is_err() {
+                        return;
+                    }
                     operation.status.revision = operation.status.revision.saturating_add(1);
                     operation.status.complete_progress = Some(progress);
                     operation.changed.notify_waiters();
                 }
-            });
-        };
+                });
+            };
         let result = session_search::complete_backfill(
             &state,
             request,
