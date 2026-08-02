@@ -244,6 +244,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(read_plugin());
     #[cfg(feature = "static-bundled-shell-plugin")]
     plugins.push(shell_plugin());
+    #[cfg(feature = "static-bundled-compressed-session-search-plugin")]
+    plugins.push(compressed_session_search_plugin());
     #[cfg(feature = "static-bundled-tantivy-session-search-plugin")]
     plugins.push(tantivy_session_search_plugin());
     #[cfg(feature = "static-bundled-skills-plugin")]
@@ -423,6 +425,14 @@ fn shell_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
         bcode_shell_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-compressed-session-search-plugin")]
+fn compressed_session_search_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"),
+        bcode_compressed_session_search_plugin::static_plugin(),
     )
 }
 

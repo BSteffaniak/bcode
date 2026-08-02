@@ -1,0 +1,32 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "text-processing"]
+description = "Optional compressed deep-output session search provider for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "search", "session", "compression", "plugin"]
+license     = { workspace = true }
+name        = "bcode_compressed_session_search_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_plugin_sdk     = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_session_search = { workspace = true }
+regex                = { workspace = true, features = ["std", "unicode"] }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+sha2                 = { workspace = true }
+zstd                 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

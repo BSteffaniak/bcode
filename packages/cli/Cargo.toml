@@ -80,6 +80,7 @@ static-bundled-code-review-plugin = [
     "_static-bundled",
     "bcode_tui/static-bundled-code-review-plugin",
 ]
+static-bundled-compressed-session-search-plugin = ["_static-bundled"]
 static-bundled-default-agents-plugin = ["_static-bundled"]
 static-bundled-document-plugin = ["_static-bundled"]
 static-bundled-fake-provider-plugin = ["_static-bundled"]

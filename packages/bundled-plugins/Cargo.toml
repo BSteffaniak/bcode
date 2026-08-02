@@ -14,6 +14,7 @@ version     = { workspace = true }
 bcode_bedrock_provider_plugin           = { workspace = true, optional = true }
 bcode_blims_plugin                      = { workspace = true, optional = true }
 bcode_code_review_plugin                = { workspace = true, optional = true }
+bcode_compressed_session_search_plugin  = { workspace = true, optional = true }
 bcode_default_agents_plugin             = { workspace = true, optional = true }
 bcode_document_plugin                   = { workspace = true, optional = true }
 bcode_eval_plugin                       = { workspace = true, optional = true }
@@ -80,6 +81,10 @@ static-bundled-blims-plugin = [
 static-bundled-code-review-plugin = [
     "dep:bcode_code_review_plugin",
     "bcode_code_review_plugin/static-bundled",
+]
+static-bundled-compressed-session-search-plugin = [
+    "dep:bcode_compressed_session_search_plugin",
+    "bcode_compressed_session_search_plugin/static-bundled",
 ]
 static-bundled-default-agents-plugin = [
     "dep:bcode_default_agents_plugin",

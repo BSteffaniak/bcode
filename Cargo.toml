@@ -27,6 +27,7 @@ members = [
     "plugins/vim-edit-plugin",
     "plugins/workflow-plugin",
     "plugins/model-plugin",
+    "plugins/compressed-session-search-plugin",
     "plugins/tantivy-session-search-plugin",
     "plugins/skills-plugin",
     "plugins/worktree-plugin",
@@ -121,6 +122,7 @@ bcode_client                            = { version = "0.0.1-alpha.0", default-f
 bcode_code_review_models                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/code-review/models" }
 bcode_code_review_plugin                = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/code-review-plugin" }
 bcode_command                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/command" }
+bcode_compressed_session_search_plugin  = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/compressed-session-search-plugin" }
 bcode_config                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
 bcode_daemon_lifecycle                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/daemon-lifecycle" }
 bcode_database_observability            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/database-observability" }
@@ -380,6 +382,7 @@ worktree_setup_git = { version = "0.4.0", default-features = false }
 worktree_setup_operations = { version = "0.4.0", default-features = false }
 zeroize = { version = "1.8.2", default-features = false, features = ["std"] }
 zip = { version = "5.1.1", default-features = false, features = ["deflate"] }
+zstd = { version = "0.13.3", default-features = false }
 
 [profile.dev.package.sha2]
 opt-level = 3

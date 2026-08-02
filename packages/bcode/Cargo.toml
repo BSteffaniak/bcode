@@ -137,6 +137,12 @@ static-bundled-code-review-plugin = [
     "bcode_bundled_plugins/static-bundled-code-review-plugin",
     "bcode_cli/static-bundled-code-review-plugin",
 ]
+static-bundled-compressed-session-search-plugin = [
+    "bundled-plugins",
+    "cli",
+    "bcode_bundled_plugins/static-bundled-compressed-session-search-plugin",
+    "bcode_cli/static-bundled-compressed-session-search-plugin",
+]
 static-bundled-default-agents-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-default-agents-plugin",

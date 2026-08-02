@@ -74,6 +74,20 @@ for manifest in "${provider_manifests[@]}"; do
   fi
 done
 
+# Concrete provider implementation dependencies must also remain independently disableable.
+if cargo tree -p bcode_bundled_plugins --no-default-features -i zstd 2>/dev/null \
+  | grep -q '^zstd '; then
+  fail "compressed-search Zstd enters the bundled-plugin graph when its feature is disabled"
+fi
+if ! cargo tree -p bcode_bundled_plugins --no-default-features \
+  --features static-bundled-compressed-session-search-plugin -i zstd 2>/dev/null \
+  | grep -q '^zstd '; then
+  fail "compressed-search Zstd is absent when its explicit static-bundle feature is enabled"
+fi
+if cargo tree -p bcode --no-default-features -i zstd 2>/dev/null | grep -q '^zstd '; then
+  fail "compressed-search Zstd enters the product facade when its feature is disabled"
+fi
+
 # The optional Tantivy backend must remain absent from ordinary/default products and enter the
 # feature graph only through its independently named static-bundle feature.
 if cargo tree -p bcode_bundled_plugins --no-default-features -i tantivy 2>/dev/null \

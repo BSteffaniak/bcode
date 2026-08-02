@@ -1,0 +1,24 @@
+id      = "bcode.compressed-session-search"
+name    = "Bcode Compressed Session Search"
+version = "0.0.1"
+
+categories = ["search", "session", "deep-output"]
+
+[[services]]
+class        = "service"
+description  = "Optional bounded deep search over independently compressed normalized output chunks"
+interface_id = "bcode.session_search/v1"
+name         = "Compressed Session Search"
+
+[config]
+categories = ["search", "session"]
+section    = "plugin.bcode.compressed-session-search"
+
+[concurrency]
+type = "concurrent"
+
+[runtime]
+abi_version  = 3
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_compressed_session_search_plugin.dylib"
+type         = "native"

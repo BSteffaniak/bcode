@@ -1981,7 +1981,7 @@ pub(crate) mod tests {
     use std::ffi::c_void;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const FAST_PROVIDER_ID: &str = "test.fast-session-search";
     const SLOW_PROVIDER_ID: &str = "test.slow-session-search";
@@ -3522,6 +3522,71 @@ pub(crate) mod tests {
         assert!(!response.selection_truncated);
         assert!(response.next_cursor.is_none());
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual daemon ingestion-lag performance baseline"]
+    async fn benchmark_daemon_incremental_ingestion_lag() {
+        const DEFAULT_SESSIONS: usize = 8;
+        const DEFAULT_EVENTS: usize = 64;
+        const MAX_SESSIONS: usize = 32;
+        const MAX_EVENTS: usize = 512;
+
+        let sessions = std::env::var("BCODE_SESSION_SEARCH_INGESTION_SESSIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SESSIONS);
+        let events = std::env::var("BCODE_SESSION_SEARCH_INGESTION_EVENTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_EVENTS);
+        assert!((1..=MAX_SESSIONS).contains(&sessions));
+        assert!((1..=MAX_EVENTS).contains(&events));
+
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut session_ids = Vec::with_capacity(sessions);
+        for session_index in 0..sessions {
+            let session = state
+                .sessions
+                .create_session(
+                    Some(format!("ingestion benchmark {session_index}")),
+                    workspace.path().to_path_buf(),
+                )
+                .await
+                .expect("create session");
+            for event_index in 0..events {
+                state
+                    .sessions
+                    .append_context_compacted(
+                        session.id,
+                        format!("benchmark session {session_index} event {event_index}"),
+                        0,
+                    )
+                    .await
+                    .expect("append event");
+            }
+            session_ids.push(session.id);
+        }
+
+        let started = Instant::now();
+        for session_id in &session_ids {
+            state.session_search_dirty.mark_committed(*session_id).await;
+        }
+        process_dirty_sessions(&state).await;
+        let elapsed = started.elapsed();
+        let pending = state.session_search_dirty.snapshot().await.0;
+        assert!(pending.is_empty());
+        let calls = APPLY_BATCH_CALLS.load(Ordering::SeqCst);
+        assert!(calls >= sessions);
+        println!(
+            "session_search_daemon_ingestion_benchmark sessions={sessions} events_per_session={events} total_events={} apply_calls={calls} ingestion_lag_us={} events_per_second={}",
+            sessions * events,
+            elapsed.as_micros(),
+            (sessions * events) as u128 * 1_000_000 / elapsed.as_micros().max(1)
+        );
     }
 
     #[tokio::test]

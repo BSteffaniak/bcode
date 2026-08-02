@@ -200,6 +200,31 @@ may be enabled, implementation and tests must enforce:
 These are provider-owned derived-state limits. They do not expand canonical read bounds or permit the
 provider to open canonical storage.
 
+The optional compressed deep-output provider stores only approved normalized `shell_output` and
+`tool_output` records delivered through the session-search service. It owns a versioned manifest and
+independently checksummed Zstd chunks under its confined `storage_root`; it never opens canonical
+session storage. The provider is separately compiled, selected, configured, and disableable from
+Tantivy. It advertises scan execution with literal terms, phrase, and bounded Rust-regex semantics.
+
+Provider defaults and hard bounds are 256 KiB/64 records per chunk, 128 chunks per invocation,
+256 MiB normalized bytes per session, 8 GiB compressed provider quota, 64 MiB cache, 200 hits, and
+4 KiB previews. Search deadlines and cancellation are checked between chunks and records. Missing,
+partial, corrupt, checksum-invalid, or suspicious high-ratio chunks fail closed instead of producing
+silent empty results. Checkpoints and duplicate digests are atomically published with the manifest;
+they support safe newly requested continuation but do not provide reconnect-safe or durable
+transport resume.
+
+Initial release evidence over a deterministic 25,000-record repeated-output corpus measured
+21,088,894 normalized bytes to 342,551 compressed bytes (1.6%), 3.706 seconds ingestion,
+0.084/0.094/0.335 ms warm-query p50/p95/p99, 0.138/0.211/0.211 ms cold-query p50/p95/p99,
+and 0.195 ms for two concurrent scans. A fresh already-built release test process isolated provider
+execution from Cargo/compiler overhead: it measured 166.4 MiB maximum RSS, 161.4 MiB peak footprint,
+0.66 user CPU seconds, and 0.13 system CPU seconds for the 3.64-second 25,000-record benchmark body.
+This remains a conservative provider-process ceiling because the process includes the Rust test
+harness and corpus construction, but it is isolated from compilation. The isolated rerun measured
+21,088,894 normalized bytes to 337,548 compressed bytes (1.6%), 3.594 seconds ingestion,
+0.088/0.108/0.778 ms warm query, 0.144/0.175/0.175 ms cold query, and 0.180 ms for two scans.
+
 ## Measured limits
 
 The deterministic Tantivy provider baseline now covers both 25,000 and 100,000 records. The final-size

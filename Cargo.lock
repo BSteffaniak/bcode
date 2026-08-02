@@ -1438,6 +1438,7 @@ dependencies = [
  "bcode_blims_plugin",
  "bcode_code_review_plugin",
  "bcode_command",
+ "bcode_compressed_session_search_plugin",
  "bcode_config",
  "bcode_default_agents_plugin",
  "bcode_document_plugin",
@@ -1587,6 +1588,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "bcode_compressed_session_search_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bcode_session_search",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "zstd",
 ]
 
 [[package]]

@@ -233,16 +233,38 @@ BCODE_SESSION_SEARCH_HYDRATION_EVENTS=1000 \
 
 Before grouped hydration, a 2026-08-02 debug-profile run over 1,000 persistent events and 20 hits
 measured 226.664 ms p50 and 457.672 ms p95, failing the 100 ms budget because each hit independently
-opened canonical storage. After grouping bounded ranges, the same corpus measured 0.510 ms p50 and
-1.129 ms p95 over 20 runs. The full command still took 364.82 seconds because ordinary one-event
-durable append dominates deterministic fixture setup. The benchmark asserts exact canonical events
-and rejects p95 above 100 ms.
+opened canonical storage. After grouping bounded ranges, the same debug-profile corpus measured 0.510 ms p50 and
+1.129 ms p95 over 20 runs. A fresh 2026-08-03 release rerun measured 0.046/0.237/0.237 ms
+p50/p95/p99 and completed the benchmark body in 29 seconds after compilation. The earlier full debug
+command took 364.82 seconds because ordinary one-event durable append dominates deterministic fixture
+setup. The benchmark asserts exact canonical events and rejects p95 above 100 ms.
 
 A 10,000-event attempt exceeded a 20-minute command envelope during ordinary append setup before
 reporting hydration timings. This is not evidence of hydration failure, but representative larger
 application/daemon distributions remain open until a bounded bulk fixture/setup path can preserve
 canonical schema, sequence, and projection rules.
 
+
+## Daemon incremental-ingestion benchmark
+
+The ignored server benchmark measures the production dirty-session queue, bounded canonical reads,
+projection, provider discovery/routing, typed apply-batch calls, and queue drain across multiple
+sessions:
+
+```sh
+BCODE_SESSION_SEARCH_INGESTION_SESSIONS=8 \
+BCODE_SESSION_SEARCH_INGESTION_EVENTS=64 \
+  cargo test -p bcode_server benchmark_daemon_incremental_ingestion_lag --lib -- \
+  --ignored --nocapture
+```
+
+A 2026-08-03 debug-profile run over eight sessions and 512 total events made eight provider apply
+calls, drained the dirty queue, and measured 200.829 ms from committed-notification enqueue through
+terminal provider acknowledgments (2,549 events/second); an immediately preceding run measured
+198.535 ms and 2,578 events/second. The complete later test took 36.30 seconds because
+canonical fixture creation performs ordinary durable appends before the timed interval. This measures
+the application/daemon ingestion path against a typed in-process provider; it does not substitute for
+provider-specific compression/index costs and does not make canonical writes wait on provider work.
 
 ## Tantivy transcript-provider benchmark
 
@@ -264,6 +286,7 @@ Observed release results on the development machine:
 * total ingestion including 100 durable commits: 6.608 seconds, or 3,783 records/second;
 * commit latency: 60.871 ms p50 and 93.786 ms p95 per 250-record batch;
 * warm 20-hit query latency over the 25,000-record corpus: 0.236 ms p50 and 0.329 ms p95;
+* a fresh 2026-08-03 rerun measured 0.397/0.668/0.761 ms query p50/p95/p99, 87.391/154.971/205.220 ms commit p50/p95/p99, 2,698 records/second, 4.125 ms reopen, and 17.5% amplification;
 * provider reopen with retained checkpoint/index reconciliation: 1.926 ms;
 * index bytes: 4,693,199 bytes, or 17.5% of normalized source bytes;
 * configured writer memory: 15 MiB; process RSS was not isolated from the Rust test harness, so no
