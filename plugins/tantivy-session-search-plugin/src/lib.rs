@@ -1962,6 +1962,31 @@ mod tests {
     }
 
     #[test]
+    fn restart_preserves_completed_checkpoint_and_classifies_duplicate_delivery() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        let session_id = SessionId::new();
+        let request = apply_batch_request(session_id, "batch-complete-restart", 1, "needle");
+        {
+            let plugin = TantivySessionSearchPlugin::default();
+            let response = plugin.apply_batch(&config, &request, &ServiceCancellation::default());
+            assert!(response.error.is_none());
+            assert!(plugin.status(&config).coverage[0].complete);
+        }
+
+        let restarted = TantivySessionSearchPlugin::default();
+        let response = restarted.apply_batch(&config, &request, &ServiceCancellation::default());
+        let acknowledgment: ApplySearchRecordsResponse =
+            response.payload_json().expect("duplicate acknowledgment");
+        assert_eq!(acknowledgment.outcome, ApplyBatchOutcome::Duplicate);
+        let status = restarted.status(&config);
+        assert_eq!(status.coverage.len(), 1);
+        assert!(status.coverage[0].complete);
+        assert_eq!(status.coverage[0].indexed_through_sequence, Some(1));
+        assert_eq!(status.document_count, 1);
+    }
+
+    #[test]
     fn restart_reconciles_committed_index_marker_into_provider_state() {
         let root = tempfile::tempdir().expect("root");
         let config = config(root.path());
