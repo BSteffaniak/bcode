@@ -4,7 +4,7 @@ Bcode's provider-independent scoring surface is opt-in:
 
 ```toml
 [dependencies]
-bcode = { version = "0.0.1-alpha.0", default-features = false, features = ["evaluation"] }
+bcode = { git = "https://github.com/BSteffaniak/bcode", rev = "<commit>", default-features = false, features = ["evaluation"] }
 ```
 
 Without `evaluation`, the high-level `bcode` crate does not depend on `bcode_eval`, and

@@ -50,7 +50,7 @@ fn hero() -> Containers {
                 text-align=center
                 margin-bottom=16
             {
-                "Terminal-native coding agent"
+                "Terminal-native coding agent and Rust SDK"
             }
 
             div
@@ -61,7 +61,7 @@ fn hero() -> Containers {
                 text-align=center
                 max-width=680
             {
-                "Bcode is a Rust-native, TUI-first coding agent with local client/server architecture, plugin-driven tools, skills, and model providers."
+                "Work from a keyboard-first TUI with explicit permissions and durable sessions, or embed the same typed agent building blocks in a Rust application."
             }
 
             (hero_actions())
@@ -125,17 +125,17 @@ fn features() -> Containers {
             (feature_card(
                 0,
                 "terminal-native",
-                "Designed around a keyboard-first TUI workflow instead of a web chat surface."
+                "A keyboard-first TUI with streamed output, rich Markdown, and native tool presentations."
             ))
             (feature_card(
                 1,
-                "plugin-driven",
-                "Tools, providers, skills, and integrations are modeled as first-class plugins."
+                "permissioned",
+                "Plan and build modes keep sensitive commands and repository changes behind explicit policy."
             ))
             (feature_card(
                 2,
-                "configurable",
-                "CLI and config references are generated from the same Rust code used by the app."
+                "embeddable",
+                "Use Bcode's provider, tool, session, and workflow APIs without the TUI or daemon."
             ))
         }
     }

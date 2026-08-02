@@ -6,38 +6,6 @@ use bcode_config::{
 };
 use hyperchad_docs_site::EnvOverrideDoc;
 
-/// Extract a section from a markdown document by heading.
-pub(crate) fn extract_section_for(
-    markdown: &str,
-    start_heading: &str,
-    end_prefix: Option<&str>,
-) -> String {
-    let lines: Vec<&str> = markdown.lines().collect();
-    let mut start_idx = None;
-    let mut end_idx = lines.len();
-
-    for (i, line) in lines.iter().enumerate() {
-        if *line == start_heading {
-            start_idx = Some(i + 1);
-            continue;
-        }
-        if let Some(start) = start_idx
-            && i > start
-            && let Some(prefix) = end_prefix
-            && line.starts_with(prefix)
-            && *line != start_heading
-        {
-            end_idx = i;
-            break;
-        }
-    }
-
-    start_idx.map_or_else(
-        || markdown.to_string(),
-        |start| lines[start..end_idx].join("\n"),
-    )
-}
-
 /// Generate the CLI reference markdown from the actual clap command tree.
 pub(crate) fn generate_cli_reference() -> String {
     let mut doc =
@@ -385,11 +353,14 @@ mod tests {
     }
 
     #[test]
-    fn markdown_sections_used_by_docs_routes_exist() {
-        let readme = include_str!("../../../../../README.md");
-        assert!(
-            readme.contains("## TUI keybindings"),
-            "README heading '## TUI keybindings' missing"
-        );
+    fn markdown_pages_used_by_docs_routes_exist() {
+        for markdown in [
+            include_str!("../../../../../docs/getting-started.md"),
+            include_str!("../../../../../docs/sdk.md"),
+            include_str!("../../../../../docs/tui-keybindings.md"),
+            include_str!("../../../../../docs/plugins.md"),
+        ] {
+            assert!(!markdown.trim().is_empty());
+        }
     }
 }

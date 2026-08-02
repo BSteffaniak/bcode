@@ -19,13 +19,8 @@ pub static DOC_SECTIONS: &[DocsSection] = &[
     DocsSection::new(DEVELOPMENT, "Development"),
 ];
 
-fn generate_overview() -> String {
-    include_str!("../../../../README.md").to_string()
-}
-
-fn generate_tui_keybindings() -> String {
-    let readme = include_str!("../../../../README.md");
-    docs::extract_section_for(readme, "## TUI keybindings", Some("## "))
+fn generate_getting_started() -> String {
+    include_str!("../../../../docs/getting-started.md").to_string()
 }
 
 fn generate_cli() -> String {
@@ -43,15 +38,29 @@ pub static DOC_PAGES: &[DocPage] = &[
         route: "/docs",
         title: None,
         section: GETTING_STARTED,
-        nav_label: "Overview",
-        generate: generate_overview,
+        nav_label: "Getting Started",
+        generate: generate_getting_started,
     },
-    docs_generated_page! {
+    docs_markdown_page! {
+        source: "docs/sdk.md",
+        route: "/docs/sdk",
+        title: "Rust SDK",
+        section: GETTING_STARTED,
+        nav_label: "Rust SDK",
+    },
+    docs_markdown_page! {
+        source: "docs/tui-keybindings.md",
         route: "/docs/tui-keybindings",
         title: "TUI Keybindings",
         section: GETTING_STARTED,
         nav_label: "TUI Keybindings",
-        generate: generate_tui_keybindings,
+    },
+    docs_markdown_page! {
+        source: "docs/plugins.md",
+        route: "/docs/plugins",
+        title: "Plugins",
+        section: GETTING_STARTED,
+        nav_label: "Plugins",
     },
     docs_generated_page! {
         route: "/docs/cli",
@@ -87,6 +96,13 @@ pub static DOC_PAGES: &[DocPage] = &[
         title: "Permissions",
         section: CAPABILITIES,
         nav_label: "Permissions",
+    },
+    docs_markdown_page! {
+        source: "docs/reasoning-presentation.md",
+        route: "/docs/reasoning-presentation",
+        title: "Reasoning Presentation",
+        section: CAPABILITIES,
+        nav_label: "Reasoning Presentation",
     },
     docs_markdown_page! {
         source: "docs/session-import-plugins.md",
@@ -166,11 +182,11 @@ mod tests {
     }
 
     #[test]
-    fn markdown_page_sources_are_workspace_docs_or_readme() {
+    fn markdown_page_sources_are_workspace_docs() {
         for page in DOC_PAGES {
             if let Some(source) = page.source {
                 assert!(
-                    source == "README.md" || source.starts_with("docs/"),
+                    source.starts_with("docs/"),
                     "unexpected source for {}: {source}",
                     page.route
                 );

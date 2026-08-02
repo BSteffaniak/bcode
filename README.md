@@ -1,494 +1,106 @@
 # Bcode
 
-## Reasoning display policy
+**A terminal-native coding agent and Rust SDK built around explicit permissions, durable sessions, and first-class tools.**
 
-Reasoning display is a local presentation choice and is separate from provider request controls
-such as reasoning effort or requested summary detail. Fresh configuration defaults to showing all
-readable reasoning exposed by the provider:
+Bcode keeps coding work close to the repository. Inspect code, run commands, review changes, manage worktrees, and return to persistent sessions from a keyboard-first terminal interface. Sensitive operations pass through visible permission policy instead of disappearing behind an opaque agent loop.
 
-```toml
-[tui.thinking]
-show = true
-mode = "all"
+The same provider, tool, session, and workflow building blocks are available as a lean Rust library for applications that need an agent runtime without the TUI or daemon.
+
+> [!IMPORTANT]
+> Bcode is early alpha and currently distributed from source. APIs, configuration, and storage formats may change before the first public release.
+
+## Why Bcode
+
+* **Made for the terminal.** Streamed output, rich Markdown, a command palette, session navigation, and native presentations for tools, diffs, files, and shell commands.
+* **Control the work.** Plan and build agents expose different capabilities, while shell commands, file changes, worktrees, and other sensitive operations follow explicit `allow`, `ask`, or `deny` policy.
+* **Keep the thread.** Sessions survive the terminal, can be reopened or forked, and can move into isolated Git worktrees when a task needs its own workspace.
+* **Extend the agent, not just the prompt.** Providers, tools, authentication, commands, skills, workflows, and rich TUI surfaces can all be plugin-owned.
+
+## Run Bcode
+
+Bcode currently requires the [stable Rust toolchain](https://www.rust-lang.org/tools/install) and a source build:
+
+```sh
+git clone https://github.com/BSteffaniak/bcode.git
+cd bcode
+cargo build --release -p bcode \
+  --no-default-features \
+  --features app,static-bundled-plugins \
+  --bin bcode
+./target/release/bcode
 ```
 
-Supported modes are:
+On Windows, run `target\release\bcode.exe` instead.
 
-* `all`: show distinct provider summary/milestone and raw/detail parts;
-* `summary`: show summary, milestone, and deliberate legacy compatibility parts only;
-* `raw`: show raw/detail parts only;
-* `show = false`: hide all readable parts.
+The first interactive launch opens Bcode's setup flow for provider, model, authentication, and permission choices. The bundled provider integrations cover OpenAI-compatible APIs—including OpenAI API keys and ChatGPT subscription login—and Amazon Bedrock.
 
-Every mode retains neutral reasoning activity chrome when activity evidence exists, including
-opaque-only, interrupted, and failed activities. Filtering is silent: Bcode does not announce
-suppressed or unavailable representations and does not fall back from summary to raw or vice versa.
-Renderer-neutral and non-TUI clients can select the equivalent `ReasoningPresentationPolicy`
-(`all`, `summary`, `raw`, or `hidden`); HyperChad defaults to `all`. This policy is local and never
-changes provider request construction.
-Use `/thinking mode all|summary|raw`, `/thinking show|hide`, and `/thinking status` to inspect or
-change the local TUI policy. Provider plugins should follow the structured reasoning mapping rules
-in [`docs/model-provider-contract.md`](docs/model-provider-contract.md).
+See [Getting started](docs/getting-started.md) for build choices and initial setup, or jump to the [CLI](#documentation) and configuration references.
 
+## Use Bcode from Rust
 
-Bcode is a Rust-native, TUI-first, plugin-driven coding agent with a local client/server architecture.
-
-Terminal GitHub Markdown support, browser differences, security boundaries, and rich-content policies are documented in [GitHub Markdown in the transcript TUI](docs/github-markdown-tui.md).
-
-## Use Bcode as a Rust SDK
-
-The `bcode` crate can be used directly from Rust applications without launching the TUI. The default feature set is intentionally lean and TUI-independent; opt into heavier product or integration paths only when needed.
-
-```toml
-[dependencies]
-bcode = { version = "0.0.1-alpha.0", default-features = false }
-```
-
-The `bcode.model-provider/v1` operation, lifecycle, capability, event, error, retry, timeout, and cancellation requirements are documented in [the model provider contract](docs/model-provider-contract.md). Provider authors can run the public deterministic `bcode_model_provider_runtime::run_provider_conformance_suite` against an in-process adapter, loaded plugin, or proxy. SDK application tests can enable the opt-in `testing` feature for deterministic provider/tool/permission/cache/session/clock fixtures, complete request/lifecycle capture, and stream assertions without native plugins, a daemon, credentials, or network access; see [the deterministic testing guide](docs/sdk-testing.md) and executable [`scripted_provider` example](packages/bcode/examples/scripted_provider.rs). Provider-independent result scoring is separately opt-in through the `evaluation` feature; see [the SDK evaluation guide](docs/sdk-evaluation.md).
-
-For application-defined providers, implement one in-process turn method and wrap it with `InProcessModelProviderAdapter`. The adapter owns provider turn IDs, polling, terminal lifecycle events, cancellation races, and idempotent cleanup; the existing runtime still owns tool loops, policy, timeouts, and optional sessions. See [`packages/bcode/examples/custom_provider.rs`](packages/bcode/examples/custom_provider.rs).
-
-```rust,no_run
-use bcode::{
-    InProcessModelProvider, InProcessModelProviderAdapter, InProcessProviderContext,
-    InProcessProviderFuture, InProcessProviderOutcome, ModelTurnRequest, ProviderTurnEvent,
-};
-
-struct CustomProvider;
-
-impl InProcessModelProvider for CustomProvider {
-    fn run_turn(
-        &self,
-        _request: ModelTurnRequest,
-        context: InProcessProviderContext,
-    ) -> InProcessProviderFuture<'_> {
-        Box::pin(async move {
-            context.events().emit(ProviderTurnEvent::TextDelta {
-                text: "hello from my provider".to_string(),
-            }).expect("turn is active");
-            Ok(InProcessProviderOutcome::EndTurn)
-        })
-    }
-}
-
-let provider = InProcessModelProviderAdapter::new(CustomProvider);
-```
-
-Implement `ModelProviderInvoker` directly only when adapting an existing external polling lifecycle.
-
-Provider-specific request controls stay out of the provider-neutral model API. Opt into a provider feature, then pass its documented typed extension through the agent builder; the extension is serialized in a provider-scoped envelope and rejected if sent to a foreign provider or unsupported API surface. For example, the OpenAI-compatible feature exposes Responses API service tier, truncation, safety identifier, and prompt-cache retention without stringly typed JSON:
+Until the crate is published, depend on the repository directly. Pin a commit for applications that need reproducible builds.
 
 ```toml
 [dependencies]
-bcode = { version = "0.0.1-alpha.0", default-features = false, features = ["openai-compatible-provider"] }
+bcode = { git = "https://github.com/BSteffaniak/bcode", default-features = false }
 ```
 
-```rust,no_run
-use bcode::{Agent, openai::{OpenAiResponsesRequestOptions, OpenAiServiceTier}};
-
-let agent = Agent::builder()
-    .model("gpt-5")
-    .provider_extension(&OpenAiResponsesRequestOptions {
-        service_tier: Some(OpenAiServiceTier::Priority),
-        safety_identifier: Some("stable-user-id".to_string()),
-        ..OpenAiResponsesRequestOptions::default()
-    })?;
-# Ok::<(), bcode::BcodeError>(())
-```
-
-The feature is disabled by default, so lean custom-provider and agent users do not compile the OpenAI-compatible transport stack. `ProviderRequestContext::request` remains an explicitly advanced, untyped escape hatch for newly released provider fields that have no typed extension yet; providers reserve typed/core field names and fail conflicting overrides.
-
-Granular capability negotiation is separate from these provider-native options. `ProviderCapabilities::feature_support` reports the active provider surface, and each `ModelInfo::feature_support` reports only model-specific evidence. `ModelTurnRequest::requested_features()` inventories parameters, structured-output strictness, tool modes/parallelism, cache hints, and media input. `ModelFeatureSupport::negotiate(...)` returns `Guaranteed` only when both provider and model affirm support with provenance; missing legacy/catalog data remains `Unknown`, never an implicit guarantee. Provider adapters additionally reject unsupported requested controls before network work.
-
-Provider/model resolution is inspectable rather than implicit. `Bcode::default_selection_provenance()`, `ProviderRegistry::default_selection_report()`, and `Agent::selection_report()` expose the effective selector, winning provider/model sources (config, profile, alias, auth config, exact environment variable, explicit registration, or per-request override), provider registration source, and selected model metadata source. Per-request builder overrides replace only the provenance they actually supersede.
-
-Basic stateless text generation uses explicit imports and a provider invoker:
-
-```rust,no_run
-use bcode::{Agent, ModelProviderInvoker};
-
-# async fn run(mut provider: impl ModelProviderInvoker) -> bcode::Result<()> {
-let agent = Agent::builder().model("example-model").build();
-let response = agent.run(&mut provider, "Say hello").await?;
-println!("{}", response.text);
-# Ok(())
-# }
-```
-
-### Builder-first quickstart
-
-Dedicated request builders are the primary API. They keep advanced options discoverable while still accepting any caller-supplied `ModelProviderInvoker`:
+Bcode's lean SDK accepts application-owned model providers and does not require the TUI, daemon, bundled plugins, or network access:
 
 ```rust,no_run
 use bcode::{ModelProviderInvoker, generate_text_builder};
-use std::time::Duration;
 
-# async fn run(mut provider: impl ModelProviderInvoker) -> bcode::Result<()> {
-let response = generate_text_builder()
-    .model("example-provider:example-model")
-    .system("Answer concisely.")
-    .prompt("Why is the sky blue?")
-    .metadata("request-id", "demo-1")
-    .timeout(Duration::from_secs(30))
-    .run(&mut provider)
-    .await?;
-println!("{}", response.text);
-# Ok(())
-# }
-```
+async fn review(provider: &mut impl ModelProviderInvoker) -> bcode::Result<String> {
+    let response = generate_text_builder()
+        .model("your-model")
+        .system("Review the patch. Be precise.")
+        .prompt("Review the current changes")
+        .run(provider)
+        .await?;
 
-For the smallest stateless call, use the thin helper; it delegates to the same builder:
-
-```rust,no_run
-# use bcode::ModelProviderInvoker;
-# async fn run(mut provider: impl ModelProviderInvoker) -> bcode::Result<()> {
-let response = bcode::generate_text(&mut provider, "Say hello").await?;
-# Ok(())
-# }
-```
-
-Progressively add `stream_text_builder`, `generate_object_builder::<T>`, `stream_object_builder::<T>`, tools, hooks, or sessions without changing the provider/model concepts.
-
-### Runtime modes and features
-
-* With `default-features = false`, the lean SDK includes builders, caller-supplied providers, tools, hooks, structured output, and lightweight session APIs; it does not include config loading, daemon IPC, the TUI, OCR, or bundled plugins.
-* Enable `config` to load provider/model defaults from Bcode's layered config and environment rules.
-* Enable `embedded-plugins` to host plugin-backed providers and tools directly in-process; this does not require daemon IPC.
-* Enable `daemon-client` for the separate `BcodeClient` daemon path; it does not enable the TUI.
-* Enable `app` only for the complete Bcode CLI/TUI product and its bundled plugin/OCR packaging. Individual static bundled plugin features remain opt-in for custom embedded distributions.
-
-### Provider registry and defaults
-
-Provider selection uses `ModelSelector`; `"provider:model"` selects both values, while `"model"` leaves provider routing to the configured invoker. Explicit defaults stay lean:
-
-```rust
-use bcode::{Bcode, ProviderRegistry};
-
-let registry = ProviderRegistry::new()
-    .provider("example-provider")
-    .default_model("example-provider:example-model");
-let sdk = Bcode::builder().provider_registry(registry).build();
-assert_eq!(sdk.default_model_selector().unwrap().model_id(), "example-model");
-```
-
-With the `config` feature, `Bcode::configured()` or `Bcode::builder().load_provider_defaults()` reads the normal layered Bcode configuration. `provider_defaults_from_config(...)` accepts an already loaded config, and `provider_defaults_from_config_environment(...)` supports deterministic environment snapshots. Configured defaults select a provider/model; actual embedded execution additionally requires `embedded-plugins` plus `plugin_runtime(...)`.
-
-Environment resolution follows the application rules, including `BCODE_MODEL_PROVIDER`/`BCODE_PROVIDER`, provider-specific model variables such as `BCODE_OPENAI_MODEL` or `BCODE_BEDROCK_MODEL`, and credential-based provider detection. Explicit builder selections can override defaults.
-
-For tests, examples, or custom integrations, implement `ModelProviderInvoker` and run a request builder. When a provider ends a round with tool calls, the runtime executes the complete batch and returns results in provider order until the provider finishes. Provider factories can instead be configured on `AgentBuilder`. Embedded applications create a plugin runtime host and pass it through `Bcode::builder().plugin_runtime(...)` or `Agent::builder().plugin_runtime(...)`.
-
-### Custom tools
-
-Register synchronous inline tools with `Agent::builder().inline_tool(...)`; handlers receive a transport-free `ToolInvocationDescriptor`. For Rust-typed inputs and outputs, use `TypedTool::<Input, Output>::new(...)` with `typed_tool(...)`: Bcode derives the input JSON Schema, decodes provider arguments into `Input`, and serializes `Output` into a structured JSON tool result. Inline tools are best for application-local behavior that should run in the embedding process. Use `tool_choice(ToolChoice::Auto | None | Required | Tool { .. })` to control provider tool selection where supported. Inline handler failures fail the turn by default; `tool_failure_policy(ToolFailurePolicy::ReturnToModel)` converts them into model-visible error results for recovery. Use `scoped_inline_tool(...)` for asynchronous local tools that also need exchanges, unsolicited input, nested services, artifact writes, lifecycle events, contributions, or cancellation through `InvocationScope`.
-
-Use plugin-backed tools when behavior should be discoverable from plugin manifests, independently packaged or disabled, permission/capability described by the plugin owner, or shared with the Bcode product. Enable `embedded-plugins`, construct a `PluginRuntimeHost`, and pass it to `Bcode::builder().plugin_runtime(...)`. `Bcode::discover_tools()` queries only manifests declaring `bcode.tool/v1` and returns plugin-owned definitions plus routing IDs; register selected definitions with `plugin_tool(...)`. Custom distributions can enable individual `static-bundled-*-plugin` features; `bundled-plugins` exposes bundled registrations without implicitly enabling the complete app, while `app` is reserved for full CLI/TUI packaging. Both inline and plugin tools retain `bcode_tool::ToolDefinition` compatibility, and provider-requested batches use the same registered tools and execution options as direct calls.
-
-Advanced hosts can inject typed adapters without implementing orchestration:
-
-```rust,no_run
-use bcode::{
-    Agent, HeadlessExchangePolicy, InvocationArtifactSink, InvocationInputRouter,
-    InvocationServiceRouter, ToolInvoker,
-};
-use std::sync::Arc;
-
-# fn build(
-#     invoker: Arc<dyn ToolInvoker>,
-#     inputs: Arc<dyn InvocationInputRouter>,
-#     services: Arc<dyn InvocationServiceRouter>,
-#     artifacts: Arc<dyn InvocationArtifactSink>,
-# ) -> Agent {
-Agent::builder()
-    .tool_invoker(invoker)
-    .input_router(inputs)
-    .service_router(services)
-    .artifact_sink(artifacts)
-    .headless_exchange_policy(HeadlessExchangePolicy::Reject)
-    .build()
-# }
-```
-
-### Multi-step generation metadata
-
-Every completed `GenerateTextResponse` includes ordered `GenerationStep` values in addition to the raw runtime events. `Model` steps identify the zero-based provider round and aggregate its text, reasoning, and usage; `ToolCall` and `ToolResult` preserve model/runtime boundaries; `FinalResponse` records final text, stop reason, and total latency. This gives application code a stable step-oriented view while retaining `response.runtime.events` for event-level diagnostics.
-
-### Streaming events
-
-Use `Agent::stream(provider, prompt)` for a complete provider/tool turn. It yields `ScopedAgentStreamItem` values whose events are generic `ScopedTurnEvent` runtime, invocation-lifecycle, or contribution envelopes, followed by exactly one final response or error as the last stream item. Provider events, including tool-call requests, retain provider occurrence order. Concurrent tool lifecycle, contribution, and `ToolResult` stream events may interleave or arrive in completion order and must be correlated by invocation/call ID and sequence. After the complete batch settles, tool-result messages sent to the next provider round and returned batch outputs are restored to provider call order. `Agent::stream_text_with_provider(...)` is the high-level provider-only text stream; advanced hosts can call `AgentRuntime::run_streaming_text_turn(...)` when they explicitly need the raw runtime `AgentStream`.
-
-`TextStream`, `AgentStream`, `ScopedAgentStream`, and `ObjectStream<T>` implement `futures::Stream`, so applications can use standard stream combinators by importing `futures::StreamExt`. Each type also retains an inherent `next()` convenience method. `TextStream` is the high-level SDK text stream with typed `BcodeError` and terminal middleware/hook finalization; `AgentStream` is the advanced raw runtime stream. Dropping a live runtime-backed stream requests cancellation of its complete provider turn; normal terminal delivery marks the stream complete before the terminal item is sent.
-
-Runtime-created streams use a bounded queue of `DEFAULT_STREAM_BUFFER_CAPACITY` items (256 by default). Configure a different positive bound with `AgentRuntime::with_stream_buffer_capacity(...)`. If a consumer falls behind and fills the queue, Bcode cancels the provider turn and terminates with `RuntimeError::StreamBufferFull` instead of buffering without limit. Terminal results and errors use a separate single terminal slot, so overflow reporting cannot itself block behind the full event queue.
-
-### Streaming and completed-response semantics
-
-Successful runtime events are exposed live in occurrence order and retained verbatim in the terminal `GenerateTextResponse::runtime.events`, so late consumers and non-streaming calls retain warnings, usage, exact-input counts, request projections, provider metadata, retry notices, reasoning, tool events, and the final lifecycle event. `runtime.usage` and `runtime.stop_reason` mirror the final provider snapshot. `GenerationStep` provides the stable provider-ordered model/tool/final view; completion-order concurrent tool events remain available in the raw event list.
-
-Failures are terminal typed `BcodeError`/`RuntimeError` values rather than synthetic successful responses. Streaming consumers keep events already observed before a provider or middleware failure; non-streaming callers receive the same structured cause. Provider-emitted cancellation first produces `AgentEvent::Cancelled` and then terminal `RuntimeError::Cancelled`; cancellation before provider startup has no fabricated provider event and returns the same terminal error.
-
-### Structured output
-
-Use `generate_object_builder::<T>()` for serde-typed extraction. `StructuredOutputOptions::for_type::<T>()` derives a JSON Schema from `schemars`; `StructuredOutputOptions::json_schema(...)` accepts explicit schemas. Bcode requests provider-native structured output where available, validates returned JSON locally, and supports explicit repair attempts with `with_max_repairs(...)`.
-
-For incremental UI updates, use `stream_object_builder::<T>()`. `ObjectStreamItem::RawDelta` contains each raw fragment. `Partial` contains a changed best-effort JSON value reconstructed only from valid incomplete prefixes; syntactically invalid prefixes are not repaired. `ValidatedPartial` is emitted when a changed partial value passes the configured schema. `Finished` contains the final schema-validated, decoded `T` plus the complete response, while `Error` is terminal for provider, timeout, cancellation, JSON, schema, and decode failures. Schemas that cannot be satisfied incrementally simply produce raw/partial events without `ValidatedPartial` until a satisfying value exists; if the final value never satisfies the schema, the stream ends with `Error`. Streaming repair attempts are rejected explicitly because retrying after visible deltas would require retracting prior events; use buffered `generate_object_builder::<T>()` when `with_max_repairs(...)` is required. The `stream_object(...)` helper delegates to the same builder.
-
-### Middleware, reliability, and observability
-
-Non-streaming text and structured requests support transport-independent `ModelMiddleware`. A middleware layer receives the complete `AgentTurnRequest` before provider invocation and the `GenerateTextResponse` after success. Layers run in registration order before the request and unwind in reverse order afterward. The stable standard-`tracing` span/event names, correlation fields, privacy boundaries, and stream-task propagation are documented in [the SDK tracing contract](docs/sdk-tracing.md). Hook and middleware panic behavior is documented in [hook and middleware failure boundaries](docs/hook-middleware-failures.md): synchronous callbacks are panic-contained as typed SDK failures without bypassing canonical provider/tool cleanup.
-
-```rust,no_run
-use bcode::{AgentTurnRequest, GenerateTextResponse, ModelMiddleware, ModelProviderInvoker};
-
-struct RedactAndBudget;
-
-impl ModelMiddleware for RedactAndBudget {
-    fn before_request(&self, mut request: AgentTurnRequest) -> bcode::Result<AgentTurnRequest> {
-        if request.prompt.len() > 8_000 {
-            return Err(bcode::BcodeError::Hook("request budget exceeded".into()));
-        }
-        request.prompt = request.prompt.replace("secret", "[redacted]");
-        Ok(request)
-    }
-
-    fn after_response(
-        &self,
-        _request: &AgentTurnRequest,
-        response: GenerateTextResponse,
-    ) -> bcode::Result<GenerateTextResponse> {
-        // Inspect response.runtime.usage, latency_ms, warnings, and events here.
-        Ok(response)
-    }
+    Ok(response.text)
 }
-
-# async fn run(mut provider: impl ModelProviderInvoker) -> bcode::Result<()> {
-let response = bcode::generate_text_builder()
-    .prompt("Do not reveal this secret")
-    .middleware_layer(RedactAndBudget)
-    .fallback_policy(
-        bcode::FallbackPolicy::new().fallback("backup-provider:backup-model"),
-    )
-    .run(&mut provider)
-    .await?;
-# Ok(())
-# }
 ```
 
-Middleware can implement rate-limit/budget rejection, redaction and safety transforms, response auditing, and tracing without server or TUI dependencies. For buffered response caching, implement `ModelResponseCache` or use bounded `InMemoryModelResponseCache`, then attach it with `response_cache(...)`. Bcode derives secret-safe provider/model/config/request identities after request middleware, preserves complete structured/tool/usage responses, exposes hit/stored/bypassed provenance, runs response middleware and hooks on hits, bypasses unsafe tool/custom-routing/custom-stop requests unless explicitly identified, and supports expiration, invalidation, privacy, and bounded single-flight behavior. See `docs/model-response-cache.md`. `RetryPolicy` retries only provider-originated failures through the runtime's cancellation-aware retry boundary; `FallbackPolicy` instead switches through an ordered list of provider/model selectors. Configure one planner directly when custom behavior must combine retry, fallback, compaction, or request rebuilding. Timeout, cancellation, permission, tool, middleware, cache, and validation failures remain terminal by default.
+Add text streaming, typed structured output, tools, middleware, retries, stateful sessions, persistence, memory, or embedded plugins as the application grows. Deterministic provider fixtures support SDK tests without credentials or network access.
 
-High-level `TextStream`, `ObjectStream<T>`, and `ScopedAgentStream` use the canonical provider/tool loop, so configured tools and provider round planners—including retry and fallback policies—remain active. They apply request middleware before provider startup and response middleware plus model hooks to the terminal response. `TextStreamItem::ScopedEvent` retains invocation lifecycle and contribution events that do not fit the normalized model-event family. Response transforms do not buffer, rewrite, or retract already emitted deltas; transformed terminal `response.text` is canonical and Bcode resynchronizes `response.runtime.text` plus ordered `response.steps` after the middleware stack. A response-middleware rejection becomes the single terminal typed SDK error after any visible events. Streaming intentionally bypasses `ModelResponseCache`: replaying a cached completed response would not reproduce trustworthy event timing or provider/tool lifecycle. Low-level `AgentStream` remains available as the raw runtime stream when SDK middleware, hooks, tools, and provider-round planning are not wanted.
+Read the [SDK guide](docs/sdk.md) or explore the [executable examples](packages/bcode/examples).
 
-### Hooks and observability
+## Extend Bcode
 
-`AgentBuilder` supports `on_before_model`, `on_after_model`, `on_before_tool`, and `on_after_tool` hooks. Hook contexts expose model IDs, prompts, tool calls, metadata, latency, and runtime events so applications can add logging, metrics, policy checks, or tracing without depending on TUI internals.
+Bcode plugins are native Rust libraries with manifest-declared, versioned interfaces. A plugin can contribute model providers, tools, auth methods, commands, workflow blocks, session importers, visual adapters, and complete terminal surfaces. Bundled plugins use the same boundaries and can be disabled independently.
 
-### Optional sessions and persistence
+Start with the [plugin guide](docs/plugins.md) and the [dynamic plugin example](examples/hello-plugin).
 
-Stateless calls do not require a session. For frontend-oriented conversations, call `Agent::chat()` and `AgentSession::send(...)`; `session()` and `generate_text_with_provider(...)` remain the explicit equivalents. Successful turns preserve the complete visible assistant/tool/result transcript used by later model context. The wrapper also exposes append, retry/regenerate, branch/fork, and import/export operations with commit-before-mutation persistence semantics. See `docs/stateful-chat.md`.
+## Documentation
 
-Applications can attach legacy request context through `SessionContextProvider`, or use the typed
-`MemoryProvider` contract for query-aware retrieval with relevance, provenance, privacy, size
-bounds, failure policy, and retrieval reports. Retrieved memory is request-only and never mutates the
-visible/persisted transcript. Persisted memory requires an explicit
-`AgentSession::remember(...)` call with `MemoryRetention::SessionTranscript`. See
-`docs/application-memory.md` for the complete contract. Context providers return normal `ModelMessage` values for each request, but those injected messages are not appended to or persisted with the visible transcript. For extensible SDK-managed persistence, implement `SessionPersistenceAdapter` and call `Agent::session_with_persistence(...)`; adapters load/save complete `PersistedSession` values and can target databases, object stores, or application services without TUI/server dependencies. `LocalSessionStore` is the built-in explicit JSON adapter and remains available through `session_with_store(...)`. Missing stores start empty, while empty or corrupt stores return repair/replacement errors instead of silently rebuilding or replaying unbounded history.
+### Start here
 
-Daemon-backed session catalogs, attach/history operations, model selection, input submission, and cancellation remain intentionally `bcode_client`-only. Enable `daemon-client` and use the re-exported `BcodeClient`; embedded `AgentSession` persistence adapters do not silently connect to or depend on a daemon.
+* [Getting started](docs/getting-started.md)
+* CLI and configuration references are generated from Bcode's command tree and Rust schema; [Getting started](docs/getting-started.md#configuration) shows how to build them locally.
+* [TUI keybindings](docs/tui-keybindings.md)
 
-See `packages/bcode/examples/` for runnable examples covering text generation, streaming, custom tools, hooks/observability, structured output, local sessions, and daemon-client setup.
+### Work with Bcode
 
-## Smooth live text presentation
+* [Permissions](docs/permissions.md)
+* [Worktrees](docs/worktrees.md)
+* [Skills](docs/skills.md)
+* [Session imports](docs/session-import-plugins.md)
+* [Reasoning presentation](docs/reasoning-presentation.md)
 
-Bcode smooths live assistant and readable-reasoning text by default through the renderer-neutral
-session view. The first displayable grapheme remains immediate while the rest of each provider chunk
-is presented within a short bounded lag. Terminal and web frontends consume the same policy; their
-native frame cadence may coalesce multiple due graphemes into one update.
+### Build on Bcode
 
-```toml
-[presentation.streaming]
-enabled = true
-curve = "linear" # linear, ease_in, ease_out, or ease_in_out
-max_lag_ms = 40
-```
+* [Rust SDK](docs/sdk.md)
+* [Plugins](docs/plugins.md)
+* [Model provider contract](docs/model-provider-contract.md)
+* [Frontend contracts](docs/frontend-contracts.md)
 
-Set `enabled = false` or `max_lag_ms = 0` to present provider chunks immediately. Values above 250
-milliseconds are bounded to 250 milliseconds so configuration cannot introduce a long response lag.
+## Project status
 
-## TUI keybindings
+Bcode is under active development at `0.0.1-alpha.0`. There are no published binaries or crates yet. Release automation currently targets ARM64 and x86-64 macOS, ARM64 and x86-64 Linux, and x86-64 Windows.
 
-TUI keybindings are configurable in `bcode.toml` under scoped `[tui.keybindings.*]` tables. Each scope maps `key = "action.id"`, matching bmux-style key-to-action configuration. Set a key to `""`, `"none"`, or `"unbind"` to remove a default binding for that key.
+This repository does not yet include a contributor guide or security policy. Use [GitHub Issues](https://github.com/BSteffaniak/bcode/issues) for bug reports and focused proposals; do not include credentials or other sensitive data.
 
-```toml
-[tui.keybindings.chat]
-"enter" = "tui.input.submitSteering"
-"ctrl+shift+enter" = "tui.input.submitFollowUp"
-"shift+enter" = "tui.input.newLine"
-"up" = "tui.input.historyPrevious"
-"down" = "tui.input.historyNext"
-"left" = "tui.editor.moveCursorLeft"
-"right" = "tui.editor.moveCursorRight"
-"alt+left" = "tui.editor.moveCursorWordLeft"
-"alt+right" = "tui.editor.moveCursorWordRight"
-"ctrl+left" = "tui.editor.moveCursorWordLeft"
-"ctrl+right" = "tui.editor.moveCursorWordRight"
-"ctrl+a" = "tui.editor.moveCursorStart"
-"ctrl+e" = "tui.editor.moveCursorEnd"
-"backspace" = "tui.editor.deleteCharBackward"
-"delete" = "tui.editor.deleteCharForward"
-"alt+backspace" = "tui.editor.deleteWordBackward"
-"ctrl+w" = "tui.editor.deleteWordBackward"
-"alt+delete" = "tui.editor.deleteWordForward"
-"ctrl+delete" = "tui.editor.deleteWordForward"
-"ctrl+u" = "tui.editor.deleteToStart"
-"ctrl+k" = "tui.editor.deleteToEnd"
-"escape" = "app.interrupt"
-"ctrl+d" = "app.exit"
-"ctrl+c" = "app.clear"
-"ctrl+f" = "app.search"
-"pageUp" = "transcript.pageUp"
-"pageDown" = "transcript.pageDown"
+## License
 
-[tui.keybindings.permission]
-"y" = "app.permission.approve"
-"n" = "app.permission.deny"
-"a" = "app.permission.alwaysAllow"
-"d" = "app.permission.alwaysDeny"
-"left" = "tui.select.previous"
-"right" = "tui.select.next"
-"enter" = "tui.select.confirm"
-"escape" = "tui.select.cancel"
-
-[tui.keybindings.session_picker]
-"up" = "tui.select.previous"
-"down" = "tui.select.next"
-"enter" = "tui.select.confirm"
-"escape" = "tui.select.cancel"
-```
-
-Key format follows `modifier+key`, with `ctrl`, `alt`, and `shift` modifiers. Examples: `ctrl+d`, `alt+left`, `pageUp`, `escape`, `enter`.
-
-The chat composer uses a Unicode-aware editor buffer. Standard composer defaults include `up` / `down` session message history navigation, left/right grapheme movement, `alt+left` / `alt+right` and `ctrl+left` / `ctrl+right` word movement, `ctrl+a` / `ctrl+e` start/end movement, `backspace` / `delete` character deletion, `alt+backspace` / `ctrl+w` word-backward deletion, `alt+delete` / `ctrl+delete` word-forward deletion, and `ctrl+u` / `ctrl+k` delete-to-start/end. Plain `home` and `end` remain transcript top/bottom bindings in the chat scope by default.
-
-Permission prompts are modal by default: permission actions only apply in the permission scope, and hints are generated from the configured permission keymap.
-
-### Permissions
-
-Bcode uses an agent-scoped permission model with `allow` / `ask` / `deny` rules under `[agent.<id>.permission]` in `bcode.toml`. See [`docs/permissions.md`](docs/permissions.md) for the full shape, category list, and built-in defaults for the `plan` and `build` agents.
-
-### Plugin and tool selection
-
-Bcode separates plugin availability and loading from model-callable tool exposure. Statically bundled plugins are compiled into the Bcode binary, but the distribution chooses which of those plugins participate in bundled defaults. Users can still opt out of bundled defaults or opt in to any available plugin.
-
-```toml
-[plugins]
-default = "none"
-enabled = ["bcode.default-agents", "bcode.filesystem", "bcode.vim-edit"]
-
-[tools]
-default = "none"
-enabled = ["filesystem.read", "vim_edit.preview"]
-```
-
-Use `default = "bundled"` under `[plugins]` to enable Bcode's distribution defaults unless disabled, `default = "none"` to start with no default plugins, or `default = "all"` to enable every available or discovered plugin unless disabled. A plugin may be compiled into Bcode without participating in distribution defaults. The Vim edit plugin is bundled but opt-in; enable it without rebuilding with:
-
-```toml
-[plugins]
-enabled = ["bcode.vim-edit"]
-```
-
-Under `[tools]`, `default = "agent"` uses the active agent's normal tool policy, `default = "none"` exposes only explicitly enabled tools, and `default = "all"` exposes all loaded tools except those in `disabled`.
-
-```toml
-[plugins]
-disabled = ["bcode.vim-edit"]
-
-[tools]
-disabled = ["vim_edit.apply"]
-```
-
-## Plugin authentication
-
-Enabled plugins register authentication providers and methods dynamically. The canonical workflow is:
-
-```sh
-bcode auth providers
-bcode auth login <provider> [--method <method>]
-bcode auth status <provider>
-bcode auth logout <provider>
-```
-
-Bcode owns hidden prompting, secure vault storage, ownership checks, device sealing, and invocation-scoped credential delivery. Provider plugins own credential declarations, OAuth/device flows, refresh, verification, and revocation. Provider-specific model IDs and base URLs remain model/provider configuration rather than auth enrollment.
-
-See [Dynamic Plugin Authentication Architecture](docs/dynamic-plugin-authentication.md) for contracts, profile precedence, lifecycle, failure behavior, and plugin-author guidance. Exa setup is documented in [`plugins/web-search-plugin/EXA.md`](plugins/web-search-plugin/EXA.md), and OpenAI multi-subscription behavior in [`docs/openai-subscription-failover.md`](docs/openai-subscription-failover.md).
-
-## Auth vault device seals
-
-Bcode stores provider secrets in sshenv-backed auth vault profiles. By default, Bcode prefers a strict transparent device-only seal for those profiles: macOS uses a non-syncing `ThisDeviceOnly` Keychain item, Windows uses current-user DPAPI, and Linux uses TPM when available. If the seal cannot be applied and `device_seal = "preferred"`, Bcode continues with a warning; `device_seal = "required"` turns that into an error.
-
-Advanced auth profile settings can override the default:
-
-```toml
-[auth.profiles.openai.settings]
-device_seal = "preferred"              # off, preferred, required
-device_seal_mode = "transparent-device-only" # transparent-device-only, default
-device_seal_strict = "true"
-# Optional explicit backend override:
-# device_seal_backend = "macos-keychain-device-only"
-```
-
-Run `bcode auth status <provider>` to inspect an integrated provider profile. The legacy provider-less `bcode auth status` remains available for active declarative-profile diagnostics. See [Dynamic Plugin Authentication Architecture](docs/dynamic-plugin-authentication.md) for vault custody and runtime metadata rules.
-
-## Session import
-
-Bcode can discover sessions from other coding agents through bundled session-import plugins. The Pi importer is enabled by default and reads Pi JSONL history without mutating Pi's files.
-
-In the TUI, open the session picker or run `/rescan-imports`; importable rows are marked like `[pi import]`. Selecting one copies it into a normal Bcode session and continuation uses Bcode's selected provider, agent, tools, and permissions. Imported external tool calls are inert history and are not replayed.
-
-CLI helpers:
-
-```sh
-bcode session import sources
-bcode session import discover --source pi
-bcode session import discover --source pi --diagnostics
-bcode session import open --source pi <external-session-id>
-```
-
-Configuration lives under `[session_import]` and `[session_import.pi]`:
-
-```toml
-[session_import]
-enabled = true
-hide_already_imported = true
-
-[session_import.pi]
-enabled = true
-path_mode = "defaults_and_custom" # defaults_only, custom_only, defaults_and_custom
-paths = ["/path/to/pi/sessions"]
-```
-
-The default Pi path is `~/.pi/agent/sessions`. Use `custom_only` to avoid scanning the default home-directory location. Import warnings are shown when mappings are lossy, such as image blocks that are not yet copied into Bcode artifacts.
-
-### Session search
-
-The standard distribution enables the bundled Tantivy transcript provider by default. Its disposable state root is host-managed beneath the artifact-isolated Bcode state directory, so ordinary local search requires no plugin selection or `storage_root` setting. The bundled compressed deep-output provider remains disabled by default because it indexes high-volume shell/tool output; enable it explicitly only when that coverage is wanted. Set `[session_search].enabled = false` to disable all search providers and ingestion without affecting canonical session commands.
-
-Historical indexing is always explicit:
-
-```sh
-bcode session search-backfill             # all enabled providers
-bcode session search-backfill --provider bcode.tantivy-session-search
-```
-
-Backfill operation IDs and revisions exist only in the current daemon process. After a restart, issue a new command; providers continue safely from their own durable derived checkpoints rather than from transport state. See [`docs/session-search-operations.md`](docs/session-search-operations.md) for storage overrides, cancellation, coverage, and purge/rebuild operations.
-
-### Client request timeout
-
-
-Local client/daemon IPC requests time out after 15 seconds by default. For slower
-session opens, set a persistent override in `bcode.toml`:
-
-```toml
-[client]
-request_timeout_secs = 60
-```
-
-Use `bcode --request-timeout-secs 60 ...` for a one-shot override. This setting
-controls local IPC requests; it does not change model-provider HTTP timeouts.
+Bcode is available under the [Mozilla Public License 2.0](LICENSE).

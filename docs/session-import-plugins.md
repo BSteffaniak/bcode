@@ -1,52 +1,90 @@
-# Session Import Plugins
+# Session import plugins
 
-Bcode session import providers expose external coding-agent conversations as one-time imports into native Bcode sessions.
+Bcode can discover conversations created by other coding agents and import a selected conversation into a native Bcode session. The bundled distribution currently includes importers for Pi and OpenCode.
 
-## Interface
+Import is a one-time copy, not synchronization. After import, continuation uses Bcode's selected provider, agent, tools, and permissions. External tool calls become inert history and are never replayed.
 
-Plugins implement the service interface:
+## Use the TUI
 
-```text
-bcode.session_import/v1
-```
-
-Operations:
-
-* `list_sources` returns source metadata such as `pi` or `claude-code`.
-* `discover_sessions` returns lightweight external session summaries for picker/catalog views.
-* `load_session` returns one selected external session as normalized import events.
-
-The shared Rust contract lives in:
+Open the session picker or run:
 
 ```text
-packages/session-import
+/rescan-imports
 ```
 
-## Ownership rules
+Import candidates are labeled with their source. Selecting one loads it through the source plugin, creates a normal Bcode session, records import provenance, and switches to the new session. Warnings are shown when source data cannot be represented exactly.
 
-* Import plugins read source-owned files read-only.
-* Import plugins do not write Bcode session event logs.
-* The Bcode server owns duplicate detection, provenance metadata, and native session creation.
-* Imported sessions are one-way snapshots. After import, Bcode does not resync that session from the source.
+## Use the CLI
 
-## Privacy expectations
+List available import sources:
 
-* Do not recursively scan arbitrary home directories.
-* Scan known app data roots or explicitly configured paths only.
-* Surface source IDs and scanned roots through config/docs.
-* Do not preserve raw external events by default.
+```sh
+bcode session import sources
+```
 
-## Normalized events
+Discover candidates from one source:
 
-Providers should map source events into `ImportableSessionEventKind`:
+```sh
+bcode session import discover --source pi
+bcode session import discover --source opencode
+```
 
-* `UserMessage`
-* `AssistantMessage`
-* `ToolCallRequested`
-* `ToolCallFinished`
-* `ModelChanged`
-* `AgentChanged`
-* `ContextCompacted`
-* `SystemMessage`
+Include bounded source diagnostics:
 
-When source data cannot be represented exactly, emit an `ImportWarning` and, if useful for transcript continuity, a visible `SystemMessage`.
+```sh
+bcode session import discover --source pi --diagnostics
+```
+
+Import one external session:
+
+```sh
+bcode session import open --source pi <external-session-id>
+bcode session import open --source opencode <external-session-id>
+```
+
+## Configuration
+
+Session import and startup discovery are enabled by default:
+
+```toml
+[session_import]
+enabled = true
+auto_discover_on_startup = true
+hide_already_imported = true
+
+[session_import.pi]
+enabled = true
+path_mode = "defaults_and_custom"
+paths = []
+
+[session_import.opencode]
+enabled = true
+path_mode = "defaults_and_custom"
+paths = []
+```
+
+`path_mode` accepts:
+
+* `defaults_only`
+* `custom_only`
+* `defaults_and_custom`
+
+Pi's default root is `~/.pi/agent/sessions`. The OpenCode importer checks `~/.local/share/opencode/opencode.db` and `~/.local/share/opencode/opencode-stable.db`. Set `custom_only` when Bcode should scan only explicitly listed roots.
+
+Import plugins do not recursively scan arbitrary home directories. They inspect known application roots or configured paths, and they read source-owned files without modifying them.
+
+## Normalization
+
+The shared import contract can represent:
+
+* user and assistant messages;
+* tool requests and results;
+* model and agent changes;
+* context compaction;
+* system messages.
+
+When source data cannot be represented exactly, the importer emits an `ImportWarning` and may add a visible system message for continuity. For example, referenced image blocks may be reported as lossy when their source artifacts are not copied.
+
+## Architecture boundary
+
+Import plugins implement the versioned `bcode.session_import/v1` service. Plugins own source discovery and decoding; the Bcode server owns duplicate detection, provenance, and canonical session creation. Import plugins never write Bcode's canonical event history directly.

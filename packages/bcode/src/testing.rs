@@ -20,6 +20,8 @@ use tokio::sync::Notify;
 pub enum TextStreamEventKind {
     /// Provider turn started.
     TurnStarted,
+    /// Positioned provider output.
+    Output,
     /// Assistant text delta.
     TextDelta,
     /// Legacy untyped reasoning delta.
@@ -60,6 +62,7 @@ impl From<&AgentEvent> for TextStreamEventKind {
     fn from(event: &AgentEvent) -> Self {
         match event {
             AgentEvent::TurnStarted => Self::TurnStarted,
+            AgentEvent::Output { .. } => Self::Output,
             AgentEvent::TextDelta(_) => Self::TextDelta,
             AgentEvent::ReasoningDelta(_) => Self::ReasoningDelta,
             AgentEvent::ReasoningActivity(_) => Self::ReasoningActivity,

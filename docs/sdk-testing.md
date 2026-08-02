@@ -4,7 +4,7 @@ Enable Bcode's opt-in `testing` feature to use a public, network-free provider f
 
 ```toml
 [dev-dependencies]
-bcode = { version = "0.0.1-alpha.0", default-features = false, features = ["testing"] }
+bcode = { git = "https://github.com/BSteffaniak/bcode", rev = "<commit>", default-features = false, features = ["testing"] }
 ```
 
 `bcode::testing::ScriptedProvider` implements the production `ModelProviderInvoker` boundary. It

@@ -1,0 +1,103 @@
+# Plugins
+
+Bcode uses plugins for domain behavior rather than treating extensibility as a thin callback layer. Model providers, tools, authentication methods, commands, skills, workflows, session importers, visual adapters, and complete TUI surfaces can all be plugin-owned.
+
+The initial plugin runtime loads native Rust dynamic libraries. Plugins are trusted native code, not sandboxed extensions.
+
+## Bundled and discovered plugins
+
+Release builds can statically bundle plugins into the Bcode executable. Bundling makes a plugin available; activation policy determines whether it is loaded. Bundled defaults can be disabled, and available plugins can be enabled explicitly.
+
+Bcode also discovers manifest-driven native plugins from:
+
+```text
+<current-directory>/.bcode/plugins
+$XDG_CONFIG_HOME/bcode/plugins
+~/.config/bcode/plugins
+<directory-containing-bcode>/plugins
+```
+
+A discovery root may contain a plugin manifest directly or plugin subdirectories containing `bcode-plugin.toml`.
+
+Inspect available plugins and services with:
+
+```sh
+bcode plugin list
+bcode plugin services
+bcode plugin check
+```
+
+## Selection
+
+Plugin loading and model-callable tool exposure are separate choices:
+
+```toml
+[plugins]
+default = "bundled" # bundled | none | all
+enabled = ["bcode.vim-edit"]
+disabled = ["bcode.blims"]
+
+[tools]
+default = "agent" # agent | none | all
+enabled = []
+disabled = ["vim_edit.apply"]
+```
+
+A plugin may provide commands or UI without exposing a model-callable tool. Agent profiles apply an additional tool policy after plugin selection.
+
+## Manifest and service boundaries
+
+A plugin manifest declares stable identity, runtime ABI information, concurrency policy, and versioned contributions. Depending on its domain, it may declare:
+
+* typed service interfaces and operations;
+* model-callable tools;
+* authentication providers and enrollment methods;
+* command-palette and slash-command contributions;
+* workflow blocks and templates;
+* event subscriptions;
+* structured visual adapters;
+* renderer-native TUI surfaces.
+
+Cross-boundary requests and responses use Bcode-owned serializable contracts. Product hosts own discovery, loading, routing, lifecycle, and contract enforcement; the plugin retains its domain rules.
+
+## Build the example plugin
+
+The [`hello-plugin`](../examples/hello-plugin) example is a native dynamic library with a manifest, service, event subscriptions, authentication contribution, and serialized TUI visual adapter. It is primarily a smoke-test fixture, but it demonstrates the complete loading boundary.
+
+```sh
+cargo build -p bcode_hello_plugin
+```
+
+The built library name is platform-specific:
+
+```text
+target/debug/libbcode_hello_plugin.dylib  # macOS
+target/debug/libbcode_hello_plugin.so     # Linux
+target/debug/bcode_hello_plugin.dll       # Windows
+```
+
+Place the library and an adjusted `bcode-plugin.toml` together under a discovery root, then run `bcode plugin check` before enabling it. The repository's [`smoke-native-plugin.sh`](../scripts/smoke-native-plugin.sh) demonstrates discovery, loading, service invocation, daemon routing, and event delivery.
+
+## Plugin-owned authentication
+
+Enabled plugins register their authentication providers and methods. The host owns hidden prompting, secure credential custody, ownership checks, and invocation-scoped delivery; plugins own provider identity, credential declarations, OAuth/device protocols, refresh, verification, and revocation.
+
+```sh
+bcode auth providers
+bcode auth login <provider> [--method <method>]
+bcode auth status <provider>
+bcode auth logout <provider>
+```
+
+See [Dynamic plugin authentication](dynamic-plugin-authentication.md).
+
+## Workflows and presentation
+
+Plugins can contribute typed workflow blocks and immutable templates without owning the generic scheduler or durable workflow store. They can also publish structured presentation payloads with renderer-specific adapters and a generic fallback.
+
+See:
+
+* [Workflow plugins and templates](workflow-plugins-and-templates.md)
+* [Plugin-authored durable workflows](plugin-workflows.md)
+* [Plugin presentation updates](plugin-live-progress.md)
+* [Tool runtime ownership](tool-runtime-contract-ownership.md)
