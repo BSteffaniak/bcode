@@ -953,6 +953,15 @@ mod header_tests {
     }
 
     #[test]
+    fn full_frame_contains_build_version_in_header() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 160, 24));
+        render(&mut app, &mut Frame::new(&mut buffer));
+        let header = buffer.row_symbols(0).expect("header row");
+        assert!(header.contains(super::super::build_info().display_version()));
+    }
+
+    #[test]
     fn header_shows_build_version_when_space_is_available() {
         let app = BmuxApp::new_with_history(None, &[], &[], false);
         let rendered = text(&header_spans(&app, 200, TuiTheme::for_app(&app)));

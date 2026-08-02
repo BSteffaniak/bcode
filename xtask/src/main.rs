@@ -2200,8 +2200,6 @@ fn create_zip_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
     paths.sort();
     let file = File::create(archive)?;
     let mut writer = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
     for path in paths {
         let relative = path.strip_prefix(staging_dir).map_err(|error| {
             format_error(format!(
@@ -2211,12 +2209,28 @@ fn create_zip_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
             ))
         })?;
         let name = zip_entry_name(relative)?;
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(archive_file_mode(&path)?);
         writer.start_file(name, options)?;
         let mut source = File::open(&path)?;
         io::copy(&mut source, &mut writer)?;
     }
     writer.finish()?;
     Ok(())
+}
+
+fn archive_file_mode(path: &Path) -> Result<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        Ok(path.metadata()?.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(0o644)
+    }
 }
 
 fn archive_source_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -3516,8 +3530,13 @@ fn extract_zip_confined<R: io::Read + io::Seek>(
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = File::create(output)?;
+        let mut file = File::create(&output)?;
         io::copy(&mut entry, &mut file)?;
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&output, fs::Permissions::from_mode(mode & 0o777))?;
+        }
     }
     Ok(())
 }
@@ -3656,6 +3675,7 @@ fn copy_release_binary(source: &Path, destination: &Path) -> Result<()> {
             destination.display()
         ))
     })?;
+    fs::set_permissions(destination, source.metadata()?.permissions())?;
     Ok(())
 }
 
@@ -3991,6 +4011,25 @@ mod tests {
 
         assert!(recreate_dir(&linked).is_err());
         assert!(outside.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn packaged_version_probe_requires_exact_distribution_output() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let binary = temp.path().join("bcode-version-fixture");
+        fs::write(&binary, "#!/bin/sh\nprintf 'bcode v0.0.1-alpha.0\\n'\n")
+            .expect("fixture binary");
+        let mut permissions = fs::metadata(&binary).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).expect("executable fixture");
+
+        let mut exact = Command::new(&binary);
+        assert!(verify_binary_version(&mut exact, "0.0.1-alpha.0").is_ok());
+        let mut mismatch = Command::new(&binary);
+        assert!(verify_binary_version(&mut mismatch, "9.9.9").is_err());
     }
 
     #[test]

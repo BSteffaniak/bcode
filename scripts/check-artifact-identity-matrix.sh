@@ -15,6 +15,30 @@ trap cleanup EXIT
 
 cd "${root}"
 
+count_live_record_processes() {
+    local state_dir="$1"
+    python3 - "${state_dir}" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+count = 0
+for path in pathlib.Path(sys.argv[1], "daemons").glob("*.json"):
+    with path.open("r", encoding="utf-8") as record_file:
+        pid = json.load(record_file).get("pid")
+    if isinstance(pid, int):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass
+        count += 1
+print(count)
+PY
+}
+
 build_artifact() {
     local name="$1"
     local artifact_id="$2"
@@ -162,7 +186,7 @@ for client_index in "${!client_pids[@]}"; do
 done
 check_running_artifact "${workdir}/debug-a" matrix-debug-a "${concurrent_state}"
 record_count="$(find "${concurrent_state}/daemons" -name '*.json' -type f | wc -l | tr -d ' ')"
-process_count="$(pgrep -f "${concurrent_state}/daemon-images" | wc -l | tr -d ' ')"
+process_count="$(count_live_record_processes "${concurrent_state}")"
 if [[ "${record_count}" != "1" || "${process_count}" != "1" ]]; then
     echo "concurrent clients produced ${record_count} records and ${process_count} daemon processes" >&2
     exit 1
@@ -200,7 +224,7 @@ if [[ "${new_pid}" == "${old_pid}" ]] || ! kill -0 "${new_pid}" 2>/dev/null; the
     exit 1
 fi
 record_count="$(find "${restart_state}/daemons" -name '*.json' -type f | wc -l | tr -d ' ')"
-process_count="$(pgrep -f "${restart_state}/daemon-images" | wc -l | tr -d ' ')"
+process_count="$(count_live_record_processes "${restart_state}")"
 if [[ "${record_count}" != "1" || "${process_count}" != "1" ]]; then
     echo "daemon crash reconnect produced ${record_count} records and ${process_count} processes" >&2
     exit 1

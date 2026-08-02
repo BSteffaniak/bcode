@@ -73,6 +73,7 @@ tracing-opentelemetry                   = { workspace = true, optional = true }
 tracing-subscriber                      = { workspace = true, optional = true }
 
 [dev-dependencies]
+bcode_build_info      = { workspace = true }
 bcode_hello_plugin    = { workspace = true }
 bcode_plugin          = { workspace = true }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
