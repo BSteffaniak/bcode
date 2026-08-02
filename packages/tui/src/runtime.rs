@@ -161,6 +161,7 @@ async fn run_event_loop_with_input_and_static_bundled<W: Write>(
         Ok(config) => {
             settings.apply_tui_config(&config.tui);
             chat.app.apply_tui_config(config.tui.clone());
+            let _ = chat.app.apply_presentation_config(config.presentation);
             chat.start_effect(TuiEffect::ReconcileAuthSecurity {
                 config: Box::new(config),
             });

@@ -69,6 +69,7 @@ pub enum TranscriptFrameInput {
     DurableBatch(Vec<SessionEvent>),
     Resize(u16, u16),
     ScrollUp(usize),
+    AdvanceStreaming(std::time::Duration),
     Observe,
 }
 
@@ -116,6 +117,16 @@ impl TranscriptFrameSequence {
                 }
                 TranscriptFrameInput::ScrollUp(rows) => {
                     let _ = self.app.scroll_transcript_up(rows);
+                }
+                TranscriptFrameInput::AdvanceStreaming(after_deadline) => {
+                    let deadline = self
+                        .app
+                        .next_streaming_presentation_deadline(std::time::Instant::now())
+                        .expect("frame step requires pending stream presentation");
+                    assert!(
+                        self.app
+                            .advance_streaming_presentation(deadline + after_deadline)
+                    );
                 }
                 TranscriptFrameInput::Observe => {}
             }
@@ -224,6 +235,61 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[test]
+    fn smoothed_stream_frame_sequence_preserves_identity_markdown_and_following() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        assert!(!app.apply_presentation_config(bcode_config::PresentationConfig::default()));
+        let frames = TranscriptFrameSequence::new(app, 80, 24).run([
+            TranscriptFrameStep {
+                label: "stream-start",
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                        output_position: None,
+                        turn_id: "turn-1".to_owned(),
+                        segment_id: "segment-1".to_owned(),
+                        segment_order: 0,
+                        update: TextStreamUpdate {
+                            generation: 0,
+                            first_revision: 1,
+                            revision: 1,
+                            operation: TextStreamOperation::Append {
+                                expected_offset: 0,
+                                text: "**smooth markdown output**".to_owned(),
+                            },
+                        },
+                    },
+                }),
+            },
+            TranscriptFrameStep {
+                label: "stream-complete",
+                input: TranscriptFrameInput::AdvanceStreaming(std::time::Duration::from_millis(
+                    100,
+                )),
+            },
+        ]);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].observation.semantic_items.len(), 1);
+        assert_eq!(frames[1].observation.semantic_items.len(), 1);
+        assert_eq!(
+            frames[0].observation.terminal_items[0].0,
+            frames[1].observation.terminal_items[0].0
+        );
+        assert!(
+            frames[1].text.contains("smooth markdown output"),
+            "{}",
+            frames[1].text
+        );
+        assert!(frames[1].markdown_fresh_equivalent);
+        assert_ne!(frames[1].observation.scroll_mode, "manual_detached");
+        assert!(matches!(
+            frames[1].observation.damage,
+            super::super::transcript_document::TranscriptDocumentDamage::Items(ref ids)
+                if ids.len() == 1
+        ));
     }
 
     #[test]

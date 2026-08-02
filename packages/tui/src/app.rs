@@ -1149,6 +1149,21 @@ impl BmuxApp {
         self.session_id
     }
 
+    /// Return the next renderer-neutral live text presentation deadline.
+    #[must_use]
+    pub fn next_streaming_presentation_deadline(&self, now: Instant) -> Option<Instant> {
+        self.session_view.next_streaming_presentation_deadline(now)
+    }
+
+    /// Advance renderer-neutral live text presentation and adapt any visible changes.
+    pub fn advance_streaming_presentation(&mut self, now: Instant) -> bool {
+        if !self.session_view.advance_streaming_presentation(now) {
+            return false;
+        }
+        let _ = self.apply_session_view_terminal_adapter();
+        true
+    }
+
     /// Return the current session title, if known.
     #[must_use]
     pub fn session_title(&self) -> Option<&str> {
@@ -1183,6 +1198,17 @@ impl BmuxApp {
                 self.markdown_presentation_revision.saturating_add(1);
         }
         self.sync_theme_target(Instant::now());
+    }
+
+    /// Apply renderer-neutral presentation configuration.
+    pub fn apply_presentation_config(&mut self, config: bcode_config::PresentationConfig) -> bool {
+        let changed = self
+            .session_view
+            .set_streaming_presentation_policy(config.streaming.policy());
+        if changed {
+            let _ = self.apply_session_view_terminal_adapter();
+        }
+        changed
     }
 
     /// Return terminal UI configuration.
@@ -4890,6 +4916,78 @@ mod tests {
             SessionEventApplication::Live,
         );
         assert_eq!(app.transcript, before);
+    }
+
+    #[test]
+    fn tui_stream_presentation_advances_only_shared_adapter_item_and_preserves_viewport() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        assert!(!app.apply_presentation_config(bcode_config::PresentationConfig::default()));
+        let live = SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-1".to_owned(),
+                segment_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    first_revision: 1,
+                    revision: 1,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset: 0,
+                        text: "smooth output".to_owned(),
+                    },
+                },
+            },
+        };
+        app.absorb_session_live_event(&live);
+        let item_id = bcode_session_view_models::TranscriptViewItemId::new(
+            "assistant-turn:turn-1:segment:segment-1",
+        );
+        assert_eq!(app.transcript().len(), 1);
+        let before_scroll = app.scroll_offset();
+        let deadline = app
+            .next_streaming_presentation_deadline(Instant::now())
+            .expect("pending presentation deadline");
+        assert!(app.advance_streaming_presentation(deadline + Duration::from_millis(50)));
+        assert_eq!(app.transcript().len(), 1);
+        assert!(app.transcript().iter().any(|item| {
+            item.text().contains("smooth output")
+                && matches!(item.kind(), &TranscriptItemKind::AssistantMessage)
+        }));
+        assert_eq!(app.scroll_offset(), before_scroll);
+        assert!(matches!(
+            app.last_transcript_damage,
+            TranscriptDocumentDamage::Items(ref ids) if ids.contains(&item_id)
+        ));
+    }
+
+    #[test]
+    fn tui_disabling_stream_presentation_flushes_through_shared_adapter() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        assert!(!app.apply_presentation_config(bcode_config::PresentationConfig::default()));
+        app.absorb_session_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-1".to_owned(),
+                segment_order: 0,
+                text: "pending output".to_owned(),
+            },
+        });
+        let mut presentation = bcode_config::PresentationConfig::default();
+        presentation.streaming.enabled = false;
+        assert!(app.apply_presentation_config(presentation));
+        assert!(
+            app.next_streaming_presentation_deadline(Instant::now())
+                .is_none()
+        );
+        assert!(matches!(
+            app.last_transcript_damage,
+            TranscriptDocumentDamage::Items(_)
+        ));
     }
 
     #[test]

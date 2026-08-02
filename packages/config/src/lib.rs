@@ -230,6 +230,9 @@ pub struct BcodeConfig {
     pub invariants: InvariantsConfig,
     #[serde(default)]
     pub system_prompt: SystemPromptConfig,
+    /// Renderer-neutral presentation configuration.
+    #[serde(default)]
+    pub presentation: PresentationConfig,
     #[serde(default)]
     pub tui: TuiConfig,
     #[serde(default)]
@@ -261,6 +264,7 @@ impl Default for BcodeConfig {
             skills: SkillsConfig::default(),
             invariants: InvariantsConfig::default(),
             system_prompt: SystemPromptConfig::default(),
+            presentation: PresentationConfig::default(),
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
             session_search: SessionSearchConfig::default(),
@@ -317,6 +321,10 @@ impl ConfigDocSchema for BcodeConfig {
             schema_section_doc::<SystemPromptConfig>(
                 "system_prompt",
                 "System prompt mode and section controls.",
+            ),
+            schema_section_doc::<PresentationConfig>(
+                "presentation",
+                "Renderer-neutral presentation behavior.",
             ),
             schema_section_doc::<TuiConfig>("tui", "Terminal UI behavior and appearance."),
             schema_section_doc::<SessionImportConfig>(
@@ -1883,6 +1891,90 @@ fn default_worktree_branch_prefix() -> String {
 
 const fn default_worktree_setup_enabled() -> bool {
     true
+}
+
+/// Renderer-neutral presentation configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "presentation")]
+pub struct PresentationConfig {
+    /// Live text stream presentation configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub streaming: PresentationStreamingConfig,
+}
+
+/// Renderer-neutral live text stream presentation configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "streaming")]
+pub struct PresentationStreamingConfig {
+    /// Smooth accepted live text into progressive visible prefixes.
+    #[serde(default = "default_streaming_presentation_enabled")]
+    pub enabled: bool,
+    /// Curve used to distribute visible progress over the lag budget.
+    #[serde(default)]
+    pub curve: StreamingInterpolationCurveConfig,
+    /// Maximum nominal age of hidden accepted text in milliseconds.
+    #[serde(default = "default_streaming_presentation_max_lag_ms")]
+    pub max_lag_ms: u64,
+}
+
+impl PresentationStreamingConfig {
+    /// Convert configuration into the bounded renderer-neutral policy.
+    #[must_use]
+    pub const fn policy(self) -> bcode_session_view_models::StreamingPresentationPolicy {
+        bcode_session_view_models::StreamingPresentationPolicy {
+            enabled: self.enabled,
+            curve: match self.curve {
+                StreamingInterpolationCurveConfig::Linear => {
+                    bcode_session_view_models::StreamingInterpolationCurve::Linear
+                }
+                StreamingInterpolationCurveConfig::EaseIn => {
+                    bcode_session_view_models::StreamingInterpolationCurve::EaseIn
+                }
+                StreamingInterpolationCurveConfig::EaseOut => {
+                    bcode_session_view_models::StreamingInterpolationCurve::EaseOut
+                }
+                StreamingInterpolationCurveConfig::EaseInOut => {
+                    bcode_session_view_models::StreamingInterpolationCurve::EaseInOut
+                }
+            },
+            max_lag_ms: self.max_lag_ms,
+        }
+        .normalized()
+    }
+}
+
+impl Default for PresentationStreamingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_streaming_presentation_enabled(),
+            curve: StreamingInterpolationCurveConfig::default(),
+            max_lag_ms: default_streaming_presentation_max_lag_ms(),
+        }
+    }
+}
+
+const fn default_streaming_presentation_enabled() -> bool {
+    true
+}
+
+const fn default_streaming_presentation_max_lag_ms() -> u64 {
+    bcode_session_view_models::StreamingPresentationPolicy::DEFAULT_MAX_LAG_MS
+}
+
+/// Easing curve for renderer-neutral live text presentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingInterpolationCurveConfig {
+    /// Constant-rate progression.
+    #[default]
+    Linear,
+    /// Slow start followed by acceleration.
+    EaseIn,
+    /// Fast start followed by deceleration.
+    EaseOut,
+    /// Slow start and end around a faster midpoint.
+    EaseInOut,
 }
 
 /// Terminal UI configuration.
@@ -4814,6 +4906,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_skills_toml(&mut output, &config.skills);
     write_invariants_toml(&mut output, &config.invariants);
     write_system_prompt_toml(&mut output, &config.system_prompt);
+    write_presentation_toml(&mut output, config.presentation);
     write_tui_toml(&mut output, &config.tui);
     write_client_toml(&mut output, &config.client);
     write_domain_toml(&mut output, "web_search", &config.web_search);
@@ -5433,6 +5526,33 @@ const fn system_prompt_mode_name(mode: SystemPromptMode) -> &'static str {
     match mode {
         SystemPromptMode::Default => "default",
         SystemPromptMode::Replace => "replace",
+    }
+}
+
+fn write_presentation_toml(output: &mut String, presentation: PresentationConfig) {
+    if presentation == PresentationConfig::default() {
+        return;
+    }
+    let streaming = presentation.streaming;
+    writeln!(output, "[presentation.streaming]").expect("writing to string should not fail");
+    writeln!(output, "enabled = {}", streaming.enabled).expect("writing to string should not fail");
+    writeln!(
+        output,
+        "curve = {}",
+        toml_string(streaming_curve_name(streaming.curve))
+    )
+    .expect("writing to string should not fail");
+    writeln!(output, "max_lag_ms = {}", streaming.max_lag_ms)
+        .expect("writing to string should not fail");
+    output.push('\n');
+}
+
+const fn streaming_curve_name(curve: StreamingInterpolationCurveConfig) -> &'static str {
+    match curve {
+        StreamingInterpolationCurveConfig::Linear => "linear",
+        StreamingInterpolationCurveConfig::EaseIn => "ease_in",
+        StreamingInterpolationCurveConfig::EaseOut => "ease_out",
+        StreamingInterpolationCurveConfig::EaseInOut => "ease_in_out",
     }
 }
 
@@ -6672,6 +6792,94 @@ scheme = "api_key"
         assert!(
             toml::from_str::<super::ToolExecutionConfig>(
                 "parallel = true\nmax_concurrency = 0\npreparation_timeout_ms = 30000\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn every_configured_stream_curve_maps_through_normal_config() {
+        for (name, expected) in [
+            (
+                "linear",
+                bcode_session_view_models::StreamingInterpolationCurve::Linear,
+            ),
+            (
+                "ease_in",
+                bcode_session_view_models::StreamingInterpolationCurve::EaseIn,
+            ),
+            (
+                "ease_out",
+                bcode_session_view_models::StreamingInterpolationCurve::EaseOut,
+            ),
+            (
+                "ease_in_out",
+                bcode_session_view_models::StreamingInterpolationCurve::EaseInOut,
+            ),
+        ] {
+            let config: BcodeConfig =
+                toml::from_str(&format!("[presentation.streaming]\ncurve = \"{name}\"\n"))
+                    .expect("configured stream curve parses");
+            assert_eq!(config.presentation.streaming.policy().curve, expected);
+        }
+
+        let zero: BcodeConfig =
+            toml::from_str("[presentation.streaming]\nenabled = true\nmax_lag_ms = 0\n")
+                .expect("zero lag parses");
+        assert!(zero.presentation.streaming.policy().is_immediate());
+    }
+
+    #[test]
+    fn streaming_presentation_defaults_and_configuration_round_trip() {
+        let default = BcodeConfig::default().presentation.streaming;
+        assert!(default.enabled);
+        assert_eq!(
+            default.curve,
+            super::StreamingInterpolationCurveConfig::Linear
+        );
+        assert_eq!(default.max_lag_ms, 40);
+        assert_eq!(
+            default.policy(),
+            bcode_session_view_models::StreamingPresentationPolicy::default()
+        );
+
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[presentation.streaming]
+enabled = false
+curve = "ease_in_out"
+max_lag_ms = 5000
+"#,
+        )
+        .expect("stream presentation config parses");
+        let policy = config.presentation.streaming.policy();
+        assert!(!policy.enabled);
+        assert_eq!(
+            policy.curve,
+            bcode_session_view_models::StreamingInterpolationCurve::EaseInOut
+        );
+        assert_eq!(
+            policy.max_lag_ms,
+            bcode_session_view_models::StreamingPresentationPolicy::MAX_LAG_MS
+        );
+
+        let rendered = super::config_to_toml(&config);
+        assert!(rendered.contains("[presentation.streaming]"), "{rendered}");
+        assert!(rendered.contains("enabled = false"), "{rendered}");
+        assert!(rendered.contains("curve = \"ease_in_out\""), "{rendered}");
+        assert!(rendered.contains("max_lag_ms = 5000"), "{rendered}");
+        let reparsed: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
+        assert_eq!(reparsed.presentation, config.presentation);
+    }
+
+    #[test]
+    fn streaming_presentation_rejects_unknown_curve() {
+        assert!(
+            toml::from_str::<BcodeConfig>(
+                r#"
+[presentation.streaming]
+curve = "bounce"
+"#
             )
             .is_err()
         );

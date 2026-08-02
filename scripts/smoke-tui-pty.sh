@@ -82,6 +82,13 @@ model_id = "fake-echo"
 [model.profiles.pty-smoke.settings]
 fake_stream_delta_delay_ms = "500"
 
+# Shared stream presentation is enabled explicitly in PTY acceptance so fake-provider
+# chunk delivery exercises the normal renderer-neutral smoothing path.
+[presentation.streaming]
+enabled = true
+curve = "linear"
+max_lag_ms = 40
+
 [model.prompt_cache]
 mode = "off"
 

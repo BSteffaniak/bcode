@@ -18,6 +18,27 @@ the canonical fallback.
 
 Canonical transcript content crosses the single `SessionViewTerminalAdapter` boundary into the TUI. Runtime-work label composition and other terminal activity strings live in TUI modules rather than shared session-view models.
 
+## Smooth live text presentation
+
+`SessionView` owns renderer-neutral smoothing of accepted live assistant and readable-reasoning text.
+Normalized stream generation, revision, checkpoint, offset, and terminal validation remains immediate
+and authoritative; only the transcript prefix exposed to a client is ephemeral presentation state.
+Presentation timing and prefixes are never persisted and do not alter provider, runtime, permission,
+tool, or public frontend-event semantics.
+
+Each frontend supplies a `StreamingPresentationPolicy` to its per-client `SessionView`, schedules
+`next_streaming_presentation_deadline`, and calls `advance_streaming_presentation` from its native
+event loop. The shared layer exposes the first complete grapheme immediately, uses the selected
+curve to advance the remaining prefix, and flushes exact accepted text on stream or model-turn
+terminal outcomes. Checkpoints, durable final content, history rebuilds, generation replacement, and
+disabling smoothing reconcile directly rather than replaying animation.
+
+The configured `max_lag_ms` is a bounded presentation backlog, not a fixed response delay. Renderer
+cadence and backpressure may coalesce intermediate prefixes. HyperChad retains only the newest
+snapshot per opaque render scope, and skipped animation frames use complete snapshots rather than
+patch chains based on undelivered revisions. TUI and HyperChad code must not split chunks, evaluate
+curves, or own accepted text; those semantics remain in `packages/session-view`.
+
 ## Transcript eligibility catalog
 
 Every `TranscriptViewItemKind` is intentional chronological product history:

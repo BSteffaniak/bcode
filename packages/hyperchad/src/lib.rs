@@ -29,7 +29,7 @@ use bcode_session_view::{SessionView, execute_session_view_action};
 use bcode_session_view_models::{
     ComposerDraftViewScope, InteractionViewSummary, MessageAcceptanceDispositionView,
     PromptPlacementView, ReasoningPresentationPolicy, SessionViewAction, SessionViewPatch,
-    SessionViewSnapshot,
+    SessionViewSnapshot, StreamingPresentationPolicy,
 };
 use hyperchad::router::{RoutePath, RouteRequest, Router};
 use serde::Deserialize;
@@ -50,7 +50,8 @@ pub struct HyperChadAppState {
     interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
     interaction_submissions: Arc<Mutex<BTreeSet<String>>>,
     reasoning_presentation_policy: ReasoningPresentationPolicy,
-    renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
+    streaming_presentation_policy: StreamingPresentationPolicy,
+    renderer_tx: Arc<Mutex<Option<Arc<LatestSnapshotUpdates>>>>,
 }
 
 impl std::fmt::Debug for HyperChadAppState {
@@ -66,6 +67,10 @@ impl std::fmt::Debug for HyperChadAppState {
             .field(
                 "reasoning_presentation_policy",
                 &self.reasoning_presentation_policy,
+            )
+            .field(
+                "streaming_presentation_policy",
+                &self.streaming_presentation_policy,
             )
             .field(
                 "renderer_configured",
@@ -119,7 +124,7 @@ impl std::fmt::Debug for LocalInteractionControllers {
 /// Opaque renderer-owned subscription scope.
 ///
 /// Bcode application code stores and forwards this value without parsing or composing it.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RenderSubscriptionScope(String);
 
 impl std::fmt::Debug for RenderSubscriptionScope {
@@ -137,15 +142,48 @@ struct ScopedSnapshotUpdate {
     sessions: Vec<SessionSummary>,
 }
 
+#[derive(Default)]
+struct LatestSnapshotUpdates {
+    by_scope: Mutex<BTreeMap<RenderSubscriptionScope, ScopedSnapshotUpdate>>,
+    notify: tokio::sync::Notify,
+}
+
+impl LatestSnapshotUpdates {
+    fn publish(&self, update: ScopedSnapshotUpdate) {
+        self.by_scope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(update.scope.clone(), update);
+        self.notify.notify_one();
+    }
+
+    #[cfg_attr(not(any(test, feature = "renderer-html-actix")), allow(dead_code))]
+    async fn next(&self) -> ScopedSnapshotUpdate {
+        loop {
+            let update = {
+                self.by_scope
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_first()
+                    .map(|(_, update)| update)
+            };
+            if let Some(update) = update {
+                return update;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
 struct SessionWatchContext {
     client: BcodeClient,
     render_scope: RenderSubscriptionScope,
     session_id: SessionId,
-    renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
-    last_sent_snapshot: Arc<Mutex<Option<SessionViewSnapshot>>>,
+    renderer_tx: Arc<Mutex<Option<Arc<LatestSnapshotUpdates>>>>,
     history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
     interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
     reasoning_presentation_policy: ReasoningPresentationPolicy,
+    streaming_presentation_policy: StreamingPresentationPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,19 +313,36 @@ impl HyperChadAppState {
     /// Create `HyperChad` application state from a daemon client and access capability.
     #[must_use]
     pub fn new(client: BcodeClient, access_token: impl Into<Arc<str>>) -> Self {
-        Self::with_reasoning_presentation_policy(
+        Self::with_presentation_policies(
             client,
             access_token,
             ReasoningPresentationPolicy::All,
+            StreamingPresentationPolicy::default(),
         )
     }
 
-    /// Create `HyperChad` application state with a renderer-local reasoning policy.
+    /// Create `HyperChad` state with shared live text presentation policy.
     #[must_use]
-    pub fn with_reasoning_presentation_policy(
+    pub fn with_streaming_presentation_policy(
+        client: BcodeClient,
+        access_token: impl Into<Arc<str>>,
+        streaming_presentation_policy: StreamingPresentationPolicy,
+    ) -> Self {
+        Self::with_presentation_policies(
+            client,
+            access_token,
+            ReasoningPresentationPolicy::All,
+            streaming_presentation_policy,
+        )
+    }
+
+    /// Create `HyperChad` application state with renderer-local presentation policies.
+    #[must_use]
+    pub fn with_presentation_policies(
         client: BcodeClient,
         access_token: impl Into<Arc<str>>,
         reasoning_presentation_policy: ReasoningPresentationPolicy,
+        streaming_presentation_policy: StreamingPresentationPolicy,
     ) -> Self {
         let client = client.with_interaction_adapters(local_interaction_adapters());
         Self {
@@ -298,6 +353,7 @@ impl HyperChadAppState {
             interaction_controllers: Arc::new(Mutex::new(LocalInteractionControllers::default())),
             interaction_submissions: Arc::new(Mutex::new(BTreeSet::new())),
             reasoning_presentation_policy,
+            streaming_presentation_policy: streaming_presentation_policy.normalized(),
             renderer_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -348,16 +404,17 @@ impl HyperChadAppState {
         let interaction_controllers = Arc::clone(&self.interaction_controllers);
         let watched_sessions = Arc::clone(&self.watched_sessions);
         let reasoning_presentation_policy = self.reasoning_presentation_policy;
+        let streaming_presentation_policy = self.streaming_presentation_policy;
         tokio::spawn(async move {
             if let Err(error) = Box::pin(watch_session_updates(SessionWatchContext {
                 client,
                 render_scope,
                 session_id,
                 renderer_tx: Arc::clone(&renderer_tx),
-                last_sent_snapshot: Arc::new(Mutex::new(None)),
                 history_windows,
                 interaction_controllers,
                 reasoning_presentation_policy,
+                streaming_presentation_policy,
             }))
             .await
             {
@@ -1684,6 +1741,7 @@ async fn attach_watched_session(
     session_id: SessionId,
     interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
     reasoning_presentation_policy: ReasoningPresentationPolicy,
+    streaming_presentation_policy: StreamingPresentationPolicy,
 ) -> Result<(SessionWatcher, AttachedSessionHistory, SessionView), ClientError> {
     let mut watcher = client
         .watch_session_projection_window(session_id, hyperchad_projection_window_request())
@@ -1693,6 +1751,7 @@ async fn attach_watched_session(
         .ok_or(ClientError::UnexpectedResponse)?;
     let mut view = view_from_attached_history(&attached);
     view.set_reasoning_presentation_policy(reasoning_presentation_policy);
+    let _ = view.set_streaming_presentation_policy(streaming_presentation_policy);
     hydrate_session_model_status(client, session_id, &mut view).await?;
     hydrate_pending_permissions(client, session_id, &mut view).await?;
     hydrate_pending_interactions(client, session_id, &mut view, interaction_controllers).await?;
@@ -1718,8 +1777,8 @@ const fn durable_event_disposition(
 }
 
 fn browser_update_sender(
-    renderer_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
-) -> Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>> {
+    renderer_tx: &Arc<Mutex<Option<Arc<LatestSnapshotUpdates>>>>,
+) -> Option<Arc<LatestSnapshotUpdates>> {
     renderer_tx
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1798,6 +1857,7 @@ async fn attach_watch_with_retry(
             context.session_id,
             &context.interaction_controllers,
             context.reasoning_presentation_policy,
+            context.streaming_presentation_policy,
         )
         .await
         {
@@ -1816,6 +1876,7 @@ async fn attach_watch_with_retry(
     }
 }
 
+#[cfg(test)]
 fn scoped_snapshot_patch(
     previous: &mut Option<SessionViewSnapshot>,
     snapshot: &SessionViewSnapshot,
@@ -1832,17 +1893,10 @@ fn scoped_snapshot_update(
     snapshot: SessionViewSnapshot,
     sessions: Vec<SessionSummary>,
 ) -> ScopedSnapshotUpdate {
-    let patch = {
-        let mut previous = context
-            .last_sent_snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        scoped_snapshot_patch(&mut previous, &snapshot)
-    };
     ScopedSnapshotUpdate {
         scope: context.render_scope.clone(),
         snapshot,
-        patch,
+        patch: None,
         sessions,
     }
 }
@@ -1879,10 +1933,8 @@ async fn send_connection_update(
     .unwrap_or_else(|_| snapshot_from_view(view, attached));
     snapshot.connection_status = status;
     snapshot.catalog_status = catalog_status;
-    Ok(sender
-        .send(scoped_snapshot_update(context, snapshot, sessions))
-        .await
-        .is_ok())
+    sender.publish(scoped_snapshot_update(context, snapshot, sessions));
+    Ok(true)
 }
 
 async fn send_watched_snapshot(
@@ -1912,14 +1964,12 @@ async fn send_watched_snapshot(
     let Some(sender) = browser_update_sender(&context.renderer_tx) else {
         return Ok(false);
     };
-    Ok(sender
-        .send(scoped_snapshot_update(
-            context,
-            snapshot,
-            session_list.sessions,
-        ))
-        .await
-        .is_ok())
+    sender.publish(scoped_snapshot_update(
+        context,
+        snapshot,
+        session_list.sessions,
+    ));
+    Ok(true)
 }
 
 async fn watch_session_updates(context: SessionWatchContext) -> Result<(), ClientError> {
@@ -1937,7 +1987,26 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
     };
 
     loop {
-        let event = match watcher.next_event().await {
+        let presentation_deadline =
+            view.next_streaming_presentation_deadline(std::time::Instant::now());
+        let event = if let Some(deadline) = presentation_deadline {
+            let delay = deadline.saturating_duration_since(std::time::Instant::now());
+            tokio::select! {
+                event = watcher.next_event() => Some(event),
+                () = tokio::time::sleep(delay) => None,
+            }
+        } else {
+            Some(watcher.next_event().await)
+        };
+        let Some(event) = event else {
+            if view.advance_streaming_presentation(std::time::Instant::now())
+                && !send_watched_snapshot(&context, &mut attached, &view).await?
+            {
+                return Ok(());
+            }
+            continue;
+        };
+        let event = match event {
             Ok(event) => event,
             Err(error) => {
                 if browser_update_sender(renderer_tx).is_none() {
@@ -2037,15 +2106,16 @@ pub fn configure_live_updates<R>(renderer: &R, state: &HyperChadAppState)
 where
     R: hyperchad::renderer::Renderer + Clone + 'static,
 {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ScopedSnapshotUpdate>(1);
+    let updates = Arc::new(LatestSnapshotUpdates::default());
     *state
         .renderer_tx
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&updates));
     let renderer = renderer.clone();
     let access_token = Arc::clone(&state.access_token);
     tokio::spawn(async move {
-        while let Some(update) = rx.recv().await {
+        loop {
+            let update = updates.next().await;
             if let Some(patch) = &update.patch {
                 tracing::trace!(
                     base_revision = patch.base_revision,
@@ -2074,6 +2144,112 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hyperchad_streaming_policies_preserve_multibyte_text_for_every_mode() {
+        let session_id = bcode_session_models::SessionId::new();
+        let text = "e\u{301}clair 🙂 stream";
+        let mut policies = vec![StreamingPresentationPolicy::immediate()];
+        policies.extend(
+            ["linear", "ease_in", "ease_out", "ease_in_out"]
+                .into_iter()
+                .map(|curve| {
+                    serde_json::from_value::<StreamingPresentationPolicy>(serde_json::json!({
+                        "enabled": true,
+                        "curve": curve,
+                        "max_lag_ms": 40
+                    }))
+                    .expect("serialized stream policy")
+                }),
+        );
+        for policy in policies {
+            let mut view = SessionView::new();
+            let _ = view.set_streaming_presentation_policy(policy);
+            view.apply_live_event(&bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-1".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: 1,
+                        revision: 1,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: 0,
+                            text: text.to_owned(),
+                        },
+                    },
+                },
+            });
+            if let Some(deadline) =
+                view.next_streaming_presentation_deadline(std::time::Instant::now())
+            {
+                assert!(view.advance_streaming_presentation(
+                    deadline + std::time::Duration::from_millis(100)
+                ));
+            }
+            let snapshot = view.snapshot();
+            assert!(snapshot.transcript.items.iter().any(|item| matches!(
+                &item.kind,
+                bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                    if message.text == text
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_snapshot_updates_keep_newest_state_independently_per_scope() {
+        let updates = LatestSnapshotUpdates::default();
+        let scope_a = RenderSubscriptionScope("a".to_owned());
+        let scope_b = RenderSubscriptionScope("b".to_owned());
+        for (scope, revision) in [
+            (scope_a.clone(), 1),
+            (scope_b.clone(), 4),
+            (scope_a.clone(), 7),
+        ] {
+            let mut snapshot = SessionViewSnapshot::empty();
+            snapshot.revision = revision;
+            updates.publish(ScopedSnapshotUpdate {
+                scope,
+                snapshot,
+                patch: None,
+                sessions: Vec::new(),
+            });
+        }
+        let first = updates.next().await;
+        let second = updates.next().await;
+        assert_eq!(first.scope, scope_a);
+        assert_eq!(first.snapshot.revision, 7);
+        assert_eq!(second.scope, scope_b);
+        assert_eq!(second.snapshot.revision, 4);
+    }
+
+    #[tokio::test]
+    async fn latest_snapshot_updates_coalesce_by_scope_without_blocking_publishers() {
+        let updates = LatestSnapshotUpdates::default();
+        let scope = RenderSubscriptionScope("scope".to_owned());
+        for revision in 1..=3 {
+            let mut snapshot = SessionViewSnapshot::empty();
+            snapshot.revision = revision;
+            updates.publish(ScopedSnapshotUpdate {
+                scope: scope.clone(),
+                snapshot,
+                patch: None,
+                sessions: Vec::new(),
+            });
+        }
+        let received = updates.next().await;
+        assert_eq!(received.snapshot.revision, 3);
+        assert!(
+            updates
+                .by_scope
+                .lock()
+                .expect("latest update lock")
+                .is_empty()
+        );
+    }
 
     fn durable(
         session_id: bcode_session_models::SessionId,

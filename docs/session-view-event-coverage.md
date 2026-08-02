@@ -9,6 +9,16 @@ Status meanings:
 * **Missing**: renderer-relevant semantics exist in the TUI or host flow but are absent from the shared projection.
 * **Intentional no-op**: the event has no renderer-semantic state to share at present.
 
+## Live stream presentation cadence
+
+`AssistantTextStreamUpdated`, `AssistantReasoningTextStreamUpdated`, and their legacy delta adapters
+always update canonical generation/revision/offset integrity immediately. A configured frontend may
+temporarily expose only a grapheme-safe prefix through `SessionView`; accepted bytes and terminal
+state remain authoritative and presentation prefixes are never durable history. Checkpoints,
+generation replacement, durable finalization, model-turn completion, history-window rebuild, and
+runtime disablement reconcile pending presentation directly. TUI and HyperChad schedule the same
+shared deadlines and must not independently split chunks or evaluate interpolation curves.
+
 ## Updateable tool transcript migration
 
 The coverage statuses below describe the implemented shared projection. `SessionView` is now the sole

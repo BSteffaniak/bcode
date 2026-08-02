@@ -957,9 +957,11 @@ async fn handle_web_command(
         .map_err(|error| CliError::HyperChadRender(error.to_owned()))?;
     let port = requested_port.unwrap_or(0);
     let access_token = random_web_access_token()?;
-    let state = bcode_hyperchad::HyperChadAppState::new(
+    let config = bcode_config::load_config()?;
+    let state = bcode_hyperchad::HyperChadAppState::with_streaming_presentation_policy(
         BcodeClient::default_endpoint(),
         access_token.clone(),
+        config.presentation.streaming.policy(),
     );
     let builder = bcode_hyperchad::init(&state).await?;
     let launch_token = access_token;

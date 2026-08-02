@@ -24,7 +24,7 @@ for registry in ("ARTIFACT_ADAPTERS", "VISUAL_ADAPTERS"):
 
 artifact_count = len(registries["ARTIFACT_ADAPTERS"])
 visual_count = len(registries["VISUAL_ADAPTERS"])
-if artifact_count != 24 or visual_count != 25:
+if artifact_count != 24 or visual_count != 29:
     raise SystemExit(
         f"adapter registry changed without updating exhaustive coverage: "
         f"artifacts={artifact_count} visuals={visual_count}"
@@ -57,11 +57,11 @@ expected_variants = {
     "UserMessage",
     "AssistantMessage",
     "ReasoningMessage",
+    "ReasoningActivity",
     "ToolInvocation",
+    "ToolRequestDraft",
     "ToolRequest",
     "Permission",
-    "RuntimeWork",
-    "Usage",
     "Compaction",
     "Interaction",
     "Skill",

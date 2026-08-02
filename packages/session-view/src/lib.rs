@@ -18,12 +18,14 @@ use bcode_session_models::{
 use bcode_session_view_models::{
     ChatMessageView, CompactionView, CompactionViewStatus, ComposerViewState,
     InteractionViewSummary, PluginStatusView, ProviderProgressView, SessionViewSnapshot, SkillView,
-    SkillViewStatus, TextFormat, TextStreamViewState, TextStreamViewStatus, ThinkingViewState,
-    ToolInvocationView, ToolInvocationViewStatus, ToolRequestDraftView, ToolResultView,
-    ToolTimingView, TranscriptViewItem, TranscriptViewItemId, TranscriptViewItemKind,
-    TurnOutputLocation,
+    SkillViewStatus, StreamingInterpolationCurve, StreamingPresentationPolicy, TextFormat,
+    TextStreamViewState, TextStreamViewStatus, ThinkingViewState, ToolInvocationView,
+    ToolInvocationViewStatus, ToolRequestDraftView, ToolResultView, ToolTimingView,
+    TranscriptViewItem, TranscriptViewItemId, TranscriptViewItemKind, TurnOutputLocation,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, Default)]
 struct LiveReasoningActivity {
@@ -124,6 +126,152 @@ impl ToolInvocationAggregate {
     }
 }
 
+const MAX_RETAINED_PENDING_TEXT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone)]
+enum PendingTextDestination {
+    Transcript {
+        turn_id: String,
+    },
+    ReasoningPart {
+        turn_id: String,
+        activity_id: String,
+        activity_order: u32,
+        part_id: String,
+        kind: bcode_session_models::ReasoningContentKind,
+        role: bcode_session_models::ReasoningContentRole,
+        part_order: u32,
+    },
+}
+
+impl PendingTextDestination {
+    fn turn_id(&self) -> &str {
+        match self {
+            Self::Transcript { turn_id } | Self::ReasoningPart { turn_id, .. } => turn_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingTextPresentation {
+    target: String,
+    presented_bytes: usize,
+    started_at: Instant,
+    deadline: Instant,
+    destination: PendingTextDestination,
+}
+
+impl PendingTextPresentation {
+    fn new(
+        target: String,
+        presented_bytes: usize,
+        now: Instant,
+        max_lag: Duration,
+        destination: PendingTextDestination,
+    ) -> Self {
+        Self {
+            target,
+            presented_bytes,
+            started_at: now,
+            deadline: now.checked_add(max_lag).unwrap_or(now),
+            destination,
+        }
+    }
+
+    fn rebase(
+        &mut self,
+        target: String,
+        now: Instant,
+        max_lag: Duration,
+        destination: PendingTextDestination,
+    ) {
+        self.target = target;
+        self.started_at = now;
+        self.deadline = now.checked_add(max_lag).unwrap_or(now);
+        self.destination = destination;
+    }
+
+    fn due_bytes(&self, now: Instant, curve: StreamingInterpolationCurve) -> usize {
+        const SCALE: u128 = 1_000_000;
+        if now >= self.deadline {
+            return self.target.len();
+        }
+        let duration = self.deadline.saturating_duration_since(self.started_at);
+        if duration.is_zero() {
+            return self.target.len();
+        }
+        let elapsed = now.saturating_duration_since(self.started_at);
+        let progress = elapsed
+            .as_nanos()
+            .saturating_mul(SCALE)
+            .checked_div(duration.as_nanos().max(1))
+            .unwrap_or(SCALE)
+            .min(SCALE);
+        let cubic = |value: u128| {
+            value
+                .saturating_mul(value)
+                .checked_div(SCALE)
+                .unwrap_or(SCALE)
+                .saturating_mul(value)
+                .checked_div(SCALE)
+                .unwrap_or(SCALE)
+        };
+        let curved = match curve {
+            StreamingInterpolationCurve::Linear => progress,
+            StreamingInterpolationCurve::EaseIn => cubic(progress),
+            StreamingInterpolationCurve::EaseOut => {
+                SCALE.saturating_sub(cubic(SCALE.saturating_sub(progress)))
+            }
+            StreamingInterpolationCurve::EaseInOut if progress < SCALE / 2 => {
+                cubic(progress).saturating_mul(4).min(SCALE)
+            }
+            StreamingInterpolationCurve::EaseInOut => SCALE.saturating_sub(
+                cubic(SCALE.saturating_sub(progress).saturating_mul(2))
+                    .checked_div(2)
+                    .unwrap_or(0),
+            ),
+        };
+        let remaining_graphemes = self.target[self.presented_bytes..].graphemes(true).count();
+        if remaining_graphemes == 0 {
+            return self.target.len();
+        }
+        let due_graphemes = usize::try_from(
+            u128::try_from(remaining_graphemes)
+                .unwrap_or(u128::MAX)
+                .saturating_mul(curved)
+                .checked_div(SCALE)
+                .unwrap_or(0),
+        )
+        .unwrap_or(remaining_graphemes)
+        .min(remaining_graphemes);
+        if due_graphemes == 0 {
+            return self.presented_bytes;
+        }
+        self.target[self.presented_bytes..]
+            .grapheme_indices(true)
+            .nth(due_graphemes)
+            .map_or(self.target.len(), |(offset, _)| {
+                self.presented_bytes + offset
+            })
+    }
+
+    fn next_deadline(&self, now: Instant) -> Instant {
+        let remaining = self.target[self.presented_bytes..].graphemes(true).count();
+        if remaining <= 1 {
+            return self.deadline;
+        }
+        let remaining_u32 = u32::try_from(remaining).unwrap_or(u32::MAX).max(1);
+        let interval = self
+            .deadline
+            .saturating_duration_since(now)
+            .checked_div(remaining_u32)
+            .unwrap_or(Duration::from_millis(1));
+        now.checked_add(interval.max(Duration::from_millis(1)))
+            .unwrap_or(now)
+            .min(self.deadline)
+    }
+}
+
 /// Renderer-neutral session view projection.
 #[derive(Debug, Clone)]
 pub struct SessionView {
@@ -137,6 +285,8 @@ pub struct SessionView {
     live_reasoning: BTreeMap<(String, String), LiveReasoningActivity>,
     last_text_stream_updates:
         BTreeMap<TranscriptViewItemId, bcode_session_models::TextStreamUpdate>,
+    streaming_presentation_policy: StreamingPresentationPolicy,
+    pending_text_presentations: BTreeMap<TranscriptViewItemId, PendingTextPresentation>,
 }
 
 impl Default for SessionView {
@@ -159,6 +309,8 @@ impl SessionView {
             terminal_runtime_work: BTreeSet::new(),
             live_reasoning: BTreeMap::new(),
             last_text_stream_updates: BTreeMap::new(),
+            streaming_presentation_policy: StreamingPresentationPolicy::immediate(),
+            pending_text_presentations: BTreeMap::new(),
         }
     }
 
@@ -197,6 +349,61 @@ impl SessionView {
         self.tool_invocations
             .get(invocation_id)
             .and_then(|aggregate| aggregate.presentations.get(identity))
+    }
+
+    /// Set the renderer-neutral live text presentation policy.
+    ///
+    /// Switching to immediate presentation flushes all accepted pending text.
+    pub fn set_streaming_presentation_policy(
+        &mut self,
+        policy: StreamingPresentationPolicy,
+    ) -> bool {
+        let policy = policy.normalized();
+        if self.streaming_presentation_policy == policy {
+            return false;
+        }
+        self.streaming_presentation_policy = policy;
+        if policy.is_immediate() {
+            return self.flush_pending_text_presentations();
+        }
+        false
+    }
+
+    /// Return the next time at which shared visible text may advance.
+    #[must_use]
+    pub fn next_streaming_presentation_deadline(&self, now: Instant) -> Option<Instant> {
+        self.pending_text_presentations
+            .values()
+            .map(|pending| pending.next_deadline(now))
+            .min()
+    }
+
+    /// Advance due shared visible text prefixes.
+    ///
+    /// Returns whether renderer-visible state changed.
+    pub fn advance_streaming_presentation(&mut self, now: Instant) -> bool {
+        let curve = self.streaming_presentation_policy.curve;
+        let due = self
+            .pending_text_presentations
+            .iter()
+            .filter_map(|(id, pending)| {
+                let due_bytes = pending.due_bytes(now, curve);
+                (due_bytes > pending.presented_bytes).then(|| (id.clone(), due_bytes))
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (id, due_bytes) in due {
+            let Some(pending) = self.pending_text_presentations.get_mut(&id) else {
+                continue;
+            };
+            let text = pending.target[..due_bytes].to_owned();
+            let destination = pending.destination.clone();
+            pending.presented_bytes = due_bytes;
+            changed |= self.replace_presented_text(&id, &text, &destination);
+        }
+        self.pending_text_presentations
+            .retain(|_, pending| pending.presented_bytes < pending.target.len());
+        changed
     }
 
     /// Return the current snapshot.
@@ -570,6 +777,7 @@ impl SessionView {
             })
             .collect::<Vec<_>>();
         let mut replacement = Self::new();
+        replacement.streaming_presentation_policy = self.streaming_presentation_policy;
         replacement.snapshot.session_id = previous.session_id;
         replacement.snapshot.title = previous.title;
         replacement.snapshot.working_directory = previous.working_directory;
@@ -1160,6 +1368,7 @@ impl SessionView {
                 outcome,
                 message,
             } => {
+                let _ = self.flush_turn_text_presentations(turn_id);
                 if self.snapshot.runtime.active_turn_id.as_deref() == Some(turn_id) {
                     self.snapshot.runtime.active_turn_id = None;
                 }
@@ -1658,7 +1867,7 @@ impl SessionView {
                 let id = TranscriptViewItemId::new(format!(
                     "assistant-turn:{turn_id}:segment:{segment_id}"
                 ));
-                self.apply_ordered_assistant_update(id.clone(), update);
+                self.apply_ordered_assistant_update(id.clone(), turn_id, update);
                 self.assign_output_location(&id, turn_id, *output_position);
             }
             SessionLiveEventKind::AssistantTextDelta {
@@ -1667,14 +1876,17 @@ impl SessionView {
                 text,
                 ..
             } => {
-                self.push_or_append_streaming_message(
-                    TranscriptViewItemId::new(format!(
-                        "assistant-turn:{turn_id}:segment:{segment_id}"
-                    )),
-                    0,
-                    None,
+                let id = TranscriptViewItemId::new(format!(
+                    "assistant-turn:{turn_id}:segment:{segment_id}"
+                ));
+                let mut target = self.accepted_presentation_target(&id);
+                target.push_str(text);
+                self.present_transcript_target(
+                    id,
+                    target,
+                    turn_id,
                     StreamingMessageKind::Assistant,
-                    text,
+                    Instant::now(),
                 );
             }
             SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
@@ -1711,12 +1923,15 @@ impl SessionView {
                     active_text: Some(text.clone()),
                     streaming: true,
                 };
-                self.push_or_append_streaming_message(
-                    TranscriptViewItemId::new(format!("reasoning-turn:{turn_id}")),
-                    0,
-                    None,
+                let id = TranscriptViewItemId::new(format!("reasoning-turn:{turn_id}"));
+                let mut target = self.accepted_presentation_target(&id);
+                target.push_str(text);
+                self.present_transcript_target(
+                    id,
+                    target,
+                    turn_id,
                     StreamingMessageKind::Reasoning,
-                    text,
+                    Instant::now(),
                 );
             }
             SessionLiveEventKind::AssistantReasoningActivity {
@@ -2079,6 +2294,7 @@ impl SessionView {
         {
             self.snapshot.text_streams.remove(&stream_id);
             self.last_text_stream_updates.remove(&stream_id);
+            self.pending_text_presentations.remove(&stream_id);
             if let Some(activity) = self
                 .live_reasoning
                 .get_mut(&(turn_id.to_owned(), activity_id.to_owned()))
@@ -2115,11 +2331,15 @@ impl SessionView {
         }
 
         let activity_key = (turn_id.to_owned(), activity_id.to_owned());
-        let current_text = self
-            .live_reasoning
-            .get(&activity_key)
-            .and_then(|activity| activity.parts.get(part_id))
-            .map_or_else(String::new, |part| part.text.clone());
+        let current_text = self.pending_text_presentations.get(&stream_id).map_or_else(
+            || {
+                self.live_reasoning
+                    .get(&activity_key)
+                    .and_then(|activity| activity.parts.get(part_id))
+                    .map_or_else(String::new, |part| part.text.clone())
+            },
+            |pending| pending.target.clone(),
+        );
         let next_text = match &update.operation {
             TextStreamOperation::Append {
                 expected_offset,
@@ -2168,22 +2388,35 @@ impl SessionView {
             }
         };
         self.last_text_stream_updates
-            .insert(stream_id, update.clone());
-        if let Some(text) = next_text {
-            self.apply_live_reasoning_activity(
-                turn_id,
-                &bcode_session_models::ReasoningActivityEvent::PartCompleted {
-                    activity_id: activity_id.to_owned(),
-                    activity_order,
-                    part_id: part_id.to_owned(),
-                    kind,
-                    role,
-                    part_order,
-                    text,
-                },
-            );
-        } else {
-            self.bump_revision();
+            .insert(stream_id.clone(), update.clone());
+        let destination = PendingTextDestination::ReasoningPart {
+            turn_id: turn_id.to_owned(),
+            activity_id: activity_id.to_owned(),
+            activity_order,
+            part_id: part_id.to_owned(),
+            kind,
+            role,
+            part_order,
+        };
+        match (&update.operation, next_text) {
+            (TextStreamOperation::Append { .. }, Some(text)) => {
+                self.present_reasoning_target(stream_id, text, destination, Instant::now());
+            }
+            (TextStreamOperation::Checkpoint { .. }, Some(text)) => {
+                self.pending_text_presentations.remove(&stream_id);
+                let _ = self.replace_presented_text(&stream_id, &text, &destination);
+            }
+            (TextStreamOperation::Terminal { .. }, None) => {
+                if let Some(pending) = self.pending_text_presentations.remove(&stream_id) {
+                    let _ = self.replace_presented_text(
+                        &stream_id,
+                        &pending.target,
+                        &pending.destination,
+                    );
+                }
+                self.bump_revision();
+            }
+            _ => {}
         }
     }
 
@@ -3096,6 +3329,7 @@ impl SessionView {
     fn apply_ordered_assistant_update(
         &mut self,
         id: TranscriptViewItemId,
+        turn_id: &str,
         update: &bcode_session_models::TextStreamUpdate,
     ) {
         use bcode_session_models::TextStreamOperation;
@@ -3113,7 +3347,9 @@ impl SessionView {
         {
             self.remove_transcript_item(&id);
             self.snapshot.text_streams.remove(&id);
+            self.pending_text_presentations.remove(&id);
         }
+        let mut accepted_target = self.accepted_presentation_target(&id);
         let state = self
             .snapshot
             .text_streams
@@ -3160,10 +3396,13 @@ impl SessionView {
                 state.accepted_bytes = state.accepted_bytes.saturating_add(text.len());
                 self.last_text_stream_updates
                     .insert(id.clone(), update.clone());
-                self.push_or_append_streaming_message_by_id(
+                accepted_target.push_str(text);
+                self.present_transcript_target(
                     id,
+                    accepted_target,
+                    turn_id,
                     StreamingMessageKind::Assistant,
-                    text,
+                    Instant::now(),
                 );
             }
             TextStreamOperation::Checkpoint {
@@ -3188,6 +3427,7 @@ impl SessionView {
                 };
                 self.last_text_stream_updates
                     .insert(id.clone(), update.clone());
+                self.pending_text_presentations.remove(&id);
                 self.replace_streaming_message_by_id(id, text);
             }
             TextStreamOperation::Terminal { status } => {
@@ -3195,6 +3435,9 @@ impl SessionView {
                 state.status = TextStreamViewStatus::Terminal(*status);
                 self.last_text_stream_updates
                     .insert(id.clone(), update.clone());
+                if let Some(pending) = self.pending_text_presentations.remove(&id) {
+                    let _ = self.replace_presented_text(&id, &pending.target, &pending.destination);
+                }
                 if let Some(item) = self
                     .snapshot
                     .transcript
@@ -3210,28 +3453,6 @@ impl SessionView {
                 self.bump_revision();
             }
         }
-    }
-
-    fn push_or_append_streaming_message_by_id(
-        &mut self,
-        id: TranscriptViewItemId,
-        kind: StreamingMessageKind,
-        text: &str,
-    ) {
-        if let Some(item) = self
-            .snapshot
-            .transcript
-            .items
-            .iter_mut()
-            .find(|item| item.id == id)
-        {
-            append_text_to_item(item, text);
-            item.revision = item.revision.saturating_add(1);
-            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
-            self.bump_revision();
-            return;
-        }
-        self.push_item(id, 0, None, true, kind.item_kind(text.to_owned()));
     }
 
     fn replace_streaming_message_by_id(&mut self, id: TranscriptViewItemId, text: &str) {
@@ -3256,6 +3477,215 @@ impl SessionView {
             true,
             StreamingMessageKind::Assistant.item_kind(text.to_owned()),
         );
+    }
+
+    fn present_reasoning_target(
+        &mut self,
+        stream_id: TranscriptViewItemId,
+        target: String,
+        destination: PendingTextDestination,
+        now: Instant,
+    ) {
+        if self.streaming_presentation_policy.is_immediate() {
+            self.pending_text_presentations.remove(&stream_id);
+            let _ = self.replace_presented_text(&stream_id, &target, &destination);
+            return;
+        }
+        let current_bytes = match &destination {
+            PendingTextDestination::ReasoningPart {
+                turn_id,
+                activity_id,
+                part_id,
+                ..
+            } => self
+                .live_reasoning
+                .get(&(turn_id.clone(), activity_id.clone()))
+                .and_then(|activity| activity.parts.get(part_id))
+                .map_or(0, |part| part.text.len()),
+            PendingTextDestination::Transcript { .. } => 0,
+        };
+        if target.len().saturating_sub(current_bytes) > MAX_RETAINED_PENDING_TEXT_BYTES {
+            self.pending_text_presentations.remove(&stream_id);
+            let _ = self.replace_presented_text(&stream_id, &target, &destination);
+            return;
+        }
+        let max_lag = Duration::from_millis(self.streaming_presentation_policy.max_lag_ms);
+        if current_bytes == 0 {
+            let first_bytes = target
+                .grapheme_indices(true)
+                .nth(1)
+                .map_or(target.len(), |(offset, _)| offset);
+            let _ = self.replace_presented_text(&stream_id, &target[..first_bytes], &destination);
+            if first_bytes < target.len() {
+                self.pending_text_presentations.insert(
+                    stream_id,
+                    PendingTextPresentation::new(target, first_bytes, now, max_lag, destination),
+                );
+            }
+            return;
+        }
+        self.pending_text_presentations
+            .entry(stream_id)
+            .and_modify(|pending| {
+                pending.rebase(target.clone(), now, max_lag, destination.clone());
+            })
+            .or_insert_with(|| {
+                PendingTextPresentation::new(target, current_bytes, now, max_lag, destination)
+            });
+    }
+
+    fn accepted_presentation_target(&self, id: &TranscriptViewItemId) -> String {
+        self.pending_text_presentations.get(id).map_or_else(
+            || {
+                self.snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .find(|item| item.id == *id)
+                    .and_then(transcript_item_text)
+                    .unwrap_or_default()
+                    .to_owned()
+            },
+            |pending| pending.target.clone(),
+        )
+    }
+
+    fn present_transcript_target(
+        &mut self,
+        id: TranscriptViewItemId,
+        target: String,
+        turn_id: &str,
+        kind: StreamingMessageKind,
+        now: Instant,
+    ) {
+        let destination = PendingTextDestination::Transcript {
+            turn_id: turn_id.to_owned(),
+        };
+        if self.streaming_presentation_policy.is_immediate() {
+            self.pending_text_presentations.remove(&id);
+            if self.replace_presented_text(&id, &target, &destination) {
+                return;
+            }
+            self.push_item(id, 0, None, true, kind.item_kind(target));
+            return;
+        }
+
+        let current_bytes = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .and_then(transcript_item_text)
+            .map_or(0, str::len);
+        if target.len().saturating_sub(current_bytes) > MAX_RETAINED_PENDING_TEXT_BYTES {
+            self.pending_text_presentations.remove(&id);
+            if !self.replace_presented_text(&id, &target, &destination) {
+                self.push_item(id, 0, None, true, kind.item_kind(target));
+            }
+            return;
+        }
+        let max_lag = Duration::from_millis(self.streaming_presentation_policy.max_lag_ms);
+        if current_bytes == 0 {
+            let first_bytes = target
+                .grapheme_indices(true)
+                .nth(1)
+                .map_or(target.len(), |(offset, _)| offset);
+            let visible = target[..first_bytes].to_owned();
+            self.push_item(id.clone(), 0, None, true, kind.item_kind(visible));
+            if first_bytes < target.len() {
+                self.pending_text_presentations.insert(
+                    id,
+                    PendingTextPresentation::new(target, first_bytes, now, max_lag, destination),
+                );
+            }
+            return;
+        }
+        self.pending_text_presentations
+            .entry(id)
+            .and_modify(|pending| {
+                pending.rebase(target.clone(), now, max_lag, destination.clone());
+            })
+            .or_insert_with(|| {
+                PendingTextPresentation::new(target, current_bytes, now, max_lag, destination)
+            });
+    }
+
+    fn replace_presented_text(
+        &mut self,
+        id: &TranscriptViewItemId,
+        text: &str,
+        destination: &PendingTextDestination,
+    ) -> bool {
+        match destination {
+            PendingTextDestination::Transcript { .. } => {
+                let Some(item) = self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == *id)
+                else {
+                    return false;
+                };
+                if !replace_text_in_item(item, text) {
+                    return false;
+                }
+                item.revision = item.revision.saturating_add(1);
+                self.snapshot.transcript.revision =
+                    self.snapshot.transcript.revision.saturating_add(1);
+                self.bump_revision();
+                true
+            }
+            PendingTextDestination::ReasoningPart {
+                turn_id,
+                activity_id,
+                activity_order,
+                part_id,
+                kind,
+                role,
+                part_order,
+            } => {
+                self.apply_live_reasoning_activity(
+                    turn_id,
+                    &bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                        activity_id: activity_id.clone(),
+                        activity_order: *activity_order,
+                        part_id: part_id.clone(),
+                        kind: *kind,
+                        role: *role,
+                        part_order: *part_order,
+                        text: text.to_owned(),
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    fn flush_turn_text_presentations(&mut self, turn_id: &str) -> bool {
+        let pending_ids = self
+            .pending_text_presentations
+            .iter()
+            .filter(|(_, pending)| pending.destination.turn_id() == turn_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for id in pending_ids {
+            if let Some(pending) = self.pending_text_presentations.remove(&id) {
+                changed |= self.replace_presented_text(&id, &pending.target, &pending.destination);
+            }
+        }
+        changed
+    }
+
+    fn flush_pending_text_presentations(&mut self) -> bool {
+        let pending = std::mem::take(&mut self.pending_text_presentations);
+        let mut changed = false;
+        for (id, pending) in pending {
+            changed |= self.replace_presented_text(&id, &pending.target, &pending.destination);
+        }
+        changed
     }
 
     fn remove_transcript_item(&mut self, id: &TranscriptViewItemId) {
@@ -3743,6 +4173,16 @@ fn filtered_reasoning_text<'a>(
         .join("\n\n")
 }
 
+const fn transcript_item_text(item: &TranscriptViewItem) -> Option<&str> {
+    match &item.kind {
+        TranscriptViewItemKind::AssistantMessage { message }
+        | TranscriptViewItemKind::ReasoningMessage { message }
+        | TranscriptViewItemKind::UserMessage { message }
+        | TranscriptViewItemKind::SystemMessage { message } => Some(message.text.as_str()),
+        _ => None,
+    }
+}
+
 fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) -> bool {
     match &mut item.kind {
         TranscriptViewItemKind::AssistantMessage { message }
@@ -3847,6 +4287,481 @@ mod tests {
         SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTokenUsage, ToolInvocationResult,
     };
     use std::path::PathBuf;
+
+    fn ordered_assistant_update(
+        session_id: SessionId,
+        update: bcode_session_models::TextStreamUpdate,
+    ) -> SessionLiveEvent {
+        SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-1".to_owned(),
+                segment_order: 0,
+                update,
+            },
+        }
+    }
+
+    fn ordered_reasoning_update(
+        session_id: SessionId,
+        generation: u64,
+        first_revision: u64,
+        revision: u64,
+        expected_offset: usize,
+        text: &str,
+    ) -> SessionLiveEvent {
+        SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                output_position: None,
+                turn_id: "turn-1".to_owned(),
+                activity_id: "activity-1".to_owned(),
+                activity_order: 0,
+                part_id: "part-1".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Detail,
+                part_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation,
+                    first_revision,
+                    revision,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset,
+                        text: text.to_owned(),
+                    },
+                },
+            },
+        }
+    }
+
+    fn projected_reasoning_text(view: &SessionView) -> String {
+        view.snapshot()
+            .transcript
+            .items
+            .iter()
+            .find_map(|item| match &item.kind {
+                TranscriptViewItemKind::ReasoningActivity { activity } => Some(activity.text()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn smoothed_reasoning_overlapping_arrivals_preserve_exact_target() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_reasoning_update(session_id, 0, 1, 1, 0, "first"));
+        assert_eq!(projected_reasoning_text(&view), "f");
+        view.apply_live_event(&ordered_reasoning_update(session_id, 0, 2, 2, 5, " second"));
+        assert!("first second".starts_with(&projected_reasoning_text(&view)));
+        let deadline = view
+            .next_streaming_presentation_deadline(Instant::now())
+            .expect("reasoning presentation deadline");
+        assert!(view.advance_streaming_presentation(deadline + Duration::from_millis(100)));
+        assert_eq!(projected_reasoning_text(&view), "first second");
+    }
+
+    #[test]
+    fn generation_replacement_discards_stale_assistant_backlog() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "obsolete response".to_owned(),
+                },
+            },
+        ));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 1,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "replacement".to_owned(),
+                },
+            },
+        ));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("r"));
+        let deadline = view
+            .next_streaming_presentation_deadline(Instant::now())
+            .expect("replacement presentation deadline");
+        assert!(view.advance_streaming_presentation(deadline + Duration::from_millis(100)));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("replacement")
+        );
+    }
+
+    #[test]
+    fn legacy_deltas_share_smoothing_and_exact_terminal_flush() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        for text in ["legacy", " delta"] {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-1".to_owned(),
+                    segment_order: 0,
+                    text: text.to_owned(),
+                },
+            });
+        }
+        assert!("legacy delta".starts_with(transcript_item_text(view.snapshot(), &id).unwrap()));
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn-1".to_owned(),
+                outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                message: None,
+            },
+        ));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("legacy delta")
+        );
+    }
+
+    #[test]
+    fn performance_contract_first_grapheme_lag_flush_and_memory_are_bounded() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        let append_started = Instant::now();
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "abcdefghijklmnopqrstuvwxyz".to_owned(),
+                },
+            },
+        ));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("a"));
+        assert!(append_started.elapsed() < Duration::from_millis(10));
+        let next_deadline = view
+            .next_streaming_presentation_deadline(append_started)
+            .expect("presentation deadline");
+        let terminal_deadline = view
+            .pending_text_presentations
+            .get(&id)
+            .expect("pending presentation")
+            .deadline;
+        assert!(next_deadline <= terminal_deadline);
+        assert!(
+            terminal_deadline.saturating_duration_since(append_started)
+                <= Duration::from_millis(StreamingPresentationPolicy::DEFAULT_MAX_LAG_MS + 1)
+        );
+        assert!(view.advance_streaming_presentation(terminal_deadline + Duration::from_millis(1)));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("abcdefghijklmnopqrstuvwxyz")
+        );
+
+        let terminal_started = Instant::now();
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 2,
+                revision: 2,
+                operation: bcode_session_models::TextStreamOperation::Terminal {
+                    status: bcode_session_models::TextStreamTerminalStatus::Completed,
+                },
+            },
+        ));
+        assert!(terminal_started.elapsed() < Duration::from_millis(10));
+        assert!(view.pending_text_presentations.is_empty());
+
+        let pending_size = std::mem::size_of::<PendingTextPresentation>();
+        assert!(pending_size < 512);
+        assert_eq!(view.pending_text_presentations.len(), 0);
+    }
+
+    #[test]
+    fn oversized_pending_chunk_catches_up_without_retaining_backlog() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let text = "x".repeat(MAX_RETAINED_PENDING_TEXT_BYTES + 1);
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: text.clone(),
+                },
+            },
+        ));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some(text.as_str())
+        );
+        assert!(
+            view.next_streaming_presentation_deadline(Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interpolation_curves_have_deterministic_relative_progress() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let target = "abcdefghij".to_owned();
+        let pending = PendingTextPresentation {
+            target,
+            presented_bytes: 0,
+            started_at: started,
+            deadline,
+            destination: PendingTextDestination::Transcript {
+                turn_id: "turn-1".to_owned(),
+            },
+        };
+        let midpoint = started + Duration::from_millis(50);
+        let linear = pending.due_bytes(midpoint, StreamingInterpolationCurve::Linear);
+        let ease_in = pending.due_bytes(midpoint, StreamingInterpolationCurve::EaseIn);
+        let ease_out = pending.due_bytes(midpoint, StreamingInterpolationCurve::EaseOut);
+        let ease_in_out = pending.due_bytes(midpoint, StreamingInterpolationCurve::EaseInOut);
+        assert_eq!(linear, 5);
+        assert_eq!(ease_in, 1);
+        assert_eq!(ease_out, 8);
+        assert_eq!(ease_in_out, 5);
+        assert_eq!(
+            pending.due_bytes(deadline, StreamingInterpolationCurve::EaseIn),
+            10
+        );
+    }
+
+    #[test]
+    fn policy_disable_flushes_pending_text_immediately() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "pending text".to_owned(),
+                },
+            },
+        ));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("p"));
+        assert!(view.set_streaming_presentation_policy(StreamingPresentationPolicy::immediate()));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("pending text")
+        );
+        assert!(
+            view.next_streaming_presentation_deadline(Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn history_window_rebuild_discards_pending_presentation_and_preserves_policy() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "pending".to_owned(),
+                },
+            },
+        ));
+        assert!(
+            view.next_streaming_presentation_deadline(Instant::now())
+                .is_some()
+        );
+        view.rebuild_history_window(&[]);
+        assert!(
+            view.next_streaming_presentation_deadline(Instant::now())
+                .is_none()
+        );
+        assert_eq!(
+            view.streaming_presentation_policy,
+            StreamingPresentationPolicy::default()
+        );
+    }
+
+    #[test]
+    fn model_turn_finish_flushes_pending_text_without_stream_terminal() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "cancelled output".to_owned(),
+                },
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn-1".to_owned(),
+                outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+                message: None,
+            },
+        ));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("cancelled output")
+        );
+        assert!(
+            view.next_streaming_presentation_deadline(Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn smoothed_assistant_stream_exposes_first_grapheme_then_exact_target() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        let started = Instant::now();
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "e\u{301}clair".to_owned(),
+                },
+            },
+        ));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("e\u{301}"));
+        assert!(view.next_streaming_presentation_deadline(started).is_some());
+        assert!(view.advance_streaming_presentation(started + Duration::from_millis(100)));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("e\u{301}clair")
+        );
+        assert!(
+            view.next_streaming_presentation_deadline(Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn immediate_policy_preserves_whole_chunk_behavior() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::immediate()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "whole chunk".to_owned(),
+                },
+            },
+        ));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("whole chunk")
+        );
+        assert!(
+            view.next_streaming_presentation_deadline(Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_update_flushes_pending_text_and_is_absorbing() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "complete".to_owned(),
+                },
+            },
+        ));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 2,
+                revision: 2,
+                operation: bcode_session_models::TextStreamOperation::Terminal {
+                    status: bcode_session_models::TextStreamTerminalStatus::Completed,
+                },
+            },
+        ));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("complete"));
+        assert!(
+            view.next_streaming_presentation_deadline(Instant::now())
+                .is_none()
+        );
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 3,
+                revision: 3,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 8,
+                    text: " stale".to_owned(),
+                },
+            },
+        ));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("complete"));
+    }
 
     fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {

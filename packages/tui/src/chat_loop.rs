@@ -635,6 +635,9 @@ async fn run_chat_loop<W: Write>(
                 telemetry_flush: loop_state.telemetry.next_flush_at(),
                 redraw: needs_redraw.then_some(redraw_at),
                 draft_save: draft_autosave.next_save_at(),
+                streaming_presentation: chat
+                    .app
+                    .next_streaming_presentation_deadline(Instant::now()),
                 session_stream_blocked: loop_state.request_draft_handoff.blocks_session_stream(),
             },
         )
@@ -700,7 +703,9 @@ async fn run_chat_loop<W: Write>(
                         loop_state.accept_markdown_projection_completion(chat, completion);
                 }
             }
-            ChatLoopEvent::Timer => {}
+            ChatLoopEvent::Timer => {
+                needs_redraw |= chat.app.advance_streaming_presentation(Instant::now());
+            }
         }
         if before_session_id != chat.session_id {
             loop_state.request_draft_handoff.clear();
@@ -1051,6 +1056,7 @@ fn apply_config_result(
                     .set_status(format!("plugin presentation unavailable: {error}")),
             }
             chat.app.apply_tui_config(config.tui.clone());
+            let _ = chat.app.apply_presentation_config(config.presentation);
             chat.replace_effect(TuiEffect::ReconcileAuthSecurity {
                 config: Box::new(config),
             });
@@ -2846,6 +2852,7 @@ struct ChatLoopDeadlines {
     telemetry_flush: Option<Instant>,
     redraw: Option<Instant>,
     draft_save: Option<Instant>,
+    streaming_presentation: Option<Instant>,
     session_stream_blocked: bool,
 }
 
@@ -2872,6 +2879,7 @@ async fn next_chat_loop_event(
         deadlines.telemetry_flush,
         deadlines.redraw,
         deadlines.draft_save,
+        deadlines.streaming_presentation,
     ]
     .into_iter()
     .flatten()

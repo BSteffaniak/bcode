@@ -19,6 +19,7 @@ bcode_session_view_models = { workspace = true }
 bcode_skill_models        = { workspace = true }
 bcode_tool                = { workspace = true }
 serde_json                = { workspace = true, features = ["std"] }
+unicode-segmentation      = { workspace = true }
 
 [dev-dependencies]
 bcode_session = { workspace = true }

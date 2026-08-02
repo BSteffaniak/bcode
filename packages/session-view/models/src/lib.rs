@@ -26,6 +26,74 @@ mod renderer_fixtures;
 #[cfg(test)]
 mod tests;
 
+/// Easing curve used to expose accepted live text to renderer-neutral views.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingInterpolationCurve {
+    /// Expose text at a constant rate.
+    #[default]
+    Linear,
+    /// Start slowly and accelerate toward the presentation deadline.
+    EaseIn,
+    /// Start quickly and decelerate toward the presentation deadline.
+    EaseOut,
+    /// Start and finish slowly around a faster midpoint.
+    EaseInOut,
+}
+
+/// Renderer-neutral policy for smoothing accepted live text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingPresentationPolicy {
+    /// Whether accepted live text should be exposed progressively.
+    pub enabled: bool,
+    /// Curve used to distribute visible progress over the lag budget.
+    pub curve: StreamingInterpolationCurve,
+    /// Maximum nominal age of hidden accepted text in milliseconds.
+    pub max_lag_ms: u64,
+}
+
+impl StreamingPresentationPolicy {
+    /// Default maximum nominal presentation lag.
+    pub const DEFAULT_MAX_LAG_MS: u64 = 40;
+    /// Largest accepted presentation lag from configuration.
+    pub const MAX_LAG_MS: u64 = 250;
+
+    /// Return an immediate whole-chunk presentation policy.
+    #[must_use]
+    pub const fn immediate() -> Self {
+        Self {
+            enabled: false,
+            curve: StreamingInterpolationCurve::Linear,
+            max_lag_ms: 0,
+        }
+    }
+
+    /// Return whether this policy exposes accepted text immediately.
+    #[must_use]
+    pub const fn is_immediate(self) -> bool {
+        !self.enabled || self.max_lag_ms == 0
+    }
+
+    /// Return this policy with its lag bounded to the supported range.
+    #[must_use]
+    pub const fn normalized(mut self) -> Self {
+        if self.max_lag_ms > Self::MAX_LAG_MS {
+            self.max_lag_ms = Self::MAX_LAG_MS;
+        }
+        self
+    }
+}
+
+impl Default for StreamingPresentationPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            curve: StreamingInterpolationCurve::Linear,
+            max_lag_ms: Self::DEFAULT_MAX_LAG_MS,
+        }
+    }
+}
+
 /// Monotonic revision for renderer-visible view state.
 pub type ViewRevision = u64;
 

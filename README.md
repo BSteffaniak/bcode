@@ -295,6 +295,23 @@ Daemon-backed session catalogs, attach/history operations, model selection, inpu
 
 See `packages/bcode/examples/` for runnable examples covering text generation, streaming, custom tools, hooks/observability, structured output, local sessions, and daemon-client setup.
 
+## Smooth live text presentation
+
+Bcode smooths live assistant and readable-reasoning text by default through the renderer-neutral
+session view. The first displayable grapheme remains immediate while the rest of each provider chunk
+is presented within a short bounded lag. Terminal and web frontends consume the same policy; their
+native frame cadence may coalesce multiple due graphemes into one update.
+
+```toml
+[presentation.streaming]
+enabled = true
+curve = "linear" # linear, ease_in, ease_out, or ease_in_out
+max_lag_ms = 40
+```
+
+Set `enabled = false` or `max_lag_ms = 0` to present provider chunks immediately. Values above 250
+milliseconds are bounded to 250 milliseconds so configuration cannot introduce a long response lag.
+
 ## TUI keybindings
 
 TUI keybindings are configurable in `bcode.toml` under scoped `[tui.keybindings.*]` tables. Each scope maps `key = "action.id"`, matching bmux-style key-to-action configuration. Set a key to `""`, `"none"`, or `"unbind"` to remove a default binding for that key.

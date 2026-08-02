@@ -1614,6 +1614,7 @@ dependencies = [
  "bcode_model",
  "bcode_plugin",
  "bcode_plugin_sdk",
+ "bcode_session_view_models",
  "bcode_skill_models",
  "bcode_tool",
  "hyperchad_docs_config",
@@ -2469,6 +2470,7 @@ dependencies = [
  "bcode_skill_models",
  "bcode_tool",
  "serde_json",
+ "unicode-segmentation",
 ]
 
 [[package]]

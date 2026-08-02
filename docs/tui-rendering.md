@@ -104,6 +104,19 @@ Current visual adapters require rows, basic text styles, transcript title/timeou
 and artifact chunks. Interactive actions remain on the existing typed interaction/surface contracts;
 the serialized visual contract intentionally does not generalize into an interactive surface ABI.
 
+## Smooth stream scheduling
+
+Configured live text smoothing remains semantic state in `SessionView`, not terminal rendering logic.
+The TUI contributes the shared presentation deadline to its normal event-loop deadline set, advances
+the view when due, and adapts only changed `SessionView` items through
+`SessionViewTerminalAdapter`. It does not split provider chunks or evaluate interpolation curves.
+
+`[presentation.streaming]` is frontend-independent: `enabled = false` or `max_lag_ms = 0` restores
+immediate chunk presentation, while `curve` selects `linear`, `ease_in`, `ease_out`, or
+`ease_in_out`. The default `max_lag_ms = 40` is bounded to 250 ms. Presentation advancement requests
+a redraw but still respects `[tui.render].max_fps`; cancellation, permissions, execution, canonical
+stream validation, and terminal flushing do not wait for terminal cadence.
+
 ## Draw cadence
 `[tui.render]` controls terminal draw cadence.
 

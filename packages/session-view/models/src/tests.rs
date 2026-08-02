@@ -450,6 +450,45 @@ fn structured_reasoning_activity_round_trips_through_renderer_wire_model() {
 }
 
 #[test]
+fn streaming_presentation_policy_has_stable_defaults_and_wire_values() {
+    let default = StreamingPresentationPolicy::default();
+    assert!(default.enabled);
+    assert_eq!(default.curve, StreamingInterpolationCurve::Linear);
+    assert_eq!(
+        default.max_lag_ms,
+        StreamingPresentationPolicy::DEFAULT_MAX_LAG_MS
+    );
+    assert!(!default.is_immediate());
+    assert!(StreamingPresentationPolicy::immediate().is_immediate());
+
+    for (curve, wire) in [
+        (StreamingInterpolationCurve::Linear, r#""linear""#),
+        (StreamingInterpolationCurve::EaseIn, r#""ease_in""#),
+        (StreamingInterpolationCurve::EaseOut, r#""ease_out""#),
+        (StreamingInterpolationCurve::EaseInOut, r#""ease_in_out""#),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&curve).expect("serialize curve"),
+            wire
+        );
+        assert_eq!(
+            serde_json::from_str::<StreamingInterpolationCurve>(wire).expect("deserialize curve"),
+            curve
+        );
+    }
+
+    let normalized = StreamingPresentationPolicy {
+        max_lag_ms: u64::MAX,
+        ..StreamingPresentationPolicy::default()
+    }
+    .normalized();
+    assert_eq!(
+        normalized.max_lag_ms,
+        StreamingPresentationPolicy::MAX_LAG_MS
+    );
+}
+
+#[test]
 fn reasoning_presentation_policy_has_stable_wire_values() {
     for (policy, wire) in [
         (ReasoningPresentationPolicy::All, r#""all""#),
