@@ -359,6 +359,10 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
             }
             bcode_session_models::SessionLiveEventKind::ToolRequestDraft { event }
                 if !matches!(
+                    &event.operation,
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint { text, .. }
+                        if event.revision == 1 && text.is_empty()
+                ) && !matches!(
                     event.operation,
                     bcode_session_models::ToolRequestDraftOperation::Remove { .. }
                 ) =>
@@ -640,10 +644,35 @@ mod tests {
             ))
             .is_none()
         );
+        assert!(
+            supersedable_event_key(&request_draft_event(
+                session_id,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: String::new(),
+                },
+            ))
+            .is_none()
+        );
         assert_eq!(
             supersedable_event_key(&request_draft_event(
                 session_id,
                 1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "first payload".to_owned(),
+                },
+            )),
+            Some(SupersedableEventKey::ToolRequestDraft {
+                tool_call_id: "call-1".to_owned(),
+                placement: "request",
+            })
+        );
+        assert_eq!(
+            supersedable_event_key(&request_draft_event(
+                session_id,
+                2,
                 bcode_session_models::ToolRequestDraftOperation::Checkpoint {
                     start_offset: 0,
                     text: "draft".to_owned(),
@@ -657,7 +686,7 @@ mod tests {
         assert!(
             supersedable_event_key(&request_draft_event(
                 session_id,
-                2,
+                3,
                 bcode_session_models::ToolRequestDraftOperation::Remove {
                     reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
                 },
@@ -671,7 +700,7 @@ mod tests {
         let session_id = SessionId::new();
         let (sender, receiver) = mpsc::unbounded_channel();
         let mut pending = BTreeMap::new();
-        for revision in 1..=10_000 {
+        for revision in 2..=10_000 {
             let mut event = request_draft_event(
                 session_id,
                 revision,

@@ -338,7 +338,9 @@ def screen_text():
     return result.stdout
 
 while time.monotonic() < deadline:
-    readable, _, _ = select.select([fd], [], [], 0.2)
+    now = time.monotonic()
+    probe_wait = max(0.0, min(0.2, next_screen_probe - now))
+    readable, _, _ = select.select([fd], [], [], probe_wait)
     if readable:
         try:
             chunk = os.read(fd, 65_536)

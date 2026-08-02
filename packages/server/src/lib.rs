@@ -7898,6 +7898,7 @@ struct ActiveContributionRegistry {
 #[derive(Debug, Clone)]
 struct ActiveToolRequestDraft {
     event: bcode_session_models::ToolRequestDraftEvent,
+    raw_preview: String,
     preview: String,
     preview_start_offset: usize,
     last_updated_at: Instant,
@@ -16761,6 +16762,7 @@ struct ToolArgumentStreamProgress {
 struct ModelStreamProgress {
     active_tool_calls: BTreeMap<String, ToolArgumentStreamProgress>,
     generations: BTreeMap<String, u64>,
+    sensitive_values: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -16903,6 +16905,13 @@ impl ModelStreamAccumulator {
 }
 
 impl ModelStreamProgress {
+    fn with_sensitive_values(sensitive_values: Vec<String>) -> Self {
+        Self {
+            sensitive_values,
+            ..Self::default()
+        }
+    }
+
     const MAX_TOOL_REQUEST_DRAFT_PREVIEW_BYTES: usize = 128 * 1024;
 
     fn start_tool_call(
@@ -17015,6 +17024,33 @@ impl ModelStreamProgress {
             }
             active.pending_text.push_str(delta);
         }
+    }
+
+    fn tool_request_draft_start_event(
+        &mut self,
+        turn_id: &str,
+        call_id: &str,
+    ) -> Option<bcode_session_models::ToolRequestDraftEvent> {
+        let active = self.active_tool_calls.get_mut(call_id)?;
+        active.revision = active.revision.saturating_add(1);
+        Some(bcode_session_models::ToolRequestDraftEvent {
+            output_position: active.output_position,
+            turn_id: turn_id.to_owned(),
+            tool_call_id: active.call_id.clone(),
+            tool_name: active.name.clone(),
+            producer_plugin_id: active.producer_plugin_id.clone(),
+            schema: active.schema.clone(),
+            schema_version: active.schema_version,
+            placement: active.placement,
+            generation: active.generation,
+            revision: active.revision,
+            operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: String::new(),
+            },
+            argument_bytes: 0,
+            truncated: false,
+        })
     }
 
     fn take_tool_request_draft_event(
@@ -18934,7 +18970,12 @@ async fn poll_model_turn_events(
     );
     let mut outcome = ModelPollOutcome::default();
     let output_position_base = *next_output_position;
-    let mut stream_progress = ModelStreamProgress::default();
+    let provider_context = session_model_selection(state, session_id)
+        .await
+        .provider_context;
+    let mut stream_progress = ModelStreamProgress::with_sensitive_values(
+        provider_request_context_sensitive_values(&provider_context),
+    );
     let mut idle_for = Duration::ZERO;
     let mut no_progress_warned = false;
     loop {
@@ -19261,6 +19302,21 @@ async fn finish_all_tool_request_drafts(
     }
 }
 
+async fn publish_stream_tool_request_draft_live(
+    state: &ServerState,
+    session_id: SessionId,
+    stream_progress: &ModelStreamProgress,
+    event: bcode_session_models::ToolRequestDraftEvent,
+) {
+    publish_tool_request_draft_live_with_sensitive_values(
+        state,
+        session_id,
+        event,
+        &stream_progress.sensitive_values,
+    )
+    .await;
+}
+
 #[allow(
     clippy::large_stack_frames,
     clippy::too_many_arguments,
@@ -19393,6 +19449,17 @@ async fn handle_provider_turn_event(
                         placement,
                     },
                 );
+                if let Some(draft) =
+                    stream_progress.tool_request_draft_start_event(turn_id, &call_id)
+                {
+                    publish_stream_tool_request_draft_live(
+                        state,
+                        session_id,
+                        stream_progress,
+                        draft,
+                    )
+                    .await;
+                }
                 publish_provider_stream_progress_live(
                     state,
                     session_id,
@@ -19409,7 +19476,13 @@ async fn handle_provider_turn_event(
                 if let Some(draft) =
                     stream_progress.take_tool_request_draft_event(turn_id, &call_id)
                 {
-                    publish_tool_request_draft_live(state, session_id, draft).await;
+                    publish_stream_tool_request_draft_live(
+                        state,
+                        session_id,
+                        stream_progress,
+                        draft,
+                    )
+                    .await;
                 }
             }
             bcode_model::ProviderOutputEvent::ToolCallFinished { call } => {
@@ -19418,7 +19491,13 @@ async fn handle_provider_turn_event(
                 if let Some(checkpoint) =
                     stream_progress.tool_request_draft_checkpoint(turn_id, &call_id)
                 {
-                    publish_tool_request_draft_live(state, session_id, checkpoint.clone()).await;
+                    publish_stream_tool_request_draft_live(
+                        state,
+                        session_id,
+                        stream_progress,
+                        checkpoint.clone(),
+                    )
+                    .await;
                     if checkpoint.placement
                         == bcode_session_models::ToolContributionPlacement::Request
                     {
@@ -19488,7 +19567,13 @@ async fn handle_provider_turn_event(
             if let Some(checkpoint) =
                 stream_progress.tool_request_draft_checkpoint(turn_id, &call_id)
             {
-                publish_tool_request_draft_live(state, session_id, checkpoint.clone()).await;
+                publish_stream_tool_request_draft_live(
+                    state,
+                    session_id,
+                    stream_progress,
+                    checkpoint.clone(),
+                )
+                .await;
                 if checkpoint.placement == bcode_session_models::ToolContributionPlacement::Request
                 {
                     remove_tool_request_draft_live(
@@ -19689,6 +19774,10 @@ async fn handle_provider_turn_event(
                     placement,
                 },
             );
+            if let Some(draft) = stream_progress.tool_request_draft_start_event(turn_id, &call_id) {
+                publish_stream_tool_request_draft_live(state, session_id, stream_progress, draft)
+                    .await;
+            }
             publish_provider_stream_progress_live(
                 state,
                 session_id,
@@ -19750,7 +19839,8 @@ async fn handle_provider_turn_event(
         ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
             stream_progress.record_tool_call_delta(&call_id, &delta);
             if let Some(draft) = stream_progress.take_tool_request_draft_event(turn_id, &call_id) {
-                publish_tool_request_draft_live(state, session_id, draft).await;
+                publish_stream_tool_request_draft_live(state, session_id, stream_progress, draft)
+                    .await;
             }
         }
     }
@@ -20141,33 +20231,94 @@ fn provider_metadata_trace_detail(key: &str, value: &str) -> String {
     key.to_string()
 }
 
-fn provider_request_context_has_sensitive_values(
+fn provider_request_context_sensitive_values(
     context: &bcode_model::ProviderRequestContext,
-) -> bool {
-    !context.env.is_empty()
-        || context.auth.as_ref().is_some_and(|auth| {
+) -> Vec<String> {
+    context
+        .env
+        .values()
+        .map(String::as_str)
+        .chain(context.auth.iter().flat_map(|auth| {
             auth.credentials
                 .values()
-                .any(|credential| !credential.value.is_empty())
-        })
-        || context.auth_candidates.iter().any(|candidate| {
-            !candidate.env.is_empty()
-                || candidate
+                .map(|credential| credential.value.as_str())
+        }))
+        .chain(context.auth_candidates.iter().flat_map(|candidate| {
+            candidate.env.values().map(String::as_str).chain(
+                candidate
                     .auth
                     .credentials
                     .values()
-                    .any(|credential| !credential.value.is_empty())
+                    .map(|credential| credential.value.as_str()),
+            )
+        }))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn sanitize_tool_request_draft_preview(
+    preview: &str,
+    sensitive_values: &[String],
+) -> (String, bool) {
+    const REDACTED: &str = "[REDACTED]";
+    let mut sanitized = preview.to_owned();
+    let mut redacted = false;
+    for sensitive in sensitive_values {
+        if sanitized.contains(sensitive) {
+            sanitized = sanitized.replace(sensitive, REDACTED);
+            redacted = true;
+        }
+    }
+    let trailing_prefix = sensitive_values
+        .iter()
+        .flat_map(|sensitive| {
+            sensitive
+                .char_indices()
+                .skip(1)
+                .map(move |(index, _)| &sensitive[..index])
         })
+        .filter(|prefix| sanitized.ends_with(prefix))
+        .max_by_key(|prefix| prefix.len());
+    if let Some(prefix) = trailing_prefix {
+        sanitized.truncate(sanitized.len().saturating_sub(prefix.len()));
+        if prefix.len() >= 4 {
+            sanitized.push_str(REDACTED);
+        }
+        redacted = true;
+    }
+    (sanitized, redacted)
+}
+
+fn sanitized_tool_request_draft_event(
+    event: &bcode_session_models::ToolRequestDraftEvent,
+    preview: &str,
+    preview_start_offset: usize,
+    sensitive_values: &[String],
+) -> (bcode_session_models::ToolRequestDraftEvent, String, bool) {
+    let (preview, redacted) = sanitize_tool_request_draft_preview(preview, sensitive_values);
+    let mut sanitized = event.clone();
+    if !matches!(
+        sanitized.operation,
+        bcode_session_models::ToolRequestDraftOperation::Remove { .. }
+    ) {
+        sanitized.operation = bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+            start_offset: preview_start_offset,
+            text: preview.clone(),
+        };
+    }
+    (sanitized, preview, redacted)
 }
 
 const MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION: usize = 256;
 const MAX_ACTIVE_TOOL_REQUEST_DRAFT_BYTES_PER_SESSION: usize = 4 * 1024 * 1024;
 
 #[allow(clippy::too_many_lines)] // Registry validation and accounting remain atomic under one mutex guard.
-async fn publish_tool_request_draft_live(
+async fn publish_tool_request_draft_live_with_sensitive_values(
     state: &ServerState,
     session_id: SessionId,
     event: bcode_session_models::ToolRequestDraftEvent,
+    sensitive_values: &[String],
 ) {
     let key = ActiveLiveStateKey::tool_request_draft(
         session_id,
@@ -20178,15 +20329,9 @@ async fn publish_tool_request_draft_live(
         event.operation,
         bcode_session_models::ToolRequestDraftOperation::Remove { .. }
     );
-    if !terminal_update
-        && provider_request_context_has_sensitive_values(&state.selected_provider_context)
-    {
-        state
-            .metrics
-            .increment_counter("server.live_state.request_draft_redacted_total");
-        return;
-    }
     let mut mutex_hold_ns = 0_u64;
+    let mut published_event = None;
+    let mut redacted = false;
     let accepted = state
         .active_tool_request_drafts
         .lock()
@@ -20209,7 +20354,7 @@ async fn publish_tool_request_draft_live(
                 }
                 let mut preview = current
                     .filter(|current| current.event.generation == event.generation)
-                    .map_or_else(String::new, |current| current.preview.clone());
+                    .map_or_else(String::new, |current| current.raw_preview.clone());
                 let mut preview_start_offset = current
                     .filter(|current| current.event.generation == event.generation)
                     .map_or(0, |current| current.preview_start_offset);
@@ -20230,7 +20375,7 @@ async fn publish_tool_request_draft_live(
                     bcode_session_models::ToolRequestDraftOperation::Remove { .. } => {
                         if let Some(removed) = registry.drafts.remove(&key) {
                             let bytes = registry.session_bytes.entry(session_id).or_default();
-                            *bytes = bytes.saturating_sub(removed.preview.len());
+                            *bytes = bytes.saturating_sub(removed.raw_preview.len());
                             if *bytes == 0 {
                                 registry.session_bytes.remove(&session_id);
                             }
@@ -20238,11 +20383,12 @@ async fn publish_tool_request_draft_live(
                         registry
                             .terminal_revisions
                             .insert(key, (event.generation, event.revision.saturating_add(1)));
+                        published_event = Some(event.clone());
                         return true;
                     }
                 }
 
-                let previous_bytes = current.map_or(0, |current| current.preview.len());
+                let previous_bytes = current.map_or(0, |current| current.raw_preview.len());
                 let session_count = registry
                     .drafts
                     .keys()
@@ -20264,11 +20410,21 @@ async fn publish_tool_request_draft_live(
                     return false;
                 }
 
+                let (sanitized_event, sanitized_preview, was_redacted) =
+                    sanitized_tool_request_draft_event(
+                        &event,
+                        &preview,
+                        preview_start_offset,
+                        sensitive_values,
+                    );
+                redacted |= was_redacted;
+                published_event = Some(sanitized_event.clone());
                 registry.drafts.insert(
                     key,
                     ActiveToolRequestDraft {
-                        event: event.clone(),
-                        preview,
+                        event: sanitized_event,
+                        raw_preview: preview,
+                        preview: sanitized_preview,
                         preview_start_offset,
                         last_updated_at: Instant::now(),
                     },
@@ -20295,11 +20451,18 @@ async fn publish_tool_request_draft_live(
                 .metrics
                 .increment_counter("server.live_state.accepted_updates_total");
         }
+        if redacted {
+            state
+                .metrics
+                .increment_counter("server.live_state.request_draft_redacted_total");
+        }
         refresh_active_live_state_metrics(state);
-        let _ = state
-            .sessions
-            .publish_live_event(session_id, SessionLiveEventKind::ToolRequestDraft { event })
-            .await;
+        if let Some(event) = published_event {
+            let _ = state
+                .sessions
+                .publish_live_event(session_id, SessionLiveEventKind::ToolRequestDraft { event })
+                .await;
+        }
     } else if terminal_update {
         state
             .metrics
@@ -20309,6 +20472,30 @@ async fn publish_tool_request_draft_live(
             "request draft terminal revision was stale or overflowed; retained terminal dominance"
         );
     }
+}
+
+async fn publish_tool_request_draft_live(
+    state: &ServerState,
+    session_id: SessionId,
+    event: bcode_session_models::ToolRequestDraftEvent,
+) {
+    let provider_context = state
+        .session_model_selections
+        .lock()
+        .await
+        .get(&session_id)
+        .map_or_else(
+            || state.selected_provider_context.clone(),
+            |selection| selection.provider_context.clone(),
+        );
+    let sensitive_values = provider_request_context_sensitive_values(&provider_context);
+    publish_tool_request_draft_live_with_sensitive_values(
+        state,
+        session_id,
+        event,
+        &sensitive_values,
+    )
+    .await;
 }
 
 async fn remove_tool_request_draft_live(
@@ -29922,6 +30109,10 @@ fn pending_live_event_key(
         }
         SessionLiveEventKind::ToolRequestDraft { event }
             if !matches!(
+                &event.operation,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint { text, .. }
+                    if event.revision == 1 && text.is_empty()
+            ) && !matches!(
                 event.operation,
                 bcode_session_models::ToolRequestDraftOperation::Remove { .. }
             ) =>
@@ -36427,6 +36618,26 @@ library = "test"
             .await
             .expect("session");
         let state = test_server_state(sessions.clone());
+        let secret = "openai-secret-must-not-enter-tool-drafts";
+        state.session_model_selections.lock().await.insert(
+            session.id,
+            SessionModelSelection {
+                provider_context: bcode_model::ProviderRequestContext {
+                    auth: Some(bcode_model::ProviderAuthContext {
+                        credentials: BTreeMap::from([(
+                            "api_key".to_owned(),
+                            bcode_model::ProviderAuthCredential {
+                                value: secret.to_owned(),
+                                source: Some("test".to_owned()),
+                            },
+                        )]),
+                        ..bcode_model::ProviderAuthContext::default()
+                    }),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                ..SessionModelSelection::default()
+            },
+        );
         let durable_before = sessions
             .session_history(session.id)
             .await
@@ -36446,9 +36657,12 @@ library = "test"
             ),
         )
         .await;
-        assert_eq!(
-            active_tool_request_draft_snapshot_events(&state, session.id).len(),
-            1
+        let live = active_tool_request_draft_snapshot_events(&state, session.id);
+        assert_eq!(live.len(), 1);
+        assert!(
+            !serde_json::to_string(&live)
+                .expect("live draft JSON")
+                .contains(secret)
         );
         assert_eq!(
             sessions
@@ -36874,7 +37088,7 @@ library = "test"
     }
 
     #[tokio::test]
-    async fn request_draft_is_suppressed_when_provider_context_contains_secrets() {
+    async fn request_draft_redacts_matching_provider_secrets_without_suppressing_progress() {
         let sessions = SessionManager::default();
         let session_id = sessions
             .create_session(Some("secret draft".to_owned()), test_working_directory())
@@ -36905,8 +37119,17 @@ library = "test"
         )
         .await;
 
-        assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
-        assert!(attachment.live_events.try_recv().is_err());
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session_id).len(),
+            1
+        );
+        let event = attachment
+            .live_events
+            .try_recv()
+            .expect("sanitized live draft");
+        let encoded = serde_json::to_string(&event).expect("live event JSON");
+        assert!(!encoded.contains("secret-value"));
+        assert!(encoded.contains("[REDACTED]"));
         assert_eq!(
             state
                 .metrics
@@ -36915,6 +37138,54 @@ library = "test"
                 .get("server.live_state.request_draft_redacted_total"),
             Some(&1)
         );
+    }
+
+    #[tokio::test]
+    async fn request_draft_redacts_secret_split_across_provider_deltas() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("split secret draft".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("attach");
+        let mut state = test_server_state(sessions);
+        state
+            .selected_provider_context
+            .env
+            .insert("API_TOKEN".to_owned(), "secret-value".to_owned());
+        for (revision, offset, text) in [(1, 0, "se"), (2, 2, "cret-"), (3, 7, "value")] {
+            publish_tool_request_draft_live(
+                &state,
+                session_id,
+                request_draft_event(
+                    "call-secret",
+                    1,
+                    revision,
+                    bcode_session_models::ToolRequestDraftOperation::Append {
+                        offset,
+                        text: text.to_owned(),
+                    },
+                ),
+            )
+            .await;
+            let event = attachment
+                .live_events
+                .try_recv()
+                .expect("sanitized live draft");
+            let encoded = serde_json::to_string(&event).expect("live event JSON");
+            assert!(!encoded.contains("secret-"));
+            assert!(!encoded.contains("secret-value"));
+            if revision > 1 {
+                assert!(encoded.contains("[REDACTED]"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -37601,6 +37872,42 @@ library = "test"
             ralph_iteration_status_from_model_outcome(Some(ModelTurnOutcome::Error)),
             "work_failed"
         );
+    }
+
+    #[test]
+    fn tool_request_draft_start_event_precedes_argument_revisions() {
+        let mut progress = ModelStreamProgress::default();
+        progress.start_tool_call_with_presentation(
+            None,
+            "call-write".to_owned(),
+            "filesystem.write".to_owned(),
+            ToolRequestDraftPresentation {
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                schema: "bcode.filesystem.request-draft.write".to_owned(),
+                schema_version: 1,
+                placement: bcode_session_models::ToolContributionPlacement::Request,
+            },
+        );
+
+        let started = progress
+            .tool_request_draft_start_event("turn-1", "call-write")
+            .expect("start draft");
+        assert_eq!(started.revision, 1);
+        assert_eq!(started.argument_bytes, 0);
+        assert!(matches!(
+            started.operation,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                ref text,
+            } if text.is_empty()
+        ));
+
+        progress.record_tool_call_delta("call-write", r#"{"path":"live.txt"#);
+        let delta = progress
+            .take_tool_request_draft_event("turn-1", "call-write")
+            .expect("argument draft");
+        assert_eq!(delta.revision, 2);
+        assert!(delta.argument_bytes > 0);
     }
 
     #[test]
@@ -53209,11 +53516,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
 
         assert!(matches!(
-            pending.push(draft(1, 0, "hello ")),
+            pending.push(draft(2, 0, "hello ")),
             BufferLiveEventResult::Buffered { superseded: false }
         ));
         assert!(matches!(
-            pending.push(draft(2, 6, "world")),
+            pending.push(draft(3, 6, "world")),
             BufferLiveEventResult::Buffered { superseded: true }
         ));
         let events = pending.take_events();
@@ -53228,11 +53535,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
 
         assert!(matches!(
-            pending.push(draft(3, 99, "gap")),
+            pending.push(draft(4, 99, "gap")),
             BufferLiveEventResult::Buffered { superseded: false }
         ));
         assert!(matches!(
-            pending.push(draft(4, 100, "still-gapped")),
+            pending.push(draft(5, 100, "still-gapped")),
             BufferLiveEventResult::Rejected(BufferLiveEventError::Gap)
         ));
         assert_eq!(pending.len(), 1);
@@ -53266,13 +53573,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let mut pending = PendingLiveEventBuffer::default();
         let first_text = "a".repeat(MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT);
-        let first = draft(1, 0, first_text);
+        let first = draft(2, 0, first_text);
         assert!(!pending.should_flush_before(&first));
         assert!(matches!(
             pending.push(first),
             BufferLiveEventResult::Buffered { superseded: false }
         ));
-        let next = draft(2, MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT, "b".to_owned());
+        let next = draft(3, MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT, "b".to_owned());
         assert!(pending.should_flush_before(&next));
         let flushed = pending.take_events();
         assert_eq!(flushed.len(), 1);
@@ -53295,7 +53602,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     event: request_draft_event(
                         &format!("call-{index}"),
                         1,
-                        1,
+                        2,
                         bcode_session_models::ToolRequestDraftOperation::Checkpoint {
                             start_offset: 0,
                             text: "bounded".to_owned(),
@@ -53315,7 +53622,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 event: request_draft_event(
                     "call-overflow",
                     1,
-                    1,
+                    2,
                     bcode_session_models::ToolRequestDraftOperation::Checkpoint {
                         start_offset: 0,
                         text: "rejected".to_owned(),
