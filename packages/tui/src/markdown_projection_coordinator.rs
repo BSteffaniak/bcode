@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 use bcode_markdown_render::{
     MarkdownRenderOptions, MarkdownRenderResult, MarkdownStreamingRenderState,
 };
-use tokio::sync::mpsc;
 
 /// Complete identity for one transcript Markdown render generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +60,7 @@ type MarkdownRenderer = dyn Fn(&mut MarkdownStreamingRenderState, &str, &Markdow
 /// One active and one replaceable latest pending Markdown request.
 pub struct MarkdownProjectionCoordinator {
     mailbox: Arc<(Mutex<WorkerMailbox>, Condvar)>,
-    completion_rx: mpsc::UnboundedReceiver<MarkdownProjectionCompletion>,
+    completion_rx: tokio::sync::watch::Receiver<Option<MarkdownProjectionCompletion>>,
     latest_requested: Option<MarkdownProjectionGeneration>,
     worker: JoinHandle<()>,
 }
@@ -92,7 +91,7 @@ impl MarkdownProjectionCoordinator {
         ));
         let worker_mailbox = Arc::clone(&mailbox);
         let renderer: Arc<MarkdownRenderer> = Arc::new(renderer);
-        let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+        let (completion_tx, completion_rx) = tokio::sync::watch::channel(None);
         let worker = std::thread::spawn(move || {
             let mut state = MarkdownStreamingRenderState::default();
             loop {
@@ -128,11 +127,11 @@ impl MarkdownProjectionCoordinator {
                     |result| MarkdownProjectionOutcome::Rendered(Arc::new(result)),
                 );
                 if completion_tx
-                    .send(MarkdownProjectionCompletion {
+                    .send(Some(MarkdownProjectionCompletion {
                         generation: request.generation,
                         outcome,
                         render_duration: started.elapsed(),
-                    })
+                    }))
                     .is_err()
                 {
                     break;
@@ -172,18 +171,25 @@ impl MarkdownProjectionCoordinator {
 
     /// Wait for the next worker completion.
     pub async fn next_completion(&mut self) -> Option<MarkdownProjectionCompletion> {
-        self.completion_rx.recv().await
+        loop {
+            self.completion_rx.changed().await.ok()?;
+            let completion = self.completion_rx.borrow_and_update().clone();
+            if completion.as_ref().is_some_and(|completion| {
+                self.latest_requested.as_ref() == Some(&completion.generation)
+            }) {
+                return completion;
+            }
+        }
     }
 
     /// Return the newest completed generation, discarding stale completions.
     pub fn try_latest_completion(&mut self) -> Option<MarkdownProjectionCompletion> {
-        let mut accepted = None;
-        while let Ok(completion) = self.completion_rx.try_recv() {
-            if self.latest_requested.as_ref() == Some(&completion.generation) {
-                accepted = Some(completion);
-            }
+        if !self.completion_rx.has_changed().unwrap_or(false) {
+            return None;
         }
-        accepted
+        let completion = self.completion_rx.borrow_and_update().clone();
+        completion
+            .filter(|completion| self.latest_requested.as_ref() == Some(&completion.generation))
     }
 
     /// Forget the accepted generation when its item/session leaves residency.
@@ -194,7 +200,7 @@ impl MarkdownProjectionCoordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .request = None;
-        while self.completion_rx.try_recv().is_ok() {}
+        let _ = self.completion_rx.borrow_and_update();
     }
 }
 
@@ -250,6 +256,27 @@ mod tests {
             panic!("expected rendered Markdown projection");
         };
         result
+    }
+
+    #[tokio::test]
+    async fn completion_slot_replaces_an_unobserved_older_generation() {
+        let mut coordinator = MarkdownProjectionCoordinator::new();
+        coordinator.request(request(1, "first"));
+        for _ in 0..100 {
+            if coordinator
+                .completion_rx
+                .borrow()
+                .as_ref()
+                .is_some_and(|completion| completion.generation.item_revision == 1)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+        coordinator.request(request(2, "latest"));
+
+        let completion = wait_latest(&mut coordinator).await;
+        assert_eq!(completion.generation.item_revision, 2);
     }
 
     #[tokio::test]

@@ -94,6 +94,8 @@ fn finalized_artifact_error_is_terminal(error: &ClientError) -> bool {
     )
 }
 
+const ACTIVE_ARTIFACT_COMPLETION_CAPACITY: usize = 64;
+
 #[derive(Debug, Default)]
 pub struct ArtifactStreamStats {
     pub observed_targets: u64,
@@ -110,8 +112,8 @@ pub struct ArtifactStreamStats {
 
 pub struct ArtifactStreamCoordinator {
     artifact_fetches: BTreeMap<ActiveArtifactKey, ActiveArtifactFetchState>,
-    artifact_fetch_sender: tokio::sync::mpsc::UnboundedSender<ActiveArtifactFetchCompletion>,
-    artifact_fetch_receiver: tokio::sync::mpsc::UnboundedReceiver<ActiveArtifactFetchCompletion>,
+    artifact_fetch_sender: tokio::sync::mpsc::Sender<ActiveArtifactFetchCompletion>,
+    artifact_fetch_receiver: tokio::sync::mpsc::Receiver<ActiveArtifactFetchCompletion>,
     passive_client: BcodeClient,
     stats: ArtifactStreamStats,
 }
@@ -119,7 +121,7 @@ pub struct ArtifactStreamCoordinator {
 impl ArtifactStreamCoordinator {
     pub(crate) fn new(passive_client: BcodeClient) -> Self {
         let (artifact_fetch_sender, artifact_fetch_receiver) =
-            tokio::sync::mpsc::unbounded_channel();
+            tokio::sync::mpsc::channel(ACTIVE_ARTIFACT_COMPLETION_CAPACITY);
         Self {
             artifact_fetches: BTreeMap::new(),
             artifact_fetch_sender,
@@ -393,14 +395,16 @@ impl ArtifactStreamCoordinator {
                     length,
                 )
                 .await;
-            let _ = sender.send(ActiveArtifactFetchCompletion {
-                session_id,
-                key: task_key,
-                requested_offset,
-                requested_end,
-                target_revision,
-                result,
-            });
+            let _result = sender
+                .send(ActiveArtifactFetchCompletion {
+                    session_id,
+                    key: task_key,
+                    requested_offset,
+                    requested_end,
+                    target_revision,
+                    result,
+                })
+                .await;
         });
     }
 
@@ -558,10 +562,15 @@ impl ArtifactStreamCoordinator {
     }
 
     #[cfg(test)]
+    pub(crate) fn completion_capacity(&self) -> usize {
+        self.artifact_fetch_receiver.max_capacity()
+    }
+
+    #[cfg(test)]
     pub(crate) fn enqueue_test_completion(&self, session_id: SessionId) {
-        let _ = self
+        let _result = self
             .artifact_fetch_sender
-            .send(ActiveArtifactFetchCompletion {
+            .try_send(ActiveArtifactFetchCompletion {
                 session_id,
                 key: (
                     session_id,
@@ -599,6 +608,15 @@ impl ArtifactStreamCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_completion_channel_is_bounded() {
+        let coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        assert_eq!(
+            coordinator.completion_capacity(),
+            ACTIVE_ARTIFACT_COMPLETION_CAPACITY
+        );
+    }
 
     fn target(committed_bytes: u64, revision: u64, finalized: bool) -> ActiveArtifactTarget {
         ActiveArtifactTarget {

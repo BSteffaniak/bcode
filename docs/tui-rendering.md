@@ -1,5 +1,26 @@
 # TUI rendering configuration
 
+## BMUX runtime migration target
+
+Bcode's normal terminal entry point in `packages/tui/src/runtime.rs` will construct one
+`bmux_tui_runtime` owner for terminal input, bounded application admission, commands,
+subscriptions, timers, redraw coalescing, and presentation cadence. Bcode continues to own
+`ActiveChat`, session-view adaptation, permissions, client effects, transcript layout, image
+composition, navigation, and all other product semantics. BMUX runtime types do not enter portable
+frontend or plugin contracts.
+
+The migration path is intentionally staged: first prove the generic runtime through an isolated
+plugin-surface adapter, then move the central chat scheduler and effect lifecycle, and finally route
+pickers, dialogs, onboarding, and plugin surfaces through the same root terminal runtime. A pilot
+runtime is not final architecture and must be removed once root navigation owns that surface.
+
+Migration is complete only when the normal startup path uses the root runtime; reliable session and
+terminal updates use bounded admission; request-draft paint handoff, hit maps, cursor state, and
+image-scene ordering remain correct; manual nested draw/input loops and obsolete generic effect
+plumbing are removed; local BMUX path patches are removed; and all BMUX TUI crates are pinned to the
+same exact committed BMUX revision. Render cadence continues to limit presentation only and never
+delays semantic updates, authorization, cancellation dispatch, or canonical execution.
+
 ## Session picker and search scope
 
 The TUI keeps local canonical-summary filtering distinct from transcript search. Local filtering is

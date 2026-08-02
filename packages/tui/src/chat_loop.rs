@@ -46,7 +46,7 @@ const BCODE_EVENT_DRAIN_BUDGET: usize = 32;
 const ARTIFACT_COMPLETION_DRAIN_BUDGET: usize = 8;
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 #[derive(Debug, Clone)]
-struct DraftAutosave {
+pub struct DraftAutosave {
     launch_working_directory: std::path::PathBuf,
     last_seen_text: String,
     last_saved_text: Option<String>,
@@ -55,7 +55,7 @@ struct DraftAutosave {
 }
 
 impl DraftAutosave {
-    fn new(launch_working_directory: std::path::PathBuf, initial_text: String) -> Self {
+    pub fn new(launch_working_directory: std::path::PathBuf, initial_text: String) -> Self {
         Self {
             launch_working_directory,
             last_seen_text: initial_text.clone(),
@@ -114,7 +114,7 @@ impl DraftAutosave {
     }
 }
 
-struct ChatLoopState {
+pub struct ChatLoopState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
     effects: TuiEffectRunner,
@@ -142,7 +142,7 @@ struct ChatLoopState {
 }
 
 impl ChatLoopState {
-    fn new(
+    pub fn new(
         foreground_client: &BcodeClient,
         passive_client: &BcodeClient,
         metrics_enabled: bool,
@@ -172,6 +172,68 @@ impl ChatLoopState {
             request_draft_handoff: RequestDraftHandoff::default(),
             frame_index: 0,
         }
+    }
+
+    pub fn mark_presentation_committed(&mut self) {
+        self.request_draft_handoff.mark_painted();
+    }
+
+    pub fn apply_session_stream_update(
+        &mut self,
+        chat: &mut ActiveChat,
+        update: history_flow::SessionStreamUpdate,
+    ) -> bool {
+        if self.request_draft_handoff.blocks_session_stream() {
+            self.request_draft_handoff.deferred.push_back(update);
+            return false;
+        }
+        let paint_id = request_handoff_paint_id(&update).map(ToOwned::to_owned);
+        let changed = absorb_session_stream_update(chat, self, update);
+        self.request_draft_handoff
+            .observe_applied(paint_id, changed);
+        changed
+    }
+
+    pub fn apply_deferred_session_stream_updates(&mut self, chat: &mut ActiveChat) -> bool {
+        if self.request_draft_handoff.blocks_session_stream() {
+            return false;
+        }
+        let mut changed = false;
+        while let Some(update) = self.request_draft_handoff.deferred.pop_front() {
+            let paint_id = request_handoff_paint_id(&update).map(ToOwned::to_owned);
+            let update_changed = absorb_session_stream_update(chat, self, update);
+            self.request_draft_handoff
+                .observe_applied(paint_id, update_changed);
+            changed |= update_changed;
+            if self.request_draft_handoff.blocks_session_stream() {
+                break;
+            }
+        }
+        changed
+    }
+
+    pub fn apply_artifact_completion(
+        &mut self,
+        chat: &ActiveChat,
+        completion: ActiveArtifactFetchCompletion,
+    ) -> bool {
+        handle_artifact_completion(chat, self, completion)
+    }
+
+    pub fn apply_markdown_projection_completion(
+        &mut self,
+        chat: &mut ActiveChat,
+        completion: super::markdown_projection_coordinator::MarkdownProjectionCompletion,
+    ) -> bool {
+        self.accept_markdown_projection_completion(chat, completion)
+    }
+
+    pub fn record_runtime_stats(&mut self, stats: &bmux_tui_runtime::RuntimeStats) {
+        super::runtime_adapter::record_stats(&mut self.telemetry, stats);
+    }
+
+    pub fn flush_telemetry_if_due(&mut self, now: Instant) {
+        self.telemetry.flush_if_due(now);
     }
 
     fn drain_pending_effects(&mut self, chat: &mut ActiveChat) -> bool {
@@ -315,7 +377,7 @@ impl ChatLoopState {
         changed
     }
 
-    fn abort_all_effects(&mut self) {
+    pub fn abort_all_effects(&mut self) {
         self.effects.abort_all();
         self.markdown_projection.invalidate();
         if let Some(markdown) = &mut self.markdown_presentation {
@@ -420,6 +482,7 @@ pub struct TuiRuntimeSettings {
     keymap: BmuxKeyMap,
     mouse_scroll_rows: usize,
     frame_interval: Option<Duration>,
+    runtime_config: bmux_tui_runtime::RuntimeConfig,
     metrics_enabled: bool,
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
     tui_extensions: Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension>,
@@ -436,6 +499,7 @@ impl TuiRuntimeSettings {
             keymap: BmuxKeyMap::from_config(&tui_config),
             mouse_scroll_rows: tui_config.mouse.effective_scroll_rows(),
             frame_interval: tui_config.render.frame_interval(),
+            runtime_config: super::runtime_adapter::config(&tui_config),
             metrics_enabled: false,
             static_plugins: static_plugins.to_vec(),
             tui_extensions: super::bundled_tui_extensions(),
@@ -447,6 +511,13 @@ impl TuiRuntimeSettings {
         self.keymap = BmuxKeyMap::from_config(tui_config);
         self.mouse_scroll_rows = tui_config.mouse.effective_scroll_rows();
         self.frame_interval = tui_config.render.frame_interval();
+        self.runtime_config = super::runtime_adapter::config(tui_config);
+    }
+
+    /// Build the domain-neutral BMUX runtime configuration for current TUI settings.
+    #[must_use]
+    pub const fn bmux_runtime_config(&self) -> bmux_tui_runtime::RuntimeConfig {
+        self.runtime_config
     }
 
     pub const fn set_metrics_enabled(&mut self, enabled: bool) {
@@ -583,7 +654,7 @@ async fn run_chat_loop<W: Write>(
             start_draft_save(chat, &mut draft_autosave);
         }
 
-        let redraw_at = next_redraw_at(last_redraw, settings.frame_interval);
+        let redraw_at = next_redraw_at(last_redraw, settings.bmux_runtime_config().frame_interval);
         if needs_redraw && Instant::now() >= redraw_at {
             let schedule_delay = Instant::now().saturating_duration_since(redraw_at);
             draw_chat_frame(
@@ -591,7 +662,7 @@ async fn run_chat_loop<W: Write>(
                 chat,
                 loop_state,
                 schedule_delay,
-                settings.frame_interval,
+                settings.bmux_runtime_config().frame_interval,
             )?;
             if let Some(action) = startup_action.take()
                 && action == super::startup_action::StartupTuiAction::OpenRalphHome
@@ -1831,11 +1902,16 @@ mod render_cadence_tests {
         };
         settings.apply_tui_config(&config);
         assert_eq!(
+            settings.bmux_runtime_config().frame_interval,
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
             next_redraw_at(start, settings.frame_interval),
             start + Duration::from_millis(50)
         );
         config.render.max_fps = 0;
         settings.apply_tui_config(&config);
+        assert_eq!(settings.bmux_runtime_config().frame_interval, None);
         assert_eq!(next_redraw_at(start, settings.frame_interval), start);
     }
 }
@@ -1984,7 +2060,7 @@ fn reconcile_markdown_presentation(
 }
 
 #[allow(clippy::too_many_lines)]
-fn draw_chat_frame<W: Write>(
+pub fn draw_chat_frame<W: Write>(
     terminal: &mut Terminal<&mut W>,
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
@@ -2355,7 +2431,7 @@ fn interactive_surface_area(surface: &mut InteractiveSurfaceState, viewport: Rec
 
 #[cfg(test)]
 fn take_bcode_events(
-    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<history_flow::SessionStreamUpdate>,
+    receiver: &mut tokio::sync::mpsc::Receiver<history_flow::SessionStreamUpdate>,
     budget: usize,
 ) -> Vec<history_flow::SessionStreamUpdate> {
     (0..budget)
@@ -2419,7 +2495,7 @@ fn request_handoff_paint_id(update: &history_flow::SessionStreamUpdate) -> Optio
 }
 
 fn take_next_bcode_event(
-    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<history_flow::SessionStreamUpdate>,
+    receiver: &mut tokio::sync::mpsc::Receiver<history_flow::SessionStreamUpdate>,
     handoff: &mut RequestDraftHandoff,
 ) -> Option<history_flow::SessionStreamUpdate> {
     handoff
@@ -3920,7 +3996,7 @@ mod scheduler_tests {
     }
 
     fn test_chat() -> ActiveChat {
-        let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
         ActiveChat {
             app: super::super::app::BmuxApp::new_with_history(None, &[], &[], false),
             agents: super::super::session_flow::AgentCatalog::default(),
@@ -5143,7 +5219,9 @@ mod scheduler_tests {
             request_draft_remove(session_id, 4),
             canonical_write_request(session_id),
         ] {
-            chat.event_sender.send(update).expect("queue stream update");
+            chat.event_sender
+                .try_send(update)
+                .expect("queue stream update");
         }
         let mut state = ChatLoopState::new(
             &BcodeClient::default_endpoint(),
@@ -5195,7 +5273,9 @@ mod scheduler_tests {
             request_draft_remove(session_id, 2),
             canonical_write_request(session_id),
         ] {
-            chat.event_sender.send(update).expect("queue stream update");
+            chat.event_sender
+                .try_send(update)
+                .expect("queue stream update");
         }
         let mut state = ChatLoopState::new(
             &BcodeClient::default_endpoint(),
@@ -5229,10 +5309,10 @@ mod scheduler_tests {
 
     #[test]
     fn daemon_queue_draining_obeys_its_per_tick_budget() {
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = crate::history_flow::session_stream_channel();
         for revision in 0..100 {
             sender
-                .send(history_flow::SessionStreamUpdate::Event(Box::new(
+                .try_send(history_flow::SessionStreamUpdate::Event(Box::new(
                     BcodeEvent::SessionCatalogUpdated { revision },
                 )))
                 .expect("daemon event");
@@ -5245,9 +5325,9 @@ mod scheduler_tests {
     #[test]
     fn ready_artifact_completion_precedes_a_saturated_daemon_queue() {
         let mut chat = test_chat();
-        for revision in 0..1_000 {
+        for revision in 0..256 {
             chat.event_sender
-                .send(history_flow::SessionStreamUpdate::Event(Box::new(
+                .try_send(history_flow::SessionStreamUpdate::Event(Box::new(
                     BcodeEvent::SessionCatalogUpdated { revision },
                 )))
                 .expect("daemon event");

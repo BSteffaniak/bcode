@@ -659,6 +659,11 @@ pub trait PluginTuiSurface: Send {
     }
 
     /// Drain effectful asynchronous work that was queued by synchronous input handling.
+    ///
+    /// This compatibility hook borrows the surface for the duration of the future. Hosts must
+    /// await it while retaining exclusive surface ownership; it cannot be scheduled as an owned
+    /// BMUX runtime command. Runtime-driven surfaces should instead model effect work as owned
+    /// request/result messages so application mutation remains serialized in `Program::update`.
     fn drain_effects<'a>(
         &'a mut self,
         _host: &'a dyn PluginTuiHost,
@@ -1091,7 +1096,7 @@ impl PluginTuiRegistry {
 #[derive(Clone)]
 pub struct TokioPluginTuiHost {
     handle: tokio::runtime::Handle,
-    redraw_sender: mpsc::UnboundedSender<()>,
+    redraw_sender: mpsc::Sender<()>,
     text_input: Option<Arc<dyn PluginTuiTextInputResolver>>,
 }
 
@@ -1126,7 +1131,7 @@ impl TokioPluginTuiHost {
     ///
     /// Panics if called outside a Tokio runtime.
     #[must_use]
-    pub fn current(redraw_sender: mpsc::UnboundedSender<()>) -> Self {
+    pub fn current(redraw_sender: mpsc::Sender<()>) -> Self {
         Self {
             handle: tokio::runtime::Handle::current(),
             redraw_sender,
@@ -1155,7 +1160,7 @@ impl PluginTuiHost for TokioPluginTuiHost {
         let redraw_sender = self.redraw_sender.clone();
         drop(self.handle.spawn(async move {
             task.await;
-            let _ = redraw_sender.send(());
+            let _ = redraw_sender.try_send(());
         }));
     }
 
@@ -1163,12 +1168,12 @@ impl PluginTuiHost for TokioPluginTuiHost {
         let redraw_sender = self.redraw_sender.clone();
         drop(self.handle.spawn_blocking(move || {
             task();
-            let _ = redraw_sender.send(());
+            let _ = redraw_sender.try_send(());
         }));
     }
 
     fn request_redraw(&self) {
-        let _ = self.redraw_sender.send(());
+        let _ = self.redraw_sender.try_send(());
     }
 
     fn text_edit_command(&self, stroke: KeyStroke) -> Option<TextEditCommand> {

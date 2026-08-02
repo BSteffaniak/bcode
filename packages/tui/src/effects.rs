@@ -45,7 +45,7 @@ pub struct SubmitMessageRequest {
     /// Reasoning effort generation captured by this submission, if locally pending.
     pub reasoning_effort_generation: Option<u64>,
     /// Event sender for a newly-created session stream.
-    pub event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
+    pub event_sender: mpsc::Sender<super::history_flow::SessionStreamUpdate>,
 }
 
 /// Skill action kind requested by the TUI.
@@ -84,7 +84,7 @@ pub struct SkillActionRequest {
     /// Pending reasoning effort generation captured by the invocation.
     pub reasoning_effort_generation: Option<u64>,
     /// Event sender for a newly-created session stream.
-    pub event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
+    pub event_sender: mpsc::Sender<super::history_flow::SessionStreamUpdate>,
 }
 
 /// Background work requested by local TUI event handling.
@@ -96,7 +96,7 @@ pub enum TuiEffect {
         /// Initial projection window request.
         initial_window_request: ProjectionWindowRequest,
         /// Event sender for the live session stream.
-        event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
+        event_sender: mpsc::Sender<super::history_flow::SessionStreamUpdate>,
         /// Whether this explicit open may start the daemon.
         allow_daemon_start: bool,
     },
@@ -932,13 +932,14 @@ impl TuiEffectQueue {
     }
 }
 
-/// Owns and polls daemon-backed TUI background work.
+const TUI_EFFECT_STREAM_CAPACITY: usize = 64;
+
 pub struct TuiEffectRunner {
     foreground_client: BcodeClient,
     passive_client: BcodeClient,
     tasks: BTreeMap<EffectKey, tokio::task::JoinHandle<TuiEffectResult>>,
-    streaming_sender: mpsc::UnboundedSender<TuiEffectResult>,
-    streaming_receiver: mpsc::UnboundedReceiver<TuiEffectResult>,
+    streaming_sender: mpsc::Sender<TuiEffectResult>,
+    streaming_receiver: mpsc::Receiver<TuiEffectResult>,
     queued_latest: BTreeMap<EffectKey, TuiEffect>,
     queued_presentation_notes: BTreeMap<SessionId, VecDeque<TuiEffect>>,
 }
@@ -947,7 +948,7 @@ impl TuiEffectRunner {
     /// Create an effect runner using foreground and passive clients.
     #[must_use]
     pub fn new(foreground_client: &BcodeClient, passive_client: &BcodeClient) -> Self {
-        let (streaming_sender, streaming_receiver) = mpsc::unbounded_channel();
+        let (streaming_sender, streaming_receiver) = mpsc::channel(TUI_EFFECT_STREAM_CAPACITY);
         Self {
             foreground_client: foreground_client.clone(),
             passive_client: passive_client.clone(),
@@ -957,6 +958,12 @@ impl TuiEffectRunner {
             queued_latest: BTreeMap::new(),
             queued_presentation_notes: BTreeMap::new(),
         }
+    }
+
+    /// Return the bounded streaming completion capacity.
+    #[cfg(test)]
+    fn streaming_capacity(&self) -> usize {
+        self.streaming_receiver.max_capacity()
     }
 
     /// Start an effect if another effect with the same key is not running.
@@ -1146,7 +1153,7 @@ impl TuiEffect {
     async fn run(
         self,
         client: BcodeClient,
-        streaming_sender: mpsc::UnboundedSender<TuiEffectResult>,
+        streaming_sender: mpsc::Sender<TuiEffectResult>,
     ) -> TuiEffectResult {
         match self {
             Self::OpenSession {
@@ -1163,9 +1170,10 @@ impl TuiEffect {
                     event_sender,
                     initial_window_request,
                     |snapshot| {
-                        let _ = streaming_sender.send(TuiEffectResult::SessionOpenProgress {
-                            snapshot: snapshot.clone(),
-                        });
+                        let _result =
+                            streaming_sender.try_send(TuiEffectResult::SessionOpenProgress {
+                                snapshot: snapshot.clone(),
+                            });
                     },
                 )
                 .await,
@@ -1460,7 +1468,7 @@ async fn ensure_session_for_foreground_action(
     client: &BcodeClient,
     session_id: Option<SessionId>,
     launch_working_directory: std::path::PathBuf,
-    event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
+    event_sender: mpsc::Sender<super::history_flow::SessionStreamUpdate>,
 ) -> Result<
     (
         SessionId,
@@ -2085,6 +2093,13 @@ mod progress_routing_tests {
         runner.abort_all();
     }
 
+    #[test]
+    fn effect_streaming_completion_channel_is_bounded() {
+        let client = BcodeClient::default_endpoint();
+        let runner = TuiEffectRunner::new(&client, &client);
+        assert_eq!(runner.streaming_capacity(), TUI_EFFECT_STREAM_CAPACITY);
+    }
+
     #[tokio::test]
     async fn runner_drains_streaming_session_progress_through_effect_results() {
         let client = BcodeClient::default_endpoint();
@@ -2108,7 +2123,7 @@ mod progress_routing_tests {
         };
         runner
             .streaming_sender
-            .send(TuiEffectResult::SessionOpenProgress {
+            .try_send(TuiEffectResult::SessionOpenProgress {
                 snapshot: snapshot.clone(),
             })
             .expect("stream progress result");

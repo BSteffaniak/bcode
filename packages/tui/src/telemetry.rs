@@ -29,7 +29,7 @@ pub struct TuiTelemetry {
     histograms: Vec<(MetricKey, u64)>,
     next_flush_at: Instant,
     batch_tx: watch::Sender<Option<ClientMetricBatch>>,
-    outcome_rx: mpsc::UnboundedReceiver<DeliveryOutcome>,
+    outcome_rx: mpsc::Receiver<DeliveryOutcome>,
     in_flight: Arc<AtomicBool>,
     pending: Arc<AtomicBool>,
     worker: JoinHandle<()>,
@@ -39,7 +39,7 @@ impl TuiTelemetry {
     /// Start a bounded sender using an independent daemon connection.
     pub(crate) fn new(client: BcodeClient, enabled: bool) -> Self {
         let (batch_tx, mut batch_rx) = watch::channel(None::<ClientMetricBatch>);
-        let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+        let (outcome_tx, outcome_rx) = mpsc::channel(1);
         let in_flight = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(AtomicBool::new(false));
         let worker_in_flight = Arc::clone(&in_flight);
@@ -57,10 +57,12 @@ impl TuiTelemetry {
                 let observations = batch.observations.len();
                 let succeeded = client.ingest_client_metrics(batch).await.is_ok();
                 worker_in_flight.store(false, Ordering::Release);
-                let _ = outcome_tx.send(DeliveryOutcome {
-                    observations,
-                    succeeded,
-                });
+                let _ = outcome_tx
+                    .send(DeliveryOutcome {
+                        observations,
+                        succeeded,
+                    })
+                    .await;
             }
         });
         Self {
@@ -277,6 +279,66 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_stats_map_to_secret_safe_tui_metrics() {
+        let client = BcodeClient::default_endpoint();
+        let mut telemetry = TuiTelemetry::new(client, true);
+        super::super::runtime_adapter::record_stats(
+            &mut telemetry,
+            &bmux_tui_runtime::RuntimeStats {
+                reliable_depth: 3,
+                reliable_high_water: 7,
+                terminal_depth: 2,
+                latest_depth: 1,
+                redraw_coalesced: 11,
+                scheduler_budget_exhausted: 5,
+                stale_command_completions: 4,
+                presentation_delay_us: 13,
+                ..bmux_tui_runtime::RuntimeStats::default()
+            },
+        );
+
+        assert_eq!(
+            telemetry
+                .gauges
+                .get(&("tui.runtime.reliable_depth".to_owned(), MetricLabels::new())),
+            Some(&3)
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.redraw_coalesced_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&11)
+        );
+        assert!(telemetry.histograms.iter().any(|((name, _), value)| {
+            name == "tui.runtime.presentation_delay_us" && *value == 13
+        }));
+    }
+
+    #[tokio::test]
+    async fn outcome_channel_has_one_pending_slot() {
+        let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+        outcome_tx
+            .try_send(DeliveryOutcome {
+                observations: 1,
+                succeeded: true,
+            })
+            .expect("first outcome fits");
+        assert!(
+            outcome_tx
+                .try_send(DeliveryOutcome {
+                    observations: 2,
+                    succeeded: false,
+                })
+                .is_err()
+        );
+        assert_eq!(
+            outcome_rx.recv().await.map(|outcome| outcome.observations),
+            Some(1)
+        );
     }
 
     #[tokio::test]

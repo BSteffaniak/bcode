@@ -64,7 +64,9 @@ pub(crate) mod ralph_start_dialog_render;
 pub(crate) mod render;
 #[cfg(test)]
 mod renderer_fixtures;
+mod root_program;
 pub(crate) mod runtime;
+mod runtime_adapter;
 mod runtime_context;
 pub(crate) mod session_flow;
 pub(crate) mod session_fork_dialog;

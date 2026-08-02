@@ -1810,7 +1810,7 @@ fn draft_agent_selection_updates_header() {
 
 #[test]
 fn new_draft_preserves_selected_agent() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
@@ -1934,7 +1934,7 @@ fn migration_stage_families_and_terminal_failure_render_through_status_chrome() 
 
 #[test]
 fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
@@ -1995,7 +1995,7 @@ fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection(
 
 #[tokio::test]
 async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_result() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
@@ -2079,7 +2079,7 @@ async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_
 
 #[tokio::test]
 async fn async_session_open_preserves_typed_draft() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
@@ -2133,7 +2133,7 @@ async fn async_session_open_preserves_typed_draft() {
 
 #[tokio::test]
 async fn async_session_open_initial_state_preserves_existing_draft() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
@@ -2160,7 +2160,7 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
 
 #[tokio::test]
 async fn async_session_open_failure_clears_progress_and_remains_visible() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
@@ -2207,7 +2207,7 @@ async fn async_session_open_failure_clears_progress_and_remains_visible() {
 
 #[tokio::test]
 async fn async_session_open_initial_state_preserves_plugin_host() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
@@ -2234,7 +2234,7 @@ async fn async_session_open_initial_state_preserves_plugin_host() {
 
 #[tokio::test]
 async fn async_session_open_completion_preserves_plugin_host() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
@@ -2277,7 +2277,7 @@ async fn async_session_open_completion_preserves_plugin_host() {
 
 #[test]
 fn switch_to_draft_session_preserves_plugin_host() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
@@ -2300,7 +2300,7 @@ fn switch_to_draft_session_preserves_plugin_host() {
 
 #[tokio::test]
 async fn session_open_preserved_plugin_host_renders_live_request_contribution() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),

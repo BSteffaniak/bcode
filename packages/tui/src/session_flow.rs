@@ -35,8 +35,8 @@ pub struct ActiveChat {
     pub app: BmuxApp,
     pub agents: AgentCatalog,
     pub session_id: Option<SessionId>,
-    pub event_sender: mpsc::UnboundedSender<history_flow::SessionStreamUpdate>,
-    pub event_receiver: mpsc::UnboundedReceiver<history_flow::SessionStreamUpdate>,
+    pub event_sender: mpsc::Sender<history_flow::SessionStreamUpdate>,
+    pub event_receiver: mpsc::Receiver<history_flow::SessionStreamUpdate>,
     pub event_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
     pub opening_session_progress: Option<bcode_session_models::SessionOpenOperationSnapshot>,
@@ -685,9 +685,7 @@ fn start_picker_transcript_search(
     client: &BcodeClient,
     picker: &mut session_picker::SessionPickerApp,
     effect: &mut super::session_search_effect::SessionSearchEffect,
-    completion_tx: tokio::sync::mpsc::UnboundedSender<
-        super::session_search_effect::SessionSearchCompletion,
-    >,
+    completion_tx: tokio::sync::mpsc::Sender<super::session_search_effect::SessionSearchCompletion>,
 ) -> bool {
     let input = picker.filter().buffer().text().trim();
     if input.is_empty() {
@@ -884,7 +882,7 @@ pub async fn pick_session<W: Write>(
     )
     .await;
     let mut search_effect = super::session_search_effect::SessionSearchEffect::default();
-    let (search_completion_tx, mut search_completion_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (search_completion_tx, mut search_completion_rx) = tokio::sync::mpsc::channel(1);
     draw_session_picker(io.terminal, &mut picker, services.theme)?;
     loop {
         draw_session_picker(io.terminal, &mut picker, services.theme)?;

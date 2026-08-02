@@ -19,6 +19,7 @@ use bcode_session_view_models::SessionConnectionViewStatus;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
+use bmux_tui_runtime::InvalidationSignal;
 use tokio::sync::mpsc;
 
 use super::terminal_events::TuiInput;
@@ -31,7 +32,7 @@ const MAX_PLUGIN_SESSION_VIEW_BUFFER: usize = 256;
 #[derive(Debug, Clone)]
 struct BcodePluginTuiHost {
     handle: tokio::runtime::Handle,
-    redraw_sender: mpsc::UnboundedSender<()>,
+    redraw: InvalidationSignal,
     client: BcodeClient,
 }
 
@@ -42,10 +43,10 @@ impl BcodePluginTuiHost {
     ///
     /// Panics if called outside a Tokio runtime.
     #[must_use]
-    fn current(redraw_sender: mpsc::UnboundedSender<()>, client: BcodeClient) -> Self {
+    fn current(redraw: InvalidationSignal, client: BcodeClient) -> Self {
         Self {
             handle: tokio::runtime::Handle::current(),
-            redraw_sender,
+            redraw,
             client,
         }
     }
@@ -80,23 +81,23 @@ fn workflow_start_request(
 
 impl PluginTuiHost for BcodePluginTuiHost {
     fn spawn(&self, task: PluginTask) {
-        let redraw_sender = self.redraw_sender.clone();
+        let redraw = self.redraw.clone();
         drop(self.handle.spawn(async move {
             task.await;
-            let _ = redraw_sender.send(());
+            redraw.request();
         }));
     }
 
     fn spawn_blocking(&self, task: Box<dyn FnOnce() + Send + 'static>) {
-        let redraw_sender = self.redraw_sender.clone();
+        let redraw = self.redraw.clone();
         drop(self.handle.spawn_blocking(move || {
             task();
-            let _ = redraw_sender.send(());
+            redraw.request();
         }));
     }
 
     fn request_redraw(&self) {
-        let _ = self.redraw_sender.send(());
+        self.redraw.request();
     }
 
     fn copy_text(&self, text: String) -> Result<(), PluginTuiHostError> {
@@ -188,15 +189,9 @@ impl PluginTuiHost for BcodePluginTuiHost {
             .max(DEFAULT_PLUGIN_SESSION_VIEW_BUFFER.min(MAX_PLUGIN_SESSION_VIEW_BUFFER));
         let (sender, receiver) = mpsc::channel(buffer);
         let client = self.client.clone();
-        let redraw_sender = self.redraw_sender.clone();
+        let redraw = self.redraw.clone();
         drop(self.handle.spawn(async move {
-            Box::pin(stream_plugin_session_view(
-                client,
-                request,
-                sender,
-                redraw_sender,
-            ))
-            .await;
+            Box::pin(stream_plugin_session_view(client, request, sender, redraw)).await;
         }));
         Ok(PluginSessionViewSubscription { receiver })
     }
@@ -300,18 +295,17 @@ async fn stream_plugin_session_view(
     client: BcodeClient,
     request: PluginSessionViewSubscriptionRequest,
     sender: mpsc::Sender<PluginSessionViewUpdate>,
-    redraw_sender: mpsc::UnboundedSender<()>,
+    redraw: InvalidationSignal,
 ) {
     if let Err(error) =
-        stream_plugin_session_view_inner(client, request, sender.clone(), redraw_sender.clone())
-            .await
+        stream_plugin_session_view_inner(client, request, sender.clone(), redraw.clone()).await
     {
         let _ = sender
             .send(PluginSessionViewUpdate::Disconnected {
                 message: error.to_string(),
             })
             .await;
-        let _ = redraw_sender.send(());
+        redraw.request();
     }
 }
 
@@ -398,7 +392,7 @@ fn client_permission_views(
 
 async fn send_plugin_session_snapshot(
     sender: &mpsc::Sender<PluginSessionViewUpdate>,
-    redraw_sender: &mpsc::UnboundedSender<()>,
+    redraw: &InvalidationSignal,
     view: &SessionView,
 ) -> bool {
     if sender
@@ -410,7 +404,7 @@ async fn send_plugin_session_snapshot(
     {
         return false;
     }
-    let _ = redraw_sender.send(());
+    redraw.request();
     true
 }
 
@@ -418,12 +412,12 @@ async fn stream_plugin_session_view_inner(
     client: BcodeClient,
     request: PluginSessionViewSubscriptionRequest,
     sender: mpsc::Sender<PluginSessionViewUpdate>,
-    redraw_sender: mpsc::UnboundedSender<()>,
+    redraw: InvalidationSignal,
 ) -> Result<(), bcode_client::ClientError> {
     let session_id = request.session_id;
     let mut connection = client.connect("bcode-plugin-tui-session-view").await?;
     let mut view = attach_plugin_session_view(&client, &mut connection, &request).await?;
-    if !send_plugin_session_snapshot(&sender, &redraw_sender, &view).await {
+    if !send_plugin_session_snapshot(&sender, &redraw, &view).await {
         return Ok(());
     }
 
@@ -451,7 +445,7 @@ async fn stream_plugin_session_view_inner(
                     | BcodeEvent::SessionViewResyncRequired { .. }
                     | BcodeEvent::SessionCatalogUpdated { .. } => false,
                 };
-                if changed && !send_plugin_session_snapshot(&sender, &redraw_sender, &view).await {
+                if changed && !send_plugin_session_snapshot(&sender, &redraw, &view).await {
                     return Ok(());
                 }
                 false
@@ -463,7 +457,7 @@ async fn stream_plugin_session_view_inner(
         }
 
         view.set_connection_status(SessionConnectionViewStatus::Reconnecting);
-        if !send_plugin_session_snapshot(&sender, &redraw_sender, &view).await {
+        if !send_plugin_session_snapshot(&sender, &redraw, &view).await {
             return Ok(());
         }
         drop(connection);
@@ -476,7 +470,7 @@ async fn stream_plugin_session_view_inner(
                     attach_plugin_session_view(&client, &mut next_connection, &request).await
             {
                 view = next_view;
-                if !send_plugin_session_snapshot(&sender, &redraw_sender, &view).await {
+                if !send_plugin_session_snapshot(&sender, &redraw, &view).await {
                     return Ok(());
                 }
                 connection = next_connection;
@@ -554,7 +548,7 @@ pub async fn run_plugin_surface_with_input_and_client<W: Write>(
     }
 }
 
-/// Run a plugin-owned surface until it closes or requests temporary native-session navigation.
+/// Run one plugin-owned surface until it closes or requests temporary native-session navigation.
 ///
 /// The caller retains the surface and input stream across `OpenSession`, allowing it to run the
 /// ordinary session viewer and then invoke this function again to resume exact surface state.
@@ -569,8 +563,8 @@ pub async fn run_plugin_surface_until_navigation_with_input_and_client<W: Write>
     surface: &mut dyn PluginTuiSurface,
     client: BcodeClient,
 ) -> Result<PluginSurfaceRunOutcome, TuiError> {
-    let (redraw_sender, mut redraw_receiver) = mpsc::unbounded_channel();
-    let host = BcodePluginTuiHost::current(redraw_sender, client);
+    let redraw = InvalidationSignal::new();
+    let host = BcodePluginTuiHost::current(redraw.clone(), client);
     let mut needs_redraw = true;
     let mut close_outcome = None;
     let mut should_exit = false;
@@ -603,6 +597,9 @@ pub async fn run_plugin_surface_until_navigation_with_input_and_client<W: Write>
         if should_exit {
             continue;
         }
+        if redraw.take() {
+            needs_redraw = true;
+        }
         if needs_redraw {
             terminal.draw(|frame| {
                 let area = frame.area();
@@ -629,10 +626,8 @@ pub async fn run_plugin_surface_until_navigation_with_input_and_client<W: Write>
                     return Ok(PluginSurfaceRunOutcome::OpenSession(session_id));
                 }
             }
-            redraw = redraw_receiver.recv() => {
-                if redraw.is_some() {
-                    needs_redraw = true;
-                }
+            () = redraw.wait() => {
+                needs_redraw |= redraw.take();
             }
         }
     }
@@ -645,6 +640,17 @@ pub async fn run_plugin_surface_until_navigation_with_input_and_client<W: Write>
 enum PluginSurfaceHostAction {
     None,
     OpenSession(SessionId),
+}
+
+fn handle_host_event<W: Write>(terminal: &mut Terminal<&mut W>, event: &Event) -> bool {
+    match event {
+        Event::Resize(size) => {
+            terminal.resize(Rect::new(0, 0, size.width, size.height));
+            true
+        }
+        Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => true,
+        Event::Key(_) | Event::Mouse(_) | Event::Paste(_) | Event::User(_) => false,
+    }
 }
 
 fn apply_plugin_surface_action(
@@ -672,17 +678,6 @@ fn apply_plugin_surface_action(
             *should_exit = true;
             PluginSurfaceHostAction::None
         }
-    }
-}
-
-fn handle_host_event<W: Write>(terminal: &mut Terminal<&mut W>, event: &Event) -> bool {
-    match event {
-        Event::Resize(size) => {
-            terminal.resize(Rect::new(0, 0, size.width, size.height));
-            true
-        }
-        Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => true,
-        Event::Key(_) | Event::Mouse(_) | Event::Paste(_) | Event::User(_) => false,
     }
 }
 
@@ -909,6 +904,24 @@ mod tests {
         assert_eq!(action, PluginSurfaceHostAction::OpenSession(session_id));
         assert!(!should_exit);
         assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn bmux_invalidation_signal_coalesces_plugin_redraw_requests() {
+        let redraw = bmux_tui_runtime::InvalidationSignal::new();
+        redraw.request();
+        redraw.request();
+
+        assert!(redraw.take());
+        assert!(!redraw.take());
+        assert_eq!(redraw.requests(), 2);
+        assert_eq!(redraw.coalesced(), 1);
+    }
+
+    #[test]
+    fn plugin_surface_host_source_uses_bmux_redraw_latch() {
+        let source = include_str!("plugin_surface_host.rs");
+        assert!(source.contains("InvalidationSignal"));
     }
 
     #[test]

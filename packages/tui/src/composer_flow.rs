@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn opening_session_defers_message_without_consuming_composer_text() {
-        let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
         let session_id = bcode_session_models::SessionId::new();
         let mut chat = super::super::session_flow::ActiveChat {
             app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),

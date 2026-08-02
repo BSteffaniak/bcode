@@ -198,7 +198,7 @@ impl SessionSearchEffect {
         policy: bcode_session_search::SessionSearchPlanPolicy,
         routes: Vec<bcode_session_search::SessionSearchContentRoute>,
         hydrate: bool,
-        completion_tx: tokio::sync::mpsc::UnboundedSender<SessionSearchCompletion>,
+        completion_tx: tokio::sync::mpsc::Sender<SessionSearchCompletion>,
     ) -> u64 {
         self.replace_with(
             move || async move {
@@ -214,7 +214,7 @@ impl SessionSearchEffect {
     fn replace_with<Dispatch, DispatchFuture>(
         &mut self,
         dispatch: Dispatch,
-        completion_tx: tokio::sync::mpsc::UnboundedSender<SessionSearchCompletion>,
+        completion_tx: tokio::sync::mpsc::Sender<SessionSearchCompletion>,
     ) -> u64
     where
         Dispatch: FnOnce() -> DispatchFuture + Send + 'static,
@@ -232,11 +232,13 @@ impl SessionSearchEffect {
         self.task = Some(tokio::spawn(async move {
             tokio::time::sleep(SESSION_SEARCH_DEBOUNCE).await;
             if let Some((response, hydrated_hits)) = dispatch().await {
-                let _ = completion_tx.send(SessionSearchCompletion {
-                    generation,
-                    response,
-                    hydrated_hits,
-                });
+                let _ = completion_tx
+                    .send(SessionSearchCompletion {
+                        generation,
+                        response,
+                        hydrated_hits,
+                    })
+                    .await;
             }
         }));
         generation
@@ -517,8 +519,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_channel_has_one_pending_slot() {
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
+        completion_tx
+            .try_send(completion(1))
+            .expect("first completion fits");
+        assert!(completion_tx.try_send(completion(2)).is_err());
+        assert_eq!(
+            completion_rx.recv().await.map(|item| item.generation),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
     async fn picker_loop_replacement_dispatches_only_latest_generation() {
-        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
         let first_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let latest_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut effect = SessionSearchEffect::default();
@@ -572,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn rapid_replacement_dispatches_only_latest_query_after_debounce() {
-        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
         let first_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let latest_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut effect = SessionSearchEffect::default();

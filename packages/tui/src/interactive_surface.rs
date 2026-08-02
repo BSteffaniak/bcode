@@ -1,6 +1,8 @@
 //! Generic inline interactive surface host for tool interactions.
 
 use bcode_plugin::{PluginLoadError, PluginRuntimeHost};
+#[cfg(test)]
+use bcode_plugin_sdk::tui::PluginTuiHost;
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiAction, PluginTuiSurfaceOpenRequest, TokioPluginTuiHost,
 };
@@ -178,6 +180,18 @@ pub struct InteractiveSurfaceState {
 }
 
 impl InteractiveSurfaceState {
+    #[cfg(test)]
+    pub(crate) fn redraw_channel_is_bounded_for_test() {
+        let (redraw_sender, mut redraw_receiver) = mpsc::channel(1);
+        let host = TokioPluginTuiHost::current(redraw_sender);
+
+        host.request_redraw();
+        host.request_redraw();
+
+        assert_eq!(redraw_receiver.try_recv(), Ok(()));
+        assert!(redraw_receiver.try_recv().is_err());
+    }
+
     /// Open an inline surface from the plugin runtime by surface kind.
     ///
     /// # Errors
@@ -193,7 +207,7 @@ impl InteractiveSurfaceState {
         let interaction_id = interaction_id.into();
         let surface_kind = surface_kind.into();
         let request = serde_json::from_str(request_json).unwrap_or_else(|_| json!({}));
-        let (redraw_sender, _redraw_receiver) = mpsc::unbounded_channel();
+        let (redraw_sender, _redraw_receiver) = mpsc::channel(1);
         let host = TokioPluginTuiHost::current(redraw_sender).with_text_input_resolver(Arc::new(
             InteractiveTextInputResolver {
                 keymap: keymap.clone(),
@@ -809,6 +823,11 @@ mod tests {
         (area.y..area.bottom()).flat_map(move |y| {
             (area.x..area.right()).map(move |x| bmux_tui::geometry::Point::new(x, y))
         })
+    }
+
+    #[tokio::test]
+    async fn inline_plugin_redraw_channel_is_bounded_and_coalesces() {
+        InteractiveSurfaceState::redraw_channel_is_bounded_for_test();
     }
 
     #[test]

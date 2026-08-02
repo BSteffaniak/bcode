@@ -7,13 +7,12 @@ use std::time::Duration;
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 use bmux_tui::terminal::Terminal;
-use tokio::sync::mpsc;
 
 use super::app::BmuxApp;
 use super::effects::{TuiEffect, TuiEffectQueue};
 use super::startup_action::StartupTuiAction;
 use super::terminal_events::TuiInput;
-use super::{TuiError, chat_loop, session_flow};
+use super::{TuiError, chat_loop, history_flow, session_flow};
 
 /// Attach to a session and run the active chat loop.
 #[allow(clippy::future_not_send, dead_code)]
@@ -116,7 +115,7 @@ async fn run_event_loop_with_input_and_static_bundled<W: Write>(
             },
         )
         .with_interaction_adapters(super::bundled_interaction_adapters("tui"));
-    let (event_sender, event_receiver) = mpsc::unbounded_channel();
+    let (event_sender, event_receiver) = history_flow::session_stream_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
     let presentation_config = config.as_ref().ok();
     let plugin_selection =

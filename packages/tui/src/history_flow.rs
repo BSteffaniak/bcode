@@ -14,6 +14,17 @@ use tokio::task::JoinHandle;
 
 use super::TuiError;
 
+const SESSION_STREAM_CAPACITY: usize = 256;
+
+/// Create the bounded reliable session-stream channel used by an active chat.
+#[must_use]
+pub fn session_stream_channel() -> (
+    mpsc::Sender<SessionStreamUpdate>,
+    mpsc::Receiver<SessionStreamUpdate>,
+) {
+    mpsc::channel(SESSION_STREAM_CAPACITY)
+}
+
 /// Update delivered by the resilient TUI session event stream.
 #[derive(Debug)]
 pub enum SessionStreamUpdate {
@@ -109,7 +120,7 @@ pub async fn load_timeline_jump_events(
 pub async fn attach_session_event_stream(
     client: &BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
+    event_sender: mpsc::Sender<SessionStreamUpdate>,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     attach_session_event_stream_with_window_request(
         client,
@@ -125,7 +136,7 @@ pub async fn attach_session_event_stream(
 pub async fn attach_paused_session_event_stream(
     client: &BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
+    event_sender: mpsc::Sender<SessionStreamUpdate>,
 ) -> Result<
     (
         bcode_client::AttachedSessionHistory,
@@ -167,7 +178,7 @@ pub async fn attach_paused_session_event_stream(
 pub async fn attach_session_event_stream_with_limit(
     client: &BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
+    event_sender: mpsc::Sender<SessionStreamUpdate>,
     limit: usize,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     let mut connection = client.connect("bcode-tui-bmux").await?;
@@ -201,7 +212,7 @@ pub async fn attach_session_event_stream_with_limit(
 pub async fn attach_session_event_stream_with_window_request(
     client: &BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
+    event_sender: mpsc::Sender<SessionStreamUpdate>,
     request: ProjectionWindowRequest,
     mut on_progress: impl FnMut(&bcode_session_models::SessionOpenOperationSnapshot),
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
@@ -259,7 +270,7 @@ async fn attach_projection_window(
 fn spawn_reconnecting_recent_event_stream(
     client: BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
+    event_sender: mpsc::Sender<SessionStreamUpdate>,
     limit: usize,
     connection: bcode_client::ClientConnection,
 ) -> JoinHandle<()> {
@@ -284,7 +295,7 @@ fn spawn_reconnecting_recent_event_stream(
 fn spawn_reconnecting_window_event_stream(
     client: BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
+    event_sender: mpsc::Sender<SessionStreamUpdate>,
     request: ProjectionWindowRequest,
     connection: bcode_client::ClientConnection,
 ) -> JoinHandle<()> {
@@ -388,8 +399,8 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
     }
 }
 
-fn flush_superseded_progress(
-    event_sender: &mpsc::UnboundedSender<SessionStreamUpdate>,
+async fn flush_superseded_progress(
+    event_sender: &mpsc::Sender<SessionStreamUpdate>,
     pending: &mut BTreeMap<SupersedableEventKey, BcodeEvent>,
 ) -> bool {
     let mut events = std::mem::take(pending).into_values().collect::<Vec<_>>();
@@ -402,6 +413,7 @@ fn flush_superseded_progress(
     for event in events {
         if event_sender
             .send(SessionStreamUpdate::Event(Box::new(event)))
+            .await
             .is_err()
         {
             return false;
@@ -413,7 +425,7 @@ fn flush_superseded_progress(
 async fn reconnecting_event_stream<F>(
     client: BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
+    event_sender: mpsc::Sender<SessionStreamUpdate>,
     mut connection: bcode_client::ClientConnection,
     attach: F,
 ) where
@@ -443,7 +455,7 @@ async fn reconnecting_event_stream<F>(
             () = &mut progress_flush, if !pending_progress.is_empty() => None,
         };
         let Some(received) = received else {
-            if !flush_superseded_progress(&event_sender, &mut pending_progress) {
+            if !flush_superseded_progress(&event_sender, &mut pending_progress).await {
                 return;
             }
             progress_flush
@@ -461,7 +473,7 @@ async fn reconnecting_event_stream<F>(
                     let was_empty = pending_progress.is_empty();
                     pending_progress.insert(key, event);
                     if pending_progress.len() >= MAX_PENDING_PROGRESS_KEYS
-                        && !flush_superseded_progress(&event_sender, &mut pending_progress)
+                        && !flush_superseded_progress(&event_sender, &mut pending_progress).await
                     {
                         return;
                     }
@@ -473,9 +485,10 @@ async fn reconnecting_event_stream<F>(
                 } else {
                     // Preserve canonical ordering at non-supersedable boundaries while collapsing
                     // high-frequency progress updates to their latest state.
-                    if !flush_superseded_progress(&event_sender, &mut pending_progress)
+                    if !flush_superseded_progress(&event_sender, &mut pending_progress).await
                         || event_sender
                             .send(SessionStreamUpdate::Event(Box::new(event)))
+                            .await
                             .is_err()
                     {
                         return;
@@ -495,6 +508,7 @@ async fn reconnecting_event_stream<F>(
         drop(connection);
         if event_sender
             .send(SessionStreamUpdate::ResyncStarted { session_id })
+            .await
             .is_err()
         {
             return;
@@ -511,6 +525,7 @@ async fn reconnecting_event_stream<F>(
                                 session_id,
                                 attached: Box::new(attached),
                             })
+                            .await
                             .is_err()
                         {
                             return;
@@ -695,10 +710,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn request_drafts_collapse_to_latest_checkpoint_per_placement_aware_key() {
+    #[tokio::test]
+    async fn request_drafts_collapse_to_latest_checkpoint_per_placement_aware_key() {
         let session_id = SessionId::new();
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = session_stream_channel();
         let mut pending = BTreeMap::new();
         for revision in 2..=10_000 {
             let mut event = request_draft_event(
@@ -731,15 +746,15 @@ mod tests {
             );
         }
         assert_eq!(pending.len(), 256);
-        assert!(flush_superseded_progress(&sender, &mut pending));
+        assert!(flush_superseded_progress(&sender, &mut pending).await);
         assert!(pending.is_empty());
         assert_eq!(receiver.len(), 256);
     }
 
-    #[test]
-    fn placed_progress_flood_collapses_to_latest_update() {
+    #[tokio::test]
+    async fn placed_progress_flood_collapses_to_latest_update() {
         let session_id = SessionId::new();
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = session_stream_channel();
         let mut pending = BTreeMap::new();
         for sequence in 1..=10_000 {
             let event = placed_progress_event(
@@ -750,7 +765,7 @@ mod tests {
             pending.insert(supersedable_event_key(&event).expect("progress key"), event);
         }
 
-        assert!(flush_superseded_progress(&sender, &mut pending));
+        assert!(flush_superseded_progress(&sender, &mut pending).await);
         assert!(pending.is_empty());
         let SessionStreamUpdate::Event(event) = receiver.try_recv().expect("latest progress")
         else {
@@ -774,10 +789,10 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
-    #[test]
-    fn progress_flood_collapses_to_latest_update() {
+    #[tokio::test]
+    async fn progress_flood_collapses_to_latest_update() {
         let session_id = SessionId::new();
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = session_stream_channel();
         let mut pending = BTreeMap::new();
         for sequence in 1..=10_000 {
             let event = lifecycle_event(
@@ -788,7 +803,7 @@ mod tests {
             pending.insert(supersedable_event_key(&event).expect("progress key"), event);
         }
 
-        assert!(flush_superseded_progress(&sender, &mut pending));
+        assert!(flush_superseded_progress(&sender, &mut pending).await);
         assert!(pending.is_empty());
         let SessionStreamUpdate::Event(event) = receiver.try_recv().expect("latest progress")
         else {
