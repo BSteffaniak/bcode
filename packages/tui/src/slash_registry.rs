@@ -48,6 +48,10 @@ impl SlashCompletion {
 
 const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand {
+        name: "version",
+        draft_safe: true,
+    },
+    BuiltinSlashCommand {
         name: "sessions",
         draft_safe: true,
     },
@@ -170,6 +174,10 @@ const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
 ];
 
 const STATIC_COMPLETIONS: &[SlashCompletion] = &[
+    SlashCompletion {
+        command: "/version",
+        description: "Show detailed build information",
+    },
     SlashCompletion {
         command: "/plan",
         description: "Switch to plan agent",
@@ -464,4 +472,18 @@ pub async fn resolve(
         skill_id: skill.id,
         arguments: slash_command_arguments(message),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_is_draft_safe_and_discoverable() {
+        assert!(builtin_command("version").expect("version").draft_safe());
+        assert!(static_completions().iter().any(|completion| {
+            completion.command() == "/version"
+                && completion.description().contains("build information")
+        }));
+    }
 }

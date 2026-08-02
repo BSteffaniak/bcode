@@ -42,6 +42,12 @@ pub struct BuildInfo {
     mode: BuildMode,
     git: GitState,
     digest: String,
+    target: String,
+    profile: String,
+    features: Vec<String>,
+    compiler: String,
+    release_channel: Option<String>,
+    built_at_unix_seconds: Option<u64>,
     display_version: String,
 }
 
@@ -72,6 +78,12 @@ impl BuildInfo {
             mode,
             git,
             digest,
+            target: "unknown".to_owned(),
+            profile: "unknown".to_owned(),
+            features: Vec::new(),
+            compiler: "unknown".to_owned(),
+            release_channel: None,
+            built_at_unix_seconds: None,
             display_version,
         })
     }
@@ -98,6 +110,83 @@ impl BuildInfo {
     #[must_use]
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+
+    /// Attach normalized diagnostic facts to this build.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a fact is empty, too long, or contains unsafe
+    /// control characters, or when the release timestamp/channel is invalid.
+    pub fn with_diagnostics(
+        mut self,
+        target: impl Into<String>,
+        profile: impl Into<String>,
+        features: Vec<String>,
+        compiler: impl Into<String>,
+        release_channel: Option<String>,
+        built_at_unix_seconds: Option<u64>,
+    ) -> Result<Self, BuildInfoError> {
+        self.target = target.into();
+        self.profile = profile.into();
+        self.compiler = compiler.into();
+        validate_diagnostic("target", &self.target, 128)?;
+        validate_diagnostic("profile", &self.profile, 64)?;
+        validate_diagnostic("compiler", &self.compiler, 512)?;
+        let mut features = features;
+        features.sort();
+        features.dedup();
+        for feature in &features {
+            validate_diagnostic("feature", feature, 128)?;
+        }
+        if let Some(channel) = release_channel.as_deref() {
+            validate_diagnostic("release channel", channel, 64)?;
+        }
+        if built_at_unix_seconds
+            .is_some_and(|timestamp| !(1..=253_402_300_799).contains(&timestamp))
+        {
+            return Err(BuildInfoError::InvalidValue("build timestamp"));
+        }
+        self.features = features;
+        self.release_channel = release_channel;
+        self.built_at_unix_seconds = built_at_unix_seconds;
+        Ok(self)
+    }
+
+    /// Return the compilation target triple.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Return the Cargo profile used for this artifact.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    /// Return sorted final-product feature names.
+    #[must_use]
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
+
+    /// Return the compiler/toolchain identity.
+    #[must_use]
+    pub fn compiler(&self) -> &str {
+        &self.compiler
+    }
+
+    /// Return the explicitly supplied release channel.
+    #[must_use]
+    pub fn release_channel(&self) -> Option<&str> {
+        self.release_channel.as_deref()
+    }
+
+    /// Return the reproducible build/release timestamp, when supplied.
+    #[must_use]
+    pub const fn built_at_unix_seconds(&self) -> Option<u64> {
+        self.built_at_unix_seconds
     }
 
     /// Return the canonical label shown by frontends.
@@ -198,6 +287,23 @@ fn validate_git_state(git: &GitState) -> Result<(), BuildInfoError> {
     Ok(())
 }
 
+fn validate_diagnostic(
+    field: &'static str,
+    value: &str,
+    maximum_len: usize,
+) -> Result<(), BuildInfoError> {
+    if value.is_empty() {
+        return Err(BuildInfoError::Empty(field));
+    }
+    if value.len() > maximum_len {
+        return Err(BuildInfoError::TooLong(field));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(BuildInfoError::InvalidCharacter(field));
+    }
+    Ok(())
+}
+
 fn validate_hex(
     field: &'static str,
     value: &str,
@@ -224,6 +330,9 @@ pub enum BuildInfoError {
     /// A field exceeded its bounded representation.
     #[error("{0} is too long")]
     TooLong(&'static str),
+    /// A field contained a semantically invalid value.
+    #[error("{0} contains an invalid value")]
+    InvalidValue(&'static str),
     /// A field contained a character outside its normalized representation.
     #[error("{0} contains an invalid character")]
     InvalidCharacter(&'static str),
@@ -341,6 +450,46 @@ mod tests {
         assert_eq!(
             normalize_path(r"packages\bcode\src\main.rs"),
             "packages/bcode/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn diagnostics_are_sorted_and_validated() {
+        let info = BuildInfo::new(
+            "1.2.3",
+            BuildMode::Developer,
+            GitState::Unavailable,
+            "1234abcd",
+        )
+        .and_then(|info| {
+            info.with_diagnostics(
+                "target",
+                "release",
+                vec!["z".to_owned(), "a".to_owned(), "a".to_owned()],
+                "rustc 1.95.0",
+                Some("stable".to_owned()),
+                Some(1),
+            )
+        })
+        .expect("diagnostics");
+        assert_eq!(info.features(), &["a", "z"]);
+        assert_eq!(info.built_at_unix_seconds(), Some(1));
+        assert!(
+            BuildInfo::new(
+                "1.2.3",
+                BuildMode::Developer,
+                GitState::Unavailable,
+                "1234abcd"
+            )
+            .and_then(|info| info.with_diagnostics(
+                "target",
+                "release",
+                Vec::new(),
+                "rustc",
+                None,
+                Some(0),
+            ))
+            .is_err()
         );
     }
 

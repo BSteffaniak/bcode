@@ -11,6 +11,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=BCODE_DISTRIBUTION_BUILD");
+    println!("cargo:rerun-if-env-changed=BCODE_RELEASE_CHANNEL");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTC_WRAPPER");
     for (name, _) in env::vars().filter(|(name, _)| name.starts_with("CARGO_FEATURE_")) {
@@ -40,6 +42,11 @@ fn main() {
     let profile = env::var("PROFILE").unwrap_or_default();
     let features = enabled_features();
     let rustc = rustc_identity();
+    let compiler_summary = rustc
+        .lines()
+        .next()
+        .unwrap_or("rustc-unavailable")
+        .to_owned();
     let source_digest = build_support::source_digest(&workspace, &source_files);
     let digest = bcode_build_info::BuildFacts {
         source_digest,
@@ -57,6 +64,34 @@ fn main() {
         if git.dirty { "1" } else { "0" }
     );
     println!("cargo:rustc-env=BCODE_BUILD_DIGEST={digest}");
+    println!(
+        "cargo:rustc-env=BCODE_BUILD_TARGET={}",
+        env::var("TARGET").unwrap_or_default()
+    );
+    println!(
+        "cargo:rustc-env=BCODE_BUILD_PROFILE={}",
+        env::var("PROFILE").unwrap_or_default()
+    );
+    println!(
+        "cargo:rustc-env=BCODE_BUILD_FEATURES={}",
+        enabled_features().join(",")
+    );
+    println!("cargo:rustc-env=BCODE_BUILD_COMPILER={compiler_summary}");
+    println!(
+        "cargo:rustc-env=BCODE_RELEASE_CHANNEL={}",
+        env::var("BCODE_RELEASE_CHANNEL").unwrap_or_default()
+    );
+    let source_date_epoch = env::var("SOURCE_DATE_EPOCH").unwrap_or_default();
+    if !source_date_epoch.is_empty()
+        && source_date_epoch
+            .parse::<u64>()
+            .ok()
+            .filter(|value| (1..=253_402_300_799).contains(value))
+            .is_none()
+    {
+        panic!("SOURCE_DATE_EPOCH must be a supported positive Unix timestamp");
+    }
+    println!("cargo:rustc-env=BCODE_BUILD_TIMESTAMP={source_date_epoch}");
 }
 
 fn emit_git_rerun_paths(workspace: &Path) {

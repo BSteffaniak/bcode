@@ -17,12 +17,37 @@ fn build_info() -> bcode_build_info::BuildInfo {
             dirty: env!("BCODE_BUILD_GIT_DIRTY") == "1",
         }
     };
+    let built_at = match env!("BCODE_BUILD_TIMESTAMP") {
+        "" => None,
+        value => Some(
+            value
+                .parse::<u64>()
+                .expect("build script must embed a valid build timestamp"),
+        ),
+    };
     bcode_build_info::BuildInfo::new(
         env!("CARGO_PKG_VERSION"),
         mode,
         git,
         env!("BCODE_BUILD_DIGEST"),
     )
+    .and_then(|info| {
+        info.with_diagnostics(
+            env!("BCODE_BUILD_TARGET"),
+            env!("BCODE_BUILD_PROFILE"),
+            env!("BCODE_BUILD_FEATURES")
+                .split(',')
+                .filter(|feature| !feature.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+            env!("BCODE_BUILD_COMPILER"),
+            match env!("BCODE_RELEASE_CHANNEL") {
+                "" => None,
+                channel => Some(channel.to_owned()),
+            },
+            built_at,
+        )
+    })
     .expect("build script must embed valid Bcode build information")
 }
 

@@ -194,11 +194,19 @@ passwords, provider tokens, or private-key material in the repository, workflow 
 logs. Until that decision and a successful signed publication exist, use unsigned artifacts only via
 the explicit exception and do not claim production Authenticode coverage.
 
-Store the PFX as an Actions secret encoded or supplied in the format
+Store PFX as an Actions secret encoded or supplied in the format
 expected by the runner secret policy; the workflow rejects incomplete certificate/password secret
 pairs and removes the temporary PFX in an `always()` cleanup step. Rotate or revoke it through the
 certificate authority and replace the repository secrets. Local development remains unsigned unless these variables are set.
 A valid Authenticode signature does not guarantee Microsoft Defender SmartScreen reputation.
+
+Canonical distribution builds also provide diagnostic release metadata to `bcode /version`:
+
+* `BCODE_RELEASE_CHANNEL` defaults to `stable` in `cargo xtask release` and may be explicitly overridden.
+* `SOURCE_DATE_EPOCH` is the reproducible build/release timestamp. When absent, release automation uses the source commit timestamp when Git metadata is available.
+* Local builds do not use the wall clock and report the build date as unavailable unless `SOURCE_DATE_EPOCH` was explicitly supplied.
+
+The timestamp and channel are diagnostic only. They do not enter daemon routing, compatibility, or the deterministic developer build digest.
 
 ## Release workflow
 

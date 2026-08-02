@@ -652,6 +652,66 @@ async fn handle_agent_command(
     })
 }
 
+fn format_build_info_markdown(info: &bcode_build_info::BuildInfo) -> String {
+    use bcode_build_info::{BuildMode, GitState};
+
+    let mode = match info.mode() {
+        BuildMode::Developer => "Developer",
+        BuildMode::Distribution => "Distribution",
+    };
+    let (commit, source_state) = match info.git() {
+        GitState::Unavailable => ("unavailable".to_owned(), "Git unavailable"),
+        GitState::Revision {
+            short_commit,
+            dirty,
+        } => (short_commit.clone(), if *dirty { "Dirty" } else { "Clean" }),
+    };
+    let features = if info.features().is_empty() {
+        "none".to_owned()
+    } else {
+        info.features().join(", ")
+    };
+    let built_at = info
+        .built_at_unix_seconds()
+        .map_or_else(|| "unavailable".to_owned(), format_unix_timestamp_utc);
+    let release_channel = info.release_channel().unwrap_or("unavailable");
+    format!(
+        "# Bcode build\n\n* **Version:** `{}`\n* **Mode:** {mode}\n* **Crate version:** `{}`\n* **Git commit:** `{commit}`\n* **Source state:** {source_state}\n* **Build digest:** `{}`\n* **Target:** `{}`\n* **Profile:** `{}`\n* **Features:** `{features}`\n* **Compiler:** `{}`\n* **Artifact ID:** `{}`\n* **Release channel:** `{release_channel}`\n* **Built/released at:** `{built_at}`",
+        info.display_version(),
+        info.version(),
+        info.digest(),
+        info.target(),
+        info.profile(),
+        info.compiler(),
+        bcode_ipc::ARTIFACT_ID,
+    )
+}
+
+fn format_unix_timestamp_utc(timestamp: u64) -> String {
+    let days = timestamp / 86_400;
+    let seconds = timestamp % 86_400;
+    let (year, month, day) = civil_date_from_days(i64::try_from(days).unwrap_or(i64::MAX));
+    let hour = seconds / 3_600;
+    let minute = seconds % 3_600 / 60;
+    let second = seconds % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let days = days_since_epoch + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
 fn slash_client_issue(label: &str, error: &bcode_client::ClientError) -> SlashCommandOutcome {
     SlashCommandOutcome::Handled(daemon_issue::client_issue_status(label, error))
 }
@@ -708,6 +768,9 @@ async fn execute_builtin(
     command: &str,
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     match command {
+        "version" => Ok(SlashCommandOutcome::SystemMarkdown(
+            format_build_info_markdown(&super::build_info()),
+        )),
         "sessions" => Ok(SlashCommandOutcome::PickSession),
         "resync" => resync_command(client, parts).await,
         "rescan-imports" => client.refresh_session_catalog(None).await.map(|list| {
@@ -890,6 +953,50 @@ async fn execute_builtin(
 mod tests {
     use super::*;
     use bcode_ralph::RalphPromptKind;
+
+    #[test]
+    fn version_markdown_contains_detailed_build_facts() {
+        let info = bcode_build_info::BuildInfo::new(
+            "1.2.3",
+            bcode_build_info::BuildMode::Distribution,
+            bcode_build_info::GitState::Revision {
+                short_commit: "abcdef12".to_owned(),
+                dirty: false,
+            },
+            "1234abcd",
+        )
+        .and_then(|info| {
+            info.with_diagnostics(
+                "aarch64-apple-darwin",
+                "release",
+                vec!["app".to_owned()],
+                "rustc 1.95.0",
+                Some("stable".to_owned()),
+                Some(1_735_689_600),
+            )
+        })
+        .expect("build info");
+        let markdown = format_build_info_markdown(&info);
+        for expected in [
+            "# Bcode build",
+            "`v1.2.3`",
+            "Git commit:** `abcdef12`",
+            "Target:** `aarch64-apple-darwin`",
+            "Release channel:** `stable`",
+            "2025-01-01T00:00:00Z",
+        ] {
+            assert!(markdown.contains(expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn unix_timestamp_format_is_utc() {
+        assert_eq!(format_unix_timestamp_utc(1), "1970-01-01T00:00:01Z");
+        assert_eq!(
+            format_unix_timestamp_utc(1_735_689_600),
+            "2025-01-01T00:00:00Z"
+        );
+    }
 
     #[test]
     fn thinking_mode_slash_parser_covers_every_local_mode() {

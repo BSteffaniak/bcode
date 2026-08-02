@@ -1318,6 +1318,17 @@ impl BcodeBuildPurpose {
     }
 }
 
+fn git_commit_timestamp() -> Option<String> {
+    let output = Command::new("git")
+        .args(["--no-pager", "show", "-s", "--format=%ct", "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    let timestamp = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && timestamp.parse::<u64>().ok().is_some_and(|value| value > 0))
+        .then_some(timestamp)
+}
+
 fn build_bcode_release(
     target: &str,
     features: &[String],
@@ -1327,7 +1338,19 @@ fn build_bcode_release(
     let mut command = Command::new("cargo");
     command
         .env("BCODE_ARTIFACT_ID", &artifact_id)
-        .env("BCODE_DISTRIBUTION_BUILD", purpose.distribution_env())
+        .env("BCODE_DISTRIBUTION_BUILD", purpose.distribution_env());
+    if purpose == BcodeBuildPurpose::Distribution {
+        command.env(
+            "BCODE_RELEASE_CHANNEL",
+            env::var("BCODE_RELEASE_CHANNEL").unwrap_or_else(|_| "stable".to_owned()),
+        );
+        if env::var_os("SOURCE_DATE_EPOCH").is_none()
+            && let Some(timestamp) = git_commit_timestamp()
+        {
+            command.env("SOURCE_DATE_EPOCH", timestamp);
+        }
+    }
+    command
         .arg("build")
         .arg("--release")
         .arg("--package")
