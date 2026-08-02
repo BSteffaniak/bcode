@@ -3117,8 +3117,9 @@ pub(crate) mod tests {
         durations.sort_unstable();
         let p50_us = durations[RUNS / 2];
         let p95_us = durations[(RUNS * 95 / 100).min(RUNS - 1)];
+        let p99_us = durations[(RUNS * 99 / 100).min(RUNS - 1)];
         println!(
-            "session_search_hydration_benchmark events={events} hits={HITS} runs={RUNS} p50_us={p50_us} p95_us={p95_us}"
+            "session_search_hydration_benchmark events={events} hits={HITS} runs={RUNS} p50_us={p50_us} p95_us={p95_us} p99_us={p99_us}"
         );
         assert!(
             p95_us <= HYDRATION_P95_BUDGET_US,

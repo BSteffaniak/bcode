@@ -1929,6 +1929,87 @@ impl BcodeClient {
         }
     }
 
+    /// Start an addressable historical backfill operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_search_backfill_start(
+        &self,
+        request: bcode_session_search::BackfillSessionSearchRequest,
+    ) -> Result<bcode_session_search::StartSessionSearchBackfillResponse, ClientError> {
+        match self
+            .send_request(Request::SessionSearchBackfillStart { request })
+            .await?
+        {
+            ResponsePayload::SessionSearchBackfillStarted { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read bounded status for an addressable historical backfill operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the operation is unknown.
+    pub async fn session_search_backfill_status(
+        &self,
+        operation_id: String,
+    ) -> Result<bcode_session_search::SessionSearchBackfillOperationStatus, ClientError> {
+        match self
+            .send_request(Request::SessionSearchBackfillStatus { operation_id })
+            .await?
+        {
+            ResponsePayload::SessionSearchBackfillOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Wait for a newer addressable historical backfill revision or timeout.
+    ///
+    /// The revision is in-process notification state and does not imply durable resume.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, the operation is unknown, or the wait
+    /// bound is invalid.
+    pub async fn session_search_backfill_wait(
+        &self,
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    ) -> Result<bcode_session_search::SessionSearchBackfillOperationStatus, ClientError> {
+        match self
+            .send_request(Request::SessionSearchBackfillWait {
+                operation_id,
+                after_revision,
+                timeout_ms,
+            })
+            .await?
+        {
+            ResponsePayload::SessionSearchBackfillOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Request cancellation of an addressable historical backfill operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the operation is unknown.
+    pub async fn session_search_backfill_cancel(
+        &self,
+        operation_id: String,
+    ) -> Result<bcode_session_search::SessionSearchBackfillOperationStatus, ClientError> {
+        match self
+            .send_request(Request::SessionSearchBackfillCancel { operation_id })
+            .await?
+        {
+            ResponsePayload::SessionSearchBackfillOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Explicitly backfill selected or bounded catalog sessions into one provider.
     ///
     /// # Errors

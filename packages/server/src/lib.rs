@@ -320,6 +320,13 @@ impl WorkflowComputationCancellation {
 }
 
 #[derive(Debug)]
+struct SessionSearchBackfillOperation {
+    status: bcode_session_search::SessionSearchBackfillOperationStatus,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+    changed: Arc<Notify>,
+}
+
+#[derive(Debug)]
 pub struct ServerState {
     pub sessions: SessionManager,
     session_migrations: bcode_session_migration::SessionMigrationService,
@@ -327,6 +334,8 @@ pub struct ServerState {
     pub plugins: bcode_plugin::PluginRuntimeHost,
     session_search_enabled: bool,
     session_search_dirty: session_search::SessionSearchDirtyQueue,
+    session_search_backfills: Mutex<BTreeMap<String, SessionSearchBackfillOperation>>,
+    next_session_search_backfill_id: std::sync::atomic::AtomicU64,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
@@ -1535,6 +1544,8 @@ impl ServerState {
             plugins,
             session_search_enabled: init.session_search_enabled,
             session_search_dirty: session_search::SessionSearchDirtyQueue::default(),
+            session_search_backfills: Mutex::default(),
+            next_session_search_backfill_id: std::sync::atomic::AtomicU64::new(1),
             model_catalog: init
                 .model_catalog
                 .expect("server model catalog resolver must be initialized"),
@@ -3414,6 +3425,41 @@ async fn run_with_static_bundled_inner(
     }
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
+    state.metrics.record_histogram(
+        "server.startup.ready_ms",
+        u64::try_from(startup_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    state.metrics.set_gauge(
+        "server.startup.session_search_enabled",
+        i64::from(config.session_search.enabled),
+    );
+    let search_providers = session_search::list_providers(&state).await.providers;
+    state.metrics.set_gauge(
+        "server.startup.session_search_provider_count",
+        i64::try_from(search_providers.len()).unwrap_or(i64::MAX),
+    );
+    state.metrics.set_gauge(
+        "server.startup.session_search_index_bytes",
+        search_providers
+            .iter()
+            .fold(0_u64, |total, provider| {
+                total.saturating_add(provider.status.index_bytes)
+            })
+            .try_into()
+            .unwrap_or(i64::MAX),
+    );
+    state.metrics.set_gauge(
+        "server.startup.session_search_rebuilding_providers",
+        i64::try_from(
+            search_providers
+                .iter()
+                .filter(|provider| {
+                    provider.status.state == bcode_session_search::SearchProviderState::Rebuilding
+                })
+                .count(),
+        )
+        .unwrap_or(i64::MAX),
+    );
     tracing::info!(
         target: "bcode_server::startup",
         elapsed_ms = stage_started_at.elapsed().as_millis(),
@@ -3775,6 +3821,10 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionSearchExplain { .. } => "session_search_explain",
         Request::SessionSearchPurge { .. } => "session_search_purge",
         Request::SessionSearchRebuild { .. } => "session_search_rebuild",
+        Request::SessionSearchBackfillStart { .. } => "session_search_backfill_start",
+        Request::SessionSearchBackfillStatus { .. } => "session_search_backfill_status",
+        Request::SessionSearchBackfillWait { .. } => "session_search_backfill_wait",
+        Request::SessionSearchBackfillCancel { .. } => "session_search_backfill_cancel",
         Request::SessionSearchBackfill { .. } => "session_search_backfill",
         Request::PrepareSessionOpen { .. } => "prepare_session_open",
         Request::WaitSessionOpenProgress { .. } => "wait_session_open_progress",
@@ -4175,6 +4225,28 @@ async fn handle_request_inner(
         } => {
             let result = session_search::rebuild_provider(state, &provider_id, confirmation).await;
             handle_session_search_maintenance(request_id, writer, result).await
+        }
+        Request::SessionSearchBackfillStart { request } => {
+            let result = start_session_search_backfill(Arc::clone(state), request).await;
+            handle_session_search_backfill_start(request_id, writer, result).await
+        }
+        Request::SessionSearchBackfillStatus { operation_id } => {
+            let result = session_search_backfill_status(state, &operation_id).await;
+            handle_session_search_backfill_operation(request_id, writer, result).await
+        }
+        Request::SessionSearchBackfillWait {
+            operation_id,
+            after_revision,
+            timeout_ms,
+        } => {
+            let result =
+                wait_session_search_backfill(state, &operation_id, after_revision, timeout_ms)
+                    .await;
+            handle_session_search_backfill_operation(request_id, writer, result).await
+        }
+        Request::SessionSearchBackfillCancel { operation_id } => {
+            let result = cancel_session_search_backfill(state, &operation_id).await;
+            handle_session_search_backfill_operation(request_id, writer, result).await
         }
         Request::SessionSearchBackfill { request } => {
             let result = session_search::backfill_provider(state, request).await;
@@ -5234,6 +5306,10 @@ async fn handle_hello(
         .first_hello_recorded
         .swap(true, std::sync::atomic::Ordering::AcqRel)
     {
+        state.metrics.record_histogram(
+            "server.startup.first_verified_hello_ms",
+            u64::try_from(state.startup_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
         tracing::info!(
             target: "bcode_server::startup",
             elapsed_ms = state.startup_started_at.elapsed().as_millis(),
@@ -8896,6 +8972,256 @@ async fn handle_session_search_maintenance(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::SessionSearchMaintenance { response }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    format!("session_search_{:?}", error.code).to_lowercase(),
+                    error.message,
+                )),
+            )
+            .await
+        }
+    }
+}
+
+const MAX_SESSION_SEARCH_BACKFILL_OPERATIONS: usize = 128;
+
+async fn handle_session_search_backfill_start(
+    request_id: u64,
+    writer: &SharedWriter,
+    result: Result<
+        bcode_session_search::StartSessionSearchBackfillResponse,
+        bcode_session_search::SessionSearchServiceError,
+    >,
+) -> Result<(), ServerError> {
+    match result {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionSearchBackfillStarted { response }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    format!("session_search_{:?}", error.code).to_lowercase(),
+                    error.message,
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn start_session_search_backfill(
+    state: Arc<ServerState>,
+    request: bcode_session_search::BackfillSessionSearchRequest,
+) -> Result<
+    bcode_session_search::StartSessionSearchBackfillResponse,
+    bcode_session_search::SessionSearchServiceError,
+> {
+    let mut operations = state.session_search_backfills.lock().await;
+    if operations.len() >= MAX_SESSION_SEARCH_BACKFILL_OPERATIONS {
+        let terminal_id = operations.iter().find_map(|(id, operation)| {
+            matches!(
+                operation.status.state,
+                bcode_session_search::SessionSearchBackfillOperationState::Completed
+                    | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                    | bcode_session_search::SessionSearchBackfillOperationState::Failed
+            )
+            .then(|| id.clone())
+        });
+        if let Some(terminal_id) = terminal_id {
+            operations.remove(&terminal_id);
+        } else {
+            return Err(bcode_session_search::SessionSearchServiceError {
+                code: bcode_session_search::SearchErrorCode::QuotaExceeded,
+                message: "too many active session-search backfill operations".to_owned(),
+                retryable: true,
+            });
+        }
+    }
+    let id = state
+        .next_session_search_backfill_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let operation_id = format!("session-search-backfill-{id}");
+    let provider_id = request.provider_id.clone();
+    let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+    let changed = Arc::new(Notify::new());
+    operations.insert(
+        operation_id.clone(),
+        SessionSearchBackfillOperation {
+            status: bcode_session_search::SessionSearchBackfillOperationStatus {
+                operation_id: operation_id.clone(),
+                provider_id: provider_id.clone(),
+                revision: 1,
+                state: bcode_session_search::SessionSearchBackfillOperationState::Running,
+                response: None,
+                error: None,
+            },
+            cancellation: cancellation.clone(),
+            changed,
+        },
+    );
+    drop(operations);
+    let task_operation_id = operation_id.clone();
+    tokio::spawn(async move {
+        let result = session_search::backfill_provider_with_cancellation(
+            &state,
+            request,
+            Some(&cancellation),
+        )
+        .await;
+        let mut operations = state.session_search_backfills.lock().await;
+        if let Some(operation) = operations.get_mut(&task_operation_id) {
+            operation.status.revision = operation.status.revision.saturating_add(1);
+            let cancellation_requested = operation.cancellation.is_cancelled();
+            match result {
+                Ok(response) => {
+                    operation.status.state = if cancellation_requested {
+                        bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                    } else {
+                        bcode_session_search::SessionSearchBackfillOperationState::Completed
+                    };
+                    operation.status.response = Some(response);
+                }
+                Err(error) => {
+                    operation.status.state = if cancellation_requested {
+                        bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                    } else {
+                        bcode_session_search::SessionSearchBackfillOperationState::Failed
+                    };
+                    operation.status.error = Some(error);
+                }
+            }
+            operation.changed.notify_waiters();
+        }
+    });
+    Ok(bcode_session_search::StartSessionSearchBackfillResponse {
+        operation_id,
+        provider_id,
+    })
+}
+
+async fn session_search_backfill_status(
+    state: &ServerState,
+    operation_id: &str,
+) -> Result<
+    bcode_session_search::SessionSearchBackfillOperationStatus,
+    bcode_session_search::SessionSearchServiceError,
+> {
+    state
+        .session_search_backfills
+        .lock()
+        .await
+        .get(operation_id)
+        .map(|operation| operation.status.clone())
+        .ok_or_else(|| bcode_session_search::SessionSearchServiceError {
+            code: bcode_session_search::SearchErrorCode::InvalidRequest,
+            message: "unknown session-search backfill operation".to_owned(),
+            retryable: false,
+        })
+}
+
+async fn wait_session_search_backfill(
+    state: &ServerState,
+    operation_id: &str,
+    after_revision: u64,
+    timeout_ms: u64,
+) -> Result<
+    bcode_session_search::SessionSearchBackfillOperationStatus,
+    bcode_session_search::SessionSearchServiceError,
+> {
+    if timeout_ms == 0 || timeout_ms > 30_000 {
+        return Err(bcode_session_search::SessionSearchServiceError {
+            code: bcode_session_search::SearchErrorCode::InvalidRequest,
+            message: "backfill wait timeout must be between 1 and 30000 milliseconds".to_owned(),
+            retryable: false,
+        });
+    }
+    let (status, changed) = {
+        let operations = state.session_search_backfills.lock().await;
+        let operation = operations.get(operation_id).ok_or_else(|| {
+            bcode_session_search::SessionSearchServiceError {
+                code: bcode_session_search::SearchErrorCode::InvalidRequest,
+                message: "unknown session-search backfill operation".to_owned(),
+                retryable: false,
+            }
+        })?;
+        let snapshot = (operation.status.clone(), Arc::clone(&operation.changed));
+        drop(operations);
+        snapshot
+    };
+    if status.revision > after_revision
+        || matches!(
+            status.state,
+            bcode_session_search::SessionSearchBackfillOperationState::Completed
+                | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                | bcode_session_search::SessionSearchBackfillOperationState::Failed
+        )
+    {
+        return Ok(status);
+    }
+    let notified = changed.notified();
+    let current = session_search_backfill_status(state, operation_id).await?;
+    if current.revision > after_revision {
+        return Ok(current);
+    }
+    let _ = tokio::time::timeout(Duration::from_millis(timeout_ms), notified).await;
+    session_search_backfill_status(state, operation_id).await
+}
+
+async fn cancel_session_search_backfill(
+    state: &ServerState,
+    operation_id: &str,
+) -> Result<
+    bcode_session_search::SessionSearchBackfillOperationStatus,
+    bcode_session_search::SessionSearchServiceError,
+> {
+    let mut operations = state.session_search_backfills.lock().await;
+    let operation = operations.get_mut(operation_id).ok_or_else(|| {
+        bcode_session_search::SessionSearchServiceError {
+            code: bcode_session_search::SearchErrorCode::InvalidRequest,
+            message: "unknown session-search backfill operation".to_owned(),
+            retryable: false,
+        }
+    })?;
+    if operation.status.state == bcode_session_search::SessionSearchBackfillOperationState::Running
+    {
+        operation.cancellation.cancel();
+        operation.status.revision = operation.status.revision.saturating_add(1);
+        operation.status.state =
+            bcode_session_search::SessionSearchBackfillOperationState::CancellationRequested;
+        operation.changed.notify_waiters();
+    }
+    let status = operation.status.clone();
+    drop(operations);
+    Ok(status)
+}
+
+async fn handle_session_search_backfill_operation(
+    request_id: u64,
+    writer: &SharedWriter,
+    result: Result<
+        bcode_session_search::SessionSearchBackfillOperationStatus,
+        bcode_session_search::SessionSearchServiceError,
+    >,
+) -> Result<(), ServerError> {
+    match result {
+        Ok(status) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionSearchBackfillOperation { status }),
             )
             .await
         }
@@ -30515,6 +30841,189 @@ mod tests {
     use std::sync::Mutex as TestMutex;
     use switchy::database::{DatabaseValue, query::FilterableQuery};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[tokio::test]
+    async fn server_status_exposes_startup_measurement_dimensions() {
+        let mut state = test_server_state(SessionManager::default());
+        state.session_search_enabled = false;
+        state
+            .metrics
+            .record_histogram("server.startup.ready_ms", 17);
+        state
+            .metrics
+            .set_gauge("server.startup.session_search_enabled", 0);
+        state
+            .metrics
+            .set_gauge("server.startup.session_search_provider_count", 0);
+        state
+            .metrics
+            .set_gauge("server.startup.session_search_index_bytes", 0);
+        state
+            .metrics
+            .set_gauge("server.startup.session_search_rebuilding_providers", 0);
+
+        let status = state.status(None).await;
+        assert_eq!(
+            status
+                .metrics
+                .histograms
+                .get("server.startup.ready_ms")
+                .map(|histogram| (histogram.count, histogram.min, histogram.max)),
+            Some((1, Some(17), Some(17)))
+        );
+        for gauge in [
+            "server.startup.session_search_enabled",
+            "server.startup.session_search_provider_count",
+            "server.startup.session_search_index_bytes",
+            "server.startup.session_search_rebuilding_providers",
+        ] {
+            assert_eq!(status.metrics.gauges.get(gauge), Some(&0), "{gauge}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_wait_returns_on_revision_change_and_times_out_boundedly() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let operation_id = "session-search-backfill-test".to_owned();
+        let changed = Arc::new(Notify::new());
+        state.session_search_backfills.lock().await.insert(
+            operation_id.clone(),
+            SessionSearchBackfillOperation {
+                status: bcode_session_search::SessionSearchBackfillOperationStatus {
+                    operation_id: operation_id.clone(),
+                    provider_id: "provider.test".to_owned(),
+                    revision: 1,
+                    state: bcode_session_search::SessionSearchBackfillOperationState::Running,
+                    response: None,
+                    error: None,
+                },
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                changed: Arc::clone(&changed),
+            },
+        );
+        let wait_state = Arc::clone(&state);
+        let wait_operation_id = operation_id.clone();
+        let waiter = tokio::spawn(async move {
+            wait_session_search_backfill(&wait_state, &wait_operation_id, 1, 5_000).await
+        });
+        tokio::task::yield_now().await;
+        {
+            let mut operations = state.session_search_backfills.lock().await;
+            let operation = operations.get_mut(&operation_id).expect("operation");
+            operation.status.revision = 2;
+            operation.status.state =
+                bcode_session_search::SessionSearchBackfillOperationState::Completed;
+            operation.changed.notify_waiters();
+            drop(operations);
+        }
+        let status = waiter.await.expect("wait task").expect("wait result");
+        assert_eq!(status.revision, 2);
+        assert_eq!(
+            status.state,
+            bcode_session_search::SessionSearchBackfillOperationState::Completed
+        );
+
+        let started = Instant::now();
+        let status = wait_session_search_backfill(&state, &operation_id, 2, 10)
+            .await
+            .expect("terminal wait");
+        assert_eq!(status.revision, 2);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_ipc_backfill_operation_lifecycle_and_restart_loss_are_explicit() {
+        let state = Arc::new(session_search::tests::state_with_providers(&[(
+            "test.slow-session-search",
+            session_search::tests::TestProviderBehavior::Slow,
+        )]));
+        let session = state
+            .sessions
+            .create_session(Some("IPC backfill".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "cancel through IPC".to_owned(), 0)
+            .await
+            .expect("append event");
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("first.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let started = client
+            .session_search_backfill_start(bcode_session_search::BackfillSessionSearchRequest {
+                provider_id: "test.slow-session-search".to_owned(),
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                cursor: None,
+                deadline_ms: 5_000,
+            })
+            .await
+            .expect("start through IPC");
+        let running = client
+            .session_search_backfill_status(started.operation_id.clone())
+            .await
+            .expect("status through IPC");
+        assert_eq!(running.revision, 1);
+        let cancelling = client
+            .session_search_backfill_cancel(started.operation_id.clone())
+            .await
+            .expect("cancel through IPC");
+        assert_eq!(
+            cancelling.state,
+            bcode_session_search::SessionSearchBackfillOperationState::CancellationRequested
+        );
+        let cancellation_started = Instant::now();
+        let terminal = client
+            .session_search_backfill_wait(started.operation_id.clone(), cancelling.revision, 5_000)
+            .await
+            .expect("wait through IPC");
+        assert_eq!(
+            terminal.state,
+            bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+        );
+        assert!(
+            cancellation_started.elapsed() < Duration::from_secs(1),
+            "in-flight provider cancellation should reach a terminal state promptly"
+        );
+        server.abort();
+
+        let restarted_state = Arc::new(test_server_state(SessionManager::default()));
+        let restarted_endpoint =
+            bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("restarted.sock"));
+        let listener = LocalIpcListener::bind(&restarted_endpoint).expect("restarted IPC listener");
+        let restarted_server = tokio::spawn(async move {
+            let stream = listener
+                .accept()
+                .await
+                .expect("restarted client connection");
+            handle_client(stream, restarted_state)
+                .await
+                .expect("handle restarted client");
+        });
+        let restarted_client = bcode_client::BcodeClient::new(restarted_endpoint);
+        assert!(
+            restarted_client
+                .session_search_backfill_status(started.operation_id)
+                .await
+                .is_err(),
+            "in-process operation notification state must not survive daemon restart"
+        );
+        restarted_server.abort();
+    }
 
     #[cfg(unix)]
     #[tokio::test]

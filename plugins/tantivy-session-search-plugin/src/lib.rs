@@ -2472,8 +2472,10 @@ mod tests {
         commit_durations.sort_unstable();
         let query_p50_us = query_durations[QUERY_RUNS / 2];
         let query_p95_us = query_durations[QUERY_RUNS * 95 / 100];
+        let query_p99_us = query_durations[QUERY_RUNS * 99 / 100];
         let commit_p50_us = commit_durations[commit_durations.len() / 2];
         let commit_p95_us = commit_durations[commit_durations.len() * 95 / 100];
+        let commit_p99_us = commit_durations[commit_durations.len() * 99 / 100];
 
         drop(plugin);
         let open_started = Instant::now();
@@ -2484,7 +2486,7 @@ mod tests {
         drop(reopened);
 
         eprintln!(
-            "tantivy_session_search_benchmark records={records} batches={} normalized_bytes={normalized_bytes} index_bytes={index_bytes} amplification_permille={amplification_permille} ingestion_us={ingestion_us} records_per_second={} commit_p50_us={commit_p50_us} commit_p95_us={commit_p95_us} query_runs={QUERY_RUNS} query_p50_us={query_p50_us} query_p95_us={query_p95_us} open_us={open_us} configured_writer_memory_bytes={writer_memory_bytes} hydration=not_measured_provider_has_no_canonical_access",
+            "tantivy_session_search_benchmark records={records} batches={} normalized_bytes={normalized_bytes} index_bytes={index_bytes} amplification_permille={amplification_permille} ingestion_us={ingestion_us} records_per_second={} commit_p50_us={commit_p50_us} commit_p95_us={commit_p95_us} commit_p99_us={commit_p99_us} query_runs={QUERY_RUNS} query_p50_us={query_p50_us} query_p95_us={query_p95_us} query_p99_us={query_p99_us} open_us={open_us} configured_writer_memory_bytes={writer_memory_bytes} hydration=not_measured_provider_has_no_canonical_access",
             records / BATCH_SIZE,
             u128::try_from(records)
                 .unwrap_or(u128::MAX)

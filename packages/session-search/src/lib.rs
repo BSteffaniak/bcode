@@ -1716,6 +1716,40 @@ pub struct SessionSearchBackfillResponse {
     pub status: SessionSearchStatus,
 }
 
+/// Lifecycle state for one addressable historical backfill operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchBackfillOperationState {
+    Running,
+    CancellationRequested,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+/// Bounded status for one daemon-owned historical backfill operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchBackfillOperationStatus {
+    pub operation_id: String,
+    pub provider_id: String,
+    /// Monotonic in-process revision for race-free bounded waiting.
+    ///
+    /// This is notification state only; it does not promise durable or reconnect-safe resume.
+    pub revision: u64,
+    pub state: SessionSearchBackfillOperationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<SessionSearchBackfillResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<SessionSearchServiceError>,
+}
+
+/// Acknowledgment that an addressable historical backfill was started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartSessionSearchBackfillResponse {
+    pub operation_id: String,
+    pub provider_id: String,
+}
+
 /// Portable summary of an explicit provider maintenance operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchMaintenanceResponse {

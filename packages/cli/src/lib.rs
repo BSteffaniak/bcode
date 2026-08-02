@@ -2027,6 +2027,45 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Start an addressable historical backfill operation.
+    SearchBackfillStart {
+        #[arg(long)]
+        provider: String,
+        #[arg(long = "session")]
+        sessions: Vec<SessionId>,
+        #[arg(long)]
+        after_timestamp_ms: Option<u64>,
+        #[arg(long)]
+        before_timestamp_ms: Option<u64>,
+        #[arg(long, value_parser = parse_session_search_backfill_cursor)]
+        cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
+        #[arg(long, default_value_t = 30_000)]
+        deadline_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read status for an addressable historical backfill operation.
+    SearchBackfillStatus {
+        operation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait for a newer operation revision or timeout.
+    SearchBackfillWait {
+        operation_id: String,
+        #[arg(long, default_value_t = 0)]
+        after_revision: u64,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Request cancellation of an addressable historical backfill operation.
+    SearchBackfillCancel {
+        operation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Explicitly backfill selected or bounded catalog sessions into one provider.
     SearchBackfill {
         #[arg(long)]
@@ -2779,6 +2818,10 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
         | SessionCommand::SearchStatus { .. }
         | SessionCommand::SearchPurge { .. }
         | SessionCommand::SearchRebuild { .. }
+        | SessionCommand::SearchBackfillStart { .. }
+        | SessionCommand::SearchBackfillStatus { .. }
+        | SessionCommand::SearchBackfillWait { .. }
+        | SessionCommand::SearchBackfillCancel { .. }
         | SessionCommand::SearchBackfill { .. }
         | SessionCommand::SearchExplain { .. }) => {
             handle_session_search_subcommand(command).await?;
@@ -8796,6 +8839,26 @@ async fn handle_session_search_subcommand(command: SessionCommand) -> Result<(),
             confirm,
             json,
         } => session_search_maintenance(provider, confirm, json, true).await,
+        command @ SessionCommand::SearchBackfillStart { .. } => {
+            handle_session_search_backfill_start_cli(command).await
+        }
+        SessionCommand::SearchBackfillStatus { operation_id, json } => {
+            session_search_backfill_operation(operation_id, json, false).await
+        }
+        SessionCommand::SearchBackfillWait {
+            operation_id,
+            after_revision,
+            timeout_ms,
+            json,
+        } => {
+            let status = BcodeClient::default_endpoint()
+                .session_search_backfill_wait(operation_id, after_revision, timeout_ms)
+                .await?;
+            print_session_search_backfill_operation(&status, json)
+        }
+        SessionCommand::SearchBackfillCancel { operation_id, json } => {
+            session_search_backfill_operation(operation_id, json, true).await
+        }
         command @ SessionCommand::SearchBackfill { .. } => {
             handle_session_search_backfill_cli(command).await
         }
@@ -8804,6 +8867,69 @@ async fn handle_session_search_subcommand(command: SessionCommand) -> Result<(),
         }
         _ => unreachable!("session search handler received another command"),
     }
+}
+
+async fn handle_session_search_backfill_start_cli(command: SessionCommand) -> Result<(), CliError> {
+    let SessionCommand::SearchBackfillStart {
+        provider,
+        sessions,
+        after_timestamp_ms,
+        before_timestamp_ms,
+        cursor,
+        deadline_ms,
+        json,
+    } = command
+    else {
+        unreachable!("session search backfill start handler received another command")
+    };
+    let response = BcodeClient::default_endpoint()
+        .session_search_backfill_start(bcode_session_search::BackfillSessionSearchRequest {
+            provider_id: provider,
+            session_ids: sessions.into_iter().collect(),
+            after_timestamp_ms,
+            before_timestamp_ms,
+            cursor,
+            deadline_ms,
+        })
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!(
+            "started {} for {}",
+            response.operation_id, response.provider_id
+        );
+    }
+    Ok(())
+}
+
+async fn session_search_backfill_operation(
+    operation_id: String,
+    json: bool,
+    cancel: bool,
+) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let status = if cancel {
+        client.session_search_backfill_cancel(operation_id).await?
+    } else {
+        client.session_search_backfill_status(operation_id).await?
+    };
+    print_session_search_backfill_operation(&status, json)
+}
+
+fn print_session_search_backfill_operation(
+    status: &bcode_session_search::SessionSearchBackfillOperationStatus,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(status)?);
+    } else {
+        println!(
+            "{}: {:?} provider={} revision={}",
+            status.operation_id, status.state, status.provider_id, status.revision
+        );
+    }
+    Ok(())
 }
 
 async fn handle_session_search_backfill_cli(command: SessionCommand) -> Result<(), CliError> {
@@ -11821,6 +11947,33 @@ mod web_command_tests {
                     json: true,
                 }
             }) if provider == "bcode.tantivy-session-search" && sessions.len() == 1
+        ));
+    }
+
+    #[test]
+    fn session_search_backfill_wait_parses_revision_and_timeout() {
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "search-backfill-wait",
+            "session-search-backfill-7",
+            "--after-revision",
+            "2",
+            "--timeout-ms",
+            "5000",
+            "--json",
+        ])
+        .expect("backfill wait command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session {
+                command: SessionCommand::SearchBackfillWait {
+                    operation_id,
+                    after_revision: 2,
+                    timeout_ms: 5000,
+                    json: true,
+                }
+            }) if operation_id == "session-search-backfill-7"
         ));
     }
 

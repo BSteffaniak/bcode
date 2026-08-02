@@ -36,9 +36,21 @@ if ! [[ "${samples}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 cd "${root}"
-cargo build --quiet "${cargo_profile_args[@]}" -p bcode --features distribution
+skip_build="${BCODE_DAEMON_PERF_SKIP_BUILD:-0}"
+if [[ "${skip_build}" != "0" && "${skip_build}" != "1" ]]; then
+  echo "BCODE_DAEMON_PERF_SKIP_BUILD must be 0 or 1" >&2
+  exit 2
+fi
+build_features="${BCODE_DAEMON_PERF_FEATURES:-distribution,static-bundled-tantivy-session-search-plugin}"
+if [[ "${skip_build}" == "0" ]]; then
+  cargo build --quiet "${cargo_profile_args[@]}" -p bcode --features "${build_features}"
+fi
 
-bcode="${root}/target/${binary_dir}/bcode"
+bcode="${BCODE_DAEMON_PERF_BINARY:-${root}/target/${binary_dir}/bcode}"
+if [[ ! -x "${bcode}" ]]; then
+  echo "daemon performance binary is not executable: ${bcode}" >&2
+  exit 2
+fi
 probe="${bcode}"
 artifact_bytes="$(wc -c <"${bcode}" | tr -d ' ')"
 mkdir -p "${output_dir}"
@@ -60,10 +72,59 @@ cleanup() {
 trap cleanup EXIT
 
 new_environment() {
+  local mode="${1:-default}"
   local workdir
   workdir="$(mktemp -d "${suite_work_root}/environment.XXXXXX")"
   mkdir -p "${workdir}/tmp" "${workdir}/state"
   printf '[client]\nrequest_timeout_secs = 30\n' >"${workdir}/config.toml"
+  case "${mode}" in
+    search-disabled)
+      printf '\n[session_search]\nenabled = false\n' >>"${workdir}/config.toml"
+      ;;
+    search-enabled-empty)
+      mkdir -p "${workdir}/search-index"
+      cat >>"${workdir}/config.toml" <<EOF
+
+[session_search]
+enabled = true
+
+[plugins]
+enabled = ["bcode.tantivy-session-search"]
+
+[plugins.config."bcode.tantivy-session-search"]
+storage_root = "${workdir}/search-index"
+EOF
+      ;;
+    search-enabled-large|search-rebuilding)
+      local source_root
+      if [[ "${mode}" == "search-enabled-large" ]]; then
+        source_root="${BCODE_DAEMON_PERF_LARGE_INDEX_ROOT:-}"
+      else
+        source_root="${BCODE_DAEMON_PERF_REBUILDING_INDEX_ROOT:-}"
+      fi
+      if [[ -z "${source_root}" || ! -d "${source_root}" ]]; then
+        echo "${mode} requires its configured provider fixture root" >&2
+        return 2
+      fi
+      cp -R "${source_root}" "${workdir}/search-index"
+      cat >>"${workdir}/config.toml" <<EOF
+
+[session_search]
+enabled = true
+
+[plugins]
+enabled = ["bcode.tantivy-session-search"]
+
+[plugins.config."bcode.tantivy-session-search"]
+storage_root = "${workdir}/search-index"
+EOF
+      ;;
+    default) ;;
+    *)
+      echo "unknown startup environment mode: ${mode}" >&2
+      return 2
+      ;;
+  esac
   printf '%s\n' "${workdir}"
 }
 
@@ -78,12 +139,18 @@ run_bcode() {
     "$@"
 }
 
+enforce_budgets="${BCODE_DAEMON_PERF_ENFORCE_BUDGETS:-1}"
+if [[ "${enforce_budgets}" != "0" && "${enforce_budgets}" != "1" ]]; then
+  echo "BCODE_DAEMON_PERF_ENFORCE_BUDGETS must be 0 or 1" >&2
+  exit 2
+fi
+
 summarize() {
   local scenario="$1"
   local command="$2"
   local p95_limit_us="${3:-}"
   local limit_args=()
-  if [[ -n "${p95_limit_us}" ]]; then
+  if [[ -n "${p95_limit_us}" && "${enforce_budgets}" == "1" ]]; then
     limit_args=(--p95-limit-us "${p95_limit_us}")
   fi
   python3 "${root}/scripts/summarize-daemon-startup-measurements.py" \
@@ -143,6 +210,26 @@ for ((iteration = 0; iteration < samples; iteration++)); do
   rm -rf "${first_workdir}"
 done
 summarize first-cold "bcode server startup-probe"
+
+startup_modes=(search-disabled search-enabled-empty)
+if [[ -n "${BCODE_DAEMON_PERF_LARGE_INDEX_ROOT:-}" ]]; then
+  startup_modes+=(search-enabled-large)
+fi
+if [[ -n "${BCODE_DAEMON_PERF_REBUILDING_INDEX_ROOT:-}" ]]; then
+  startup_modes+=(search-rebuilding)
+fi
+for mode in "${startup_modes[@]}"; do
+  : >"${output_dir}/${mode}-cold.samples"
+  for ((iteration = 0; iteration < samples; iteration++)); do
+    mode_workdir="$(new_environment "${mode}")"
+    workdirs+=("${mode_workdir}")
+    run_bcode "${mode_workdir}" "${probe}" server startup-probe >>"${output_dir}/${mode}-cold.samples"
+    run_bcode "${mode_workdir}" "${bcode}" server metrics --json >"${output_dir}/${mode}-${iteration}-metrics.json"
+    run_bcode "${mode_workdir}" "${bcode}" server stop --force >/dev/null
+    rm -rf "${mode_workdir}"
+  done
+  summarize "${mode}-cold" "bcode server startup-probe"
+done
 
 concurrent_workdir="$(new_environment)"
 workdirs+=("${concurrent_workdir}")

@@ -832,6 +832,24 @@ pub enum Request {
         provider_id: String,
         confirmation: String,
     },
+    /// Start an addressable historical backfill operation.
+    SessionSearchBackfillStart {
+        request: bcode_session_search::BackfillSessionSearchRequest,
+    },
+    /// Read bounded state for an addressable historical backfill operation.
+    SessionSearchBackfillStatus {
+        operation_id: String,
+    },
+    /// Wait for a newer revision or timeout for an addressable historical backfill operation.
+    SessionSearchBackfillWait {
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    },
+    /// Request cancellation of an addressable historical backfill operation.
+    SessionSearchBackfillCancel {
+        operation_id: String,
+    },
     /// Explicitly backfill selected or bounded catalog sessions into one provider.
     SessionSearchBackfill {
         request: bcode_session_search::BackfillSessionSearchRequest,
@@ -2505,6 +2523,12 @@ pub enum ResponsePayload {
     },
     SessionSearchMaintenance {
         response: bcode_session_search::SessionSearchMaintenanceResponse,
+    },
+    SessionSearchBackfillStarted {
+        response: bcode_session_search::StartSessionSearchBackfillResponse,
+    },
+    SessionSearchBackfillOperation {
+        status: bcode_session_search::SessionSearchBackfillOperationStatus,
     },
     SessionSearchBackfill {
         response: bcode_session_search::SessionSearchBackfillResponse,
