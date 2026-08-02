@@ -169,9 +169,11 @@ amplification using a 15 MiB writer cache. A fresh already-built release test pr
 70,074,368 bytes (66.8 MiB) maximum RSS and 33,980,944 bytes peak memory footprint under macOS
 `/usr/bin/time -l`; this is a conservative whole-provider-process value including the test harness,
 record construction, ingestion, query, and reopen phases, not coordinator-only incremental RSS.
-These results satisfy the initial 100 ms ordinary-query and 50% amplification budgets. A separate
-production-path hydration benchmark measured 56.826/80.268 ms p50/p95 for 20 exact locators over a
-200-event persistent session, within the 100 ms bounded-read budget; larger representative hydration
-setup remains open. Commit latency belongs to detached asynchronous provider work, not the canonical
-append path. Daemon startup modes and daemon-level p50/p95/p99 measurements remain outstanding; see
-`docs/session-search-baseline.md`.
+These provider results satisfy the initial 100 ms ordinary-query and 50% amplification budgets. A
+grouped production-path hydration benchmark measured 0.510/1.129 ms p50/p95 for 20 exact locators
+over a 1,000-event persistent session, within the 100 ms bounded-read budget. Nearby same-session
+locators use bounded inclusive reads while sparse gaps split; missing exact sequences remain stale.
+A 10,000-event ordinary-append fixture exceeded a 20-minute setup envelope before measurement, so
+larger representative application/daemon distributions remain open. Commit latency belongs to
+detached asynchronous provider work, not the canonical append path. Daemon startup modes and
+daemon-level p50/p95/p99 measurements remain outstanding; see `docs/session-search-baseline.md`.

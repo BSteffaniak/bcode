@@ -385,10 +385,19 @@ Public search and investigation contracts remain portable. Renderers adapt share
 without owning provider workflows or canonical session state. The TUI owns terminal layout and
 interaction only.
 
-The first TUI search slice is canonical picker filtering over portable summary metadata; it remains
-renderer-local and does not invoke providers or imply transcript coverage. Dedicated transcript
-search is a separate later slice that must consume these contracts asynchronously and hydrate
-canonical locators before navigation.
+The TUI preserves local canonical-summary filtering as a renderer-only picker capability, distinct
+from transcript search. Ctrl-F explicitly starts bounded transcript search from the current picker
+query. The renderer uses the portable client contract asynchronously through a 150 ms replaceable,
+generation-gated effect; it shows a bounded multi-result list with canonical summary titles, exact
+hydrated timestamps when available, content kind, provider/rank, bounded preview/truncation,
+hydration state, and separate query/corpus completeness plus provider/failure counts. Inline
+`deep:`, repeatable `content:<kind>`, and repeatable `provider:<id>` controls map to typed portable
+policy/filters; shell/tool output fails closed without explicit deep mode. Enter can navigate only an
+exact canonical hydration, using the normal bounded `AroundSequence` projection attach and canonical
+sequence anchor. Stale, deleted, damaged, unavailable, or mismatched hydration is non-navigable.
+Provider previews never become canonical transcript history, and renderer search state is ephemeral.
+Provider deadlines and cancellation remain application-owned; task replacement is not a
+reconnect-safe replay protocol.
 
 The intended `bcode-session-history` skill contract is to use supported Bcode commands and report
 session IDs, query scope, content/provider coverage, truncation, freshness, and failures. A native

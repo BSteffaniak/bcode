@@ -2,26 +2,27 @@
 
 ## Session picker and search scope
 
-The initial TUI session-search slice is intentionally limited to local filtering of the canonical
-session-summary picker. That filter remains renderer-owned interaction state and may match title,
-session ID, working directory, import source, and fork metadata already present in portable
-summaries. It does not invoke optional search providers, claim transcript coverage, expose deep or
-content-category controls, or render provider documents as canonical history.
+The TUI keeps local canonical-summary filtering distinct from transcript search. Local filtering is
+renderer-owned ephemeral state and may match title, session ID, working directory, import source,
+and fork metadata already present in portable summaries. It does not invoke providers or imply
+transcript coverage.
 
-A later dedicated transcript-search mode must consume the portable session-search request/result/
-status contracts asynchronously, expose partial/degraded coverage, and navigate through canonical
-locator hydration. Its reusable effect waits 150 ms before dispatch, aborts superseded renderer
-work, advances a renderer-local generation on replacement/cancel, and accepts terminal aggregates
-only for the latest generation. Provider deadlines and cancellation remain application-owned; this
-is not a reconnect-safe replay protocol. It must not reuse local picker filtering as evidence that
-transcript search or provider coverage exists. Picker text input, selection/viewport, key routing,
-rendering, and hit surfaces stay in TUI modules, and picker filter state is ephemeral: rebuilding from catalog summaries
-must not emit canonical events or persistence writes.
+Ctrl-F explicitly starts bounded transcript search from the current picker query. The picker uses
+the portable client contract through a 150 ms replaceable, generation-gated effect, so input and
+catalog updates remain responsive and stale completions cannot replace newer results. A bounded
+multi-result view exposes canonical summary title, canonical session/sequence, exact hydrated
+timestamp when available, content kind, provider/rank, bounded preview/truncation, hydration state,
+and separate query/corpus completeness plus provider/failure counts. Inline `deep:`, repeatable
+`content:<kind>`, and repeatable `provider:<id>` controls map to typed portable policy and filters;
+shell/tool output fails closed unless deep mode is explicit.
 
-The presentation adapter keeps content kind, canonical session locator/ID, canonical catalog title,
-provider/rank, bounded preview and truncation, canonical hydrated timestamp/outcome, query/corpus
-completeness, provider/failure counts, and explicit degraded state. Provider documents never become
-title or history authority.
+Enter navigates only an exact canonical hydration through the normal bounded `AroundSequence`
+projection attach and canonical sequence anchor. Stale, deleted, damaged, unavailable, missing, or
+mismatched hydration cannot navigate. Provider previews never become canonical history. Picker
+input, result selection/viewport, key routing, rendering, and hit surfaces stay TUI-local, and search
+state emits no canonical events or persistence writes. Provider deadlines and cancellation remain
+application-owned; renderer task replacement is not reconnect-safe replay or durable transport
+resume.
 
 ## Semantic transcript boundary
 

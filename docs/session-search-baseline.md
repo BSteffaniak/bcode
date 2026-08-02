@@ -221,21 +221,27 @@ not relaxed into the budget.
 
 ## Canonical hydration benchmark
 
-The ignored server benchmark exercises the production exact-locator hydration path through the
-session manager and zero-neighbor `around` reads:
+The ignored server benchmark exercises production exact-locator hydration through grouped bounded
+canonical event-range reads. Locators are grouped by session, split when gaps exceed 64 sequences,
+and each read is capped to the number of requested locators:
 
 ```sh
-cargo test -p bcode_server benchmark_canonical_hit_hydration --lib -- \
+BCODE_SESSION_SEARCH_HYDRATION_EVENTS=1000 \
+  cargo test -p bcode_server benchmark_canonical_hit_hydration --lib -- \
   --ignored --nocapture
 ```
 
-A 2026-08-01 debug-profile run hydrated 20 hits over a 200-event persistent canonical session for 20
-runs at 56.826 ms p50 and 80.268 ms p95, within the initial 100 ms bounded-read budget. The benchmark
-asserts that every locator returns the exact canonical event and rejects p95 above 100 ms. Attempts
-to construct 1,000- and 10,000-event corpora through ordinary one-event durable append exceeded the
-five-minute command envelope during setup, before reporting hydration timings. This is not evidence
-of hydration failure, but it means representative 100,000-event hydration remains open until the
-benchmark has a bounded bulk fixture/setup path that preserves canonical schema and sequence rules.
+Before grouped hydration, a 2026-08-02 debug-profile run over 1,000 persistent events and 20 hits
+measured 226.664 ms p50 and 457.672 ms p95, failing the 100 ms budget because each hit independently
+opened canonical storage. After grouping bounded ranges, the same corpus measured 0.510 ms p50 and
+1.129 ms p95 over 20 runs. The full command still took 364.82 seconds because ordinary one-event
+durable append dominates deterministic fixture setup. The benchmark asserts exact canonical events
+and rejects p95 above 100 ms.
+
+A 10,000-event attempt exceeded a 20-minute command envelope during ordinary append setup before
+reporting hydration timings. This is not evidence of hydration failure, but representative larger
+application/daemon distributions remain open until a bounded bulk fixture/setup path can preserve
+canonical schema, sequence, and projection rules.
 
 
 ## Tantivy transcript-provider benchmark

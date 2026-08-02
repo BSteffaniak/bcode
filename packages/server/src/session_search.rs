@@ -16,7 +16,7 @@ use bcode_session_search::{
 };
 use futures::future::join_all;
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 
@@ -1731,46 +1731,73 @@ pub fn report_hydration_outcomes(
 
 /// Hydrate provider locators through exact bounded canonical reads.
 ///
-/// Each hit performs a zero-neighbor around-sequence read. A missing anchor is stale and never
-/// substituted with another event. The returned vector preserves grouped hit order.
+/// Hits are grouped by session and read through bounded inclusive sequence ranges, with gaps split
+/// so sparse locators cannot widen one read into unbounded canonical work. A missing exact sequence
+/// is stale and never substituted with another event. The returned vector preserves grouped hit
+/// order.
 pub async fn hydrate_hits(
     state: &ServerState,
     hits: Vec<bcode_session_search::SessionSearchHit>,
 ) -> Vec<HydratedSessionSearchHit> {
-    let reads = hits.into_iter().map(|hit| async move {
-        let result = state
-            .sessions
-            .session_history_around(
-                hit.locator.session_id,
-                bcode_session_models::SessionHistoryAroundQuery {
-                    sequence: hit.locator.sequence,
-                    before: 0,
-                    after: 0,
-                },
-            )
-            .await;
-        match result {
-            Ok(window) if window.anchor_present => {
-                let event = window
-                    .events
-                    .into_iter()
-                    .find(|event| event.sequence == hit.locator.sequence);
-                if let Some(event) = event {
-                    HydratedSessionSearchHit {
-                        hit,
-                        outcome: SearchHitHydrationOutcome::Hydrated,
-                        event: Some(Box::new(event)),
-                        message: None,
+    const MAX_HYDRATION_RANGE_SPAN: u64 = 64;
+    let mut hydrated = vec![None; hits.len()];
+    let mut by_session = BTreeMap::<bcode_session_models::SessionId, Vec<(usize, u64)>>::new();
+    for (index, hit) in hits.iter().enumerate() {
+        by_session
+            .entry(hit.locator.session_id)
+            .or_default()
+            .push((index, hit.locator.sequence));
+    }
+    for (session_id, mut locators) in by_session {
+        locators.sort_by_key(|(_, sequence)| *sequence);
+        let mut start = 0;
+        while start < locators.len() {
+            let range_start = locators[start].1;
+            let mut end = start + 1;
+            while end < locators.len()
+                && locators[end].1.saturating_sub(range_start) <= MAX_HYDRATION_RANGE_SPAN
+            {
+                end += 1;
+            }
+            let range_end = locators[end - 1].1;
+            match state
+                .sessions
+                .session_events_range(session_id, range_start, range_end, end - start)
+                .await
+            {
+                Ok(events) => {
+                    let events = events
+                        .into_iter()
+                        .map(|event| (event.sequence, event))
+                        .collect::<BTreeMap<_, _>>();
+                    for &(index, sequence) in &locators[start..end] {
+                        let hit = hits[index].clone();
+                        hydrated[index] = Some(if let Some(event) = events.get(&sequence) {
+                            HydratedSessionSearchHit {
+                                hit,
+                                outcome: SearchHitHydrationOutcome::Hydrated,
+                                event: Some(Box::new(event.clone())),
+                                message: None,
+                            }
+                        } else {
+                            stale_hydration(hit)
+                        });
                     }
-                } else {
-                    stale_hydration(hit)
+                }
+                Err(error) => {
+                    for &(index, _) in &locators[start..end] {
+                        hydrated[index] = Some(hydration_error(hits[index].clone(), &error));
+                    }
                 }
             }
-            Ok(_) => stale_hydration(hit),
-            Err(error) => hydration_error(hit, &error),
+            start = end;
         }
-    });
-    join_all(reads).await
+    }
+    hydrated
+        .into_iter()
+        .zip(hits)
+        .map(|(hydrated, hit)| hydrated.unwrap_or_else(|| stale_hydration(hit)))
+        .collect()
 }
 
 fn stale_hydration(hit: bcode_session_search::SessionSearchHit) -> HydratedSessionSearchHit {
@@ -2916,6 +2943,60 @@ pub(crate) mod tests {
 
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
         assert!(state.session_search_dirty.snapshot().await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grouped_hydration_preserves_order_and_splits_sparse_session_ranges() {
+        let state = state_with_providers(&[]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("grouped hydration".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        for sequence in 0..70 {
+            state
+                .sessions
+                .append_context_compacted(session.id, format!("event {sequence}"), 0)
+                .await
+                .expect("append event");
+        }
+        let sequences = [70, 2, 69, 10_000];
+        let hits = sequences
+            .into_iter()
+            .enumerate()
+            .map(|(rank, sequence)| SessionSearchHit {
+                locator: SessionSearchLocator {
+                    session_id: session.id,
+                    sequence,
+                    record_id: Some(format!("record-{sequence}")),
+                },
+                content_kind: SearchContentKind::Compaction,
+                matched_field: SearchField::Text,
+                provider_id: FAST_PROVIDER_ID.to_owned(),
+                provider_rank: u32::try_from(rank + 1).expect("rank"),
+                provider_score: None,
+                preview: None,
+                preview_truncated: false,
+            })
+            .collect();
+
+        let hydrated = hydrate_hits(&state, hits).await;
+
+        assert_eq!(
+            hydrated
+                .iter()
+                .map(|hit| hit.hit.locator.sequence)
+                .collect::<Vec<_>>(),
+            sequences
+        );
+        assert_eq!(hydrated[0].outcome, SearchHitHydrationOutcome::Hydrated);
+        assert_eq!(hydrated[1].outcome, SearchHitHydrationOutcome::Hydrated);
+        assert_eq!(hydrated[2].outcome, SearchHitHydrationOutcome::Hydrated);
+        assert_eq!(hydrated[3].outcome, SearchHitHydrationOutcome::StaleLocator);
     }
 
     #[tokio::test]

@@ -1293,6 +1293,58 @@ mod session_search_input_tests {
     }
 
     #[test]
+    fn picker_multi_result_interaction_selects_and_closes_without_provider_history() {
+        let session_id = bcode_session_models::SessionId::new();
+        let result = bcode_session_search::HydratedSessionSearchHit {
+            hit: bcode_session_search::SessionSearchHit {
+                locator: bcode_session_search::SessionSearchLocator {
+                    session_id,
+                    sequence: 7,
+                    record_id: Some("result".to_owned()),
+                },
+                content_kind: bcode_session_search::SearchContentKind::AssistantMessage,
+                matched_field: bcode_session_search::SearchField::Text,
+                provider_id: "provider".to_owned(),
+                provider_rank: 1,
+                provider_score: None,
+                preview: Some("provider preview".to_owned()),
+                preview_truncated: false,
+            },
+            outcome: bcode_session_search::SearchHitHydrationOutcome::Hydrated,
+            event: Some(Box::new(bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 7,
+                timestamp_ms: 99,
+                session_id,
+                provenance: None,
+                kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                    text: "canonical".to_owned(),
+                },
+            })),
+            message: None,
+        };
+        let response = bcode_session_search::FederatedSessionSearchResponse {
+            hits: vec![result.hit.clone()],
+            query_complete: true,
+            coverage_complete: true,
+            providers: Vec::new(),
+            failures: Vec::new(),
+        };
+        let mut picker = session_picker::SessionPickerApp::new(Vec::new());
+        picker.set_search_results(&response, vec![result]);
+
+        assert_eq!(
+            handle_picker_search_key(&mut picker, KeyStroke::simple(KeyCode::Enter)),
+            PickerKeyOutcome::TranscriptSearch
+        );
+        assert_eq!(
+            handle_picker_search_key(&mut picker, KeyStroke::simple(KeyCode::Escape)),
+            PickerKeyOutcome::Continue
+        );
+        assert_eq!(picker.mode(), session_picker::SessionPickerMode::Filter);
+    }
+
+    #[test]
     fn picker_search_rejects_large_output_without_deep_control() {
         assert_eq!(
             parse_picker_transcript_search_input("content:tool-output needle"),
