@@ -79,7 +79,8 @@ pub async fn rebuild_provider(
     .await
 }
 
-const MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES: usize = 8;
+const MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES: usize =
+    bcode_session_search::MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES;
 
 /// Run explicit complete historical backfill across every selected provider.
 ///
@@ -131,6 +132,14 @@ pub async fn complete_backfill(
         .map(|provider| provider.plugin_id)
         .collect::<Vec<_>>();
     provider_ids.sort();
+    if provider_ids.len() > bcode_session_search::MAX_COMPLETE_BACKFILL_PROVIDERS {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::QuotaExceeded,
+            message: "too many enabled session-search providers for one complete backfill"
+                .to_owned(),
+            retryable: false,
+        });
+    }
     if provider_ids.is_empty() {
         return Err(SessionSearchServiceError {
             code: SearchErrorCode::ProviderUnavailable,
@@ -279,16 +288,22 @@ pub async fn complete_backfill(
                     });
                 }
             }
-            return Ok(
-                bcode_session_search::CompleteSessionSearchBackfillResponse {
-                    provider_ids,
-                    catalog_revision_started: revision_started,
-                    catalog_revision_completed: revision_completed,
-                    convergence_passes,
-                    cancelled: cancellation.is_cancelled(),
-                    providers,
-                },
-            );
+            let response = bcode_session_search::CompleteSessionSearchBackfillResponse {
+                provider_ids,
+                catalog_revision_started: revision_started,
+                catalog_revision_completed: revision_completed,
+                convergence_passes,
+                cancelled: cancellation.is_cancelled(),
+                providers,
+            };
+            response
+                .validate()
+                .map_err(|error| SessionSearchServiceError {
+                    code: SearchErrorCode::Internal,
+                    message: bounded_message(&error.to_string()),
+                    retryable: false,
+                })?;
+            return Ok(response);
         }
         pass_started_revision = revision_completed;
     }
@@ -2326,6 +2341,11 @@ pub(crate) mod tests {
     static STATEFUL_CHECKPOINTS: std::sync::LazyLock<
         std::sync::Mutex<BTreeMap<&'static str, StatefulProviderCheckpoint>>,
     > = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+    static STATEFUL_APPLY_PUBLISHED: AtomicBool = AtomicBool::new(false);
+    static STATEFUL_APPLY_RELEASE: std::sync::LazyLock<(
+        std::sync::Mutex<bool>,
+        std::sync::Condvar,
+    )> = std::sync::LazyLock::new(|| (std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
     #[derive(Debug)]
     struct TestProviderInstance {
@@ -2572,6 +2592,14 @@ pub(crate) mod tests {
                                     .sum(),
                             },
                         );
+                        drop(checkpoints);
+                        STATEFUL_APPLY_PUBLISHED.store(true, Ordering::SeqCst);
+                        let (release, changed) = &*STATEFUL_APPLY_RELEASE;
+                        let mut release = release.lock().expect("stateful apply release");
+                        while !*release {
+                            release = changed.wait(release).expect("stateful apply release wait");
+                        }
+                        drop(release);
                     }
                     duplicate
                 } else {
@@ -2727,6 +2755,15 @@ pub(crate) mod tests {
             cli_registration: None,
             handle_event: test_handle_event,
         }
+    }
+
+    pub fn slow_apply_started() -> bool {
+        SLOW_APPLY_STARTED.load(Ordering::SeqCst)
+    }
+
+    pub fn reset_slow_apply_state() {
+        SLOW_APPLY_STARTED.store(false, Ordering::SeqCst);
+        SLOW_APPLY_CANCELLED.store(false, Ordering::SeqCst);
     }
 
     pub fn state_with_providers(
@@ -3522,6 +3559,11 @@ pub(crate) mod tests {
             .lock()
             .expect("stateful checkpoints")
             .clear();
+        STATEFUL_APPLY_PUBLISHED.store(false, Ordering::SeqCst);
+        *STATEFUL_APPLY_RELEASE
+            .0
+            .lock()
+            .expect("stateful apply release") = true;
         let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Stateful)]);
         let workspace = tempfile::tempdir().expect("workspace");
         let session = state
@@ -3559,6 +3601,87 @@ pub(crate) mod tests {
             APPLY_BATCH_CALLS.load(Ordering::SeqCst),
             1,
             "fresh provider coverage must suppress duplicate apply calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_checkpoint_recovers_when_first_coordinator_is_interrupted() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        STATEFUL_CHECKPOINTS
+            .lock()
+            .expect("stateful checkpoints")
+            .clear();
+        STATEFUL_APPLY_PUBLISHED.store(false, Ordering::SeqCst);
+        *STATEFUL_APPLY_RELEASE
+            .0
+            .lock()
+            .expect("stateful apply release") = false;
+        let state = std::sync::Arc::new(state_with_providers(&[(
+            FAST_PROVIDER_ID,
+            TestProviderBehavior::Stateful,
+        )]));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("publication crash window".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "publish before response".to_owned(), 0)
+            .await
+            .expect("append event");
+        let request = bcode_session_search::CompleteSessionSearchBackfillRequest {
+            provider_id: Some(FAST_PROVIDER_ID.to_owned()),
+            session_ids: BTreeSet::from([session.id]),
+            after_timestamp_ms: None,
+            before_timestamp_ms: None,
+            slice_deadline_ms: 5_000,
+        };
+        let first_state = std::sync::Arc::clone(&state);
+        let first_request = request.clone();
+        let first = tokio::spawn(async move {
+            complete_backfill(
+                &first_state,
+                first_request,
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !STATEFUL_APPLY_PUBLISHED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider publishes checkpoint");
+        first.abort();
+        *STATEFUL_APPLY_RELEASE
+            .0
+            .lock()
+            .expect("stateful apply release") = true;
+        STATEFUL_APPLY_RELEASE.1.notify_all();
+        let _ = first.await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+
+        let recovered = complete_backfill(
+            &state,
+            request,
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+        )
+        .await
+        .expect("checkpoint recovery");
+        assert_eq!(recovered.providers[0].completed_sessions, 1);
+        assert_eq!(
+            APPLY_BATCH_CALLS.load(Ordering::SeqCst),
+            0,
+            "recovery must trust fresh provider coverage rather than redeliver"
         );
     }
 

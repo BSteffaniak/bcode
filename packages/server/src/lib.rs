@@ -31221,6 +31221,59 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     #[tokio::test]
+    async fn canonical_writes_complete_while_slow_complete_backfill_is_blocked() {
+        let state = Arc::new(session_search::tests::state_with_providers(&[(
+            "test.slow-session-search",
+            session_search::tests::TestProviderBehavior::Slow,
+        )]));
+        session_search::tests::reset_slow_apply_state();
+        let session = state
+            .sessions
+            .create_session(Some("write isolation".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "slow initial".to_owned(), 0)
+            .await
+            .expect("initial append");
+        let started = start_complete_session_search_backfill(
+            Arc::clone(&state),
+            bcode_session_search::CompleteSessionSearchBackfillRequest {
+                provider_id: Some("test.slow-session-search".to_owned()),
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                slice_deadline_ms: 5_000,
+            },
+        )
+        .await
+        .expect("start complete backfill");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session_search::tests::slow_apply_started() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider apply starts");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            state.sessions.append_context_compacted(
+                session.id,
+                "canonical write wins".to_owned(),
+                0,
+            ),
+        )
+        .await
+        .expect("canonical write must not wait for provider")
+        .expect("canonical write succeeds");
+        let _ = cancel_session_search_backfill(&state, &started.operation_id)
+            .await
+            .expect("cancel backfill");
+    }
+
+    #[tokio::test]
     async fn server_status_exposes_startup_measurement_dimensions() {
         let mut state = test_server_state(SessionManager::default());
         state.session_search_enabled = false;

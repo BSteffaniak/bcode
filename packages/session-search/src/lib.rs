@@ -35,6 +35,10 @@ pub const OP_REMOVE_SESSION: &str = "remove_session";
 pub const OP_PURGE: &str = "purge";
 /// Explicitly discard and recreate provider-owned derived state for historical backfill.
 pub const OP_REBUILD: &str = "rebuild";
+/// Maximum providers included in one complete historical-backfill operation.
+pub const MAX_COMPLETE_BACKFILL_PROVIDERS: usize = 64;
+/// Maximum bounded convergence passes for one complete historical-backfill operation.
+pub const MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES: usize = 8;
 /// Maximum canonical sessions selected by one explicit backfill request.
 pub const MAX_BACKFILL_SESSIONS: usize = 256;
 /// Maximum bounded ingestion batches processed per session in one backfill request.
@@ -1771,6 +1775,34 @@ pub struct CompleteSessionSearchBackfillProgress {
     pub providers_completed: usize,
 }
 
+impl CompleteSessionSearchBackfillProgress {
+    /// Validate bounded provider identities and monotonic aggregate progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider identity/count or progress counters violate portable bounds.
+    pub fn validate(&self) -> Result<(), ContractValidationError> {
+        validate_complete_provider_ids(&self.provider_ids)?;
+        if let Some(current) = &self.current_provider_id {
+            validate_nonempty_bounded("current_provider_id", current, MAX_FILTER_VALUE_BYTES)?;
+            if !self.provider_ids.contains(current) {
+                return Err(ContractValidationError::InvalidFilter(
+                    "current provider is not in the snapshotted provider set",
+                ));
+            }
+        }
+        if self.convergence_pass == 0
+            || self.convergence_pass > MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES
+            || self.providers_completed > self.provider_ids.len()
+        {
+            return Err(ContractValidationError::InvalidFilter(
+                "complete backfill progress counters are inconsistent",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Terminal aggregate for one provider in complete historical backfill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompleteSessionSearchBackfillProviderResult {
@@ -1784,6 +1816,38 @@ pub struct CompleteSessionSearchBackfillProviderResult {
     pub error: Option<SessionSearchServiceError>,
 }
 
+impl CompleteSessionSearchBackfillProviderResult {
+    /// Validate bounded identity, counts, and failure summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when counts are inconsistent or public text exceeds portable bounds.
+    pub fn validate(&self) -> Result<(), ContractValidationError> {
+        validate_nonempty_bounded("provider_id", &self.provider_id, MAX_FILTER_VALUE_BYTES)?;
+        if self
+            .completed_sessions
+            .saturating_add(self.incomplete_sessions)
+            .saturating_add(self.failed_sessions)
+            > self.selected_sessions
+            || (self.catalog_pages == 0 && self.selected_sessions > 0)
+        {
+            return Err(ContractValidationError::InvalidFilter(
+                "complete backfill provider counts are inconsistent",
+            ));
+        }
+        if let Some(error) = &self.error
+            && error.message.len() > MAX_HIT_PREVIEW_BYTES
+        {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "provider_error_message",
+                actual: error.message.len(),
+                maximum: MAX_HIT_PREVIEW_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Terminal response for one explicit complete historical-backfill operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompleteSessionSearchBackfillResponse {
@@ -1793,6 +1857,57 @@ pub struct CompleteSessionSearchBackfillResponse {
     pub convergence_passes: usize,
     pub cancelled: bool,
     pub providers: Vec<CompleteSessionSearchBackfillProviderResult>,
+}
+
+impl CompleteSessionSearchBackfillResponse {
+    /// Validate bounded provider aggregates and convergence metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider identities, counts, or convergence facts are inconsistent.
+    pub fn validate(&self) -> Result<(), ContractValidationError> {
+        validate_complete_provider_ids(&self.provider_ids)?;
+        if self.providers.len() > self.provider_ids.len()
+            || self.convergence_passes == 0
+            || self.convergence_passes > MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES
+        {
+            return Err(ContractValidationError::InvalidFilter(
+                "complete backfill aggregate bounds are inconsistent",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for provider in &self.providers {
+            provider.validate()?;
+            if !self.provider_ids.contains(&provider.provider_id)
+                || !seen.insert(provider.provider_id.as_str())
+            {
+                return Err(ContractValidationError::InvalidFilter(
+                    "complete backfill provider aggregates do not match the snapshot",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_complete_provider_ids(provider_ids: &[String]) -> Result<(), ContractValidationError> {
+    if provider_ids.is_empty() || provider_ids.len() > MAX_COMPLETE_BACKFILL_PROVIDERS {
+        return Err(ContractValidationError::LimitExceeded {
+            field: "provider_ids",
+            actual: provider_ids.len(),
+            maximum: MAX_COMPLETE_BACKFILL_PROVIDERS,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for provider_id in provider_ids {
+        validate_nonempty_bounded("provider_id", provider_id, MAX_FILTER_VALUE_BYTES)?;
+        if !seen.insert(provider_id.as_str()) {
+            return Err(ContractValidationError::InvalidFilter(
+                "complete backfill provider identities must be unique",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Portable summary of one explicit bounded historical backfill request.
@@ -1999,6 +2114,51 @@ mod tests {
             mode: TextMatchMode::Terms,
             fields: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn complete_backfill_contracts_round_trip_and_reject_inconsistent_bounds() {
+        let progress = CompleteSessionSearchBackfillProgress {
+            provider_ids: vec!["provider.a".to_owned(), "provider.b".to_owned()],
+            current_provider_id: Some("provider.b".to_owned()),
+            catalog_revision_started: 7,
+            convergence_pass: 2,
+            providers_completed: 1,
+        };
+        progress.validate().expect("valid progress");
+        let encoded = serde_json::to_value(&progress).expect("progress encodes");
+        let decoded: CompleteSessionSearchBackfillProgress =
+            serde_json::from_value(encoded).expect("progress decodes");
+        assert_eq!(decoded, progress);
+
+        let response = CompleteSessionSearchBackfillResponse {
+            provider_ids: progress.provider_ids.clone(),
+            catalog_revision_started: 7,
+            catalog_revision_completed: 8,
+            convergence_passes: 2,
+            cancelled: false,
+            providers: vec![CompleteSessionSearchBackfillProviderResult {
+                provider_id: "provider.a".to_owned(),
+                selected_sessions: 1,
+                completed_sessions: 1,
+                incomplete_sessions: 0,
+                failed_sessions: 0,
+                catalog_pages: 1,
+                error: None,
+            }],
+        };
+        response.validate().expect("valid response");
+        let encoded = serde_json::to_value(&response).expect("response encodes");
+        let decoded: CompleteSessionSearchBackfillResponse =
+            serde_json::from_value(encoded).expect("response decodes");
+        assert_eq!(decoded, response);
+
+        let mut invalid = progress;
+        invalid.providers_completed = 3;
+        assert!(invalid.validate().is_err());
+        let mut duplicate = response;
+        duplicate.provider_ids = vec!["provider.a".to_owned(), "provider.a".to_owned()];
+        assert!(duplicate.validate().is_err());
     }
 
     #[test]
