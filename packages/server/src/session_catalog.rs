@@ -107,6 +107,12 @@ impl SessionCatalog {
         self.revision_rx.clone()
     }
 
+    /// Return the current catalog revision without starting discovery or loading storage.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        *self.revision_rx.borrow()
+    }
+
     /// Return the current coherent catalog snapshot for a working directory.
     pub async fn snapshot(
         &self,

@@ -1717,6 +1717,38 @@ impl SessionManager {
         sorted_session_summaries(handles, &working_directory)
     }
 
+    /// Return one stable bounded page of native session summaries ordered by update time and ID.
+    ///
+    /// An empty `session_ids` set selects from the complete native catalog. The cursor is exclusive.
+    /// This method retains at most `limit + 1` summaries while scanning the loaded catalog.
+    pub async fn session_summaries_page(
+        &self,
+        session_ids: &BTreeSet<SessionId>,
+        after_timestamp_ms: Option<u64>,
+        before_timestamp_ms: Option<u64>,
+        cursor: Option<(u64, SessionId)>,
+        limit: usize,
+    ) -> Vec<SessionSummary> {
+        let inner = self.inner.lock().await;
+        let retain = limit.saturating_add(1);
+        let mut selected = BTreeMap::new();
+        for handle in inner.sessions.values() {
+            let summary = handle.snapshot().summary;
+            if (!session_ids.is_empty() && !session_ids.contains(&summary.id))
+                || after_timestamp_ms.is_some_and(|after| summary.updated_at_ms < after)
+                || before_timestamp_ms.is_some_and(|before| summary.updated_at_ms > before)
+                || cursor.is_some_and(|cursor| (summary.updated_at_ms, summary.id) <= cursor)
+            {
+                continue;
+            }
+            selected.insert((summary.updated_at_ms, summary.id), summary);
+            if selected.len() > retain {
+                selected.pop_last();
+            }
+        }
+        selected.into_values().collect()
+    }
+
     /// List all already-loaded sessions, including inspectable background execution sessions.
     pub async fn all_session_summaries(&self) -> Vec<SessionSummary> {
         self.all_session_catalog_entries()

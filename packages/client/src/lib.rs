@@ -1929,7 +1929,25 @@ impl BcodeClient {
         }
     }
 
-    /// Start an addressable historical backfill operation.
+    /// Start an addressable complete historical backfill operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_search_complete_backfill_start(
+        &self,
+        request: bcode_session_search::CompleteSessionSearchBackfillRequest,
+    ) -> Result<bcode_session_search::StartSessionSearchBackfillResponse, ClientError> {
+        match self
+            .send_request(Request::SessionSearchCompleteBackfillStart { request })
+            .await?
+        {
+            ResponsePayload::SessionSearchCompleteBackfillStarted { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Start an addressable bounded single-provider historical backfill operation.
     ///
     /// # Errors
     ///

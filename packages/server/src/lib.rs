@@ -2345,13 +2345,17 @@ fn resolve_plugin_configs(
             manifests.insert(manifest.id.clone(), manifest);
         }
     }
+    if let Ok(discovered) = bcode_plugin::discover_plugins() {
+        for plugin in discovered {
+            manifests
+                .entry(plugin.manifest.id.clone())
+                .or_insert(plugin.manifest);
+        }
+    }
     manifests
         .values()
-        .filter_map(|manifest| {
+        .map(|manifest| {
             let raw = resolved_plugin_config_value(config, manifest);
-            if raw.is_null() {
-                return None;
-            }
             let delivered = sanitize_plugin_config_value(&raw);
             let redacted = redact_plugin_config_value(&raw);
             let plugin_id = manifest.id.clone();
@@ -2361,13 +2365,33 @@ fn resolve_plugin_configs(
                 std::sync::Arc::new(move |_interface_id, _operation, _delivered_config| {
                     resolve_invocation_secrets(&plugin_id, &config, &resolver_source)
                 });
-            Some((
-                manifest.id.clone(),
-                bcode_plugin::ResolvedPluginConfig::new(delivered, redacted)
-                    .with_secret_resolver(resolver),
-            ))
+            let plugin_config = bcode_plugin::ResolvedPluginConfig::new(delivered, redacted)
+                .with_state_root(managed_plugin_state_root(&manifest.id))
+                .with_secret_resolver(resolver);
+            (manifest.id.clone(), plugin_config)
         })
         .collect()
+}
+
+fn managed_plugin_state_root(plugin_id: &str) -> PathBuf {
+    let encoded_id = plugin_id
+        .bytes()
+        .flat_map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+                vec![char::from(byte)].into_iter()
+            } else {
+                format!("%{byte:02X}")
+                    .chars()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            }
+        })
+        .collect::<String>();
+    bcode_config::default_state_dir()
+        .join("derived")
+        .join("plugins")
+        .join(bcode_ipc::daemon_namespace())
+        .join(encoded_id)
 }
 
 fn resolved_plugin_config_value(
@@ -3821,6 +3845,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionSearchExplain { .. } => "session_search_explain",
         Request::SessionSearchPurge { .. } => "session_search_purge",
         Request::SessionSearchRebuild { .. } => "session_search_rebuild",
+        Request::SessionSearchCompleteBackfillStart { .. } => {
+            "session_search_complete_backfill_start"
+        }
         Request::SessionSearchBackfillStart { .. } => "session_search_backfill_start",
         Request::SessionSearchBackfillStatus { .. } => "session_search_backfill_status",
         Request::SessionSearchBackfillWait { .. } => "session_search_backfill_wait",
@@ -4225,6 +4252,10 @@ async fn handle_request_inner(
         } => {
             let result = session_search::rebuild_provider(state, &provider_id, confirmation).await;
             handle_session_search_maintenance(request_id, writer, result).await
+        }
+        Request::SessionSearchCompleteBackfillStart { request } => {
+            let result = start_complete_session_search_backfill(Arc::clone(state), request).await;
+            handle_complete_session_search_backfill_start(request_id, writer, result).await
         }
         Request::SessionSearchBackfillStart { request } => {
             let result = start_session_search_backfill(Arc::clone(state), request).await;
@@ -8992,6 +9023,150 @@ async fn handle_session_search_maintenance(
 
 const MAX_SESSION_SEARCH_BACKFILL_OPERATIONS: usize = 128;
 
+async fn handle_complete_session_search_backfill_start(
+    request_id: u64,
+    writer: &SharedWriter,
+    result: Result<
+        bcode_session_search::StartSessionSearchBackfillResponse,
+        bcode_session_search::SessionSearchServiceError,
+    >,
+) -> Result<(), ServerError> {
+    match result {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionSearchCompleteBackfillStarted { response }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    format!("session_search_{:?}", error.code).to_lowercase(),
+                    error.message,
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn start_complete_session_search_backfill(
+    state: Arc<ServerState>,
+    request: bcode_session_search::CompleteSessionSearchBackfillRequest,
+) -> Result<
+    bcode_session_search::StartSessionSearchBackfillResponse,
+    bcode_session_search::SessionSearchServiceError,
+> {
+    request
+        .validate()
+        .map_err(|error| bcode_session_search::SessionSearchServiceError {
+            code: bcode_session_search::SearchErrorCode::InvalidRequest,
+            message: error.to_string(),
+            retryable: false,
+        })?;
+    let provider_id = request
+        .provider_id
+        .clone()
+        .unwrap_or_else(|| "all-enabled-providers".to_owned());
+    let mut operations = state.session_search_backfills.lock().await;
+    admit_session_search_backfill_operation(&mut operations)?;
+    let id = state
+        .next_session_search_backfill_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let operation_id = format!("session-search-backfill-{id}");
+    let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+    let changed = Arc::new(Notify::new());
+    operations.insert(
+        operation_id.clone(),
+        SessionSearchBackfillOperation {
+            status: bcode_session_search::SessionSearchBackfillOperationStatus {
+                operation_id: operation_id.clone(),
+                provider_id: provider_id.clone(),
+                revision: 1,
+                state: bcode_session_search::SessionSearchBackfillOperationState::Running,
+                response: None,
+                complete_response: None,
+                error: None,
+            },
+            cancellation: cancellation.clone(),
+            changed,
+        },
+    );
+    drop(operations);
+    let task_operation_id = operation_id.clone();
+    tokio::spawn(async move {
+        let result = session_search::complete_backfill(&state, request, &cancellation).await;
+        let mut operations = state.session_search_backfills.lock().await;
+        if let Some(operation) = operations.get_mut(&task_operation_id) {
+            operation.status.revision = operation.status.revision.saturating_add(1);
+            let cancellation_requested = operation.cancellation.is_cancelled();
+            match result {
+                Ok(response) => {
+                    operation.status.state = if cancellation_requested || response.cancelled {
+                        bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                    } else if response.providers.iter().any(|provider| {
+                        provider.error.is_some()
+                            || provider.failed_sessions > 0
+                            || provider.incomplete_sessions > 0
+                    }) {
+                        bcode_session_search::SessionSearchBackfillOperationState::Failed
+                    } else {
+                        bcode_session_search::SessionSearchBackfillOperationState::Completed
+                    };
+                    operation.status.complete_response = Some(response);
+                }
+                Err(error) => {
+                    operation.status.state = if cancellation_requested {
+                        bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                    } else {
+                        bcode_session_search::SessionSearchBackfillOperationState::Failed
+                    };
+                    operation.status.error = Some(error);
+                }
+            }
+            operation.changed.notify_waiters();
+        }
+    });
+    Ok(bcode_session_search::StartSessionSearchBackfillResponse {
+        operation_id,
+        provider_id,
+    })
+}
+
+fn admit_session_search_backfill_operation(
+    operations: &mut BTreeMap<String, SessionSearchBackfillOperation>,
+) -> Result<(), bcode_session_search::SessionSearchServiceError> {
+    if operations.len() < MAX_SESSION_SEARCH_BACKFILL_OPERATIONS {
+        return Ok(());
+    }
+    let terminal_id = operations.iter().find_map(|(id, operation)| {
+        matches!(
+            operation.status.state,
+            bcode_session_search::SessionSearchBackfillOperationState::Completed
+                | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                | bcode_session_search::SessionSearchBackfillOperationState::Failed
+        )
+        .then(|| id.clone())
+    });
+    terminal_id.map_or_else(
+        || {
+            Err(bcode_session_search::SessionSearchServiceError {
+                code: bcode_session_search::SearchErrorCode::QuotaExceeded,
+                message: "too many active session-search backfill operations".to_owned(),
+                retryable: true,
+            })
+        },
+        |terminal_id| {
+            operations.remove(&terminal_id);
+            Ok(())
+        },
+    )
+}
+
 async fn handle_session_search_backfill_start(
     request_id: u64,
     writer: &SharedWriter,
@@ -9031,26 +9206,7 @@ async fn start_session_search_backfill(
     bcode_session_search::SessionSearchServiceError,
 > {
     let mut operations = state.session_search_backfills.lock().await;
-    if operations.len() >= MAX_SESSION_SEARCH_BACKFILL_OPERATIONS {
-        let terminal_id = operations.iter().find_map(|(id, operation)| {
-            matches!(
-                operation.status.state,
-                bcode_session_search::SessionSearchBackfillOperationState::Completed
-                    | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
-                    | bcode_session_search::SessionSearchBackfillOperationState::Failed
-            )
-            .then(|| id.clone())
-        });
-        if let Some(terminal_id) = terminal_id {
-            operations.remove(&terminal_id);
-        } else {
-            return Err(bcode_session_search::SessionSearchServiceError {
-                code: bcode_session_search::SearchErrorCode::QuotaExceeded,
-                message: "too many active session-search backfill operations".to_owned(),
-                retryable: true,
-            });
-        }
-    }
+    admit_session_search_backfill_operation(&mut operations)?;
     let id = state
         .next_session_search_backfill_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9067,6 +9223,7 @@ async fn start_session_search_backfill(
                 revision: 1,
                 state: bcode_session_search::SessionSearchBackfillOperationState::Running,
                 response: None,
+                complete_response: None,
                 error: None,
             },
             cancellation: cancellation.clone(),
@@ -31086,6 +31243,7 @@ mod tests {
                     revision: 1,
                     state: bcode_session_search::SessionSearchBackfillOperationState::Running,
                     response: None,
+                    complete_response: None,
                     error: None,
                 },
                 cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -31444,6 +31602,32 @@ mod tests {
             bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned
         );
         server.abort();
+    }
+
+    #[test]
+    fn managed_plugin_state_roots_are_artifact_isolated_and_component_safe() {
+        let ordinary = managed_plugin_state_root("bcode.tantivy-session-search");
+        assert!(ordinary.is_absolute());
+        assert!(ordinary.starts_with(bcode_config::default_state_dir().join("derived/plugins")));
+        assert_eq!(
+            ordinary.parent().and_then(std::path::Path::file_name),
+            Some(std::ffi::OsStr::new(&bcode_ipc::daemon_namespace()))
+        );
+        assert_eq!(
+            ordinary.file_name(),
+            Some(std::ffi::OsStr::new("bcode.tantivy-session-search"))
+        );
+
+        let hostile = managed_plugin_state_root("../plugin/with separators");
+        assert_eq!(
+            hostile.parent(),
+            ordinary.parent(),
+            "plugin identity must remain one encoded path component"
+        );
+        assert_eq!(
+            hostile.file_name(),
+            Some(std::ffi::OsStr::new("..%2Fplugin%2Fwith%20separators"))
+        );
     }
 
     #[test]

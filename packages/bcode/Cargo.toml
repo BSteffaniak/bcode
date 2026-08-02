@@ -204,6 +204,8 @@ static-bundled-pi-session-import-plugin = [
 static-bundled-plugins = [
     "bundled-plugins",
     "cli",
+    "static-bundled-compressed-session-search-plugin",
+    "static-bundled-tantivy-session-search-plugin",
     "bcode_bundled_plugins/static-bundled-plugins",
     "bcode_cli/static-bundled-plugins",
 ]

@@ -362,12 +362,15 @@ impl ConcurrentRustPlugin for TantivySessionSearchPlugin {
                 "unsupported Tantivy session-search interface",
             );
         }
-        let config = match context.config_or_default::<ProviderConfig>() {
+        let mut config = match context.config_or_default::<ProviderConfig>() {
             Ok(config) => config,
             Err(error) => {
                 return ServiceResponse::error("invalid_configuration", error.to_string());
             }
         };
+        if config.storage_root.is_none() {
+            config.storage_root.clone_from(&context.config.state_root);
+        }
         if let Err(error) = config.validate() {
             return error_response(&error);
         }

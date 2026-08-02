@@ -1408,6 +1408,12 @@ pub struct PluginConfigContext {
     pub redacted_config: serde_json::Value,
     #[serde(default)]
     pub secrets: BTreeMap<String, String>,
+    /// Host-authorized root for disposable plugin-owned state.
+    ///
+    /// The host does not create this path. Plugins remain responsible for
+    /// confinement checks before opening or deleting state beneath it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_root: Option<std::path::PathBuf>,
 }
 
 impl PluginConfigContext {
@@ -2601,6 +2607,7 @@ mod tests {
         TransientProgressLimits, TransientProgressPublisher,
     };
     use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
     use std::ffi::c_void;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
@@ -2832,6 +2839,28 @@ mod tests {
             bcode_tool::ToolContributionOperation::Remove
         );
         assert_eq!(decoded[3].contribution.payload, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn plugin_config_context_round_trips_optional_state_root_and_defaults_compatibly() {
+        let context = super::PluginConfigContext {
+            config: serde_json::json!({"enabled": true}),
+            redacted_config: serde_json::json!({"enabled": true}),
+            secrets: BTreeMap::new(),
+            state_root: Some(std::path::PathBuf::from("/state/plugins/example")),
+        };
+        let encoded = serde_json::to_value(&context).expect("config context encodes");
+        let decoded: super::PluginConfigContext =
+            serde_json::from_value(encoded).expect("config context decodes");
+        assert_eq!(decoded, context);
+
+        let legacy: super::PluginConfigContext = serde_json::from_value(serde_json::json!({
+            "config": null,
+            "redacted_config": null,
+            "secrets": {}
+        }))
+        .expect("legacy config context decodes");
+        assert!(legacy.state_root.is_none());
     }
 
     #[test]

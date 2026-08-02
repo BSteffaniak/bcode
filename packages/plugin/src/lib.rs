@@ -995,6 +995,7 @@ pub type PluginSecretResolver = Arc<
 pub struct ResolvedPluginConfig {
     pub config: serde_json::Value,
     pub redacted_config: serde_json::Value,
+    pub state_root: Option<PathBuf>,
     secret_resolver: Option<PluginSecretResolver>,
 }
 
@@ -1004,6 +1005,7 @@ impl std::fmt::Debug for ResolvedPluginConfig {
             .debug_struct("ResolvedPluginConfig")
             .field("config", &self.config)
             .field("redacted_config", &self.redacted_config)
+            .field("state_root", &self.state_root)
             .field("has_secret_resolver", &self.secret_resolver.is_some())
             .finish()
     }
@@ -1014,6 +1016,7 @@ impl Default for ResolvedPluginConfig {
         Self {
             config: serde_json::Value::Null,
             redacted_config: serde_json::Value::Null,
+            state_root: None,
             secret_resolver: None,
         }
     }
@@ -1026,8 +1029,16 @@ impl ResolvedPluginConfig {
         Self {
             config,
             redacted_config,
+            state_root: None,
             secret_resolver: None,
         }
+    }
+
+    /// Attach a host-authorized root for disposable plugin-owned state.
+    #[must_use]
+    pub fn with_state_root(mut self, state_root: PathBuf) -> Self {
+        self.state_root = Some(state_root);
+        self
     }
 
     /// Attach a host-owned invocation-time secret resolver.
@@ -1493,6 +1504,7 @@ impl LoadedPlugin {
                 config: self.config.config.clone(),
                 redacted_config: self.config.redacted_config.clone(),
                 secrets,
+                state_root: self.config.state_root.clone(),
             },
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),

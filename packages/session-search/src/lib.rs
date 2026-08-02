@@ -1613,6 +1613,63 @@ pub struct RebuildSessionSearchRequest {
     pub confirmation: String,
 }
 
+/// Explicit complete historical-backfill selection.
+///
+/// The optional provider scopes the operation to one enabled provider. When absent, the daemon
+/// snapshots every enabled provider and processes each through bounded catalog and ingestion pages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteSessionSearchBackfillRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub session_ids: BTreeSet<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_timestamp_ms: Option<u64>,
+    /// Deadline for each bounded provider/catalog slice, not the whole operation.
+    #[serde(default = "default_backfill_deadline_ms")]
+    pub slice_deadline_ms: u64,
+}
+
+impl CompleteSessionSearchBackfillRequest {
+    /// Validate portable selection and per-slice execution bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the optional provider identity, selected-session count, timestamp
+    /// range, or per-slice deadline violates portable bounds.
+    pub fn validate(&self) -> Result<(), ContractValidationError> {
+        if let Some(provider_id) = &self.provider_id {
+            validate_nonempty_bounded("provider_id", provider_id, MAX_FILTER_VALUE_BYTES)?;
+        }
+        if self.session_ids.len() > MAX_BACKFILL_SESSIONS {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "session_ids",
+                actual: self.session_ids.len(),
+                maximum: MAX_BACKFILL_SESSIONS,
+            });
+        }
+        if self.slice_deadline_ms == 0 || self.slice_deadline_ms > MAX_BACKFILL_DEADLINE_MS {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "slice_deadline_ms",
+                actual: usize::try_from(self.slice_deadline_ms).unwrap_or(usize::MAX),
+                maximum: usize::try_from(MAX_BACKFILL_DEADLINE_MS).unwrap_or(usize::MAX),
+            });
+        }
+        if self
+            .after_timestamp_ms
+            .zip(self.before_timestamp_ms)
+            .is_some_and(|(after, before)| after > before)
+        {
+            return Err(ContractValidationError::InvalidFilter(
+                "after timestamp must not exceed before timestamp",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Stable continuation point for bounded catalog-wide historical backfill selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchBackfillCursor {
@@ -1703,6 +1760,30 @@ pub struct SessionSearchBackfillSessionResult {
     pub error: Option<SessionSearchServiceError>,
 }
 
+/// Terminal aggregate for one provider in complete historical backfill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteSessionSearchBackfillProviderResult {
+    pub provider_id: String,
+    pub selected_sessions: usize,
+    pub completed_sessions: usize,
+    pub incomplete_sessions: usize,
+    pub failed_sessions: usize,
+    pub catalog_pages: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<SessionSearchServiceError>,
+}
+
+/// Terminal response for one explicit complete historical-backfill operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteSessionSearchBackfillResponse {
+    pub provider_ids: Vec<String>,
+    pub catalog_revision_started: u64,
+    pub catalog_revision_completed: u64,
+    pub convergence_passes: usize,
+    pub cancelled: bool,
+    pub providers: Vec<CompleteSessionSearchBackfillProviderResult>,
+}
+
 /// Portable summary of one explicit bounded historical backfill request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchBackfillResponse {
@@ -1745,6 +1826,8 @@ pub struct SessionSearchBackfillOperationStatus {
     pub state: SessionSearchBackfillOperationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<SessionSearchBackfillResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete_response: Option<CompleteSessionSearchBackfillResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<SessionSearchServiceError>,
 }

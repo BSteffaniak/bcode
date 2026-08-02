@@ -1533,6 +1533,36 @@ mod tests {
     }
 
     #[test]
+    fn stale_plugin_state_cleanup_is_namespace_confined_and_symlink_safe() {
+        let state = tempfile::tempdir().expect("state");
+        let plugins = state.path().join("derived/plugins");
+        let stale_root = plugins.join("ipc-v1-stale");
+        let retained = plugins.join("ipc-v1-retained");
+        fs::create_dir_all(&stale_root).expect("stale state");
+        fs::create_dir_all(&retained).expect("retained state");
+        fs::write(stale_root.join("provider.json"), b"derived").expect("provider state");
+
+        remove_stale_plugin_state(state.path(), "ipc-v1-stale").expect("cleanup stale state");
+        assert!(!stale_root.exists());
+        assert!(retained.exists());
+        remove_stale_plugin_state(state.path(), "../ipc-v1-retained")
+            .expect("reject hostile namespace");
+        assert!(retained.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let external = tempfile::tempdir().expect("external");
+            let link = plugins.join("ipc-v1-link");
+            symlink(external.path(), &link).expect("namespace symlink");
+            remove_stale_plugin_state(state.path(), "ipc-v1-link")
+                .expect("symlink cleanup fails closed");
+            assert!(link.exists());
+            assert!(external.path().exists());
+        }
+    }
+
+    #[test]
     fn daemon_record_identity_fields_are_independently_validated() {
         let record = record_with_writer_epoch(Some(2));
         let exact = bcode_ipc::DaemonStatus {
@@ -2257,6 +2287,43 @@ async fn wait_for_existing_daemon(endpoint: &IpcEndpoint) -> bool {
     false
 }
 
+fn remove_stale_plugin_state(
+    state_dir: &Path,
+    namespace: &str,
+) -> Result<(), DaemonLifecycleError> {
+    if namespace.is_empty()
+        || namespace.len() > 256
+        || !namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Ok(());
+    }
+    let plugins_root = state_dir.join("derived").join("plugins");
+    let namespace_root = plugins_root.join(namespace);
+    let metadata = match fs::symlink_metadata(&namespace_root) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(DaemonLifecycleError::Io {
+                path: namespace_root,
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    fs::remove_dir_all(&namespace_root).map_err(|source| DaemonLifecycleError::Io {
+        path: namespace_root.clone(),
+        source,
+    })?;
+    if fs::read_dir(&plugins_root).is_ok_and(|mut entries| entries.next().is_none()) {
+        let _ = fs::remove_dir(&plugins_root);
+    }
+    Ok(())
+}
+
 async fn cleanup_stale_daemon_records() -> Result<(), DaemonLifecycleError> {
     let state_dir = bcode_config::default_state_dir();
     for (path, record) in read_records(&state_dir) {
@@ -2269,6 +2336,7 @@ async fn cleanup_stale_daemon_records() -> Result<(), DaemonLifecycleError> {
         ) {
             continue;
         }
+        remove_stale_plugin_state(&state_dir, &record.namespace)?;
         remove_record_path(&path)?;
         remove_stale_socket(&record);
     }

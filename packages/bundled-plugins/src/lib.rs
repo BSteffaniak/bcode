@@ -434,6 +434,7 @@ fn compressed_session_search_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"),
         bcode_compressed_session_search_plugin::static_plugin(),
     )
+    .with_default_activation(bcode_plugin::PluginDefaultActivation::Disabled)
 }
 
 #[cfg(feature = "static-bundled-tantivy-session-search-plugin")]
@@ -729,6 +730,90 @@ mod tests {
             adapter.tui_surface_kind.as_deref(),
             Some("bcode.question.inline")
         );
+    }
+
+    #[cfg(all(
+        feature = "static-bundled-tantivy-session-search-plugin",
+        feature = "static-bundled-compressed-session-search-plugin"
+    ))]
+    #[test]
+    fn session_search_providers_have_safe_distribution_defaults() {
+        let static_plugins = super::static_bundled_plugins();
+        let all_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)
+            .expect("static plugin manifests parse");
+        let default_ids = bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)
+            .expect("static plugin manifests parse");
+
+        assert!(
+            all_ids
+                .iter()
+                .any(|id| id == "bcode.tantivy-session-search")
+        );
+        assert!(
+            all_ids
+                .iter()
+                .any(|id| id == "bcode.compressed-session-search")
+        );
+        assert!(
+            default_ids
+                .iter()
+                .any(|id| id == "bcode.tantivy-session-search")
+        );
+        assert!(
+            default_ids
+                .iter()
+                .all(|id| id != "bcode.compressed-session-search")
+        );
+
+        let default_selection = bcode_config::plugin_selection_with_default_plugin_ids(
+            &bcode_config::BcodeConfig::default(),
+            &default_ids,
+        );
+        assert!(default_selection.is_enabled("bcode.tantivy-session-search"));
+        assert!(!default_selection.is_enabled("bcode.compressed-session-search"));
+
+        let compressed_config = bcode_config::BcodeConfig {
+            plugins: bcode_config::PluginConfig {
+                enabled: std::collections::BTreeSet::from([
+                    "bcode.compressed-session-search".to_owned()
+                ]),
+                ..bcode_config::PluginConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let compressed_selection = bcode_config::plugin_selection_with_default_plugin_ids(
+            &compressed_config,
+            &default_ids,
+        );
+        assert!(compressed_selection.is_enabled("bcode.compressed-session-search"));
+
+        let disabled_config = bcode_config::BcodeConfig {
+            plugins: bcode_config::PluginConfig {
+                disabled: std::collections::BTreeSet::from([
+                    "bcode.tantivy-session-search".to_owned()
+                ]),
+                ..bcode_config::PluginConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let disabled_selection =
+            bcode_config::plugin_selection_with_default_plugin_ids(&disabled_config, &default_ids);
+        assert!(!disabled_selection.is_enabled("bcode.tantivy-session-search"));
+
+        let all_config = bcode_config::BcodeConfig {
+            plugins: bcode_config::PluginConfig {
+                default: bcode_config::PluginDefaultMode::All,
+                disabled: std::collections::BTreeSet::from([
+                    "bcode.compressed-session-search".to_owned()
+                ]),
+                ..bcode_config::PluginConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let all_selection =
+            bcode_config::plugin_selection_with_default_plugin_ids(&all_config, &default_ids);
+        assert!(all_selection.is_enabled("bcode.tantivy-session-search"));
+        assert!(!all_selection.is_enabled("bcode.compressed-session-search"));
     }
 
     #[cfg(feature = "static-bundled-vim-edit-plugin")]

@@ -79,6 +79,149 @@ pub async fn rebuild_provider(
     .await
 }
 
+/// Run explicit complete historical backfill across every selected provider.
+///
+/// Provider and catalog work remains bounded by the existing single-provider request. Reissuing
+/// this operation is safe because each provider owns durable sequence/text checkpoints.
+///
+/// # Errors
+///
+/// Returns a normalized error when selection is invalid, search is disabled, no eligible provider
+/// exists, or catalog discovery fails.
+#[allow(clippy::too_many_lines)]
+pub async fn complete_backfill(
+    state: &ServerState,
+    request: bcode_session_search::CompleteSessionSearchBackfillRequest,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<bcode_session_search::CompleteSessionSearchBackfillResponse, SessionSearchServiceError>
+{
+    request
+        .validate()
+        .map_err(|error| SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: bounded_message(&error.to_string()),
+            retryable: false,
+        })?;
+    if !state.session_search_enabled {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: "session search is globally disabled".to_owned(),
+            retryable: false,
+        });
+    }
+    let inventory = list_providers(state).await;
+    let mut provider_ids = inventory
+        .providers
+        .into_iter()
+        .filter(|provider| {
+            provider
+                .capabilities
+                .features
+                .contains(&SearchFeature::HistoricalBackfill)
+                && request
+                    .provider_id
+                    .as_ref()
+                    .is_none_or(|selected| selected == &provider.plugin_id)
+        })
+        .map(|provider| provider.plugin_id)
+        .collect::<Vec<_>>();
+    provider_ids.sort();
+    if provider_ids.is_empty() {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: request.provider_id.map_or_else(
+                || "no enabled session-search provider supports historical backfill".to_owned(),
+                |provider_id| {
+                    format!("session-search provider '{provider_id}' is not enabled and ready")
+                },
+            ),
+            retryable: false,
+        });
+    }
+
+    state
+        .sessions
+        .wait_catalog_loaded()
+        .await
+        .map_err(|error| SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: bounded_message(&error.to_string()),
+            retryable: true,
+        })?;
+    let revision_started = state.session_catalog.revision();
+    let mut providers = Vec::with_capacity(provider_ids.len());
+    for provider_id in &provider_ids {
+        let mut cursor = None;
+        let mut aggregate = bcode_session_search::CompleteSessionSearchBackfillProviderResult {
+            provider_id: provider_id.clone(),
+            selected_sessions: 0,
+            completed_sessions: 0,
+            incomplete_sessions: 0,
+            failed_sessions: 0,
+            catalog_pages: 0,
+            error: None,
+        };
+        loop {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let response = backfill_provider_with_cancellation(
+                state,
+                BackfillSessionSearchRequest {
+                    provider_id: provider_id.clone(),
+                    session_ids: request.session_ids.clone(),
+                    after_timestamp_ms: request.after_timestamp_ms,
+                    before_timestamp_ms: request.before_timestamp_ms,
+                    cursor,
+                    deadline_ms: request.slice_deadline_ms,
+                },
+                Some(cancellation),
+            )
+            .await;
+            match response {
+                Ok(response) => {
+                    aggregate.selected_sessions = aggregate
+                        .selected_sessions
+                        .saturating_add(response.selected_sessions);
+                    aggregate.completed_sessions = aggregate
+                        .completed_sessions
+                        .saturating_add(response.completed_sessions);
+                    aggregate.incomplete_sessions = aggregate
+                        .incomplete_sessions
+                        .saturating_add(response.incomplete_sessions);
+                    aggregate.failed_sessions = aggregate
+                        .failed_sessions
+                        .saturating_add(response.failed_sessions);
+                    aggregate.catalog_pages = aggregate.catalog_pages.saturating_add(1);
+                    cursor = response.next_cursor;
+                    if cursor.is_none() || response.deadline_reached {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    aggregate.error = Some(error);
+                    break;
+                }
+            }
+        }
+        providers.push(aggregate);
+        if cancellation.is_cancelled() {
+            break;
+        }
+    }
+    let revision_completed = state.session_catalog.revision();
+    Ok(
+        bcode_session_search::CompleteSessionSearchBackfillResponse {
+            provider_ids,
+            catalog_revision_started: revision_started,
+            catalog_revision_completed: revision_completed,
+            convergence_passes: 1,
+            cancelled: cancellation.is_cancelled(),
+            providers,
+        },
+    )
+}
+
 /// Explicitly backfill selected or bounded catalog sessions into one provider.
 ///
 /// The daemon owns canonical selection and bounded forward reads. Progress resumes from the
@@ -158,20 +301,19 @@ pub async fn backfill_provider_with_cancellation(
             message: bounded_message(&error.to_string()),
             retryable: true,
         })?;
-    let mut summaries = state.sessions.all_session_summaries().await;
-    summaries.retain(|summary| {
-        (request.session_ids.is_empty() || request.session_ids.contains(&summary.id))
-            && request
-                .after_timestamp_ms
-                .is_none_or(|after| summary.updated_at_ms >= after)
-            && request
-                .before_timestamp_ms
-                .is_none_or(|before| summary.updated_at_ms <= before)
-            && request.cursor.as_ref().is_none_or(|cursor| {
-                (summary.updated_at_ms, summary.id) > (cursor.updated_at_ms, cursor.session_id)
-            })
-    });
-    summaries.sort_by_key(|summary| (summary.updated_at_ms, summary.id));
+    let mut summaries = state
+        .sessions
+        .session_summaries_page(
+            &request.session_ids,
+            request.after_timestamp_ms,
+            request.before_timestamp_ms,
+            request
+                .cursor
+                .as_ref()
+                .map(|cursor| (cursor.updated_at_ms, cursor.session_id)),
+            MAX_BACKFILL_SESSIONS,
+        )
+        .await;
     let selection_truncated = summaries.len() > MAX_BACKFILL_SESSIONS;
     summaries.truncate(MAX_BACKFILL_SESSIONS);
     let next_cursor = selection_truncated

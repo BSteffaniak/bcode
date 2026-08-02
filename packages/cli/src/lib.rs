@@ -2102,10 +2102,10 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Start an addressable historical backfill operation.
+    /// Start an addressable complete historical backfill operation.
     SearchBackfillStart {
         #[arg(long)]
-        provider: String,
+        provider: Option<String>,
         #[arg(long = "session")]
         sessions: Vec<SessionId>,
         #[arg(long)]
@@ -2141,10 +2141,10 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Explicitly backfill selected or bounded catalog sessions into one provider.
+    /// Explicitly backfill the complete selected catalog into all enabled or one scoped provider.
     SearchBackfill {
         #[arg(long)]
-        provider: String,
+        provider: Option<String>,
         /// Restrict maintenance to selected canonical session IDs.
         #[arg(long = "session")]
         sessions: Vec<SessionId>,
@@ -8959,7 +8959,7 @@ async fn handle_session_search_backfill_start_cli(command: SessionCommand) -> Re
         sessions,
         after_timestamp_ms,
         before_timestamp_ms,
-        cursor,
+        cursor: _,
         deadline_ms,
         json,
     } = command
@@ -8967,14 +8967,15 @@ async fn handle_session_search_backfill_start_cli(command: SessionCommand) -> Re
         unreachable!("session search backfill start handler received another command")
     };
     let response = BcodeClient::default_endpoint()
-        .session_search_backfill_start(bcode_session_search::BackfillSessionSearchRequest {
-            provider_id: provider,
-            session_ids: sessions.into_iter().collect(),
-            after_timestamp_ms,
-            before_timestamp_ms,
-            cursor,
-            deadline_ms,
-        })
+        .session_search_complete_backfill_start(
+            bcode_session_search::CompleteSessionSearchBackfillRequest {
+                provider_id: provider,
+                session_ids: sessions.into_iter().collect(),
+                after_timestamp_ms,
+                before_timestamp_ms,
+                slice_deadline_ms: deadline_ms,
+            },
+        )
         .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&response)?);
@@ -9012,6 +9013,31 @@ fn print_session_search_backfill_operation(
             "{}: {:?} provider={} revision={}",
             status.operation_id, status.state, status.provider_id, status.revision
         );
+        if let Some(response) = &status.complete_response {
+            println!(
+                "providers={} revisions={}->{} passes={} cancelled={}",
+                response.provider_ids.len(),
+                response.catalog_revision_started,
+                response.catalog_revision_completed,
+                response.convergence_passes,
+                response.cancelled
+            );
+            for provider in &response.providers {
+                println!(
+                    "  {}: selected={}, complete={}, incomplete={}, failed={}, pages={}{}",
+                    provider.provider_id,
+                    provider.selected_sessions,
+                    provider.completed_sessions,
+                    provider.incomplete_sessions,
+                    provider.failed_sessions,
+                    provider.catalog_pages,
+                    provider
+                        .error
+                        .as_ref()
+                        .map_or(String::new(), |error| format!(": {}", error.message))
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -9058,58 +9084,41 @@ fn parse_session_search_backfill_cursor(
 }
 
 async fn session_search_backfill(
-    provider: String,
+    provider: Option<String>,
     sessions: Vec<SessionId>,
     after_timestamp_ms: Option<u64>,
     before_timestamp_ms: Option<u64>,
-    cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
+    _cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
     deadline_ms: u64,
     json: bool,
 ) -> Result<(), CliError> {
-    let response = BcodeClient::default_endpoint()
-        .session_search_backfill(bcode_session_search::BackfillSessionSearchRequest {
-            provider_id: provider,
-            session_ids: sessions.into_iter().collect(),
-            after_timestamp_ms,
-            before_timestamp_ms,
-            cursor,
-            deadline_ms,
-        })
+    let client = BcodeClient::default_endpoint();
+    let started = client
+        .session_search_complete_backfill_start(
+            bcode_session_search::CompleteSessionSearchBackfillRequest {
+                provider_id: provider,
+                session_ids: sessions.into_iter().collect(),
+                after_timestamp_ms,
+                before_timestamp_ms,
+                slice_deadline_ms: deadline_ms,
+            },
+        )
         .await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-        return Ok(());
+    let mut revision = 0;
+    loop {
+        let status = client
+            .session_search_backfill_wait(started.operation_id.clone(), revision, 30_000)
+            .await?;
+        revision = status.revision;
+        if matches!(
+            status.state,
+            bcode_session_search::SessionSearchBackfillOperationState::Completed
+                | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                | bcode_session_search::SessionSearchBackfillOperationState::Failed
+        ) {
+            return print_session_search_backfill_operation(&status, json);
+        }
     }
-    println!(
-        "{} backfill: selected={}, complete={}, incomplete={}, failed={}, selection_truncated={}, next_cursor={}, deadline_reached={}, elapsed={}ms",
-        response.provider_id,
-        response.selected_sessions,
-        response.completed_sessions,
-        response.incomplete_sessions,
-        response.failed_sessions,
-        response.selection_truncated,
-        response.next_cursor.as_ref().map_or_else(
-            || "none".to_owned(),
-            |cursor| format!("{}:{}", cursor.updated_at_ms, cursor.session_id)
-        ),
-        response.deadline_reached,
-        response.elapsed_ms
-    );
-    for session in response.sessions {
-        println!(
-            "  {}: {:?}, batches={}, through={:?}, tail={:?}{}",
-            session.session_id,
-            session.outcome,
-            session.batches_applied,
-            session.indexed_through_sequence,
-            session.canonical_tail_sequence,
-            session
-                .error
-                .as_ref()
-                .map_or(String::new(), |error| format!(": {}", error.message))
-        );
-    }
-    Ok(())
 }
 
 async fn session_search_explain(command: SessionSearchCliCommand) -> Result<(), CliError> {
@@ -12020,6 +12029,24 @@ mod web_command_tests {
     }
 
     #[test]
+    fn session_search_backfill_parses_all_enabled_provider_scope() {
+        let cli = Cli::try_parse_from(["bcode", "session", "search-backfill", "--json"])
+            .expect("unscoped backfill command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session {
+                command: SessionCommand::SearchBackfill {
+                    provider: None,
+                    sessions,
+                    cursor: None,
+                    json: true,
+                    ..
+                }
+            }) if sessions.is_empty()
+        ));
+    }
+
+    #[test]
     fn session_search_backfill_parses_selected_and_time_bounded_scope() {
         let cli = Cli::try_parse_from([
             "bcode",
@@ -12050,7 +12077,7 @@ mod web_command_tests {
                     deadline_ms: 5000,
                     json: true,
                 }
-            }) if provider == "bcode.tantivy-session-search" && sessions.len() == 1
+            }) if provider.as_deref() == Some("bcode.tantivy-session-search") && sessions.len() == 1
         ));
     }
 
