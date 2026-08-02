@@ -260,6 +260,12 @@ working-directory change receive the new summary directory without rewriting ear
 records. Import completion and fork lineage do change the generation fingerprint because they define
 canonical provenance.
 
+The complete coordinator uses cooperative application-owned scheduling between bounded provider
+slices. Ordinary federated queries and incremental ingestion already in flight finish before the next
+maintenance slice, and newly waiting ordinary work is admitted before maintenance reacquires its
+slice. This prevents a catalog-wide run from monopolizing provider work while preserving bounded
+maintenance progress. Canonical writes remain outside this scheduler and never wait on provider work.
+
 The public client/IPC/CLI boundary exposes provider-scoped purge, empty rebuild, bounded
 single-provider backfill, and a complete explicit coordinator. `bcode session search-backfill`
 snapshots every enabled provider with historical-ingestion support in deterministic plugin-ID order;

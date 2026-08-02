@@ -334,6 +334,7 @@ pub struct ServerState {
     pub plugins: bcode_plugin::PluginRuntimeHost,
     session_search_enabled: bool,
     session_search_dirty: session_search::SessionSearchDirtyQueue,
+    session_search_work: session_search::SessionSearchWorkScheduler,
     session_search_backfills: Mutex<BTreeMap<String, SessionSearchBackfillOperation>>,
     next_session_search_backfill_id: std::sync::atomic::AtomicU64,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
@@ -1544,6 +1545,7 @@ impl ServerState {
             plugins,
             session_search_enabled: init.session_search_enabled,
             session_search_dirty: session_search::SessionSearchDirtyQueue::default(),
+            session_search_work: session_search::SessionSearchWorkScheduler::default(),
             session_search_backfills: Mutex::default(),
             next_session_search_backfill_id: std::sync::atomic::AtomicU64::new(1),
             model_catalog: init
@@ -31225,7 +31227,167 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     #[tokio::test]
+    async fn canonical_writes_complete_when_provider_backfill_fails_unavailable() {
+        let _guard = session_search::tests::lock_search_tests().await;
+        let state = Arc::new(session_search::tests::state_with_providers(&[(
+            "test.unavailable-session-search",
+            session_search::tests::TestProviderBehavior::UnavailableApply,
+        )]));
+        let session = state
+            .sessions
+            .create_session(
+                Some("failed write isolation".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "initial".to_owned(), 0)
+            .await
+            .expect("initial append");
+
+        let started = start_complete_session_search_backfill(
+            Arc::clone(&state),
+            bcode_session_search::CompleteSessionSearchBackfillRequest {
+                provider_id: Some("test.unavailable-session-search".to_owned()),
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                slice_deadline_ms: 5_000,
+            },
+        )
+        .await
+        .expect("start backfill");
+        let appended = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.sessions.append_context_compacted(
+                session.id,
+                "write survives failure".to_owned(),
+                0,
+            ),
+        )
+        .await
+        .expect("canonical write must not wait for provider failure")
+        .expect("canonical write succeeds");
+
+        let mut revision = 0;
+        let terminal = loop {
+            let status =
+                wait_session_search_backfill(&state, &started.operation_id, revision, 10_000)
+                    .await
+                    .expect("operation status");
+            revision = status.revision;
+            if matches!(
+                status.state,
+                bcode_session_search::SessionSearchBackfillOperationState::Completed
+                    | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                    | bcode_session_search::SessionSearchBackfillOperationState::Failed
+            ) {
+                break status;
+            }
+        };
+        assert_eq!(
+            terminal.state,
+            bcode_session_search::SessionSearchBackfillOperationState::Failed
+        );
+        let page = state
+            .sessions
+            .session_history_page(
+                session.id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: None,
+                    limit: 20,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .expect("canonical history");
+        assert!(
+            page.events
+                .iter()
+                .any(|event| event.sequence == appended.sequence)
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_backfill_operation_is_failed_when_one_provider_is_unavailable() {
+        let _guard = session_search::tests::lock_search_tests().await;
+        let state = Arc::new(session_search::tests::state_with_providers(&[
+            (
+                "test.unavailable-session-search",
+                session_search::tests::TestProviderBehavior::UnavailableApply,
+            ),
+            (
+                "test.fast-session-search",
+                session_search::tests::TestProviderBehavior::Fast,
+            ),
+        ]));
+        let session = state
+            .sessions
+            .create_session(
+                Some("partial operation failure".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "partial operation".to_owned(), 0)
+            .await
+            .expect("append");
+
+        let started = start_complete_session_search_backfill(
+            Arc::clone(&state),
+            bcode_session_search::CompleteSessionSearchBackfillRequest {
+                provider_id: None,
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                slice_deadline_ms: 5_000,
+            },
+        )
+        .await
+        .expect("start backfill");
+        let mut revision = 0;
+        let terminal = loop {
+            let status =
+                wait_session_search_backfill(&state, &started.operation_id, revision, 10_000)
+                    .await
+                    .expect("operation status");
+            revision = status.revision;
+            if matches!(
+                status.state,
+                bcode_session_search::SessionSearchBackfillOperationState::Completed
+                    | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
+                    | bcode_session_search::SessionSearchBackfillOperationState::Failed
+            ) {
+                break status;
+            }
+        };
+
+        assert_eq!(
+            terminal.state,
+            bcode_session_search::SessionSearchBackfillOperationState::Failed
+        );
+        let response = terminal
+            .complete_response
+            .expect("partial failure response retained");
+        assert_eq!(response.providers.len(), 2);
+        assert!(response.providers.iter().any(|provider| {
+            provider.provider_id == "test.fast-session-search"
+                && provider.completed_sessions == 1
+                && provider.failed_sessions == 0
+        }));
+        assert!(response.providers.iter().any(|provider| {
+            provider.provider_id == "test.unavailable-session-search"
+                && provider.failed_sessions == 1
+        }));
+    }
+
+    #[tokio::test]
     async fn canonical_writes_complete_while_slow_complete_backfill_is_blocked() {
+        let _guard = session_search::tests::lock_search_tests().await;
         let state = Arc::new(session_search::tests::state_with_providers(&[(
             "test.slow-session-search",
             session_search::tests::TestProviderBehavior::Slow,
@@ -31369,8 +31531,29 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    async fn assert_cancelled_backfill_status_is_stable(
+        client: &bcode_client::BcodeClient,
+        operation_id: &str,
+        terminal_revision: u64,
+    ) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stable = client
+            .session_search_backfill_status(operation_id.to_owned())
+            .await
+            .expect("terminal status remains addressable");
+        assert_eq!(stable.revision, terminal_revision);
+        assert_eq!(
+            stable.state,
+            bcode_session_search::SessionSearchBackfillOperationState::Cancelled,
+            "blocked provider cancellation must publish exactly one stable terminal state"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn real_ipc_backfill_operation_lifecycle_and_restart_loss_are_explicit() {
+        let _guard = session_search::tests::lock_search_tests().await;
         let state = Arc::new(session_search::tests::state_with_providers(&[(
             "test.slow-session-search",
             session_search::tests::TestProviderBehavior::Slow,
@@ -31437,6 +31620,12 @@ mod tests {
             cancellation_started.elapsed() < Duration::from_secs(1),
             "in-flight provider cancellation should reach a terminal state promptly"
         );
+        assert_cancelled_backfill_status_is_stable(
+            &client,
+            &started.operation_id,
+            terminal.revision,
+        )
+        .await;
         server.abort();
 
         let restarted_state = Arc::new(test_server_state(SessionManager::default()));
@@ -31466,6 +31655,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_ipc_investigation_and_search_run_while_daemon_owns_session_storage() {
+        let _guard = session_search::tests::lock_search_tests().await;
         let session_root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent(session_root.path()).expect("sessions");
         let session = sessions

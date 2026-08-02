@@ -18,7 +18,7 @@ use futures::future::join_all;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::ServerState;
 
@@ -26,6 +26,44 @@ const MAX_DIRTY_SESSION_SEARCH_SESSIONS: usize = 1_024;
 const MAX_INCREMENTAL_BATCHES_PER_SESSION: usize = 16;
 const INCREMENTAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAINTENANCE_PROVIDER_SLICES_BEFORE_YIELD: usize = 1;
+
+/// Cooperative scheduler that prevents explicit maintenance from monopolizing provider work.
+#[derive(Debug, Default)]
+pub(crate) struct SessionSearchWorkScheduler {
+    maintenance_gate: Mutex<()>,
+    work_gate: RwLock<()>,
+    ordinary_waiters: std::sync::atomic::AtomicUsize,
+}
+
+impl SessionSearchWorkScheduler {
+    async fn run_ordinary<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        self.ordinary_waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let guard = self.work_gate.read().await;
+        self.ordinary_waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        let result = work.await;
+        drop(guard);
+        result
+    }
+
+    async fn run_maintenance<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        let maintenance_guard = self.maintenance_gate.lock().await;
+        while self
+            .ordinary_waiters
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            tokio::task::yield_now().await;
+        }
+        let work_guard = self.work_gate.write().await;
+        let result = work.await;
+        drop(work_guard);
+        drop(maintenance_guard);
+        result
+    }
+}
 
 /// Run an explicit provider-owned purge and return fresh provider status.
 ///
@@ -245,19 +283,21 @@ pub async fn complete_backfill(
                 if cancellation.is_cancelled() {
                     break;
                 }
-                let response = backfill_provider_with_cancellation(
-                    state,
-                    BackfillSessionSearchRequest {
-                        provider_id: provider_id.clone(),
-                        session_ids: request.session_ids.clone(),
-                        after_timestamp_ms: request.after_timestamp_ms,
-                        before_timestamp_ms: request.before_timestamp_ms,
-                        cursor,
-                        deadline_ms: request.slice_deadline_ms,
-                    },
-                    Some(cancellation),
-                )
-                .await;
+                let response = state
+                    .session_search_work
+                    .run_maintenance(backfill_provider_with_cancellation(
+                        state,
+                        BackfillSessionSearchRequest {
+                            provider_id: provider_id.clone(),
+                            session_ids: request.session_ids.clone(),
+                            after_timestamp_ms: request.after_timestamp_ms,
+                            before_timestamp_ms: request.before_timestamp_ms,
+                            cursor,
+                            deadline_ms: request.slice_deadline_ms,
+                        },
+                        Some(cancellation),
+                    ))
+                    .await;
                 if cancellation.is_cancelled() {
                     break;
                 }
@@ -289,6 +329,9 @@ pub async fn complete_backfill(
                         }
                         if cursor.is_none() || response.deadline_reached {
                             break;
+                        }
+                        for _ in 0..MAINTENANCE_PROVIDER_SLICES_BEFORE_YIELD {
+                            tokio::task::yield_now().await;
                         }
                     }
                     Err(error) => {
@@ -1041,17 +1084,19 @@ async fn ingest_session_tail(
         .await
         .map_err(IngestionError::retryable)?;
     for provider in providers {
-        ingest_provider_pages(
-            state,
-            session_id,
-            &summary,
-            &provider,
-            MAX_INCREMENTAL_BATCHES_PER_SESSION,
-            None,
-            true,
-            None,
-        )
-        .await?;
+        state
+            .session_search_work
+            .run_ordinary(ingest_provider_pages(
+                state,
+                session_id,
+                &summary,
+                &provider,
+                MAX_INCREMENTAL_BATCHES_PER_SESSION,
+                None,
+                true,
+                None,
+            ))
+            .await?;
     }
     Ok(())
 }
@@ -1960,13 +2005,15 @@ pub async fn search_federated_with_policy_and_routes(
             let result = if call_deadline.is_zero() {
                 Err(timeout_error())
             } else {
-                search_provider_with_timeout(
-                    state,
-                    &provider.plugin_id,
-                    &provider_request,
-                    call_deadline,
-                )
-                .await
+                state
+                    .session_search_work
+                    .run_ordinary(search_provider_with_timeout(
+                        state,
+                        &provider.plugin_id,
+                        &provider_request,
+                        call_deadline,
+                    ))
+                    .await
             };
             (
                 provider.plugin_id,
@@ -2276,6 +2323,7 @@ pub(crate) mod tests {
     const FUTURE_PROVIDER_ID: &str = "test.future-session-search";
     const FUTURE_CAPABILITY_PROVIDER_ID: &str = "test.future-capability-session-search";
     const CRASH_PROVIDER_ID: &str = "test.crash-session-search";
+    const UNAVAILABLE_PROVIDER_ID: &str = "test.unavailable-session-search";
     const FAST_PROVIDER_MANIFEST: &str = concat!(
         "id = \"test.fast-session-search\"\n",
         "name = \"Session Search Integration Provider\"\n",
@@ -2377,6 +2425,22 @@ pub(crate) mod tests {
         "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
 
+    const UNAVAILABLE_PROVIDER_MANIFEST: &str = concat!(
+        "id = \"test.unavailable-session-search\"\n",
+        "name = \"Session Search Unavailable Provider\"\n",
+        "version = \"0.0.1\"\n\n",
+        "[[services]]\n",
+        "interface_id = \"bcode.session_search/v1\"\n",
+        "name = \"Session Search Unavailable Provider\"\n\n",
+        "[concurrency]\n",
+        "type = \"concurrent\"\n\n",
+        "[runtime]\n",
+        "type = \"native\"\n",
+        "library = \"libsession_search_unavailable_provider.dylib\"\n",
+        "abi_version = 3\n",
+        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
+    );
+
     #[derive(Debug, Clone, Copy)]
     pub enum TestProviderBehavior {
         Fast,
@@ -2387,6 +2451,11 @@ pub(crate) mod tests {
         Crash,
         RejectCleanup,
         Stateful,
+        UnavailableApply,
+        QuotaApply,
+        CorruptApply,
+        StaleApply,
+        IncompatiblePolicy,
     }
 
     #[derive(Debug, Clone)]
@@ -2419,6 +2488,7 @@ pub(crate) mod tests {
             FUTURE_PROVIDER_ID => FUTURE_PROVIDER_MANIFEST,
             FUTURE_CAPABILITY_PROVIDER_ID => FUTURE_CAPABILITY_PROVIDER_MANIFEST,
             CRASH_PROVIDER_ID => CRASH_PROVIDER_MANIFEST,
+            UNAVAILABLE_PROVIDER_ID => UNAVAILABLE_PROVIDER_MANIFEST,
             _ => panic!("unknown test provider {provider_id}"),
         })
         .expect("test provider manifest")
@@ -2458,6 +2528,12 @@ pub(crate) mod tests {
         cached: &'static OnceLock<Option<std::ffi::CString>>,
     ) -> *const std::ffi::c_char {
         bcode_plugin_sdk::static_manifest_export(CRASH_PROVIDER_MANIFEST, cached)
+    }
+
+    fn unavailable_provider_manifest_export(
+        cached: &'static OnceLock<Option<std::ffi::CString>>,
+    ) -> *const std::ffi::c_char {
+        bcode_plugin_sdk::static_manifest_export(UNAVAILABLE_PROVIDER_MANIFEST, cached)
     }
 
     fn provider_capabilities(provider_id: &str) -> SessionSearchCapabilities {
@@ -2562,6 +2638,13 @@ pub(crate) mod tests {
             OP_CAPABILITIES => service_response(&provider_capabilities(provider.provider_id)),
             OP_STATUS => {
                 let mut status = provider_status(provider.provider_id);
+                if matches!(provider.behavior, TestProviderBehavior::IncompatiblePolicy) {
+                    status.state = SearchProviderState::Degraded;
+                    status.degraded_reason = Some(
+                        "configured content policy is incompatible; explicit rebuild required"
+                            .to_owned(),
+                    );
+                }
                 if matches!(provider.behavior, TestProviderBehavior::FutureStatus) {
                     status.record_schema_version = CURRENT_SEARCH_RECORD_VERSION.saturating_add(1);
                 }
@@ -2587,6 +2670,41 @@ pub(crate) mod tests {
                 service_response(&status)
             }
             OP_APPLY_BATCH => {
+                if matches!(provider.behavior, TestProviderBehavior::UnavailableApply) {
+                    return bcode_plugin_sdk::SERVICE_STATUS_PLUGIN_UNAVAILABLE;
+                }
+                if let Some((code, message)) = match provider.behavior {
+                    TestProviderBehavior::QuotaApply => {
+                        Some(("quota_exceeded", "provider quota exhausted"))
+                    }
+                    TestProviderBehavior::CorruptApply => {
+                        Some(("corrupt_index", "provider index is corrupt"))
+                    }
+                    TestProviderBehavior::StaleApply => {
+                        Some(("stale_generation", "provider generation is stale"))
+                    }
+                    TestProviderBehavior::IncompatiblePolicy => Some((
+                        "content_disabled",
+                        "provider content policy is incompatible; explicit rebuild required",
+                    )),
+                    TestProviderBehavior::Fast
+                    | TestProviderBehavior::Slow
+                    | TestProviderBehavior::Malformed
+                    | TestProviderBehavior::FutureStatus
+                    | TestProviderBehavior::FutureCapability
+                    | TestProviderBehavior::Crash
+                    | TestProviderBehavior::RejectCleanup
+                    | TestProviderBehavior::Stateful
+                    | TestProviderBehavior::UnavailableApply => None,
+                } {
+                    return bcode_plugin_sdk::write_service_response(
+                        &ServiceResponse::error(code, message),
+                        output,
+                        output_capacity,
+                        output_len,
+                        bcode_plugin_sdk::ServiceEventEmitter::new(event_callback, event_user_data),
+                    );
+                }
                 let request = context
                     .request
                     .payload_json::<ApplySearchRecordsRequest>()
@@ -2644,10 +2762,14 @@ pub(crate) mod tests {
                                     .indexed_through_sequence
                                     .unwrap_or(0),
                                 indexed_text_bytes: request
-                                    .records
-                                    .iter()
-                                    .map(|record| record.indexed_bytes)
-                                    .sum(),
+                                    .expected_previous_session_text_bytes
+                                    .saturating_add(
+                                        request
+                                            .records
+                                            .iter()
+                                            .map(|record| record.indexed_bytes)
+                                            .sum(),
+                                    ),
                             },
                         );
                         drop(checkpoints);
@@ -2734,7 +2856,12 @@ pub(crate) mod tests {
                 }
                 TestProviderBehavior::Fast
                 | TestProviderBehavior::RejectCleanup
-                | TestProviderBehavior::Stateful => {
+                | TestProviderBehavior::Stateful
+                | TestProviderBehavior::UnavailableApply
+                | TestProviderBehavior::QuotaApply
+                | TestProviderBehavior::CorruptApply
+                | TestProviderBehavior::StaleApply
+                | TestProviderBehavior::IncompatiblePolicy => {
                     match context.request.payload_json::<SessionSearchRequest>() {
                         Ok(request) => service_response(&provider_search_response(
                             provider.provider_id,
@@ -2800,6 +2927,7 @@ pub(crate) mod tests {
             FUTURE_PROVIDER_ID => future_provider_manifest_export,
             FUTURE_CAPABILITY_PROVIDER_ID => future_capability_provider_manifest_export,
             CRASH_PROVIDER_ID => crash_provider_manifest_export,
+            UNAVAILABLE_PROVIDER_ID => unavailable_provider_manifest_export,
             _ => panic!("unknown test provider {provider_id}"),
         };
         StaticPluginVtable {
@@ -2813,6 +2941,10 @@ pub(crate) mod tests {
             cli_registration: None,
             handle_event: test_handle_event,
         }
+    }
+
+    pub async fn lock_search_tests() -> tokio::sync::MutexGuard<'static, ()> {
+        SEARCH_TEST_LOCK.lock().await
     }
 
     pub fn slow_apply_started() -> bool {
@@ -3549,6 +3681,54 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_scheduler_yields_to_waiting_ordinary_work_between_slices() {
+        let scheduler = std::sync::Arc::new(SessionSearchWorkScheduler::default());
+        let first_slice_started = std::sync::Arc::new(Notify::new());
+        let release_first_slice = std::sync::Arc::new(Notify::new());
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        let maintenance_scheduler = std::sync::Arc::clone(&scheduler);
+        let maintenance_started = std::sync::Arc::clone(&first_slice_started);
+        let maintenance_release = std::sync::Arc::clone(&release_first_slice);
+        let maintenance_order = std::sync::Arc::clone(&order);
+        let first = tokio::spawn(async move {
+            maintenance_scheduler
+                .run_maintenance(async {
+                    maintenance_order.lock().await.push("maintenance-1");
+                    maintenance_started.notify_waiters();
+                    maintenance_release.notified().await;
+                })
+                .await;
+        });
+        first_slice_started.notified().await;
+
+        let ordinary_scheduler = std::sync::Arc::clone(&scheduler);
+        let ordinary_order = std::sync::Arc::clone(&order);
+        let ordinary = tokio::spawn(async move {
+            ordinary_scheduler
+                .run_ordinary(async {
+                    ordinary_order.lock().await.push("ordinary");
+                })
+                .await;
+        });
+        tokio::task::yield_now().await;
+        release_first_slice.notify_waiters();
+        first.await.expect("first maintenance slice");
+
+        scheduler
+            .run_maintenance(async {
+                order.lock().await.push("maintenance-2");
+            })
+            .await;
+        ordinary.await.expect("ordinary work");
+
+        assert_eq!(
+            *order.lock().await,
+            vec!["maintenance-1", "ordinary", "maintenance-2"]
+        );
+    }
+
+    #[tokio::test]
     async fn complete_backfill_selects_all_enabled_providers_deterministically() {
         let _guard = SEARCH_TEST_LOCK.lock().await;
         APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
@@ -3615,6 +3795,80 @@ pub(crate) mod tests {
         assert_eq!(terminal_progress.failed_sessions, 0);
         assert_eq!(terminal_progress.providers.len(), 2);
         drop(progress);
+    }
+
+    #[tokio::test]
+    async fn complete_backfill_continues_after_provider_failure_and_reports_partial_failure() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[
+            (
+                UNAVAILABLE_PROVIDER_ID,
+                TestProviderBehavior::UnavailableApply,
+            ),
+            (FAST_PROVIDER_ID, TestProviderBehavior::Fast),
+        ]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("partial provider failure".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "index healthy provider".to_owned(), 0)
+            .await
+            .expect("append event");
+
+        let response = complete_backfill(
+            &state,
+            bcode_session_search::CompleteSessionSearchBackfillRequest {
+                provider_id: None,
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                slice_deadline_ms: 5_000,
+            },
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+        )
+        .await
+        .expect("complete backfill returns aggregate failure");
+
+        assert_eq!(
+            response.provider_ids,
+            vec![
+                FAST_PROVIDER_ID.to_owned(),
+                UNAVAILABLE_PROVIDER_ID.to_owned()
+            ]
+        );
+        let healthy = response
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == FAST_PROVIDER_ID)
+            .expect("healthy provider result");
+        assert_eq!(healthy.completed_sessions, 1);
+        assert_eq!(healthy.failed_sessions, 0);
+        assert!(healthy.error.is_none());
+        let unavailable = response
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == UNAVAILABLE_PROVIDER_ID)
+            .expect("unavailable provider result");
+        assert_eq!(unavailable.completed_sessions, 0);
+        assert_eq!(unavailable.failed_sessions, 1);
+        assert!(unavailable.error.is_none());
+        assert_eq!(
+            unavailable
+                .failed_sessions
+                .saturating_add(unavailable.incomplete_sessions),
+            1,
+            "terminal aggregate must retain the provider-local failed session"
+        );
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3752,6 +4006,191 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_canonical_append_forces_complete_backfill_convergence() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        STATEFUL_CHECKPOINTS
+            .lock()
+            .expect("stateful checkpoints")
+            .clear();
+        STATEFUL_APPLY_PUBLISHED.store(false, Ordering::SeqCst);
+        *STATEFUL_APPLY_RELEASE
+            .0
+            .lock()
+            .expect("stateful apply release") = false;
+        let state = std::sync::Arc::new(state_with_providers(&[(
+            FAST_PROVIDER_ID,
+            TestProviderBehavior::Stateful,
+        )]));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("concurrent convergence".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "first tail".to_owned(), 0)
+            .await
+            .expect("first append");
+        state.session_catalog.refresh_native_now(&state).await;
+        let revision_started = state.session_catalog.revision();
+
+        let task_state = std::sync::Arc::clone(&state);
+        let operation = tokio::spawn(async move {
+            complete_backfill(
+                &task_state,
+                bcode_session_search::CompleteSessionSearchBackfillRequest {
+                    provider_id: Some(FAST_PROVIDER_ID.to_owned()),
+                    session_ids: BTreeSet::from([session.id]),
+                    after_timestamp_ms: None,
+                    before_timestamp_ms: None,
+                    slice_deadline_ms: 5_000,
+                },
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !STATEFUL_APPLY_PUBLISHED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first provider publication");
+
+        state
+            .sessions
+            .append_context_compacted(session.id, "concurrent tail".to_owned(), 0)
+            .await
+            .expect("concurrent append");
+        let updated = state
+            .sessions
+            .session_summary(session.id)
+            .await
+            .expect("updated summary");
+        state.session_catalog.upsert_native_session(updated).await;
+        assert!(state.session_catalog.revision() > revision_started);
+        *STATEFUL_APPLY_RELEASE
+            .0
+            .lock()
+            .expect("stateful apply release") = true;
+        STATEFUL_APPLY_RELEASE.1.notify_all();
+
+        let response = operation
+            .await
+            .expect("operation task")
+            .expect("converged complete backfill");
+        assert!(response.convergence_passes >= 2);
+        assert_eq!(response.providers[0].completed_sessions, 1);
+        assert_eq!(response.providers[0].failed_sessions, 0);
+        let canonical_tail = canonical_session_tail(&state, session.id)
+            .await
+            .expect("canonical tail")
+            .expect("tail exists");
+        let checkpoint = STATEFUL_CHECKPOINTS
+            .lock()
+            .expect("stateful checkpoints")
+            .get(FAST_PROVIDER_ID)
+            .cloned()
+            .expect("provider checkpoint");
+        assert_eq!(checkpoint.indexed_through_sequence, canonical_tail);
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn reinvocation_after_operation_loss_completes_from_provider_checkpoint() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        STATEFUL_CHECKPOINTS
+            .lock()
+            .expect("stateful checkpoints")
+            .clear();
+        STATEFUL_APPLY_PUBLISHED.store(false, Ordering::SeqCst);
+        *STATEFUL_APPLY_RELEASE
+            .0
+            .lock()
+            .expect("stateful apply release") = false;
+        let first_state = std::sync::Arc::new(state_with_providers(&[(
+            FAST_PROVIDER_ID,
+            TestProviderBehavior::Stateful,
+        )]));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = first_state
+            .sessions
+            .create_session(
+                Some("operation loss recovery".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        first_state
+            .sessions
+            .append_context_compacted(session.id, "published before restart".to_owned(), 0)
+            .await
+            .expect("append event");
+        let request = bcode_session_search::CompleteSessionSearchBackfillRequest {
+            provider_id: Some(FAST_PROVIDER_ID.to_owned()),
+            session_ids: BTreeSet::from([session.id]),
+            after_timestamp_ms: None,
+            before_timestamp_ms: None,
+            slice_deadline_ms: 5_000,
+        };
+        let task_state = std::sync::Arc::clone(&first_state);
+        let task_request = request.clone();
+        let interrupted = tokio::spawn(async move {
+            complete_backfill(
+                &task_state,
+                task_request,
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !STATEFUL_APPLY_PUBLISHED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider checkpoint publication");
+        interrupted.abort();
+        *STATEFUL_APPLY_RELEASE
+            .0
+            .lock()
+            .expect("stateful apply release") = true;
+        STATEFUL_APPLY_RELEASE.1.notify_all();
+        let _ = interrupted.await;
+
+        let sessions = first_state.sessions.clone();
+        drop(first_state);
+        let mut restarted =
+            state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Stateful)]);
+        restarted.sessions = sessions;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let response = complete_backfill(
+            &restarted,
+            request,
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+        )
+        .await
+        .expect("new invocation after operation loss");
+
+        assert_eq!(response.providers[0].completed_sessions, 1);
+        assert_eq!(response.providers[0].failed_sessions, 0);
+        assert_eq!(
+            APPLY_BATCH_CALLS.load(Ordering::SeqCst),
+            0,
+            "new operation must continue from the durable provider checkpoint"
+        );
+    }
+
+    #[tokio::test]
     async fn complete_backfill_scopes_one_provider_and_honors_precancellation() {
         let _guard = SEARCH_TEST_LOCK.lock().await;
         APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
@@ -3875,6 +4314,60 @@ pub(crate) mod tests {
         assert!(!response.deadline_reached);
         let error = response.sessions[0].error.as_ref().expect("cancel error");
         assert!(error.retryable);
+    }
+
+    #[tokio::test]
+    async fn provider_failure_modes_never_report_false_complete_coverage() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        for (behavior, expected) in [
+            (TestProviderBehavior::QuotaApply, "quota_exceeded"),
+            (TestProviderBehavior::CorruptApply, "corrupt_index"),
+            (TestProviderBehavior::StaleApply, "stale_generation"),
+            (TestProviderBehavior::IncompatiblePolicy, "content_disabled"),
+            (
+                TestProviderBehavior::UnavailableApply,
+                "plugin service invocation failed",
+            ),
+        ] {
+            let state = state_with_providers(&[(FAST_PROVIDER_ID, behavior)]);
+            let workspace = tempfile::tempdir().expect("workspace");
+            let session = state
+                .sessions
+                .create_session(
+                    Some(format!("failure {expected}")),
+                    workspace.path().to_path_buf(),
+                )
+                .await
+                .expect("create session");
+            state
+                .sessions
+                .append_context_compacted(session.id, "must not be complete".to_owned(), 0)
+                .await
+                .expect("append event");
+
+            let response = complete_backfill(
+                &state,
+                bcode_session_search::CompleteSessionSearchBackfillRequest {
+                    provider_id: Some(FAST_PROVIDER_ID.to_owned()),
+                    session_ids: BTreeSet::from([session.id]),
+                    after_timestamp_ms: None,
+                    before_timestamp_ms: None,
+                    slice_deadline_ms: 5_000,
+                },
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+                None,
+            )
+            .await
+            .expect("failure remains a typed aggregate result");
+            let provider = &response.providers[0];
+            assert_eq!(provider.completed_sessions, 0, "{expected}");
+            assert_eq!(provider.incomplete_sessions, 0, "{expected}");
+            assert_eq!(provider.failed_sessions, 1, "{expected}");
+            assert!(
+                provider.error.is_none(),
+                "session-local failure is retained"
+            );
+        }
     }
 
     #[tokio::test]

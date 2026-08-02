@@ -131,7 +131,9 @@ bcode session search-backfill --provider bcode.tantivy-session-search \
 
 `--deadline-ms` bounds each provider/catalog slice, not the complete operation. The daemon owns cursor
 continuation and repeats bounded convergence passes when the catalog changes; callers do not manually
-stitch pages. Ctrl-C requests cancellation through the addressable operation before the command exits.
+stitch pages. Between slices, cooperative scheduling admits waiting ordinary queries and incremental
+ingestion before maintenance continues. Canonical session writes never wait for this provider-work
+scheduler. Ctrl-C requests cancellation through the addressable operation before the command exits.
 Reissuing the command is idempotent because providers validate deterministic batches against durable
 sequence/text checkpoints.
 
