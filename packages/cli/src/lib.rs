@@ -9112,6 +9112,19 @@ fn parse_session_search_backfill_cursor(
     })
 }
 
+fn complete_backfill_terminal_result(
+    status: &bcode_session_search::SessionSearchBackfillOperationStatus,
+) -> Result<(), CliError> {
+    if status.state == bcode_session_search::SessionSearchBackfillOperationState::Completed {
+        Ok(())
+    } else {
+        Err(CliError::InvalidArguments(format!(
+            "session-search backfill ended in {:?} state",
+            status.state
+        )))
+    }
+}
+
 async fn session_search_backfill(
     provider: Option<String>,
     sessions: Vec<SessionId>,
@@ -9158,16 +9171,7 @@ async fn session_search_backfill(
                 | bcode_session_search::SessionSearchBackfillOperationState::Failed
         ) {
             print_session_search_backfill_operation(&status, json)?;
-            return if status.state
-                == bcode_session_search::SessionSearchBackfillOperationState::Completed
-            {
-                Ok(())
-            } else {
-                Err(CliError::InvalidArguments(format!(
-                    "session-search backfill ended in {:?} state",
-                    status.state
-                )))
-            };
+            return complete_backfill_terminal_result(&status);
         }
         if !json {
             print_session_search_backfill_operation(&status, false)?;
@@ -12080,6 +12084,66 @@ mod web_command_tests {
                 && confirm == "rebuild-bcode.tantivy-session-search"
                 && !json
         ));
+    }
+
+    #[test]
+    fn complete_backfill_terminal_result_rejects_cancelled_partial_and_failed_statuses() {
+        let status = |state, response| bcode_session_search::SessionSearchBackfillOperationStatus {
+            operation_id: "operation".to_owned(),
+            provider_id: "all-enabled-providers".to_owned(),
+            revision: 2,
+            state,
+            response: None,
+            complete_progress: None,
+            complete_response: response,
+            error: None,
+        };
+        assert!(
+            complete_backfill_terminal_result(&status(
+                bcode_session_search::SessionSearchBackfillOperationState::Completed,
+                None,
+            ))
+            .is_ok()
+        );
+        assert!(
+            complete_backfill_terminal_result(&status(
+                bcode_session_search::SessionSearchBackfillOperationState::Cancelled,
+                None,
+            ))
+            .is_err()
+        );
+        let partial = bcode_session_search::CompleteSessionSearchBackfillResponse {
+            provider_ids: vec!["provider".to_owned()],
+            catalog_revision_started: 1,
+            catalog_revision_completed: 1,
+            convergence_passes: 1,
+            cancelled: false,
+            providers: vec![
+                bcode_session_search::CompleteSessionSearchBackfillProviderResult {
+                    provider_id: "provider".to_owned(),
+                    selected_sessions: 1,
+                    completed_sessions: 0,
+                    incomplete_sessions: 1,
+                    failed_sessions: 0,
+                    catalog_pages: 1,
+                    error: None,
+                },
+            ],
+        };
+        assert!(
+            complete_backfill_terminal_result(&status(
+                bcode_session_search::SessionSearchBackfillOperationState::Failed,
+                Some(partial),
+            ))
+            .is_err()
+        );
+        assert!(
+            complete_backfill_terminal_result(&status(
+                bcode_session_search::SessionSearchBackfillOperationState::Failed,
+                None,
+            ))
+            .is_err()
+        );
     }
 
     #[test]
