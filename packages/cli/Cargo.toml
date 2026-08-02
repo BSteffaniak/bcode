@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 base64                       = { workspace = true }
+bcode_build_info             = { workspace = true }
 bcode_client                 = { workspace = true }
 bcode_config                 = { workspace = true }
 bcode_daemon_lifecycle       = { workspace = true }

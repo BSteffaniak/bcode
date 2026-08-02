@@ -184,7 +184,28 @@ impl Options {
     }
 }
 
+fn normalize_release_version(version: &str) -> Result<&str> {
+    let normalized = version.strip_prefix('v').unwrap_or(version);
+    if normalized.is_empty() {
+        return Err(format_error("release version must not be empty"));
+    }
+    Ok(normalized)
+}
+
 fn validate_artifact_inputs(options: &Options) -> Result<()> {
+    if matches!(
+        options.command,
+        CommandName::Release | CommandName::VerifyRelease
+    ) {
+        let requested = normalize_release_version(&options.version)?;
+        let workspace = workspace_version();
+        if requested != workspace {
+            return Err(format_error(format!(
+                "release version `{}` does not match workspace version `{workspace}`",
+                options.version
+            )));
+        }
+    }
     if matches!(
         options.command,
         CommandName::Release | CommandName::VerifyRelease
@@ -1282,11 +1303,31 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn build_bcode_release(target: &str, features: &[String]) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BcodeBuildPurpose {
+    Developer,
+    Distribution,
+}
+
+impl BcodeBuildPurpose {
+    const fn distribution_env(self) -> &'static str {
+        match self {
+            Self::Developer => "0",
+            Self::Distribution => "1",
+        }
+    }
+}
+
+fn build_bcode_release(
+    target: &str,
+    features: &[String],
+    purpose: BcodeBuildPurpose,
+) -> Result<()> {
     let artifact_id = generated_artifact_id();
     let mut command = Command::new("cargo");
     command
         .env("BCODE_ARTIFACT_ID", &artifact_id)
+        .env("BCODE_DISTRIBUTION_BUILD", purpose.distribution_env())
         .arg("build")
         .arg("--release")
         .arg("--package")
@@ -1309,7 +1350,7 @@ fn build_bcode_release(target: &str, features: &[String]) -> Result<()> {
 
 fn build(options: &Options) -> Result<()> {
     let features = selected_features(options, false);
-    build_bcode_release(&options.target, &features)
+    build_bcode_release(&options.target, &features, BcodeBuildPurpose::Developer)
 }
 
 fn release(options: &Options) -> Result<()> {
@@ -1321,7 +1362,7 @@ fn release(options: &Options) -> Result<()> {
     if target_kind == TargetKind::Windows {
         windows_signing_configuration()?;
     }
-    build_bcode_release(&options.target, &features)?;
+    build_bcode_release(&options.target, &features, BcodeBuildPurpose::Distribution)?;
 
     let binary = built_binary(&options.target, target_kind);
     ensure_file(&binary)?;
@@ -1439,6 +1480,7 @@ fn verify_release(options: &Options) -> Result<()> {
             target_kind,
             include_mermaid_worker,
             include_tesseract,
+            normalize_release_version(&options.version)?,
         )?;
     } else {
         println!(
@@ -1469,7 +1511,7 @@ fn dev_release(options: &Options) -> Result<()> {
     ensure_windows_release_runs_natively(&options.target, "dev-release")?;
     let features = selected_features(options, true);
     let target_kind = TargetKind::parse(&options.target)?;
-    build_bcode_release(&options.target, &features)?;
+    build_bcode_release(&options.target, &features, BcodeBuildPurpose::Developer)?;
     let binary = built_binary(&options.target, target_kind);
     ensure_file(&binary)?;
     let artifact_id_before_postprocessing = if options.target == host_target() {
@@ -2393,6 +2435,7 @@ fn smoke_test_release_archive(
     target_kind: TargetKind,
     include_mermaid_worker: bool,
     include_tesseract: bool,
+    expected_version: &str,
 ) -> Result<()> {
     let extraction = verification_extraction_path(archive);
     recreate_dir(&extraction)?;
@@ -2402,6 +2445,7 @@ fn smoke_test_release_archive(
         &extraction,
         include_mermaid_worker,
         include_tesseract,
+        expected_version,
     );
     let cleanup = fs::remove_dir_all(&extraction);
     match (result, cleanup) {
@@ -2409,6 +2453,23 @@ fn smoke_test_release_archive(
         (Ok(()), Err(error)) => Err(error.into()),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn expected_binary_version(version: &str) -> String {
+    format!("{BINARY_NAME} v{version}")
+}
+
+fn verify_binary_version(command: &mut Command, expected_version: &str) -> Result<()> {
+    let output = command_output(command)?;
+    let expected = expected_binary_version(expected_version);
+    let actual = output.trim();
+    if actual != expected {
+        return Err(format_error(format!(
+            "packaged version mismatch: expected {expected:?}, found {actual:?}"
+        )));
+    }
+    println!("verified packaged version: {actual}");
+    Ok(())
 }
 
 fn probe_artifact_identity(binary: &Path) -> Result<String> {
@@ -2446,6 +2507,7 @@ fn smoke_test_release_archive_in(
     extraction: &Path,
     include_mermaid_worker: bool,
     include_tesseract: bool,
+    expected_version: &str,
 ) -> Result<()> {
     if target_kind == TargetKind::Linux {
         run_command(
@@ -2467,10 +2529,10 @@ fn smoke_test_release_archive_in(
         let smoke_root = extraction.join("windows version smoke 状态");
         fs::create_dir_all(smoke_root.join("temp"))?;
         windows_product_smoke_environment(&mut version, extraction, &smoke_root, None);
-        run_command(&mut version)?;
+        verify_binary_version(&mut version, expected_version)?;
         fs::remove_dir_all(smoke_root)?;
     } else {
-        run_command(&mut version)?;
+        verify_binary_version(&mut version, expected_version)?;
     }
     verify_extracted_artifact_identity(&binary)?;
     if include_mermaid_worker {
@@ -3932,6 +3994,31 @@ mod tests {
     }
 
     #[test]
+    fn build_purpose_selects_explicit_distribution_metadata() {
+        assert_eq!(BcodeBuildPurpose::Developer.distribution_env(), "0");
+        assert_eq!(BcodeBuildPurpose::Distribution.distribution_env(), "1");
+        assert_eq!(expected_binary_version("1.2.3"), "bcode v1.2.3");
+    }
+
+    #[test]
+    fn release_version_normalization_and_agreement_are_strict() {
+        assert_eq!(
+            normalize_release_version("v1.2.3").expect("version"),
+            "1.2.3"
+        );
+        assert_eq!(
+            normalize_release_version("1.2.3").expect("version"),
+            "1.2.3"
+        );
+        assert!(normalize_release_version("v").is_err());
+
+        let mut options = Options::help();
+        options.command = CommandName::Release;
+        options.version = "v999.0.0".to_owned();
+        assert!(validate_artifact_inputs(&options).is_err());
+    }
+
+    #[test]
     fn release_artifact_inputs_reject_unsafe_versions_and_output_roots() {
         let mut options = Options::help();
         options.command = CommandName::Release;
@@ -3942,7 +4029,7 @@ mod tests {
             assert!(validate_artifact_inputs(&options).is_err(), "{version}");
         }
 
-        options.version = "v1.2.3-rc_1".to_owned();
+        options.version = format!("v{}", workspace_version());
         assert!(validate_artifact_inputs(&options).is_ok());
 
         let outside = tempfile::tempdir().expect("outside output");
@@ -4206,7 +4293,10 @@ mod tests {
         let first_extraction = verification_extraction_path(&archive);
         let second_extraction = verification_extraction_path(&archive);
         assert_ne!(first_extraction, second_extraction);
-        assert!(smoke_test_release_archive(&archive, TargetKind::Windows, true, true).is_err());
+        assert!(
+            smoke_test_release_archive(&archive, TargetKind::Windows, true, true, "0.0.1-alpha.0",)
+                .is_err()
+        );
         let leaked = fs::read_dir(temp.path())
             .expect("temp entries")
             .filter_map(std::result::Result::ok)

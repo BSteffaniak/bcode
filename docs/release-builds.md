@@ -34,13 +34,14 @@ Supported v1 targets:
 * `x86_64-unknown-linux-gnu`
 * `x86_64-pc-windows-msvc`
 
-Artifacts are written to `target/dist/` with adjacent `sha256` files. Each `bcode` artifact also
+Artifacts are written to `target/dist/` with adjacent `sha256` files. Canonical `release` builds embed the workspace crate version as their user-visible version (`bcode v<version>`). The requested release version may have one leading `v`, but its normalized value must exactly match `[workspace.package].version`; packaging fails before building when they differ. `build` and `dev-release` remain developer builds even though they use Cargo's release profile, and report a deterministic diagnostic label containing Git state and a build digest. The display label is diagnostic only and is distinct from daemon routing identity.
+
+Each `bcode` artifact also
 contains an exact produced-artifact identity. `cargo xtask build`, `release`, and `dev-release`
 generate one identity for the produced binary; signing, stripping, copying, archiving, and extraction
 must preserve it. The executable's artifact identity is probed before and after host post-link
 signing or stripping, and the staged copy is checked against the same value before archiving.
-`verify-release` then executes `bcode artifact-id` from the extracted host artifact and fails if the
-identity is missing or malformed before running daemon smoke coverage. Together these checks cover
+`verify-release` first requires exact `bcode v<workspace-version>` output from the extracted native artifact, then executes `bcode artifact-id` and fails if the identity is missing or malformed before running daemon smoke coverage. Together these checks cover
 macOS signing, Linux stripping, Windows signing when configured, copy/staging, archiving, and
 extraction without treating signatures or executable digests as identity. Artifact identity is
 daemon routing metadata and is distinct from the archive checksum and executable SHA-256.

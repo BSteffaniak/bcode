@@ -111,6 +111,42 @@ pub(crate) mod worktree_flow;
 pub(crate) mod wt_create_dialog;
 pub(crate) mod wt_create_dialog_render;
 
+static BUILD_INFO: std::sync::OnceLock<bcode_build_info::BuildInfo> = std::sync::OnceLock::new();
+
+/// Initialize immutable build information for all TUI entry points.
+///
+/// # Panics
+///
+/// Panics if a different build identity was already installed in this process.
+pub fn initialize_build_info(build_info: bcode_build_info::BuildInfo) {
+    set_build_info(build_info);
+}
+
+fn set_build_info(build_info: bcode_build_info::BuildInfo) {
+    if let Some(current) = BUILD_INFO.get() {
+        assert_eq!(
+            current, &build_info,
+            "TUI build information changed at runtime"
+        );
+    } else {
+        BUILD_INFO
+            .set(build_info)
+            .expect("TUI build information initialized more than once");
+    }
+}
+
+pub(crate) fn build_info() -> bcode_build_info::BuildInfo {
+    BUILD_INFO.get().cloned().unwrap_or_else(|| {
+        bcode_build_info::BuildInfo::new(
+            env!("CARGO_PKG_VERSION"),
+            bcode_build_info::BuildMode::Developer,
+            bcode_build_info::GitState::Unavailable,
+            "00000000",
+        )
+        .expect("fallback TUI build information")
+    })
+}
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -550,11 +586,15 @@ pub async fn run_ralph_home() -> Result<(), TuiError> {
 /// Returns I/O errors from terminal setup, event polling, drawing, or Bcode
 /// client operations.
 #[allow(clippy::future_not_send)]
-pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
+pub async fn run(
+    session_id: Option<SessionId>,
+    build_info: bcode_build_info::BuildInfo,
+) -> Result<(), TuiError> {
     markdown_activation_adapter_linkage();
     Box::pin(run_with_static_bundled(
         session_id,
         &static_bundled_plugins(),
+        build_info,
     ))
     .await
 }
@@ -569,7 +609,9 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
 pub async fn run_with_static_bundled(
     session_id: Option<SessionId>,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    build_info: bcode_build_info::BuildInfo,
 ) -> Result<(), TuiError> {
+    set_build_info(build_info);
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;
     let result = {
@@ -657,7 +699,7 @@ pub async fn run_code_review_workspace(
         Ok(session_id) => {
             let _writer = guard.leave()?;
             if let Some(session_id) = session_id {
-                Box::pin(run(Some(session_id))).await
+                Box::pin(run(Some(session_id), build_info())).await
             } else {
                 Ok(())
             }
@@ -692,7 +734,7 @@ pub async fn run_code_review(
         Ok(session_id) => {
             let _writer = guard.leave()?;
             if let Some(session_id) = session_id {
-                Box::pin(run(Some(session_id))).await
+                Box::pin(run(Some(session_id), build_info())).await
             } else {
                 Ok(())
             }

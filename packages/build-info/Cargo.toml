@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Build identity and display version semantics for Bcode artifacts"
+edition     = { workspace = true }
+keywords    = ["bcode", "build", "version"]
+license     = { workspace = true }
+name        = "bcode_build_info"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+sha2      = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

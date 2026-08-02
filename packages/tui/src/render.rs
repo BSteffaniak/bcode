@@ -926,6 +926,13 @@ fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
             false,
         );
 
+    line = line.optional(
+        super::build_info().display_version().to_owned(),
+        muted,
+        5,
+        false,
+    );
+
     if let Some(session_id) = app.session_id() {
         line = line.optional(short_session_id(&session_id.to_string()), muted, 10, false);
     }
@@ -935,6 +942,33 @@ fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
 
 fn short_session_id(session_id: &str) -> String {
     format!("#{}", session_id.chars().take(8).collect::<String>())
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    fn text(spans: &[Span]) -> String {
+        spans.iter().map(|span| span.content.as_str()).collect()
+    }
+
+    #[test]
+    fn header_shows_build_version_when_space_is_available() {
+        let app = BmuxApp::new_with_history(None, &[], &[], false);
+        let rendered = text(&header_spans(&app, 200, TuiTheme::for_app(&app)));
+        assert!(rendered.contains("bcode"));
+        assert!(rendered.contains(super::super::build_info().display_version()));
+    }
+
+    #[test]
+    fn header_omits_build_version_before_required_context() {
+        let app = BmuxApp::new_with_history(None, &[], &[], false);
+        let rendered = text(&header_spans(&app, 50, TuiTheme::for_app(&app)));
+        assert!(rendered.contains("bcode"));
+        assert!(rendered.contains(app.display_agent_id()));
+        assert!(!rendered.contains(super::super::build_info().display_version()));
+        assert!(!rendered.ends_with(" · "));
+    }
 }
 
 fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {

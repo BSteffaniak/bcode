@@ -121,14 +121,21 @@ use std::sync::OnceLock;
 static STATIC_BUNDLED_PLUGINS: OnceLock<Vec<bcode_plugin::StaticBundledPlugin>> = OnceLock::new();
 static STATIC_BUNDLED_PLUGIN_IDS: OnceLock<Vec<String>> = OnceLock::new();
 static STATIC_BUNDLED_DEFAULT_PLUGIN_IDS: OnceLock<Vec<String>> = OnceLock::new();
+static BUILD_INFO: OnceLock<bcode_build_info::BuildInfo> = OnceLock::new();
+
+fn build_info() -> &'static bcode_build_info::BuildInfo {
+    BUILD_INFO
+        .get()
+        .expect("Bcode CLI build information must be initialized")
+}
 
 /// Parse CLI arguments and run the requested command.
 ///
 /// # Errors
 ///
 /// Returns an error when the requested command fails.
-pub async fn run() -> Result<(), CliError> {
-    run_with_static_bundled(Vec::new()).await
+pub async fn run(build_info: bcode_build_info::BuildInfo) -> Result<(), CliError> {
+    run_with_static_bundled(build_info, Vec::new()).await
 }
 
 /// Parse CLI arguments and run with caller-provided static bundled plugins.
@@ -136,10 +143,20 @@ pub async fn run() -> Result<(), CliError> {
 /// # Errors
 ///
 /// Returns an error when the requested command fails.
+///
+/// # Panics
+///
+/// Panics when CLI startup is initialized more than once in one process with
+/// independently supplied build information.
 pub async fn run_with_static_bundled(
+    artifact_build_info: bcode_build_info::BuildInfo,
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
 ) -> Result<(), CliError> {
     init_tracing();
+    BUILD_INFO
+        .set(artifact_build_info.clone())
+        .expect("Bcode CLI build information initialized more than once");
+    bcode_tui::initialize_build_info(artifact_build_info);
     bcode_daemon_lifecycle::initialize_artifact_bootstrap()?;
     let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
     let static_default_plugin_ids =
@@ -153,7 +170,9 @@ pub async fn run_with_static_bundled(
             .get()
             .map_or(&[][..], Vec::as_slice),
     )?;
-    let command = plugin_cli::compose(Cli::command(), &registrations);
+    let mut command =
+        plugin_cli::compose(root_command_with_build_info(build_info()), &registrations);
+    command = command.version(build_info().display_version());
     let matches = command.get_matches();
     let _config_override = config_override_from_matches(&matches);
     if let Some(plugin) = plugin_cli::matched(&matches, &registrations)
@@ -1208,7 +1227,12 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         } => cancel_session_turn(session_id, clear_queue).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
-            bcode_tui::run_with_static_bundled(session_id, &static_bundled_plugins()).await?;
+            bcode_tui::run_with_static_bundled(
+                session_id,
+                &static_bundled_plugins(),
+                build_info().clone(),
+            )
+            .await?;
         }
         Commands::Send {
             session_id,
@@ -1327,6 +1351,10 @@ fn init_tracing() {
     }
 }
 
+fn root_command_with_build_info(build_info: &'static bcode_build_info::BuildInfo) -> clap::Command {
+    Cli::command().version(build_info.display_version())
+}
+
 /// Return the root `bcode` CLI command definition.
 ///
 /// This keeps generated documentation, completions, and help snapshots in sync
@@ -1334,6 +1362,51 @@ fn init_tracing() {
 #[must_use]
 pub fn root_command() -> clap::Command {
     Cli::command()
+}
+
+#[cfg(test)]
+mod build_version_tests {
+    use super::*;
+
+    #[test]
+    fn root_command_uses_exact_canonical_build_label() {
+        let cases = [
+            (
+                bcode_build_info::BuildMode::Distribution,
+                bcode_build_info::GitState::Unavailable,
+                "bcode v1.2.3\n",
+            ),
+            (
+                bcode_build_info::BuildMode::Developer,
+                bcode_build_info::GitState::Revision {
+                    short_commit: "abcdef12".to_owned(),
+                    dirty: false,
+                },
+                "bcode v1.2.3-dev.gabcdef12.b1234abcd\n",
+            ),
+            (
+                bcode_build_info::BuildMode::Developer,
+                bcode_build_info::GitState::Revision {
+                    short_commit: "abcdef12".to_owned(),
+                    dirty: true,
+                },
+                "bcode v1.2.3-dev.gabcdef12.dirty.b1234abcd\n",
+            ),
+            (
+                bcode_build_info::BuildMode::Developer,
+                bcode_build_info::GitState::Unavailable,
+                "bcode v1.2.3-dev.nogit.b1234abcd\n",
+            ),
+        ];
+        for (mode, git, expected) in cases {
+            let info = Box::leak(Box::new(
+                bcode_build_info::BuildInfo::new("1.2.3", mode, git, "1234abcd")
+                    .expect("build info"),
+            ));
+            let output = root_command_with_build_info(info).render_version().clone();
+            assert_eq!(output, expected);
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -8153,7 +8226,12 @@ async fn run_new_session_tui(worktree: Option<String>) -> Result<(), CliError> {
     } else {
         client.create_session(None).await?
     };
-    bcode_tui::run_with_static_bundled(Some(session.id), &static_bundled_plugins()).await?;
+    bcode_tui::run_with_static_bundled(
+        Some(session.id),
+        &static_bundled_plugins(),
+        build_info().clone(),
+    )
+    .await?;
     Ok(())
 }
 

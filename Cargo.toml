@@ -40,6 +40,7 @@ members = [
     "packages/agent-profile",
     "packages/agent-runtime",
     "packages/bcode",
+    "packages/build-info",
     "packages/bundled-plugins",
     "packages/cli",
     "packages/client",
@@ -116,6 +117,7 @@ bcode_agent_profile                     = { version = "0.0.1-alpha.0", default-f
 bcode_agent_runtime                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-runtime" }
 bcode_bedrock_provider_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/bedrock-provider-plugin" }
 bcode_blims_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/blims-plugin" }
+bcode_build_info                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/build-info" }
 bcode_bundled_plugins                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bundled-plugins" }
 bcode_cli                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
 bcode_client                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }

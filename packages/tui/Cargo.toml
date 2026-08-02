@@ -13,6 +13,7 @@ version     = { workspace = true }
 [dependencies]
 arboard                   = { workspace = true }
 bcode_agent_profile       = { workspace = true }
+bcode_build_info          = { workspace = true }
 bcode_bundled_plugins     = { workspace = true }
 bcode_client              = { workspace = true }
 bcode_code_review_models  = { workspace = true }

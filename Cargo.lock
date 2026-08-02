@@ -1284,6 +1284,7 @@ dependencies = [
  "bcode_agent_policy",
  "bcode_agent_profile",
  "bcode_agent_runtime",
+ "bcode_build_info",
  "bcode_bundled_plugins",
  "bcode_cli",
  "bcode_client",
@@ -1431,6 +1432,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_build_info"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "bcode_bundled_plugins"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1474,6 +1483,7 @@ name = "bcode_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
  "base64 0.22.1",
+ "bcode_build_info",
  "bcode_client",
  "bcode_config",
  "bcode_daemon_lifecycle",
@@ -2668,6 +2678,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "arboard",
  "bcode_agent_profile",
+ "bcode_build_info",
  "bcode_bundled_plugins",
  "bcode_client",
  "bcode_code_review_models",

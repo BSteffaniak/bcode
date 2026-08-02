@@ -30,6 +30,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Check daemon lifecycle architecture
         run: scripts/check-daemon-lifecycle-architecture.sh
+      - name: Check build version architecture
+        run: scripts/check-build-version-architecture.sh
       - name: Check produced artifact identity matrix
         run: scripts/check-artifact-identity-matrix.sh
 
