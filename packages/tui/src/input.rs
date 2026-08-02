@@ -192,6 +192,7 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
         | BmuxAction::EditorDeleteWordForward
         | BmuxAction::EditorDeleteToStart
         | BmuxAction::EditorDeleteToEnd
+        | BmuxAction::InteractionFocusActive
         | BmuxAction::SkillInvoke
         | BmuxAction::SkillActivate
         | BmuxAction::SkillDeactivate

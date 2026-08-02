@@ -180,8 +180,6 @@ impl QuestionInteractionController {
         }
         self.focus = QuestionFocusTarget::Custom { question_index };
         self.set_custom(question_index, text.to_owned());
-        self.invalid_question_index = None;
-        self.validation_error = None;
         InteractionOutput::Redraw
     }
 
@@ -221,10 +219,20 @@ impl QuestionInteractionController {
         let Some(question) = self.request.questions.get(question_index) else {
             return;
         };
+        if text.len() > super::MAX_CUSTOM_ANSWER_BYTES {
+            self.invalid_question_index = Some(question_index);
+            self.validation_error = Some(format!(
+                "Custom answer exceeds the {} byte limit.",
+                super::MAX_CUSTOM_ANSWER_BYTES
+            ));
+            return;
+        }
         let Some(answer) = self.answers.get_mut(question_index) else {
             return;
         };
         answer.custom = (!text.is_empty()).then_some(text);
+        self.invalid_question_index = None;
+        self.validation_error = None;
         if question.custom_mode == QuestionCustomMode::Exclusive {
             answer.selected.clear();
         }
@@ -582,6 +590,34 @@ mod tests {
             control_id: option_control_id(0, 0),
         });
         assert_eq!(controller.snapshot().answers[0].custom, None);
+    }
+
+    #[test]
+    fn oversized_custom_answer_is_rejected_without_replacing_valid_state() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[],
+            QuestionSelectionMode::Single,
+            true,
+            QuestionCustomMode::Additional,
+            true,
+        )));
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(0),
+            value: InteractionValue::String("valid".to_owned()),
+        });
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(0),
+            value: InteractionValue::String("x".repeat(crate::MAX_CUSTOM_ANSWER_BYTES + 1)),
+        });
+
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.answers[0].custom.as_deref(), Some("valid"));
+        assert!(
+            snapshot
+                .validation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("byte limit"))
+        );
     }
 
     #[test]

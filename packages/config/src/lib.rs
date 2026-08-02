@@ -1993,6 +1993,10 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub diff_viewer: TuiDiffViewerConfig,
+    /// Interactive surface presentation configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub interactions: TuiInteractionConfig,
     /// Mouse interaction configuration.
     #[config_doc(nested)]
     #[serde(default)]
@@ -2083,6 +2087,40 @@ impl Default for TuiRenderConfig {
 
 const fn default_tui_render_max_fps() -> u16 {
     60
+}
+
+/// Terminal interactive-surface presentation configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "interactions")]
+pub struct TuiInteractionConfig {
+    /// Where the active interaction is rendered.
+    #[serde(default)]
+    pub placement: TuiInteractionPlacement,
+    /// How keyboard focus behaves while an inline interaction is fully off-screen.
+    #[serde(default)]
+    pub offscreen_focus: TuiInteractionOffscreenFocus,
+}
+
+/// Active terminal interaction placement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiInteractionPlacement {
+    /// Render the interaction at its semantic transcript position.
+    #[default]
+    Transcript,
+    /// Pin the interaction above the composer while leaving transcript layout unchanged.
+    Pinned,
+}
+
+/// Keyboard focus behavior for a fully hidden inline interaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiInteractionOffscreenFocus {
+    /// Keep routing interaction input while the user reads other transcript content.
+    #[default]
+    Retain,
+    /// Suspend interaction input until the active interaction is restored into view.
+    Suspend,
 }
 
 /// Terminal diff viewer rendering configuration.
@@ -5563,6 +5601,7 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
         write_tui_keybinding_section(output, "session_picker", &tui.keybindings.session_picker);
     }
     write_tui_mouse_toml(output, &tui.mouse);
+    write_tui_interactions_toml(output, tui.interactions);
     write_tui_markdown_toml(output, tui.markdown);
     writeln!(output, "[tui.thinking]").expect("writing to string should not fail");
     writeln!(output, "show = {}", tui.thinking.show).expect("writing to string should not fail");
@@ -5580,6 +5619,32 @@ const fn tui_thinking_mode_name(mode: TuiThinkingMode) -> &'static str {
         TuiThinkingMode::Summary => "summary",
         TuiThinkingMode::Raw => "raw",
     }
+}
+
+fn write_tui_interactions_toml(output: &mut String, interactions: TuiInteractionConfig) {
+    if interactions == TuiInteractionConfig::default() {
+        return;
+    }
+    writeln!(output, "[tui.interactions]").expect("writing to string should not fail");
+    writeln!(
+        output,
+        "placement = {}",
+        toml_string(match interactions.placement {
+            TuiInteractionPlacement::Transcript => "transcript",
+            TuiInteractionPlacement::Pinned => "pinned",
+        })
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "offscreen_focus = {}",
+        toml_string(match interactions.offscreen_focus {
+            TuiInteractionOffscreenFocus::Retain => "retain",
+            TuiInteractionOffscreenFocus::Suspend => "suspend",
+        })
+    )
+    .expect("writing to string should not fail");
+    output.push('\n');
 }
 
 fn write_tui_markdown_toml(output: &mut String, markdown: TuiMarkdownConfig) {
@@ -6496,9 +6561,9 @@ mod tests {
         BcodeConfig, CompactionBackend, CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot,
         ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc, InvariantGuidanceMode,
         InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc, TuiAccentTransitionCurve,
-        TuiMouseConfig, TuiRenderConfig, TuiVisualAdapterConfig, default_config_paths_from,
-        default_permissions_state_path, load_config_from_paths,
-        load_config_from_paths_with_overrides, load_permissions_state_from,
+        TuiInteractionOffscreenFocus, TuiInteractionPlacement, TuiMouseConfig, TuiRenderConfig,
+        TuiVisualAdapterConfig, default_config_paths_from, default_permissions_state_path,
+        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
         register_runtime_auth_subscription, set_openai_compatible_sshenv_auth_method,
@@ -6510,6 +6575,48 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn interaction_presentation_defaults_parse_and_serialize() {
+        let default = BcodeConfig::default().tui.interactions;
+        assert_eq!(default.placement, TuiInteractionPlacement::Transcript);
+        assert_eq!(
+            default.offscreen_focus,
+            TuiInteractionOffscreenFocus::Retain
+        );
+
+        let configured: BcodeConfig = toml::from_str(
+            "[tui.interactions]\nplacement = \"pinned\"\noffscreen_focus = \"suspend\"\n",
+        )
+        .expect("interaction presentation config parses");
+        assert_eq!(
+            configured.tui.interactions.placement,
+            TuiInteractionPlacement::Pinned
+        );
+        assert_eq!(
+            configured.tui.interactions.offscreen_focus,
+            TuiInteractionOffscreenFocus::Suspend
+        );
+
+        let rendered = super::config_to_toml(&configured);
+        assert!(rendered.contains("[tui.interactions]"), "{rendered}");
+        assert!(rendered.contains("placement = \"pinned\""), "{rendered}");
+        assert!(
+            rendered.contains("offscreen_focus = \"suspend\""),
+            "{rendered}"
+        );
+        let round_trip: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
+        assert_eq!(round_trip.tui.interactions, configured.tui.interactions);
+
+        assert!(
+            toml::from_str::<BcodeConfig>("[tui.interactions]\nplacement = \"floating\"\n")
+                .is_err()
+        );
+        assert!(
+            toml::from_str::<BcodeConfig>("[tui.interactions]\noffscreen_focus = \"guess\"\n")
+                .is_err()
+        );
+    }
 
     #[test]
     fn compatible_provider_configuration_matrix_preserves_provider_settings() {

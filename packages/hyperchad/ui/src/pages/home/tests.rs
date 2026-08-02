@@ -219,6 +219,9 @@ fn non_tool_permission_fixture_items(
 
 fn non_tool_interaction_fixture_items() -> Vec<TranscriptViewItem> {
     let interaction = |id: &str, resolved: bool, resolution| InteractionViewSummary {
+        producer_id: None,
+        exchange_schema: None,
+        exchange_schema_version: None,
         interaction_id: id.to_owned(),
         kind: "fixture.interaction".to_owned(),
         surface_kind: "fixture.surface".to_owned(),
@@ -479,6 +482,9 @@ fn repeated_domain_components_use_stable_semantic_identities() {
         can_remember: false,
     });
     snapshot.interactions.push(InteractionViewSummary {
+        producer_id: None,
+        exchange_schema: None,
+        exchange_schema_version: None,
         interaction_id: interaction_id.to_owned(),
         kind: "future.interaction".to_owned(),
         surface_kind: "future.surface".to_owned(),
@@ -1230,6 +1236,9 @@ fn opaque_session_context_is_propagated_to_navigation() {
 fn unknown_interactions_keep_bounded_active_controls_and_resolved_history() {
     let session_id = bcode_session_models::SessionId::new();
     let active = InteractionViewSummary {
+        producer_id: None,
+        exchange_schema: None,
+        exchange_schema_version: None,
         interaction_id: "interaction-unknown".to_owned(),
         kind: "future.interaction".to_owned(),
         surface_kind: "future.surface".to_owned(),
@@ -1301,6 +1310,9 @@ fn unknown_interactions_keep_bounded_active_controls_and_resolved_history() {
 #[test]
 fn question_snapshot_renders_polished_controls_and_generic_fallback() {
     let interaction = InteractionViewSummary {
+        producer_id: None,
+        exchange_schema: None,
+        exchange_schema_version: None,
         interaction_id: "interaction-1".to_owned(),
         kind: "bcode.question".to_owned(),
         surface_kind: "bcode.question.inline".to_owned(),
@@ -1371,6 +1383,9 @@ fn question_snapshot_renders_polished_controls_and_generic_fallback() {
 #[test]
 fn question_snapshot_renders_multiple_checkbox_and_exclusive_custom_semantics() {
     let interaction = InteractionViewSummary {
+        producer_id: None,
+        exchange_schema: None,
+        exchange_schema_version: None,
         interaction_id: "interaction-multiple".to_owned(),
         kind: "bcode.question".to_owned(),
         surface_kind: "bcode.question.inline".to_owned(),
@@ -2780,6 +2795,9 @@ fn runtime_work_is_presented_from_runtime_state_outside_transcript() {
 #[test]
 fn active_interaction_controls_replace_only_matching_pending_timeline_summary() {
     let interaction = |id: &str, resolved: bool| InteractionViewSummary {
+        producer_id: None,
+        exchange_schema: None,
+        exchange_schema_version: None,
         interaction_id: id.to_owned(),
         kind: "fixture.interaction".to_owned(),
         surface_kind: "fixture.surface".to_owned(),

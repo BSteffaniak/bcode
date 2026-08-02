@@ -348,6 +348,7 @@ pub struct BmuxApp {
     transcript: TranscriptDocument,
     local_notices: Vec<TranscriptItem>,
     transcript_projection_revision: u64,
+    interaction_surface_layout_revision: u64,
     session_view_terminal_adapter: SessionViewTerminalAdapter,
     session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
@@ -554,6 +555,7 @@ impl BmuxApp {
             transcript: TranscriptDocument::default(),
             local_notices: Vec::new(),
             transcript_projection_revision: 0,
+            interaction_surface_layout_revision: 0,
             session_view_terminal_adapter: SessionViewTerminalAdapter::default(),
             session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
@@ -1883,6 +1885,60 @@ impl BmuxApp {
         }
         self.viewport
             .top_row(self.transcript_layout.total_rows(), viewport_height)
+    }
+
+    /// Return the terminal transcript index for one interaction id.
+    #[must_use]
+    pub fn interaction_transcript_index(&self, interaction_id: &str) -> Option<usize> {
+        self.transcript().iter().position(|item| {
+            item.interaction()
+                .is_some_and(|interaction| interaction.interaction_id == interaction_id)
+        })
+    }
+
+    /// Return global transcript row range for one terminal transcript item.
+    #[must_use]
+    pub fn transcript_item_row_range(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        let start = self
+            .transcript_layout
+            .entry_start_row(VisibleTranscriptSource::Transcript, index)?;
+        let rows = self
+            .transcript_layout
+            .entry_row_count(VisibleTranscriptSource::Transcript, index)?;
+        Some(start..start.saturating_add(rows))
+    }
+
+    /// Scroll one terminal transcript item into view.
+    pub fn scroll_transcript_item_into_view(&mut self, index: usize) -> bool {
+        let Some(range) = self.transcript_item_row_range(index) else {
+            return false;
+        };
+        let top = self.transcript_top_row(self.viewport.height());
+        let height = usize::from(self.viewport.height()).max(1);
+        let target_top = if range.start < top {
+            range.start
+        } else if range.end > top.saturating_add(height) {
+            range.end.saturating_sub(height)
+        } else {
+            return false;
+        };
+        self.cancel_transcript_scroll_animation_for_manual_scroll();
+        self.mark_manual_transcript_scroll();
+        self.scroll_mode = TranscriptScrollMode::ManualDetached;
+        self.viewport.materialize_top_row(target_top);
+        true
+    }
+
+    /// Return the active interaction-surface layout revision.
+    #[must_use]
+    pub const fn interaction_surface_layout_revision(&self) -> u64 {
+        self.interaction_surface_layout_revision
+    }
+
+    /// Mark interaction-surface layout inputs as changed.
+    pub const fn invalidate_interaction_surface_layout(&mut self) {
+        self.interaction_surface_layout_revision =
+            self.interaction_surface_layout_revision.saturating_add(1);
     }
 
     /// Return resident transcript-affecting event count.

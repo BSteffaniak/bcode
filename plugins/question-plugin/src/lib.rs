@@ -25,6 +25,12 @@ use std::fmt::Write as _;
 
 const TOOL_NAME: &str = "question";
 const QUESTION_EXCHANGE_SCHEMA: &str = "bcode.question.request";
+const MAX_QUESTIONS: usize = 32;
+const MAX_OPTIONS_PER_QUESTION: usize = 100;
+const MAX_QUESTION_TEXT_BYTES: usize = 16 * 1024;
+const MAX_OPTION_TEXT_BYTES: usize = 4 * 1024;
+#[cfg(feature = "static-bundled")]
+const MAX_CUSTOM_ANSWER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Default)]
 pub struct QuestionPlugin;
@@ -434,6 +440,11 @@ fn parse_question_request(value: Value) -> Result<NormalizedQuestionRequest, Str
     if question_values.is_empty() {
         return Err("Invalid question tool input: at least one question is required.".to_string());
     }
+    if question_values.len() > MAX_QUESTIONS {
+        return Err(format!(
+            "Invalid question tool input: at most {MAX_QUESTIONS} questions are supported."
+        ));
+    }
     let questions = question_values
         .into_iter()
         .enumerate()
@@ -455,9 +466,10 @@ fn parse_question(index: usize, value: Value) -> Result<Question, String> {
     };
     let text = string_field(&object, "question")
         .filter(|value| !value.trim().is_empty())
+        .filter(|value| value.len() <= MAX_QUESTION_TEXT_BYTES)
         .ok_or_else(|| {
             format!(
-                "Invalid question tool input: question {} is missing `question`.",
+                "Invalid question tool input: question {} is missing `question` or exceeds {MAX_QUESTION_TEXT_BYTES} bytes.",
                 index.saturating_add(1)
             )
         })?;
@@ -478,6 +490,12 @@ fn parse_question(index: usize, value: Value) -> Result<Question, String> {
     let custom = bool_field(&object, "custom").unwrap_or(true);
     let custom_mode = enum_field(&object, "custom_mode")?.unwrap_or(QuestionCustomMode::Additional);
     let options = options_field(&object, index)?;
+    if options.len() > MAX_OPTIONS_PER_QUESTION {
+        return Err(format!(
+            "Invalid question tool input: question {} has more than {MAX_OPTIONS_PER_QUESTION} options.",
+            index.saturating_add(1)
+        ));
+    }
     if options.is_empty() && !custom {
         return Err(format!(
             "Invalid question tool input: question {} needs `options` unless `custom` is true.",
@@ -572,14 +590,24 @@ fn parse_option(
     value: &Value,
 ) -> Result<QuestionOption, String> {
     match value {
-        Value::String(label) => Ok(QuestionOption {
-            label: label.clone(),
-            value: None,
-            description: None,
-        }),
+        Value::String(label)
+            if !label.trim().is_empty() && label.len() <= MAX_OPTION_TEXT_BYTES =>
+        {
+            Ok(QuestionOption {
+                label: label.clone(),
+                value: None,
+                description: None,
+            })
+        }
+        Value::String(_) => Err(format!(
+            "Invalid question tool input: question {} option {} is empty or exceeds {MAX_OPTION_TEXT_BYTES} bytes.",
+            question_index.saturating_add(1),
+            option_index.saturating_add(1)
+        )),
         Value::Object(object) => {
             let label = string_field(object, "label")
                 .filter(|value| !value.trim().is_empty())
+                .filter(|value| value.len() <= MAX_OPTION_TEXT_BYTES)
                 .ok_or_else(|| {
                     format!(
                         "Invalid question tool input: question {} option {} is missing `label`.",
@@ -702,6 +730,32 @@ mod tests {
                 required: false,
             }],
         }
+    }
+
+    #[test]
+    fn question_request_bounds_reject_oversized_collections_and_text() {
+        let too_many = (0..=MAX_QUESTIONS)
+            .map(|index| json!({"question": format!("Question {index}")}))
+            .collect::<Vec<_>>();
+        assert!(parse_question_request(json!({"questions": too_many})).is_err());
+
+        assert!(
+            parse_question_request(json!({
+                "question": "x".repeat(MAX_QUESTION_TEXT_BYTES + 1)
+            }))
+            .is_err()
+        );
+
+        let too_many_options = (0..=MAX_OPTIONS_PER_QUESTION)
+            .map(|index| format!("Option {index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            parse_question_request(json!({
+                "question": "Choose",
+                "options": too_many_options
+            }))
+            .is_err()
+        );
     }
 
     #[test]

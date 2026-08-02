@@ -1607,6 +1607,15 @@ pub enum InteractionViewState {
 pub struct InteractionViewSummary {
     /// Interaction identifier.
     pub interaction_id: String,
+    /// Producer that owns the exchange schema, when projected from a tool exchange.
+    #[serde(default)]
+    pub producer_id: Option<String>,
+    /// Producer-owned exchange request schema, when available.
+    #[serde(default)]
+    pub exchange_schema: Option<String>,
+    /// Version of the producer-owned exchange schema, when available.
+    #[serde(default)]
+    pub exchange_schema_version: Option<u32>,
     /// Interaction kind.
     pub kind: String,
     /// Renderer-specific surface key supplied by the interaction owner.

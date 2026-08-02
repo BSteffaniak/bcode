@@ -1946,6 +1946,9 @@ pub async fn load_pending_interactions(
     {
         let exchange = request.request;
         let interaction_id = exchange.exchange_id.clone();
+        let producer_id = exchange.producer_id.clone();
+        let exchange_schema = exchange.schema.clone();
+        let exchange_schema_version = exchange.schema_version;
         let snapshot = exchange.payload;
         let adapter = interaction_adapter_for_exchange(
             &exchange.producer_id,
@@ -1962,6 +1965,9 @@ pub async fn load_pending_interactions(
             .unwrap_or_else(|| exchange.schema.clone());
         interactions.push(bcode_session_view_models::InteractionViewSummary {
             interaction_id,
+            producer_id: Some(producer_id),
+            exchange_schema: Some(exchange_schema),
+            exchange_schema_version: Some(exchange_schema_version),
             kind,
             surface_kind,
             tool_call_id: Some(exchange.invocation_id),

@@ -42,6 +42,7 @@ pub enum BmuxAction {
     TranscriptBottom,
     TranscriptLineUp,
     TranscriptLineDown,
+    InteractionFocusActive,
     PermissionApprove,
     PermissionDeny,
     SelectUp,
@@ -100,6 +101,7 @@ impl BmuxAction {
             "transcript.bottom" => Self::TranscriptBottom,
             "transcript.lineUp" => Self::TranscriptLineUp,
             "transcript.lineDown" => Self::TranscriptLineDown,
+            "tui.interaction.focusActive" => Self::InteractionFocusActive,
             "app.permission.approve" => Self::PermissionApprove,
             "app.permission.deny" => Self::PermissionDeny,
             "tui.select.up" | "tui.select.previous" => Self::SelectUp,
@@ -325,6 +327,7 @@ impl BmuxKeyMap {
             | BmuxAction::TranscriptBottom
             | BmuxAction::TranscriptLineUp
             | BmuxAction::TranscriptLineDown
+            | BmuxAction::InteractionFocusActive
             | BmuxAction::PermissionApprove
             | BmuxAction::PermissionDeny
             | BmuxAction::SelectUp
@@ -383,6 +386,7 @@ impl BmuxKeyMap {
             | BmuxAction::TranscriptBottom
             | BmuxAction::TranscriptLineUp
             | BmuxAction::TranscriptLineDown
+            | BmuxAction::InteractionFocusActive
             | BmuxAction::PermissionApprove
             | BmuxAction::PermissionDeny
             | BmuxAction::SelectUp
@@ -495,6 +499,7 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<BmuxKeyBinding>> {
                 bind("ctrl+end", BmuxAction::TranscriptBottom),
                 bind("ctrl+up", BmuxAction::TranscriptLineUp),
                 bind("ctrl+down", BmuxAction::TranscriptLineDown),
+                bind("ctrl+i", BmuxAction::InteractionFocusActive),
             ],
         ),
         (

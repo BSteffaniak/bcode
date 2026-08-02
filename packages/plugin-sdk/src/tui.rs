@@ -7,10 +7,13 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::interaction::{InteractionInput, InteractionOutput, PluginInteraction};
 use bcode_session_models::{ProjectionWindowRequest, SessionId};
 use bcode_session_view_models::{ReasoningPresentationPolicy, SessionViewSnapshot};
+use bmux_keyboard::KeyStroke;
+use bmux_text_edit::{TextEditCommand, TextMotion};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
@@ -291,6 +294,21 @@ pub trait PluginTuiHost: Send + Sync {
         Err(PluginTuiHostError::Unsupported(
             "clipboard writes are not available from this host".to_string(),
         ))
+    }
+
+    /// Resolve a key stroke to one host-configured text edit command.
+    fn text_edit_command(&self, _stroke: KeyStroke) -> Option<TextEditCommand> {
+        None
+    }
+
+    /// Resolve a key stroke to one host-configured selection motion.
+    fn text_selection_motion(&self, _stroke: KeyStroke) -> Option<TextMotion> {
+        None
+    }
+
+    /// Return whether a key stroke is configured to submit composer-like input.
+    fn text_submit(&self, _stroke: KeyStroke) -> bool {
+        false
     }
 
     /// Start one durable workflow through the host's generic workflow service.
@@ -671,7 +689,12 @@ where
     fn render(&mut self, snapshot: &C::Snapshot, area: Rect, frame: &mut Frame<'_>);
 
     /// Translate terminal input to a semantic interaction input.
-    fn input(&mut self, event: &Event, snapshot: &C::Snapshot) -> Option<InteractionInput>;
+    fn input(
+        &mut self,
+        event: &Event,
+        snapshot: &C::Snapshot,
+        _host: &dyn PluginTuiHost,
+    ) -> Option<InteractionInput>;
 }
 
 struct TypedTerminalInteractionSurface<C, R>
@@ -719,8 +742,11 @@ where
             .render(&self.controller.snapshot(), area, frame);
     }
 
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let Some(input) = self.renderer.input(event, &self.controller.snapshot()) else {
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let Some(input) = self
+            .renderer
+            .input(event, &self.controller.snapshot(), host)
+        else {
             return PluginTuiAction::None;
         };
         plugin_tui_action_from_interaction_output(self.controller.handle_input(input))
@@ -1062,10 +1088,35 @@ impl PluginTuiRegistry {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TokioPluginTuiHost {
     handle: tokio::runtime::Handle,
     redraw_sender: mpsc::UnboundedSender<()>,
+    text_input: Option<Arc<dyn PluginTuiTextInputResolver>>,
+}
+
+impl std::fmt::Debug for TokioPluginTuiHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TokioPluginTuiHost")
+            .field(
+                "text_input",
+                &self.text_input.as_ref().map(|_| "configured"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Host resolver for configured composer-like text input intent.
+pub trait PluginTuiTextInputResolver: Send + Sync {
+    /// Resolve one configured edit command.
+    fn edit_command(&self, stroke: KeyStroke) -> Option<TextEditCommand>;
+
+    /// Resolve one configured selection motion.
+    fn selection_motion(&self, stroke: KeyStroke) -> Option<TextMotion>;
+
+    /// Return whether this stroke submits composer-like input.
+    fn submits(&self, stroke: KeyStroke) -> bool;
 }
 
 impl TokioPluginTuiHost {
@@ -1079,7 +1130,18 @@ impl TokioPluginTuiHost {
         Self {
             handle: tokio::runtime::Handle::current(),
             redraw_sender,
+            text_input: None,
         }
+    }
+
+    /// Attach a host-configured composer-like text input resolver.
+    #[must_use]
+    pub fn with_text_input_resolver(
+        mut self,
+        resolver: Arc<dyn PluginTuiTextInputResolver>,
+    ) -> Self {
+        self.text_input = Some(resolver);
+        self
     }
 }
 
@@ -1102,5 +1164,19 @@ impl PluginTuiHost for TokioPluginTuiHost {
 
     fn request_redraw(&self) {
         let _ = self.redraw_sender.send(());
+    }
+
+    fn text_edit_command(&self, stroke: KeyStroke) -> Option<TextEditCommand> {
+        self.text_input.as_ref()?.edit_command(stroke)
+    }
+
+    fn text_selection_motion(&self, stroke: KeyStroke) -> Option<TextMotion> {
+        self.text_input.as_ref()?.selection_motion(stroke)
+    }
+
+    fn text_submit(&self, stroke: KeyStroke) -> bool {
+        self.text_input
+            .as_ref()
+            .is_some_and(|resolver| resolver.submits(stroke))
     }
 }

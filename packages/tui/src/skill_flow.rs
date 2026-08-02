@@ -251,6 +251,7 @@ fn handle_skill_picker_action(
         | BmuxAction::EditorDeleteWordBackward
         | BmuxAction::EditorDeleteWordForward
         | BmuxAction::EditorDeleteToStart
+        | BmuxAction::InteractionFocusActive
         | BmuxAction::EditorDeleteToEnd => skill_picker::SkillPickerAction::Continue,
     }
 }

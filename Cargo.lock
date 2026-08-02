@@ -2212,6 +2212,8 @@ dependencies = [
  "bcode_session_view_models",
  "bcode_tool",
  "bcode_workflow",
+ "bmux_keyboard",
+ "bmux_text_edit",
  "bmux_tui",
  "clap",
  "schemars",
@@ -2273,7 +2275,9 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
  "bmux_keyboard",
+ "bmux_text_edit",
  "bmux_tui",
+ "bmux_tui_components",
  "serde",
  "serde_json",
 ]

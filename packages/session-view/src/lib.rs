@@ -16,7 +16,7 @@ use bcode_session_models::{
     ToolInvocationProjection, apply_tool_invocation_projection_event,
 };
 use bcode_session_view_models::{
-    ChatMessageView, CompactionView, CompactionViewStatus, ComposerViewState,
+    ChatMessageView, CompactionView, CompactionViewStatus, ComposerViewState, InteractionViewState,
     InteractionViewSummary, PluginStatusView, ProviderProgressView, SessionViewSnapshot, SkillView,
     SkillViewStatus, StreamingInterpolationCurve, StreamingPresentationPolicy, TextFormat,
     TextStreamViewState, TextStreamViewStatus, ThinkingViewState, ToolInvocationView,
@@ -106,6 +106,138 @@ fn tool_invocation_id(event: &SessionEvent) -> Option<&str> {
         SessionEventKind::ToolInvocationLifecycle { event } => Some(&event.invocation_id),
         SessionEventKind::ToolInvocationResultRecorded { record } => Some(&record.invocation_id),
         _ => None,
+    }
+}
+
+fn interaction_from_exchange_request(
+    request: &bcode_session_models::ToolExchangeRequest,
+) -> InteractionViewSummary {
+    InteractionViewSummary {
+        interaction_id: request.exchange_id.clone(),
+        producer_id: Some(request.producer_id.clone()),
+        exchange_schema: Some(request.schema.clone()),
+        exchange_schema_version: Some(request.schema_version),
+        kind: request.schema.clone(),
+        surface_kind: String::new(),
+        tool_call_id: Some(request.invocation_id.clone()),
+        title: Some(request.producer_id.clone()),
+        required: request.response_policy
+            == bcode_session_models::ToolExchangeResponsePolicy::Required,
+        snapshot: Some(request.payload.clone()),
+        state: InteractionViewState::Pending,
+        status_detail: None,
+        resolved: false,
+        resolution: None,
+    }
+}
+
+fn merge_hydrated_interaction(
+    existing: Option<&InteractionViewSummary>,
+    mut hydrated: InteractionViewSummary,
+) -> InteractionViewSummary {
+    let Some(existing) = existing else {
+        return hydrated;
+    };
+    if hydrated.producer_id.is_none() {
+        hydrated.producer_id.clone_from(&existing.producer_id);
+    }
+    if hydrated.exchange_schema.is_none() {
+        hydrated
+            .exchange_schema
+            .clone_from(&existing.exchange_schema);
+    }
+    if hydrated.exchange_schema_version.is_none() {
+        hydrated.exchange_schema_version = existing.exchange_schema_version;
+    }
+    hydrated
+}
+
+fn terminal_interaction_without_request(
+    interaction_id: &str,
+    resolution: &bcode_session_models::ToolExchangeResolution,
+) -> InteractionViewSummary {
+    InteractionViewSummary {
+        interaction_id: interaction_id.to_owned(),
+        producer_id: None,
+        exchange_schema: None,
+        exchange_schema_version: None,
+        kind: "bcode.tool.exchange".to_owned(),
+        surface_kind: String::new(),
+        tool_call_id: None,
+        title: Some("Interaction".to_owned()),
+        required: false,
+        snapshot: None,
+        state: interaction_state_for_resolution(resolution),
+        status_detail: interaction_status_detail(resolution),
+        resolved: true,
+        resolution: Some(interaction_resolution_payload(resolution)),
+    }
+}
+
+fn interaction_state_for_resolution(
+    resolution: &bcode_session_models::ToolExchangeResolution,
+) -> InteractionViewState {
+    match resolution {
+        bcode_session_models::ToolExchangeResolution::Responded { payload } if matches!(payload.get("status"), Some(serde_json::Value::String(status)) if status == "dismissed") => {
+            InteractionViewState::Cancelled
+        }
+        bcode_session_models::ToolExchangeResolution::Responded { .. } => {
+            InteractionViewState::Resolved
+        }
+        bcode_session_models::ToolExchangeResolution::Cancelled
+        | bcode_session_models::ToolExchangeResolution::TimedOut
+        | bcode_session_models::ToolExchangeResolution::NoCompatibleConsumer
+        | bcode_session_models::ToolExchangeResolution::ConsumerDetached => {
+            InteractionViewState::Cancelled
+        }
+        bcode_session_models::ToolExchangeResolution::Failed { .. } => {
+            InteractionViewState::ActionError
+        }
+    }
+}
+
+fn interaction_status_detail(
+    resolution: &bcode_session_models::ToolExchangeResolution,
+) -> Option<String> {
+    match resolution {
+        bcode_session_models::ToolExchangeResolution::Responded { payload } if matches!(payload.get("status"), Some(serde_json::Value::String(status)) if status == "dismissed") => {
+            Some("dismissed".to_owned())
+        }
+        bcode_session_models::ToolExchangeResolution::Responded { .. } => None,
+        bcode_session_models::ToolExchangeResolution::Cancelled => Some("cancelled".to_owned()),
+        bcode_session_models::ToolExchangeResolution::TimedOut => Some("timed out".to_owned()),
+        bcode_session_models::ToolExchangeResolution::NoCompatibleConsumer => {
+            Some("no compatible consumer".to_owned())
+        }
+        bcode_session_models::ToolExchangeResolution::ConsumerDetached => {
+            Some("consumer detached".to_owned())
+        }
+        bcode_session_models::ToolExchangeResolution::Failed { code, message } => {
+            Some(format!("{code}: {message}"))
+        }
+    }
+}
+
+fn interaction_resolution_payload(
+    resolution: &bcode_session_models::ToolExchangeResolution,
+) -> serde_json::Value {
+    match resolution {
+        bcode_session_models::ToolExchangeResolution::Responded { payload } => payload.clone(),
+        bcode_session_models::ToolExchangeResolution::Cancelled => {
+            serde_json::json!({"status": "cancelled"})
+        }
+        bcode_session_models::ToolExchangeResolution::TimedOut => {
+            serde_json::json!({"status": "timed_out"})
+        }
+        bcode_session_models::ToolExchangeResolution::NoCompatibleConsumer => {
+            serde_json::json!({"status": "no_compatible_consumer"})
+        }
+        bcode_session_models::ToolExchangeResolution::ConsumerDetached => {
+            serde_json::json!({"status": "consumer_detached"})
+        }
+        bcode_session_models::ToolExchangeResolution::Failed { code, message } => {
+            serde_json::json!({"status": "failed", "code": code, "message": message})
+        }
     }
 }
 
@@ -718,7 +850,13 @@ impl SessionView {
             self.bump_revision();
         }
         for interaction in interactions {
-            self.upsert_interaction(interaction);
+            self.upsert_interaction(merge_hydrated_interaction(
+                self.snapshot
+                    .interactions
+                    .iter()
+                    .find(|existing| existing.interaction_id == interaction.interaction_id),
+                interaction,
+            ));
         }
     }
 
@@ -739,6 +877,7 @@ impl SessionView {
     }
 
     /// Clear bounded history projection while retaining authoritative hydrated session state.
+    #[allow(clippy::too_many_lines)] // One replacement preserves all live supplemental state atomically.
     pub fn clear_history_window(&mut self) {
         let previous = self.snapshot.clone();
         let terminal_runtime_work = self.terminal_runtime_work.clone();
@@ -776,6 +915,27 @@ impl SessionView {
                     .map(|placement| (contribution.clone(), placement))
             })
             .collect::<Vec<_>>();
+        let retained_interactions = previous
+            .interactions
+            .iter()
+            .cloned()
+            .map(|interaction| {
+                let metadata = previous
+                    .transcript
+                    .items
+                    .iter()
+                    .find_map(|item| match &item.kind {
+                        TranscriptViewItemKind::Interaction {
+                            interaction: item_interaction,
+                        } if item_interaction.interaction_id == interaction.interaction_id => {
+                            Some((item.sequence.unwrap_or(0), item.timestamp_ms))
+                        }
+                        _ => None,
+                    });
+                let (sequence, timestamp_ms) = metadata.unwrap_or((0, None));
+                (interaction, sequence, timestamp_ms)
+            })
+            .collect::<Vec<_>>();
         let mut replacement = Self::new();
         replacement.streaming_presentation_policy = self.streaming_presentation_policy;
         replacement.snapshot.session_id = previous.session_id;
@@ -788,7 +948,6 @@ impl SessionView {
         replacement.snapshot.composer = previous.composer;
         replacement.snapshot.thinking = previous.thinking;
         replacement.snapshot.runtime = previous.runtime;
-        replacement.snapshot.interactions = previous.interactions;
         replacement.snapshot.session_summary = previous.session_summary;
         replacement.snapshot.transcript.source_start_sequence =
             previous.transcript.source_start_sequence;
@@ -833,6 +992,9 @@ impl SessionView {
         }
         for (contribution, placement) in live_contributions {
             replacement.apply_contribution_event(0, None, &contribution, placement);
+        }
+        for (interaction, sequence, timestamp_ms) in retained_interactions {
+            replacement.upsert_interaction_item(interaction, sequence, timestamp_ms);
         }
         *self = replacement;
     }
@@ -1562,14 +1724,23 @@ impl SessionView {
                     format!("{}:{}", request.invocation_id, request.exchange_id),
                     request.clone(),
                 );
-                self.bump_revision();
+                self.upsert_interaction_item(
+                    interaction_from_exchange_request(request),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                );
             }
             SessionEventKind::ToolExchangeResolved { event: resolution } => {
                 self.snapshot.active_exchanges.remove(&format!(
                     "{}:{}",
                     resolution.invocation_id, resolution.exchange_id
                 ));
-                self.bump_revision();
+                self.resolve_interaction_item(
+                    &resolution.exchange_id,
+                    &resolution.resolution,
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                );
             }
             SessionEventKind::ToolContribution {
                 event: contribution,
@@ -3325,6 +3496,59 @@ impl SessionView {
         }
     }
 
+    fn resolve_interaction_item(
+        &mut self,
+        interaction_id: &str,
+        resolution: &bcode_session_models::ToolExchangeResolution,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+    ) {
+        let Some(index) = self
+            .snapshot
+            .interactions
+            .iter()
+            .position(|interaction| interaction.interaction_id == interaction_id)
+        else {
+            // A bounded history window can begin after the request. Retain a generic terminal row
+            // rather than guessing producer-owned request semantics that are no longer resident.
+            self.upsert_interaction_item(
+                terminal_interaction_without_request(interaction_id, resolution),
+                sequence,
+                timestamp_ms,
+            );
+            return;
+        };
+        if self.snapshot.interactions[index].resolved {
+            return;
+        }
+        let interaction = &mut self.snapshot.interactions[index];
+        interaction.state = interaction_state_for_resolution(resolution);
+        interaction.status_detail = interaction_status_detail(resolution);
+        interaction.resolved = true;
+        interaction.resolution = Some(interaction_resolution_payload(resolution));
+        let interaction = interaction.clone();
+        let Some(id) = self.interaction_item_ids.get(interaction_id).cloned() else {
+            self.upsert_interaction_item(interaction, sequence, timestamp_ms);
+            return;
+        };
+        let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+        else {
+            self.upsert_interaction_item(interaction, sequence, timestamp_ms);
+            return;
+        };
+        item.kind = TranscriptViewItemKind::Interaction { interaction };
+        item.sequence = (sequence != 0).then_some(sequence).or(item.sequence);
+        item.timestamp_ms = timestamp_ms.or(item.timestamp_ms);
+        item.revision = item.revision.saturating_add(1);
+        self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        self.bump_revision();
+    }
+
     #[allow(clippy::too_many_lines)] // One reducer keeps generation/revision/offset transitions atomic.
     fn apply_ordered_assistant_update(
         &mut self,
@@ -5013,8 +5237,156 @@ mod tests {
             view.snapshot().active_exchanges["call:question"],
             request_event
         );
+        let interaction_id = TranscriptViewItemId::interaction("question");
+        let pending = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == interaction_id)
+            .expect("pending interaction row");
+        let pending_revision = pending.revision;
+        assert!(matches!(
+            &pending.kind,
+            TranscriptViewItemKind::Interaction { interaction }
+                if interaction.kind == "future.question/schema"
+                    && interaction.surface_kind.is_empty()
+                    && interaction.required
+                    && interaction.snapshot
+                        == Some(serde_json::json!({"opaque_question": true}))
+                    && interaction.state == InteractionViewState::Pending
+                    && !interaction.resolved
+        ));
+
         view.apply_event(&resolved);
         assert!(view.snapshot().active_exchanges.is_empty());
+        let terminal = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == interaction_id)
+            .expect("terminal interaction row");
+        assert!(terminal.revision > pending_revision);
+        assert_eq!(terminal.sequence, Some(10));
+        assert!(matches!(
+            &terminal.kind,
+            TranscriptViewItemKind::Interaction { interaction }
+                if interaction.state == InteractionViewState::Resolved
+                    && interaction.resolved
+                    && interaction.resolution
+                        == Some(serde_json::json!({"opaque_answer": 42}))
+        ));
+        assert_eq!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| item.id == interaction_id)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn exchange_terminal_resolution_without_resident_request_is_retained_generically() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            10,
+            SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: "call".to_owned(),
+                    exchange_id: "question".to_owned(),
+                    resolution: bcode_session_models::ToolExchangeResolution::TimedOut,
+                },
+            },
+        ));
+
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::Interaction { interaction }
+                if interaction.kind == "bcode.tool.exchange"
+                    && interaction.state == InteractionViewState::Cancelled
+                    && interaction.resolved
+                    && interaction.status_detail.as_deref() == Some("timed out")
+                    && interaction.resolution
+                        == Some(serde_json::json!({"status": "timed_out"}))
+        ));
+    }
+
+    #[test]
+    fn exchange_resolution_variants_have_explicit_terminal_semantics() {
+        let variants = [
+            (
+                bcode_session_models::ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"status": "dismissed"}),
+                },
+                InteractionViewState::Cancelled,
+                Some("dismissed"),
+            ),
+            (
+                bcode_session_models::ToolExchangeResolution::Cancelled,
+                InteractionViewState::Cancelled,
+                Some("cancelled"),
+            ),
+            (
+                bcode_session_models::ToolExchangeResolution::NoCompatibleConsumer,
+                InteractionViewState::Cancelled,
+                Some("no compatible consumer"),
+            ),
+            (
+                bcode_session_models::ToolExchangeResolution::ConsumerDetached,
+                InteractionViewState::Cancelled,
+                Some("consumer detached"),
+            ),
+            (
+                bcode_session_models::ToolExchangeResolution::Failed {
+                    code: "route_failed".to_owned(),
+                    message: "offline".to_owned(),
+                },
+                InteractionViewState::ActionError,
+                Some("route_failed: offline"),
+            ),
+        ];
+
+        for (index, (resolution, expected_state, expected_detail)) in
+            variants.into_iter().enumerate()
+        {
+            let mut view = SessionView::new();
+            let exchange_id = format!("question-{index}");
+            view.apply_event(&event(
+                SessionId::new(),
+                1,
+                SessionEventKind::ToolExchangeRequested {
+                    request: bcode_session_models::ToolExchangeRequest {
+                        invocation_id: format!("call-{index}"),
+                        exchange_id: exchange_id.clone(),
+                        producer_id: "producer".to_owned(),
+                        schema: "schema".to_owned(),
+                        schema_version: 1,
+                        payload: serde_json::json!({}),
+                        response_policy: bcode_session_models::ToolExchangeResponsePolicy::Optional,
+                    },
+                },
+            ));
+            view.apply_event(&event(
+                view.snapshot().session_id.expect("session id"),
+                2,
+                SessionEventKind::ToolExchangeResolved {
+                    event: bcode_session_models::ToolExchangeResolutionEvent {
+                        invocation_id: format!("call-{index}"),
+                        exchange_id,
+                        resolution,
+                    },
+                },
+            ));
+            let interaction = &view.snapshot().interactions[0];
+            assert_eq!(interaction.state, expected_state);
+            assert_eq!(interaction.status_detail.as_deref(), expected_detail);
+            assert!(interaction.resolved);
+        }
     }
 
     #[test]
@@ -8144,6 +8516,63 @@ mod tests {
     }
 
     #[test]
+    fn hydration_enriches_event_projected_interaction_without_losing_exchange_facts() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolExchangeRequested {
+                request: bcode_session_models::ToolExchangeRequest {
+                    invocation_id: "call-1".to_owned(),
+                    exchange_id: "question-1".to_owned(),
+                    producer_id: "bcode.question".to_owned(),
+                    schema: "bcode.question.request".to_owned(),
+                    schema_version: 1,
+                    payload: serde_json::json!({"questions": []}),
+                    response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+                },
+            },
+        ));
+
+        view.set_pending_interactions(vec![InteractionViewSummary {
+            producer_id: Some("bcode.question".to_owned()),
+            exchange_schema: Some("bcode.question.request".to_owned()),
+            exchange_schema_version: Some(1),
+            interaction_id: "question-1".to_owned(),
+            kind: "bcode.question".to_owned(),
+            surface_kind: "bcode.question.inline".to_owned(),
+            tool_call_id: Some("call-1".to_owned()),
+            title: Some("Question".to_owned()),
+            required: true,
+            snapshot: Some(serde_json::json!({"questions": []})),
+            state: InteractionViewState::Pending,
+            status_detail: None,
+            resolved: false,
+            resolution: None,
+        }]);
+
+        let interaction = &view.snapshot().interactions[0];
+        assert_eq!(interaction.kind, "bcode.question");
+        assert_eq!(interaction.surface_kind, "bcode.question.inline");
+        assert_eq!(interaction.producer_id.as_deref(), Some("bcode.question"));
+        assert_eq!(
+            interaction.exchange_schema.as_deref(),
+            Some("bcode.question.request")
+        );
+        assert_eq!(interaction.exchange_schema_version, Some(1));
+        assert_eq!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| item.id == TranscriptViewItemId::interaction("question-1"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn assistant_context_precedes_pending_question_and_resolution_updates_same_item() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
@@ -8155,6 +8584,9 @@ mod tests {
             },
         ));
         view.upsert_interaction(InteractionViewSummary {
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
             surface_kind: "bcode.question.inline".to_owned(),
@@ -8184,6 +8616,9 @@ mod tests {
             .revision;
 
         view.upsert_interaction(InteractionViewSummary {
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
             surface_kind: "bcode.question.inline".to_owned(),
@@ -8224,6 +8659,9 @@ mod tests {
     #[test]
     fn authoritative_interaction_hydration_removes_stale_pending_state() {
         let interaction = |id: &str| InteractionViewSummary {
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
             interaction_id: id.to_owned(),
             kind: "question".to_owned(),
             surface_kind: "question.inline".to_owned(),

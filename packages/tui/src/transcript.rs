@@ -112,6 +112,11 @@ pub enum TranscriptItemKind {
         /// Current semantic state of the owning invocation, when known.
         invocation: Option<Box<ToolInvocationView>>,
     },
+    /// Renderer-neutral interactive request adapted for terminal presentation.
+    Interaction {
+        /// Stable semantic interaction summary.
+        interaction: Box<InteractionViewSummary>,
+    },
     /// Generic fallback item.
     Generic,
 }
@@ -334,6 +339,7 @@ impl TranscriptItem {
             | TranscriptItemKind::Meta
             | TranscriptItemKind::Skill
             | TranscriptItemKind::SkillError
+            | TranscriptItemKind::Interaction { .. }
             | TranscriptItemKind::Generic => None,
         }
     }
@@ -473,6 +479,15 @@ impl TranscriptItem {
     #[must_use]
     pub const fn kind(&self) -> &TranscriptItemKind {
         &self.kind
+    }
+
+    /// Return a renderer-neutral interaction summary for this item, when present.
+    #[must_use]
+    pub const fn interaction(&self) -> Option<&InteractionViewSummary> {
+        match &self.kind {
+            TranscriptItemKind::Interaction { interaction } => Some(interaction),
+            _ => None,
+        }
     }
 
     /// Return the renderer-neutral text format.
@@ -1093,7 +1108,14 @@ fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -
     } else {
         format!("{label} ({state})\nAnswer in the active interaction panel.")
     };
-    TranscriptItem::with_kind("Interaction", text, false, TranscriptItemKind::Generic)
+    TranscriptItem::with_kind(
+        "Interaction",
+        text,
+        false,
+        TranscriptItemKind::Interaction {
+            interaction: Box::new(interaction.clone()),
+        },
+    )
 }
 
 /// Format JSON-like values for transcript display.
@@ -1260,13 +1282,16 @@ mod tests {
     }
 
     #[test]
-    fn generic_skill_and_interaction_items_remain_explicit_plain_text() {
+    fn skill_and_interaction_items_remain_explicit_plain_text() {
         let skill = terminal_skill_item_from_shared(&bcode_session_view_models::SkillView {
             skill_id: "review".to_owned(),
             status: bcode_session_view_models::SkillViewStatus::ContextLoaded,
             text: "* literal context".to_owned(),
         });
         let interaction = terminal_interaction_item_from_shared(&InteractionViewSummary {
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
             surface_kind: "bcode.question.inline".to_owned(),
@@ -1282,11 +1307,19 @@ mod tests {
 
         assert_eq!(skill.text_format(), TextFormat::PlainText);
         assert_eq!(interaction.text_format(), TextFormat::PlainText);
+        assert!(matches!(
+            interaction.kind(),
+            TranscriptItemKind::Interaction { interaction }
+                if interaction.interaction_id == "question-1"
+        ));
     }
 
     #[test]
     fn pending_interaction_summary_avoids_duplicate_raw_form_payload() {
         let interaction = InteractionViewSummary {
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
             surface_kind: "bcode.question.inline".to_owned(),
@@ -1311,6 +1344,9 @@ mod tests {
     #[test]
     fn resolved_interaction_summary_keeps_durable_outcome() {
         let interaction = InteractionViewSummary {
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
             surface_kind: "bcode.question.inline".to_owned(),

@@ -132,3 +132,33 @@ Bcode records `tui.frame.changed_cells` and `tui.frame.full_repaint_total`; repe
 therefore use BMUX's retained-buffer changed-cell transport, while resize or explicit backend reset
 may repaint fully. Custom dirty-region transport is not justified unless production telemetry shows
 changed-cell amplification beyond the existing item-scoped layout and BMUX cell diff.
+
+## Interactive tool presentation
+
+`[tui.interactions]` controls terminal presentation for active plugin-owned interactions.
+
+```toml
+[tui.interactions]
+placement = "transcript"
+offscreen_focus = "retain"
+```
+
+* `placement = "transcript"` is the default. The active surface occupies its semantic interaction
+  transcript item and scrolls with ordinary transcript content.
+* `placement = "pinned"` pins the same surface above the composer. The overlay does not change
+  transcript layout, and the host underpaints its complete rectangle before plugin rendering.
+* `offscreen_focus = "retain"` is the default. Keyboard input continues to reach the active inline
+  interaction while the user scrolls backward for context.
+* `offscreen_focus = "suspend"` routes ordinary input back to the composer while the inline item is
+  fully hidden. `tui.interaction.focusActive` restores the item into view; its default binding is
+  Ctrl-I and it can be remapped under `[tui.keybindings.chat]`.
+
+Placement and off-screen focus are renderer-owned and apply on configuration reload without changing
+controller or exchange state. Interaction values and validation remain plugin-owned. Host-configured
+composer edit, selection, newline, and submit bindings are adapted through the terminal plugin host.
+
+Inline interaction rows use the existing indexed transcript layout and viewport. Partial visibility
+is rendered through a bounded scratch frame and clipped into terminal coordinates, including cursor
+and mouse translation. Only one queued interaction is active at a time. Question requests are
+bounded to 32 questions, 100 options per question, 16 KiB question text, 4 KiB option labels, and
+64 KiB custom answers; custom inputs display at most six content rows at once.

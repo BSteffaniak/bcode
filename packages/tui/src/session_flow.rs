@@ -1190,6 +1190,7 @@ fn handle_picker_filter_key(
             | BmuxAction::SkillInvoke
             | BmuxAction::SkillActivate
             | BmuxAction::SkillDeactivate
+            | BmuxAction::InteractionFocusActive
             | BmuxAction::SkillHelp => PickerKeyOutcome::Continue,
         };
     }

@@ -1991,14 +1991,34 @@ fn draw_chat_frame<W: Write>(
     let frame_started = Instant::now();
     let prepare_started = frame_started;
     let full_transcript_area = render::transcript_area_for_frame(&chat.app, terminal.area());
-    let dock_height = loop_state
+    let interaction_rows = loop_state
         .interactive_surface
         .as_mut()
-        .map_or(0, |surface| {
-            interactive_surface_height(surface, full_transcript_area)
-        });
+        .map(|surface| surface.preferred_height(full_transcript_area.width).max(1));
+    let pinned = chat.app.tui_config().interactions.placement
+        == bcode_config::TuiInteractionPlacement::Pinned;
+    let dock_height = if pinned {
+        loop_state
+            .interactive_surface
+            .as_mut()
+            .map_or(0, |surface| {
+                interactive_surface_height(surface, full_transcript_area)
+            })
+    } else {
+        0
+    };
+    let active_inline_rows = (!pinned)
+        .then(|| {
+            Some((
+                loop_state.interactive_surface.as_ref()?.interaction_id(),
+                interaction_rows?,
+            ))
+        })
+        .flatten();
     let prepared =
-        render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height);
+        super::transcript_projection::with_active_interaction_rows(active_inline_rows, || {
+            render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height)
+        });
     let layout = prepared.map(|(layout, _dock)| layout);
     let rich_presentation = layout.map_or_else(
         || MarkdownFramePresentation {
@@ -2008,17 +2028,43 @@ fn draw_chat_frame<W: Write>(
         },
         |layout| reconcile_markdown_presentation(chat, loop_state, layout.body),
     );
-    let surface_area = prepared.map_or_else(
-        || {
-            Rect::new(
-                full_transcript_area.x,
-                full_transcript_area.bottom(),
-                full_transcript_area.width,
-                0,
+    let inline_placement = (!pinned)
+        .then(|| {
+            inline_interaction_surface_placement(
+                &chat.app,
+                layout.map(|layout| layout.body),
+                loop_state
+                    .interactive_surface
+                    .as_ref()
+                    .map(InteractiveSurfaceState::interaction_id),
             )
-        },
-        |(_layout, dock)| dock,
-    );
+        })
+        .flatten();
+    let surface_area = if pinned {
+        prepared.map_or_else(
+            || {
+                Rect::new(
+                    full_transcript_area.x,
+                    full_transcript_area.bottom(),
+                    full_transcript_area.width,
+                    0,
+                )
+            },
+            |(_layout, dock)| dock,
+        )
+    } else {
+        inline_placement.map_or_else(
+            || {
+                Rect::new(
+                    full_transcript_area.x,
+                    full_transcript_area.bottom(),
+                    full_transcript_area.width,
+                    0,
+                )
+            },
+            |placement| placement.destination,
+        )
+    };
     for stats in chat.app.transcript_layout_mut().drain_sync_stats() {
         let mut labels = bcode_metrics::MetricLabels::new();
         labels.insert(
@@ -2158,8 +2204,20 @@ fn draw_chat_frame<W: Write>(
         if let Some(dialog) = &mut loop_state.timeline_dialog {
             timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
         }
-        if let Some(surface) = &mut loop_state.interactive_surface {
-            surface.render(surface_area, frame);
+        if let Some(surface) = &mut loop_state.interactive_surface
+            && !surface_area.is_empty()
+        {
+            if pinned {
+                frame.fill(surface_area, " ", bmux_tui::prelude::Style::new());
+                surface.render(surface_area, frame);
+            } else if let Some(placement) = inline_placement {
+                surface.render_clipped(
+                    placement.full_area,
+                    placement.visible_content_offset,
+                    placement.destination,
+                    frame,
+                );
+            }
         }
     })?;
     loop_state.telemetry.record_histogram(
@@ -2221,6 +2279,56 @@ fn draw_chat_frame<W: Write>(
 
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InlineInteractionPlacement {
+    destination: Rect,
+    full_area: Rect,
+    visible_content_offset: u16,
+}
+
+fn inline_interaction_surface_placement(
+    app: &super::app::BmuxApp,
+    body: Option<Rect>,
+    interaction_id: Option<&str>,
+) -> Option<InlineInteractionPlacement> {
+    let body = body?;
+    let index = app.interaction_transcript_index(interaction_id?)?;
+    let range = app.transcript_item_row_range(index)?;
+    let top = app.transcript_top_row(body.height);
+    let visible_start = range.start.max(top);
+    let visible_end = range.end.min(top.saturating_add(usize::from(body.height)));
+    if visible_start >= visible_end {
+        return None;
+    }
+    Some(InlineInteractionPlacement {
+        destination: Rect::new(
+            body.x,
+            body.y.saturating_add(
+                u16::try_from(visible_start.saturating_sub(top)).unwrap_or(u16::MAX),
+            ),
+            body.width,
+            u16::try_from(visible_end.saturating_sub(visible_start)).unwrap_or(u16::MAX),
+        ),
+        full_area: Rect::new(
+            0,
+            0,
+            body.width,
+            u16::try_from(range.end.saturating_sub(range.start)).unwrap_or(u16::MAX),
+        ),
+        visible_content_offset: u16::try_from(visible_start.saturating_sub(range.start))
+            .unwrap_or(u16::MAX),
+    })
+}
+
+fn inline_interaction_surface_area(
+    app: &super::app::BmuxApp,
+    body: Option<Rect>,
+    interaction_id: Option<&str>,
+) -> Option<Rect> {
+    inline_interaction_surface_placement(app, body, interaction_id)
+        .map(|placement| placement.destination)
 }
 
 fn interactive_surface_height(surface: &mut InteractiveSurfaceState, viewport: Rect) -> u16 {
@@ -2576,17 +2684,54 @@ fn absorb_bcode_event(
 fn interaction_surface_request(
     interaction: &bcode_session_view_models::InteractionViewSummary,
 ) -> Option<InteractiveSurfaceRequest> {
-    (!interaction.resolved && !interaction.surface_kind.is_empty()).then(|| {
-        InteractiveSurfaceRequest::new(
-            interaction.interaction_id.clone(),
-            interaction.surface_kind.clone(),
-            interaction
-                .snapshot
-                .clone()
-                .unwrap_or(serde_json::Value::Null)
-                .to_string(),
-        )
-    })
+    if interaction.resolved {
+        return None;
+    }
+    let surface_kind = if interaction.surface_kind.is_empty() {
+        interaction_adapter_for_summary(interaction)?.tui_surface_kind?
+    } else {
+        interaction.surface_kind.clone()
+    };
+    Some(InteractiveSurfaceRequest::new(
+        interaction.interaction_id.clone(),
+        surface_kind,
+        interaction
+            .snapshot
+            .clone()
+            .unwrap_or(serde_json::Value::Null)
+            .to_string(),
+    ))
+}
+
+#[cfg(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+))]
+fn interaction_adapter_for_summary(
+    interaction: &bcode_session_view_models::InteractionViewSummary,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    bcode_bundled_plugins::interaction_adapter(
+        interaction.producer_id.as_deref()?,
+        interaction.exchange_schema.as_deref()?,
+        interaction.exchange_schema_version?,
+        "tui",
+    )
+}
+
+#[cfg(not(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+)))]
+const fn interaction_adapter_for_summary(
+    _interaction: &bcode_session_view_models::InteractionViewSummary,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    None
 }
 
 #[cfg(not(any(
@@ -2809,12 +2954,14 @@ async fn maybe_start_interactive_surface(
             .interactive_surface_queue
             .front_ready(Instant::now())
             .expect("ready request checked above"),
+        &BmuxKeyMap::from_config(chat.app.tui_config()),
     )
     .await;
     match opened {
         Ok(surface) => {
             loop_state.interactive_surface_queue.pop_front();
             loop_state.interactive_surface = Some(surface);
+            chat.app.invalidate_interaction_surface_layout();
             true
         }
         Err(error) => {
@@ -3026,7 +3173,8 @@ async fn handle_event<W: Write>(
         | Event::Focus(_)
         | Event::Tick
         | Event::Mouse(_))
-            if loop_state.interactive_surface.is_some() =>
+            if loop_state.interactive_surface.is_some()
+                && interaction_input_is_active(chat, loop_state, context.terminal.area()) =>
         {
             handle_interactive_surface_event(context, chat, loop_state, event).await
         }
@@ -3080,6 +3228,25 @@ async fn handle_event<W: Write>(
     }
 }
 
+fn interaction_input_is_active(
+    chat: &ActiveChat,
+    loop_state: &ChatLoopState,
+    terminal_area: Rect,
+) -> bool {
+    if chat.app.tui_config().interactions.placement == bcode_config::TuiInteractionPlacement::Pinned
+        || chat.app.tui_config().interactions.offscreen_focus
+            == bcode_config::TuiInteractionOffscreenFocus::Retain
+    {
+        return true;
+    }
+    let Some(surface) = loop_state.interactive_surface.as_ref() else {
+        return false;
+    };
+    let body = render::transcript_area_for_frame(&chat.app, terminal_area);
+    inline_interaction_surface_area(&chat.app, Some(body), Some(surface.interaction_id()))
+        .is_some_and(|area| !area.is_empty())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InteractiveSurfaceEventRoute {
     Host(BmuxAction),
@@ -3130,6 +3297,18 @@ async fn handle_interactive_surface_host_key<W: Write>(
             resolve_interactive_surface_dismissed(context, chat, loop_state).await?;
             Ok(true)
         }
+        Some(BmuxAction::InteractionFocusActive) => {
+            let Some(surface) = loop_state.interactive_surface.as_ref() else {
+                return Ok(false);
+            };
+            let Some(index) = chat
+                .app
+                .interaction_transcript_index(surface.interaction_id())
+            else {
+                return Ok(false);
+            };
+            Ok(chat.app.scroll_transcript_item_into_view(index))
+        }
         Some(action) if is_transcript_action(action) => {
             Ok(input::handle_host_action(&mut chat.app, action).redraw)
         }
@@ -3153,6 +3332,7 @@ const fn is_transcript_action(action: BmuxAction) -> bool {
             | BmuxAction::TranscriptBottom
             | BmuxAction::TranscriptLineUp
             | BmuxAction::TranscriptLineDown
+            | BmuxAction::InteractionFocusActive
     )
 }
 
@@ -3210,12 +3390,32 @@ async fn handle_interactive_surface_event<W: Write>(
     let Some(surface) = &mut loop_state.interactive_surface else {
         return Ok(false);
     };
-    let _surface_area = interactive_surface_area(
-        surface,
-        render::transcript_area_for_frame(&chat.app, context.terminal.area()),
+    let event = if chat.app.tui_config().interactions.placement
+        == bcode_config::TuiInteractionPlacement::Transcript
+    {
+        let body = render::transcript_area_for_frame(&chat.app, context.terminal.area());
+        if let Some(placement) = inline_interaction_surface_placement(
+            &chat.app,
+            Some(body),
+            Some(surface.interaction_id()),
+        ) {
+            InteractiveSurfaceState::translate_clipped_event(
+                event,
+                placement.full_area,
+                placement.visible_content_offset,
+                placement.destination,
+            )
+        } else {
+            event
+        }
+    } else {
+        event
+    };
+    let interaction_id = surface.interaction_id().to_owned();
+    let previous_height = surface.preferred_height(
+        render::transcript_area_for_frame(&chat.app, context.terminal.area()).width,
     );
     if let Some(resolution) = surface.handle_event(&event) {
-        let interaction_id = surface.interaction_id().to_owned();
         match execute_session_view_action(
             context.services.client,
             SessionViewAction::ResolveExchange {
@@ -3227,6 +3427,7 @@ async fn handle_interactive_surface_event<W: Write>(
         {
             Ok(SessionViewActionOutcome::InteractionResolved { resolved: true }) => {
                 loop_state.interactive_surface = None;
+                chat.app.invalidate_interaction_surface_layout();
             }
             Ok(SessionViewActionOutcome::InteractionResolved { resolved: false }) => {
                 loop_state.interactive_surface = None;
@@ -3236,16 +3437,37 @@ async fn handle_interactive_surface_event<W: Write>(
             }
             Ok(_) => {
                 surface.clear_pending_resolution();
+                if let Some(index) = chat
+                    .app
+                    .interaction_transcript_index(surface.interaction_id())
+                {
+                    chat.app.mark_transcript_item_dirty(index);
+                }
                 chat.app.set_status(
                     "Interactive response failed: unexpected daemon response; retry".to_owned(),
                 );
             }
             Err(error) => {
                 surface.clear_pending_resolution();
+                if let Some(index) = chat
+                    .app
+                    .interaction_transcript_index(surface.interaction_id())
+                {
+                    chat.app.mark_transcript_item_dirty(index);
+                }
                 tracing::warn!(%error, "failed to resolve interactive request");
                 chat.app
                     .set_status(format!("Interactive response failed; retry: {error}"));
             }
+        }
+    } else if let Some(surface) = loop_state.interactive_surface.as_mut() {
+        let current_height = surface.preferred_height(
+            render::transcript_area_for_frame(&chat.app, context.terminal.area()).width,
+        );
+        if current_height != previous_height {
+            chat.app.invalidate_interaction_surface_layout();
+        } else if let Some(index) = chat.app.interaction_transcript_index(&interaction_id) {
+            chat.app.mark_transcript_item_dirty(index);
         }
     }
     Ok(true)
@@ -3945,6 +4167,9 @@ mod scheduler_tests {
         surface_kind: &str,
     ) -> bcode_session_view_models::InteractionViewSummary {
         bcode_session_view_models::InteractionViewSummary {
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
             interaction_id: id.to_owned(),
             kind: "bcode.question".to_owned(),
             surface_kind: surface_kind.to_owned(),

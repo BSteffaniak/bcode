@@ -582,6 +582,7 @@ async fn explanatory_assistant_context_remains_visible_above_question_dock() {
             }]
         })
         .to_string(),
+        &crate::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
     )
     .await
     .expect("question surface");
@@ -1984,6 +1985,9 @@ fn push_transcript_item_rows(
             ) {
                 push_tool_invocation_fallback_rows(rows, invocation.as_deref(), item, width);
             }
+        }
+        TranscriptItemKind::Interaction { interaction: _ } => {
+            push_detail_block(rows, &item.display_role(), item.text(), Color::Cyan, width);
         }
         TranscriptItemKind::Generic => {
             push_detail_block(

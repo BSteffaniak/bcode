@@ -105,6 +105,7 @@ pub async fn handle_permission_key(
         | BmuxAction::SkillInvoke
         | BmuxAction::SkillActivate
         | BmuxAction::SkillDeactivate
+        | BmuxAction::InteractionFocusActive
         | BmuxAction::SkillHelp => Ok(false),
     }
 }

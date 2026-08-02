@@ -663,6 +663,9 @@ async fn hydrate_pending_interactions(
         };
         let status_detail = validation_error;
         view.upsert_interaction(InteractionViewSummary {
+            producer_id: Some(exchange.producer_id.clone()),
+            exchange_schema: Some(exchange.schema.clone()),
+            exchange_schema_version: Some(exchange.schema_version),
             interaction_id,
             kind,
             surface_kind,

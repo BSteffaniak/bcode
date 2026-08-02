@@ -1,14 +1,19 @@
 //! Native TUI renderer for the interactive question tool.
 
+use std::collections::BTreeMap;
+
 use bcode_plugin_sdk::tui::TerminalInteractionRenderer;
 use bcode_tool::{InteractionControlId, InteractionInput, InteractionNavigation, InteractionValue};
 use bmux_keyboard::KeyCode;
+use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::wrap_text_with_continuation;
+use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
 
 use super::question_interaction::{
     QuestionFocusTarget, QuestionInteractionController, QuestionSnapshot, custom_control_id,
@@ -25,6 +30,8 @@ pub struct QuestionTerminalRenderer {
     controls: Vec<ControlRegion>,
     viewport_offset: u16,
     content_height: u16,
+    custom_inputs: BTreeMap<usize, TextInputState>,
+    custom_areas: BTreeMap<usize, Rect>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,24 +216,48 @@ impl QuestionTerminalRenderer {
         };
         let value = snapshot.answers[question_index]
             .custom
-            .clone()
+            .as_deref()
             .unwrap_or_default();
-        let text = format!("{label}: {value}");
         let start_y = *content_y;
+        let input_height = {
+            let state = self
+                .custom_inputs
+                .entry(question_index)
+                .or_insert_with(|| TextInputState::new(TextEditBuffer::from_text(value)));
+            if state.buffer().text() != value {
+                *state = TextInputState::new(TextEditBuffer::from_text(value));
+                state
+                    .buffer_mut()
+                    .move_cursor(bmux_text_edit::TextMotion::End);
+            }
+            custom_input_height(state, self.last_area.width)
+        };
+        *content_y = content_y.saturating_add(input_height);
         let control_id = custom_control_id(question_index);
-        self.render_wrapped(
-            frame,
-            content_y,
-            &text,
-            "  ",
-            "  ",
-            focus_style(matches!(
-                snapshot.focus,
-                QuestionFocusTarget::Custom { question_index: focused }
-                    if focused == question_index
-            )),
-        );
-        if let Some(area) = self.control_area(start_y, content_y.saturating_sub(start_y)) {
+        if let Some(area) = self.control_area(start_y, input_height) {
+            let state = self
+                .custom_inputs
+                .get_mut(&question_index)
+                .expect("custom input initialized above");
+            state.set_content_area(area, &TextInputPolicy::chat_composer());
+            TextInputBox::new(TextInputPolicy::chat_composer())
+                .label(label)
+                .policy(TextInputBoxPolicy {
+                    field_chrome: true,
+                    panel_chrome: false,
+                    background: false,
+                    cursor: true,
+                    focused: matches!(
+                        snapshot.focus,
+                        QuestionFocusTarget::Custom { question_index: focused }
+                            if focused == question_index
+                    ),
+                    disabled: false,
+                    min_rows: area.height,
+                    max_rows: Some(area.height),
+                })
+                .render(area, state, frame);
+            self.custom_areas.insert(question_index, area);
             self.controls.push(ControlRegion { area, control_id });
         }
     }
@@ -278,6 +309,55 @@ impl QuestionTerminalRenderer {
         );
     }
 
+    fn custom_input(
+        &mut self,
+        event: &Event,
+        snapshot: &QuestionSnapshot,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> Option<InteractionInput> {
+        let QuestionFocusTarget::Custom { question_index } = snapshot.focus else {
+            return None;
+        };
+        let value = snapshot.answers[question_index]
+            .custom
+            .as_deref()
+            .unwrap_or_default();
+        let state = self
+            .custom_inputs
+            .entry(question_index)
+            .or_insert_with(|| TextInputState::new(TextEditBuffer::from_text(value)));
+        let before = state.buffer().text().to_owned();
+        match event {
+            Event::Key(stroke) => {
+                if let Some(motion) = host.text_selection_motion(*stroke) {
+                    state
+                        .buffer_mut()
+                        .move_cursor_with_selection(motion, bmux_text_edit::SelectionMode::Extend);
+                    state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
+                } else if let Some(command) = host.text_edit_command(*stroke) {
+                    state.buffer_mut().apply_command(command);
+                    state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
+                } else {
+                    TextInputControl::new(&TextInputPolicy::chat_composer())
+                        .handle_key(state, *stroke);
+                }
+            }
+            Event::Paste(text) => {
+                TextInputControl::new(&TextInputPolicy::chat_composer()).handle_paste(state, text);
+            }
+            Event::Mouse(mouse) => {
+                TextInputControl::new(&TextInputPolicy::chat_composer())
+                    .handle_mouse(state, *mouse);
+            }
+            Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => return None,
+        }
+        let text = state.buffer().text();
+        (text != before).then(|| InteractionInput::Change {
+            control_id: custom_control_id(question_index),
+            value: InteractionValue::String(text.to_owned()),
+        })
+    }
+
     fn mouse_input(&self, event: &bmux_tui::event::MouseEvent) -> Option<InteractionInput> {
         if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             return None;
@@ -324,16 +404,10 @@ impl QuestionTerminalRenderer {
                     .custom
                     .as_deref()
                     .unwrap_or_default();
-                let label = if question.options.is_empty() {
-                    "Answer"
-                } else {
-                    "Custom answer"
-                };
-                let available = width.saturating_sub(2).max(1);
-                height = height.saturating_add(wrapped_height(
-                    &format!("{label}: {value}"),
-                    available,
-                    available,
+                let state = TextInputState::new(TextEditBuffer::from_text(value));
+                height = height.saturating_add(custom_input_height(
+                    &state,
+                    u16::try_from(width).unwrap_or(u16::MAX),
                 ));
             }
             if snapshot.invalid_question_index == Some(question_index) {
@@ -388,16 +462,10 @@ impl QuestionTerminalRenderer {
                     .custom
                     .as_deref()
                     .unwrap_or_default();
-                let label = if question.options.is_empty() {
-                    "Answer"
-                } else {
-                    "Custom answer"
-                };
-                let available = width.saturating_sub(2).max(1);
-                y = y.saturating_add(wrapped_height(
-                    &format!("{label}: {value}"),
-                    available,
-                    available,
+                let state = TextInputState::new(TextEditBuffer::from_text(value));
+                y = y.saturating_add(custom_input_height(
+                    &state,
+                    u16::try_from(width).unwrap_or(u16::MAX),
                 ));
                 if snapshot.focus == (QuestionFocusTarget::Custom { question_index }) {
                     return (start, y);
@@ -450,8 +518,8 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
     fn render(&mut self, snapshot: &QuestionSnapshot, area: Rect, frame: &mut Frame<'_>) {
         self.last_area = area;
         self.controls.clear();
+        self.custom_areas.clear();
         self.ensure_focus_visible(snapshot, area.width, area.height);
-        frame.fill(area, " ", Style::new().bg(Color::Black));
         let mut content_y = 0;
         self.render_title(frame, &mut content_y);
         if let Some(error) = &snapshot.validation_error {
@@ -480,86 +548,119 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         }
     }
 
-    fn input(&mut self, event: &Event, snapshot: &QuestionSnapshot) -> Option<InteractionInput> {
-        match event {
-            Event::Key(stroke)
-                if stroke.key == KeyCode::Tab
-                    && stroke.modifiers.shift
-                    && !stroke.modifiers.ctrl
-                    && !stroke.modifiers.alt
-                    && !stroke.modifiers.super_key
-                    && !stroke.modifiers.hyper
-                    && !stroke.modifiers.meta =>
-            {
-                Some(InteractionInput::Navigate {
-                    direction: InteractionNavigation::Previous,
-                })
-            }
-            Event::Key(stroke) if stroke.modifiers.is_empty() => match stroke.key {
-                KeyCode::Tab | KeyCode::Down => Some(InteractionInput::Navigate {
-                    direction: InteractionNavigation::Next,
-                }),
-                KeyCode::Up => Some(InteractionInput::Navigate {
-                    direction: InteractionNavigation::Previous,
-                }),
-                KeyCode::Right => {
-                    if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) {
-                        None
-                    } else {
-                        Some(InteractionInput::Navigate {
-                            direction: InteractionNavigation::Next,
-                        })
-                    }
-                }
-                KeyCode::Left => {
-                    if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) {
-                        None
-                    } else {
-                        Some(InteractionInput::Navigate {
-                            direction: InteractionNavigation::Previous,
-                        })
-                    }
-                }
-                KeyCode::Enter | KeyCode::Space => Some(InteractionInput::Activate {
-                    control_id: snapshot.focused_control_id.clone(),
-                }),
-                KeyCode::Escape => Some(InteractionInput::Cancel),
-                KeyCode::Backspace => custom_text_change(snapshot, |text| {
-                    text.pop();
-                }),
-                KeyCode::Char(character) => {
-                    if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) {
-                        custom_text_change(snapshot, |text| text.push(character))
-                    } else if let QuestionFocusTarget::Option { question_index, .. } =
-                        snapshot.focus
-                        && let Some(option_index) =
-                            option_shortcut(character).filter(|option_index| {
-                                *option_index
-                                    < snapshot.request.questions[question_index].options.len()
-                            })
-                    {
-                        Some(InteractionInput::Activate {
-                            control_id: option_control_id(question_index, option_index),
-                        })
-                    } else {
-                        None
-                    }
-                }
-                KeyCode::Home
-                | KeyCode::End
-                | KeyCode::PageUp
-                | KeyCode::PageDown
-                | KeyCode::Delete
-                | KeyCode::Insert
-                | KeyCode::F(_) => None,
-            },
-            Event::Mouse(mouse) => self.mouse_input(mouse),
-            Event::Paste(text) => custom_text_change(snapshot, |value| value.push_str(text)),
-            Event::Key(_) | Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
-                None
-            }
+    fn input(
+        &mut self,
+        event: &Event,
+        snapshot: &QuestionSnapshot,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> Option<InteractionInput> {
+        if let Event::Key(stroke) = event
+            && host.text_submit(*stroke)
+            && matches!(
+                snapshot.focus,
+                QuestionFocusTarget::Custom { .. } | QuestionFocusTarget::Submit
+            )
+        {
+            return Some(InteractionInput::Submit);
         }
+        if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. })
+            && !matches!(
+                event,
+                Event::Key(stroke)
+                    if stroke.key == KeyCode::Tab
+                        || stroke.key == KeyCode::Escape
+                        || stroke.key == KeyCode::Enter && !stroke.modifiers.shift
+            )
+            && let Some(input) = self.custom_input(event, snapshot, host)
+        {
+            return Some(input);
+        }
+        standard_input(self, event, snapshot)
     }
+}
+
+fn standard_input(
+    renderer: &QuestionTerminalRenderer,
+    event: &Event,
+    snapshot: &QuestionSnapshot,
+) -> Option<InteractionInput> {
+    match event {
+        Event::Key(stroke)
+            if stroke.key == KeyCode::Tab
+                && stroke.modifiers.shift
+                && !stroke.modifiers.ctrl
+                && !stroke.modifiers.alt
+                && !stroke.modifiers.super_key
+                && !stroke.modifiers.hyper
+                && !stroke.modifiers.meta =>
+        {
+            Some(InteractionInput::Navigate {
+                direction: InteractionNavigation::Previous,
+            })
+        }
+        Event::Key(stroke)
+            if !stroke.modifiers.ctrl
+                && !stroke.modifiers.alt
+                && !stroke.modifiers.super_key
+                && !stroke.modifiers.hyper
+                && !stroke.modifiers.meta =>
+        {
+            standard_key_input(stroke.key, snapshot)
+        }
+        Event::Mouse(mouse) => renderer.mouse_input(mouse),
+        Event::Paste(text) => custom_text_change(snapshot, |value| value.push_str(text)),
+        Event::Key(_) | Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => None,
+    }
+}
+
+fn standard_key_input(key: KeyCode, snapshot: &QuestionSnapshot) -> Option<InteractionInput> {
+    match key {
+        KeyCode::Tab | KeyCode::Down => Some(InteractionInput::Navigate {
+            direction: InteractionNavigation::Next,
+        }),
+        KeyCode::Up => Some(InteractionInput::Navigate {
+            direction: InteractionNavigation::Previous,
+        }),
+        KeyCode::Right => (!matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }))
+            .then_some(InteractionInput::Navigate {
+                direction: InteractionNavigation::Next,
+            }),
+        KeyCode::Left => (!matches!(snapshot.focus, QuestionFocusTarget::Custom { .. })).then_some(
+            InteractionInput::Navigate {
+                direction: InteractionNavigation::Previous,
+            },
+        ),
+        KeyCode::Enter | KeyCode::Space => Some(InteractionInput::Activate {
+            control_id: snapshot.focused_control_id.clone(),
+        }),
+        KeyCode::Escape => Some(InteractionInput::Cancel),
+        KeyCode::Backspace => custom_text_change(snapshot, |text| {
+            text.pop();
+        }),
+        KeyCode::Char(character) => option_shortcut_input(character, snapshot),
+        KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_) => None,
+    }
+}
+
+fn option_shortcut_input(character: char, snapshot: &QuestionSnapshot) -> Option<InteractionInput> {
+    if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) {
+        return custom_text_change(snapshot, |text| text.push(character));
+    }
+    let QuestionFocusTarget::Option { question_index, .. } = snapshot.focus else {
+        return None;
+    };
+    let option_index = option_shortcut(character).filter(|option_index| {
+        *option_index < snapshot.request.questions[question_index].options.len()
+    })?;
+    Some(InteractionInput::Activate {
+        control_id: option_control_id(question_index, option_index),
+    })
 }
 
 fn option_shortcut_label(option_index: usize) -> String {
@@ -599,6 +700,13 @@ fn custom_text_change(
     })
 }
 
+fn custom_input_height(state: &TextInputState, width: u16) -> u16 {
+    TextInputControl::new(&TextInputPolicy::chat_composer())
+        .visible_rows_for_width(state, width.saturating_sub(2).max(1))
+        .clamp(1, 6)
+        .saturating_add(2)
+}
+
 fn wrapped_height(text: &str, first_width: usize, continuation_width: usize) -> u16 {
     u16::try_from(
         wrap_text_with_continuation(text, first_width.max(1), continuation_width.max(1)).len(),
@@ -632,6 +740,7 @@ const fn option_style(focused: bool, selected: bool) -> Style {
 mod tests {
     use super::*;
     use bcode_plugin_sdk::interaction::PluginInteraction;
+    use bcode_plugin_sdk::tui::{PluginTask, PluginTuiHost};
     use bcode_tool::{InteractionInput, InteractionOutput};
     use bmux_keyboard::{KeyStroke, Modifiers};
     use bmux_tui::buffer::Buffer;
@@ -640,6 +749,19 @@ mod tests {
     use crate::{
         NormalizedQuestionRequest, Question, QuestionControl, QuestionCustomMode, QuestionOption,
     };
+
+    #[derive(Debug, Default)]
+    struct TestHost;
+
+    impl PluginTuiHost for TestHost {
+        fn spawn(&self, _task: PluginTask) {}
+
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+
+        fn request_redraw(&self) {}
+    }
+
+    const TEST_HOST: TestHost = TestHost;
 
     fn question(
         text: &str,
@@ -691,6 +813,26 @@ mod tests {
         })
     }
 
+    fn shifted_character(character: char) -> Event {
+        Event::Key(KeyStroke {
+            key: KeyCode::Char(character),
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        })
+    }
+
+    fn shifted_key(key: KeyCode) -> Event {
+        Event::Key(KeyStroke {
+            key,
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        })
+    }
+
     fn apply_event(
         renderer: &mut QuestionTerminalRenderer,
         controller: &mut QuestionInteractionController,
@@ -698,7 +840,21 @@ mod tests {
     ) -> InteractionOutput {
         let snapshot = controller.snapshot();
         renderer
-            .input(event, &snapshot)
+            .input(event, &snapshot, &TEST_HOST)
+            .map_or(InteractionOutput::None, |input| {
+                controller.handle_input(input)
+            })
+    }
+
+    fn render_then_apply_event(
+        renderer: &mut QuestionTerminalRenderer,
+        controller: &mut QuestionInteractionController,
+        event: &Event,
+    ) -> InteractionOutput {
+        let snapshot = controller.snapshot();
+        let _ = render_snapshot(renderer, &snapshot, Rect::new(0, 0, 48, 12));
+        renderer
+            .input(event, &snapshot, &TEST_HOST)
             .map_or(InteractionOutput::None, |input| {
                 controller.handle_input(input)
             })
@@ -748,6 +904,49 @@ mod tests {
     }
 
     #[test]
+    fn composer_grade_custom_input_supports_cursor_delete_unicode_multiline_and_paste() {
+        let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question("Explain", &[], true, true)],
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+
+        for event in [
+            shifted_character('A'),
+            key(KeyCode::Char('b')),
+            key(KeyCode::Char('é')),
+            key(KeyCode::Left),
+            key(KeyCode::Backspace),
+            Event::Paste("🙂".to_owned()),
+            shifted_key(KeyCode::Enter),
+            key(KeyCode::Char('Z')),
+        ] {
+            let _ = render_then_apply_event(&mut renderer, &mut controller, &event);
+        }
+
+        assert_eq!(
+            controller.snapshot().answers[0].custom.as_deref(),
+            Some("A🙂\nZé")
+        );
+    }
+
+    #[test]
+    fn custom_input_accepts_shift_modified_capital_letters() {
+        let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question("Explain", &[], true, true)],
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+
+        assert_eq!(
+            apply_event(&mut renderer, &mut controller, &shifted_character('A')),
+            InteractionOutput::Redraw
+        );
+        assert_eq!(
+            controller.snapshot().answers[0].custom.as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
     fn custom_input_reserves_left_right_home_end_and_delete_for_host_behavior() {
         let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Explain", &[], true, true)],
@@ -772,6 +971,7 @@ mod tests {
                         modifiers: Modifiers::NONE,
                     }),
                     &snapshot,
+                    &TEST_HOST,
                 ),
                 None,
                 "{key:?} must remain unsupported until cursor-aware editing exists"
@@ -921,6 +1121,7 @@ mod tests {
                     Point::new(second.x, second.y),
                 )),
                 &snapshot,
+                &TEST_HOST,
             )
             .expect("visible option click");
         controller.handle_input(input);

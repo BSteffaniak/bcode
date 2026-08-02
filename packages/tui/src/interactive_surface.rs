@@ -10,8 +10,39 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use serde_json::json;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
+
+#[derive(Debug)]
+struct InteractiveTextInputResolver {
+    keymap: BmuxKeyMap,
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiTextInputResolver for InteractiveTextInputResolver {
+    fn edit_command(
+        &self,
+        stroke: bmux_keyboard::KeyStroke,
+    ) -> Option<bmux_text_edit::TextEditCommand> {
+        self.keymap.editor_command_for_key(stroke)
+    }
+
+    fn selection_motion(
+        &self,
+        stroke: bmux_keyboard::KeyStroke,
+    ) -> Option<bmux_text_edit::TextMotion> {
+        self.keymap.editor_selection_motion_for_key(stroke)
+    }
+
+    fn submits(&self, stroke: bmux_keyboard::KeyStroke) -> bool {
+        matches!(
+            self.keymap.action_for_key(BmuxScope::Chat, stroke),
+            Some(BmuxAction::InputSubmitSteering | BmuxAction::InputSubmitFollowUp)
+        )
+    }
+}
 
 const SURFACE_OPEN_RETRY_DELAY: Duration = Duration::from_secs(2);
 
@@ -155,12 +186,17 @@ impl InteractiveSurfaceState {
         interaction_id: impl Into<String>,
         surface_kind: impl Into<String>,
         request_json: &str,
+        keymap: &BmuxKeyMap,
     ) -> Result<Self, PluginLoadError> {
         let interaction_id = interaction_id.into();
         let surface_kind = surface_kind.into();
         let request = serde_json::from_str(request_json).unwrap_or_else(|_| json!({}));
         let (redraw_sender, _redraw_receiver) = mpsc::unbounded_channel();
-        let host = TokioPluginTuiHost::current(redraw_sender);
+        let host = TokioPluginTuiHost::current(redraw_sender).with_text_input_resolver(Arc::new(
+            InteractiveTextInputResolver {
+                keymap: keymap.clone(),
+            },
+        ));
         let (plugin_id, surface) =
             open_surface(runtime, &interaction_id, &surface_kind, request).await?;
         let _ = plugin_id;
@@ -180,12 +216,14 @@ impl InteractiveSurfaceState {
     pub async fn open_request(
         runtime: &PluginRuntimeHost,
         request: &InteractiveSurfaceRequest,
+        keymap: &BmuxKeyMap,
     ) -> Result<Self, PluginLoadError> {
         Self::open(
             runtime,
             request.interaction_id.clone(),
             request.surface_kind.clone(),
             &request.request_json,
+            keymap,
         )
         .await
     }
@@ -213,9 +251,97 @@ impl InteractiveSurfaceState {
         self.surface.render(area, frame);
     }
 
+    /// Render a clipped slice of the interactive surface using full-surface coordinates.
+    pub fn render_clipped(
+        &mut self,
+        full_area: Rect,
+        visible_content_offset: u16,
+        destination: Rect,
+        frame: &mut Frame<'_>,
+    ) {
+        if full_area.is_empty() || destination.is_empty() {
+            return;
+        }
+        let mut buffer = bmux_tui::buffer::Buffer::empty(full_area);
+        let mut scratch = Frame::new(&mut buffer);
+        self.surface.render(full_area, &mut scratch);
+        for destination_y in destination.y..destination.bottom() {
+            let source_y = full_area
+                .y
+                .saturating_add(visible_content_offset)
+                .saturating_add(destination_y.saturating_sub(destination.y));
+            for destination_x in destination.x..destination.right() {
+                let source_x = full_area
+                    .x
+                    .saturating_add(destination_x.saturating_sub(destination.x));
+                let Some(cell) = scratch
+                    .buffer()
+                    .get(bmux_tui::geometry::Point::new(source_x, source_y))
+                else {
+                    continue;
+                };
+                frame.buffer_mut().set_cell(
+                    bmux_tui::geometry::Point::new(destination_x, destination_y),
+                    cell.symbol.clone(),
+                    cell.style,
+                );
+            }
+        }
+        if let Some(cursor) = scratch.cursor()
+            && cursor.visible
+            && cursor.position.y >= full_area.y.saturating_add(visible_content_offset)
+            && cursor.position.y
+                < full_area
+                    .y
+                    .saturating_add(visible_content_offset)
+                    .saturating_add(destination.height)
+        {
+            frame.set_cursor(bmux_tui::frame::Cursor {
+                position: bmux_tui::geometry::Point::new(
+                    destination
+                        .x
+                        .saturating_add(cursor.position.x.saturating_sub(full_area.x)),
+                    destination.y.saturating_add(
+                        cursor
+                            .position
+                            .y
+                            .saturating_sub(full_area.y)
+                            .saturating_sub(visible_content_offset),
+                    ),
+                ),
+                visible: true,
+            });
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn render_for_test(&mut self, area: Rect, frame: &mut Frame<'_>) {
         self.render(area, frame);
+    }
+
+    /// Translate a mouse event from a clipped destination into full-surface coordinates.
+    #[must_use]
+    pub fn translate_clipped_event(
+        event: Event,
+        full_area: Rect,
+        visible_content_offset: u16,
+        destination: Rect,
+    ) -> Event {
+        let Event::Mouse(mut mouse) = event else {
+            return event;
+        };
+        if destination.contains(mouse.position) {
+            mouse.position = bmux_tui::geometry::Point::new(
+                full_area
+                    .x
+                    .saturating_add(mouse.position.x.saturating_sub(destination.x)),
+                full_area
+                    .y
+                    .saturating_add(visible_content_offset)
+                    .saturating_add(mouse.position.y.saturating_sub(destination.y)),
+            );
+        }
+        Event::Mouse(mouse)
     }
 
     /// Clear a pending resolution so the user can retry after host delivery fails.
@@ -312,7 +438,10 @@ mod tests {
         })
     }
 
-    async fn question_surface(questions: serde_json::Value) -> InteractiveSurfaceState {
+    async fn question_surface_with_config(
+        questions: serde_json::Value,
+        config: &bcode_config::TuiConfig,
+    ) -> InteractiveSurfaceState {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
             bcode_question_plugin::static_plugin(),
@@ -327,9 +456,56 @@ mod tests {
             "question-call-question",
             "bcode.question.inline",
             &serde_json::json!({ "questions": questions }).to_string(),
+            &BmuxKeyMap::from_config(config),
         )
         .await
         .expect("open local question TUI surface")
+    }
+
+    async fn question_surface(questions: serde_json::Value) -> InteractiveSurfaceState {
+        question_surface_with_config(questions, &bcode_config::TuiConfig::default()).await
+    }
+
+    #[tokio::test]
+    async fn clipped_surface_rendering_and_mouse_translation_preserve_full_coordinates() {
+        let mut surface = question_surface(serde_json::json!([{
+            "header": null,
+            "question": "Choose one",
+            "options": [
+                {"label": "One", "value": "one", "description": null},
+                {"label": "Two", "value": "two", "description": null}
+            ],
+            "control": "radio",
+            "selection_mode": "single",
+            "custom": false,
+            "custom_mode": "additional",
+            "required": true
+        }]))
+        .await;
+        let full_area = Rect::new(0, 0, 40, surface.preferred_height(40));
+        let destination = Rect::new(5, 7, 40, full_area.height.saturating_sub(1));
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 50, 20));
+        surface.render_clipped(full_area, 1, destination, &mut Frame::new(&mut buffer));
+        assert!(
+            buffer
+                .row_symbols(destination.y)
+                .is_some_and(|row| !row.trim().is_empty())
+        );
+
+        let translated = InteractiveSurfaceState::translate_clipped_event(
+            Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(7, 9),
+            )),
+            full_area,
+            1,
+            destination,
+        );
+        assert!(matches!(
+            translated,
+            Event::Mouse(mouse)
+                if mouse.position == bmux_tui::geometry::Point::new(2, 3)
+        ));
     }
 
     #[test]
@@ -370,6 +546,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_editor_bindings_are_forwarded_to_question_text_input() {
+        let mut config = bcode_config::TuiConfig::default();
+        config
+            .keybindings
+            .chat
+            .insert("ctrl+b".to_owned(), "tui.editor.moveCursorLeft".to_owned());
+        config.keybindings.chat.insert(
+            "ctrl+d".to_owned(),
+            "tui.editor.deleteCharForward".to_owned(),
+        );
+        let mut surface = question_surface_with_config(
+            serde_json::json!([{
+                "header": null,
+                "question": "Explain?",
+                "options": [],
+                "control": "radio",
+                "selection_mode": "single",
+                "custom": true,
+                "custom_mode": "additional",
+                "required": true
+            }]),
+            &config,
+        )
+        .await;
+        let area = Rect::new(0, 0, 48, 12);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        surface.render_for_test(area, &mut Frame::new(&mut buffer));
+
+        for character in ['a', 'b'] {
+            assert!(
+                surface
+                    .handle_event(&Event::Key(KeyStroke {
+                        key: KeyCode::Char(character),
+                        modifiers: Modifiers::NONE,
+                    }))
+                    .is_none()
+            );
+        }
+        assert!(
+            surface
+                .handle_event(&Event::Key(KeyStroke {
+                    key: KeyCode::Char('b'),
+                    modifiers: Modifiers {
+                        ctrl: true,
+                        ..Modifiers::NONE
+                    },
+                }))
+                .is_none()
+        );
+        assert!(
+            surface
+                .handle_event(&Event::Key(KeyStroke {
+                    key: KeyCode::Char('d'),
+                    modifiers: Modifiers {
+                        ctrl: true,
+                        ..Modifiers::NONE
+                    },
+                }))
+                .is_none()
+        );
+        let submitted = surface
+            .handle_event(&key(KeyCode::Enter))
+            .expect("configured edit leaves a valid answer that submits");
+        assert_eq!(
+            submitted,
+            ToolExchangeResolution::Responded {
+                payload: serde_json::json!({
+                    "status": "answered",
+                    "questions": [{
+                        "question_index": 0,
+                        "selected": [],
+                        "custom": "a"
+                    }]
+                })
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn submitted_resolution_is_retained_until_host_confirmation_and_can_retry() {
         let plugin_runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection::all_enabled(),
@@ -396,6 +651,7 @@ mod tests {
                 }]
             })
             .to_string(),
+            &BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
         )
         .await
         .expect("question surface");
@@ -453,6 +709,7 @@ mod tests {
                 }]
             })
             .to_string(),
+            &BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
         )
         .await
         .expect("open local question TUI surface");
