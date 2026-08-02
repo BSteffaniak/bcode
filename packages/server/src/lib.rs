@@ -28226,8 +28226,11 @@ fn authorize_workflow_plugin_block(
     activation: &bcode_workflow_store::PendingActivation,
     block: &bcode_workflow::WorkflowBlockDefinition,
 ) -> Result<(), WorkflowStoreError> {
-    if block.authorization.capability == bcode_workflow::WorkflowToolCapability::ReadOnly
-        && !block.authorization.explicit_grant_required
+    if matches!(
+        block.authorization.capability,
+        bcode_workflow::WorkflowToolCapability::Disabled
+            | bcode_workflow::WorkflowToolCapability::ReadOnly
+    ) && !block.authorization.explicit_grant_required
     {
         return Ok(());
     }
@@ -29205,8 +29208,10 @@ async fn settle_workflow_agent_observation(
             {
                 tracing::warn!("failed to propagate fail-fast sibling cancellation: {error}");
             }
-            if let Err(error) = drive_workflow_run(state, &request.activation.run_id).await {
-                tracing::warn!("failed to continue workflow after completion: {error}");
+            if let Err(error) =
+                drive_workflow_run_and_parents(state, &request.activation.run_id).await
+            {
+                tracing::warn!("failed to continue workflow hierarchy after completion: {error}");
             }
         }
         Err(error) => {
@@ -34438,6 +34443,7 @@ mod tests {
                 .expect("batch")
                 .is_some()
         );
+        drop(store);
     }
 
     #[tokio::test]

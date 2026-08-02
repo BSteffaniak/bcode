@@ -818,7 +818,37 @@ fn configured_fake_structured_output(
     else {
         return Ok(None);
     };
-    let value = if let Some(threshold) = configured.strip_prefix("loop_until:") {
+    let value = if configured == "matching_input:" {
+        let input: serde_json::Value =
+            serde_json::from_str(user_text.rsplit("\n\n").next().unwrap_or(user_text))
+                .map_err(|error| fake_structured_output_error(&error))?;
+        let validator =
+            jsonschema::validator_for(&structured.schema).map_err(|error| ProviderError {
+                code: "invalid_structured_output_schema".to_string(),
+                category: ProviderErrorCategory::InvalidRequest,
+                message: error.to_string(),
+                retryable: false,
+                provider_message: None,
+                failure: None,
+                request_id: None,
+                diagnostic_context: Box::default(),
+                sources: Box::default(),
+                retry: None,
+            })?;
+        find_matching_input_value(&input, &validator, 0).ok_or_else(|| ProviderError {
+            code: "no_matching_fake_structured_input".to_string(),
+            category: ProviderErrorCategory::InvalidRequest,
+            message: "fake provider found no input value matching the requested JSON schema"
+                .to_string(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        })?
+    } else if let Some(threshold) = configured.strip_prefix("loop_until:") {
         let threshold = threshold
             .parse::<u64>()
             .map_err(|error| fake_structured_output_error(&error))?;
@@ -880,6 +910,28 @@ fn configured_fake_structured_output(
             sources: Box::default(),
             retry: None,
         })
+}
+
+fn find_matching_input_value(
+    value: &serde_json::Value,
+    validator: &jsonschema::Validator,
+    depth: usize,
+) -> Option<serde_json::Value> {
+    if depth > 32 {
+        return None;
+    }
+    if validator.is_valid(value) {
+        return Some(value.clone());
+    }
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_matching_input_value(value, validator, depth + 1)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .find_map(|value| find_matching_input_value(value, validator, depth + 1)),
+        _ => None,
+    }
 }
 
 fn fake_value_for_schema(schema: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
@@ -2023,6 +2075,34 @@ mod tests {
             finished
                 .iter()
                 .any(|event| { matches!(event, ProviderTurnEvent::TextDelta { .. }) })
+        );
+    }
+
+    #[test]
+    fn matching_input_fixture_finds_nested_schema_value_without_synthesizing_product_data() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["version", "value"],
+            "properties": {
+                "version": {"const": 1},
+                "value": {"type": "string"}
+            }
+        });
+        let validator = jsonschema::validator_for(&schema).expect("schema");
+        let input = serde_json::json!({
+            "unrelated": true,
+            "envelope": {
+                "state": {"version": 1, "value": "retained"}
+            }
+        });
+        assert_eq!(
+            find_matching_input_value(&input, &validator, 0),
+            Some(serde_json::json!({"version": 1, "value": "retained"}))
+        );
+        assert_eq!(
+            find_matching_input_value(&serde_json::json!({"version": 2}), &validator, 0),
+            None
         );
     }
 

@@ -6,8 +6,9 @@
 
 use bcode_workflow::{
     WORKFLOW_COMPILATION_PREVIEW_VERSION, WorkflowAuthoringDocument, WorkflowAuthoringListCursor,
-    WorkflowCompilationPreview, WorkflowDefinition, WorkflowDefinitionIdentity,
-    WorkflowProducerProvenance, WorkflowRevisionListCursor, WorkflowRunLimitPolicy,
+    WorkflowBlockDefinition, WorkflowCompilationPreview, WorkflowDefinition,
+    WorkflowDefinitionIdentity, WorkflowNodeDataflowPolicy, WorkflowProducerProvenance,
+    WorkflowRevisionListCursor, WorkflowRunLimitPolicy, prepare_workflow_node_dataflow,
     validate_persistable_authoring_value,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction};
@@ -3496,7 +3497,9 @@ impl WorkflowStore {
              JOIN workflow_runs run ON run.run_id = output.run_id \
              JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
                AND definition.version = run.definition_version \
-             WHERE output.run_id = ?1 ORDER BY output.created_at_ms, output.output_id LIMIT ?2",
+             WHERE output.run_id = ?1 \
+               AND json_type(output.value_json, '$.iterations_completed') = 'integer' \
+             ORDER BY output.created_at_ms, output.output_id LIMIT ?2",
         )?;
         statement
             .query_map((run_id, limit), |row| {
@@ -3537,8 +3540,16 @@ impl WorkflowStore {
                     {
                         return Ok(None);
                     }
+                    let value: serde_json::Value = serde_json::from_str(&value_json)?;
+                    if value
+                        .get("iterations_completed")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
                     let outcome: bcode_workflow::WorkflowRepeatOutcome<serde_json::Value> =
-                        serde_json::from_str(&value_json)?;
+                        serde_json::from_value(value)?;
                     Ok(Some(WorkflowRepeatOutcomeSummary {
                         run_id,
                         node_id,
@@ -3997,8 +4008,8 @@ impl WorkflowStore {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid identity/scope, stale input, conflicting requests, or storage
-    /// failure. No prepared attempt or external dispatch is created by this operation.
+    /// Returns an error for invalid identity/scope, malformed or stale input, conflicting requests,
+    /// or storage failure. No prepared attempt or external dispatch is created by this operation.
     pub fn request_mutation_approval(
         &mut self,
         approval: &WorkflowMutationApproval,
@@ -4006,25 +4017,35 @@ impl WorkflowStore {
         validate_mutation_approval(approval)?;
         let scope_json = bounded_json("workflow mutation approval scope", &approval.scope)?;
         let transaction = self.connection.transaction()?;
-        let (status, definition_id, definition_version, workspace_snapshot, input_json) =
-            transaction.query_row(
-                "SELECT activation.status, run.definition_id, run.definition_version, \
-                 run.workspace_snapshot, activation.input_json \
+        let (
+            status,
+            definition_id,
+            definition_version,
+            workspace_snapshot,
+            input_json,
+            definition_json,
+        ) = transaction.query_row(
+            "SELECT activation.status, run.definition_id, run.definition_version, \
+                 run.workspace_snapshot, activation.input_json, definition.definition_json \
                  FROM workflow_activations activation \
                  JOIN workflow_runs run ON run.run_id = activation.run_id \
+                 JOIN workflow_definitions definition \
+                   ON definition.definition_id = run.definition_id \
+                  AND definition.version = run.definition_version \
                  WHERE activation.run_id = ?1 AND activation.node_id = ?2 \
                    AND activation.activation_id = ?3",
-                (&approval.run_id, &approval.node_id, &approval.activation_id),
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, u32>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                },
-            )?;
+            (&approval.run_id, &approval.node_id, &approval.activation_id),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )?;
         if !matches!(status.as_str(), "pending" | "waiting_mutation_approval")
             || definition_id != approval.scope.definition_id
             || definition_version != approval.scope.definition_version
@@ -4034,14 +4055,11 @@ impl WorkflowStore {
                 "mutation approval does not match dispatchable activation identity".to_string(),
             ));
         }
-        let input = input_json
-            .as_deref()
-            .map_or_else(|| "null".to_string(), ToString::to_string);
-        if sha256_hex(input.as_bytes()) != approval.scope.input_checksum_sha256 {
-            return Err(WorkflowStoreError::InvalidData(
-                "mutation approval input checksum is stale".to_string(),
-            ));
-        }
+        validate_mutation_approval_input_checksum(
+            approval,
+            input_json.as_deref(),
+            &definition_json,
+        )?;
         let changed = transaction.execute(
             "INSERT OR IGNORE INTO workflow_mutation_approvals \
              (approval_id, run_id, node_id, activation_id, scope_json, status, requested_at_ms, expires_at_ms) \
@@ -4122,12 +4140,16 @@ impl WorkflowStore {
                  approval.scope_json, approval.status, approval.requested_at_ms, \
                  approval.expires_at_ms, approval.grant_id, activation.status, \
                  activation.input_json, run.definition_id, run.definition_version, \
-                 run.workspace_snapshot, run.status, run.cancellation_requested_at_ms \
+                 run.workspace_snapshot, run.status, run.cancellation_requested_at_ms, \
+                 definition.definition_json \
                  FROM workflow_mutation_approvals approval \
                  JOIN workflow_activations activation ON activation.run_id = approval.run_id \
                    AND activation.node_id = approval.node_id \
                    AND activation.activation_id = approval.activation_id \
                  JOIN workflow_runs run ON run.run_id = approval.run_id \
+                 JOIN workflow_definitions definition \
+                   ON definition.definition_id = run.definition_id \
+                  AND definition.version = run.definition_version \
                  WHERE approval.approval_id = ?1",
                 [approval_id],
                 |row| {
@@ -4147,6 +4169,7 @@ impl WorkflowStore {
                         row.get::<_, String>(12)?,
                         row.get::<_, String>(13)?,
                         row.get::<_, Option<u64>>(14)?,
+                        row.get::<_, String>(15)?,
                     ))
                 },
             )
@@ -4172,6 +4195,7 @@ impl WorkflowStore {
             workspace_snapshot,
             run_status,
             cancellation_requested_at_ms,
+            definition_json,
         ) = row;
         let expected_status = match decision {
             WorkflowMutationApprovalDecision::Approve => "approved",
@@ -4233,14 +4257,25 @@ impl WorkflowStore {
         scope
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-        let input = input_json.unwrap_or_else(|| "null".to_string());
+        validate_mutation_approval_input_checksum(
+            &WorkflowMutationApproval {
+                approval_id: approval_id.to_string(),
+                run_id: run_id.clone(),
+                node_id: node_id.clone(),
+                activation_id: activation_id.clone(),
+                scope: scope.clone(),
+                requested_at_ms: 0,
+                expires_at_ms,
+            },
+            input_json.as_deref(),
+            &definition_json,
+        )?;
         if scope.definition_id != definition_id
             || scope.definition_version != definition_version
             || scope.run_id != run_id
             || scope.node_id != node_id
             || scope.activation_id != activation_id
             || scope.workspace_snapshot != workspace_snapshot
-            || sha256_hex(input.as_bytes()) != scope.input_checksum_sha256
         {
             return Err(WorkflowStoreError::InvalidData(
                 "mutation approval scope became stale before decision".to_string(),
@@ -7794,7 +7829,20 @@ where
         .edges
         .iter()
         .filter(|edge| {
-            edge.from == output.node_id && matches!(edge.kind, bcode_workflow::EdgeKind::Direct)
+            if edge.from != output.node_id {
+                return false;
+            }
+            match &edge.kind {
+                bcode_workflow::EdgeKind::Direct => true,
+                bcode_workflow::EdgeKind::Conditional {
+                    predicate,
+                    expected,
+                } => evaluate_predicate(predicate, &output.value)
+                    .is_ok_and(|selected| selected == *expected),
+                bcode_workflow::EdgeKind::Back { .. } | bcode_workflow::EdgeKind::Retry { .. } => {
+                    false
+                }
+            }
         })
         .map(|edge| edge.to.clone())
         .collect::<Vec<_>>();
@@ -7871,14 +7919,22 @@ where
     targets.dedup();
     let mut activated = Vec::new();
     for node_id in targets {
+        let reached_by_conditional = definition.edges.iter().any(|edge| {
+            edge.from == output.node_id
+                && edge.to == node_id
+                && matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. })
+        });
         let dependencies = definition
             .edges
             .iter()
             .filter(|edge| edge.to == node_id)
             .filter(|edge| {
-                matches!(edge.kind, bcode_workflow::EdgeKind::Direct)
-                    || (edge.from == output.node_id
-                        && matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. }))
+                if reached_by_conditional {
+                    edge.from == output.node_id
+                        && matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. })
+                } else {
+                    matches!(edge.kind, bcode_workflow::EdgeKind::Direct)
+                }
             })
             .map(|edge| edge.from.as_str())
             .collect::<Vec<_>>();
@@ -9276,6 +9332,36 @@ fn validate_repair_resolution(resolution: &RepairResolution) -> Result<(), Workf
             validate_bounded_message("repair reason", reason)
         }
     }
+}
+
+fn validate_mutation_approval_input_checksum(
+    approval: &WorkflowMutationApproval,
+    input_json: Option<&str>,
+    definition_json: &str,
+) -> Result<(), WorkflowStoreError> {
+    let input: serde_json::Value = serde_json::from_str(input_json.unwrap_or("null"))?;
+    let definition: WorkflowDefinition = serde_json::from_str(definition_json)?;
+    let node = definition.node(&approval.node_id).ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "mutation approval references a missing workflow node".to_string(),
+        )
+    })?;
+    let owner_input = if node.dataflow == WorkflowNodeDataflowPolicy::StateEnvelopeV1 {
+        let block: WorkflowBlockDefinition = serde_json::from_value(node.configuration.clone())?;
+        prepare_workflow_node_dataflow(node.dataflow, &node.input, &block.input, &input)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+            .owner_input()
+            .clone()
+    } else {
+        input
+    };
+    let input = serde_json::to_vec(&owner_input)?;
+    if sha256_hex(&input) != approval.scope.input_checksum_sha256 {
+        return Err(WorkflowStoreError::InvalidData(
+            "mutation approval input checksum is stale".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn bounded_json<T: Serialize>(label: &str, value: &T) -> Result<String, WorkflowStoreError> {
@@ -16331,6 +16417,94 @@ mod tests {
             )
             .expect("skipped");
         assert_eq!(skipped, "skipped");
+    }
+
+    #[test]
+    fn conditional_edges_from_task_nodes_select_exactly_one_successor() {
+        let schema = bcode_workflow::ValueSchema::of::<serde_json::Value>();
+        let source = bcode_workflow::NodeDefinition {
+            id: "source".to_string(),
+            name: "source".to_string(),
+            kind: bcode_workflow::NodeKind::Task,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::Value::Null,
+        };
+        let target = |id: &str| bcode_workflow::NodeDefinition {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: bcode_workflow::NodeKind::Task,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::Value::Null,
+        };
+        let predicate = bcode_workflow::PredicateExpression::Equals {
+            version: bcode_workflow::WORKFLOW_PREDICATE_VERSION,
+            path: "status".to_string(),
+            value: serde_json::json!("ready"),
+        };
+        let definition = WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "conditional-task".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([
+                ("source".to_string(), source),
+                ("ready".to_string(), target("ready")),
+                ("other".to_string(), target("other")),
+            ]),
+            entries: vec!["source".to_string()],
+            exits: vec!["ready".to_string(), "other".to_string()],
+            edges: vec![
+                bcode_workflow::EdgeDefinition {
+                    from: "source".to_string(),
+                    to: "ready".to_string(),
+                    kind: bcode_workflow::EdgeKind::Conditional {
+                        predicate: predicate.clone(),
+                        expected: true,
+                    },
+                    transform: None,
+                },
+                bcode_workflow::EdgeDefinition {
+                    from: "source".to_string(),
+                    to: "other".to_string(),
+                    kind: bcode_workflow::EdgeKind::Conditional {
+                        predicate,
+                        expected: false,
+                    },
+                    transform: None,
+                },
+            ],
+        };
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("conditional-task", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "conditional-task-run".to_string();
+        run.definition_id = "conditional-task".to_string();
+        store.create_run(&run).expect("run");
+        let source_schema_id = definition.nodes["source"].output.type_name.clone();
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "source-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "source".to_string(),
+                activation_id: activation_identity(&run.run_id, "source", 0),
+                schema_id: source_schema_id,
+                schema_version: 1,
+                value: serde_json::json!({"status": "other"}),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("output");
+        assert_eq!(result.activated.len(), 1);
+        assert_eq!(result.activated[0].node_id, "other");
     }
 
     #[test]

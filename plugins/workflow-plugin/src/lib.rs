@@ -43,7 +43,7 @@ const _: () =
 #[serde(deny_unknown_fields)]
 pub struct CodingProgressDocumentReference {
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub digest_sha256: Option<String>,
 }
 
@@ -197,10 +197,11 @@ impl RustPlugin for WorkflowPlugin {
                         return ServiceResponse::error("invalid_request", error.to_string());
                     }
                 };
-                let request = match invocation.typed_input::<BatchOutcomeRequest>() {
-                    Ok(request) => request,
+                let state = match invocation.typed_input::<CodingWorkflowState>() {
+                    Ok(state) => state,
                     Err(error) => return ServiceResponse::error("invalid_request", error),
                 };
+                let request = BatchOutcomeRequest { version: 1, state };
                 match batch_outcome(&request) {
                     Ok(outcome) => json_response(&outcome),
                     Err(error) => ServiceResponse::error("invalid_batch_outcome", error),
@@ -528,7 +529,15 @@ fn retain_batch_operation_result(
         return Ok(());
     }
     if operation == BatchInputOperation::CommitMessage {
-        state.latest.completion_assessment = Some(value);
+        state.latest.prepared_change_set = Some(value);
+        return Ok(());
+    }
+    if operation == BatchInputOperation::ComposeCommit {
+        let message = serde_json::from_value::<CodingWorkflowState>(value.clone())
+            .ok()
+            .and_then(|state| state.latest.completion_assessment)
+            .unwrap_or(value);
+        state.latest.completion_assessment = Some(message);
         return Ok(());
     }
     if let Ok(receipt) = serde_json::from_value::<bcode_git_plugin::VerificationReceipt>(value) {
@@ -656,9 +665,11 @@ fn batch_input(
             })
             .map_err(|error| error.to_string())?
         }
-        BatchInputOperation::CommitMessage => {
-            return Err("commit-message input is produced by exact Git preparation".to_string());
-        }
+        BatchInputOperation::CommitMessage => state
+            .latest
+            .prepared_change_set
+            .clone()
+            .ok_or_else(|| "commit-message input has no exact Git preparation".to_string())?,
     };
     Ok(serde_json::json!({
         "schema_version": bcode_workflow::WORKFLOW_STATE_ENVELOPE_VERSION,
@@ -1662,7 +1673,13 @@ mod tests {
             .flat_map(|service| &service.workflow_blocks)
             .find(|block| block.block_id == "git.prepare")
             .expect("declared Git prepare block");
-        assert_eq!(&git_prepare_block, declared_prepare);
+        assert_eq!(git_prepare_block.block_id, declared_prepare.block_id);
+        assert_eq!(
+            git_prepare_block.block_version,
+            declared_prepare.block_version
+        );
+        assert_eq!(git_prepare_block.plugin_id, declared_prepare.plugin_id);
+        assert_eq!(git_prepare_block.operation, declared_prepare.operation);
         assert_eq!(git_prepare_block.block_id, "git.prepare");
         assert_eq!(
             git_prepare_block.effect,

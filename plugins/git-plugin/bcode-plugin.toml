@@ -114,18 +114,15 @@ timeout_ms             = 30000
 [services.workflow_blocks.input]
 schema = { type = "object", additionalProperties = false, required = [
     "max_paths",
-], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } }
+    "project_instruction_fingerprint_sha256",
+], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, progress_document_path = { type = [
+    "string",
+    "null",
+], maxLength = 4096 }, project_instruction_fingerprint_sha256 = { type = "string", pattern = "^[0-9a-fA-F]{64}$" }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } }
 type_name = "bcode.git.prepare-request/v1"
 
 [services.workflow_blocks.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "repository_root",
-    "head",
-    "changed_paths",
-], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
-    "path",
-    "status",
-], properties = { path = { type = "string" }, status = { type = "string" } } } } } }
+schema    = { type = "object", maxProperties = 16 }
 type_name = "bcode.git.prepare-result/v1"
 
 [services.workflow_blocks.authorization]
@@ -147,24 +144,7 @@ reconciliation         = "idempotent_replay"
 timeout_ms             = 30000
 
 [services.workflow_blocks.input]
-schema = { type = "object", additionalProperties = false, required = [
-    "preparation",
-    "message",
-    "no_changes",
-], properties = { preparation = { type = "object", additionalProperties = false, required = [
-    "repository_root",
-    "head",
-    "changed_paths",
-], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
-    "path",
-    "status",
-], properties = { path = { type = "string" }, status = { type = "string" } } } } } }, message = { type = "object", additionalProperties = false, required = [
-    "title",
-    "description",
-], properties = { title = { type = "string", minLength = 1, maxLength = 256 }, description = { type = "string", maxLength = 7935 } } }, no_changes = { enum = [
-    "fail",
-    "no_op",
-] } } }
+schema    = { type = "object", maxProperties = 8 }
 type_name = "bcode.git.compose-commit-request/v1"
 
 [services.workflow_blocks.output]

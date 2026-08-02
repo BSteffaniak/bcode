@@ -71,11 +71,8 @@ reconciliation         = "idempotent_replay"
 timeout_ms             = 5000
 
 [services.workflow_blocks.input]
-schema = { type = "object", additionalProperties = false, required = [
-    "version",
-    "state",
-], properties = { version = { const = 1 }, state = { type = "object" } } }
-type_name = "bcode.workflow.batch-outcome-request/v1"
+schema    = { type = "object" }
+type_name = "bcode.workflow.coding-workflow-state/v1"
 
 [services.workflow_blocks.output]
 schema = { type = "object", additionalProperties = false, required = [
@@ -107,16 +104,8 @@ schema    = { type = "object" }
 type_name = "bcode.workflow.coding-workflow-state/v1"
 
 [services.workflow_blocks.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "version",
-    "max_paths",
-    "project_instruction_fingerprint_sha256",
-], properties = { version = { const = 1 }, include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, progress_document_path = { type = [
-    "string",
-    "null",
-], maxLength = 4096 }, max_paths = { type = "integer", minimum = 1, maximum = 10000 }, project_instruction_fingerprint_sha256 = { type = "string", pattern = "^[0-9a-fA-F]{64}$" } } }
-type_name = "bcode.git.repository-snapshot-request/v1"
-
+schema    = { type = "object" }
+type_name = "bcode.workflow.state-envelope/v1"
 [services.workflow_blocks.authorization]
 capability              = "read_only"
 explicit_grant_required = false
@@ -136,25 +125,8 @@ schema    = { type = "object" }
 type_name = "bcode.workflow.coding-workflow-state/v1"
 
 [services.workflow_blocks.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "version",
-    "cwd",
-    "commands",
-    "environment",
-    "output",
-], properties = { version = { const = 1 }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, commands = { type = "array", minItems = 1, maxItems = 64, items = { type = "object", additionalProperties = false, required = [
-    "argv",
-    "timeout_ms",
-    "continue_on_nonzero",
-], properties = { argv = { type = "array", minItems = 1, maxItems = 256, items = { type = "string", maxLength = 65536 } }, timeout_ms = { type = "integer", minimum = 1, maximum = 300000 }, continue_on_nonzero = { type = "boolean" } } } }, environment = { type = "object", additionalProperties = false, required = [
-    "inherit",
-    "set",
-], properties = { inherit = { type = "boolean" }, set = { type = "object", maxProperties = 128, additionalProperties = { type = "string", maxLength = 65536 } } } }, output = { type = "object", additionalProperties = false, required = [
-    "preview_bytes",
-    "artifact_spill",
-], properties = { preview_bytes = { type = "integer", minimum = 0, maximum = 65536 }, artifact_spill = { type = "boolean" } } } } }
-type_name = "bcode.shell.command-plan/v1"
-
+schema    = { type = "object" }
+type_name = "bcode.workflow.state-envelope/v1"
 [services.workflow_blocks.authorization]
 capability              = "read_only"
 explicit_grant_required = false
@@ -174,25 +146,8 @@ schema    = { type = "object" }
 type_name = "bcode.workflow.coding-workflow-state/v1"
 
 [services.workflow_blocks.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "version",
-    "cwd",
-    "commands",
-    "environment",
-    "output",
-], properties = { version = { const = 1 }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, commands = { type = "array", minItems = 1, maxItems = 64, items = { type = "object", additionalProperties = false, required = [
-    "argv",
-    "timeout_ms",
-    "continue_on_nonzero",
-], properties = { argv = { type = "array", minItems = 1, maxItems = 256, items = { type = "string", maxLength = 65536 } }, timeout_ms = { type = "integer", minimum = 1, maximum = 300000 }, continue_on_nonzero = { type = "boolean" } } } }, environment = { type = "object", additionalProperties = false, required = [
-    "inherit",
-    "set",
-], properties = { inherit = { type = "boolean" }, set = { type = "object", maxProperties = 128, additionalProperties = { type = "string", maxLength = 65536 } } } }, output = { type = "object", additionalProperties = false, required = [
-    "preview_bytes",
-    "artifact_spill",
-], properties = { preview_bytes = { type = "integer", minimum = 0, maximum = 65536 }, artifact_spill = { type = "boolean" } } } } }
-type_name = "bcode.shell.command-plan/v1"
-
+schema    = { type = "object" }
+type_name = "bcode.workflow.state-envelope/v1"
 [services.workflow_blocks.authorization]
 capability              = "read_only"
 explicit_grant_required = false
@@ -212,21 +167,8 @@ schema    = { type = "object" }
 type_name = "bcode.workflow.coding-workflow-state/v1"
 
 [services.workflow_blocks.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "version",
-    "stage",
-    "plan_sha256",
-    "instruction_fingerprint_sha256",
-    "pre_snapshot",
-    "post_snapshot",
-    "commands_passed",
-    "required_artifacts_complete",
-], properties = { version = { const = 1 }, stage = { type = "string", enum = [
-    "pre_format",
-    "post_format",
-] }, plan_sha256 = { type = "string" }, instruction_fingerprint_sha256 = { type = "string" }, pre_snapshot = { type = "object" }, post_snapshot = { type = "object" }, commands_passed = { type = "boolean" }, required_artifacts_complete = { type = "boolean" } } }
-type_name = "bcode.git.verification-receipt-request/v1"
-
+schema    = { type = "object" }
+type_name = "bcode.workflow.state-envelope/v1"
 [services.workflow_blocks.authorization]
 capability              = "read_only"
 explicit_grant_required = false
@@ -246,21 +188,8 @@ schema    = { type = "object" }
 type_name = "bcode.workflow.coding-workflow-state/v1"
 
 [services.workflow_blocks.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "version",
-    "stage",
-    "plan_sha256",
-    "instruction_fingerprint_sha256",
-    "pre_snapshot",
-    "post_snapshot",
-    "commands_passed",
-    "required_artifacts_complete",
-], properties = { version = { const = 1 }, stage = { type = "string", enum = [
-    "pre_format",
-    "post_format",
-] }, plan_sha256 = { type = "string" }, instruction_fingerprint_sha256 = { type = "string" }, pre_snapshot = { type = "object" }, post_snapshot = { type = "object" }, commands_passed = { type = "boolean" }, required_artifacts_complete = { type = "boolean" } } }
-type_name = "bcode.git.verification-receipt-request/v1"
-
+schema    = { type = "object" }
+type_name = "bcode.workflow.state-envelope/v1"
 [services.workflow_blocks.authorization]
 capability              = "read_only"
 explicit_grant_required = false
@@ -280,10 +209,29 @@ schema    = { type = "object" }
 type_name = "bcode.workflow.coding-workflow-state/v1"
 
 [services.workflow_blocks.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "max_paths",
-], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } }
-type_name = "bcode.git.prepare-request/v1"
+schema    = { type = "object" }
+type_name = "bcode.workflow.state-envelope/v1"
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "workflow.commit-message-input"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "workflow.commit-message-input"
+plugin_id              = "bcode.workflow"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.coding-workflow-state/v1"
+
+[services.workflow_blocks.output]
+schema    = { type = "object" }
+type_name = "bcode.workflow.state-envelope/v1"
 
 [services.workflow_blocks.authorization]
 capability              = "read_only"
@@ -304,26 +252,8 @@ schema    = { type = "object" }
 type_name = "bcode.workflow.coding-workflow-state/v1"
 
 [services.workflow_blocks.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "preparation",
-    "message",
-    "no_changes",
-], properties = { preparation = { type = "object", additionalProperties = false, required = [
-    "repository_root",
-    "head",
-    "changed_paths",
-], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
-    "path",
-    "status",
-], properties = { path = { type = "string" }, status = { type = "string" } } } } } }, message = { type = "object", additionalProperties = false, required = [
-    "title",
-    "description",
-], properties = { title = { type = "string", minLength = 1, maxLength = 256 }, description = { type = "string", maxLength = 7935 } } }, no_changes = { enum = [
-    "fail",
-    "no_op",
-] } } }
-type_name = "bcode.git.compose-commit-request/v1"
-
+schema    = { type = "object" }
+type_name = "bcode.workflow.state-envelope/v1"
 [services.workflow_blocks.authorization]
 capability              = "read_only"
 explicit_grant_required = false
@@ -1607,7 +1537,7 @@ risk     = "shell and Git mutations require exact approval"
 [[workflow_templates]]
 contribution_version  = 1
 description           = "Create a normal mutable authored draft for a bounded coding implementation batch with workflow-plugin-owned state."
-document_source       = { path = "templates/implementation-batch.workflow.json", sha256 = "b1a29d79f288785cbd31e5f27bfabfcdb04305d01b0b68259aa0c6534c15d9d2" }
+document_source       = { path = "templates/implementation-batch.workflow.json", sha256 = "35eef0ec533bef912b4b170974c410e03aa6d958caabdabfc0c5568f6de7d192" }
 required_capabilities = ["workflow-production/v1"]
 template_id           = "implementation-batch"
 template_version      = 1
@@ -1620,7 +1550,7 @@ workflow_level = "implementation_batch"
 [[workflow_templates]]
 contribution_version  = 1
 description           = "Call an exact implementation-batch definition up to five times and refocus the progress document after each exhausted batch."
-document_source       = { path = "templates/delivery-tranche.workflow.json", sha256 = "349975eba812078728d4dd25b402da877ee9cdcc7eee1fa850d0af4a271395aa" }
+document_source       = { path = "templates/delivery-tranche.workflow.json", sha256 = "23fc5ff97ac4453906ea2df2923b9b2108ec927b8e667dac69fef04e8cee410b" }
 required_capabilities = ["workflow-production/v1"]
 required_plugins      = ["bcode.workflow"]
 required_skills       = ["refocus-progress-doc"]
@@ -1635,7 +1565,7 @@ workflow_level = "delivery_tranche"
 [[workflow_templates]]
 contribution_version  = 1
 description           = "Create or attach progress, review tranche-scoped plans, call up to ten exact delivery tranches, and wait durably for operator continuation."
-document_source       = { path = "templates/progress-driven-delivery.workflow.json", sha256 = "c38ca7ede3e5b1d24a7b6e773bf44bca1ff7488657ad223c3c2f083bc55fdbf1" }
+document_source       = { path = "templates/progress-driven-delivery.workflow.json", sha256 = "d5e738cf5ac0055f2b0403a5fbff977e178aecb7ddb08b70323f701251899b59" }
 required_capabilities = ["workflow-production/v1"]
 required_plugins      = ["bcode.workflow"]
 required_skills       = ["local-progress-doc"]
