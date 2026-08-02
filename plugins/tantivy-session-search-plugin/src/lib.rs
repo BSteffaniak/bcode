@@ -1425,14 +1425,37 @@ fn confined_storage_root(configured: &Path) -> Result<PathBuf, ProviderError> {
         }
         configured.canonicalize().map_err(ProviderError::index)
     } else {
-        let parent = configured.parent().ok_or_else(|| {
+        let mut existing = configured.parent().ok_or_else(|| {
             ProviderError::configuration("storage_root has no parent directory".to_owned())
         })?;
-        let parent = parent.canonicalize().map_err(ProviderError::index)?;
-        let name = configured.file_name().ok_or_else(|| {
+        let mut missing = Vec::new();
+        while !existing.exists() {
+            let name = existing.file_name().ok_or_else(|| {
+                ProviderError::configuration(
+                    "storage_root has no existing confined ancestor".to_owned(),
+                )
+            })?;
+            missing.push(name.to_os_string());
+            existing = existing.parent().ok_or_else(|| {
+                ProviderError::configuration(
+                    "storage_root has no existing confined ancestor".to_owned(),
+                )
+            })?;
+        }
+        let metadata = std::fs::symlink_metadata(existing).map_err(ProviderError::index)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(ProviderError::configuration(
+                "storage_root ancestor must be a non-symlink directory".to_owned(),
+            ));
+        }
+        let mut confined = existing.canonicalize().map_err(ProviderError::index)?;
+        for component in missing.into_iter().rev() {
+            confined.push(component);
+        }
+        confined.push(configured.file_name().ok_or_else(|| {
             ProviderError::configuration("storage_root has no final component".to_owned())
-        })?;
-        Ok(parent.join(name))
+        })?);
+        Ok(confined)
     }
 }
 
@@ -2010,9 +2033,12 @@ mod tests {
             let plugin = TantivySessionSearchPlugin::default();
             let response = plugin.apply_batch(&config, &request, &ServiceCancellation::default());
             assert!(response.error.is_none());
-            assert!(plugin.status(&config).coverage[0].complete);
+            let status = plugin.status(&config);
+            assert!(status.coverage[0].complete);
+            assert_eq!(status.document_count, 1);
         }
 
+        let before = TantivySessionSearchPlugin::default().status(&config);
         let restarted = TantivySessionSearchPlugin::default();
         let response = restarted.apply_batch(&config, &request, &ServiceCancellation::default());
         let acknowledgment: ApplySearchRecordsResponse =
@@ -2023,6 +2049,8 @@ mod tests {
         assert!(status.coverage[0].complete);
         assert_eq!(status.coverage[0].indexed_through_sequence, Some(1));
         assert_eq!(status.document_count, 1);
+        assert_eq!(status.index_bytes, before.index_bytes);
+        assert_eq!(status.coverage, before.coverage);
     }
 
     #[test]

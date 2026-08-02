@@ -2191,7 +2191,7 @@ pub(crate) mod tests {
         SessionSearchCapabilities, SessionSearchContentRoute, SessionSearchHit,
         SessionSearchLocator, SessionSearchPlanPolicy, SessionSearchRouteMode, SessionSearchStatus,
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2313,7 +2313,19 @@ pub(crate) mod tests {
         FutureCapability,
         Crash,
         RejectCleanup,
+        Stateful,
     }
+
+    #[derive(Debug, Clone)]
+    struct StatefulProviderCheckpoint {
+        generation: SearchCanonicalGeneration,
+        indexed_through_sequence: u64,
+        indexed_text_bytes: u64,
+    }
+
+    static STATEFUL_CHECKPOINTS: std::sync::LazyLock<
+        std::sync::Mutex<BTreeMap<&'static str, StatefulProviderCheckpoint>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
 
     #[derive(Debug)]
     struct TestProviderInstance {
@@ -2475,6 +2487,25 @@ pub(crate) mod tests {
                 if matches!(provider.behavior, TestProviderBehavior::FutureStatus) {
                     status.record_schema_version = CURRENT_SEARCH_RECORD_VERSION.saturating_add(1);
                 }
+                if matches!(provider.behavior, TestProviderBehavior::Stateful)
+                    && let Some(checkpoint) = STATEFUL_CHECKPOINTS
+                        .lock()
+                        .expect("stateful checkpoints")
+                        .get(provider.provider_id)
+                        .cloned()
+                {
+                    status.document_count = 1;
+                    status.coverage = vec![bcode_session_search::SessionSearchCoverage {
+                        generation: checkpoint.generation,
+                        content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+                        indexed_through_sequence: Some(checkpoint.indexed_through_sequence),
+                        complete: true,
+                        indexed_text_bytes: checkpoint.indexed_text_bytes,
+                        skipped_records: 0,
+                        truncated_records: 0,
+                        exclusions: Vec::new(),
+                    }];
+                }
                 service_response(&status)
             }
             OP_APPLY_BATCH => {
@@ -2514,10 +2545,46 @@ pub(crate) mod tests {
                             | SearchContentKind::Compaction
                     )
                 }));
+                let duplicate = if matches!(provider.behavior, TestProviderBehavior::Stateful) {
+                    let mut checkpoints =
+                        STATEFUL_CHECKPOINTS.lock().expect("stateful checkpoints");
+                    let duplicate =
+                        checkpoints
+                            .get(provider.provider_id)
+                            .is_some_and(|checkpoint| {
+                                checkpoint.generation.fingerprint == request.generation.fingerprint
+                                    && request.indexed_through_sequence.is_some_and(|sequence| {
+                                        sequence <= checkpoint.indexed_through_sequence
+                                    })
+                            });
+                    if !duplicate {
+                        checkpoints.insert(
+                            provider.provider_id,
+                            StatefulProviderCheckpoint {
+                                generation: request.generation.clone(),
+                                indexed_through_sequence: request
+                                    .indexed_through_sequence
+                                    .unwrap_or(0),
+                                indexed_text_bytes: request
+                                    .records
+                                    .iter()
+                                    .map(|record| record.indexed_bytes)
+                                    .sum(),
+                            },
+                        );
+                    }
+                    duplicate
+                } else {
+                    false
+                };
                 APPLY_BATCH_CALLS.fetch_add(1, Ordering::SeqCst);
                 service_response(&ApplySearchRecordsResponse {
                     batch_id: request.batch_id,
-                    outcome: bcode_session_search::ApplyBatchOutcome::Applied,
+                    outcome: if duplicate {
+                        bcode_session_search::ApplyBatchOutcome::Duplicate
+                    } else {
+                        bcode_session_search::ApplyBatchOutcome::Applied
+                    },
                     applied_records: request.records.len(),
                     indexed_through_sequence: request.indexed_through_sequence.unwrap_or_else(
                         || {
@@ -2579,7 +2646,9 @@ pub(crate) mod tests {
                 TestProviderBehavior::Crash => {
                     return bcode_plugin_sdk::SERVICE_STATUS_PLUGIN_UNAVAILABLE;
                 }
-                TestProviderBehavior::Fast | TestProviderBehavior::RejectCleanup => {
+                TestProviderBehavior::Fast
+                | TestProviderBehavior::RejectCleanup
+                | TestProviderBehavior::Stateful => {
                     match context.request.payload_json::<SessionSearchRequest>() {
                         Ok(request) => service_response(&provider_search_response(
                             provider.provider_id,
@@ -3443,6 +3512,54 @@ pub(crate) mod tests {
                 .any(|update| update.providers_completed == 2)
         );
         drop(progress);
+    }
+
+    #[tokio::test]
+    async fn complete_backfill_rerun_uses_provider_checkpoint_without_duplicate_apply() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        STATEFUL_CHECKPOINTS
+            .lock()
+            .expect("stateful checkpoints")
+            .clear();
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Stateful)]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("idempotent complete backfill".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "index once".to_owned(), 0)
+            .await
+            .expect("append event");
+        let request = bcode_session_search::CompleteSessionSearchBackfillRequest {
+            provider_id: Some(FAST_PROVIDER_ID.to_owned()),
+            session_ids: BTreeSet::from([session.id]),
+            after_timestamp_ms: None,
+            before_timestamp_ms: None,
+            slice_deadline_ms: 5_000,
+        };
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+
+        let first = complete_backfill(&state, request.clone(), &cancellation, None)
+            .await
+            .expect("first complete backfill");
+        assert_eq!(first.providers[0].completed_sessions, 1);
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
+        let second = complete_backfill(&state, request, &cancellation, None)
+            .await
+            .expect("second complete backfill");
+        assert_eq!(second.providers[0].completed_sessions, 1);
+        assert_eq!(
+            APPLY_BATCH_CALLS.load(Ordering::SeqCst),
+            1,
+            "fresh provider coverage must suppress duplicate apply calls"
+        );
     }
 
     #[tokio::test]

@@ -1512,6 +1512,7 @@ mod tests {
             })
             .expect("apply");
         assert_eq!(applied.outcome, ApplyBatchOutcome::Applied);
+        let before = plugin.status(&config);
         drop(plugin);
         let plugin = CompressedSessionSearchPlugin::default();
         let response = plugin
@@ -1533,6 +1534,10 @@ mod tests {
             })
             .expect("duplicate");
         assert_eq!(duplicate.outcome, ApplyBatchOutcome::Duplicate);
+        let after = plugin.status(&config);
+        assert_eq!(after.document_count, before.document_count);
+        assert_eq!(after.index_bytes, before.index_bytes);
+        assert_eq!(after.coverage, before.coverage);
     }
 
     #[test]

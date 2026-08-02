@@ -2540,8 +2540,42 @@ mod tests {
     use bcode_session_models::{
         ExecutionSessionContextMode, ExecutionSessionProvenance, SessionVisibility,
     };
+    use std::collections::BTreeSet;
     use std::time::Duration;
     use switchy::database::query::FilterableQuery;
+
+    #[tokio::test]
+    async fn session_summary_pages_are_bounded_ordered_and_cursor_continuable() {
+        let manager = SessionManager::default();
+        let workspace = tempfile::tempdir().expect("workspace");
+        for index in 0..6 {
+            manager
+                .create_session(
+                    Some(format!("page session {index}")),
+                    workspace.path().to_path_buf(),
+                )
+                .await
+                .expect("create session");
+        }
+
+        let first = manager
+            .session_summaries_page(&BTreeSet::new(), None, None, None, 2)
+            .await;
+        assert_eq!(first.len(), 3, "one lookahead summary is retained");
+        assert!(first.windows(2).all(|pair| {
+            (pair[0].updated_at_ms, pair[0].id) < (pair[1].updated_at_ms, pair[1].id)
+        }));
+        let cursor = (first[1].updated_at_ms, first[1].id);
+        let second = manager
+            .session_summaries_page(&BTreeSet::new(), None, None, Some(cursor), 2)
+            .await;
+        assert_eq!(second.len(), 3);
+        assert!(second.iter().all(|summary| {
+            (summary.updated_at_ms, summary.id) > cursor
+                && summary.id != first[0].id
+                && summary.id != first[1].id
+        }));
+    }
 
     fn session_database_files(
         root: &std::path::Path,
