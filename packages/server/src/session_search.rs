@@ -93,6 +93,20 @@ pub async fn backfill_provider(
     state: &ServerState,
     request: BackfillSessionSearchRequest,
 ) -> Result<SessionSearchBackfillResponse, SessionSearchServiceError> {
+    backfill_provider_with_cancellation(state, request, None).await
+}
+
+/// Run explicit historical backfill with caller-owned cancellation.
+///
+/// # Errors
+///
+/// Returns the same normalized errors as [`backfill_provider`].
+#[allow(clippy::too_many_lines)]
+pub async fn backfill_provider_with_cancellation(
+    state: &ServerState,
+    request: BackfillSessionSearchRequest,
+    cancellation: Option<&bcode_plugin_sdk::ServiceCancellation>,
+) -> Result<SessionSearchBackfillResponse, SessionSearchServiceError> {
     request
         .validate()
         .map_err(|error| SessionSearchServiceError {
@@ -175,7 +189,9 @@ pub async fn backfill_provider(
     let selected_sessions = summaries.len();
     let mut sessions = Vec::with_capacity(selected_sessions);
     for summary in summaries {
-        if Instant::now() >= deadline {
+        if cancellation.is_some_and(bcode_plugin_sdk::ServiceCancellation::is_cancelled)
+            || Instant::now() >= deadline
+        {
             break;
         }
         let session_id = summary.id;
@@ -235,6 +251,7 @@ pub async fn backfill_provider(
             MAX_BACKFILL_BATCHES_PER_SESSION,
             Some(deadline),
             false,
+            cancellation,
         )
         .await;
         sessions.push(match result {
@@ -745,6 +762,7 @@ async fn ingest_session_tail(
             MAX_INCREMENTAL_BATCHES_PER_SESSION,
             None,
             true,
+            None,
         )
         .await?;
     }
@@ -759,6 +777,7 @@ struct ProviderIngestionProgress {
     complete: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ingest_provider_pages(
     state: &ServerState,
     session_id: bcode_session_models::SessionId,
@@ -767,6 +786,7 @@ async fn ingest_provider_pages(
     max_batches: usize,
     deadline: Option<Instant>,
     requeue_incomplete: bool,
+    cancellation: Option<&bcode_plugin_sdk::ServiceCancellation>,
 ) -> Result<ProviderIngestionProgress, IngestionError> {
     if state.session_migrations.is_active(session_id).await {
         return Err(IngestionError::permanent(
@@ -810,6 +830,7 @@ async fn ingest_provider_pages(
             previous_sequence,
             previous_text_bytes,
             deadline,
+            cancellation,
         )
         .await?
         else {
@@ -929,6 +950,7 @@ async fn ingest_provider_page(
     previous_sequence: Option<u64>,
     previous_text_bytes: u64,
     deadline: Option<Instant>,
+    cancellation: Option<&bcode_plugin_sdk::ServiceCancellation>,
 ) -> Result<Option<(u64, u64)>, IngestionError> {
     let page = state
         .sessions
@@ -1023,7 +1045,7 @@ async fn ingest_provider_page(
             records,
         };
         request.validate().map_err(IngestionError::permanent)?;
-        invoke_apply_batch(state, provider, &request, deadline).await?;
+        invoke_apply_batch(state, provider, &request, deadline, cancellation).await?;
         return Ok(Some((indexed_through_sequence, previous_text_bytes)));
     }
     let last_sequence = records.last().map(|record| record.locator.sequence);
@@ -1058,7 +1080,7 @@ async fn ingest_provider_page(
         previous_text_bytes.saturating_add(request.records.iter().fold(0_u64, |total, record| {
             total.saturating_add(record.normalized_bytes)
         }));
-    invoke_apply_batch(state, provider, &request, deadline).await?;
+    invoke_apply_batch(state, provider, &request, deadline, cancellation).await?;
     Ok(Some((indexed_through_sequence, indexed_text_bytes)))
 }
 
@@ -1067,6 +1089,7 @@ async fn invoke_apply_batch(
     provider: &SessionSearchProviderInfo,
     request: &ApplySearchRecordsRequest,
     deadline: Option<Instant>,
+    cancellation: Option<&bcode_plugin_sdk::ServiceCancellation>,
 ) -> Result<ApplySearchRecordsResponse, IngestionError> {
     let response = if let Some(deadline) = deadline {
         let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
@@ -1074,18 +1097,34 @@ async fn invoke_apply_batch(
                 "historical backfill deadline reached",
             ));
         };
-        state
-            .plugins
-            .invoke_service_json_scoped_with_timeout(
-                &provider.plugin_id,
-                SESSION_SEARCH_INTERFACE_ID,
-                OP_APPLY_BATCH,
-                request,
-                bcode_plugin::PluginInvocationScope::Global,
-                timeout,
-            )
-            .await
-            .map_err(classify_ingestion_call_error)?
+        if let Some(cancellation) = cancellation {
+            state
+                .plugins
+                .invoke_service_json_scoped_cancellable(
+                    &provider.plugin_id,
+                    SESSION_SEARCH_INTERFACE_ID,
+                    OP_APPLY_BATCH,
+                    request,
+                    bcode_plugin::PluginInvocationScope::Global,
+                    timeout,
+                    cancellation,
+                )
+                .await
+                .map_err(classify_ingestion_call_error)?
+        } else {
+            state
+                .plugins
+                .invoke_service_json_scoped_with_timeout(
+                    &provider.plugin_id,
+                    SESSION_SEARCH_INTERFACE_ID,
+                    OP_APPLY_BATCH,
+                    request,
+                    bcode_plugin::PluginInvocationScope::Global,
+                    timeout,
+                )
+                .await
+                .map_err(classify_ingestion_call_error)?
+        }
     } else {
         state
             .plugins
@@ -3172,6 +3211,58 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn backfill_caller_cancellation_cancels_inflight_provider_ingestion() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        SLOW_APPLY_STARTED.store(false, Ordering::SeqCst);
+        SLOW_APPLY_CANCELLED.store(false, Ordering::SeqCst);
+        let state = state_with_providers(&[(SLOW_PROVIDER_ID, TestProviderBehavior::Slow)]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("caller cancel backfill".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "cancel me".to_owned(), 0)
+            .await
+            .expect("append event");
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let cancel_signal = cancellation.clone();
+        let cancel_task = tokio::spawn(async move {
+            while !SLOW_APPLY_STARTED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            cancel_signal.cancel();
+        });
+
+        let response = backfill_provider_with_cancellation(
+            &state,
+            BackfillSessionSearchRequest {
+                provider_id: SLOW_PROVIDER_ID.to_owned(),
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                cursor: None,
+                deadline_ms: 5_000,
+            },
+            Some(&cancellation),
+        )
+        .await
+        .expect("backfill returns terminal caller-cancellation progress");
+        cancel_task.await.expect("cancellation task");
+
+        assert!(SLOW_APPLY_CANCELLED.load(Ordering::SeqCst));
+        assert_eq!(response.failed_sessions, 1);
+        assert!(!response.deadline_reached);
+        let error = response.sessions[0].error.as_ref().expect("cancel error");
+        assert!(error.retryable);
+    }
+
+    #[tokio::test]
     async fn ingestion_rejects_checkpoint_ahead_of_canonical_tail_after_truncation() {
         let _guard = SEARCH_TEST_LOCK.lock().await;
         APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
@@ -3218,9 +3309,11 @@ pub(crate) mod tests {
                 exclusions: Vec::new(),
             });
 
-        let error = ingest_provider_pages(&state, session.id, &summary, &provider, 1, None, false)
-            .await
-            .expect_err("checkpoint ahead of canonical tail must fail closed");
+        let error = ingest_provider_pages(
+            &state, session.id, &summary, &provider, 1, None, false, None,
+        )
+        .await
+        .expect_err("checkpoint ahead of canonical tail must fail closed");
 
         assert!(!error.retryable);
         assert!(

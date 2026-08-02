@@ -3699,6 +3699,63 @@ impl PluginRuntimeHost {
         decode_service_response(response)
     }
 
+    /// Invoke a typed service operation with explicit scope, deadline, and caller cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encoding, invocation, cancellation, timeout, service response, or
+    /// decoding fails.
+    #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
+    pub async fn invoke_service_json_scoped_cancellable<Q, R>(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        request: &Q,
+        scope: PluginInvocationScope,
+        timeout: std::time::Duration,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    ) -> Result<R, PluginServiceCallError>
+    where
+        Q: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        let payload = serde_json::to_vec(request).map_err(PluginServiceCallError::RequestEncode)?;
+        let mut invocation = self
+            .invoke_service_with_events_scoped(plugin_id, interface_id, operation, payload, scope)
+            .await?;
+        let cancel = invocation.cancel.clone();
+        let response = tokio::select! {
+            () = async {
+                while !cancellation.is_cancelled() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            } => {
+                cancel.cancel();
+                return Err(PluginServiceCallError::Service {
+                    code: "cancelled".to_owned(),
+                    message: "plugin invocation cancelled by caller".to_owned(),
+                });
+            }
+            timed = tokio::time::timeout(timeout, async {
+                loop {
+                    if let StreamingServiceInvocationEvent::Response(response) =
+                        invocation.next_event().await?
+                    {
+                        return response;
+                    }
+                }
+            }) => timed.unwrap_or_else(|_| {
+                cancel.cancel();
+                Err(PluginLoadError::ServiceInvocationTimeout {
+                    plugin_id: plugin_id.to_owned(),
+                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                })
+            })?,
+        };
+        decode_service_response(response)
+    }
+
     /// Invoke a service operation by service interface ID with JSON payloads.
     ///
     /// # Errors
@@ -6217,6 +6274,43 @@ library = "libexample_plugin.dylib"
                 plugin_id,
                 timeout_ms: 25
             } if plugin_id == "example.hello"
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn scoped_caller_cancellation_propagates_to_static_plugin() {
+        let manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .expect("hello manifest should parse");
+        let host =
+            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
+                .expect("static hello host should load");
+        let runtime = PluginRuntimeHost::from(host);
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let cancel_signal = cancellation.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            cancel_signal.cancel();
+        });
+        let started = Instant::now();
+        let error = runtime
+            .invoke_service_json_scoped_cancellable::<_, serde_json::Value>(
+                "example.hello",
+                "example-hello/v1",
+                "wait-cancelled",
+                &serde_json::Value::Null,
+                PluginInvocationScope::Global,
+                Duration::from_secs(5),
+                &cancellation,
+            )
+            .await
+            .expect_err("wait operation should observe caller cancellation");
+        cancel_task.await.expect("cancellation task");
+        assert!(matches!(
+            error,
+            PluginServiceCallError::Service { code, .. } if code == "cancelled"
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
