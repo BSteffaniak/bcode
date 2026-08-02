@@ -291,9 +291,22 @@ mod tests {
                 reliable_depth: 3,
                 reliable_high_water: 7,
                 terminal_depth: 2,
+                terminal_high_water: 6,
                 latest_depth: 1,
+                latest_high_water: 4,
+                subscription_depth: 8,
+                subscription_high_water: 9,
+                reliable_rejected: 2,
+                terminal_rejected: 3,
+                latest_rejected: 1,
+                latest_replaced: 10,
+                subscription_rejected: 1,
+                timers_delivered: 12,
+                redraw_requests: 17,
                 redraw_coalesced: 11,
+                frames_presented: 14,
                 scheduler_budget_exhausted: 5,
+                commands_rejected: 2,
                 stale_command_completions: 4,
                 presentation_delay_us: 13,
                 ..bmux_tui_runtime::RuntimeStats::default()
@@ -307,11 +320,32 @@ mod tests {
             Some(&3)
         );
         assert_eq!(
+            telemetry.gauges.get(&(
+                "tui.runtime.subscription_high_water".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&9)
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.latest_replaced_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&10)
+        );
+        assert_eq!(
             telemetry.counters.get(&(
                 "tui.runtime.redraw_coalesced_total".to_owned(),
                 MetricLabels::new()
             )),
             Some(&11)
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.frames_presented_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&14)
         );
         assert!(telemetry.histograms.iter().any(|((name, _), value)| {
             name == "tui.runtime.presentation_delay_us" && *value == 13

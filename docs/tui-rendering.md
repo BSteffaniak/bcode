@@ -16,10 +16,12 @@ runtime is not final architecture and must be removed once root navigation owns 
 
 Migration is complete only when the normal startup path uses the root runtime; reliable session and
 terminal updates use bounded admission; request-draft paint handoff, hit maps, cursor state, and
-image-scene ordering remain correct; manual nested draw/input loops and obsolete generic effect
-plumbing are removed; local BMUX path patches are removed; and all BMUX TUI crates are pinned to the
-same exact committed BMUX revision. Render cadence continues to limit presentation only and never
-delays semantic updates, authorization, cancellation dispatch, or canonical execution.
+image-scene ordering remain correct; and manual nested draw/input loops and obsolete generic effect
+plumbing are removed. The dependency transition is already complete: Bcode resolves all BMUX crates,
+including the three TUI layers, from exact committed revision
+`f6e4a0ad2506aa08153b96f2a5888035eef412f3` with no active local path overrides. Render cadence
+continues to limit presentation only and never delays semantic updates, authorization, cancellation
+dispatch, or canonical execution.
 
 ## Session picker and search scope
 

@@ -211,18 +211,18 @@ bmux_codec = { default-features = false, features = [
     "typed-stable",
     "compression-lz4",
     "compression-zstd",
-], git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_image = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_ipc = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_keyboard = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_plugin = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_plugin_schema = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_plugin_sdk = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_terminal_grid = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_tui = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_tui_components = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
-bmux_tui_runtime = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "e0567de1b11edfb794b041bf3674f451429c493d" }
+], git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_image = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_ipc = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_keyboard = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_plugin = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_plugin_schema = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_plugin_sdk = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_terminal_grid = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_tui = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_tui_components = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
+bmux_tui_runtime = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "f6e4a0ad2506aa08153b96f2a5888035eef412f3" }
 
 # External dependencies
 arboard = { version = "3.6.1", default-features = false, features = [
@@ -423,23 +423,3 @@ opt-level = 0
 # switchy                     = { path = "/Volumes/tinyguy/GitHub/MoosicBox/packages/switchy" }
 # switchy_env                  = { path = "../MoosicBox/packages/switchy/env" }
 # switchy_time                 = { path = "../MoosicBox/packages/switchy/time" }
-
-# BMUX local development patches
-[patch."https://github.com/BSteffaniak/bmux.git"]
-# bmux_keyboard       = { path = "../../bmux/packages/keyboard" }
-# bmux_text_edit      = { path = "../../bmux/packages/text-edit" }
-bmux_keyboard       = { path = "../../wt-bmux/tui-runtime/packages/keyboard" }
-bmux_text_edit      = { path = "../../wt-bmux/tui-runtime/packages/text-edit" }
-bmux_tui            = { path = "../../wt-bmux/tui-runtime/packages/tui" }
-bmux_tui_components = { path = "../../wt-bmux/tui-runtime/packages/tui-components" }
-bmux_tui_runtime    = { path = "../../wt-bmux/tui-runtime/packages/tui-runtime" }
-# bmux_codec                  = { path = "/Volumes/ehdd/GitHub/bmux/packages/codec" }
-# bmux_ipc                    = { path = "/Volumes/ehdd/GitHub/bmux/packages/ipc" }
-# bmux_keyboard               = { path = "/Volumes/ehdd/GitHub/bmux/packages/keyboard" }
-# bmux_plugin                 = { path = "/Volumes/ehdd/GitHub/bmux/packages/plugin" }
-# bmux_plugin_schema          = { path = "/Volumes/ehdd/GitHub/bmux/packages/plugin-schema" }
-# bmux_plugin_sdk             = { path = "/Volumes/ehdd/GitHub/bmux/packages/plugin-sdk" }
-# bmux_terminal_grid          = { path = "/Volumes/ehdd/GitHub/bmux/packages/terminal-grid" }
-# bmux_text_edit              = { path = "/Volumes/ehdd/GitHub/bmux/packages/text-edit" }
-# bmux_tui                    = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui" }
-# bmux_tui_components         = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-components" }
