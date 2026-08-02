@@ -1760,6 +1760,17 @@ pub struct SessionSearchBackfillSessionResult {
     pub error: Option<SessionSearchServiceError>,
 }
 
+/// Bounded live progress for one explicit complete historical-backfill operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteSessionSearchBackfillProgress {
+    pub provider_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_provider_id: Option<String>,
+    pub catalog_revision_started: u64,
+    pub convergence_pass: usize,
+    pub providers_completed: usize,
+}
+
 /// Terminal aggregate for one provider in complete historical backfill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompleteSessionSearchBackfillProviderResult {
@@ -1826,6 +1837,8 @@ pub struct SessionSearchBackfillOperationStatus {
     pub state: SessionSearchBackfillOperationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<SessionSearchBackfillResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete_progress: Option<CompleteSessionSearchBackfillProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complete_response: Option<CompleteSessionSearchBackfillResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

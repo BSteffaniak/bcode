@@ -79,6 +79,8 @@ pub async fn rebuild_provider(
     .await
 }
 
+const MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES: usize = 8;
+
 /// Run explicit complete historical backfill across every selected provider.
 ///
 /// Provider and catalog work remains bounded by the existing single-provider request. Reissuing
@@ -93,6 +95,9 @@ pub async fn complete_backfill(
     state: &ServerState,
     request: bcode_session_search::CompleteSessionSearchBackfillRequest,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    progress: Option<
+        &(dyn Fn(bcode_session_search::CompleteSessionSearchBackfillProgress) + Send + Sync),
+    >,
 ) -> Result<bcode_session_search::CompleteSessionSearchBackfillResponse, SessionSearchServiceError>
 {
     request
@@ -149,77 +154,144 @@ pub async fn complete_backfill(
             retryable: true,
         })?;
     let revision_started = state.session_catalog.revision();
-    let mut providers = Vec::with_capacity(provider_ids.len());
-    for provider_id in &provider_ids {
-        let mut cursor = None;
-        let mut aggregate = bcode_session_search::CompleteSessionSearchBackfillProviderResult {
-            provider_id: provider_id.clone(),
-            selected_sessions: 0,
-            completed_sessions: 0,
-            incomplete_sessions: 0,
-            failed_sessions: 0,
-            catalog_pages: 0,
-            error: None,
-        };
-        loop {
-            if cancellation.is_cancelled() {
-                break;
-            }
-            let response = backfill_provider_with_cancellation(
-                state,
-                BackfillSessionSearchRequest {
-                    provider_id: provider_id.clone(),
-                    session_ids: request.session_ids.clone(),
-                    after_timestamp_ms: request.after_timestamp_ms,
-                    before_timestamp_ms: request.before_timestamp_ms,
-                    cursor,
-                    deadline_ms: request.slice_deadline_ms,
+    let mut pass_started_revision = revision_started;
+    let mut convergence_passes = 0;
+    let mut providers = Vec::new();
+    loop {
+        convergence_passes += 1;
+        providers.clear();
+        if let Some(progress) = progress {
+            progress(
+                bcode_session_search::CompleteSessionSearchBackfillProgress {
+                    provider_ids: provider_ids.clone(),
+                    current_provider_id: None,
+                    catalog_revision_started: revision_started,
+                    convergence_pass: convergence_passes,
+                    providers_completed: 0,
                 },
-                Some(cancellation),
-            )
-            .await;
-            match response {
-                Ok(response) => {
-                    aggregate.selected_sessions = aggregate
-                        .selected_sessions
-                        .saturating_add(response.selected_sessions);
-                    aggregate.completed_sessions = aggregate
-                        .completed_sessions
-                        .saturating_add(response.completed_sessions);
-                    aggregate.incomplete_sessions = aggregate
-                        .incomplete_sessions
-                        .saturating_add(response.incomplete_sessions);
-                    aggregate.failed_sessions = aggregate
-                        .failed_sessions
-                        .saturating_add(response.failed_sessions);
-                    aggregate.catalog_pages = aggregate.catalog_pages.saturating_add(1);
-                    cursor = response.next_cursor;
-                    if cursor.is_none() || response.deadline_reached {
+            );
+        }
+        for provider_id in &provider_ids {
+            if let Some(progress) = progress {
+                progress(
+                    bcode_session_search::CompleteSessionSearchBackfillProgress {
+                        provider_ids: provider_ids.clone(),
+                        current_provider_id: Some(provider_id.clone()),
+                        catalog_revision_started: revision_started,
+                        convergence_pass: convergence_passes,
+                        providers_completed: providers.len(),
+                    },
+                );
+            }
+            let mut cursor = None;
+            let mut aggregate = bcode_session_search::CompleteSessionSearchBackfillProviderResult {
+                provider_id: provider_id.clone(),
+                selected_sessions: 0,
+                completed_sessions: 0,
+                incomplete_sessions: 0,
+                failed_sessions: 0,
+                catalog_pages: 0,
+                error: None,
+            };
+            loop {
+                if cancellation.is_cancelled() {
+                    break;
+                }
+                let response = backfill_provider_with_cancellation(
+                    state,
+                    BackfillSessionSearchRequest {
+                        provider_id: provider_id.clone(),
+                        session_ids: request.session_ids.clone(),
+                        after_timestamp_ms: request.after_timestamp_ms,
+                        before_timestamp_ms: request.before_timestamp_ms,
+                        cursor,
+                        deadline_ms: request.slice_deadline_ms,
+                    },
+                    Some(cancellation),
+                )
+                .await;
+                if cancellation.is_cancelled() {
+                    break;
+                }
+                match response {
+                    Ok(response) => {
+                        aggregate.selected_sessions = aggregate
+                            .selected_sessions
+                            .saturating_add(response.selected_sessions);
+                        aggregate.completed_sessions = aggregate
+                            .completed_sessions
+                            .saturating_add(response.completed_sessions);
+                        aggregate.incomplete_sessions = aggregate
+                            .incomplete_sessions
+                            .saturating_add(response.incomplete_sessions);
+                        aggregate.failed_sessions = aggregate
+                            .failed_sessions
+                            .saturating_add(response.failed_sessions);
+                        aggregate.catalog_pages = aggregate.catalog_pages.saturating_add(1);
+                        cursor = response.next_cursor;
+                        if cursor.is_none() || response.deadline_reached {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        aggregate.error = Some(error);
                         break;
                     }
                 }
-                Err(error) => {
-                    aggregate.error = Some(error);
-                    break;
-                }
+            }
+            providers.push(aggregate);
+            if let Some(progress) = progress {
+                progress(
+                    bcode_session_search::CompleteSessionSearchBackfillProgress {
+                        provider_ids: provider_ids.clone(),
+                        current_provider_id: None,
+                        catalog_revision_started: revision_started,
+                        convergence_pass: convergence_passes,
+                        providers_completed: providers.len(),
+                    },
+                );
+            }
+            if cancellation.is_cancelled() {
+                break;
             }
         }
-        providers.push(aggregate);
-        if cancellation.is_cancelled() {
-            break;
+        let revision_completed = state.session_catalog.revision();
+        let terminal_provider_outcome = providers.iter().any(|provider| {
+            provider.error.is_some()
+                || provider.failed_sessions > 0
+                || provider.incomplete_sessions > 0
+        });
+        if cancellation.is_cancelled()
+            || terminal_provider_outcome
+            || revision_completed == pass_started_revision
+            || convergence_passes >= MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES
+        {
+            if !cancellation.is_cancelled()
+                && !terminal_provider_outcome
+                && revision_completed != pass_started_revision
+            {
+                for provider in &mut providers {
+                    provider.error = Some(SessionSearchServiceError {
+                        code: SearchErrorCode::StaleIndex,
+                        message: "session catalog continued changing during bounded convergence; rerun explicit backfill"
+                            .to_owned(),
+                        retryable: true,
+                    });
+                }
+            }
+            return Ok(
+                bcode_session_search::CompleteSessionSearchBackfillResponse {
+                    provider_ids,
+                    catalog_revision_started: revision_started,
+                    catalog_revision_completed: revision_completed,
+                    convergence_passes,
+                    cancelled: cancellation.is_cancelled(),
+                    providers,
+                },
+            );
         }
+        pass_started_revision = revision_completed;
     }
-    let revision_completed = state.session_catalog.revision();
-    Ok(
-        bcode_session_search::CompleteSessionSearchBackfillResponse {
-            provider_ids,
-            catalog_revision_started: revision_started,
-            catalog_revision_completed: revision_completed,
-            convergence_passes: 1,
-            cancelled: cancellation.is_cancelled(),
-            providers,
-        },
-    )
 }
 
 /// Explicitly backfill selected or bounded catalog sessions into one provider.
@@ -2308,6 +2380,7 @@ pub(crate) mod tests {
                 SearchFeature::StructuredFilters,
                 SearchFeature::RelevanceSort,
                 SearchFeature::IncrementalIngestion,
+                SearchFeature::HistoricalBackfill,
                 SearchFeature::Rebuild,
                 SearchFeature::Purge,
             ]),
@@ -3309,6 +3382,97 @@ pub(crate) mod tests {
             indexed_through_sequence: 1,
         };
         assert!(validate_apply_batch_response(&request, wrong_batch).is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_backfill_selects_all_enabled_providers_deterministically() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[
+            (SLOW_PROVIDER_ID, TestProviderBehavior::Fast),
+            (FAST_PROVIDER_ID, TestProviderBehavior::Fast),
+        ]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("complete all providers".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "index me".to_owned(), 0)
+            .await
+            .expect("append event");
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let progress = std::sync::Mutex::new(Vec::new());
+        let collect_progress = |update| progress.lock().expect("progress").push(update);
+
+        let response = complete_backfill(
+            &state,
+            bcode_session_search::CompleteSessionSearchBackfillRequest {
+                provider_id: None,
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                slice_deadline_ms: 5_000,
+            },
+            &cancellation,
+            Some(&collect_progress),
+        )
+        .await
+        .expect("complete backfill");
+
+        assert_eq!(
+            response.provider_ids,
+            vec![FAST_PROVIDER_ID.to_owned(), SLOW_PROVIDER_ID.to_owned()]
+        );
+        assert_eq!(response.providers.len(), 2);
+        assert!(response.providers.iter().all(|provider| {
+            provider.completed_sessions == 1
+                && provider.failed_sessions == 0
+                && provider.incomplete_sessions == 0
+        }));
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 2);
+        let progress = progress.lock().expect("progress");
+        assert!(
+            progress
+                .iter()
+                .any(|update| update.providers_completed == 2)
+        );
+        drop(progress);
+    }
+
+    #[tokio::test]
+    async fn complete_backfill_scopes_one_provider_and_honors_precancellation() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[
+            (FAST_PROVIDER_ID, TestProviderBehavior::Fast),
+            (SLOW_PROVIDER_ID, TestProviderBehavior::Fast),
+        ]);
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        cancellation.cancel();
+        let response = complete_backfill(
+            &state,
+            bcode_session_search::CompleteSessionSearchBackfillRequest {
+                provider_id: Some(FAST_PROVIDER_ID.to_owned()),
+                session_ids: BTreeSet::new(),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                slice_deadline_ms: 5_000,
+            },
+            &cancellation,
+            None,
+        )
+        .await
+        .expect("cancelled complete backfill");
+
+        assert_eq!(response.provider_ids, vec![FAST_PROVIDER_ID.to_owned()]);
+        assert!(response.cancelled);
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

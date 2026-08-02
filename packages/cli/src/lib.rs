@@ -9013,6 +9013,15 @@ fn print_session_search_backfill_operation(
             "{}: {:?} provider={} revision={}",
             status.operation_id, status.state, status.provider_id, status.revision
         );
+        if let Some(progress) = &status.complete_progress {
+            println!(
+                "progress: pass={}, providers={}/{}, current={}",
+                progress.convergence_pass,
+                progress.providers_completed,
+                progress.provider_ids.len(),
+                progress.current_provider_id.as_deref().unwrap_or("none")
+            );
+        }
         if let Some(response) = &status.complete_response {
             println!(
                 "providers={} revisions={}->{} passes={} cancelled={}",
@@ -9106,9 +9115,21 @@ async fn session_search_backfill(
         .await?;
     let mut revision = 0;
     loop {
-        let status = client
-            .session_search_backfill_wait(started.operation_id.clone(), revision, 30_000)
-            .await?;
+        let wait =
+            client.session_search_backfill_wait(started.operation_id.clone(), revision, 30_000);
+        let status = tokio::select! {
+            result = wait => result?,
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                let status = client
+                    .session_search_backfill_cancel(started.operation_id.clone())
+                    .await?;
+                print_session_search_backfill_operation(&status, json)?;
+                return Err(CliError::InvalidArguments(
+                    "session-search backfill cancelled".to_owned(),
+                ));
+            }
+        };
         revision = status.revision;
         if matches!(
             status.state,
@@ -9116,7 +9137,20 @@ async fn session_search_backfill(
                 | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
                 | bcode_session_search::SessionSearchBackfillOperationState::Failed
         ) {
-            return print_session_search_backfill_operation(&status, json);
+            print_session_search_backfill_operation(&status, json)?;
+            return if status.state
+                == bcode_session_search::SessionSearchBackfillOperationState::Completed
+            {
+                Ok(())
+            } else {
+                Err(CliError::InvalidArguments(format!(
+                    "session-search backfill ended in {:?} state",
+                    status.state
+                )))
+            };
+        }
+        if !json {
+            print_session_search_backfill_operation(&status, false)?;
         }
     }
 }

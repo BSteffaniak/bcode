@@ -9054,6 +9054,7 @@ async fn handle_complete_session_search_backfill_start(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn start_complete_session_search_backfill(
     state: Arc<ServerState>,
     request: bcode_session_search::CompleteSessionSearchBackfillRequest,
@@ -9089,6 +9090,7 @@ async fn start_complete_session_search_backfill(
                 revision: 1,
                 state: bcode_session_search::SessionSearchBackfillOperationState::Running,
                 response: None,
+                complete_progress: None,
                 complete_response: None,
                 error: None,
             },
@@ -9099,7 +9101,33 @@ async fn start_complete_session_search_backfill(
     drop(operations);
     let task_operation_id = operation_id.clone();
     tokio::spawn(async move {
-        let result = session_search::complete_backfill(&state, request, &cancellation).await;
+        let progress_state = Arc::clone(&state);
+        let progress_operation_id = task_operation_id.clone();
+        let report_progress = move |progress| {
+            let state = Arc::clone(&progress_state);
+            let operation_id = progress_operation_id.clone();
+            tokio::spawn(async move {
+                let mut operations = state.session_search_backfills.lock().await;
+                if let Some(operation) = operations.get_mut(&operation_id)
+                    && matches!(
+                        operation.status.state,
+                        bcode_session_search::SessionSearchBackfillOperationState::Running
+                            | bcode_session_search::SessionSearchBackfillOperationState::CancellationRequested
+                    )
+                {
+                    operation.status.revision = operation.status.revision.saturating_add(1);
+                    operation.status.complete_progress = Some(progress);
+                    operation.changed.notify_waiters();
+                }
+            });
+        };
+        let result = session_search::complete_backfill(
+            &state,
+            request,
+            &cancellation,
+            Some(&report_progress),
+        )
+        .await;
         let mut operations = state.session_search_backfills.lock().await;
         if let Some(operation) = operations.get_mut(&task_operation_id) {
             operation.status.revision = operation.status.revision.saturating_add(1);
@@ -9117,6 +9145,7 @@ async fn start_complete_session_search_backfill(
                     } else {
                         bcode_session_search::SessionSearchBackfillOperationState::Completed
                     };
+                    operation.status.complete_progress = None;
                     operation.status.complete_response = Some(response);
                 }
                 Err(error) => {
@@ -9223,6 +9252,7 @@ async fn start_session_search_backfill(
                 revision: 1,
                 state: bcode_session_search::SessionSearchBackfillOperationState::Running,
                 response: None,
+                complete_progress: None,
                 complete_response: None,
                 error: None,
             },
@@ -31243,6 +31273,7 @@ mod tests {
                     revision: 1,
                     state: bcode_session_search::SessionSearchBackfillOperationState::Running,
                     response: None,
+                    complete_progress: None,
                     complete_response: None,
                     error: None,
                 },
@@ -31312,21 +31343,22 @@ mod tests {
         });
         let client = bcode_client::BcodeClient::new(endpoint);
         let started = client
-            .session_search_backfill_start(bcode_session_search::BackfillSessionSearchRequest {
-                provider_id: "test.slow-session-search".to_owned(),
-                session_ids: BTreeSet::from([session.id]),
-                after_timestamp_ms: None,
-                before_timestamp_ms: None,
-                cursor: None,
-                deadline_ms: 5_000,
-            })
+            .session_search_complete_backfill_start(
+                bcode_session_search::CompleteSessionSearchBackfillRequest {
+                    provider_id: Some("test.slow-session-search".to_owned()),
+                    session_ids: BTreeSet::from([session.id]),
+                    after_timestamp_ms: None,
+                    before_timestamp_ms: None,
+                    slice_deadline_ms: 5_000,
+                },
+            )
             .await
             .expect("start through IPC");
         let running = client
             .session_search_backfill_status(started.operation_id.clone())
             .await
             .expect("status through IPC");
-        assert_eq!(running.revision, 1);
+        assert!(running.revision >= 1);
         let cancelling = client
             .session_search_backfill_cancel(started.operation_id.clone())
             .await

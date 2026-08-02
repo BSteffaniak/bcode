@@ -109,6 +109,17 @@ Search providers own their implementation details, including:
 A provider never opens canonical Bcode databases and never writes canonical session state. It
 receives bounded versioned search records projected by Bcode from finalized semantic events.
 
+The standard distribution includes Tantivy and compressed deep-output search while preserving
+independent compile-time feature paths. Host-owned distribution policy enables Tantivy for ordinary
+transcript search and leaves compressed shell/tool-output search disabled until explicitly selected.
+When `storage_root` is omitted, the application supplies a lazy authorized provider root under
+`<state>/derived/plugins/<artifact-namespace>/<plugin-id>/`; generic plugin plumbing only transports
+that optional path and providers still perform confinement checks. Exact artifact namespaces prevent
+concurrently runnable daemon versions from sharing mutable derived state. Daemon lifecycle cleanup
+removes a managed namespace root only after its daemon record is positively classified stale;
+ambiguous records, invalid identities, symlink boundaries, and explicit storage overrides fail
+closed or remain untouched.
+
 ## Complete disablement
 
 Session investigation remains available when no search provider exists. Global
@@ -249,22 +260,32 @@ working-directory change receive the new summary directory without rewriting ear
 records. Import completion and fork lineage do change the generation fingerprint because they define
 canonical provenance.
 
-The public client/IPC/CLI boundary exposes provider-scoped purge, empty rebuild, and daemon-owned
-bounded backfill. Backfill may run synchronously or as an addressable daemon operation with generated
-ID, bounded status, revision-based wait, and idempotent cancellation. Operation IDs/revisions are
-bounded in-process notification state and are intentionally lost across daemon restart; they do not
-provide reconnect-safe replay or durable operation resume. Provider-owned sequence/text checkpoints
-remain the durable continuation boundary, so a caller starts a new bounded operation after restart.
-`session search-backfill` selects either explicitly named
-canonical sessions or at most 256 catalog sessions filtered by summary update timestamps and an
-explicit stable continuation cursor, applies a
-bounded wall-clock deadline, and processes no more than 1,024 provider-sized canonical pages per
-session. It resumes from provider-owned durable sequence/text checkpoints, reports per-session
-through/tail progress plus incomplete/failure/deadline and selection-truncation state, and uses
-cancellation-propagating deadlines for provider ingestion calls. The operation never hands canonical
-storage paths or event envelopes to providers. Reissuing the request is restart-safe because each
-batch has a deterministic canonical sequence identity and provider-side expected checkpoint checks;
-this does not imply transport-level durable resume or replay.
+The public client/IPC/CLI boundary exposes provider-scoped purge, empty rebuild, bounded
+single-provider backfill, and a complete explicit coordinator. `bcode session search-backfill`
+snapshots every enabled provider with historical-ingestion support in deterministic plugin-ID order;
+`--provider` scopes that snapshot to one enabled provider. The daemon, not the CLI, traverses stable
+bounded catalog pages and existing bounded ingestion batches. It repeats bounded passes when the
+catalog revision changes and returns an explicit retryable stale result if the catalog cannot converge
+within the pass limit. Reissuing the command consults provider-owned sequence/text checkpoints and
+deterministic batch identities, so a crash after provider publication but before daemon progress
+publication does not duplicate derived documents.
+
+The foreground command creates an addressable operation, waits on bounded process-local revisions,
+prints bounded aggregate progress, and requests cancellation on Ctrl-C. Detached start/status/wait/
+cancel remain available. Operation IDs, revisions, progress snapshots, and catalog cursors are lost on
+daemon restart and define no reconnect-safe replay protocol. After restart, issue a new explicit
+command; provider checkpoints are the durable derived continuation boundary. Historical traversal is
+never scheduled by startup, listing, attach, ordinary history, rendering, model-context construction,
+or ordinary search.
+
+The bounded single-provider primitive may run directly or as an addressable daemon operation with a
+generated ID, bounded status, revision-based wait, and idempotent cancellation. It selects either
+explicitly named canonical sessions or at most 256 catalog sessions filtered by summary update
+timestamps and an explicit stable continuation cursor, applies a bounded wall-clock deadline, and
+processes no more than 1,024 provider-sized canonical pages per session. Complete orchestration owns
+that cursor internally. Both forms resume from provider-owned durable sequence/text checkpoints,
+report incomplete/failure/deadline state, and use cancellation-propagating deadlines for provider
+ingestion calls. Neither hands canonical storage paths or event envelopes to providers.
 
 Canonical deletion remains authoritative and occurs first; after success the
 server best-effort invokes each loaded provider's typed `remove_session` with the expected generation,

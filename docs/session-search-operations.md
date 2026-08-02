@@ -19,19 +19,34 @@ Set `enabled = false` to suppress provider inventory, queries, maintenance, dirt
 and ingestion-worker startup while preserving canonical investigation commands. Disabling search or
 a provider does not delete retained derived data.
 
-The optional bundled Tantivy provider must also be selected and configured. Plugin settings are
-owned by that provider:
+The standard distribution enables the bundled Tantivy transcript provider by default. Its disposable
+state root is host-managed beneath the artifact-isolated Bcode state directory, so ordinary local
+search requires no plugin selection or `storage_root` setting. The compressed deep-output provider is
+bundled but disabled by default because it copies high-volume shell/tool output into derived state.
+Enable it explicitly when that coverage is wanted:
 
 ```toml
 [plugins]
-enabled = ["bcode.tantivy-session-search"]
+enabled = ["bcode.compressed-session-search"]
+```
 
+Plugin settings remain provider-owned overrides. An explicit `storage_root` replaces the host-managed
+root and is not automatically retired with stale daemon artifacts:
+
+```toml
 [plugins.config."bcode.tantivy-session-search"]
 storage_root = "/absolute/path/to/bcode-derived/session-search/tantivy"
 quota_bytes = 2147483648
 writer_memory_bytes = 33554432
 sensitive_content = ["assistant_reasoning"]
 ```
+
+Host-managed roots live under
+`<bcode-state>/derived/plugins/<daemon-artifact-namespace>/<plugin-id>/`. They are separate from
+canonical sessions. Conservative daemon lifecycle cleanup removes a namespace root only after the
+matching daemon record is positively classified stale; malformed identities, ambiguous records, and
+symlink namespace boundaries fail closed. Explicitly configured provider roots are outside this
+cleanup policy.
 
 `storage_root` must be an absolute, confined, non-root directory. Do not place it inside a canonical
 session directory. The provider stores only disposable derived state under that root. Its default
@@ -99,15 +114,28 @@ Inspect capabilities, versions, quota, document count, degraded state, and per-s
 bcode session search-status --json
 ```
 
-Historical backfill is explicit, bounded, and optionally addressable. For a short synchronous request,
-select exact sessions when possible:
+Historical backfill is explicit. With no provider scope, one foreground command traverses bounded
+catalog pages for every enabled provider and waits for a terminal aggregate result:
+
+```sh
+bcode session search-backfill --json
+```
+
+Use `--provider` for a scoped run, and optional session/timestamp filters to restrict the complete
+selection:
 
 ```sh
 bcode session search-backfill --provider bcode.tantivy-session-search \
   --session SESSION_ID --deadline-ms 30000 --json
 ```
 
-For user-cancellable work, start an addressable operation and use its returned operation ID:
+`--deadline-ms` bounds each provider/catalog slice, not the complete operation. The daemon owns cursor
+continuation and repeats bounded convergence passes when the catalog changes; callers do not manually
+stitch pages. Ctrl-C requests cancellation through the addressable operation before the command exits.
+Reissuing the command is idempotent because providers validate deterministic batches against durable
+sequence/text checkpoints.
+
+For detached work, start an addressable operation and use its returned operation ID:
 
 ```sh
 bcode session search-backfill-start --provider bcode.tantivy-session-search \
@@ -123,18 +151,14 @@ when the daemon restarts and do not define reconnect-safe or durable resume. Pro
 and text checkpoints are the durable continuation boundary; after restart, issue a new bounded
 backfill operation, which resumes from those checkpoints.
 
-A catalog-wide request selects at most 256 sessions per call. Apply timestamp bounds and continue
-with the returned `next_cursor` (`UPDATED_AT_MS:SESSION_ID`) until `selection_truncated` is false:
+A complete operation selects at most 256 sessions per internal catalog page and continues inside the
+daemon until every page is exhausted, a slice deadline produces an honest incomplete terminal result,
+or cancellation/failure occurs. Users do not pass `next_cursor` for the complete command. The bounded
+single-provider page contract retains its stable `next_cursor` for internal coordination and API
+compatibility.
 
-```sh
-bcode session search-backfill --provider bcode.tantivy-session-search \
-  --after-timestamp-ms 1767225600000 --deadline-ms 30000 --json
-bcode session search-backfill --provider bcode.tantivy-session-search \
-  --cursor UPDATED_AT_MS:SESSION_ID --deadline-ms 30000 --json
-```
-
-Backfill resumes from provider-owned sequence/text checkpoints and reports each selected session's
-indexed-through sequence and canonical tail. Reissuing bounded work is checkpoint-safe; it is not a
+Backfill resumes from provider-owned sequence/text checkpoints and reports aggregate selected,
+complete, incomplete, failed, and page counts per provider. Reissuing bounded work is checkpoint-safe; it is not a
 claim of reconnect-safe or transport-level durable resume. Deadline, incomplete, or failed outcomes
 must be inspected before claiming complete coverage.
 

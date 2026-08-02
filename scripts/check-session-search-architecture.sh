@@ -133,6 +133,21 @@ if rg -n \
   fail "generic plugin infrastructure contains session-search domain semantics"
 fi
 
+# Complete historical traversal must remain an explicit server-owned coordinator over bounded
+# canonical pages. Startup and ordinary query paths must not invoke it, and operation snapshots must
+# not be advertised as reconnect-safe durable resume.
+if ! rg -q 'pub async fn complete_backfill' packages/server/src/session_search.rs \
+  || ! rg -q 'session_summaries_page' packages/server/src/session_search.rs \
+  || rg -n 'complete_backfill' packages/plugin packages/plugin-sdk packages/tui/src \
+    --glob '*.rs' >/tmp/bcode-session-search-complete-backfill-boundary.txt; then
+  cat /tmp/bcode-session-search-complete-backfill-boundary.txt 2>/dev/null >&2 || true
+  fail "complete backfill must remain explicit server-owned bounded coordination"
+fi
+if ! rg -q 'does not promise durable or reconnect-safe resume' \
+  packages/session-search/src/lib.rs; then
+  fail "backfill operation revisions must explicitly reject durable-resume semantics"
+fi
+
 # Large-output implementation remains evidence-gated. The transcript provider must fail closed when
 # configured for shell/tool output; synthetic data must not silently select the backend.
 if ! rg -q 'large shell/tool output is not supported by the transcript provider' \
