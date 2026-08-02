@@ -93,7 +93,7 @@ resume semantics.
 Dynamic adapters implement `bcode.tui-visual-adapter/v1` using the portable models in
 `bcode_plugin_sdk::tui_visual`. Requests and responses are serialized; no `bmux_tui` value or Rust
 trait object crosses the plugin ABI. Rendering executes outside frame drawing with a bounded queue,
-500 ms cancellation-propagating deadline, bounded response rows/spans/text, and a 512-entry cache
+2 s cancellation-propagating deadline, bounded response rows/spans/text, and a 512-entry cache
 keyed by exact adapter, invocation, schema/version, semantic presentation revision, and width.
 Artifact chunks use the same bounded service and invalidate only the affected invocation. The TUI
 converts validated rows/styles and retains ownership of layout, lifecycle/timing chrome, viewport,

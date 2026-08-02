@@ -2657,6 +2657,7 @@ dependencies = [
  "bcode_config",
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
+ "bcode_hello_plugin",
  "bcode_ipc",
  "bcode_loop_plugin",
  "bcode_markdown_render",

@@ -3605,6 +3605,63 @@ mod scheduler_tests {
         }
     }
 
+    #[tokio::test]
+    async fn config_reload_replaces_adapter_state_and_applies_disabled_route() {
+        let static_plugins = vec![bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        )];
+        let extensions = vec![bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+            "bcode.shell",
+            bcode_shell_plugin::shell_tui_registry,
+        )];
+        let initial = super::super::plugin_tui::load_default_presentation_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            &static_plugins,
+            &extensions,
+        )
+        .expect("initial shell presentation");
+        initial.bump_visual_revision_for_test("call-active");
+
+        let mut chat = test_chat();
+        chat.app.set_plugin_presentation(Arc::new(initial));
+        assert_eq!(
+            chat.app
+                .plugin_presentation()
+                .expect("initial presentation")
+                .visual_revision("call-active"),
+            1
+        );
+        let mut settings =
+            TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &static_plugins);
+        settings.tui_extensions = extensions;
+        let mut loop_state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            false,
+        );
+        let mut config = bcode_config::BcodeConfig::default();
+        config
+            .tui
+            .visual_adapters
+            .disabled
+            .insert("bcode.shell/shell-run-request-card".to_owned());
+
+        apply_config_result(&mut settings, &mut chat, &mut loop_state, Ok(config));
+
+        let reloaded = chat
+            .app
+            .plugin_presentation()
+            .expect("reloaded presentation");
+        assert_eq!(reloaded.visual_revision("call-active"), 0);
+        assert!(
+            reloaded
+                .visual_route("bcode.tool.request.shell.run", 1, Some("bcode.shell"))
+                .is_none()
+        );
+    }
+
     #[test]
     fn explicit_reasoning_completion_preserves_newer_pending_generation() {
         let mut chat = test_chat();

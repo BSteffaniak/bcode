@@ -12,6 +12,44 @@ pub struct HelloPlugin {
     event_count: usize,
 }
 
+fn render_shell_visual(context: &NativeServiceContext) -> Option<ServiceResponse> {
+    if context.request.interface_id != bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_INTERFACE_ID
+        || context.request.operation != bcode_plugin_sdk::tui_visual::OP_RENDER_TUI_VISUAL
+    {
+        return None;
+    }
+    let request = match context
+        .request
+        .payload_json::<bcode_plugin_sdk::tui_visual::RenderTuiVisualRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => {
+            return Some(ServiceResponse::error(
+                "invalid_visual_request",
+                error.to_string(),
+            ));
+        }
+    };
+    Some(
+        ServiceResponse::json(&bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse {
+            version: bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
+            render_mode: "transcript_block".to_owned(),
+            title: Some("Hello user shell".to_owned()),
+            timeout_ms: None,
+            rows: vec![bcode_plugin_sdk::tui_visual::SerializedTuiRow {
+                spans: vec![bcode_plugin_sdk::tui_visual::SerializedTuiSpan {
+                    text: format!("hello dynamic {}", request.invocation_id),
+                    foreground: bcode_plugin_sdk::tui_visual::SerializedTuiColor::LightCyan,
+                    modifiers: vec![bcode_plugin_sdk::tui_visual::SerializedTuiModifier::Bold],
+                }],
+            }],
+        })
+        .unwrap_or_else(|error| {
+            ServiceResponse::error("visual_response_encode_failed", error.to_string())
+        }),
+    )
+}
+
 impl RustPlugin for HelloPlugin {
     fn activate(&mut self) -> Result<(), PluginError> {
         Ok(())
@@ -28,6 +66,9 @@ impl RustPlugin for HelloPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if let Some(response) = render_shell_visual(&context) {
+            return response;
+        }
         if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID
             && context.request.operation == bcode_tool::OP_PREPARE_TOOL
         {

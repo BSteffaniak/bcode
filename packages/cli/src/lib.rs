@@ -11858,7 +11858,7 @@ mod web_command_tests {
             "--tool-status",
             "failed",
             "--provider",
-            "bcode.openai-compatible",
+            "provider.test",
             "--model",
             "gpt-test",
             "--agent",
@@ -11898,7 +11898,7 @@ mod web_command_tests {
                 && working_directory == Path::new("/tmp/project")
                 && tools == ["shell"]
                 && tool_statuses == ["failed"]
-                && providers == ["bcode.openai-compatible"]
+                && providers == ["provider.test"]
                 && models == ["gpt-test"]
                 && agents == ["build"]
                 && import_sources == ["opencode"]

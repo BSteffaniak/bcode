@@ -2577,6 +2577,105 @@ mod tests {
             .push(payload.to_vec());
     }
 
+    fn invoke_tool_with_captured_presentations(
+        tool_call_id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+        workspace_root: &Path,
+    ) -> (
+        ToolInvocationResponse,
+        Vec<bcode_tool::ToolPresentationUpdate>,
+    ) {
+        let updates = Mutex::new(Vec::<Vec<u8>>::new());
+        let prepared_path = arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from);
+        let context = NativeServiceContext {
+            plugin_id: FILESYSTEM_PLUGIN_ID.to_owned(),
+            request: ServiceRequest {
+                interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+                operation: bcode_tool::OP_INVOKE_TOOL.to_owned(),
+                payload: serde_json::to_vec(&ToolInvocationRequest {
+                    tool_call_id: tool_call_id.to_owned(),
+                    name: name.to_owned(),
+                    arguments,
+                    preparation_descriptor: serde_json::to_value(FilesystemPreparationDescriptor {
+                        workspace_root: Some(workspace_root.to_path_buf()),
+                        path: prepared_path,
+                    })
+                    .expect("preparation descriptor"),
+                })
+                .expect("tool request"),
+            },
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            events: ServiceEventEmitter::new(
+                Some(capture_presentation_update),
+                std::ptr::from_ref(&updates).cast_mut().cast(),
+            ),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+            bridge: bcode_plugin_sdk::ServiceBridge::default(),
+            transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+        };
+        let response = invoke_tool(&context);
+        let response = serde_json::from_slice::<ToolInvocationResponse>(&response.payload)
+            .expect("tool response");
+        let updates = updates
+            .lock()
+            .expect("updates")
+            .iter()
+            .map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload)
+                    .expect("presentation update")
+            })
+            .collect();
+        (response, updates)
+    }
+
+    #[test]
+    fn filesystem_write_and_edit_services_replace_request_with_file_change() {
+        let root = temp_dir("service-presentation-chain");
+        let path = root.join("src/lib.rs");
+        for (tool_call_id, name, arguments, expected_old, expected_new) in [
+            (
+                "call-write",
+                "filesystem.write",
+                json!({"path": path, "contents": "before\n"}),
+                "",
+                "before\n",
+            ),
+            (
+                "call-edit",
+                "filesystem.edit",
+                json!({"path": path, "old_text": "before\n", "new_text": "after\n"}),
+                "before\n",
+                "after\n",
+            ),
+        ] {
+            let (response, updates) =
+                invoke_tool_with_captured_presentations(tool_call_id, name, arguments, &root);
+            assert!(!response.is_error, "{}", response.output);
+            assert_eq!(updates.len(), 2);
+            assert_eq!(updates[0].schema, FILESYSTEM_REQUEST_SCHEMA);
+            assert_eq!(updates[0].payload["operation"], name);
+            assert_eq!(updates[1].schema, "bcode.filesystem.change");
+            assert_eq!(updates[1].payload["old_text"], expected_old);
+            assert_eq!(updates[1].payload["new_text"], expected_new);
+            assert!(updates.iter().all(|update| {
+                update.invocation_id == tool_call_id
+                    && update.identity == bcode_tool::ToolPresentationIdentity::Primary
+                    && update.generation == 0
+            }));
+            assert_eq!(
+                updates
+                    .iter()
+                    .map(|update| update.revision)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        }
+    }
+
     #[test]
     fn filesystem_primary_presentation_replaces_request_with_file_change() {
         let updates = Mutex::new(Vec::<Vec<u8>>::new());

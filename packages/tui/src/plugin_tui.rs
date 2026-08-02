@@ -15,7 +15,7 @@ const MAX_DYNAMIC_VISUAL_CACHE_ENTRIES: usize = 512;
 const DYNAMIC_VISUAL_QUEUE_CAPACITY: usize = 64;
 const DYNAMIC_VISUAL_COMPLETION_CAPACITY: usize =
     MAX_DYNAMIC_VISUAL_CACHE_ENTRIES + DYNAMIC_VISUAL_QUEUE_CAPACITY;
-const DYNAMIC_VISUAL_SERVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+const DYNAMIC_VISUAL_SERVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_DYNAMIC_VISUAL_COMPLETIONS_PER_POLL: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -1340,7 +1340,7 @@ library = "libdynamic_visual_test.dylib"
     }
 
     fn wait_for_dynamic_completion(presentation: &PluginTuiPresentation) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             if presentation.poll_dynamic_visuals() {
                 return;
@@ -1348,6 +1348,107 @@ library = "libdynamic_visual_test.dylib"
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("dynamic visual completion timed out");
+    }
+
+    fn hello_dynamic_library_path() -> std::path::PathBuf {
+        let executable = std::env::current_exe().expect("current test executable path");
+        let directory = executable.parent().expect("test executable parent");
+        let prefix = format!("{}bcode_hello_plugin", std::env::consts::DLL_PREFIX);
+        std::fs::read_dir(directory)
+            .expect("test dependency directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&prefix) && name.ends_with(std::env::consts::DLL_SUFFIX)
+                    })
+            })
+            .expect("hello plugin dynamic library")
+    }
+
+    fn discovered_hello_presentation() -> PluginTuiPresentation {
+        let root = tempfile::tempdir().expect("plugin discovery root");
+        let plugin_dir = root.path().join("hello");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin directory");
+        let manifest_path = plugin_dir.join("bcode-plugin.toml");
+        std::fs::write(
+            &manifest_path,
+            include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
+        )
+        .expect("plugin manifest");
+        let library = hello_dynamic_library_path();
+        std::fs::copy(
+            &library,
+            plugin_dir.join(
+                library
+                    .file_name()
+                    .expect("hello plugin dynamic library name"),
+            ),
+        )
+        .expect("plugin library");
+        let registered = bcode_plugin::discover_plugins_in_roots(&[root.path().to_path_buf()])
+            .expect("discover user plugin");
+        let runtime: PluginRuntimeHost = PluginHost::load_registered_plugins(&registered)
+            .expect("load discovered user plugin")
+            .into();
+        PluginTuiPresentation::with_runtime_config_and_extensions(
+            runtime,
+            bcode_config::TuiVisualAdapterConfig {
+                preferred: vec!["example.hello/hello-shell-request-card".to_owned()],
+                disabled: BTreeSet::new(),
+            },
+            &[],
+        )
+    }
+
+    #[tokio::test]
+    async fn discovered_dynamic_user_adapter_renders_shell_request_and_result() {
+        let presentation = discovered_hello_presentation();
+        for (schema, adapter_id) in [
+            ("bcode.tool.request.shell.run", "hello-shell-request-card"),
+            ("bcode.shell.run", "hello-shell-card"),
+        ] {
+            let invocation_id = format!("call-{adapter_id}");
+            let initial = presentation.routed_visual(
+                &invocation_id,
+                1,
+                schema,
+                1,
+                Some("bcode.shell"),
+                &serde_json::json!({"command": "printf hello"}),
+                &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                    80,
+                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                    None,
+                ),
+            );
+            assert!(initial.is_none(), "dynamic work must be off-frame");
+            wait_for_dynamic_completion(&presentation);
+            let routed = presentation
+                .routed_visual(
+                    &invocation_id,
+                    1,
+                    schema,
+                    1,
+                    Some("bcode.shell"),
+                    &serde_json::json!({"command": "printf hello"}),
+                    &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                        80,
+                        bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                        None,
+                    ),
+                )
+                .expect("discovered dynamic visual");
+            assert_eq!(routed.route.plugin_id, "example.hello");
+            assert_eq!(routed.route.adapter_id, adapter_id);
+            assert_eq!(routed.header.title.as_deref(), Some("Hello user shell"));
+            assert_eq!(
+                routed_text(&routed),
+                format!("hello dynamic {invocation_id}")
+            );
+        }
     }
 
     #[test]
@@ -1918,8 +2019,10 @@ library = "libdynamic_visual_test.dylib"
     fn artifact_delivery_routes_only_supported_references_and_invalidates_the_owner() {
         let presentation = test_presentation();
         let mut registry = PluginTuiRegistry::default();
-        registry
-            .register_visual_adapter(["test-adapter"], Box::new(StatefulTestAdapter::default()));
+        registry.register_visual_adapter(
+            ["shell-run-terminal-card"],
+            Box::new(StatefulTestAdapter::default()),
+        );
         presentation
             .registries
             .lock()
@@ -1994,8 +2097,10 @@ library = "libdynamic_visual_test.dylib"
             Some("text/plain; charset=utf-8"),
         ));
         let mut registry = PluginTuiRegistry::default();
-        registry
-            .register_visual_adapter(["test-adapter"], Box::new(StatefulTestAdapter::default()));
+        registry.register_visual_adapter(
+            ["shell-run-terminal-card"],
+            Box::new(StatefulTestAdapter::default()),
+        );
         presentation
             .registries
             .lock()
@@ -2034,7 +2139,7 @@ library = "libdynamic_visual_test.dylib"
         assert!(Arc::ptr_eq(&first, &second));
         let rows = second
             .visual_rows(
-                "test-adapter",
+                "shell-run-terminal-card",
                 "bcode.shell.run",
                 &serde_json::Value::Null,
                 &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(

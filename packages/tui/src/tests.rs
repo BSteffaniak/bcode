@@ -5268,7 +5268,9 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
         1
     );
     assert_eq!(
-        final_text.matches("File change · duration").count(),
+        final_text
+            .matches("Tool result · filesystem.write · ok")
+            .count(),
         1,
         "{final_text}"
     );

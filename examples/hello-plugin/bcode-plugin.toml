@@ -7,6 +7,33 @@ description  = "Echo service used by smoke tests"
 interface_id = "example-hello/v1"
 name         = "Hello Echo"
 
+[[services]]
+description  = "Serialized visual adapter used by dynamic extension tests"
+interface_id = "bcode.tui-visual-adapter/v1"
+name         = "Hello TUI Visual Adapter"
+
+[[visual_adapters]]
+artifact_schema      = "bcode.tool.request.shell.run"
+id                   = "hello-shell-request-card"
+max_schema_version   = 1
+min_schema_version   = 1
+priority             = 1000
+producer_default     = false
+render_mode          = "transcript_block"
+service_interface_id = "bcode.tui-visual-adapter/v1"
+surfaces             = ["tui"]
+
+[[visual_adapters]]
+artifact_schema      = "bcode.shell.run"
+id                   = "hello-shell-card"
+max_schema_version   = 1
+min_schema_version   = 1
+priority             = 1000
+producer_default     = false
+render_mode          = "transcript_block"
+service_interface_id = "bcode.tui-visual-adapter/v1"
+surfaces             = ["tui"]
+
 [[event_subscriptions]]
 topic = "example.event"
 
