@@ -575,6 +575,25 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
     } else if let Some(tool_call) = tool_call {
         dispatch_fake_tool_turn(turn, tool_call, fake_tool_delta_delay(request));
     } else {
+        let text = if request
+            .provider_context
+            .settings
+            .get("fake_echo_reasoning_effort")
+            .is_some_and(|value| value == "true")
+        {
+            text.map(|text| {
+                format!(
+                    "{text} [reasoning_effort={}]",
+                    request
+                        .parameters
+                        .reasoning_effort_value
+                        .as_deref()
+                        .unwrap_or("provider_default")
+                )
+            })
+        } else {
+            text
+        };
         finish_fake_text_response(
             turn,
             text,
@@ -1540,10 +1559,15 @@ fn fake_feature_support() -> bcode_model::ModelFeatureSupport {
         ]
         .into_iter()
         .map(|key| {
-            (
+            let support = if matches!(
                 key,
-                unsupported("fake provider accepts no model parameters"),
-            )
+                ModelParameterKey::ReasoningEffortValue | ModelParameterKey::ReasoningSummary
+            ) {
+                supported()
+            } else {
+                unsupported("fake provider accepts no model parameters")
+            };
+            (key, support)
         })
         .collect(),
         structured_output: [
