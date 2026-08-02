@@ -18,143 +18,6 @@ use bmux_tui::prelude::Line;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
 
-/// Versioned service interface for renderer-native TUI visual extensions.
-pub const TUI_VISUAL_ADAPTER_INTERFACE_ID: &str = "bcode.tui-visual-adapter/v1";
-/// Render one bounded visual through a serialized TUI extension.
-pub const OP_RENDER_TUI_VISUAL: &str = "render";
-/// Deliver one bounded artifact chunk through a serialized TUI extension.
-pub const OP_DELIVER_TUI_VISUAL_ARTIFACT: &str = "artifact_chunk";
-/// Current serialized TUI visual extension contract version.
-pub const TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 1;
-/// Maximum rows accepted from one serialized visual response.
-pub const MAX_SERIALIZED_TUI_VISUAL_ROWS: usize = 256;
-/// Maximum spans accepted across one serialized visual response.
-pub const MAX_SERIALIZED_TUI_VISUAL_SPANS: usize = 2_048;
-/// Maximum UTF-8 bytes accepted across one serialized visual response.
-pub const MAX_SERIALIZED_TUI_VISUAL_TEXT_BYTES: usize = 256 * 1024;
-
-/// Stable terminal color token exposed by the serialized TUI extension contract.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SerializedTuiColor {
-    #[default]
-    Reset,
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    Gray,
-    DarkGray,
-    LightRed,
-    LightGreen,
-    LightYellow,
-    LightBlue,
-    LightMagenta,
-    LightCyan,
-    White,
-}
-
-/// Stable text modifier token exposed by the serialized TUI extension contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SerializedTuiModifier {
-    Bold,
-    Dim,
-    Italic,
-    Underlined,
-}
-
-/// One bounded styled text span returned by a serialized TUI extension.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SerializedTuiSpan {
-    pub text: String,
-    #[serde(default)]
-    pub foreground: SerializedTuiColor,
-    #[serde(default)]
-    pub modifiers: Vec<SerializedTuiModifier>,
-}
-
-/// One bounded terminal row returned by a serialized TUI extension.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SerializedTuiRow {
-    pub spans: Vec<SerializedTuiSpan>,
-}
-
-/// Renderer-owned context supplied to a serialized TUI extension.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SerializedTuiVisualContext {
-    pub width: u16,
-    pub diff_layout: String,
-    pub working_directory: Option<PathBuf>,
-}
-
-/// Request to render one exact manifest adapter through a dynamic plugin service.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RenderTuiVisualRequest {
-    pub version: u32,
-    pub adapter_id: String,
-    pub invocation_id: String,
-    pub schema: String,
-    pub schema_version: u32,
-    pub payload: serde_json::Value,
-    pub context: SerializedTuiVisualContext,
-}
-
-/// Successful serialized TUI extension response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RenderTuiVisualResponse {
-    pub version: u32,
-    #[serde(default)]
-    pub render_mode: String,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub timeout_ms: Option<u64>,
-    pub rows: Vec<SerializedTuiRow>,
-}
-
-impl RenderTuiVisualResponse {
-    /// Validate response bounds before renderer conversion.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for unsupported versions, invalid render modes, or excessive rows, spans,
-    /// or text bytes.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.version != TUI_VISUAL_ADAPTER_CONTRACT_VERSION {
-            return Err(format!(
-                "unsupported TUI visual response version {}",
-                self.version
-            ));
-        }
-        if !matches!(
-            self.render_mode.as_str(),
-            "" | "inline" | "transcript_block" | "full_block"
-        ) {
-            return Err("unsupported TUI visual render mode".to_owned());
-        }
-        if self.rows.len() > MAX_SERIALIZED_TUI_VISUAL_ROWS {
-            return Err("serialized TUI visual row limit exceeded".to_owned());
-        }
-        let span_count = self.rows.iter().map(|row| row.spans.len()).sum::<usize>();
-        let text_bytes = self
-            .rows
-            .iter()
-            .flat_map(|row| &row.spans)
-            .map(|span| span.text.len())
-            .sum::<usize>();
-        if span_count > MAX_SERIALIZED_TUI_VISUAL_SPANS
-            || text_bytes > MAX_SERIALIZED_TUI_VISUAL_TEXT_BYTES
-        {
-            return Err("serialized TUI visual content limit exceeded".to_owned());
-        }
-        Ok(())
-    }
-}
-
 /// Boxed error returned by native TUI plugin surface factories.
 pub type PluginTuiError = Box<dyn Error + Send + Sync>;
 
@@ -647,50 +510,6 @@ impl PluginTuiVisualRenderContext {
     }
 }
 
-/// Artifact update delivered to one exact serialized TUI adapter.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SerializedTuiArtifactChunkRequest {
-    pub version: u32,
-    pub adapter_id: String,
-    pub chunk: SerializedTuiArtifactChunk,
-}
-
-/// Portable bounded artifact bytes for a serialized TUI adapter service.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SerializedTuiArtifactChunk {
-    pub tool_call_id: String,
-    pub artifact_id: String,
-    pub reference_key: String,
-    pub producer_plugin_id: String,
-    pub schema: String,
-    pub schema_version: u32,
-    pub content_type: Option<String>,
-    pub offset: u64,
-    pub total_bytes: u64,
-    pub revision: u64,
-    pub finalized: bool,
-    pub bytes: Vec<u8>,
-}
-
-impl From<&PluginTuiArtifactChunk> for SerializedTuiArtifactChunk {
-    fn from(chunk: &PluginTuiArtifactChunk) -> Self {
-        Self {
-            tool_call_id: chunk.tool_call_id.clone(),
-            artifact_id: chunk.artifact_id.clone(),
-            reference_key: chunk.reference_key.clone(),
-            producer_plugin_id: chunk.producer_plugin_id.clone(),
-            schema: chunk.schema.clone(),
-            schema_version: chunk.schema_version,
-            content_type: chunk.content_type.clone(),
-            offset: chunk.offset,
-            total_bytes: chunk.total_bytes,
-            revision: chunk.revision,
-            finalized: chunk.finalized,
-            bytes: chunk.bytes.clone(),
-        }
-    }
-}
-
 /// Opaque bounded artifact bytes delivered asynchronously to a plugin-owned visual adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginTuiArtifactChunk {
@@ -997,6 +816,54 @@ pub trait PluginTuiSurfaceFactory: Send + Sync {
     ///
     /// Returns an error when the requested surface cannot be opened.
     fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture;
+}
+
+/// Factory for one statically linked plugin TUI registry.
+pub type PluginTuiRegistryFactory = fn() -> PluginTuiRegistry;
+
+/// Distribution-provided static TUI extension registration.
+#[derive(Clone, Copy)]
+pub struct StaticPluginTuiExtension {
+    plugin_id: &'static str,
+    registry_factory: PluginTuiRegistryFactory,
+}
+
+impl std::fmt::Debug for StaticPluginTuiExtension {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StaticPluginTuiExtension")
+            .field("plugin_id", &self.plugin_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StaticPluginTuiExtension {
+    /// Register one static plugin's native TUI extension factory.
+    #[must_use]
+    pub const fn new(plugin_id: &'static str, registry_factory: PluginTuiRegistryFactory) -> Self {
+        Self {
+            plugin_id,
+            registry_factory,
+        }
+    }
+
+    /// Return the owning plugin ID.
+    #[must_use]
+    pub const fn plugin_id(self) -> &'static str {
+        self.plugin_id
+    }
+
+    /// Return the native TUI registry factory.
+    #[must_use]
+    pub const fn registry_factory(self) -> PluginTuiRegistryFactory {
+        self.registry_factory
+    }
+
+    /// Construct an independent native TUI registry.
+    #[must_use]
+    pub fn registry(self) -> PluginTuiRegistry {
+        (self.registry_factory)()
+    }
 }
 
 /// Registry of native TUI surfaces contributed by one plugin.

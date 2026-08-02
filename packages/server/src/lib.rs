@@ -45939,6 +45939,12 @@ library = "test"
         .await
         .expect("permission request");
 
+        let expected_cwd = std::fs::canonicalize(workspace.path())
+            .expect("canonical shell workspace")
+            .display()
+            .to_string();
+        let mut saw_complete_request = false;
+        let mut request_generation = None;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let bcode_ipc::Event::SessionLive(event) =
@@ -45951,12 +45957,30 @@ library = "test"
                 else {
                     continue;
                 };
+                if update.invocation_id != "shell-live-ipc-call"
+                    || update.producer_id != "bcode.shell"
+                {
+                    continue;
+                }
+                if update.schema == "bcode.tool.request.shell.run" {
+                    assert_eq!(update.payload["command"], command);
+                    assert_eq!(update.payload["cwd"], expected_cwd);
+                    assert_eq!(update.payload["timeout_ms"], 5_000);
+                    request_generation = Some(update.generation);
+                    saw_complete_request = true;
+                    continue;
+                }
                 let Some(artifact) = update.artifact else {
                     continue;
                 };
-                if update.producer_id != "bcode.shell" || artifact.finalized {
+                if update.schema != "bcode.shell.run" || artifact.finalized {
                     continue;
                 }
+                assert!(saw_complete_request, "recording preceded complete request");
+                assert_eq!(Some(update.generation), request_generation);
+                assert_eq!(update.payload["arguments"]["command"], command);
+                assert_eq!(update.payload["arguments"]["cwd"], expected_cwd);
+                assert_eq!(update.payload["timeout_ms"], 5_000);
                 let range = client
                     .session_artifact_range(
                         session_id,

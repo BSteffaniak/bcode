@@ -132,6 +132,7 @@ async fn run_event_loop_with_input_and_static_bundled<W: Write>(
         &plugin_selection,
         visual_adapter_config,
         static_plugins,
+        &super::bundled_tui_extensions(),
     ) {
         Ok(presentation) => app.set_plugin_presentation(Arc::new(presentation)),
         Err(error) => app.set_status(format!("plugin presentation unavailable: {error}")),

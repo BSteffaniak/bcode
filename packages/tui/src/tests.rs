@@ -2139,7 +2139,7 @@ async fn async_session_open_initial_state_preserves_plugin_host() {
         super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24)),
     );
 
-    assert!(chat.app.plugin_host().is_some());
+    assert!(chat.app.has_plugin_backend());
 }
 
 #[tokio::test]
@@ -2181,7 +2181,7 @@ async fn async_session_open_completion_preserves_plugin_host() {
         )),
     );
 
-    assert!(chat.app.plugin_host().is_some());
+    assert!(chat.app.has_plugin_backend());
 }
 
 #[test]
@@ -2203,7 +2203,7 @@ fn switch_to_draft_session_preserves_plugin_host() {
 
     super::session_flow::switch_to_draft_session(&mut chat);
 
-    assert!(chat.app.plugin_host().is_some());
+    assert!(chat.app.has_plugin_backend());
 }
 
 #[tokio::test]

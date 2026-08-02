@@ -271,6 +271,8 @@ exit_status = None
 exit_requested = False
 shell_request_sent = False
 shell_permission_responsive = False
+shell_command_visible = False
+shell_cwd_visible = False
 filesystem_request_sent = False
 filesystem_edit_request_sent = False
 live_output_before_finish = False
@@ -357,7 +359,7 @@ while time.monotonic() < deadline:
         ):
             os.write(
                 fd,
-                b"tool-shell echo FRESHLIVEOUTPUT; sleep 4; echo FRESHFINALOUTPUT\r",
+                b"tool-shell pwd; echo FRESHLIVEOUTPUT; sleep 4; echo FRESHFINALOUTPUT\r",
             )
             shell_request_sent = True
         if shell_request_sent and not shell_permission_responsive and b"approve once" in screen.lower():
@@ -371,6 +373,10 @@ while time.monotonic() < deadline:
             )
             if running_shell and b"timeout 30.0s" in screen.lower():
                 running_timeout_visible = True
+            if b"pwd; echo FRESHLIVEOUTPUT" in screen:
+                shell_command_visible = True
+            if " . ❯".encode() in screen or b"bcode-smoke." in screen:
+                shell_cwd_visible = True
             output_lines = {
                 line.strip()
                 for line in screen.splitlines()
@@ -668,6 +674,8 @@ checks = {
     "shell request sent": shell_request_sent,
     "permission dialog responsive during workflow": shell_permission_responsive,
     "live output visible before command completion": live_output_before_finish,
+    "shell command remains visible while running": shell_command_visible,
+    "shell cwd remains visible while running": shell_cwd_visible,
     "running shell shows effective timeout": running_timeout_visible,
     "raw argument JSON never visible": not raw_argument_json_visible,
     "final output did not precede live output": not final_seen_before_live,

@@ -1192,12 +1192,12 @@ if rg -n 'tool_name\.(as_deref|as_str)\(\)\s*==|match\s+[^\n]*tool_name|tool\.to
   violations=1
 fi
 
-if ! grep -F 'fn select_visual_adapter' packages/plugin/src/lib.rs >/dev/null ||
+if ! grep -F 'fn select_visual_adapters' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F 'adapter.supports(schema, schema_version, surface)' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F 'adapter.priority' packages/plugin/src/lib.rs >/dev/null ||
-   ! grep -F '.visual_adapter(schema, schema_version, "tui", producer)' packages/tui/src/plugin_tui.rs >/dev/null ||
-   ! grep -F "BTreeMap<(&'static str, u32), VisualAdapter>" packages/hyperchad/ui/src/pages/home/adapters.rs >/dev/null ||
-   ! grep -F 'unknown_contribution_uses_terminal_generic_json_fallback' packages/tui/src/app.rs >/dev/null ||
+   ! grep -F 'pub fn visual_routes(' packages/tui/src/plugin_tui.rs >/dev/null ||
+   ! grep -F 'pub fn routed_visual(' packages/tui/src/plugin_tui.rs >/dev/null ||
+   ! grep -F 'every_producer_family_renders_canonical_lifecycle_fallback_in_tui' packages/tui/src/render.rs >/dev/null ||
    ! grep -F 'unknown_contribution_has_no_raw_hyperchad_fallback' packages/hyperchad/ui/src/pages/home/tests.rs >/dev/null; then
   echo "Runtime architecture violation: platform-owned schema/version renderer selection or generic fallback coverage was removed." >&2
   violations=1

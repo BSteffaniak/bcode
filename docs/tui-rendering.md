@@ -64,6 +64,45 @@ shutdown, and resident eviction invalidate pending generations. The cache retain
 projection per resident item, so neither streaming revision count nor terminal resize history grows
 retained state.
 
+## Plugin visual adapters
+
+The TUI resolves plugin visuals by stable `<plugin-id>/<adapter-id>` references. Configure explicit
+selection under `[tui.visual_adapters]`:
+
+```toml
+[tui.visual_adapters]
+preferred = ["example.shell/shell-card", "bcode.shell/shell-run-terminal-card"]
+disabled = ["example.experimental/unstable-card"]
+```
+
+`preferred` is descending user preference. Compatible entries listed there precede unlisted
+candidates. Remaining order is manifest priority, producer-default preference, then deterministic
+plugin and adapter IDs. `disabled` removes an adapter before availability checks. Missing,
+malformed, failed, or timed-out adapters advance to the next compatible candidate; the bounded
+canonical tool fallback remains last.
+
+Reloading composed configuration rebuilds the TUI presentation host. Adapter order, disabled state,
+and plugin enablement therefore apply at the supported config reload boundary, and old adapter
+registries, caches, artifact state, and pending dynamic work are disposed together. Active
+invocations render through the rebuilt candidate hierarchy and may temporarily use a later adapter
+or canonical fallback while dynamic output is recomputed. Replacing the bytes of an already loaded
+native dynamic library is not hot-swapping: restart Bcode to load a new library artifact. This
+reload behavior transfers current semantic state; it does not claim durable adapter replay or
+resume semantics.
+
+Dynamic adapters implement `bcode.tui-visual-adapter/v1` using the portable models in
+`bcode_plugin_sdk::tui_visual`. Requests and responses are serialized; no `bmux_tui` value or Rust
+trait object crosses the plugin ABI. Rendering executes outside frame drawing with a bounded queue,
+500 ms cancellation-propagating deadline, bounded response rows/spans/text, and a 512-entry cache
+keyed by exact adapter, invocation, schema/version, semantic presentation revision, and width.
+Artifact chunks use the same bounded service and invalidate only the affected invocation. The TUI
+converts validated rows/styles and retains ownership of layout, lifecycle/timing chrome, viewport,
+hit testing, and terminal paint.
+
+Current visual adapters require rows, basic text styles, transcript title/timeout hints, render mode,
+and artifact chunks. Interactive actions remain on the existing typed interaction/surface contracts;
+the serialized visual contract intentionally does not generalize into an interactive surface ABI.
+
 ## Draw cadence
 `[tui.render]` controls terminal draw cadence.
 

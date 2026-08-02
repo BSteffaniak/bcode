@@ -1721,19 +1721,19 @@ fn push_transcript_item_rows(
             active: _,
             status,
         } => {
-            let request_visual = plugin_host
-                .and_then(|presentation| presentation.host().tool_presentation(tool_name))
+            let canonical_request_visual = plugin_host
+                .and_then(|presentation| presentation.tool_presentation(tool_name))
                 .and_then(|(_, declaration)| {
                     CanonicalToolVisual::from_request(
                         tool_call_id,
                         producer_plugin_id.as_deref(),
                         tool_name,
-                        declaration.request_schema.clone(),
-                        declaration.request_schema_version,
+                        declaration.effective_request_schema().to_owned(),
+                        declaration.effective_request_schema_version(),
                         item.text(),
                     )
                 });
-            if request_visual.as_ref().is_some_and(|visual| {
+            if canonical_request_visual.as_ref().is_some_and(|visual| {
                 push_canonical_tool_visual_rows(
                     rows,
                     visual,
@@ -1883,54 +1883,44 @@ fn push_transcript_item_rows(
             };
             let visual = CanonicalToolVisual::from_artifact(&artifact);
             let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
-            if canonical_plugin_visual_available(&visual, plugin_host) {
-                match canonical_plugin_visual_render_mode(plugin_visual, plugin_host) {
-                    Some(PluginTuiVisualRenderMode::FullBlock) => {
-                        if !push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host)
-                        {
-                            push_tool_invocation_fallback_rows(
-                                rows,
-                                invocation.as_deref(),
-                                item,
-                                width,
-                            );
-                        }
+            let working_directory = invocation
+                .as_deref()
+                .and_then(|invocation| invocation.working_directory.as_deref());
+            if let Some(routed) = resolve_canonical_plugin_visual(
+                plugin_visual,
+                working_directory,
+                width,
+                plugin_host,
+            ) {
+                match routed.render_mode {
+                    PluginTuiVisualRenderMode::FullBlock => {
+                        rows.extend(routed.rows);
                         rows.push(Line::default());
                     }
-                    Some(PluginTuiVisualRenderMode::TranscriptBlock) => {
-                        let header = canonical_plugin_visual_header(plugin_visual, plugin_host)
-                            .unwrap_or_default();
+                    PluginTuiVisualRenderMode::TranscriptBlock => {
                         let mut timing = item.tool_timing();
-                        if let Some(timeout_ms) = header.timeout_ms {
+                        if let Some(timeout_ms) = routed.header.timeout_ms {
                             timing.get_or_insert_default().timeout_ms = Some(timeout_ms);
                         }
-                        if !push_plugin_transcript_block_rows(
+                        push_tool_block_header(
                             rows,
-                            PluginTranscriptBlockContext {
-                                title: header.title.as_deref().unwrap_or("Tool contribution"),
-                                visual: plugin_visual,
-                                working_directory: invocation
-                                    .as_deref()
-                                    .and_then(|invocation| invocation.working_directory.as_deref()),
-                                plugin_host,
-                                streaming: item.streaming(),
-                                is_error: invocation
-                                    .as_deref()
-                                    .and_then(|invocation| invocation.is_error)
-                                    .unwrap_or(false),
-                                timing,
-                            },
+                            routed
+                                .header
+                                .title
+                                .as_deref()
+                                .unwrap_or("Tool contribution"),
+                            timing,
+                            item.streaming(),
+                            invocation
+                                .as_deref()
+                                .and_then(|invocation| invocation.is_error)
+                                .unwrap_or(false),
                             width,
-                        ) {
-                            push_tool_invocation_fallback_rows(
-                                rows,
-                                invocation.as_deref(),
-                                item,
-                                width,
-                            );
-                        }
+                        );
+                        rows.extend(routed.rows);
+                        rows.push(Line::default());
                     }
-                    Some(PluginTuiVisualRenderMode::Inline) | None => {
+                    PluginTuiVisualRenderMode::Inline => {
                         push_tool_block_header(
                             rows,
                             "Tool contribution",
@@ -1939,15 +1929,7 @@ fn push_transcript_item_rows(
                             false,
                             width,
                         );
-                        if !push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host)
-                        {
-                            push_tool_invocation_fallback_rows(
-                                rows,
-                                invocation.as_deref(),
-                                item,
-                                width,
-                            );
-                        }
+                        rows.extend(routed.rows);
                         rows.push(Line::default());
                     }
                 }
@@ -2894,42 +2876,6 @@ fn push_tool_request_rows(
     rows.push(Line::default());
 }
 
-fn canonical_plugin_visual_render_mode(
-    visual: &CanonicalPluginVisual,
-    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
-) -> Option<PluginTuiVisualRenderMode> {
-    let presentation = plugin_host?;
-    let route = presentation.visual_route(
-        &visual.schema,
-        visual.schema_version,
-        visual.producer_plugin_id.as_deref(),
-    )?;
-    Some(match route.render_mode {
-        bcode_plugin::PluginVisualAdapterRenderMode::Inline => PluginTuiVisualRenderMode::Inline,
-        bcode_plugin::PluginVisualAdapterRenderMode::TranscriptBlock => {
-            PluginTuiVisualRenderMode::TranscriptBlock
-        }
-        bcode_plugin::PluginVisualAdapterRenderMode::FullBlock => {
-            PluginTuiVisualRenderMode::FullBlock
-        }
-    })
-}
-
-fn canonical_plugin_visual_header(
-    visual: &CanonicalPluginVisual,
-    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
-) -> Option<bcode_plugin_sdk::tui::PluginTuiTranscriptHeader> {
-    let presentation = plugin_host?;
-    let route = presentation.visual_route(
-        &visual.schema,
-        visual.schema_version,
-        visual.producer_plugin_id.as_deref(),
-    )?;
-    presentation
-        .registry(&route.plugin_id)?
-        .visual_transcript_header(&route.adapter_id, &route.schema, &visual.payload)
-}
-
 fn canonical_plugin_visual_available(
     visual: &CanonicalToolVisual,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
@@ -2945,6 +2891,27 @@ fn canonical_plugin_visual_available(
             plugin_visual.producer_plugin_id.as_deref(),
         )
         .is_some()
+}
+
+fn resolve_canonical_plugin_visual(
+    visual: &CanonicalPluginVisual,
+    working_directory: Option<&std::path::Path>,
+    width: u16,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+) -> Option<crate::plugin_tui::RoutedTuiVisual> {
+    let presentation = plugin_host?;
+    presentation.routed_visual(
+        visual
+            .invocation_id
+            .as_deref()
+            .unwrap_or("unknown-invocation"),
+        visual.revision,
+        &visual.schema,
+        visual.schema_version,
+        visual.producer_plugin_id.as_deref(),
+        &visual.payload,
+        &plugin_visual_context(width, working_directory),
+    )
 }
 
 fn push_canonical_tool_visual_rows(
@@ -2968,20 +2935,8 @@ fn push_canonical_plugin_visual_rows(
     let Some(presentation) = plugin_host else {
         return false;
     };
-    let producer = visual.producer_plugin_id.as_deref();
     let visual_started = Instant::now();
-    let routed = presentation.routed_visual(
-        visual
-            .invocation_id
-            .as_deref()
-            .unwrap_or("unknown-invocation"),
-        visual.revision,
-        &visual.schema,
-        visual.schema_version,
-        producer,
-        &visual.payload,
-        &plugin_visual_context(width, working_directory),
-    );
+    let routed = resolve_canonical_plugin_visual(visual, working_directory, width, plugin_host);
     if let Some(routed) = &routed {
         presentation.record_visual_timing(
             "render_rows",
@@ -2993,45 +2948,6 @@ fn push_canonical_plugin_visual_rows(
         return true;
     }
     false
-}
-
-#[derive(Clone, Copy)]
-struct PluginTranscriptBlockContext<'a> {
-    title: &'a str,
-    visual: &'a CanonicalPluginVisual,
-    working_directory: Option<&'a std::path::Path>,
-    plugin_host: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
-    streaming: bool,
-    is_error: bool,
-    timing: Option<ToolTiming>,
-}
-
-fn push_plugin_transcript_block_rows(
-    rows: &mut Vec<Line>,
-    context: PluginTranscriptBlockContext<'_>,
-    width: u16,
-) -> bool {
-    let mut visual_rows = Vec::new();
-    if !push_canonical_plugin_visual_rows(
-        &mut visual_rows,
-        context.visual,
-        context.working_directory,
-        width,
-        context.plugin_host,
-    ) {
-        return false;
-    }
-    push_tool_block_header(
-        rows,
-        context.title,
-        context.timing,
-        context.streaming,
-        context.is_error,
-        width,
-    );
-    rows.extend(visual_rows);
-    rows.push(Line::default());
-    true
 }
 
 fn push_tool_block_header(
@@ -3135,13 +3051,9 @@ fn push_tool_invocation_fallback_rows(
         width,
     );
     if let Some(arguments) = invocation.arguments_json.as_deref() {
-        push_labeled_text_preview(
-            rows,
-            "arguments",
-            &bounded_tool_arguments(arguments),
-            width,
-            MAX_INLINE_TOOL_TEXT_ROWS,
-        );
+        for (label, value) in bounded_tool_argument_fields(arguments) {
+            push_labeled_text_preview(rows, &label, &value, width, 2);
+        }
     }
     match invocation.result.as_ref() {
         Some(bcode_session_view_models::ToolResultView::Text { text }) => {
@@ -3206,6 +3118,7 @@ struct ToolResultRenderContext<'a> {
     has_file_preview: bool,
 }
 
+#[allow(clippy::too_many_lines)] // Composition branches preserve distinct host-owned tool chrome.
 fn push_tool_result_rows(
     rows: &mut Vec<Line>,
     item: &TranscriptItem,
@@ -3215,37 +3128,57 @@ fn push_tool_result_rows(
 ) {
     if let Some(artifact) = context.artifact {
         let visual = CanonicalToolVisual::from_artifact(artifact);
-        if let CanonicalToolVisual::Plugin(plugin_visual) = &visual
-            && canonical_plugin_visual_render_mode(plugin_visual, plugin_host)
-                == Some(PluginTuiVisualRenderMode::FullBlock)
-            && push_canonical_tool_visual_rows(
-                rows,
-                &visual,
-                context.working_directory,
-                width,
-                plugin_host,
-            )
-        {
-            rows.push(Line::default());
-            return;
-        }
-        if let CanonicalToolVisual::Plugin(plugin_visual) = &visual
-            && canonical_plugin_visual_render_mode(plugin_visual, plugin_host)
-                == Some(PluginTuiVisualRenderMode::TranscriptBlock)
-            && push_plugin_transcript_block_rows(
-                rows,
-                PluginTranscriptBlockContext {
-                    title: artifact.title.as_deref().unwrap_or("Tool result"),
-                    visual: plugin_visual,
-                    working_directory: context.working_directory,
-                    plugin_host,
-                    streaming: item.streaming(),
-                    is_error: context.is_error,
-                    timing: item.tool_timing(),
-                },
-                width,
-            )
-        {
+        let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
+        if let Some(routed) = resolve_canonical_plugin_visual(
+            plugin_visual,
+            context.working_directory,
+            width,
+            plugin_host,
+        ) {
+            match routed.render_mode {
+                PluginTuiVisualRenderMode::FullBlock => {
+                    rows.extend(routed.rows);
+                    rows.push(Line::default());
+                }
+                PluginTuiVisualRenderMode::TranscriptBlock => {
+                    let mut timing = item.tool_timing();
+                    if let Some(timeout_ms) = routed.header.timeout_ms {
+                        timing.get_or_insert_default().timeout_ms = Some(timeout_ms);
+                    }
+                    push_tool_block_header(
+                        rows,
+                        routed
+                            .header
+                            .title
+                            .as_deref()
+                            .or(artifact.title.as_deref())
+                            .unwrap_or("Tool result"),
+                        timing,
+                        item.streaming(),
+                        context.is_error,
+                        width,
+                    );
+                    rows.extend(routed.rows);
+                    rows.push(Line::default());
+                }
+                PluginTuiVisualRenderMode::Inline => {
+                    let status = if context.is_error { "failed" } else { "ok" };
+                    let title = context.tool_name.map_or_else(
+                        || format!("Tool result · {status}"),
+                        |name| format!("Tool result · {name} · {status}"),
+                    );
+                    push_tool_block_header(
+                        rows,
+                        &title,
+                        item.tool_timing(),
+                        item.streaming(),
+                        context.is_error,
+                        width,
+                    );
+                    rows.extend(routed.rows);
+                    rows.push(Line::default());
+                }
+            }
             return;
         }
     }
@@ -3314,16 +3247,31 @@ fn push_tool_result_rows(
     rows.push(Line::default());
 }
 
-fn bounded_tool_arguments(arguments: &str) -> String {
-    const MAX_ARGUMENT_CHARS: usize = 512;
-    let mut bounded = arguments
-        .chars()
-        .take(MAX_ARGUMENT_CHARS)
-        .collect::<String>();
-    if arguments.chars().count() > MAX_ARGUMENT_CHARS {
-        bounded.push('…');
-    }
-    bounded
+fn bounded_tool_argument_fields(arguments: &str) -> Vec<(String, String)> {
+    const MAX_FIELDS: usize = 6;
+    const MAX_VALUE_CHARS: usize = 160;
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(arguments) else {
+        return Vec::new();
+    };
+    fields
+        .into_iter()
+        .take(MAX_FIELDS)
+        .filter_map(|(label, value)| {
+            let value = match value {
+                serde_json::Value::String(value) => value,
+                serde_json::Value::Number(value) => value.to_string(),
+                serde_json::Value::Bool(value) => value.to_string(),
+                serde_json::Value::Null => "none".to_owned(),
+                serde_json::Value::Array(values) => format!("{} values", values.len()),
+                serde_json::Value::Object(values) => format!("{} fields", values.len()),
+            };
+            let mut bounded = value.chars().take(MAX_VALUE_CHARS).collect::<String>();
+            if value.chars().count() > MAX_VALUE_CHARS {
+                bounded.push('…');
+            }
+            (!bounded.is_empty()).then_some((label, bounded))
+        })
+        .collect()
 }
 
 fn push_labeled_text_preview(

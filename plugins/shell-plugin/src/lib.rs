@@ -2959,6 +2959,99 @@ mod tests {
     }
 
     #[test]
+    fn shell_primary_presentation_keeps_identity_generation_and_revision_across_schema_change() {
+        let events = Mutex::new(Vec::<Vec<u8>>::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(capture_service_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let presentation = Arc::new(StdMutex::new(
+            PrimaryPresentationPublisher::with_limits_and_cancellation(
+                emitter,
+                "call-continuity",
+                "bcode.shell",
+                "bcode.tool.request.shell.run",
+                SHELL_SCHEMA_VERSION,
+                bcode_tool::ToolPresentationRetention::RetainLatest,
+                bcode_plugin_sdk::TransientProgressLimits::default(),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+        ));
+        let arguments = serde_json::json!({
+            "command": "printf hello",
+            "cwd": "/tmp/project",
+            "timeout_ms": 30_000,
+            "format_commands": true,
+            "columns": 100,
+            "rows": 30
+        });
+        presentation
+            .lock()
+            .expect("presentation")
+            .replace(&arguments)
+            .expect("request presentation");
+        let observer = shell_recording_commit_observer(
+            Some(Arc::clone(&presentation)),
+            emitter,
+            "call-continuity",
+            30_000,
+            arguments.clone(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        observer(recording::ShellRecordingCommit {
+            path: PathBuf::from("call-continuity.bcsr.partial"),
+            committed_bytes: recording::RECORDING_HEADER_AND_START_BYTES,
+            finalized: false,
+        });
+        observer(recording::ShellRecordingCommit {
+            path: PathBuf::from("call-continuity.bcsr"),
+            committed_bytes: recording::RECORDING_HEADER_AND_START_BYTES + 10,
+            finalized: true,
+        });
+
+        let updates = events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter_map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload).ok()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0].schema, "bcode.tool.request.shell.run");
+        assert!(
+            updates[1..]
+                .iter()
+                .all(|update| update.schema == SHELL_RUN_SCHEMA)
+        );
+        assert!(updates.iter().all(|update| {
+            update.invocation_id == "call-continuity"
+                && update.identity == bcode_tool::ToolPresentationIdentity::Primary
+                && update.generation == 0
+                && update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+        }));
+        assert_eq!(
+            updates
+                .iter()
+                .map(|update| update.revision)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        for update in &updates[1..] {
+            assert_eq!(update.payload["arguments"], arguments);
+            assert_eq!(update.payload["timeout_ms"], 30_000);
+            assert!(update.artifact.is_some());
+        }
+        assert!(
+            updates[2]
+                .artifact
+                .as_ref()
+                .is_some_and(|artifact| artifact.finalized)
+        );
+    }
+
+    #[test]
     fn shell_recording_publishes_first_output_revision_without_waiting_for_cadence() {
         let events = Mutex::new(Vec::<Vec<u8>>::new());
         let emitter = ServiceEventEmitter::new(

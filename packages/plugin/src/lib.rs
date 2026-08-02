@@ -580,14 +580,39 @@ pub struct PluginVisualAdapterDeclaration {
 pub struct PluginToolPresentationDeclaration {
     /// Exact model-callable tool name owned by this plugin.
     pub tool_name: String,
-    /// Plugin-owned schema used to present a complete assembled request.
+    /// Plugin-owned schema used to present a complete assembled request. Empty legacy values use
+    /// `request_draft_schema`.
+    #[serde(default)]
     pub request_schema: String,
-    /// Version of `request_schema`.
+    /// Version of `request_schema`. Zero legacy values use `request_draft_schema_version`.
+    #[serde(default)]
     pub request_schema_version: u32,
     /// Plugin-owned schema used to present streamed request arguments.
     pub request_draft_schema: String,
     /// Version of `request_draft_schema`.
     pub request_draft_schema_version: u32,
+}
+
+impl PluginToolPresentationDeclaration {
+    /// Return the effective complete-request schema with legacy draft-schema fallback.
+    #[must_use]
+    pub fn effective_request_schema(&self) -> &str {
+        if self.request_schema.is_empty() {
+            &self.request_draft_schema
+        } else {
+            &self.request_schema
+        }
+    }
+
+    /// Return the effective complete-request schema version with legacy draft-version fallback.
+    #[must_use]
+    pub const fn effective_request_schema_version(&self) -> u32 {
+        if self.request_schema_version == 0 {
+            self.request_draft_schema_version
+        } else {
+            self.request_schema_version
+        }
+    }
 }
 
 fn validate_tool_presentation_declarations<'a>(
@@ -620,10 +645,12 @@ fn validate_tool_presentation_declarations<'a>(
                     "the tool is declared more than once by this plugin",
                 ));
             }
-            if presentation.request_schema.trim().is_empty() {
+            let request_schema = presentation.effective_request_schema();
+            let request_schema_version = presentation.effective_request_schema_version();
+            if request_schema.trim().is_empty() {
                 return Err(invalid("request_schema must not be empty"));
             }
-            if presentation.request_schema_version == 0 {
+            if request_schema_version == 0 {
                 return Err(invalid("request_schema_version must be greater than zero"));
             }
             if presentation.request_draft_schema.trim().is_empty() {
@@ -635,13 +662,13 @@ fn validate_tool_presentation_declarations<'a>(
                 ));
             }
             let request_adapter_matches = manifest.visual_adapters.iter().any(|adapter| {
-                adapter.schema == presentation.request_schema
+                adapter.schema == request_schema
                     && adapter
                         .min_schema_version
-                        .is_none_or(|minimum| presentation.request_schema_version >= minimum)
+                        .is_none_or(|minimum| request_schema_version >= minimum)
                     && adapter
                         .max_schema_version
-                        .is_none_or(|maximum| presentation.request_schema_version <= maximum)
+                        .is_none_or(|maximum| request_schema_version <= maximum)
             });
             if !request_adapter_matches {
                 return Err(invalid(

@@ -451,8 +451,8 @@ fn bundled_interaction_adapter(
     feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
-fn bundled_tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiRegistry> {
-    bcode_bundled_plugins::tui_registry(plugin_id)
+fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
+    bcode_bundled_plugins::static_tui_extensions()
 }
 
 #[cfg(not(any(
@@ -462,10 +462,8 @@ fn bundled_tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::Plugin
     feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 )))]
-const fn bundled_tui_registry(
-    _plugin_id: &str,
-) -> Option<bcode_plugin_sdk::tui::PluginTuiRegistry> {
-    None
+const fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
+    Vec::new()
 }
 
 /// Run the main terminal UI and open a plugin-owned surface on startup.

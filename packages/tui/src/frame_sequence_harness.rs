@@ -706,6 +706,278 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_shell_draft_checkpoint_is_independently_renderable() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.set_plugin_host(Arc::new(shell_plugin_host()));
+        let preview = r#"{"command":"cargo check --workspace","cwd":"/tmp/project"}"#;
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+            label: "coalesced-shell-draft",
+            input: TranscriptFrameInput::Live(SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
+                        turn_id: "turn-shell".to_owned(),
+                        tool_call_id: "call-shell".to_owned(),
+                        tool_name: "shell.run".to_owned(),
+                        producer_plugin_id: Some("bcode.shell".to_owned()),
+                        schema: "bcode.tool.request.shell.run".to_owned(),
+                        schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Request,
+                        generation: 1,
+                        revision: 7,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: preview.to_owned(),
+                        },
+                        argument_bytes: preview.len(),
+                        truncated: false,
+                    },
+                },
+            }),
+        }]);
+
+        assert!(
+            frames[0].text.contains("cargo check --workspace"),
+            "{}",
+            frames[0].text
+        );
+        assert!(
+            frames[0].text.contains("/tmp/project"),
+            "{}",
+            frames[0].text
+        );
+        assert!(frames[0].text.contains("assembling"), "{}", frames[0].text);
+        assert!(
+            !frames[0].text.contains("{\"command\""),
+            "{}",
+            frames[0].text
+        );
+        assert_eq!(frames[0].observation.semantic_items.len(), 1);
+        assert_eq!(frames[0].observation.terminal_items.len(), 1);
+    }
+
+    #[test]
+    fn atomic_shell_request_has_no_false_progressive_frame() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.set_plugin_host(Arc::new(shell_plugin_host()));
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+            label: "atomic-shell-request",
+            input: TranscriptFrameInput::Durable(durable(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-shell".to_owned(),
+                    producer_plugin_id: Some("bcode.shell".to_owned()),
+                    tool_name: "shell.run".to_owned(),
+                    arguments_json: serde_json::json!({
+                        "command": "pwd",
+                        "cwd": "/tmp/project"
+                    })
+                    .to_string(),
+                    working_directory: Some(std::path::PathBuf::from("/tmp/project")),
+                },
+            )),
+        }]);
+
+        assert!(frames[0].text.contains("❯ pwd"), "{}", frames[0].text);
+        assert!(
+            frames[0].text.contains("/tmp/project"),
+            "{}",
+            frames[0].text
+        );
+        assert!(!frames[0].text.contains("assembling"), "{}", frames[0].text);
+        assert!(
+            !frames[0].text.contains("Tool · shell.run"),
+            "{}",
+            frames[0].text
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Every user-visible shell lifecycle frame is asserted.
+    fn shell_draft_request_live_and_result_keep_one_adapter_owned_identity() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.set_plugin_host(Arc::new(shell_plugin_host()));
+        let draft = |revision, preview: &str| TranscriptFrameStep {
+            label: if revision == 1 {
+                "draft-command"
+            } else {
+                "draft-cwd"
+            },
+            input: TranscriptFrameInput::Live(SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
+                        turn_id: "turn-shell".to_owned(),
+                        tool_call_id: "call-shell".to_owned(),
+                        tool_name: "shell.run".to_owned(),
+                        producer_plugin_id: Some("bcode.shell".to_owned()),
+                        schema: "bcode.tool.request.shell.run".to_owned(),
+                        schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Request,
+                        generation: 1,
+                        revision,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: preview.to_owned(),
+                        },
+                        argument_bytes: preview.len(),
+                        truncated: false,
+                    },
+                },
+            }),
+        };
+        let request = durable(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-shell".to_owned(),
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: serde_json::json!({
+                    "command": "printf 'hello from shell\\n'",
+                    "cwd": "/tmp/project",
+                    "timeout_ms": 30_000,
+                    "columns": 100,
+                    "rows": 30,
+                })
+                .to_string(),
+                working_directory: Some(std::path::PathBuf::from("/tmp/project")),
+            },
+        );
+        let live_update = |revision: u64, exit_code: Option<i32>| TranscriptFrameStep {
+            label: if exit_code.is_some() {
+                "terminal-presentation"
+            } else {
+                "live-output"
+            },
+            input: TranscriptFrameInput::Live(SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
+                    update: bcode_tool::ToolPresentationUpdate {
+                        invocation_id: "call-shell".to_owned(),
+                        producer_id: "bcode.shell".to_owned(),
+                        generation: 0,
+                        revision,
+                        identity: bcode_tool::ToolPresentationIdentity::Primary,
+                        retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                        schema: "bcode.shell.run".to_owned(),
+                        schema_version: 1,
+                        artifact: None,
+                        payload: serde_json::json!({
+                            "mode": "terminal",
+                            "timeout_ms": 30_000,
+                            "arguments": {
+                                "command": "printf 'hello from shell\\n'",
+                                "cwd": "/tmp/project",
+                                "columns": 100,
+                                "rows": 30
+                            },
+                            "output_tail": "hello from shell\n",
+                            "exit_code": exit_code,
+                            "columns": 100,
+                            "rows": 30
+                        }),
+                    },
+                },
+            }),
+        };
+        let result = durable(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-shell".to_owned(),
+                    model_output: "hello from shell".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "call-shell-shell-run".to_owned(),
+                            producer_plugin_id: "bcode.shell".to_owned(),
+                            schema: "bcode.shell.run".to_owned(),
+                            schema_version: 1,
+                            tool_call_id: Some("call-shell".to_owned()),
+                            title: Some("Shell run".to_owned()),
+                            metadata: serde_json::json!({
+                                "mode": "terminal",
+                                "timeout_ms": 30_000,
+                                "arguments": {
+                                    "command": "printf 'hello from shell\\n'",
+                                    "cwd": "/tmp/project",
+                                    "columns": 100,
+                                    "rows": 30
+                                },
+                                "output_tail": "hello from shell\n",
+                                "exit_code": 0,
+                                "columns": 100,
+                                "rows": 30
+                            }),
+                            refs: Vec::new(),
+                        }),
+                    }),
+                },
+            },
+        );
+
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+            draft(1, r#"{"command":"printf 'hello"#),
+            draft(
+                2,
+                r#"{"command":"printf 'hello from shell\\n'","cwd":"/tmp/project""#,
+            ),
+            TranscriptFrameStep {
+                label: "assembled-request",
+                input: TranscriptFrameInput::Durable(request),
+            },
+            live_update(2, None),
+            live_update(3, Some(0)),
+            TranscriptFrameStep {
+                label: "terminal-result",
+                input: TranscriptFrameInput::Durable(result),
+            },
+        ]);
+
+        assert!(
+            frames[0].text.contains("printf 'hello"),
+            "{}",
+            frames[0].text
+        );
+        assert!(frames[0].text.contains("assembling"), "{}", frames[0].text);
+        assert!(
+            frames[1].text.contains("/tmp/project"),
+            "{}",
+            frames[1].text
+        );
+        assert!(frames[2].text.contains("printf"), "{}", frames[2].text);
+        assert!(
+            frames[3].text.contains("hello from shell"),
+            "{}",
+            frames[3].text
+        );
+        assert!(frames[4].text.contains("exit code 0"), "{}", frames[4].text);
+        assert!(frames[5].text.contains("exit code 0"), "{}", frames[5].text);
+        assert_no_forbidden_frames(&frames, |frame| {
+            (frame.text.contains("Tool · shell.run")
+                || frame.text.contains("{\"command\"")
+                || frame.observation.semantic_items.len() != 1
+                || frame.observation.terminal_items.len() != 1)
+                .then(|| "shell lifecycle flashed generic/raw/duplicate content".to_owned())
+        })
+        .expect("every shell lifecycle frame remains adapter-owned and singular");
+        let semantic_id = bcode_session_view_models::TranscriptViewItemId::tool("call-shell");
+        assert!(frames.iter().all(|frame| {
+            frame.observation.semantic_items[0].0 == semantic_id
+                && frame.observation.terminal_items[0].1.as_ref() == Some(&semantic_id)
+        }));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // One lifecycle fixture proves timeout and recording identity continuity.
     fn shell_recording_revisions_keep_one_timed_invocation_item() {
         let session_id = SessionId::new();

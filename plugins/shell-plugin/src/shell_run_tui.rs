@@ -568,6 +568,9 @@ impl ShellRunTuiVisualAdapter {
         width: u16,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
+        if payload.get("preview").is_some() {
+            return shell_request_draft_rows(payload, width, context);
+        }
         let Some(runtime) = payload.get("_bcode_runtime") else {
             return shell_terminal_prompt_rows(payload, width, context);
         };
@@ -845,6 +848,125 @@ fn shell_status_rows(payload: &serde_json::Value) -> Vec<Line> {
         Span::styled("  ", muted_style()),
         Span::styled(parts.join(" · "), muted_style()),
     ])]
+}
+
+fn shell_request_draft_rows(
+    payload: &serde_json::Value,
+    _width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
+    let preview = payload
+        .get("preview")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let parsed = serde_json::from_str::<serde_json::Value>(preview).ok();
+    let command = parsed
+        .as_ref()
+        .and_then(|arguments| arguments.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| partial_json_string(preview, "command"));
+    let cwd = parsed
+        .as_ref()
+        .and_then(|arguments| arguments.get("cwd"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| partial_json_string(preview, "cwd"));
+    let format_commands = parsed
+        .as_ref()
+        .and_then(|arguments| arguments.get("format_commands"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut rows = command.as_deref().map_or_else(Vec::new, |command| {
+        let display = if format_commands {
+            format_shell_command_for_display(command)
+        } else {
+            command.to_owned()
+        };
+        display
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let mut spans = if index == 0 {
+                    prompt_spans(cwd.as_deref(), context)
+                } else {
+                    vec![Span::styled("    ", muted_style())]
+                };
+                spans.extend(shell_command_spans(line));
+                Line::from_spans(spans)
+            })
+            .collect()
+    });
+    if rows.is_empty() {
+        rows.push(Line::from_spans(vec![
+            Span::styled("  ", muted_style()),
+            Span::styled("Shell command · assembling…", muted_style()),
+        ]));
+        if let Some(cwd) = cwd.as_deref() {
+            rows.push(Line::from_spans(prompt_spans(Some(cwd), context)));
+        }
+    }
+    let argument_bytes = payload
+        .get("argument_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let truncated = payload
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let status = if truncated {
+        format!("  assembling · received {argument_bytes} bytes · preview truncated")
+    } else {
+        format!("  assembling · received {argument_bytes} bytes")
+    };
+    rows.push(Line::from_spans(vec![Span::styled(status, muted_style())]));
+    rows
+}
+
+fn partial_json_string(input: &str, key: &str) -> Option<String> {
+    let key = serde_json::to_string(key).ok()?;
+    let tail = input.get(input.find(&key)?.saturating_add(key.len())..)?;
+    let encoded = tail
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start()
+        .strip_prefix('"')?;
+    decode_partial_json_string(encoded)
+}
+
+fn decode_partial_json_string(encoded: &str) -> Option<String> {
+    let mut escaped = false;
+    let mut unicode_digits = 0_u8;
+    let mut end = encoded.len();
+    for (index, character) in encoded.char_indices() {
+        if unicode_digits > 0 {
+            if !character.is_ascii_hexdigit() {
+                end = index;
+                break;
+            }
+            unicode_digits = unicode_digits.saturating_sub(1);
+            continue;
+        }
+        if escaped {
+            if character == 'u' {
+                unicode_digits = 4;
+            }
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let candidate = &encoded[..end];
+    serde_json::from_str::<String>(&format!("\"{candidate}\""))
+        .ok()
+        .or_else(|| Some(candidate.replace("\\\"", "\"").replace("\\\\", "\\")))
 }
 
 fn shell_terminal_prompt_rows(
@@ -1455,6 +1577,65 @@ mod tests {
             frames,
             columns,
         )
+    }
+
+    #[test]
+    fn shell_request_draft_renders_partial_command_and_cwd_without_raw_json() {
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            100,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            Some(std::path::PathBuf::from("/tmp/project")),
+        );
+        let rendered = shell_request_draft_rows(
+            &serde_json::json!({
+                "argument_bytes": 67,
+                "preview": "{\"command\":\"cargo check --work\",\"cwd\":\"/tmp/project\"",
+                "truncated": false,
+            }),
+            100,
+            &context,
+        )
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(rendered.contains("cargo check --work"), "{rendered}");
+        assert!(rendered.contains(". ❯"), "{rendered}");
+        assert!(
+            rendered.contains("assembling · received 67 bytes"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("{\"command\""), "{rendered}");
+    }
+
+    #[test]
+    fn shell_request_draft_without_command_shows_bounded_assembling_state() {
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let rendered = shell_request_draft_rows(
+            &serde_json::json!({
+                "argument_bytes": 12,
+                "preview": "{\"comm",
+                "truncated": true,
+            }),
+            80,
+            &context,
+        )
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(
+            rendered.contains("Shell command · assembling…"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("preview truncated"), "{rendered}");
+        assert!(!rendered.contains("{\"comm"), "{rendered}");
     }
 
     #[test]

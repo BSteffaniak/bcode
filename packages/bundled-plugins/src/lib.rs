@@ -4,6 +4,100 @@
 
 //! Single source of truth for statically bundled Bcode plugins.
 
+/// Return statically bundled native TUI extension registrations.
+#[must_use]
+#[allow(clippy::missing_const_for_fn, clippy::vec_init_then_push)] // Feature-selected builds push function pointers at runtime.
+pub fn static_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
+    #[allow(unused_mut)]
+    let mut extensions = Vec::new();
+    #[cfg(feature = "static-bundled-code-review-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.code_review",
+        bcode_code_review_plugin::tui::tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-document-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.document",
+        bcode_document_plugin::document_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-eval-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.eval",
+        bcode_eval_plugin::tui::tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-filesystem-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.filesystem",
+        bcode_filesystem_plugin::filesystem_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-git-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.git",
+        bcode_git_plugin::git_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-loop-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.loop",
+        bcode_loop_plugin::tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-metrics-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.metrics",
+        bcode_metrics_plugin::tui::tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-model-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.model",
+        bcode_model_plugin::model_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-ocr-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.ocr",
+        bcode_ocr_plugin::ocr_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-question-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.question",
+        bcode_question_plugin::question_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-ralph-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.ralph",
+        bcode_ralph_plugin::tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-shell-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.shell",
+        bcode_shell_plugin::shell_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-skills-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.skills",
+        bcode_skills_plugin::skills_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-vim-edit-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.vim-edit",
+        bcode_vim_edit_plugin::vim_edit_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-web-search-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.web-search",
+        bcode_web_search_plugin::web_search_tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-workflow-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.workflow",
+        bcode_workflow_plugin::tui::tui_registry,
+    ));
+    #[cfg(feature = "static-bundled-worktree-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.worktree",
+        bcode_worktree_plugin::worktree_tui_registry,
+    ));
+    extensions
+}
+
 /// Return a native TUI registry for one enabled statically bundled plugin.
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
@@ -383,6 +477,35 @@ fn workflow_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bundled_tui_extension_catalog_constructs_exact_registered_adapters() {
+        let extensions = super::static_tui_extensions();
+        for (plugin_id, adapter_id, schema) in [
+            (
+                "bcode.filesystem",
+                "filesystem-request-card",
+                "bcode.filesystem.request",
+            ),
+            (
+                "bcode.shell",
+                "shell-run-request-card",
+                "bcode.tool.request.shell.run",
+            ),
+        ] {
+            if let Some(extension) = extensions
+                .iter()
+                .find(|extension| extension.plugin_id() == plugin_id)
+            {
+                assert!(
+                    extension
+                        .registry()
+                        .supports_visual_adapter(adapter_id, schema),
+                    "{plugin_id}/{adapter_id}"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "static-bundled-workflow-plugin")]
     #[test]
     fn disabling_workflow_removes_commands_status_and_tui() {

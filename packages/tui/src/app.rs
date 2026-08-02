@@ -653,10 +653,8 @@ impl BmuxApp {
     /// Return the local plugin runtime used for client-side presentation projection.
     #[cfg(test)]
     #[must_use]
-    pub fn plugin_host(&self) -> Option<&bcode_plugin::PluginHost> {
-        self.plugin_presentation
-            .as_deref()
-            .map(crate::plugin_tui::PluginTuiPresentation::host)
+    pub const fn has_plugin_backend(&self) -> bool {
+        self.plugin_presentation.is_some()
     }
 
     /// Return persistent local plugin presentation state.

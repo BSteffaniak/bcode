@@ -8,6 +8,7 @@ pub mod interaction;
 pub mod path;
 #[cfg(feature = "tui")]
 pub mod tui;
+pub mod tui_visual;
 
 pub use bcode_agent_profile::{ToolPolicyIdentity, ToolPolicyOperation, ToolPolicyPreparation};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};

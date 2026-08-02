@@ -6,6 +6,16 @@ Reasoning content remains shared semantic state, while visibility, readable-repr
 
 Plugin fallback remains contract-driven: `SessionView` transports invocation identity, lifecycle, typed results, artifacts, and opaque schema-versioned plugin payloads without interpreting tool domains. Each frontend first attempts its own plugin adapter and otherwise renders the bounded generic invocation/result contract.
 
+TUI visual selection is an ordered frontend policy over manifest-declared routes. Stable adapter
+references combine plugin ID and manifest adapter ID. Bundled/static native implementations are
+registered by exact adapter ID; user-installed dynamic implementations execute through the
+versioned serialized `bcode.tui-visual-adapter/v1` service. Its portable contract lives in
+`bcode_plugin_sdk::tui_visual` and cannot depend on terminal, IPC, web, or plugin implementation
+types. Dynamic work is bounded and precomputed outside frame rendering. The selected adapter returns
+rows plus render-mode/header hints, but the TUI retains ownership of composition, timing/lifecycle
+chrome, viewport, input, and paint. Adapter failure advances through the ordered candidates before
+the canonical fallback.
+
 Canonical transcript content crosses the single `SessionViewTerminalAdapter` boundary into the TUI. Runtime-work label composition and other terminal activity strings live in TUI modules rather than shared session-view models.
 
 ## Transcript eligibility catalog

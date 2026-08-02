@@ -13,7 +13,66 @@ use std::time::Instant;
 
 const MAX_DYNAMIC_VISUAL_CACHE_ENTRIES: usize = 512;
 const DYNAMIC_VISUAL_QUEUE_CAPACITY: usize = 64;
+const DYNAMIC_VISUAL_COMPLETION_CAPACITY: usize =
+    MAX_DYNAMIC_VISUAL_CACHE_ENTRIES + DYNAMIC_VISUAL_QUEUE_CAPACITY;
+const DYNAMIC_VISUAL_SERVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_DYNAMIC_VISUAL_COMPLETIONS_PER_POLL: usize = 16;
+
+#[derive(Debug, Clone)]
+enum PresentationPluginBackend {
+    Synchronous(Arc<PluginHost>),
+    Runtime(PluginRuntimeHost),
+}
+
+impl PresentationPluginBackend {
+    fn visual_adapters(
+        &self,
+        schema: &str,
+        schema_version: u32,
+        surface: &str,
+        producer_plugin_id: Option<&str>,
+    ) -> Vec<bcode_plugin::PluginVisualAdapterRoute> {
+        match self {
+            Self::Synchronous(host) => {
+                host.visual_adapters(schema, schema_version, surface, producer_plugin_id)
+            }
+            Self::Runtime(runtime) => runtime.registry().visual_adapters(
+                schema,
+                schema_version,
+                surface,
+                producer_plugin_id,
+            ),
+        }
+    }
+
+    fn tool_presentation(
+        &self,
+        tool_name: &str,
+    ) -> Option<(&str, &bcode_plugin::PluginToolPresentationDeclaration)> {
+        match self {
+            Self::Synchronous(host) => host.tool_presentation(tool_name),
+            Self::Runtime(runtime) => runtime.tool_presentation(tool_name),
+        }
+    }
+
+    fn has_service(&self, plugin_id: &str, interface_id: &str) -> bool {
+        match self {
+            Self::Synchronous(host) => host.has_service(plugin_id, interface_id),
+            Self::Runtime(runtime) => {
+                runtime
+                    .registry()
+                    .manifests()
+                    .get(plugin_id)
+                    .is_some_and(|manifest| {
+                        manifest
+                            .services
+                            .iter()
+                            .any(|service| service.interface_id == interface_id)
+                    })
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DynamicVisualKey {
@@ -29,7 +88,7 @@ struct DynamicVisualKey {
 #[derive(Debug)]
 struct DynamicVisualRequest {
     key: DynamicVisualKey,
-    request: bcode_plugin_sdk::tui::RenderTuiVisualRequest,
+    request: bcode_plugin_sdk::tui_visual::RenderTuiVisualRequest,
 }
 
 #[derive(Debug)]
@@ -38,7 +97,7 @@ enum DynamicVisualJob {
     Artifact {
         plugin_id: String,
         invocation_id: String,
-        request: bcode_plugin_sdk::tui::SerializedTuiArtifactChunkRequest,
+        request: bcode_plugin_sdk::tui_visual::SerializedTuiArtifactChunkRequest,
     },
 }
 
@@ -46,7 +105,8 @@ enum DynamicVisualJob {
 struct DynamicVisualCompletion {
     key: Option<DynamicVisualKey>,
     invocation_id: String,
-    result: Result<bcode_plugin_sdk::tui::RenderTuiVisualResponse, String>,
+    invalidate_invocation_cache: bool,
+    result: Result<bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse, String>,
 }
 
 #[derive(Debug)]
@@ -55,57 +115,72 @@ struct DynamicVisualCoordinator {
     completion_receiver: Receiver<DynamicVisualCompletion>,
     worker: Option<JoinHandle<()>>,
     requested: BTreeSet<DynamicVisualKey>,
-    cache:
-        BTreeMap<DynamicVisualKey, Result<bcode_plugin_sdk::tui::RenderTuiVisualResponse, String>>,
+    cache: BTreeMap<
+        DynamicVisualKey,
+        Result<bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse, String>,
+    >,
 }
 
 impl DynamicVisualCoordinator {
-    fn new(host: Arc<PluginHost>) -> Self {
+    fn new(backend: PresentationPluginBackend) -> Self {
         let (request_sender, request_receiver) =
             std::sync::mpsc::sync_channel::<DynamicVisualJob>(DYNAMIC_VISUAL_QUEUE_CAPACITY);
-        let (completion_sender, completion_receiver) =
-            std::sync::mpsc::sync_channel::<DynamicVisualCompletion>(DYNAMIC_VISUAL_QUEUE_CAPACITY);
+        let (completion_sender, completion_receiver) = std::sync::mpsc::sync_channel::<
+            DynamicVisualCompletion,
+        >(DYNAMIC_VISUAL_COMPLETION_CAPACITY);
         let worker = std::thread::Builder::new()
             .name("bcode-tui-visual-adapter".to_owned())
             .spawn(move || {
                 while let Ok(job) = request_receiver.recv() {
                     let completion = match job {
                         DynamicVisualJob::Render(job) => {
-                            let result = host
-                                .invoke_service_json::<_, bcode_plugin_sdk::tui::RenderTuiVisualResponse>(
-                                    &job.key.plugin_id,
-                                    bcode_plugin_sdk::tui::TUI_VISUAL_ADAPTER_INTERFACE_ID,
-                                    bcode_plugin_sdk::tui::OP_RENDER_TUI_VISUAL,
-                                    &job.request,
-                                )
-                                .map_err(|error| error.to_string())
-                                .and_then(|response| {
-                                    response.validate()?;
-                                    Ok(response)
-                                });
+                            let result = invoke_dynamic_visual_service::<
+                                _,
+                                bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse,
+                            >(
+                                &backend,
+                                &job.key.plugin_id,
+                                bcode_plugin_sdk::tui_visual::OP_RENDER_TUI_VISUAL,
+                                &job.request,
+                            )
+                            .and_then(|response| {
+                                response.validate()?;
+                                Ok(response)
+                            });
                             DynamicVisualCompletion {
                                 invocation_id: job.key.invocation_id.clone(),
                                 key: Some(job.key),
+                                invalidate_invocation_cache: false,
                                 result,
                             }
                         }
-                        DynamicVisualJob::Artifact { plugin_id, invocation_id, request } => {
-                            let result = host
-                                .invoke_service_json::<_, serde_json::Value>(
-                                    &plugin_id,
-                                    bcode_plugin_sdk::tui::TUI_VISUAL_ADAPTER_INTERFACE_ID,
-                                    bcode_plugin_sdk::tui::OP_DELIVER_TUI_VISUAL_ARTIFACT,
-                                    &request,
-                                )
-                                .map(|_| bcode_plugin_sdk::tui::RenderTuiVisualResponse {
-                                    version: bcode_plugin_sdk::tui::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
+                        DynamicVisualJob::Artifact {
+                            plugin_id,
+                            invocation_id,
+                            request,
+                        } => {
+                            let result = invoke_dynamic_visual_service::<_, serde_json::Value>(
+                                &backend,
+                                &plugin_id,
+                                bcode_plugin_sdk::tui_visual::OP_DELIVER_TUI_VISUAL_ARTIFACT,
+                                &request,
+                            )
+                            .map(|_| {
+                                bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse {
+                                    version:
+                                        bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
                                     render_mode: String::new(),
                                     title: None,
                                     timeout_ms: None,
                                     rows: Vec::new(),
-                                })
-                                .map_err(|error| error.to_string());
-                            DynamicVisualCompletion { key: None, invocation_id, result }
+                                }
+                            });
+                            DynamicVisualCompletion {
+                                key: None,
+                                invocation_id,
+                                invalidate_invocation_cache: result.is_ok(),
+                                result,
+                            }
                         }
                     };
                     if completion_sender.send(completion).is_err() {
@@ -126,7 +201,7 @@ impl DynamicVisualCoordinator {
     fn response(
         &self,
         key: &DynamicVisualKey,
-    ) -> Option<&bcode_plugin_sdk::tui::RenderTuiVisualResponse> {
+    ) -> Option<&bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse> {
         self.cache.get(key)?.as_ref().ok()
     }
 
@@ -162,7 +237,7 @@ impl DynamicVisualCoordinator {
         &self,
         plugin_id: String,
         invocation_id: String,
-        request: bcode_plugin_sdk::tui::SerializedTuiArtifactChunkRequest,
+        request: bcode_plugin_sdk::tui_visual::SerializedTuiArtifactChunkRequest,
     ) -> bool {
         self.request_sender.as_ref().is_some_and(|sender| {
             sender
@@ -180,6 +255,10 @@ impl DynamicVisualCoordinator {
         for _ in 0..MAX_DYNAMIC_VISUAL_COMPLETIONS_PER_POLL {
             match self.completion_receiver.try_recv() {
                 Ok(completion) => {
+                    if completion.invalidate_invocation_cache {
+                        self.cache
+                            .retain(|key, _| key.invocation_id != completion.invocation_id);
+                    }
                     dirty.insert(completion.invocation_id);
                     if let Some(key) = completion.key {
                         self.requested.remove(&key);
@@ -195,6 +274,44 @@ impl DynamicVisualCoordinator {
             }
         }
         dirty
+    }
+}
+
+fn invoke_dynamic_visual_service<Q, R>(
+    backend: &PresentationPluginBackend,
+    plugin_id: &str,
+    operation: &str,
+    request: &Q,
+) -> Result<R, String>
+where
+    Q: serde::Serialize + Sync,
+    R: serde::de::DeserializeOwned,
+{
+    match backend {
+        PresentationPluginBackend::Synchronous(host) => host
+            .invoke_service_json(
+                plugin_id,
+                bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_INTERFACE_ID,
+                operation,
+                request,
+            )
+            .map_err(|error| error.to_string()),
+        PresentationPluginBackend::Runtime(runtime) => {
+            let runtime_handle = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime_handle
+                .block_on(runtime.invoke_service_json_scoped_with_timeout(
+                    plugin_id,
+                    bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_INTERFACE_ID,
+                    operation,
+                    request,
+                    bcode_plugin::PluginInvocationScope::Global,
+                    DYNAMIC_VISUAL_SERVICE_TIMEOUT,
+                ))
+                .map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -237,8 +354,9 @@ pub struct PluginVisualDiagnostic {
 /// later render passes consume.
 #[derive(Debug)]
 pub struct PluginTuiPresentation {
-    host: Arc<PluginHost>,
+    backend: PresentationPluginBackend,
     visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
+    registry_factories: BTreeMap<String, bcode_plugin_sdk::tui::PluginTuiRegistryFactory>,
     registries: Mutex<BTreeMap<String, Arc<PluginTuiRegistry>>>,
     visual_revisions: Mutex<BTreeMap<String, u64>>,
     dirty_visuals: Mutex<BTreeSet<String>>,
@@ -252,6 +370,7 @@ pub struct PluginTuiPresentation {
 #[derive(Debug, Clone)]
 pub struct RoutedTuiVisual {
     pub route: bcode_plugin::PluginVisualAdapterRoute,
+    pub render_mode: bcode_plugin_sdk::tui::PluginTuiVisualRenderMode,
     pub rows: Vec<bmux_tui::prelude::Line>,
     pub header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader,
 }
@@ -269,23 +388,56 @@ impl PluginTuiPresentation {
         host: PluginHost,
         visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
     ) -> Self {
-        Self::from_shared_with_config(Arc::new(host), visual_adapter_config)
+        Self::from_backend(
+            PresentationPluginBackend::Synchronous(Arc::new(host)),
+            visual_adapter_config,
+            test_tui_extensions(),
+        )
+    }
+
+    /// Create production presentation state around an isolated plugin runtime.
+    #[must_use]
+    pub fn with_runtime_config_and_extensions(
+        runtime: PluginRuntimeHost,
+        visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
+        extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
+    ) -> Self {
+        Self::from_backend(
+            PresentationPluginBackend::Runtime(runtime),
+            visual_adapter_config,
+            extensions,
+        )
     }
 
     /// Create presentation state around a shared loaded plugin host.
     #[must_use]
     pub fn from_shared(host: Arc<PluginHost>) -> Self {
-        Self::from_shared_with_config(host, bcode_config::TuiVisualAdapterConfig::default())
+        Self::from_backend(
+            PresentationPluginBackend::Synchronous(host),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            test_tui_extensions(),
+        )
     }
 
-    fn from_shared_with_config(
-        host: Arc<PluginHost>,
+    fn from_backend(
+        backend: PresentationPluginBackend,
         visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
+        extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
     ) -> Self {
-        let dynamic_visuals = Mutex::new(DynamicVisualCoordinator::new(Arc::clone(&host)));
+        let registry_factories = extensions
+            .iter()
+            .map(|extension| {
+                (
+                    extension.plugin_id().to_owned(),
+                    extension.registry_factory(),
+                )
+            })
+            .collect();
+        let dynamic_visuals = Mutex::new(DynamicVisualCoordinator::new(backend.clone()));
         Self {
-            host,
+            backend,
             visual_adapter_config,
+            registry_factories,
             registries: Mutex::new(BTreeMap::new()),
             visual_revisions: Mutex::new(BTreeMap::new()),
             dirty_visuals: Mutex::new(BTreeSet::new()),
@@ -296,10 +448,13 @@ impl PluginTuiPresentation {
         }
     }
 
-    /// Return the routing host.
+    /// Return presentation metadata for an exact model-callable tool.
     #[must_use]
-    pub fn host(&self) -> &PluginHost {
-        &self.host
+    pub fn tool_presentation(
+        &self,
+        tool_name: &str,
+    ) -> Option<(&str, &bcode_plugin::PluginToolPresentationDeclaration)> {
+        self.backend.tool_presentation(tool_name)
     }
 
     /// Return the full presentation generation for registry/adapter replacement.
@@ -381,7 +536,7 @@ impl PluginTuiPresentation {
         if let Some(registry) = registries.get(plugin_id).cloned() {
             return Some(registry);
         }
-        let registry = Arc::new(tui_registry(plugin_id)?);
+        let registry = Arc::new((self.registry_factories.get(plugin_id)?)());
         registries.insert(plugin_id.to_owned(), Arc::clone(&registry));
         drop(registries);
         Some(registry)
@@ -396,7 +551,7 @@ impl PluginTuiPresentation {
         producer_plugin_id: Option<&str>,
     ) -> Vec<bcode_plugin::PluginVisualAdapterRoute> {
         self.visual_adapter_config
-            .order_routes(self.host.visual_adapters(
+            .order_routes(self.backend.visual_adapters(
                 schema,
                 schema_version,
                 "tui",
@@ -406,9 +561,9 @@ impl PluginTuiPresentation {
             .filter(|route| {
                 self.registry(&route.plugin_id).is_some_and(|registry| {
                     registry.supports_visual_adapter(&route.adapter_id, &route.schema)
-                }) || self.host.has_service(
+                }) || self.backend.has_service(
                     &route.plugin_id,
-                    bcode_plugin_sdk::tui::TUI_VISUAL_ADAPTER_INTERFACE_ID,
+                    bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_INTERFACE_ID,
                 )
             })
             .collect()
@@ -462,18 +617,22 @@ impl PluginTuiPresentation {
                 && let Some(rows) =
                     registry.visual_rows(&route.adapter_id, &route.schema, payload, context)
             {
+                let render_mode = registry
+                    .visual_render_mode(&route.adapter_id, &route.schema, payload)
+                    .unwrap_or_else(|| manifest_render_mode(route.render_mode));
                 let header = registry
                     .visual_transcript_header(&route.adapter_id, &route.schema, payload)
                     .unwrap_or_default();
                 return Some(RoutedTuiVisual {
                     route,
+                    render_mode,
                     rows,
                     header,
                 });
             }
-            if !self.host.has_service(
+            if !self.backend.has_service(
                 &route.plugin_id,
-                bcode_plugin_sdk::tui::TUI_VISUAL_ADAPTER_INTERFACE_ID,
+                bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_INTERFACE_ID,
             ) {
                 continue;
             }
@@ -492,6 +651,7 @@ impl PluginTuiPresentation {
             };
             if let Some(response) = response {
                 return Some(RoutedTuiVisual {
+                    render_mode: serialized_render_mode(&response, route.render_mode),
                     route,
                     rows: serialized_visual_rows(&response),
                     header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader {
@@ -505,14 +665,14 @@ impl PluginTuiPresentation {
             };
             dynamic.request(DynamicVisualRequest {
                 key,
-                request: bcode_plugin_sdk::tui::RenderTuiVisualRequest {
-                    version: bcode_plugin_sdk::tui::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
+                request: bcode_plugin_sdk::tui_visual::RenderTuiVisualRequest {
+                    version: bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
                     adapter_id: route.adapter_id.clone(),
                     invocation_id: invocation_id.to_owned(),
                     schema: schema.to_owned(),
                     schema_version,
                     payload: payload.clone(),
-                    context: bcode_plugin_sdk::tui::SerializedTuiVisualContext {
+                    context: bcode_plugin_sdk::tui_visual::SerializedTuiVisualContext {
                         width: context.width(),
                         diff_layout: format!("{:?}", context.diff_layout()),
                         working_directory: context.working_directory().map(ToOwned::to_owned),
@@ -557,9 +717,9 @@ impl PluginTuiPresentation {
                 reference_key,
                 content_type,
             )
-        }) || self.host.has_service(
+        }) || self.backend.has_service(
             &route.plugin_id,
-            bcode_plugin_sdk::tui::TUI_VISUAL_ADAPTER_INTERFACE_ID,
+            bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_INTERFACE_ID,
         )
     }
 
@@ -652,10 +812,10 @@ impl PluginTuiPresentation {
             coordinator.artifact(
                 route.plugin_id,
                 chunk.tool_call_id.clone(),
-                bcode_plugin_sdk::tui::SerializedTuiArtifactChunkRequest {
-                    version: bcode_plugin_sdk::tui::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
+                bcode_plugin_sdk::tui_visual::SerializedTuiArtifactChunkRequest {
+                    version: bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
                     adapter_id: route.adapter_id,
-                    chunk: chunk.into(),
+                    chunk: serialized_artifact_chunk(chunk),
                 },
             )
         });
@@ -663,10 +823,92 @@ impl PluginTuiPresentation {
     }
 }
 
+#[cfg(test)]
+fn test_tui_extensions() -> &'static [bcode_plugin_sdk::tui::StaticPluginTuiExtension] {
+    static EXTENSIONS: std::sync::OnceLock<Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension>> =
+        std::sync::OnceLock::new();
+    EXTENSIONS.get_or_init(|| {
+        vec![
+            bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+                "bcode.filesystem",
+                bcode_filesystem_plugin::filesystem_tui_registry,
+            ),
+            bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+                "bcode.git",
+                bcode_git_plugin::git_tui_registry,
+            ),
+            bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+                "bcode.question",
+                bcode_question_plugin::question_tui_registry,
+            ),
+            bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+                "bcode.shell",
+                bcode_shell_plugin::shell_tui_registry,
+            ),
+            bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+                "bcode.vim-edit",
+                bcode_vim_edit_plugin::vim_edit_tui_registry,
+            ),
+        ]
+    })
+}
+
+#[cfg(not(test))]
+const fn test_tui_extensions() -> &'static [bcode_plugin_sdk::tui::StaticPluginTuiExtension] {
+    &[]
+}
+
+fn serialized_artifact_chunk(
+    chunk: &PluginTuiArtifactChunk,
+) -> bcode_plugin_sdk::tui_visual::SerializedTuiArtifactChunk {
+    bcode_plugin_sdk::tui_visual::SerializedTuiArtifactChunk {
+        tool_call_id: chunk.tool_call_id.clone(),
+        artifact_id: chunk.artifact_id.clone(),
+        reference_key: chunk.reference_key.clone(),
+        producer_plugin_id: chunk.producer_plugin_id.clone(),
+        schema: chunk.schema.clone(),
+        schema_version: chunk.schema_version,
+        content_type: chunk.content_type.clone(),
+        offset: chunk.offset,
+        total_bytes: chunk.total_bytes,
+        revision: chunk.revision,
+        finalized: chunk.finalized,
+        bytes: chunk.bytes.clone(),
+    }
+}
+
+const fn manifest_render_mode(
+    mode: bcode_plugin::PluginVisualAdapterRenderMode,
+) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderMode {
+    match mode {
+        bcode_plugin::PluginVisualAdapterRenderMode::Inline => {
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::Inline
+        }
+        bcode_plugin::PluginVisualAdapterRenderMode::TranscriptBlock => {
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
+        }
+        bcode_plugin::PluginVisualAdapterRenderMode::FullBlock => {
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::FullBlock
+        }
+    }
+}
+
+fn serialized_render_mode(
+    response: &bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse,
+    default: bcode_plugin::PluginVisualAdapterRenderMode,
+) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderMode {
+    match response.render_mode.as_str() {
+        "inline" => bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::Inline,
+        "transcript_block" => bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock,
+        "full_block" => bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::FullBlock,
+        _ => manifest_render_mode(default),
+    }
+}
+
 fn serialized_visual_rows(
-    response: &bcode_plugin_sdk::tui::RenderTuiVisualResponse,
+    response: &bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse,
 ) -> Vec<bmux_tui::prelude::Line> {
-    use bcode_plugin_sdk::tui::{SerializedTuiColor, SerializedTuiModifier};
+    use bcode_plugin_sdk::tui_visual::{SerializedTuiColor, SerializedTuiModifier};
     use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
     response
         .rows
@@ -726,7 +968,10 @@ fn valid_diagnostic_name(name: &str) -> bool {
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
 pub fn tui_registry(plugin_id: &str) -> Option<PluginTuiRegistry> {
-    let registry = super::bundled_tui_registry(plugin_id);
+    let registry = super::bundled_tui_extensions()
+        .into_iter()
+        .find(|extension| extension.plugin_id() == plugin_id)
+        .map(bcode_plugin_sdk::tui::StaticPluginTuiExtension::registry);
     #[cfg(test)]
     let registry = registry.or_else(|| match plugin_id {
         "bcode.filesystem" => Some(bcode_filesystem_plugin::filesystem_tui_registry()),
@@ -747,6 +992,7 @@ pub fn tui_registry(plugin_id: &str) -> Option<PluginTuiRegistry> {
 pub fn load_default_host_with_static_bundled(
     selection: &bcode_plugin::PluginSelection,
     static_plugins: &[StaticBundledPlugin],
+    extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
 ) -> Result<PluginHost, PluginLoadError> {
     if let Ok(host) = PluginHost::load_defaults_with_static_bundled(selection, static_plugins) {
         Ok(host)
@@ -755,13 +1001,17 @@ pub fn load_default_host_with_static_bundled(
         let visual_plugins = selected
             .into_iter()
             .filter(|(manifest, _)| {
-                tui_registry(&manifest.id).is_some_and(|registry| {
-                    manifest.visual_adapters.iter().any(|adapter| {
-                        (adapter.surfaces.is_empty()
-                            || adapter.surfaces.iter().any(|surface| surface == "tui"))
-                            && registry.supports_visual(&adapter.schema)
+                extensions
+                    .iter()
+                    .find(|extension| extension.plugin_id() == manifest.id)
+                    .is_some_and(|extension| {
+                        let registry = extension.registry();
+                        manifest.visual_adapters.iter().any(|adapter| {
+                            (adapter.surfaces.is_empty()
+                                || adapter.surfaces.iter().any(|surface| surface == "tui"))
+                                && registry.supports_visual_adapter(&adapter.id, &adapter.schema)
+                        })
                     })
-                })
             })
             .collect::<Vec<_>>();
         Ok(PluginHost::load_static_plugins_best_effort(&visual_plugins))
@@ -777,9 +1027,15 @@ pub fn load_default_presentation_with_static_bundled(
     selection: &bcode_plugin::PluginSelection,
     visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
     static_plugins: &[StaticBundledPlugin],
+    extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
 ) -> Result<PluginTuiPresentation, PluginLoadError> {
-    load_default_host_with_static_bundled(selection, static_plugins)
-        .map(|host| PluginTuiPresentation::with_config(host, visual_adapter_config))
+    load_default_host_with_static_bundled(selection, static_plugins, extensions).map(|host| {
+        PluginTuiPresentation::with_runtime_config_and_extensions(
+            host.into(),
+            visual_adapter_config,
+            extensions,
+        )
+    })
 }
 
 /// Load the default local plugin runtime for TUI client-side services.
@@ -840,6 +1096,403 @@ pub async fn open_plugin_tui_surface(
 mod tests {
     use super::*;
     use bmux_tui::prelude::Line;
+
+    const DYNAMIC_TEST_MANIFEST: &str = r#"
+id = "test.dynamic-visual"
+name = "Dynamic Visual Test Plugin"
+version = "0.0.1"
+
+[[services]]
+interface_id = "bcode.tui-visual-adapter/v1"
+name = "Dynamic TUI Visual Adapter"
+class = "service"
+
+[[visual_adapters]]
+id = "success"
+schema = "bcode.shell.run"
+min_schema_version = 1
+max_schema_version = 1
+service_interface_id = "bcode.tui-visual-adapter/v1"
+surfaces = ["tui"]
+priority = 100
+producer_default = false
+render_mode = "transcript_block"
+
+[[visual_adapters]]
+id = "malformed"
+schema = "bcode.shell.run"
+min_schema_version = 1
+max_schema_version = 1
+service_interface_id = "bcode.tui-visual-adapter/v1"
+surfaces = ["tui"]
+priority = 99
+producer_default = false
+render_mode = "transcript_block"
+
+[[visual_adapters]]
+id = "failure"
+schema = "bcode.shell.run"
+min_schema_version = 1
+max_schema_version = 1
+service_interface_id = "bcode.tui-visual-adapter/v1"
+surfaces = ["tui"]
+priority = 98
+producer_default = false
+render_mode = "transcript_block"
+
+[[visual_adapters]]
+id = "timeout"
+schema = "bcode.shell.run"
+min_schema_version = 1
+max_schema_version = 1
+service_interface_id = "bcode.tui-visual-adapter/v1"
+surfaces = ["tui"]
+priority = 97
+producer_default = false
+render_mode = "transcript_block"
+
+[concurrency]
+type = "concurrent"
+
+[runtime]
+type = "native"
+abi_version = 3
+library = "libdynamic_visual_test.dylib"
+"#;
+
+    #[derive(Default)]
+    struct DynamicVisualTestPlugin {
+        artifact_revisions: BTreeMap<String, u64>,
+    }
+
+    impl bcode_plugin_sdk::RustPlugin for DynamicVisualTestPlugin {
+        fn invoke_service(
+            &mut self,
+            context: bcode_plugin_sdk::NativeServiceContext,
+        ) -> bcode_plugin_sdk::ServiceResponse {
+            match context.request.operation.as_str() {
+                bcode_plugin_sdk::tui_visual::OP_RENDER_TUI_VISUAL => {
+                    let Ok(request) = context
+                        .request
+                        .payload_json::<bcode_plugin_sdk::tui_visual::RenderTuiVisualRequest>(
+                    ) else {
+                        return bcode_plugin_sdk::ServiceResponse::error(
+                            "invalid_request",
+                            "render request did not decode",
+                        );
+                    };
+                    match request.adapter_id.as_str() {
+                        "failure" => bcode_plugin_sdk::ServiceResponse::error(
+                            "test_failure",
+                            "dynamic adapter failed",
+                        ),
+                        "malformed" => bcode_plugin_sdk::ServiceResponse::json(
+                            &bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse {
+                                version: 999,
+                                render_mode: "transcript_block".to_owned(),
+                                title: None,
+                                timeout_ms: None,
+                                rows: Vec::new(),
+                            },
+                        )
+                        .expect("encode malformed response"),
+                        "timeout" => {
+                            while !context.cancellation.is_cancelled() {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            bcode_plugin_sdk::ServiceResponse::error(
+                                "cancelled",
+                                "dynamic adapter was cancelled",
+                            )
+                        }
+                        "success" => {
+                            let artifact_revision = self
+                                .artifact_revisions
+                                .get(&request.invocation_id)
+                                .copied()
+                                .unwrap_or_default();
+                            bcode_plugin_sdk::ServiceResponse::json(
+                                &bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse {
+                                    version:
+                                        bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
+                                    render_mode: "transcript_block".to_owned(),
+                                    title: Some("Dynamic shell".to_owned()),
+                                    timeout_ms: Some(321),
+                                    rows: vec![bcode_plugin_sdk::tui_visual::SerializedTuiRow {
+                                        spans: vec![bcode_plugin_sdk::tui_visual::SerializedTuiSpan {
+                                            text: format!(
+                                                "dynamic:{}:artifact-{artifact_revision}",
+                                                request.adapter_id
+                                            ),
+                                            foreground:
+                                                bcode_plugin_sdk::tui_visual::SerializedTuiColor::Green,
+                                            modifiers: vec![
+                                                bcode_plugin_sdk::tui_visual::SerializedTuiModifier::Bold,
+                                            ],
+                                        }],
+                                    }],
+                                },
+                            )
+                            .expect("encode dynamic response")
+                        }
+                        _ => bcode_plugin_sdk::ServiceResponse::error(
+                            "unknown_adapter",
+                            "adapter id was not exact",
+                        ),
+                    }
+                }
+                bcode_plugin_sdk::tui_visual::OP_DELIVER_TUI_VISUAL_ARTIFACT => {
+                    let Ok(request) = context
+                        .request
+                        .payload_json::<bcode_plugin_sdk::tui_visual::SerializedTuiArtifactChunkRequest>(
+                    ) else {
+                        return bcode_plugin_sdk::ServiceResponse::error(
+                            "invalid_request",
+                            "artifact request did not decode",
+                        );
+                    };
+                    let revision = self
+                        .artifact_revisions
+                        .entry(request.chunk.tool_call_id)
+                        .or_default();
+                    *revision = revision.wrapping_add(1);
+                    bcode_plugin_sdk::ServiceResponse::json(&serde_json::json!({"accepted": true}))
+                        .expect("encode artifact response")
+                }
+                _ => bcode_plugin_sdk::ServiceResponse::error(
+                    "unsupported_operation",
+                    "unsupported dynamic visual operation",
+                ),
+            }
+        }
+    }
+
+    fn dynamic_visual_test_plugin() -> StaticBundledPlugin {
+        StaticBundledPlugin::new(
+            DYNAMIC_TEST_MANIFEST,
+            bcode_plugin_sdk::static_plugin_vtable!(DynamicVisualTestPlugin, DYNAMIC_TEST_MANIFEST),
+        )
+    }
+
+    fn dynamic_test_presentation(
+        preferred_adapter: &str,
+        disabled_adapters: &[&str],
+    ) -> PluginTuiPresentation {
+        let bundled = [
+            dynamic_visual_test_plugin(),
+            StaticBundledPlugin::new(
+                include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+                bcode_shell_plugin::static_plugin(),
+            ),
+        ];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("select dynamic visual test plugins");
+        let runtime: PluginRuntimeHost = PluginHost::load_static_plugins(&selected)
+            .expect("load dynamic visual test plugins")
+            .into();
+        PluginTuiPresentation::with_runtime_config_and_extensions(
+            runtime,
+            bcode_config::TuiVisualAdapterConfig {
+                preferred: vec![preferred_adapter.to_owned()],
+                disabled: disabled_adapters
+                    .iter()
+                    .map(|adapter| (*adapter).to_owned())
+                    .collect(),
+            },
+            test_tui_extensions(),
+        )
+    }
+
+    fn dynamic_test_visual(
+        presentation: &PluginTuiPresentation,
+        invocation_id: &str,
+    ) -> Option<RoutedTuiVisual> {
+        presentation.routed_visual(
+            invocation_id,
+            0,
+            "bcode.shell.run",
+            1,
+            Some("bcode.shell"),
+            &serde_json::json!({
+                "arguments": {
+                    "command": "printf hello",
+                    "cwd": "/tmp/project"
+                }
+            }),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                Some(std::path::PathBuf::from("/tmp/project")),
+            ),
+        )
+    }
+
+    fn routed_text(visual: &RoutedTuiVisual) -> String {
+        visual
+            .rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect()
+    }
+
+    fn wait_for_dynamic_completion(presentation: &PluginTuiPresentation) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if presentation.poll_dynamic_visuals() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("dynamic visual completion timed out");
+    }
+
+    #[test]
+    fn preferred_dynamic_adapter_overrides_producer_native_adapter_after_completion() {
+        let presentation = dynamic_test_presentation(
+            "test.dynamic-visual/success",
+            &[
+                "test.dynamic-visual/malformed",
+                "test.dynamic-visual/failure",
+                "test.dynamic-visual/timeout",
+            ],
+        );
+
+        let initial = dynamic_test_visual(&presentation, "call-success")
+            .expect("producer-native fallback while dynamic visual runs");
+        assert_eq!(initial.route.plugin_id, "bcode.shell");
+        wait_for_dynamic_completion(&presentation);
+
+        let routed =
+            dynamic_test_visual(&presentation, "call-success").expect("completed dynamic visual");
+        let dynamic_cache = presentation
+            .dynamic_visuals
+            .lock()
+            .expect("dynamic visual cache");
+        assert_eq!(
+            routed.route.adapter_reference(),
+            "test.dynamic-visual/success",
+            "cached dynamic results: {:?}",
+            dynamic_cache.cache
+        );
+        drop(dynamic_cache);
+        assert_eq!(routed.header.title.as_deref(), Some("Dynamic shell"));
+        assert_eq!(routed.header.timeout_ms, Some(321));
+        assert_eq!(routed_text(&routed), "dynamic:success:artifact-0");
+    }
+
+    #[test]
+    fn malformed_failed_and_timed_out_dynamic_adapters_fall_through() {
+        for adapter_id in ["malformed", "failure", "timeout"] {
+            let disabled = ["success", "malformed", "failure", "timeout"]
+                .into_iter()
+                .filter(|candidate| *candidate != adapter_id)
+                .map(|candidate| format!("test.dynamic-visual/{candidate}"))
+                .collect::<Vec<_>>();
+            let disabled = disabled.iter().map(String::as_str).collect::<Vec<_>>();
+            let presentation =
+                dynamic_test_presentation(&format!("test.dynamic-visual/{adapter_id}"), &disabled);
+
+            let initial = dynamic_test_visual(&presentation, &format!("call-{adapter_id}"))
+                .expect("native fallback while dynamic visual runs");
+            assert_eq!(initial.route.plugin_id, "bcode.shell");
+            wait_for_dynamic_completion(&presentation);
+
+            let fallback = dynamic_test_visual(&presentation, &format!("call-{adapter_id}"))
+                .expect("native fallback after dynamic failure");
+            assert_eq!(fallback.route.plugin_id, "bcode.shell", "{adapter_id}");
+        }
+    }
+
+    #[test]
+    fn dynamic_visual_cache_and_pending_work_remain_bounded() {
+        let presentation = dynamic_test_presentation(
+            "test.dynamic-visual/success",
+            &[
+                "test.dynamic-visual/malformed",
+                "test.dynamic-visual/failure",
+                "test.dynamic-visual/timeout",
+            ],
+        );
+        for index in 0..(MAX_DYNAMIC_VISUAL_CACHE_ENTRIES + 64) {
+            let _ = dynamic_test_visual(&presentation, &format!("call-bound-{index}"));
+        }
+        let coordinator = presentation
+            .dynamic_visuals
+            .lock()
+            .expect("dynamic coordinator");
+        assert!(
+            coordinator
+                .cache
+                .len()
+                .saturating_add(coordinator.requested.len())
+                <= MAX_DYNAMIC_VISUAL_CACHE_ENTRIES
+        );
+        assert!(coordinator.requested.len() <= MAX_DYNAMIC_VISUAL_CACHE_ENTRIES);
+        drop(coordinator);
+    }
+
+    #[test]
+    fn dynamic_artifact_update_invalidates_only_affected_invocation() {
+        let presentation = dynamic_test_presentation(
+            "test.dynamic-visual/success",
+            &[
+                "test.dynamic-visual/malformed",
+                "test.dynamic-visual/failure",
+                "test.dynamic-visual/timeout",
+            ],
+        );
+        for invocation_id in ["call-owner", "call-other"] {
+            let _ = dynamic_test_visual(&presentation, invocation_id);
+            wait_for_dynamic_completion(&presentation);
+            let visual =
+                dynamic_test_visual(&presentation, invocation_id).expect("cached dynamic visual");
+            assert_eq!(routed_text(&visual), "dynamic:success:artifact-0");
+            let _ = presentation.drain_dirty_visuals();
+        }
+
+        assert!(
+            presentation
+                .deliver_artifact_chunk(&PluginTuiArtifactChunk {
+                    tool_call_id: "call-owner".to_owned(),
+                    artifact_id: "artifact-owner".to_owned(),
+                    reference_key: "shell_recording".to_owned(),
+                    producer_plugin_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.run".to_owned(),
+                    schema_version: 1,
+                    content_type: Some(
+                        "application/x-bcode-shell-recording; version=3".to_owned(),
+                    ),
+                    offset: 0,
+                    total_bytes: 3,
+                    revision: 1,
+                    finalized: false,
+                    bytes: b"abc".to_vec(),
+                })
+                .expect("queue dynamic artifact")
+        );
+        wait_for_dynamic_completion(&presentation);
+        assert_eq!(presentation.visual_revision("call-owner"), 2);
+        assert_eq!(presentation.visual_revision("call-other"), 1);
+        assert_eq!(
+            presentation.drain_dirty_visuals(),
+            BTreeSet::from(["call-owner".to_owned()])
+        );
+
+        let during_refresh = dynamic_test_visual(&presentation, "call-owner")
+            .expect("native fallback during dynamic refresh");
+        assert_eq!(during_refresh.route.plugin_id, "bcode.shell");
+        wait_for_dynamic_completion(&presentation);
+        let refreshed =
+            dynamic_test_visual(&presentation, "call-owner").expect("refreshed dynamic visual");
+        assert_eq!(routed_text(&refreshed), "dynamic:success:artifact-1");
+        let unchanged =
+            dynamic_test_visual(&presentation, "call-other").expect("unaffected cached visual");
+        assert_eq!(routed_text(&unchanged), "dynamic:success:artifact-0");
+    }
 
     #[derive(Default)]
     struct StatefulTestAdapter {
@@ -1155,8 +1808,7 @@ mod tests {
             PluginHost::load_static_plugins(&selected).expect("load Git plugin"),
         );
         let route = presentation
-            .host()
-            .visual_adapter("bcode.git.clone_request", 1, "tui", Some("bcode.git"))
+            .visual_route("bcode.git.clone_request", 1, Some("bcode.git"))
             .expect("Git contribution route");
         assert_eq!(route.plugin_id, "bcode.git");
         let registry = presentation.registry("bcode.git").expect("Git registry");

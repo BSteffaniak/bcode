@@ -420,6 +420,7 @@ pub struct TuiRuntimeSettings {
     frame_interval: Option<Duration>,
     metrics_enabled: bool,
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
+    tui_extensions: Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension>,
     launch_working_directory: std::path::PathBuf,
 }
 
@@ -435,6 +436,7 @@ impl TuiRuntimeSettings {
             frame_interval: tui_config.render.frame_interval(),
             metrics_enabled: false,
             static_plugins: static_plugins.to_vec(),
+            tui_extensions: super::bundled_tui_extensions(),
             launch_working_directory,
         }
     }
@@ -451,6 +453,10 @@ impl TuiRuntimeSettings {
 
     pub fn static_plugins(&self) -> &[bcode_plugin::StaticBundledPlugin] {
         &self.static_plugins
+    }
+
+    pub fn tui_extensions(&self) -> &[bcode_plugin_sdk::tui::StaticPluginTuiExtension] {
+        &self.tui_extensions
     }
 
     pub fn launch_working_directory(&self) -> &std::path::Path {
@@ -1034,6 +1040,7 @@ fn apply_config_result(
                 &selection,
                 config.tui.visual_adapters.clone(),
                 settings.static_plugins(),
+                settings.tui_extensions(),
             ) {
                 Ok(presentation) => chat.app.set_plugin_presentation(Arc::new(presentation)),
                 Err(error) => chat

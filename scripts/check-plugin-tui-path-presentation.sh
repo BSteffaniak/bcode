@@ -4,6 +4,16 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
+if rg -n 'bmux_tui|bcode_tui|bcode_ipc|hyperchad|PluginTuiVisualAdapter|PluginTuiArtifactChunk' packages/plugin-sdk/src/tui_visual.rs; then
+  echo "serialized TUI visual contracts must remain renderer-implementation-neutral" >&2
+  exit 1
+fi
+
+if rg -n 'struct (RenderTuiVisual|SerializedTui)|enum SerializedTui|TUI_VISUAL_ADAPTER_INTERFACE_ID' packages/plugin-sdk/src/tui.rs; then
+  echo "serialized TUI visual ABI types belong in the portable tui_visual contract module" >&2
+  exit 1
+fi
+
 if rg -n 'visual_rows_with_context|std::env::current_dir\(\).*PluginTuiVisualRenderContext' packages plugins --glob '*.rs'; then
   echo "plugin TUI visuals must use the single complete render-context API" >&2
   exit 1
