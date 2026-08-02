@@ -55,21 +55,25 @@ contracts.
 
 ## Request metadata
 
-Interactive tool requests carry both:
+Interactive tool requests carry a producer ID plus a versioned exchange schema and opaque payload.
+A selected frontend adapter contributes an `interaction_kind`, the semantic controller kind used by
+clients that support native interaction snapshots and inputs.
 
-* `interaction_kind`: semantic controller kind, for clients that use snapshots and semantic inputs
-* `surface_kind`: renderer-specific surface kind, for terminal/TUI rendering
+Native surface identity is not stored in the shared session-view contract. Each frontend resolves
+its own adapter from the producer ID, exchange schema/version, and platform ID. A TUI adapter may
+then provide a native `tui_surface_kind`; web clients may select a different controller or native
+presentation from the same shared exchange envelope.
 
-For example, the question tool uses:
+For example, the question adapter resolves:
 
 * `interaction_kind = "bcode.question"`
-* `surface_kind = "bcode.question.inline"`
+* `tui_surface_kind = "bcode.question.inline"`
 
 The durable exchange event remains canonical. `SessionView` first projects producer ID, exchange
 schema/version, response policy, and opaque payload without interpreting plugin behavior. A client
-adapter may then enrich the same interaction item with its semantic interaction kind and native
-surface kind. Resolution updates that same transcript identity rather than creating renderer-local
-history.
+adapter may then enrich the same interaction item with its semantic interaction kind while resolving
+native presentation only at its frontend boundary. Resolution updates that same transcript identity
+rather than creating renderer-local history.
 
 Non-terminal clients should key off `interaction_kind` and should not need BMUX or terminal event
 types.

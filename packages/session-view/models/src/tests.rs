@@ -64,6 +64,56 @@ fn snapshot_patch_application_rejects_unknown_schema_versions() {
 }
 
 #[test]
+fn terminal_interaction_patch_state_is_absorbing() {
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.interactions.push(InteractionViewSummary {
+        interaction_id: "interaction".to_owned(),
+        producer_id: Some("example.plugin".to_owned()),
+        exchange_schema: Some("example.request".to_owned()),
+        exchange_schema_version: Some(1),
+        kind: "example.interaction".to_owned(),
+        tool_call_id: Some("call".to_owned()),
+        title: Some("Example".to_owned()),
+        required: true,
+        snapshot: None,
+        state: InteractionViewState::Resolved,
+        status_detail: None,
+        resolved: true,
+        resolution: Some(bcode_session_models::ToolExchangeResolution::Responded {
+            payload: serde_json::json!({"opaque": true}),
+        }),
+    });
+    let mut patch = SessionViewPatch::empty(snapshot.revision, snapshot.revision + 1);
+    patch.interactions.push(InteractionViewSummary {
+        interaction_id: "interaction".to_owned(),
+        producer_id: Some("example.plugin".to_owned()),
+        exchange_schema: Some("example.request".to_owned()),
+        exchange_schema_version: Some(1),
+        kind: "example.interaction".to_owned(),
+        tool_call_id: Some("call".to_owned()),
+        title: Some("Example".to_owned()),
+        required: true,
+        snapshot: Some(serde_json::json!({"stale": true})),
+        state: InteractionViewState::Pending,
+        status_detail: None,
+        resolved: false,
+        resolution: None,
+    });
+
+    snapshot
+        .apply_patch(&patch)
+        .expect("apply interaction patch");
+
+    assert!(snapshot.interactions[0].resolved);
+    assert_eq!(
+        snapshot.interactions[0].resolution,
+        Some(bcode_session_models::ToolExchangeResolution::Responded {
+            payload: serde_json::json!({"opaque": true}),
+        })
+    );
+}
+
+#[test]
 fn renderer_tool_presentation_fixtures_round_trip_with_stable_primary_identity() {
     let fixtures = super::renderer_fixtures::renderer_tool_presentation_fixtures();
     assert_eq!(fixtures.len(), 14);

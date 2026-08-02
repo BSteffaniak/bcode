@@ -212,7 +212,10 @@ fn interaction_notice(
             }
             div color=(color::MUTED) font-size=((typeface::LABEL)) { (interaction.kind) @if interaction.required { " · required" } }
             @if let Some(resolution) = &interaction.resolution {
-                (json_panel("resolution", resolution))
+                (json_panel(
+                    "resolution",
+                    &serde_json::to_value(resolution).unwrap_or(serde_json::Value::Null),
+                ))
             } @else if let Some(snapshot) = &interaction.snapshot {
                 (json_panel("snapshot", snapshot))
             }

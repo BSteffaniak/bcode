@@ -1960,16 +1960,12 @@ pub async fn load_pending_interactions(
             || exchange.schema.clone(),
             |adapter| adapter.interaction_kind.clone(),
         );
-        let surface_kind = adapter
-            .and_then(|adapter| adapter.tui_surface_kind)
-            .unwrap_or_else(|| exchange.schema.clone());
         interactions.push(bcode_session_view_models::InteractionViewSummary {
             interaction_id,
             producer_id: Some(producer_id),
             exchange_schema: Some(exchange_schema),
             exchange_schema_version: Some(exchange_schema_version),
             kind,
-            surface_kind,
             tool_call_id: Some(exchange.invocation_id),
             title: Some(exchange.producer_id),
             required: exchange.response_policy

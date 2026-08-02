@@ -320,7 +320,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 15;
+    pub const SCHEMA_VERSION: u16 = 16;
 
     /// Create an empty snapshot.
     #[must_use]
@@ -489,7 +489,7 @@ pub struct SessionViewPatch {
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 15;
+    pub const SCHEMA_VERSION: u16 = 16;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -838,6 +838,13 @@ fn upsert_interactions(
     updates: &[InteractionViewSummary],
 ) {
     for update in updates {
+        if let Some(existing) = target
+            .iter()
+            .find(|existing| existing.interaction_id == update.interaction_id)
+            && existing.resolved
+        {
+            continue;
+        }
         upsert_by(target, update.clone(), |interaction| {
             interaction.interaction_id.as_str()
         });
@@ -1618,9 +1625,6 @@ pub struct InteractionViewSummary {
     pub exchange_schema_version: Option<u32>,
     /// Interaction kind.
     pub kind: String,
-    /// Renderer-specific surface key supplied by the interaction owner.
-    #[serde(default)]
-    pub surface_kind: String,
     /// Associated tool call identifier, when known.
     pub tool_call_id: Option<String>,
     /// Optional title for display.
@@ -1639,9 +1643,9 @@ pub struct InteractionViewSummary {
     /// Whether the interaction has been durably resolved.
     #[serde(default)]
     pub resolved: bool,
-    /// Durable resolution payload, when resolved.
+    /// Canonical durable resolution, when resolved.
     #[serde(default)]
-    pub resolution: Option<serde_json::Value>,
+    pub resolution: Option<bcode_session_models::ToolExchangeResolution>,
 }
 
 /// Prompt placement semantics for renderer-neutral prompt submission.

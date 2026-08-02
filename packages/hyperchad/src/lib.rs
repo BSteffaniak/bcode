@@ -653,9 +653,6 @@ async fn hydrate_pending_interactions(
             || exchange.schema.clone(),
             |adapter| adapter.interaction_kind.clone(),
         );
-        let surface_kind = adapter
-            .and_then(|adapter| adapter.tui_surface_kind)
-            .unwrap_or_else(|| exchange.schema.clone());
         let state = if validation_error.is_some() {
             bcode_session_view_models::InteractionViewState::ValidationError
         } else {
@@ -668,7 +665,6 @@ async fn hydrate_pending_interactions(
             exchange_schema_version: Some(exchange.schema_version),
             interaction_id,
             kind,
-            surface_kind,
             tool_call_id: Some(exchange.invocation_id),
             title: Some(exchange.producer_id),
             required: exchange.response_policy

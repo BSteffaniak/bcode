@@ -1101,7 +1101,7 @@ fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -
             || format!("{label} ({state})"),
             |resolution| {
                 let resolution = serde_json::to_string_pretty(resolution)
-                    .unwrap_or_else(|_| resolution.to_string());
+                    .unwrap_or_else(|_| format!("{resolution:?}"));
                 format!("{label} ({state})\n{resolution}")
             },
         )
@@ -1294,7 +1294,6 @@ mod tests {
             exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
-            surface_kind: "bcode.question.inline".to_owned(),
             tool_call_id: None,
             title: Some("* literal title".to_owned()),
             required: true,
@@ -1322,7 +1321,6 @@ mod tests {
             exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
-            surface_kind: "bcode.question.inline".to_owned(),
             tool_call_id: Some("call-1".to_owned()),
             title: Some("Question".to_owned()),
             required: true,
@@ -1349,7 +1347,6 @@ mod tests {
             exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
-            surface_kind: "bcode.question.inline".to_owned(),
             tool_call_id: Some("call-1".to_owned()),
             title: Some("Question".to_owned()),
             required: true,
@@ -1357,7 +1354,9 @@ mod tests {
             state: bcode_session_view_models::InteractionViewState::Resolved,
             status_detail: None,
             resolved: true,
-            resolution: Some(serde_json::json!({"status": "answered", "selected": ["yes"]})),
+            resolution: Some(bcode_session_models::ToolExchangeResolution::Responded {
+                payload: serde_json::json!({"status": "answered", "selected": ["yes"]}),
+            }),
         };
 
         let item = terminal_interaction_item_from_shared(&interaction);

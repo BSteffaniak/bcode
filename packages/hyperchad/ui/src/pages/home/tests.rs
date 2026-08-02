@@ -224,7 +224,6 @@ fn non_tool_interaction_fixture_items() -> Vec<TranscriptViewItem> {
         exchange_schema_version: None,
         interaction_id: id.to_owned(),
         kind: "fixture.interaction".to_owned(),
-        surface_kind: "fixture.surface".to_owned(),
         tool_call_id: Some(format!("call-{id}")),
         title: Some(format!("Interaction {id}")),
         required: true,
@@ -487,7 +486,6 @@ fn repeated_domain_components_use_stable_semantic_identities() {
         exchange_schema_version: None,
         interaction_id: interaction_id.to_owned(),
         kind: "future.interaction".to_owned(),
-        surface_kind: "future.surface".to_owned(),
         tool_call_id: None,
         title: Some("Interaction".to_owned()),
         required: false,
@@ -1241,7 +1239,6 @@ fn unknown_interactions_keep_bounded_active_controls_and_resolved_history() {
         exchange_schema_version: None,
         interaction_id: "interaction-unknown".to_owned(),
         kind: "future.interaction".to_owned(),
-        surface_kind: "future.surface".to_owned(),
         tool_call_id: Some("call-unknown".to_owned()),
         title: Some("Future interaction".to_owned()),
         required: true,
@@ -1255,14 +1252,16 @@ fn unknown_interactions_keep_bounded_active_controls_and_resolved_history() {
         state: bcode_session_view_models::InteractionViewState::Pending,
         status_detail: None,
         resolved: true,
-        resolution: Some(serde_json::json!({"status": "cancelled"})),
+        resolution: Some(bcode_session_models::ToolExchangeResolution::Cancelled),
         ..active.clone()
     };
     let resolved = InteractionViewSummary {
         state: bcode_session_view_models::InteractionViewState::Pending,
         status_detail: None,
         resolved: true,
-        resolution: Some(serde_json::json!({"status": "future-resolved"})),
+        resolution: Some(bcode_session_models::ToolExchangeResolution::Responded {
+            payload: serde_json::json!({"status": "future-resolved"}),
+        }),
         ..active.clone()
     };
 
@@ -1315,7 +1314,6 @@ fn question_snapshot_renders_polished_controls_and_generic_fallback() {
         exchange_schema_version: None,
         interaction_id: "interaction-1".to_owned(),
         kind: "bcode.question".to_owned(),
-        surface_kind: "bcode.question.inline".to_owned(),
         tool_call_id: Some("call-1".to_owned()),
         title: Some("Choose".to_owned()),
         required: true,
@@ -1388,7 +1386,6 @@ fn question_snapshot_renders_multiple_checkbox_and_exclusive_custom_semantics() 
         exchange_schema_version: None,
         interaction_id: "interaction-multiple".to_owned(),
         kind: "bcode.question".to_owned(),
-        surface_kind: "bcode.question.inline".to_owned(),
         tool_call_id: Some("call-multiple".to_owned()),
         title: Some("Choose several".to_owned()),
         required: false,
@@ -2800,7 +2797,6 @@ fn active_interaction_controls_replace_only_matching_pending_timeline_summary() 
         exchange_schema_version: None,
         interaction_id: id.to_owned(),
         kind: "fixture.interaction".to_owned(),
-        surface_kind: "fixture.surface".to_owned(),
         tool_call_id: Some(format!("call-{id}")),
         title: Some(format!("Interaction {id}")),
         required: true,

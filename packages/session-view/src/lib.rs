@@ -118,7 +118,6 @@ fn interaction_from_exchange_request(
         exchange_schema: Some(request.schema.clone()),
         exchange_schema_version: Some(request.schema_version),
         kind: request.schema.clone(),
-        surface_kind: String::new(),
         tool_call_id: Some(request.invocation_id.clone()),
         title: Some(request.producer_id.clone()),
         required: request.response_policy
@@ -162,7 +161,6 @@ fn terminal_interaction_without_request(
         exchange_schema: None,
         exchange_schema_version: None,
         kind: "bcode.tool.exchange".to_owned(),
-        surface_kind: String::new(),
         tool_call_id: None,
         title: Some("Interaction".to_owned()),
         required: false,
@@ -170,17 +168,14 @@ fn terminal_interaction_without_request(
         state: interaction_state_for_resolution(resolution),
         status_detail: interaction_status_detail(resolution),
         resolved: true,
-        resolution: Some(interaction_resolution_payload(resolution)),
+        resolution: Some(resolution.clone()),
     }
 }
 
-fn interaction_state_for_resolution(
+const fn interaction_state_for_resolution(
     resolution: &bcode_session_models::ToolExchangeResolution,
 ) -> InteractionViewState {
     match resolution {
-        bcode_session_models::ToolExchangeResolution::Responded { payload } if matches!(payload.get("status"), Some(serde_json::Value::String(status)) if status == "dismissed") => {
-            InteractionViewState::Cancelled
-        }
         bcode_session_models::ToolExchangeResolution::Responded { .. } => {
             InteractionViewState::Resolved
         }
@@ -200,9 +195,6 @@ fn interaction_status_detail(
     resolution: &bcode_session_models::ToolExchangeResolution,
 ) -> Option<String> {
     match resolution {
-        bcode_session_models::ToolExchangeResolution::Responded { payload } if matches!(payload.get("status"), Some(serde_json::Value::String(status)) if status == "dismissed") => {
-            Some("dismissed".to_owned())
-        }
         bcode_session_models::ToolExchangeResolution::Responded { .. } => None,
         bcode_session_models::ToolExchangeResolution::Cancelled => Some("cancelled".to_owned()),
         bcode_session_models::ToolExchangeResolution::TimedOut => Some("timed out".to_owned()),
@@ -214,29 +206,6 @@ fn interaction_status_detail(
         }
         bcode_session_models::ToolExchangeResolution::Failed { code, message } => {
             Some(format!("{code}: {message}"))
-        }
-    }
-}
-
-fn interaction_resolution_payload(
-    resolution: &bcode_session_models::ToolExchangeResolution,
-) -> serde_json::Value {
-    match resolution {
-        bcode_session_models::ToolExchangeResolution::Responded { payload } => payload.clone(),
-        bcode_session_models::ToolExchangeResolution::Cancelled => {
-            serde_json::json!({"status": "cancelled"})
-        }
-        bcode_session_models::ToolExchangeResolution::TimedOut => {
-            serde_json::json!({"status": "timed_out"})
-        }
-        bcode_session_models::ToolExchangeResolution::NoCompatibleConsumer => {
-            serde_json::json!({"status": "no_compatible_consumer"})
-        }
-        bcode_session_models::ToolExchangeResolution::ConsumerDetached => {
-            serde_json::json!({"status": "consumer_detached"})
-        }
-        bcode_session_models::ToolExchangeResolution::Failed { code, message } => {
-            serde_json::json!({"status": "failed", "code": code, "message": message})
         }
     }
 }
@@ -414,6 +383,7 @@ pub struct SessionView {
     contribution_sequences: BTreeMap<String, u64>,
     contribution_placements: BTreeMap<String, bcode_session_models::ToolContributionPlacement>,
     terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
+    terminal_interactions: BTreeMap<String, bcode_session_models::ToolExchangeResolution>,
     live_reasoning: BTreeMap<(String, String), LiveReasoningActivity>,
     last_text_stream_updates:
         BTreeMap<TranscriptViewItemId, bcode_session_models::TextStreamUpdate>,
@@ -439,6 +409,7 @@ impl SessionView {
             contribution_sequences: BTreeMap::new(),
             contribution_placements: BTreeMap::new(),
             terminal_runtime_work: BTreeSet::new(),
+            terminal_interactions: BTreeMap::new(),
             live_reasoning: BTreeMap::new(),
             last_text_stream_updates: BTreeMap::new(),
             streaming_presentation_policy: StreamingPresentationPolicy::immediate(),
@@ -850,6 +821,12 @@ impl SessionView {
             self.bump_revision();
         }
         for interaction in interactions {
+            if self
+                .terminal_interactions
+                .contains_key(&interaction.interaction_id)
+            {
+                continue;
+            }
             self.upsert_interaction(merge_hydrated_interaction(
                 self.snapshot
                     .interactions
@@ -862,6 +839,13 @@ impl SessionView {
 
     /// Insert or replace renderer-neutral interaction state hydrated from the daemon.
     pub fn upsert_interaction(&mut self, interaction: InteractionViewSummary) {
+        if self
+            .terminal_interactions
+            .contains_key(&interaction.interaction_id)
+            && !interaction.resolved
+        {
+            return;
+        }
         self.upsert_interaction_item(interaction, 0, None);
     }
 
@@ -938,6 +922,7 @@ impl SessionView {
             .collect::<Vec<_>>();
         let mut replacement = Self::new();
         replacement.streaming_presentation_policy = self.streaming_presentation_policy;
+        replacement.terminal_interactions = self.terminal_interactions.clone();
         replacement.snapshot.session_id = previous.session_id;
         replacement.snapshot.title = previous.title;
         replacement.snapshot.working_directory = previous.working_directory;
@@ -1720,6 +1705,12 @@ impl SessionView {
                 );
             }
             SessionEventKind::ToolExchangeRequested { request } => {
+                if self
+                    .terminal_interactions
+                    .contains_key(&request.exchange_id)
+                {
+                    return;
+                }
                 self.snapshot.active_exchanges.insert(
                     format!("{}:{}", request.invocation_id, request.exchange_id),
                     request.clone(),
@@ -1735,6 +1726,9 @@ impl SessionView {
                     "{}:{}",
                     resolution.invocation_id, resolution.exchange_id
                 ));
+                self.terminal_interactions
+                    .entry(resolution.exchange_id.clone())
+                    .or_insert_with(|| resolution.resolution.clone());
                 self.resolve_interaction_item(
                     &resolution.exchange_id,
                     &resolution.resolution,
@@ -3451,6 +3445,12 @@ impl SessionView {
             .iter_mut()
             .find(|existing| existing.interaction_id == interaction.interaction_id)
         {
+            if existing.resolved && !interaction.resolved {
+                return;
+            }
+            if existing.resolved && interaction.resolved {
+                return;
+            }
             if *existing == interaction {
                 return;
             }
@@ -3525,7 +3525,7 @@ impl SessionView {
         interaction.state = interaction_state_for_resolution(resolution);
         interaction.status_detail = interaction_status_detail(resolution);
         interaction.resolved = true;
-        interaction.resolution = Some(interaction_resolution_payload(resolution));
+        interaction.resolution = Some(resolution.clone());
         let interaction = interaction.clone();
         let Some(id) = self.interaction_item_ids.get(interaction_id).cloned() else {
             self.upsert_interaction_item(interaction, sequence, timestamp_ms);
@@ -5250,7 +5250,6 @@ mod tests {
             &pending.kind,
             TranscriptViewItemKind::Interaction { interaction }
                 if interaction.kind == "future.question/schema"
-                    && interaction.surface_kind.is_empty()
                     && interaction.required
                     && interaction.snapshot
                         == Some(serde_json::json!({"opaque_question": true}))
@@ -5275,7 +5274,9 @@ mod tests {
                 if interaction.state == InteractionViewState::Resolved
                     && interaction.resolved
                     && interaction.resolution
-                        == Some(serde_json::json!({"opaque_answer": 42}))
+                        == Some(bcode_session_models::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({"opaque_answer": 42}),
+                        })
         ));
         assert_eq!(
             view.snapshot()
@@ -5286,6 +5287,60 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn terminal_interaction_ignores_stale_request_and_pending_hydration() {
+        let session_id = SessionId::new();
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call".to_owned(),
+            exchange_id: "interaction".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"request": true}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let resolution = bcode_session_models::ToolExchangeResolution::Responded {
+            payload: serde_json::json!({"opaque": true}),
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolExchangeRequested {
+                request: request.clone(),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: request.invocation_id.clone(),
+                    exchange_id: request.exchange_id.clone(),
+                    resolution: resolution.clone(),
+                },
+            },
+        ));
+
+        view.upsert_interaction(interaction_from_exchange_request(&request));
+        view.set_pending_interactions(vec![interaction_from_exchange_request(&request)]);
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::ToolExchangeRequested { request },
+        ));
+
+        assert!(view.snapshot().active_exchanges.is_empty());
+        let interaction = view
+            .snapshot()
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == "interaction")
+            .expect("terminal interaction");
+        assert!(interaction.resolved);
+        assert_eq!(interaction.resolution, Some(resolution));
     }
 
     #[test]
@@ -5312,8 +5367,54 @@ mod tests {
                     && interaction.resolved
                     && interaction.status_detail.as_deref() == Some("timed out")
                     && interaction.resolution
-                        == Some(serde_json::json!({"status": "timed_out"}))
+                        == Some(bcode_session_models::ToolExchangeResolution::TimedOut)
         ));
+    }
+
+    #[test]
+    fn terminal_interaction_survives_history_window_rebuild() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: "call".to_owned(),
+                    exchange_id: "interaction".to_owned(),
+                    resolution: bcode_session_models::ToolExchangeResolution::TimedOut,
+                },
+            },
+        ));
+
+        view.rebuild_history_window(&[]);
+        view.set_pending_interactions(vec![InteractionViewSummary {
+            producer_id: Some("example.plugin".to_owned()),
+            exchange_schema: Some("example.request".to_owned()),
+            exchange_schema_version: Some(1),
+            interaction_id: "interaction".to_owned(),
+            kind: "example.interaction".to_owned(),
+            tool_call_id: Some("call".to_owned()),
+            title: Some("Example".to_owned()),
+            required: true,
+            snapshot: Some(serde_json::json!({})),
+            state: InteractionViewState::Pending,
+            status_detail: None,
+            resolved: false,
+            resolution: None,
+        }]);
+
+        let interaction = view
+            .snapshot()
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == "interaction")
+            .expect("retained terminal interaction");
+        assert!(interaction.resolved);
+        assert_eq!(
+            interaction.resolution,
+            Some(bcode_session_models::ToolExchangeResolution::TimedOut)
+        );
     }
 
     #[test]
@@ -5323,8 +5424,8 @@ mod tests {
                 bcode_session_models::ToolExchangeResolution::Responded {
                     payload: serde_json::json!({"status": "dismissed"}),
                 },
-                InteractionViewState::Cancelled,
-                Some("dismissed"),
+                InteractionViewState::Resolved,
+                None,
             ),
             (
                 bcode_session_models::ToolExchangeResolution::Cancelled,
@@ -8541,7 +8642,6 @@ mod tests {
             exchange_schema_version: Some(1),
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
-            surface_kind: "bcode.question.inline".to_owned(),
             tool_call_id: Some("call-1".to_owned()),
             title: Some("Question".to_owned()),
             required: true,
@@ -8554,7 +8654,6 @@ mod tests {
 
         let interaction = &view.snapshot().interactions[0];
         assert_eq!(interaction.kind, "bcode.question");
-        assert_eq!(interaction.surface_kind, "bcode.question.inline");
         assert_eq!(interaction.producer_id.as_deref(), Some("bcode.question"));
         assert_eq!(
             interaction.exchange_schema.as_deref(),
@@ -8589,7 +8688,6 @@ mod tests {
             exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
-            surface_kind: "bcode.question.inline".to_owned(),
             tool_call_id: Some("call-1".to_owned()),
             title: Some("Question".to_owned()),
             required: true,
@@ -8621,7 +8719,6 @@ mod tests {
             exchange_schema_version: None,
             interaction_id: "question-1".to_owned(),
             kind: "bcode.question".to_owned(),
-            surface_kind: "bcode.question.inline".to_owned(),
             tool_call_id: Some("call-1".to_owned()),
             title: Some("Question".to_owned()),
             required: true,
@@ -8629,7 +8726,9 @@ mod tests {
             state: bcode_session_view_models::InteractionViewState::Resolved,
             status_detail: None,
             resolved: true,
-            resolution: Some(serde_json::json!({"status": "answered"})),
+            resolution: Some(bcode_session_models::ToolExchangeResolution::Responded {
+                payload: serde_json::json!({"status": "answered"}),
+            }),
         });
         let resolved = view
             .snapshot()
@@ -8643,7 +8742,10 @@ mod tests {
             &resolved.kind,
             TranscriptViewItemKind::Interaction { interaction }
                 if interaction.resolved
-                    && interaction.resolution == Some(serde_json::json!({"status": "answered"}))
+                    && interaction.resolution
+                        == Some(bcode_session_models::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({"status": "answered"}),
+                        })
         ));
         assert_eq!(
             view.snapshot()
@@ -8664,7 +8766,6 @@ mod tests {
             exchange_schema_version: None,
             interaction_id: id.to_owned(),
             kind: "question".to_owned(),
-            surface_kind: "question.inline".to_owned(),
             tool_call_id: Some("call".to_owned()),
             title: Some("Question".to_owned()),
             required: true,

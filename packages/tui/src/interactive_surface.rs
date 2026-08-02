@@ -45,6 +45,8 @@ impl bcode_plugin_sdk::tui::PluginTuiTextInputResolver for InteractiveTextInputR
 }
 
 const SURFACE_OPEN_RETRY_DELAY: Duration = Duration::from_secs(2);
+const MAX_INTERACTION_SCRATCH_ROWS: u16 = 512;
+const MAX_INTERACTION_SCRATCH_CELLS: usize = 131_072;
 
 /// Queued request to open one client-rendered interactive surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +230,22 @@ impl InteractiveSurfaceState {
         .await
     }
 
+    /// Update configured composer-like text input intent without reopening the surface.
+    pub fn update_keymap(&mut self, keymap: &BmuxKeyMap) {
+        self.host
+            .set_text_input_resolver(Arc::new(InteractiveTextInputResolver {
+                keymap: keymap.clone(),
+            }));
+    }
+
+    #[cfg(test)]
+    fn text_edit_command_for_test(
+        &self,
+        stroke: bmux_keyboard::KeyStroke,
+    ) -> Option<bmux_text_edit::TextEditCommand> {
+        bcode_plugin_sdk::tui::PluginTuiHost::text_edit_command(&self.host, stroke)
+    }
+
     /// Return the interaction id associated with this surface.
     #[must_use]
     pub fn interaction_id(&self) -> &str {
@@ -243,7 +261,7 @@ impl InteractiveSurfaceState {
     /// Return preferred rendered height at `width`.
     #[must_use]
     pub fn preferred_height(&mut self, width: u16) -> u16 {
-        self.surface.preferred_height(width)
+        bounded_surface_height(width, self.surface.preferred_height(width))
     }
 
     /// Render the interactive surface.
@@ -260,6 +278,11 @@ impl InteractiveSurfaceState {
         frame: &mut Frame<'_>,
     ) {
         if full_area.is_empty() || destination.is_empty() {
+            return;
+        }
+        let bounded_height = bounded_surface_height(full_area.width, full_area.height);
+        let full_area = Rect::new(full_area.x, full_area.y, full_area.width, bounded_height);
+        if visible_content_offset >= bounded_height {
             return;
         }
         let mut buffer = bmux_tui::buffer::Buffer::empty(full_area);
@@ -373,6 +396,16 @@ impl InteractiveSurfaceState {
     }
 }
 
+fn bounded_surface_height(width: u16, preferred_height: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    let row_limit = MAX_INTERACTION_SCRATCH_ROWS;
+    let cell_limit =
+        u16::try_from(MAX_INTERACTION_SCRATCH_CELLS / usize::from(width)).unwrap_or(u16::MAX);
+    preferred_height.min(row_limit).min(cell_limit)
+}
+
 async fn open_surface(
     runtime: &PluginRuntimeHost,
     interaction_id: &str,
@@ -466,6 +499,19 @@ mod tests {
         question_surface_with_config(questions, &bcode_config::TuiConfig::default()).await
     }
 
+    #[test]
+    fn preferred_height_is_bounded_by_rows_and_checked_cell_budget() {
+        assert_eq!(bounded_surface_height(0, u16::MAX), 0);
+        assert_eq!(
+            bounded_surface_height(1, u16::MAX),
+            MAX_INTERACTION_SCRATCH_ROWS
+        );
+        assert_eq!(bounded_surface_height(u16::MAX, u16::MAX), 2);
+        let height = bounded_surface_height(400, u16::MAX);
+        assert!(height <= MAX_INTERACTION_SCRATCH_ROWS);
+        assert!(usize::from(height) * 400 <= MAX_INTERACTION_SCRATCH_CELLS);
+    }
+
     #[tokio::test]
     async fn clipped_surface_rendering_and_mouse_translation_preserve_full_coordinates() {
         let mut surface = question_surface(serde_json::json!([{
@@ -543,6 +589,43 @@ mod tests {
         assert!(queue.front_ready(now).is_none());
         assert_eq!(queue.next_retry_at(), Some(now + SURFACE_OPEN_RETRY_DELAY));
         assert!(queue.front_ready(now + SURFACE_OPEN_RETRY_DELAY).is_some());
+    }
+
+    #[tokio::test]
+    async fn active_surface_keymap_updates_without_reopening() {
+        let mut surface = question_surface(serde_json::json!([{
+            "header": null,
+            "question": "Explain?",
+            "options": [],
+            "control": "radio",
+            "selection_mode": "single",
+            "custom": true,
+            "custom_mode": "additional",
+            "required": true
+        }]))
+        .await;
+        let stroke = KeyStroke {
+            key: KeyCode::Char('b'),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        };
+        assert_eq!(surface.text_edit_command_for_test(stroke), None);
+
+        let mut config = bcode_config::TuiConfig::default();
+        config
+            .keybindings
+            .chat
+            .insert("ctrl+b".to_owned(), "tui.editor.moveCursorLeft".to_owned());
+        surface.update_keymap(&BmuxKeyMap::from_config(&config));
+
+        assert_eq!(
+            surface.text_edit_command_for_test(stroke),
+            Some(bmux_text_edit::TextEditCommand::Move(
+                bmux_text_edit::TextMotion::Left
+            ))
+        );
     }
 
     #[tokio::test]

@@ -1056,6 +1056,9 @@ fn apply_config_result(
                     .set_status(format!("plugin presentation unavailable: {error}")),
             }
             chat.app.apply_tui_config(config.tui.clone());
+            if let Some(surface) = loop_state.interactive_surface.as_mut() {
+                surface.update_keymap(&settings.keymap);
+            }
             let _ = chat.app.apply_presentation_config(config.presentation);
             chat.replace_effect(TuiEffect::ReconcileAuthSecurity {
                 config: Box::new(config),
@@ -2687,11 +2690,7 @@ fn interaction_surface_request(
     if interaction.resolved {
         return None;
     }
-    let surface_kind = if interaction.surface_kind.is_empty() {
-        interaction_adapter_for_summary(interaction)?.tui_surface_kind?
-    } else {
-        interaction.surface_kind.clone()
-    };
+    let surface_kind = interaction_adapter_for_summary(interaction)?.tui_surface_kind?;
     Some(InteractiveSurfaceRequest::new(
         interaction.interaction_id.clone(),
         surface_kind,
@@ -4162,17 +4161,13 @@ mod scheduler_tests {
         assert_eq!(chat.app.pending_reasoning_effort_generation(), Some(newer));
     }
 
-    fn interaction(
-        id: &str,
-        surface_kind: &str,
-    ) -> bcode_session_view_models::InteractionViewSummary {
+    fn interaction(id: &str) -> bcode_session_view_models::InteractionViewSummary {
         bcode_session_view_models::InteractionViewSummary {
-            producer_id: None,
-            exchange_schema: None,
-            exchange_schema_version: None,
+            producer_id: Some("bcode.question".to_owned()),
+            exchange_schema: Some("bcode.question.request".to_owned()),
+            exchange_schema_version: Some(1),
             interaction_id: id.to_owned(),
             kind: "bcode.question".to_owned(),
-            surface_kind: surface_kind.to_owned(),
             tool_call_id: Some(format!("call-{id}")),
             title: Some("Question".to_owned()),
             required: true,
@@ -4205,8 +4200,8 @@ mod scheduler_tests {
             &BcodeClient::default_endpoint(),
             false,
         );
-        let first = interaction("first", "bcode.question.inline");
-        let second = interaction("second", "bcode.question.inline");
+        let first = interaction("first");
+        let second = interaction("second");
         reconcile_interactive_surfaces(&mut state, &[first.clone(), second.clone()]);
         reconcile_interactive_surfaces(&mut state, &[first, second.clone()]);
         assert_eq!(
@@ -4228,7 +4223,7 @@ mod scheduler_tests {
             &BcodeClient::default_endpoint(),
             false,
         );
-        let request = interaction("question-1", "bcode.question.inline");
+        let request = interaction("question-1");
         reconcile_interactive_surfaces(&mut state, std::slice::from_ref(&request));
         reconcile_interactive_surfaces(&mut state, &[request]);
         assert_eq!(
@@ -4290,9 +4285,9 @@ mod scheduler_tests {
                 "required": true
             }]
         });
-        let mut first = interaction("first", "bcode.question.inline");
+        let mut first = interaction("first");
         first.snapshot = Some(payload.clone());
-        let mut second = interaction("second", "bcode.question.inline");
+        let mut second = interaction("second");
         second.snapshot = Some(payload);
         reconcile_interactive_surfaces(&mut state, &[first, second]);
         let mut chat = test_chat();

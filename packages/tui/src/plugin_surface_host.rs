@@ -190,7 +190,13 @@ impl PluginTuiHost for BcodePluginTuiHost {
         let client = self.client.clone();
         let redraw_sender = self.redraw_sender.clone();
         drop(self.handle.spawn(async move {
-            stream_plugin_session_view(client, request, sender, redraw_sender).await;
+            Box::pin(stream_plugin_session_view(
+                client,
+                request,
+                sender,
+                redraw_sender,
+            ))
+            .await;
         }));
         Ok(PluginSessionViewSubscription { receiver })
     }

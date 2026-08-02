@@ -32,6 +32,7 @@ pub struct QuestionTerminalRenderer {
     content_height: u16,
     custom_inputs: BTreeMap<usize, TextInputState>,
     custom_areas: BTreeMap<usize, Rect>,
+    pending_custom_mouse_focus: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,6 +517,15 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
     }
 
     fn render(&mut self, snapshot: &QuestionSnapshot, area: Rect, frame: &mut Frame<'_>) {
+        if let Some(question_index) = self.pending_custom_mouse_focus
+            && matches!(
+                snapshot.focus,
+                QuestionFocusTarget::Custom { question_index: focused }
+                    if focused == question_index
+            )
+        {
+            self.pending_custom_mouse_focus = None;
+        }
         self.last_area = area;
         self.controls.clear();
         self.custom_areas.clear();
@@ -554,6 +564,22 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         snapshot: &QuestionSnapshot,
         host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> Option<InteractionInput> {
+        if let Event::Mouse(mouse) = event
+            && let Some(question_index) =
+                self.custom_areas.iter().find_map(|(question_index, area)| {
+                    area.contains(mouse.position).then_some(*question_index)
+                })
+            && snapshot.focus != (QuestionFocusTarget::Custom { question_index })
+        {
+            if let Some(state) = self.custom_inputs.get_mut(&question_index) {
+                TextInputControl::new(&TextInputPolicy::chat_composer())
+                    .handle_mouse(state, *mouse);
+            }
+            self.pending_custom_mouse_focus = Some(question_index);
+            return Some(InteractionInput::Focus {
+                control_id: custom_control_id(question_index),
+            });
+        }
         if let Event::Key(stroke) = event
             && host.text_submit(*stroke)
             && matches!(
@@ -1097,6 +1123,53 @@ mod tests {
                 && control.area.bottom() <= area.bottom()
         }));
         assert!(rendered_text(&scrolled).contains("↑ more"));
+    }
+
+    #[test]
+    fn clicking_an_unfocused_custom_input_focuses_and_places_cursor_on_first_click() {
+        let request = NormalizedQuestionRequest {
+            questions: vec![
+                question("First", &[("One", None)], false, false),
+                question("Second", &[], true, true),
+            ],
+        };
+        let mut controller = QuestionInteractionController::new(request);
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(1),
+            value: InteractionValue::String("abcd".to_owned()),
+        });
+        controller.handle_input(InteractionInput::Focus {
+            control_id: option_control_id(0, 0),
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+        let snapshot = controller.snapshot();
+        let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 40, 30));
+        let area = renderer.custom_inputs[&1].content_area();
+        let input = renderer
+            .input(
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(area.x, area.y),
+                )),
+                &snapshot,
+                &TEST_HOST,
+            )
+            .expect("focus custom field");
+        assert_eq!(
+            input,
+            InteractionInput::Focus {
+                control_id: custom_control_id(1),
+            }
+        );
+        controller.handle_input(input);
+        let focused = controller.snapshot();
+        let _buffer = render_snapshot(&mut renderer, &focused, Rect::new(0, 0, 40, 30));
+        assert_eq!(
+            focused.focus,
+            QuestionFocusTarget::Custom { question_index: 1 }
+        );
+        assert!(renderer.pending_custom_mouse_focus.is_none());
+        assert!(renderer.custom_inputs[&1].buffer().cursor_byte_index() < "abcd".len());
     }
 
     #[test]

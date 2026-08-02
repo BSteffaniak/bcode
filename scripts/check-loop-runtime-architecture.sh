@@ -40,6 +40,29 @@ if rg -n 'turn_tool_policies|FollowupCommand::(UserMessage|AdmittedTurn|Continue
   violations=1
 fi
 
+if rg -n 'payload\.get\("status"\)|resolution\.get\("status"\)' \
+  packages/session-view packages/session-view/models --glob '*.rs' \
+  >/tmp/bcode-interaction-opaque-payload-semantics.txt; then
+  echo "Runtime architecture violation: shared interaction projection interpreted opaque producer response payloads." >&2
+  cat /tmp/bcode-interaction-opaque-payload-semantics.txt >&2
+  violations=1
+fi
+
+if rg -n 'surface_kind' packages/session-view packages/session-view/models --glob '*.rs' \
+  >/tmp/bcode-session-view-native-surface.txt; then
+  echo "Runtime architecture violation: shared session-view contracts contain renderer-native surface identity." >&2
+  cat /tmp/bcode-session-view-native-surface.txt >&2
+  violations=1
+fi
+
+if cargo tree -p bcode_question_plugin --no-default-features --features dynamic-export -e features \
+  | rg 'bmux_(tui|keyboard|text_edit)|bcode_plugin_sdk feature "tui"' \
+  >/tmp/bcode-question-dynamic-tui-dependencies.txt; then
+  echo "Runtime architecture violation: dynamic question service build depends on native TUI/input crates." >&2
+  cat /tmp/bcode-question-dynamic-tui-dependencies.txt >&2
+  violations=1
+fi
+
 production_core_sources="$(mktemp)"
 trap 'rm -f "$production_core_sources"' EXIT
 for file in \

@@ -76,12 +76,10 @@ fn effective_interaction_state(
     if interaction.resolved
         && interaction.state == bcode_session_view_models::InteractionViewState::Pending
     {
-        let cancelled = interaction
-            .resolution
-            .as_ref()
-            .and_then(|resolution| resolution.get("status"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|status| matches!(status, "cancelled" | "dismissed"));
+        let cancelled = matches!(
+            interaction.resolution,
+            Some(bcode_session_models::ToolExchangeResolution::Cancelled)
+        );
         if cancelled {
             bcode_session_view_models::InteractionViewState::Cancelled
         } else {
@@ -147,7 +145,10 @@ pub(super) fn interaction_request(
         }
         @if interaction.resolved {
             @if let Some(resolution) = &interaction.resolution {
-                (json_panel("resolution", resolution))
+                (json_panel(
+                    "resolution",
+                    &serde_json::to_value(resolution).unwrap_or(serde_json::Value::Null),
+                ))
             }
         } @else {
             @if interaction.kind == "bcode.question" {

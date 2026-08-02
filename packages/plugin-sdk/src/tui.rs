@@ -1143,6 +1143,11 @@ impl TokioPluginTuiHost {
         self.text_input = Some(resolver);
         self
     }
+
+    /// Replace the host-configured composer-like text input resolver.
+    pub fn set_text_input_resolver(&mut self, resolver: Arc<dyn PluginTuiTextInputResolver>) {
+        self.text_input = Some(resolver);
+    }
 }
 
 impl PluginTuiHost for TokioPluginTuiHost {
