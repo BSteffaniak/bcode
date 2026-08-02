@@ -562,14 +562,14 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
         dispatch_fake_reasoning_turn(
             turn,
             text.to_owned(),
-            fake_tool_delta_delay(request),
+            fake_stream_delta_delay(request),
             request_input_tokens,
         );
     } else if let Some(text) = last_user_text(&request.messages).strip_prefix("stream-text ") {
         dispatch_fake_streaming_text(
             turn,
             text.to_owned(),
-            fake_tool_delta_delay(request),
+            fake_stream_delta_delay(request),
             request_input_tokens,
         );
     } else if let Some(tool_call) = tool_call {
@@ -1465,6 +1465,22 @@ fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall, delta_delay: Option<Du
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::ToolCall,
     });
+}
+
+fn fake_stream_delta_delay(request: &ModelTurnRequest) -> Option<Duration> {
+    request
+        .provider_context
+        .settings
+        .get("fake_stream_delta_delay_ms")
+        .or_else(|| {
+            request
+                .provider_context
+                .settings
+                .get("fake_tool_delta_delay_ms")
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
 }
 
 fn fake_tool_delta_delay(request: &ModelTurnRequest) -> Option<Duration> {

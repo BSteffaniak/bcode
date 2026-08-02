@@ -1,7 +1,7 @@
 //! Main chat event loop for the TUI.
 
 use bcode_plugin_sdk::path::display_from_current_dir;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -137,6 +137,7 @@ struct ChatLoopState {
     markdown_image_capabilities: bmux_image::HostImageCapabilities,
     markdown_image_config: bmux_image::ImageConfig,
     telemetry: super::telemetry::TuiTelemetry,
+    request_draft_handoff: RequestDraftHandoff,
     frame_index: u64,
 }
 
@@ -168,6 +169,7 @@ impl ChatLoopState {
             markdown_image_capabilities: bmux_image::host_caps::detect_from_env(),
             markdown_image_config: bmux_image::ImageConfig::default(),
             telemetry: super::telemetry::TuiTelemetry::new(passive_client.clone(), metrics_enabled),
+            request_draft_handoff: RequestDraftHandoff::default(),
             frame_index: 0,
         }
     }
@@ -614,7 +616,11 @@ async fn run_chat_loop<W: Write>(
                 }
             }
             refresh_invalidation_queue(chat, &mut invalidation_queue);
+            loop_state.request_draft_handoff.mark_painted();
             needs_redraw = false;
+            if drain_bcode_events(chat, loop_state, BCODE_EVENT_DRAIN_BUDGET) {
+                needs_redraw = true;
+            }
             last_redraw = Instant::now();
         }
 
@@ -629,6 +635,7 @@ async fn run_chat_loop<W: Write>(
                 telemetry_flush: loop_state.telemetry.next_flush_at(),
                 redraw: needs_redraw.then_some(redraw_at),
                 draft_save: draft_autosave.next_save_at(),
+                session_stream_blocked: loop_state.request_draft_handoff.blocks_session_stream(),
             },
         )
         .await?;
@@ -667,13 +674,8 @@ async fn run_chat_loop<W: Write>(
                 }
             }
             ChatLoopEvent::SessionStream(update) => {
-                if absorb_session_stream_update(chat, loop_state, *update)
-                    || drain_bcode_events(
-                        chat,
-                        loop_state,
-                        BCODE_EVENT_DRAIN_BUDGET.saturating_sub(1),
-                    )
-                {
+                loop_state.request_draft_handoff.deferred.push_back(*update);
+                if drain_bcode_events(chat, loop_state, BCODE_EVENT_DRAIN_BUDGET) {
                     needs_redraw = true;
                 }
                 if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
@@ -701,6 +703,7 @@ async fn run_chat_loop<W: Write>(
             ChatLoopEvent::Timer => {}
         }
         if before_session_id != chat.session_id {
+            loop_state.request_draft_handoff.clear();
             loop_state.markdown_projection.invalidate();
             loop_state.artifact_stream.retain_session(chat.session_id);
             draft_autosave.last_saved_text = None;
@@ -2232,6 +2235,7 @@ fn interactive_surface_area(surface: &mut InteractiveSurfaceState, viewport: Rec
     )
 }
 
+#[cfg(test)]
 fn take_bcode_events(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<history_flow::SessionStreamUpdate>,
     budget: usize,
@@ -2239,6 +2243,70 @@ fn take_bcode_events(
     (0..budget)
         .map_while(|_| receiver.try_recv().ok())
         .collect()
+}
+
+#[derive(Debug, Default)]
+struct RequestDraftHandoff {
+    deferred: VecDeque<history_flow::SessionStreamUpdate>,
+    awaiting_paint: BTreeSet<String>,
+}
+
+impl RequestDraftHandoff {
+    fn observe_applied(&mut self, tool_call_id: Option<String>, changed: bool) {
+        if changed && let Some(tool_call_id) = tool_call_id {
+            self.awaiting_paint.insert(tool_call_id);
+        }
+    }
+
+    fn blocks_session_stream(&self) -> bool {
+        !self.awaiting_paint.is_empty()
+    }
+
+    fn can_apply_before_paint(update: &history_flow::SessionStreamUpdate) -> bool {
+        request_draft_checkpoint_id(update).is_some()
+    }
+
+    fn mark_painted(&mut self) {
+        self.awaiting_paint.clear();
+    }
+
+    fn clear(&mut self) {
+        self.deferred.clear();
+        self.awaiting_paint.clear();
+    }
+}
+
+fn request_draft_checkpoint_id(update: &history_flow::SessionStreamUpdate) -> Option<&str> {
+    let history_flow::SessionStreamUpdate::Event(event) = update else {
+        return None;
+    };
+    let BcodeEvent::SessionLive(event) = event.as_ref() else {
+        return None;
+    };
+    let bcode_session_models::SessionLiveEventKind::ToolRequestDraft { event } = &event.kind else {
+        return None;
+    };
+    match &event.operation {
+        bcode_session_models::ToolRequestDraftOperation::Append { text, .. }
+        | bcode_session_models::ToolRequestDraftOperation::Checkpoint { text, .. }
+            if !text.is_empty() =>
+        {
+            Some(event.tool_call_id.as_str())
+        }
+        bcode_session_models::ToolRequestDraftOperation::Append { .. }
+        | bcode_session_models::ToolRequestDraftOperation::Checkpoint { .. }
+        | bcode_session_models::ToolRequestDraftOperation::Remove { .. } => None,
+    }
+}
+
+fn take_next_bcode_event(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<history_flow::SessionStreamUpdate>,
+    handoff: &mut RequestDraftHandoff,
+) -> Option<history_flow::SessionStreamUpdate> {
+    handoff
+        .deferred
+        .pop_front()
+        .or_else(|| receiver.try_recv().ok())
 }
 
 fn drain_bcode_events(
@@ -2251,8 +2319,25 @@ fn drain_bcode_events(
         i64::try_from(chat.event_receiver.len()).unwrap_or(i64::MAX),
     );
     let mut needs_redraw = false;
-    for update in take_bcode_events(&mut chat.event_receiver, budget) {
-        needs_redraw |= absorb_session_stream_update(chat, loop_state, update);
+    for _ in 0..budget {
+        let Some(update) = take_next_bcode_event(
+            &mut chat.event_receiver,
+            &mut loop_state.request_draft_handoff,
+        ) else {
+            break;
+        };
+        if loop_state.request_draft_handoff.blocks_session_stream()
+            && !RequestDraftHandoff::can_apply_before_paint(&update)
+        {
+            loop_state.request_draft_handoff.deferred.push_front(update);
+            break;
+        }
+        let checkpoint = request_draft_checkpoint_id(&update).map(ToOwned::to_owned);
+        let changed = absorb_session_stream_update(chat, loop_state, update);
+        loop_state
+            .request_draft_handoff
+            .observe_applied(checkpoint, changed);
+        needs_redraw |= changed;
     }
     needs_redraw
 }
@@ -2762,6 +2847,7 @@ struct ChatLoopDeadlines {
     telemetry_flush: Option<Instant>,
     redraw: Option<Instant>,
     draft_save: Option<Instant>,
+    session_stream_blocked: bool,
 }
 
 async fn next_chat_loop_event(
@@ -2798,7 +2884,7 @@ async fn next_chat_loop_event(
                 Ok(ChatLoopEvent::MarkdownProjectionCompleted(Box::new(markdown_completion)))
             },
             artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
-            bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
+            bcode_event = chat.event_receiver.recv(), if !deadlines.session_stream_blocked => Ok(bcode_event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
                 |update| ChatLoopEvent::SessionStream(Box::new(update)),
             )),
@@ -2826,7 +2912,7 @@ async fn next_chat_loop_event(
             )))
         },
         artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
-        bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
+        bcode_event = chat.event_receiver.recv(), if !deadlines.session_stream_blocked => Ok(bcode_event.map_or_else(
             || ChatLoopEvent::TimedInvalidations(Vec::new()),
             |update| ChatLoopEvent::SessionStream(Box::new(update)),
         )),
@@ -4150,6 +4236,171 @@ mod scheduler_tests {
         assert!(dialog.is_some());
         close_permission_dialog_for_session(&mut dialog, session_id);
         assert!(dialog.is_none());
+    }
+
+    fn request_draft_update(
+        session_id: bcode_session_models::SessionId,
+        revision: u64,
+        text: &str,
+    ) -> history_flow::SessionStreamUpdate {
+        history_flow::SessionStreamUpdate::Event(Box::new(BcodeEvent::SessionLive(
+            bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
+                        turn_id: "turn-live".to_owned(),
+                        tool_call_id: "call-write".to_owned(),
+                        tool_name: "filesystem.write".to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        schema: "bcode.filesystem.request-draft.write".to_owned(),
+                        schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Request,
+                        generation: 1,
+                        revision,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: text.to_owned(),
+                        },
+                        argument_bytes: text.len(),
+                        truncated: false,
+                    },
+                },
+            },
+        )))
+    }
+
+    fn request_draft_remove(
+        session_id: bcode_session_models::SessionId,
+        revision: u64,
+    ) -> history_flow::SessionStreamUpdate {
+        history_flow::SessionStreamUpdate::Event(Box::new(BcodeEvent::SessionLive(
+            bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
+                        turn_id: "turn-live".to_owned(),
+                        tool_call_id: "call-write".to_owned(),
+                        tool_name: "filesystem.write".to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        schema: "bcode.filesystem.request-draft.write".to_owned(),
+                        schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Request,
+                        generation: 1,
+                        revision,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Remove {
+                            reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+                        },
+                        argument_bytes: 0,
+                        truncated: false,
+                    },
+                },
+            },
+        )))
+    }
+
+    fn canonical_write_request(
+        session_id: bcode_session_models::SessionId,
+    ) -> history_flow::SessionStreamUpdate {
+        history_flow::SessionStreamUpdate::Event(Box::new(BcodeEvent::Session(
+            bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: bcode_session_models::SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    tool_name: "filesystem.write".to_owned(),
+                    arguments_json: r#"{"path":"live.txt","contents":"complete"}"#.to_owned(),
+                    working_directory: None,
+                },
+            },
+        )))
+    }
+
+    #[tokio::test]
+    async fn fast_request_draft_handoff_paints_latest_real_checkpoint_before_request() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut chat = test_chat();
+        chat.session_id = Some(session_id);
+        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        for update in [
+            request_draft_update(session_id, 1, r#"{"path":"live.txt","contents":"part"#),
+            request_draft_update(
+                session_id,
+                2,
+                r#"{"path":"live.txt","contents":"complete"}"#,
+            ),
+            request_draft_remove(session_id, 3),
+            canonical_write_request(session_id),
+        ] {
+            chat.event_sender.send(update).expect("queue stream update");
+        }
+        let mut state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            false,
+        );
+
+        assert!(drain_bcode_events(
+            &mut chat,
+            &mut state,
+            BCODE_EVENT_DRAIN_BUDGET
+        ));
+        let draft = chat.app.session_view_snapshot().tools["call-write"]
+            .request_draft
+            .as_ref()
+            .expect("latest real draft remains for paint");
+        assert!(draft.preview.contains("complete"));
+        assert_eq!(state.request_draft_handoff.deferred.len(), 1);
+        assert_eq!(chat.event_receiver.len(), 1);
+
+        state.request_draft_handoff.mark_painted();
+        assert!(drain_bcode_events(
+            &mut chat,
+            &mut state,
+            BCODE_EVENT_DRAIN_BUDGET
+        ));
+        let tool = &chat.app.session_view_snapshot().tools["call-write"];
+        assert!(tool.request_draft.is_none());
+        assert_eq!(
+            tool.arguments_json.as_deref(),
+            Some(r#"{"path":"live.txt","contents":"complete"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_request_without_provider_delta_does_not_invent_draft_frame() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut chat = test_chat();
+        chat.session_id = Some(session_id);
+        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        for update in [
+            request_draft_update(session_id, 0, ""),
+            request_draft_remove(session_id, 1),
+            canonical_write_request(session_id),
+        ] {
+            chat.event_sender.send(update).expect("queue stream update");
+        }
+        let mut state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            false,
+        );
+
+        assert!(drain_bcode_events(
+            &mut chat,
+            &mut state,
+            BCODE_EVENT_DRAIN_BUDGET
+        ));
+        assert!(!state.request_draft_handoff.blocks_session_stream());
+        assert!(state.request_draft_handoff.deferred.is_empty());
+        let tool = &chat.app.session_view_snapshot().tools["call-write"];
+        assert!(tool.request_draft.is_none());
+        assert!(tool.arguments_json.is_some());
     }
 
     #[test]

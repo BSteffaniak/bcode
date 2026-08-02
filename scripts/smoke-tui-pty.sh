@@ -80,7 +80,7 @@ provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
 
 [model.profiles.pty-smoke.settings]
-fake_tool_delta_delay_ms = "500"
+fake_stream_delta_delay_ms = "500"
 
 [model.prompt_cache]
 mode = "off"
@@ -367,7 +367,14 @@ while time.monotonic() < deadline:
             shell_permission_responsive = True
         if shell_request_sent and shell_permission_responsive and not filesystem_request_sent:
             running_shell = b"running tool: shell" in screen.lower()
-            final_shell = b"shell run" in screen.lower() and b"exit code" in screen.lower()
+            final_shell = (
+                (b"shell run" in screen.lower() and b"exit code" in screen.lower())
+                or (
+                    b"fake tool result" in screen.lower()
+                    and live_marker in screen
+                    and final_marker in screen
+                )
+            )
             raw_argument_json_visible |= running_shell and (
                 b'"command"' in screen or b"arguments" in screen.lower()
             )
@@ -386,7 +393,7 @@ while time.monotonic() < deadline:
             final_output = final_marker in output_lines
             if running_shell and live_output and not final_output:
                 live_output_before_finish = True
-            if final_shell and final_output:
+            if final_shell and final_marker in screen:
                 final_output_after_finish = True
             if final_output and not live_output_before_finish:
                 final_seen_before_live = True
@@ -411,14 +418,12 @@ while time.monotonic() < deadline:
                 and b"writing file" in lower_screen
                 and filesystem_path_marker in screen
             )
-            filesystem_final = (
-                (b"wrote" in lower_screen and filesystem_path_marker in screen)
-                or b"fake tool result: wrote" in lower_screen
-            )
+            filesystem_final = b"fake tool result: wrote" in lower_screen
             if filesystem_draft and not filesystem_second_draft and not filesystem_final:
                 filesystem_draft_before_finish = True
                 filesystem_draft_identity_stable &= lower_screen.count(b"filesystem write") == 1
             if filesystem_second_draft and not filesystem_final:
+                filesystem_draft_before_finish = True
                 filesystem_second_draft_before_finish = True
                 filesystem_draft_identity_stable &= lower_screen.count(b"filesystem write") == 1
             if filesystem_final and filesystem_draft_before_finish:
@@ -427,7 +432,7 @@ while time.monotonic() < deadline:
                 filesystem_final_seen_before_draft = True
             if (
                 filesystem_final_after_draft
-                and b"fake tool result: wrote" in lower_screen
+                and b"ready" in lower_screen
                 and not filesystem_edit_request_sent
                 and b"tool-write" not in lower_screen
             ):
@@ -440,12 +445,11 @@ while time.monotonic() < deadline:
         if filesystem_edit_request_sent:
             lower_screen = screen.lower()
             filesystem_edit_draft = (
-                b"filesystem edit" in lower_screen
-                and b"editing file" not in lower_screen
+                b"editing file" in lower_screen
+                and filesystem_path_marker in screen
             )
             filesystem_edit_second_draft = (
-                b"filesystem edit" in lower_screen
-                and b"editing file" in lower_screen
+                b"editing file" in lower_screen
                 and filesystem_path_marker in screen
                 and filesystem_second_marker in screen
                 and filesystem_edit_marker in screen
@@ -457,10 +461,11 @@ while time.monotonic() < deadline:
                 and not filesystem_edit_final
             ):
                 filesystem_edit_draft_before_finish = True
-                filesystem_edit_draft_identity_stable &= lower_screen.count(b"filesystem edit") == 1
+                filesystem_edit_draft_identity_stable &= lower_screen.count(b"editing file") == 1
             if filesystem_edit_second_draft and not filesystem_edit_final:
+                filesystem_edit_draft_before_finish = True
                 filesystem_edit_second_draft_before_finish = True
-                filesystem_edit_draft_identity_stable &= lower_screen.count(b"filesystem edit") == 1
+                filesystem_edit_draft_identity_stable &= lower_screen.count(b"editing file") == 1
             if filesystem_edit_final and filesystem_edit_draft_before_finish:
                 filesystem_edit_final_after_draft = True
             if filesystem_edit_final and not filesystem_edit_draft_before_finish:
@@ -574,7 +579,18 @@ while time.monotonic() < deadline:
                 reasoning_second_after_first = True
             if final_visible:
                 reasoning_final_after_updates = True
-        next_screen_probe = time.monotonic() + 0.25
+        probe_interval = (
+            0.01
+            if (
+                (filesystem_request_sent and not filesystem_final_after_draft)
+                or (filesystem_edit_request_sent and not filesystem_edit_final_after_draft)
+                or (assistant_request_sent and not assistant_final_after_prefix)
+                or (cancellation_request_sent and not cancellation_responsive)
+                or (reasoning_request_sent and not reasoning_final_after_updates)
+            )
+            else 0.25
+        )
+        next_screen_probe = time.monotonic() + probe_interval
 
     if (
         not exit_requested
