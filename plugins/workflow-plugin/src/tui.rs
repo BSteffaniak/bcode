@@ -33,57 +33,11 @@ impl PluginTuiSurfaceFactory for WorkflowAuthorFactory {
     }
 
     fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
-        Box::pin(async move {
-            Ok(Box::new(WorkflowAuthorSurface {
-                options: request.options,
-            }) as BoxedPluginTuiSurface)
-        })
+        crate::authoring_tui::open(request)
     }
 }
 
-#[derive(Debug)]
-struct WorkflowAuthorSurface {
-    options: serde_json::Value,
-}
-
-impl PluginTuiSurface for WorkflowAuthorSurface {
-    fn id(&self) -> &'static str {
-        "bcode.workflow-author"
-    }
-
-    fn title(&self) -> &'static str {
-        "Workflow Authoring"
-    }
-
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
-        for (offset, row) in author_lines(&self.options).into_iter().enumerate() {
-            if offset >= usize::from(area.height) {
-                break;
-            }
-            let offset = u16::try_from(offset).expect("workflow author has fewer than u16 rows");
-            frame.write_line(
-                Rect::new(area.x, area.y.saturating_add(offset), area.width, 1),
-                &Line::from(row),
-            );
-        }
-    }
-
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
-        match event {
-            Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')) => {
-                PluginTuiAction::Close { outcome: None }
-            }
-            Event::Key(key) if key.key == KeyCode::Char('s') => {
-                template_start_command(&self.options).map_or(PluginTuiAction::None, |command| {
-                    PluginTuiAction::RunCommand { command }
-                })
-            }
-            _ => PluginTuiAction::None,
-        }
-    }
-}
-
+#[cfg(test)]
 fn template_start_command(options: &serde_json::Value) -> Option<String> {
     let template = options.get("template")?;
     let owner = template.get("owner_plugin_id")?.as_str()?;
@@ -98,6 +52,7 @@ fn template_start_command(options: &serde_json::Value) -> Option<String> {
     ))
 }
 
+#[cfg(test)]
 fn author_lines(options: &serde_json::Value) -> Vec<String> {
     let mut lines = vec!["Workflow template authoring".to_string(), String::new()];
     let Some(description) = options.get("template") else {
@@ -171,6 +126,7 @@ fn author_lines(options: &serde_json::Value) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 fn effect_preview(template: &serde_json::Value) -> Vec<String> {
     let blocks = template
         .get("definition")

@@ -4,6 +4,7 @@
 
 //! Workflow product integration plugin for Bcode.
 
+mod authoring_tui;
 #[cfg(feature = "static-bundled")]
 mod cli;
 pub mod tui;
@@ -18,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 const PLUGIN_ID: &str = "bcode.workflow";
-const SURFACE_KIND: &str = "workflow.status";
+const STATUS_SURFACE_KIND: &str = "workflow.status";
+const AUTHOR_SURFACE_KIND: &str = "workflow.author";
 const QUERY_LIMIT: usize = 100;
 
 /// Current workflow-plugin coding-state contract version.
@@ -839,6 +841,31 @@ pub(crate) async fn execute_command(
                 "template".to_string(),
                 serde_json::to_value(&template).map_err(|error| error.to_string())?,
             );
+            match (
+                request.args.get("workflow_id"),
+                request.args.get("draft_id"),
+            ) {
+                (Some(workflow_id), Some(draft_id)) => {
+                    let draft = client
+                        .workflow_draft(workflow_id.clone(), draft_id.clone())
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            format!("workflow draft not found: {workflow_id}/{draft_id}")
+                        })?;
+                    options.insert(
+                        "draft".to_string(),
+                        serde_json::to_value(draft).map_err(|error| error.to_string())?,
+                    );
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(
+                        "workflow_id and draft_id must be provided together for mutable editing"
+                            .to_string(),
+                    );
+                }
+            }
             if let Some(session_id) = request.args.get("session_id") {
                 options.insert("session_id".to_string(), serde_json::json!(session_id));
             }
@@ -1087,8 +1114,16 @@ pub(crate) async fn execute_command(
         updated_provider: None,
         updated_thinking: None,
         effects: vec![CommandEffect::OpenPluginSurface {
-            surface_kind: SURFACE_KIND.to_string(),
-            instance_id: "workflow-status".to_string(),
+            surface_kind: if request.command_id == "workflow.template-describe" {
+                AUTHOR_SURFACE_KIND.to_string()
+            } else {
+                STATUS_SURFACE_KIND.to_string()
+            },
+            instance_id: if request.command_id == "workflow.template-describe" {
+                "workflow-author".to_string()
+            } else {
+                "workflow-status".to_string()
+            },
             options: serde_json::Value::Object(options),
         }],
     })

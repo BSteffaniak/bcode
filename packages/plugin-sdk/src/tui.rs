@@ -183,6 +183,129 @@ pub type PluginWorkflowControlFuture = Pin<
     >,
 >;
 
+/// Async portable workflow-authoring catalog result.
+pub type PluginWorkflowAuthoringCatalogFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+                    PluginTuiHostError,
+                >,
+            > + Send
+            + 'static,
+    >,
+>;
+
+/// Portable authored draft used by plugin-owned authoring surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkflowAuthoringDraft {
+    pub workflow_id: String,
+    pub draft_id: String,
+    pub base_revision: Option<u64>,
+    pub generation: u64,
+    pub document: bcode_workflow::WorkflowAuthoringDocument,
+    pub producer: bcode_workflow::WorkflowProducerProvenance,
+}
+
+/// Result of applying one optimistic semantic draft edit batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginWorkflowAuthoringEditResult {
+    Updated(Box<PluginWorkflowAuthoringDraft>),
+    Conflict {
+        expected_generation: u64,
+        current_generation: u64,
+    },
+    Rejected {
+        diagnostics: Vec<bcode_workflow::WorkflowValidationDiagnostic>,
+    },
+}
+
+/// Result of publishing one exact draft generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginWorkflowAuthoringPublishResult {
+    Published {
+        revision: u64,
+        activated: bool,
+    },
+    Conflict {
+        expected_generation: u64,
+        current_generation: u64,
+    },
+}
+
+/// Async workflow-authoring draft result.
+pub type PluginWorkflowAuthoringDraftFuture = Pin<
+    Box<
+        dyn Future<Output = Result<Option<PluginWorkflowAuthoringDraft>, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Portable immutable revision document used for semantic authoring review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkflowAuthoringRevision {
+    pub workflow_id: String,
+    pub revision: u64,
+    pub document: bcode_workflow::WorkflowAuthoringDocument,
+}
+
+/// Async workflow-authoring revision result.
+pub type PluginWorkflowAuthoringRevisionFuture = Pin<
+    Box<
+        dyn Future<Output = Result<Option<PluginWorkflowAuthoringRevision>, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Async workflow-authoring edit result.
+pub type PluginWorkflowAuthoringEditFuture = Pin<
+    Box<
+        dyn Future<Output = Result<PluginWorkflowAuthoringEditResult, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Async workflow-authoring validation result.
+pub type PluginWorkflowAuthoringValidationFuture = Pin<
+    Box<
+        dyn Future<Output = Result<bcode_workflow::WorkflowValidationReport, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Async workflow-authoring preview result.
+pub type PluginWorkflowAuthoringPreviewFuture = Pin<
+    Box<
+        dyn Future<Output = Result<bcode_workflow::WorkflowCompilationPreview, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Async workflow-authoring publication result.
+pub type PluginWorkflowAuthoringPublishFuture = Pin<
+    Box<
+        dyn Future<Output = Result<PluginWorkflowAuthoringPublishResult, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Async workflow-authoring start result.
+pub type PluginWorkflowAuthoringStartFuture = Pin<
+    Box<
+        dyn Future<Output = Result<PluginWorkflowStartResponse, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
 /// Renderer-neutral request for a plugin surface to start one durable workflow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginWorkflowStartRequest {
@@ -356,6 +479,115 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow lifecycle control is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Load the current bounded portable workflow-authoring catalog.
+    ///
+    /// The returned catalog contains only public workflow contracts. It does not expose daemon,
+    /// plugin-runtime, or persistence implementation state.
+    fn workflow_authoring_catalog(&self) -> PluginWorkflowAuthoringCatalogFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Load one exact mutable authored-workflow draft.
+    fn workflow_authoring_draft(
+        &self,
+        _workflow_id: String,
+        _draft_id: String,
+    ) -> PluginWorkflowAuthoringDraftFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Load one exact immutable authored-workflow revision for semantic review.
+    fn workflow_authoring_revision(
+        &self,
+        _workflow_id: String,
+        _revision: u64,
+    ) -> PluginWorkflowAuthoringRevisionFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Apply one generation-checked renderer-neutral semantic edit batch.
+    fn apply_workflow_authoring_edits(
+        &self,
+        _workflow_id: String,
+        _draft_id: String,
+        _batch: bcode_workflow::WorkflowAuthoringEditBatch,
+        _producer: bcode_workflow::WorkflowProducerProvenance,
+    ) -> PluginWorkflowAuthoringEditFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Validate one portable authoring document without mutation.
+    fn validate_workflow_authoring(
+        &self,
+        _document: bcode_workflow::WorkflowAuthoringDocument,
+    ) -> PluginWorkflowAuthoringValidationFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Compile and preview one portable authoring document without mutation.
+    fn preview_workflow_authoring(
+        &self,
+        _document: bcode_workflow::WorkflowAuthoringDocument,
+        _configuration: Option<serde_json::Value>,
+    ) -> PluginWorkflowAuthoringPreviewFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Publish one exact draft generation as an immutable authored revision.
+    fn publish_workflow_authoring_draft(
+        &self,
+        _workflow_id: String,
+        _draft_id: String,
+        _expected_generation: u64,
+        _activate: bool,
+    ) -> PluginWorkflowAuthoringPublishFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Explicitly start one immutable authored-workflow revision.
+    fn start_authored_workflow_revision(
+        &self,
+        _workflow_id: String,
+        _revision: u64,
+        _parent_session_id: SessionId,
+        _workspace_snapshot: Option<String>,
+        _configuration: Option<serde_json::Value>,
+    ) -> PluginWorkflowAuthoringStartFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow authoring is not available from this host".to_string(),
             ))
         })
     }

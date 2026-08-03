@@ -36,6 +36,12 @@ struct WorkflowCli {
     /// Exact owner-local template ID for template describe/start.
     #[arg(long)]
     template: Option<String>,
+    /// Exact logical authored-workflow identity for mutable template describe.
+    #[arg(long)]
+    workflow: Option<String>,
+    /// Exact mutable draft identity for mutable template describe.
+    #[arg(long)]
+    draft: Option<String>,
     /// Exact waiting node identity for `provide-input`.
     #[arg(long)]
     node: Option<String>,
@@ -107,6 +113,12 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         }
         if let Some(template) = cli.template {
             args.insert("template_id".to_string(), template);
+        }
+        if let Some(workflow) = cli.workflow {
+            args.insert("workflow_id".to_string(), workflow);
+        }
+        if let Some(draft) = cli.draft {
+            args.insert("draft_id".to_string(), draft);
         }
         if let Some(node) = cli.node {
             args.insert("node_id".to_string(), node);

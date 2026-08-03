@@ -171,6 +171,10 @@ if ! rg -q 'WorkflowTemplateDocumentSource' packages/plugin/src/lib.rs \
   || ! rg -q 'WorkflowDescendantRunSummary' packages/workflow-store/src/lib.rs \
   || ! rg -q 'descendant_run_summaries' packages/server/src/lib.rs \
   || ! rg -q 'Runtime-owned counters' plugins/workflow-plugin/src/tui.rs \
+  || ! rg -q 'workflow_authoring_catalog' packages/plugin-sdk/src/tui.rs packages/tui/src/plugin_surface_host.rs \
+  || ! rg -q 'apply_workflow_authoring_edits' packages/plugin-sdk/src/tui.rs packages/tui/src/plugin_surface_host.rs \
+  || ! rg -q 'WorkflowSchemaFormDescription' plugins/workflow-plugin/src/authoring_tui.rs \
+  || ! rg -q 'WorkflowAuthoringDocument' plugins/workflow-plugin/src/authoring_tui.rs \
   || ! rg -q 'flagship_restart_preserves_wait_approval_repeat_and_composed_status' packages/workflow-store/src/lib.rs \
   || ! rg -q 'durable_input_gate_waits_validates_and_activates_successor' packages/workflow-store/src/lib.rs \
   || ! rg -q 'mutation_approval_wait_is_exact_persisted_and_restart_safe' packages/workflow-store/src/lib.rs \

@@ -2902,6 +2902,9 @@ pub struct WorkflowAuthoringCatalogSnapshot {
     /// Exact plugin block contracts keyed by [`workflow_block_catalog_key`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub blocks: BTreeMap<String, WorkflowBlockDefinition>,
+    /// Authoritative generic node-configuration schemas keyed by stable serialized node kind.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_configuration_schemas: BTreeMap<String, ValueSchema>,
     /// Exact immutable definitions available for child-call preview, keyed by compiled identity.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workflow_definitions: BTreeMap<String, WorkflowDefinition>,
@@ -2974,6 +2977,7 @@ impl WorkflowAuthoringCatalogSnapshot {
         self.production_capabilities()?;
         let entry_count = self.plugins.len()
             + self.blocks.len()
+            + self.node_configuration_schemas.len()
             + self.workflow_definitions.len()
             + self.agent_profiles.len()
             + self.skills.len();
@@ -2995,6 +2999,8 @@ impl WorkflowAuthoringCatalogSnapshot {
             block.validate()?;
             validate_runtime_value_schema("catalog.blocks.input", &block.input)?;
             validate_runtime_value_schema("catalog.blocks.output", &block.output)?;
+            validate_runtime_value_schema("catalog.blocks.input", &block.input)?;
+            validate_runtime_value_schema("catalog.blocks.output", &block.output)?;
             if key != &workflow_block_catalog_key(block) {
                 return Err(authoring_error(
                     "catalog.blocks",
@@ -3008,6 +3014,16 @@ impl WorkflowAuthoringCatalogSnapshot {
                         "catalog block '{}' references unavailable plugin '{}'",
                         block.block_id, block.plugin_id
                     ),
+                ));
+            }
+        }
+        for (kind, schema) in &self.node_configuration_schemas {
+            validate_authoring_id("catalog.node_configuration_schemas.kind", kind)?;
+            validate_runtime_value_schema("catalog.node_configuration_schemas.schema", schema)?;
+            if !self.capabilities.node_kinds.contains_key(kind) {
+                return Err(authoring_error(
+                    "catalog.node_configuration_schemas",
+                    format!("configuration schema references unknown node kind '{kind}'"),
                 ));
             }
         }
@@ -3029,6 +3045,102 @@ impl WorkflowAuthoringCatalogSnapshot {
         }
         Ok(())
     }
+}
+
+/// Build the authoritative generic node-configuration schemas exposed to authoring clients.
+#[must_use]
+pub fn workflow_node_configuration_schemas() -> BTreeMap<String, ValueSchema> {
+    let object = |type_name: &str, schema| ValueSchema {
+        type_name: type_name.to_string(),
+        schema,
+    };
+    BTreeMap::from([
+        (
+            "agent".to_string(),
+            object(
+                "bcode.workflow.agent-configuration/v1",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_profile": {"type": "string", "title": "Agent profile"},
+                        "provider": {"type": ["string", "null"], "title": "Provider"},
+                        "model": {"type": ["string", "null"], "title": "Model"},
+                        "read_only": {"type": "boolean", "title": "Read only"},
+                        "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 3_600_000},
+                        "system_prompt": {"type": "string", "title": "System prompt"},
+                        "skills": {"type": "array", "title": "Skills"},
+                        "tool_allowlist": {"type": "array", "title": "Tool allowlist"}
+                    },
+                    "required": ["agent_profile", "read_only", "timeout_ms", "system_prompt"]
+                }),
+            ),
+        ),
+        (
+            "branch".to_string(),
+            object(
+                "bcode.workflow.branch-configuration/v1",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "predicate": {"type": "object", "title": "Predicate"},
+                        "true_entries": {"type": "array"},
+                        "false_entries": {"type": "array"}
+                    },
+                    "required": ["predicate", "true_entries", "false_entries"]
+                }),
+            ),
+        ),
+        (
+            "repeat".to_string(),
+            object(
+                "bcode.workflow.repeat-configuration/v1",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "predicate": {"type": "object", "title": "Predicate"},
+                        "max_iterations": {"type": "integer", "minimum": 1, "maximum": 1000}
+                    },
+                    "required": ["predicate", "max_iterations"]
+                }),
+            ),
+        ),
+        (
+            "parallel".to_string(),
+            object(
+                "bcode.workflow.parallel-configuration/v1",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "join_policy": {"enum": ["wait_all", "fail_fast"]},
+                        "branch_entries": {"type": "array"}
+                    },
+                    "required": ["join_policy", "branch_entries"]
+                }),
+            ),
+        ),
+        (
+            "input".to_string(),
+            object(
+                "bcode.workflow.input-configuration/v1",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"gate_version": {"type": "integer", "enum": [1]}},
+                    "required": ["gate_version"]
+                }),
+            ),
+        ),
+        (
+            "approval".to_string(),
+            object(
+                "bcode.workflow.approval-configuration/v1",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"gate_version": {"type": "integer", "enum": [1]}},
+                    "required": ["gate_version"]
+                }),
+            ),
+        ),
+    ])
 }
 
 /// Return the stable exact catalog key for one plugin workflow block.
@@ -3181,6 +3293,16 @@ pub enum WorkflowAuthoringEdit {
     UpdateRequirements {
         requirements: WorkflowRequirementSummary,
     },
+    /// Replace authored defaults for one plugin-block operation input.
+    UpdatePluginInputDefaults {
+        node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defaults: Option<serde_json::Value>,
+    },
+    /// Replace logical graph entry nodes.
+    UpdateEntries { entries: Vec<String> },
+    /// Replace logical graph exit nodes.
+    UpdateExits { exits: Vec<String> },
     /// Replace user-facing workflow metadata.
     UpdateMetadata { metadata: WorkflowAuthoringMetadata },
     /// Set or remove one producer-owned presentation namespace.
@@ -3295,6 +3417,7 @@ fn apply_workflow_authoring_edit(
                 .retain(|edge| edge.from != *node_id && edge.to != *node_id);
             document.definition.entries.retain(|entry| entry != node_id);
             document.definition.exits.retain(|exit| exit != node_id);
+            document.plugin_input_defaults.remove(node_id);
         }
         WorkflowAuthoringEdit::AddEdge { edge } => document.definition.edges.push(edge.clone()),
         WorkflowAuthoringEdit::UpdateEdge { selector, edge } => {
@@ -3316,6 +3439,21 @@ fn apply_workflow_authoring_edit(
         }
         WorkflowAuthoringEdit::UpdateRequirements { requirements } => {
             document.requirements.clone_from(requirements);
+        }
+        WorkflowAuthoringEdit::UpdatePluginInputDefaults { node_id, defaults } => {
+            if let Some(defaults) = defaults {
+                document
+                    .plugin_input_defaults
+                    .insert(node_id.clone(), defaults.clone());
+            } else {
+                document.plugin_input_defaults.remove(node_id);
+            }
+        }
+        WorkflowAuthoringEdit::UpdateEntries { entries } => {
+            document.definition.entries.clone_from(entries);
+        }
+        WorkflowAuthoringEdit::UpdateExits { exits } => {
+            document.definition.exits.clone_from(exits);
         }
         WorkflowAuthoringEdit::UpdateMetadata { metadata } => {
             document.metadata.clone_from(metadata);
@@ -3496,6 +3634,12 @@ pub struct WorkflowAuthoringDocument {
     /// Optional bounded defaults validated against `configuration_schema`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration_defaults: Option<serde_json::Value>,
+    /// Bounded plugin-operation input defaults keyed by plugin-block node identity.
+    ///
+    /// These values are authored separately from immutable plugin owner contracts and are
+    /// validated against the exact catalog block input schema during compilation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugin_input_defaults: BTreeMap<String, serde_json::Value>,
     /// Existing host-neutral declarative graph contract.
     pub definition: WorkflowDefinition,
     /// Bounded generic runtime configuration bindings.
@@ -3523,6 +3667,8 @@ pub struct WorkflowExecutableAuthoringSemantics {
     pub configuration_schema: ValueSchema,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration_defaults: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugin_input_defaults: BTreeMap<String, serde_json::Value>,
     pub definition: WorkflowDefinition,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<WorkflowConfigurationBinding>,
@@ -3624,7 +3770,7 @@ impl WorkflowAuthoringDocument {
         let normalized = self.normalized()?;
         let mut definition = normalized.definition;
         let mut run_limits = normalized.run_limits;
-        let mut plugin_input_defaults = BTreeMap::new();
+        let mut plugin_input_defaults = normalized.plugin_input_defaults.clone();
         let mut input_defaults = serde_json::json!({});
         for binding in &normalized.bindings {
             let source =
@@ -3697,6 +3843,7 @@ impl WorkflowAuthoringDocument {
     /// Returns an error for unsupported versions, malformed identities, invalid graph structure,
     /// invalid or unbounded schemas, duplicate binding targets, unknown references, remote schema
     /// references, oversized content, invalid defaults, or unsupported future state.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), WorkflowError> {
         if self.schema_version != WORKFLOW_AUTHORING_DOCUMENT_VERSION {
             return Err(authoring_error(
@@ -3758,6 +3905,39 @@ impl WorkflowAuthoringDocument {
                     format!("defaults do not match configuration schema: {error}"),
                 ));
             }
+        }
+        if self.plugin_input_defaults.len() > MAX_WORKFLOW_AUTHORING_REQUIREMENTS {
+            return Err(authoring_error(
+                "plugin_input_defaults",
+                format!(
+                    "plugin input defaults exceed {MAX_WORKFLOW_AUTHORING_REQUIREMENTS} entries"
+                ),
+            ));
+        }
+        for (node_id, defaults) in &self.plugin_input_defaults {
+            validate_authoring_id("plugin_input_defaults.node_id", node_id)?;
+            let node = self.definition.node(node_id).ok_or_else(|| {
+                authoring_error(
+                    format!("plugin_input_defaults.{node_id}"),
+                    "plugin input defaults reference an unknown node",
+                )
+            })?;
+            if node.kind != NodeKind::PluginBlock {
+                return Err(authoring_error(
+                    format!("plugin_input_defaults.{node_id}"),
+                    "plugin input defaults require a plugin-block node",
+                ));
+            }
+            let block: WorkflowBlockDefinition = serde_json::from_value(node.configuration.clone())
+                .map_err(|error| {
+                    authoring_error(
+                        format!("definition.nodes.{node_id}.configuration"),
+                        format!("plugin block configuration is invalid: {error}"),
+                    )
+                })?;
+            block
+                .input
+                .validate_value(&format!("plugin_input_defaults.{node_id}"), defaults)?;
         }
         if self.bindings.len() > MAX_WORKFLOW_AUTHORING_BINDINGS {
             return Err(authoring_error(
@@ -3886,6 +4066,7 @@ impl WorkflowAuthoringDocument {
             workflow_id: self.workflow_id.clone(),
             configuration_schema: self.configuration_schema.clone(),
             configuration_defaults: self.configuration_defaults.clone(),
+            plugin_input_defaults: self.plugin_input_defaults.clone(),
             definition: self.definition.clone(),
             bindings: self.bindings.clone(),
             requirements: self.requirements.clone(),
@@ -4630,7 +4811,9 @@ fn resolve_authoring_plugin_block(
         ));
     }
     if let Some(defaults) = input_defaults {
-        prepare_workflow_node_dataflow(node.dataflow, &node.input, &block.input, defaults)?;
+        block
+            .input
+            .validate_value(&format!("plugin_input_defaults.{node_id}"), defaults)?;
     }
     finish_authoring_plugin_block_resolution(
         node_id,
@@ -9217,6 +9400,7 @@ mod tests {
                 "message": "review",
                 "duration_ms": 60000
             })),
+            plugin_input_defaults: BTreeMap::new(),
             definition: WorkflowDefinition {
                 schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
                 name: "example".to_string(),
@@ -9479,6 +9663,7 @@ mod tests {
             ),
             plugins: BTreeSet::new(),
             blocks: BTreeMap::new(),
+            node_configuration_schemas: workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string(), "review".to_string()]),
             skills: BTreeSet::new(),
@@ -9909,6 +10094,55 @@ mod tests {
                 .executable_source_digest_sha256()
                 .expect("plugin identity")
         );
+    }
+
+    #[test]
+    fn authored_plugin_defaults_are_separate_from_owner_contract_and_semantically_editable() {
+        let (mut document, catalog, block) = authored_mutating_block_document();
+        document.bindings.clear();
+        document.plugin_input_defaults.insert(
+            "commit".to_string(),
+            serde_json::json!({"message": "authored"}),
+        );
+        let before_contract = document.definition.nodes["commit"].configuration.clone();
+        let batch = WorkflowAuthoringEditBatch {
+            version: WORKFLOW_AUTHORING_EDIT_VERSION,
+            expected_generation: 1,
+            edits: vec![WorkflowAuthoringEdit::UpdatePluginInputDefaults {
+                node_id: "commit".to_string(),
+                defaults: Some(serde_json::json!({"message": "edited"})),
+            }],
+        };
+        let edited = apply_workflow_authoring_edits(&document, &batch).expect("edit defaults");
+        assert_eq!(
+            edited.definition.nodes["commit"].configuration,
+            before_contract
+        );
+        let compiled = edited
+            .compilation_preview(&catalog, None)
+            .compiled
+            .expect("compiled preview");
+        assert_eq!(
+            compiled.plugin_input_defaults["commit"],
+            serde_json::json!({"message": "edited"})
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkflowBlockDefinition>(
+                edited.definition.nodes["commit"].configuration.clone()
+            )
+            .expect("owner contract"),
+            block
+        );
+
+        let invalid = WorkflowAuthoringEditBatch {
+            version: WORKFLOW_AUTHORING_EDIT_VERSION,
+            expected_generation: 1,
+            edits: vec![WorkflowAuthoringEdit::UpdatePluginInputDefaults {
+                node_id: "commit".to_string(),
+                defaults: Some(serde_json::json!({"message": 42})),
+            }],
+        };
+        assert!(apply_workflow_authoring_edits(&document, &invalid).is_err());
     }
 
     #[test]

@@ -10960,6 +10960,7 @@ mod tests {
             },
             configuration_schema: schema.clone(),
             configuration_defaults: Some(serde_json::json!({"message": "review"})),
+            plugin_input_defaults: BTreeMap::new(),
             definition: WorkflowDefinition {
                 schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
                 name: "authored-example".to_string(),
@@ -11049,6 +11050,7 @@ mod tests {
             ),
             plugins: std::collections::BTreeSet::new(),
             blocks: BTreeMap::new(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: std::collections::BTreeSet::from(["review".to_string()]),
             skills: std::collections::BTreeSet::new(),

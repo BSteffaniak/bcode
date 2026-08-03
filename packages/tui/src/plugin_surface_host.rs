@@ -7,7 +7,13 @@ use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
 use bcode_plugin_sdk::tui::{
     PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest, PluginSessionViewUpdate,
-    PluginTask, PluginTuiHost, PluginTuiHostError, PluginWorkflowControlAction,
+    PluginTask, PluginTuiHost, PluginTuiHostError, PluginWorkflowAuthoringCatalogFuture,
+    PluginWorkflowAuthoringDraft, PluginWorkflowAuthoringDraftFuture,
+    PluginWorkflowAuthoringEditFuture, PluginWorkflowAuthoringEditResult,
+    PluginWorkflowAuthoringPreviewFuture, PluginWorkflowAuthoringPublishFuture,
+    PluginWorkflowAuthoringPublishResult, PluginWorkflowAuthoringRevision,
+    PluginWorkflowAuthoringRevisionFuture, PluginWorkflowAuthoringStartFuture,
+    PluginWorkflowAuthoringValidationFuture, PluginWorkflowControlAction,
     PluginWorkflowControlFuture, PluginWorkflowControlResult, PluginWorkflowInspection,
     PluginWorkflowInspectionFuture, PluginWorkflowLookup, PluginWorkflowLookupFuture,
     PluginWorkflowStartFuture, PluginWorkflowStartRequest, PluginWorkflowStartResponse,
@@ -182,6 +188,150 @@ impl PluginTuiHost for BcodePluginTuiHost {
         })
     }
 
+    fn workflow_authoring_catalog(&self) -> PluginWorkflowAuthoringCatalogFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .workflow_authoring_catalog()
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn workflow_authoring_draft(
+        &self,
+        workflow_id: String,
+        draft_id: String,
+    ) -> PluginWorkflowAuthoringDraftFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .workflow_draft(workflow_id, draft_id)
+                .await
+                .map(|draft| draft.map(plugin_workflow_authoring_draft))
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn workflow_authoring_revision(
+        &self,
+        workflow_id: String,
+        revision: u64,
+    ) -> PluginWorkflowAuthoringRevisionFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .workflow_revision(workflow_id, revision)
+                .await
+                .map(|revision| revision.map(plugin_workflow_authoring_revision))
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn apply_workflow_authoring_edits(
+        &self,
+        workflow_id: String,
+        draft_id: String,
+        batch: bcode_workflow::WorkflowAuthoringEditBatch,
+        producer: bcode_workflow::WorkflowProducerProvenance,
+    ) -> PluginWorkflowAuthoringEditFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .apply_workflow_draft_edits(bcode_ipc::ApplyWorkflowDraftEditsRequest {
+                    workflow_id,
+                    draft_id,
+                    batch,
+                    producer,
+                })
+                .await
+                .map(plugin_workflow_authoring_edit_result)
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn validate_workflow_authoring(
+        &self,
+        document: bcode_workflow::WorkflowAuthoringDocument,
+    ) -> PluginWorkflowAuthoringValidationFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .validate_workflow_authoring(document)
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn preview_workflow_authoring(
+        &self,
+        document: bcode_workflow::WorkflowAuthoringDocument,
+        configuration: Option<serde_json::Value>,
+    ) -> PluginWorkflowAuthoringPreviewFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .preview_workflow_compilation(document, configuration)
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn publish_workflow_authoring_draft(
+        &self,
+        workflow_id: String,
+        draft_id: String,
+        expected_generation: u64,
+        activate: bool,
+    ) -> PluginWorkflowAuthoringPublishFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .publish_workflow_draft(bcode_ipc::PublishWorkflowDraftRequest {
+                    workflow_id,
+                    draft_id,
+                    expected_generation,
+                    configuration: None,
+                    activate,
+                    expected_active_revision: None,
+                    control: bcode_ipc::WorkflowComputationControl::default(),
+                })
+                .await
+                .map(plugin_workflow_authoring_publish_result)
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn start_authored_workflow_revision(
+        &self,
+        workflow_id: String,
+        revision: u64,
+        parent_session_id: SessionId,
+        workspace_snapshot: Option<String>,
+        configuration: Option<serde_json::Value>,
+    ) -> PluginWorkflowAuthoringStartFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .start_authored_workflow(bcode_ipc::StartAuthoredWorkflowRequest {
+                    selection: bcode_ipc::AuthoredWorkflowRunSelection::Revision {
+                        workflow_id,
+                        revision,
+                    },
+                    run_id: None,
+                    parent_session_id,
+                    workspace_snapshot,
+                    configuration,
+                })
+                .await
+                .map(|started| PluginWorkflowStartResponse {
+                    run_id: started.started.run.run_id,
+                    runtime_work_id: started.started.runtime_work_id.to_string(),
+                })
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
     fn subscribe_session_view(
         &self,
         request: PluginSessionViewSubscriptionRequest,
@@ -202,6 +352,70 @@ impl PluginTuiHost for BcodePluginTuiHost {
 
 pub fn root_host(redraw: InvalidationSignal, client: BcodeClient) -> impl PluginTuiHost {
     BcodePluginTuiHost::current(redraw, client)
+}
+
+fn plugin_workflow_authoring_draft(
+    draft: bcode_ipc::WorkflowDraftSnapshot,
+) -> PluginWorkflowAuthoringDraft {
+    PluginWorkflowAuthoringDraft {
+        workflow_id: draft.identity.workflow_id,
+        draft_id: draft.identity.draft_id,
+        base_revision: draft.base_revision,
+        generation: draft.generation,
+        document: draft.document,
+        producer: draft.producer,
+    }
+}
+
+fn plugin_workflow_authoring_revision(
+    revision: bcode_ipc::WorkflowRevisionSnapshot,
+) -> PluginWorkflowAuthoringRevision {
+    PluginWorkflowAuthoringRevision {
+        workflow_id: revision.identity.workflow_id,
+        revision: revision.identity.revision,
+        document: revision.document,
+    }
+}
+
+fn plugin_workflow_authoring_edit_result(
+    result: bcode_ipc::WorkflowDraftEditResult,
+) -> PluginWorkflowAuthoringEditResult {
+    match result {
+        bcode_ipc::WorkflowDraftEditResult::Updated(draft) => {
+            PluginWorkflowAuthoringEditResult::Updated(Box::new(plugin_workflow_authoring_draft(
+                *draft,
+            )))
+        }
+        bcode_ipc::WorkflowDraftEditResult::Conflict(conflict) => {
+            PluginWorkflowAuthoringEditResult::Conflict {
+                expected_generation: conflict.expected_generation,
+                current_generation: conflict.current_generation,
+            }
+        }
+        bcode_ipc::WorkflowDraftEditResult::Rejected { diagnostics } => {
+            PluginWorkflowAuthoringEditResult::Rejected { diagnostics }
+        }
+    }
+}
+
+fn plugin_workflow_authoring_publish_result(
+    result: bcode_ipc::WorkflowPublicationResult,
+) -> PluginWorkflowAuthoringPublishResult {
+    match result {
+        bcode_ipc::WorkflowPublicationResult::Published {
+            revision,
+            active_revision,
+        } => PluginWorkflowAuthoringPublishResult::Published {
+            revision: revision.identity.revision,
+            activated: active_revision == Some(revision.identity.revision),
+        },
+        bcode_ipc::WorkflowPublicationResult::Conflict(conflict) => {
+            PluginWorkflowAuthoringPublishResult::Conflict {
+                expected_generation: conflict.expected_generation,
+                current_generation: conflict.current_generation,
+            }
+        }
+    }
 }
 
 fn workflow_lookup(lookup: PluginWorkflowLookup) -> bcode_ipc::WorkflowRunBindingLookup {
@@ -509,5 +723,27 @@ mod tests {
     fn plugin_surface_host_source_uses_bmux_redraw_latch() {
         let source = include_str!("plugin_surface_host.rs");
         assert!(source.contains("InvalidationSignal"));
+    }
+
+    #[test]
+    fn plugin_surface_host_exposes_portable_workflow_authoring_services() {
+        let source = include_str!("plugin_surface_host.rs");
+        for service in [
+            "workflow_authoring_catalog",
+            "workflow_authoring_draft",
+            "workflow_authoring_revision",
+            "apply_workflow_authoring_edits",
+            "validate_workflow_authoring",
+            "preview_workflow_authoring",
+            "publish_workflow_authoring_draft",
+            "start_authored_workflow_revision",
+        ] {
+            assert!(
+                source.contains(service),
+                "missing authoring service: {service}"
+            );
+        }
+        assert!(!source.contains(concat!("super::terminal_", "events")));
+        assert!(!source.contains(concat!("Terminal<", "&mut")));
     }
 }

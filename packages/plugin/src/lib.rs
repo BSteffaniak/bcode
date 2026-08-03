@@ -8155,6 +8155,7 @@ library = "libexample_plugin.dylib"
                 .clone()
                 .expect("inline configuration schema"),
             configuration_defaults: None,
+            plugin_input_defaults: BTreeMap::new(),
             definition,
             bindings: Vec::new(),
             requirements: bcode_workflow::WorkflowRequirementSummary::default(),

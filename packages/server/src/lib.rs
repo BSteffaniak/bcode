@@ -14905,6 +14905,7 @@ async fn workflow_authoring_catalog_snapshot(
         ),
         plugins,
         blocks,
+        node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
         workflow_definitions,
         agent_profiles,
         skills,
@@ -49708,6 +49709,7 @@ library = "test"
             },
             configuration_schema: schema.clone(),
             configuration_defaults: Some(serde_json::json!({})),
+            plugin_input_defaults: BTreeMap::new(),
             definition: bcode_workflow::WorkflowDefinition {
                 schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
                 name: "ipc-authoring".to_string(),
