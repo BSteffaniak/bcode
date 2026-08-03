@@ -8445,7 +8445,36 @@ fn reqwest_provider_error(code: &'static str, error: &reqwest::Error) -> Provide
     normalized
         .diagnostic_context
         .insert("transport_kind".to_string(), transport_code.to_string());
-    if let Some(io_error) = error_chain_source::<std::io::Error>(error) {
+    let chain = transport_error_chain(error);
+    normalized.diagnostic_context.insert(
+        "error_chain_depth".to_string(),
+        chain.sources.len().to_string(),
+    );
+    if chain.truncated {
+        normalized
+            .diagnostic_context
+            .insert("error_chain_truncated".to_string(), "true".to_string());
+    }
+    if let Some(root) = chain.sources.last() {
+        let (root_source, root_code) =
+            transport_error_source_identity(*root, chain.sources.len() - 1, chain.sources.len());
+        normalized
+            .diagnostic_context
+            .insert("root_error_source".to_string(), root_source);
+        normalized
+            .diagnostic_context
+            .insert("root_error_code".to_string(), root_code);
+        normalized.diagnostic_context.insert(
+            "root_error_message".to_string(),
+            safe_transport_source_message(&root.to_string()),
+        );
+    }
+    if let Some(stage) = transport_network_stage(&chain.sources, transport_code) {
+        normalized
+            .diagnostic_context
+            .insert("network_stage".to_string(), stage.to_string());
+    }
+    if let Some(io_error) = preferred_io_error(&chain.sources) {
         normalized.diagnostic_context.insert(
             "io_error_kind".to_string(),
             io_error_kind_name(io_error.kind()).to_string(),
@@ -8456,7 +8485,11 @@ fn reqwest_provider_error(code: &'static str, error: &reqwest::Error) -> Provide
                 .insert("os_error_code".to_string(), os_error.to_string());
         }
     }
-    if let Some(tls_error) = error_chain_source::<rustls::Error>(error) {
+    if let Some(tls_error) = chain
+        .sources
+        .iter()
+        .find_map(|source| source.downcast_ref::<rustls::Error>())
+    {
         normalized.diagnostic_context.insert(
             "tls_error_kind".to_string(),
             rustls_error_kind(tls_error).to_string(),
@@ -8468,20 +8501,200 @@ fn reqwest_provider_error(code: &'static str, error: &reqwest::Error) -> Provide
         message: None,
     });
     normalized
+        .sources
+        .extend(transport_error_sources(&chain.sources));
+    normalized
 }
 
-fn error_chain_source<'a, T>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a T>
-where
-    T: std::error::Error + 'static,
-{
-    let mut source = error.source();
-    while let Some(current) = source {
-        if let Some(matched) = current.downcast_ref::<T>() {
-            return Some(matched);
-        }
-        source = current.source();
+const MAX_TRANSPORT_ERROR_CHAIN_DEPTH: usize = 16;
+const MAX_TRANSPORT_SOURCE_MESSAGE_CHARS: usize = 512;
+
+struct TransportErrorChain<'a> {
+    sources: Vec<&'a (dyn std::error::Error + 'static)>,
+    truncated: bool,
+}
+
+fn transport_error_chain<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> TransportErrorChain<'a> {
+    let mut chain = Vec::new();
+    let mut source = nested_error_source(error);
+    while let Some(current) = source
+        && chain.len() < MAX_TRANSPORT_ERROR_CHAIN_DEPTH
+    {
+        chain.push(current);
+        source = nested_error_source(current);
+    }
+    TransportErrorChain {
+        sources: chain,
+        truncated: source.is_some(),
+    }
+}
+
+fn nested_error_source<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    error.source().or_else(|| {
+        error.downcast_ref::<std::io::Error>().and_then(|error| {
+            error
+                .get_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static))
+        })
+    })
+}
+
+fn preferred_io_error<'a>(
+    chain: &[&'a (dyn std::error::Error + 'static)],
+) -> Option<&'a std::io::Error> {
+    let errors = chain
+        .iter()
+        .filter_map(|source| source.downcast_ref::<std::io::Error>())
+        .collect::<Vec<_>>();
+    errors
+        .iter()
+        .rev()
+        .copied()
+        .find(|error| error.kind() != std::io::ErrorKind::Other)
+        .or_else(|| errors.last().copied())
+}
+
+fn transport_network_stage(
+    chain: &[&(dyn std::error::Error + 'static)],
+    transport_code: &str,
+) -> Option<&'static str> {
+    if chain
+        .iter()
+        .any(|source| source.downcast_ref::<rustls::Error>().is_some())
+    {
+        return Some("tls");
+    }
+    let messages = chain
+        .iter()
+        .map(|source| source.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if messages.iter().any(|message| message.contains("dns")) {
+        return Some("dns");
+    }
+    if messages
+        .iter()
+        .any(|message| message.contains("proxy") || message.contains("tunnel"))
+    {
+        return Some("proxy");
+    }
+    if transport_code == "connect"
+        || messages
+            .iter()
+            .any(|message| message.contains("tcp") || message.contains("connect"))
+    {
+        return Some("tcp");
     }
     None
+}
+
+fn transport_error_sources(
+    chain: &[&(dyn std::error::Error + 'static)],
+) -> Vec<ProviderErrorSource> {
+    chain
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let (source_name, code) = transport_error_source_identity(*source, index, chain.len());
+            ProviderErrorSource {
+                source: source_name,
+                code: Some(code),
+                message: Some(safe_transport_source_message(&source.to_string())),
+            }
+        })
+        .collect()
+}
+
+fn transport_error_source_identity(
+    source: &(dyn std::error::Error + 'static),
+    index: usize,
+    chain_len: usize,
+) -> (String, String) {
+    if let Some(io_error) = source.downcast_ref::<std::io::Error>() {
+        return (
+            if index + 1 == chain_len {
+                "io_root"
+            } else {
+                "io"
+            }
+            .to_string(),
+            io_error_kind_name(io_error.kind()).to_string(),
+        );
+    }
+    if let Some(tls_error) = source.downcast_ref::<rustls::Error>() {
+        return (
+            if index + 1 == chain_len {
+                "rustls_root"
+            } else {
+                "rustls"
+            }
+            .to_string(),
+            rustls_error_kind(tls_error).to_string(),
+        );
+    }
+    let message = source.to_string().to_ascii_lowercase();
+    let code = if message.contains("dns") {
+        "dns"
+    } else if message.contains("proxy") || message.contains("tunnel") {
+        "proxy"
+    } else if message.contains("tcp") {
+        "tcp"
+    } else if message.contains("connect") {
+        "connect"
+    } else if message.contains("certificate") || message.contains("tls") {
+        "tls"
+    } else {
+        "unknown"
+    };
+    (
+        if index + 1 == chain_len {
+            "transport_root"
+        } else {
+            "transport"
+        }
+        .to_string(),
+        code.to_string(),
+    )
+}
+
+fn safe_transport_source_message(message: &str) -> String {
+    let without_urls = redact_diagnostic_urls(message);
+    let sanitized = sanitize_provider_diagnostic(&without_urls);
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let prefix = chars
+        .by_ref()
+        .take(MAX_TRANSPORT_SOURCE_MESSAGE_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…[TRUNCATED]")
+    } else {
+        prefix
+    }
+}
+
+fn redact_diagnostic_urls(message: &str) -> String {
+    let mut redacted = message.to_string();
+    while let Some(start) = ["http://", "https://"]
+        .into_iter()
+        .filter_map(|scheme| redacted.find(scheme))
+        .min()
+    {
+        let end = redacted[start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                (offset > 0
+                    && (character.is_whitespace()
+                        || matches!(character, ')' | ']' | '}' | ',' | ';' | '"' | '\'')))
+                .then_some(start + offset)
+            })
+            .unwrap_or(redacted.len());
+        redacted.replace_range(start..end, "[URL REDACTED]");
+    }
+    redacted
 }
 
 const fn io_error_kind_name(kind: std::io::ErrorKind) -> &'static str {
@@ -11818,6 +12031,114 @@ mod tests {
                 rustls::CertificateError::UnknownIssuer,
             )),
             "certificate_unknown_issuer"
+        );
+    }
+
+    #[test]
+    fn transport_error_chain_preserves_root_cause_and_prefers_specific_io_error() {
+        let root = std::io::Error::from(std::io::ErrorKind::NetworkUnreachable);
+        let wrapper = std::io::Error::other(root);
+        let wrapper_source = nested_error_source(&wrapper).expect("nested root cause");
+        let chain = vec![
+            &wrapper as &(dyn std::error::Error + 'static),
+            wrapper_source,
+        ];
+
+        assert_eq!(
+            preferred_io_error(&chain).map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NetworkUnreachable)
+        );
+        let sources = transport_error_sources(&chain);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].source, "io");
+        assert_eq!(sources[0].code.as_deref(), Some("other"));
+        assert_eq!(sources[1].source, "io_root");
+        assert_eq!(sources[1].code.as_deref(), Some("network_unreachable"));
+        assert_eq!(sources[1].message.as_deref(), Some("network unreachable"));
+    }
+
+    #[test]
+    fn transport_source_messages_redact_urls_and_credentials() {
+        let message = safe_transport_source_message(
+            "failed https://user:password@example.test/path?api_key=secret with bearer token-value",
+        );
+
+        assert_eq!(message, "failed [URL REDACTED] with bearer [REDACTED]");
+        assert!(!message.contains("example.test"));
+        assert!(!message.contains("password"));
+        assert!(!message.contains("token-value"));
+    }
+
+    #[test]
+    fn network_stage_uses_the_full_source_chain() {
+        let dns = std::io::Error::other("dns error");
+        let tls = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+
+        assert_eq!(transport_network_stage(&[&dns], "connect"), Some("dns"));
+        assert_eq!(transport_network_stage(&[&tls], "connect"), Some("tls"));
+    }
+
+    #[tokio::test]
+    async fn reqwest_connection_failure_preserves_the_complete_source_chain() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused local port");
+        let address = listener.local_addr().expect("read local address");
+        drop(listener);
+
+        let request_error = Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect_err("closed local port should refuse the connection");
+        let error = reqwest_provider_error("request_failed", &request_error);
+
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("network_stage")
+                .map(String::as_str),
+            Some("tcp")
+        );
+        assert!(error.sources.len() >= 3, "sources: {:?}", error.sources);
+        assert!(matches!(
+            error.sources.first(),
+            Some(ProviderErrorSource { source, code: Some(code), .. })
+                if source == "reqwest" && code == "connect"
+        ));
+        let root = error.sources.last().expect("root cause");
+        assert!(root.source.ends_with("_root"), "root source: {root:?}");
+        assert!(
+            root.message
+                .as_deref()
+                .is_some_and(|message| !message.is_empty()),
+            "root source: {root:?}"
+        );
+        assert!(
+            error.sources.iter().any(|source| {
+                source.source == "io_root" && source.code.as_deref() == Some("connection_refused")
+            }),
+            "sources: {:?}",
+            error.sources
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("io_error_kind")
+                .map(String::as_str),
+            Some("connection_refused")
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("root_error_source")
+                .map(String::as_str),
+            Some("io_root")
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("root_error_code")
+                .map(String::as_str),
+            Some("connection_refused")
         );
     }
 
