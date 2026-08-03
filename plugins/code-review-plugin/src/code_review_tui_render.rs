@@ -1090,10 +1090,9 @@ fn render_thread_detail(
             border_style,
         )]),
     );
-    let status = if thread.resolved { "resolved" } else { "open" };
     let title = format!(
-        " {} {} {} {} {}",
-        status,
+        " [{}] {} {} {} {}",
+        thread_sidebar_state_tokens(app, thread).join("/"),
         review_thread_kind_label(thread.thread_kind),
         thread.anchor.scope_label(),
         thread.line_label(),
@@ -3623,8 +3622,90 @@ struct RenderedRow {
 #[cfg(test)]
 mod tests {
     use crate::code_review_tui::ReviewFileStatus;
+    use bmux_tui::buffer::Buffer;
 
     use super::*;
+
+    fn render_app_text(app: &mut ReviewApp, width: u16, height: u16) -> String {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = Frame::new(&mut buffer);
+        render(app, &mut frame);
+        (0..buffer.area().height)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn rendered_tui_smoke_covers_navigation_composer_and_lifecycle_states() {
+        let mut app = crate::code_review_tui::tests::sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("composer")
+            .buffer
+            .insert_str("draft");
+        assert!(app.save_comment_editor());
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        let exchange_id = app.create_ai_exchange(
+            anchor.clone(),
+            "question".to_string(),
+            Some("session-1".to_string()),
+        );
+        app.mark_thread_session(&exchange_id, &anchor, "session-1");
+        app.draft_comments
+            .get_mut(&anchor)
+            .expect("draft thread")
+            .last_mut()
+            .expect("draft")
+            .session_id = Some("session-1".to_string());
+        app.suggested_comments
+            .entry(anchor.clone())
+            .or_default()
+            .push(crate::code_review_tui::ReviewSuggestedComment {
+                id: "suggestion".to_string(),
+                body: "suggestion".to_string(),
+                session_id: Some("session-1".to_string()),
+                status: crate::code_review_tui::ReviewSuggestionStatus::Suggested,
+                rationale: None,
+                created_at_ms: None,
+                updated_at_ms: None,
+            });
+        app.record_published_thread_for_test(&anchor, "github");
+        app.sidebar_mode = crate::code_review_tui::ReviewSidebarMode::Threads;
+
+        let rendered = render_app_text(&mut app, 180, 42);
+
+        for expected in ["open", "draft:1", "AI-exchange", "suggestion"] {
+            assert!(
+                rendered.contains(expected),
+                "missing rendered state {expected}"
+            );
+        }
+        let thread = app
+            .thread_summaries()
+            .into_iter()
+            .find(|thread| thread.anchor == anchor)
+            .expect("rendered thread");
+        assert!(
+            thread_sidebar_state_tokens(&app, &thread)
+                .iter()
+                .any(|token| token == "linked-session")
+        );
+        assert!(
+            thread_sidebar_state_tokens(&app, &thread)
+                .iter()
+                .any(|token| token == "published")
+        );
+
+        assert!(app.open_comment_editor());
+        app.comment_editor.as_mut().expect("composer").action =
+            crate::code_review_tui::ReviewCommentAction::AskBcode;
+        let composer = render_app_text(&mut app, 180, 42);
+        assert!(composer.contains("ask Bcode"));
+        assert!(composer.contains("[ask Bcode]"));
+    }
 
     #[test]
     fn sidebar_state_tokens_distinguish_review_lifecycle_dimensions() {
