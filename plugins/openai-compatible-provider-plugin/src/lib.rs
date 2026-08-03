@@ -4154,8 +4154,8 @@ async fn send_responses_request(
         .await
         .map_err(|error| reqwest_provider_error("request_failed", &error))?;
     let status = response.status();
+    let headers = response.headers().clone();
     if !status.is_success() {
-        let headers = response.headers().clone();
         let body = response.text().await.unwrap_or_default();
         return Err(error_from_status_and_headers(
             status.as_u16(),
@@ -4163,7 +4163,208 @@ async fn send_responses_request(
             &body,
         ));
     }
+    if let Err(mut error) = validate_stream_response_headers(status.as_u16(), &headers) {
+        enrich_unexpected_stream_response_error(&mut error, response).await;
+        return Err(error);
+    }
     Ok(response)
+}
+
+const MAX_UNEXPECTED_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+
+async fn enrich_unexpected_stream_response_error(
+    error: &mut ProviderError,
+    mut response: reqwest::Response,
+) {
+    error
+        .diagnostic_context
+        .insert("final_url".to_string(), diagnostic_url(response.url()));
+    for (header, key) in [
+        ("server", "response_server"),
+        ("cf-ray", "cloudflare_ray"),
+        ("x-oai-request-id", "openai_request_id"),
+        ("content-length", "content_length"),
+    ] {
+        if let Some(value) = response
+            .headers()
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+        {
+            error
+                .diagnostic_context
+                .insert(key.to_string(), sanitize_provider_diagnostic(value));
+        }
+    }
+
+    let mut body = Vec::new();
+    let mut truncated = response
+        .content_length()
+        .is_some_and(|length| length > MAX_UNEXPECTED_RESPONSE_BODY_BYTES as u64);
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_UNEXPECTED_RESPONSE_BODY_BYTES.saturating_sub(body.len());
+                if remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+                let copied = remaining.min(chunk.len());
+                body.extend_from_slice(&chunk[..copied]);
+                if copied < chunk.len() {
+                    truncated = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(read_error) => {
+                error.diagnostic_context.insert(
+                    "body_read_error".to_string(),
+                    reqwest_transport_kind(&read_error).to_string(),
+                );
+                break;
+            }
+        }
+    }
+    error
+        .diagnostic_context
+        .insert("body_bytes_captured".to_string(), body.len().to_string());
+    error
+        .diagnostic_context
+        .insert("body_fingerprint".to_string(), sha256_prefix(&body, 16));
+    if truncated {
+        error
+            .diagnostic_context
+            .insert("body_truncated".to_string(), "true".to_string());
+    }
+    if let Some(classification) = classify_unexpected_html_response(&body) {
+        error
+            .diagnostic_context
+            .insert("html_response_kind".to_string(), classification.to_string());
+    }
+}
+
+fn reqwest_transport_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "unknown"
+    }
+}
+
+fn diagnostic_url(url: &reqwest::Url) -> String {
+    let host = url.host_str().unwrap_or("unknown-host");
+    format!("{}://{host}{}", url.scheme(), url.path())
+}
+
+fn classify_unexpected_html_response(body: &[u8]) -> Option<&'static str> {
+    let body = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if body.contains("cf-chl-")
+        || body.contains("challenge-platform")
+        || body.contains("just a moment...")
+    {
+        return Some("cloudflare_challenge");
+    }
+    if body.contains("cloudflare access") || body.contains("/cdn-cgi/access/") {
+        return Some("cloudflare_access");
+    }
+    if body.contains("cloudflare")
+        && (body.contains("access denied")
+            || body.contains("attention required")
+            || body.contains("you have been blocked"))
+    {
+        return Some("cloudflare_block_page");
+    }
+    if body.contains("cloudflare") && (body.contains("gateway") || body.contains("zero trust")) {
+        return Some("cloudflare_gateway_page");
+    }
+    if body.contains("<!doctype html") || body.contains("<html") {
+        return Some("unclassified_html");
+    }
+    None
+}
+
+fn validate_stream_response_headers(status: u16, headers: &HeaderMap) -> Result<(), ProviderError> {
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or_default();
+    if content_type
+        .split(';')
+        .next()
+        .is_some_and(|media_type| media_type.eq_ignore_ascii_case("text/event-stream"))
+    {
+        return Ok(());
+    }
+    let mut error = provider_error(
+        "unexpected_stream_response",
+        ProviderErrorCategory::ProviderInternal,
+        if content_type.is_empty() {
+            "provider returned a successful response without an event-stream content type"
+                .to_string()
+        } else {
+            format!(
+                "provider returned a successful response with unexpected content type {content_type}"
+            )
+        },
+    );
+    error.retryable = false;
+    error.diagnostic_context = Box::new(BTreeMap::from([
+        ("http_status".to_string(), status.to_string()),
+        (
+            "content_type".to_string(),
+            if content_type.is_empty() {
+                "missing".to_string()
+            } else {
+                sanitize_provider_diagnostic(content_type)
+            },
+        ),
+    ]));
+    error.request_id = openai_request_id(headers).map(String::into_boxed_str);
+    error.sources.push(ProviderErrorSource {
+        source: "openai_api".to_string(),
+        code: Some("unexpected_stream_response".to_string()),
+        message: None,
+    });
+    Err(error)
+}
+
+fn incomplete_provider_stream_error(response: &reqwest::Response, buffer: &str) -> ProviderError {
+    let mut error = provider_error(
+        "incomplete_provider_stream",
+        ProviderErrorCategory::Network,
+        "provider response stream ended before a terminal event",
+    );
+    error.diagnostic_context = Box::new(BTreeMap::from([
+        ("buffered_bytes".to_string(), buffer.len().to_string()),
+        (
+            "content_type".to_string(),
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map_or_else(|| "missing".to_string(), sanitize_provider_diagnostic),
+        ),
+        (
+            "http_status".to_string(),
+            response.status().as_u16().to_string(),
+        ),
+    ]));
+    error.request_id = openai_request_id(response.headers()).map(String::into_boxed_str);
+    error.sources.push(ProviderErrorSource {
+        source: "openai_stream".to_string(),
+        code: Some("unexpected_eof".to_string()),
+        message: None,
+    });
+    error
 }
 
 async fn read_stream_events(
@@ -4182,7 +4383,7 @@ async fn read_stream_events(
         tokio::select! {
             chunk = response.chunk() => {
                 let Some(chunk) = chunk.map_err(|error| stream_read_error(&error))? else {
-                    return Ok(if saw_tool_call { StreamOutcome::ToolCall } else { StreamOutcome::Finished });
+                    return Err(incomplete_provider_stream_error(&response, &buffer));
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 let outcome = process_stream_buffer(
@@ -4227,6 +4428,7 @@ async fn read_responses_stream_events(
             .conversation_reuse
             .previous_provider_response_id
             .is_some(),
+        saw_assistant_text: std::cell::Cell::new(false),
         completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
     };
     loop {
@@ -4236,7 +4438,7 @@ async fn read_responses_stream_events(
         tokio::select! {
             chunk = response.chunk() => {
                 let Some(chunk) = chunk.map_err(|error| stream_read_error(&error))? else {
-                    return Ok(if saw_tool_call { StreamOutcome::ToolCall } else { StreamOutcome::Finished });
+                    return Err(incomplete_provider_stream_error(&response, &buffer));
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 let outcome = process_responses_stream_buffer(
@@ -4262,6 +4464,7 @@ struct ResponsesStreamProcessor<'a> {
     name_map: &'a BTreeMap<String, String>,
     suppress_provider_reuse_state: bool,
     uses_previous_response: bool,
+    saw_assistant_text: std::cell::Cell<bool>,
     completed_compaction_items: std::cell::RefCell<BTreeSet<(u32, String)>>,
 }
 
@@ -4295,6 +4498,25 @@ fn process_responses_stream_buffer(
     Ok(StreamOutcome::Cancelled)
 }
 
+fn empty_provider_response_error(terminal_event: &str) -> ProviderError {
+    let mut error = provider_error(
+        "empty_provider_response",
+        ProviderErrorCategory::ProviderInternal,
+        "provider reported successful completion without assistant output or a tool call",
+    );
+    error.retryable = false;
+    error.diagnostic_context = Box::new(BTreeMap::from([(
+        "terminal_event".to_string(),
+        terminal_event.to_string(),
+    )]));
+    error.sources.push(ProviderErrorSource {
+        source: "openai_stream".to_string(),
+        code: Some("empty_completion".to_string()),
+        message: None,
+    });
+    error
+}
+
 #[allow(clippy::too_many_lines)]
 fn process_responses_stream_line(
     line: &str,
@@ -4307,11 +4529,13 @@ fn process_responses_stream_line(
         return Ok(StreamOutcome::Cancelled);
     };
     if data == "[DONE]" {
-        return Ok(if *saw_tool_call {
-            StreamOutcome::ToolCall
-        } else {
-            StreamOutcome::Finished
-        });
+        if *saw_tool_call {
+            return Ok(StreamOutcome::ToolCall);
+        }
+        if !processor.saw_assistant_text.get() && reasoning_items.is_empty() {
+            return Err(empty_provider_response_error("done_marker"));
+        }
+        return Ok(StreamOutcome::Finished);
     }
     let event = serde_json::from_str::<serde_json::Value>(data).map_err(|error| {
         provider_error(
@@ -4332,6 +4556,7 @@ fn process_responses_stream_line(
                 processor.turn.push(ProviderTurnEvent::TextDelta {
                     text: delta.to_string(),
                 });
+                processor.saw_assistant_text.set(true);
             }
         }
         "response.reasoning_summary_text.delta" => process_responses_reasoning_delta(
@@ -4414,6 +4639,12 @@ fn process_responses_stream_line(
                 saw_tool_call,
                 processor.name_map,
             );
+            if !processor.saw_assistant_text.get()
+                && let Some(text) = responses_output_item_text(&event)
+            {
+                processor.turn.push(ProviderTurnEvent::TextDelta { text });
+                processor.saw_assistant_text.set(true);
+            }
             process_responses_reasoning_output_item(&event, processor.turn, reasoning_items, true);
             context_compaction::process_responses_compaction_output_item(
                 &event,
@@ -4452,8 +4683,10 @@ fn process_responses_stream_line(
                     processor.dialect,
                 )?;
                 StreamOutcome::ToolCall
-            } else {
+            } else if processor.saw_assistant_text.get() || !reasoning_items.is_empty() {
                 StreamOutcome::Finished
+            } else {
+                return Err(empty_provider_response_error(event_type));
             };
             if processor.dialect.supports_previous_response_id()
                 && !processor.suppress_provider_reuse_state
@@ -4776,6 +5009,26 @@ fn process_responses_reasoning_done(
             text: text.to_owned(),
         },
     });
+}
+
+fn responses_output_item_text(event: &serde_json::Value) -> Option<String> {
+    let item = event.get("item")?;
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        return None;
+    }
+    let text = item
+        .get("content")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter(|part| {
+            matches!(
+                part.get("type").and_then(serde_json::Value::as_str),
+                Some("output_text" | "text" | "refusal")
+            )
+        })
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
 }
 
 fn process_responses_output_item(
@@ -8429,19 +8682,7 @@ fn reqwest_provider_error(code: &'static str, error: &reqwest::Error) -> Provide
             "provider network request failed"
         },
     );
-    let transport_code = if error.is_timeout() {
-        "timeout"
-    } else if error.is_connect() {
-        "connect"
-    } else if error.is_body() {
-        "body"
-    } else if error.is_decode() {
-        "decode"
-    } else if error.is_request() {
-        "request"
-    } else {
-        "unknown"
-    };
+    let transport_code = reqwest_transport_kind(error);
     normalized
         .diagnostic_context
         .insert("transport_kind".to_string(), transport_code.to_string());
@@ -11518,8 +11759,69 @@ mod tests {
             name_map,
             suppress_provider_reuse_state: false,
             uses_previous_response: false,
+            saw_assistant_text: std::cell::Cell::new(false),
             completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
         }
+    }
+
+    #[test]
+    fn completed_message_item_emits_text_when_delta_is_missing() {
+        let turn = TurnState::default();
+        let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
+        let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = false;
+
+        let outcome = process_responses_stream_line(
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+            &processor,
+            &mut tool_calls,
+            &mut reasoning_items,
+            &mut saw_tool_call,
+        )
+        .expect("completed message item should process");
+
+        assert!(matches!(outcome, StreamOutcome::Cancelled));
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::TextDelta { text } if text == "ok"
+        )));
+    }
+
+    #[test]
+    fn completed_message_item_does_not_duplicate_streamed_text() {
+        let turn = TurnState::default();
+        let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
+        let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = false;
+
+        for line in [
+            r#"data: {"type":"response.output_text.delta","delta":"ok"}"#,
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+        ] {
+            process_responses_stream_line(
+                line,
+                &processor,
+                &mut tool_calls,
+                &mut reasoning_items,
+                &mut saw_tool_call,
+            )
+            .expect("text event should process");
+        }
+
+        let events = turn.drain();
+        assert_eq!(
+            events
+                .iter()
+                .filter(
+                    |event| matches!(event, ProviderTurnEvent::TextDelta { text } if text == "ok")
+                )
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -11530,6 +11832,7 @@ mod tests {
         processor.uses_previous_response = true;
         let mut tool_calls = BTreeMap::new();
         let mut reasoning_items = BTreeMap::new();
+        reasoning_items.insert(0, ReasoningItemAccumulator::default());
         let mut saw_tool_call = false;
 
         process_responses_stream_line(
@@ -11561,6 +11864,7 @@ mod tests {
         let processor = test_responses_stream_processor(&turn, &name_map);
         let mut tool_calls = BTreeMap::new();
         let mut reasoning_items = BTreeMap::new();
+        reasoning_items.insert(0, ReasoningItemAccumulator::default());
         let mut saw_tool_call = false;
 
         process_responses_stream_line(
@@ -11720,6 +12024,7 @@ mod tests {
             name_map: &name_map,
             suppress_provider_reuse_state: false,
             uses_previous_response: false,
+            saw_assistant_text: std::cell::Cell::new(false),
             completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
         };
 
@@ -11760,6 +12065,7 @@ mod tests {
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
         let processor = test_responses_stream_processor(&turn, &name_map);
+        processor.saw_assistant_text.set(true);
 
         let outcome = process_responses_stream_line(
             r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
@@ -11795,8 +12101,10 @@ mod tests {
             name_map: &name_map,
             suppress_provider_reuse_state: false,
             uses_previous_response: false,
+            saw_assistant_text: std::cell::Cell::new(false),
             completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
         };
+        processor.saw_assistant_text.set(true);
 
         let outcome = process_responses_stream_line(
             r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
@@ -12020,6 +12328,74 @@ mod tests {
         assert!(error.provider_message.is_none());
         assert!(error.sources.iter().all(|source| source.message.is_none()));
         assert!(!format!("{error:?}").contains("do-not-expose"));
+    }
+
+    #[test]
+    fn stream_response_requires_event_stream_content_type() {
+        let mut valid = HeaderMap::new();
+        valid.insert(
+            reqwest::header::CONTENT_TYPE,
+            "text/event-stream; charset=utf-8"
+                .parse()
+                .expect("content type"),
+        );
+        assert!(validate_stream_response_headers(200, &valid).is_ok());
+
+        let mut invalid = HeaderMap::new();
+        invalid.insert(
+            reqwest::header::CONTENT_TYPE,
+            "text/html".parse().expect("content type"),
+        );
+        let error = validate_stream_response_headers(200, &invalid)
+            .expect_err("non-SSE success must not be treated as a completed turn");
+        assert_eq!(error.code, "unexpected_stream_response");
+        assert_eq!(error.category, ProviderErrorCategory::ProviderInternal);
+        assert!(!error.retryable);
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("content_type")
+                .map(String::as_str),
+            Some("text/html")
+        );
+    }
+
+    #[test]
+    fn unexpected_html_response_classification_identifies_cloudflare_pages() {
+        assert_eq!(
+            classify_unexpected_html_response(
+                b"<!doctype html><title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/x'></script>",
+            ),
+            Some("cloudflare_challenge")
+        );
+        assert_eq!(
+            classify_unexpected_html_response(
+                b"<html><title>Cloudflare Access</title><a href='/cdn-cgi/access/login'>login</a></html>",
+            ),
+            Some("cloudflare_access")
+        );
+        assert_eq!(
+            classify_unexpected_html_response(
+                b"<html><title>Cloudflare Gateway</title><p>Zero Trust policy blocked this request</p></html>",
+            ),
+            Some("cloudflare_gateway_page")
+        );
+        assert_eq!(
+            classify_unexpected_html_response(b"<!doctype html><title>unknown</title>"),
+            Some("unclassified_html")
+        );
+    }
+
+    #[test]
+    fn diagnostic_url_excludes_query_and_userinfo() {
+        let url = reqwest::Url::parse(
+            "https://user:password@example.test/backend-api/codex/responses?token=secret",
+        )
+        .expect("url");
+        assert_eq!(
+            diagnostic_url(&url),
+            "https://example.test/backend-api/codex/responses"
+        );
     }
 
     #[test]

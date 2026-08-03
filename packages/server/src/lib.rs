@@ -19725,7 +19725,11 @@ fn provider_error_message(error: &bcode_model::ProviderError) -> String {
     if is_model_no_progress_timeout(error) {
         return error.message.clone();
     }
-    format!("model error {}: {}", error.code, error.message)
+    format!(
+        "model error {}: {}",
+        error.code,
+        provider_error_detail(error)
+    )
 }
 
 async fn active_plugin_scope_for_session(
@@ -43325,6 +43329,37 @@ library = "test"
         assert_eq!(error.category, bcode_model::ProviderErrorCategory::Timeout);
         assert!(error.retryable);
         assert_eq!(provider_error_message(&error), message);
+    }
+
+    #[test]
+    fn terminal_provider_error_message_includes_safe_diagnostics() {
+        let error = bcode_model::ProviderError {
+            code: "unexpected_stream_response".to_string(),
+            category: bcode_model::ProviderErrorCategory::ProviderInternal,
+            message: "provider returned HTML".to_string(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::new(BTreeMap::from([
+                (
+                    "html_response_kind".to_string(),
+                    "cloudflare_challenge".to_string(),
+                ),
+                ("body_fingerprint".to_string(), "1234abcd".to_string()),
+            ])),
+            sources: Box::new(vec![bcode_model::ProviderErrorSource {
+                source: "openai_api".to_string(),
+                code: Some("unexpected_stream_response".to_string()),
+                message: None,
+            }]),
+            retry: None,
+        };
+
+        assert_eq!(
+            provider_error_message(&error),
+            "model error unexpected_stream_response: Underlying error: provider_internal/unexpected_stream_response — provider returned HTML (body_fingerprint=1234abcd; html_response_kind=cloudflare_challenge; source=openai_api/unexpected_stream_response)."
+        );
     }
 
     #[test]
