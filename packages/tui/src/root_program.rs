@@ -368,13 +368,7 @@ impl BcodeRuntimeModel {
                             return super::invalidation::UiInvalidation::Structural;
                         }
                         super::chat_loop::SlashPaletteRootOutcome::Submit => {
-                            let launch_working_directory =
-                                self.settings.launch_working_directory().to_path_buf();
-                            let _staged = super::composer_flow::stage_session_message(
-                                &launch_working_directory,
-                                &mut self.chat,
-                                bcode_ipc::PromptPlacement::Steering,
-                            );
+                            self.stage_root_submission(bcode_ipc::PromptPlacement::Steering);
                             return super::invalidation::UiInvalidation::Structural;
                         }
                         super::chat_loop::SlashPaletteRootOutcome::Unhandled => {}
@@ -403,15 +397,7 @@ impl BcodeRuntimeModel {
                         super::thinking_flow::cycle_thinking_effort(&mut self.chat);
                     }
                     super::input::KeyRequest::Submit { placement } => {
-                        let launch_working_directory =
-                            self.settings.launch_working_directory().to_path_buf();
-                        if super::composer_flow::stage_session_message(
-                            &launch_working_directory,
-                            &mut self.chat,
-                            placement,
-                        ) {
-                            self.draft_autosave.mark_dirty_now();
-                        }
+                        self.stage_root_submission(placement);
                     }
                 }
                 self.loop_state.refresh_slash_palette(&mut self.chat);
@@ -469,6 +455,41 @@ impl BcodeRuntimeModel {
             }
         };
         damage
+    }
+
+    fn stage_root_submission(&mut self, placement: bcode_ipc::PromptPlacement) {
+        let launch_working_directory = self.settings.launch_working_directory().to_path_buf();
+        match super::composer_flow::stage_root_submission(
+            &launch_working_directory,
+            &mut self.chat,
+            placement,
+        ) {
+            super::composer_flow::RootSubmission::MessageStaged(staged) => {
+                if staged {
+                    self.draft_autosave.mark_dirty_now();
+                }
+            }
+            super::composer_flow::RootSubmission::SlashCommand(message) => {
+                let working_directory = self
+                    .chat
+                    .app
+                    .working_directory()
+                    .unwrap_or_else(|| self.settings.launch_working_directory())
+                    .to_path_buf();
+                self.chat
+                    .replace_effect(super::effects::TuiEffect::ExecuteSlashCommand {
+                        session_id: self.chat.session_id,
+                        working_directory,
+                        current_agent_id: self.chat.app.current_agent_id().to_owned(),
+                        reasoning_display_mode: self.chat.app.reasoning_display_mode(),
+                        reasoning_visible: self.chat.app.reasoning_visible(),
+                        message,
+                    });
+                self.chat
+                    .app
+                    .set_status("running slash command…".to_owned());
+            }
+        }
     }
 
     fn apply_root_command_action(&mut self, action: bcode_command::CommandAction) {

@@ -423,6 +423,34 @@ fn defer_submission_while_session_opens(chat: &mut ActiveChat) -> bool {
     true
 }
 
+pub enum RootSubmission {
+    MessageStaged(bool),
+    SlashCommand(String),
+}
+
+pub fn stage_root_submission(
+    launch_working_directory: &std::path::Path,
+    chat: &mut ActiveChat,
+    placement: bcode_ipc::PromptPlacement,
+) -> RootSubmission {
+    if chat.opening_session_id.is_some() {
+        chat.app
+            .set_status("Session is still opening; message kept in composer".to_owned());
+        return RootSubmission::MessageStaged(false);
+    }
+    let message = chat.app.take_pending_submission();
+    if slash_registry::slash_command_name(&message).is_some() {
+        chat.app.clear_pending_submission(&message);
+        return RootSubmission::SlashCommand(message);
+    }
+    chat.app.restore_pending_submission(&message);
+    RootSubmission::MessageStaged(stage_session_message(
+        launch_working_directory,
+        chat,
+        placement,
+    ))
+}
+
 pub fn stage_session_message(
     launch_working_directory: &std::path::Path,
     chat: &mut ActiveChat,

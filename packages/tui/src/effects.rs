@@ -155,6 +155,21 @@ pub enum TuiEffect {
     },
     /// Load host and plugin command-palette contributions.
     LoadCommandPalette,
+    /// Execute a resolved slash command without terminal navigation.
+    ExecuteSlashCommand {
+        /// Current session.
+        session_id: Option<SessionId>,
+        /// Working directory context.
+        working_directory: std::path::PathBuf,
+        /// Current agent identity.
+        current_agent_id: String,
+        /// Current reasoning display mode.
+        reasoning_display_mode: bcode_config::TuiThinkingMode,
+        /// Whether reasoning is displayed.
+        reasoning_visible: bool,
+        /// Complete command text.
+        message: String,
+    },
     /// Invoke a plugin-owned command without terminal navigation effects.
     InvokePluginCommand {
         /// Plugin owner.
@@ -443,6 +458,13 @@ pub enum TuiEffectResult {
         /// Contributions result from the application client boundary.
         result: Result<Vec<bcode_command::CommandContribution>, ClientError>,
     },
+    /// Resolved slash command execution completed.
+    SlashCommandExecuted {
+        /// Submitted command text.
+        message: String,
+        /// Command outcome.
+        result: Result<super::slash_commands::SlashCommandOutcome, ClientError>,
+    },
     /// Plugin command invocation completed.
     PluginCommandInvoked {
         /// Plugin owner.
@@ -643,6 +665,7 @@ impl TuiEffectResult {
             | Self::AuthSecurityReconciled { .. }
             | Self::SlashPaletteLoaded { .. }
             | Self::CommandPaletteLoaded { .. }
+            | Self::SlashCommandExecuted { .. }
             | Self::PluginCommandInvoked { .. } => DaemonObservation::None,
         }
     }
@@ -718,6 +741,7 @@ enum EffectKey {
     DraftSave,
     SlashPalette,
     CommandPalette,
+    SlashCommand,
     PluginCommand(String, String),
     RenameSession(SessionId),
     DeleteSession(SessionId),
@@ -903,6 +927,7 @@ impl TuiEffect {
             | Self::SaveDraft { .. }
             | Self::LoadSlashPalette { .. }
             | Self::LoadCommandPalette
+            | Self::ExecuteSlashCommand { .. }
             | Self::InvokePluginCommand { .. } => {
                 unreachable!("daemon start failure for non-foreground effect")
             }
@@ -947,7 +972,8 @@ impl TuiEffect {
             | Self::ListPermissions
             | Self::SaveDraft { .. }
             | Self::LoadSlashPalette { .. }
-            | Self::LoadCommandPalette => EffectDaemonIntent::Background,
+            | Self::LoadCommandPalette
+            | Self::ExecuteSlashCommand { .. } => EffectDaemonIntent::Background,
         }
     }
 }
@@ -1341,6 +1367,7 @@ impl TuiEffect {
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::LoadCommandPalette => EffectKey::CommandPalette,
+            Self::ExecuteSlashCommand { .. } => EffectKey::SlashCommand,
             Self::InvokePluginCommand {
                 plugin_id,
                 command_id,
@@ -1500,6 +1527,34 @@ impl TuiEffect {
                     .await
                     .map(|contributions| contributions.command_contributions),
             },
+            Self::ExecuteSlashCommand {
+                session_id,
+                working_directory,
+                current_agent_id,
+                reasoning_display_mode,
+                reasoning_visible,
+                message,
+            } => {
+                let result = match super::slash_registry::resolve(&client, &message).await {
+                    Ok(resolution) => {
+                        super::slash_commands::execute_resolved(
+                            &client,
+                            session_id,
+                            super::slash_commands::SlashExecutionContext {
+                                working_directory: &working_directory,
+                                current_agent_id: &current_agent_id,
+                                reasoning_display_mode,
+                                reasoning_visible,
+                            },
+                            &message,
+                            resolution,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                TuiEffectResult::SlashCommandExecuted { message, result }
+            }
             Self::InvokePluginCommand {
                 plugin_id,
                 command_id,

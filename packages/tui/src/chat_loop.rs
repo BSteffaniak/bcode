@@ -1313,6 +1313,13 @@ pub fn apply_effect_result(
                 }
             }
         }
+        TuiEffectResult::SlashCommandExecuted { message, result } => match result {
+            Ok(outcome) => apply_root_slash_command_outcome(chat, &message, outcome),
+            Err(error) => {
+                chat.app.restore_pending_submission(&message);
+                report_nonfatal_client_error(chat, "Slash command failed", &error);
+            }
+        },
         TuiEffectResult::PluginCommandInvoked { plugin_id, result } => match result {
             Ok(response) => {
                 if let Some(message) = response.message {
@@ -1721,6 +1728,148 @@ fn apply_slash_palette_result(
         palette.select_command(&previous);
     }
     loop_state.slash_palette = (!palette.is_empty()).then_some(palette);
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_root_slash_command_outcome(
+    chat: &mut ActiveChat,
+    message: &str,
+    outcome: super::slash_commands::SlashCommandOutcome,
+) {
+    use super::slash_commands::SlashCommandOutcome;
+    match outcome {
+        SlashCommandOutcome::Handled(status) => chat.app.set_status(status),
+        SlashCommandOutcome::SystemMarkdown(text) => chat.push_presentation_note(
+            "bcode.host",
+            text,
+            bcode_command::CommandTextFormat::Markdown,
+        ),
+        SlashCommandOutcome::SystemPlain(text) => chat.push_presentation_note(
+            "bcode.host",
+            text,
+            bcode_command::CommandTextFormat::PlainText,
+        ),
+        SlashCommandOutcome::SetThinkingDisplay(show) => {
+            chat.app.set_reasoning_visible(show);
+            chat.app.set_status(if show {
+                "reasoning display enabled".to_owned()
+            } else {
+                "reasoning display hidden".to_owned()
+            });
+        }
+        SlashCommandOutcome::ToggleThinkingDisplay => {
+            let show = !chat.app.reasoning_visible();
+            chat.app.set_reasoning_visible(show);
+            chat.app.set_status(if show {
+                "reasoning output shown".to_owned()
+            } else {
+                "reasoning output hidden".to_owned()
+            });
+        }
+        SlashCommandOutcome::SetThinkingMode(mode) => {
+            chat.app.set_reasoning_display_mode(mode);
+        }
+        SlashCommandOutcome::NewDraftSession => session_flow::switch_to_draft_session(chat),
+        SlashCommandOutcome::CancelTurn { session_id } => {
+            chat.start_effect(TuiEffect::CancelTurn { session_id });
+        }
+        SlashCommandOutcome::CancelRuntimeWork {
+            session_id,
+            work_id,
+        } => {
+            let work_id = bcode_session_models::WorkId::new(work_id);
+            chat.start_effect(TuiEffect::CancelRuntimeWork {
+                session_id,
+                work_id,
+            });
+        }
+        SlashCommandOutcome::CompactContext { session_id } => {
+            chat.start_effect(TuiEffect::CompactContext { session_id });
+        }
+        SlashCommandOutcome::AttachWorktree { session_id, path } => {
+            chat.start_effect(TuiEffect::AttachWorktree { session_id, path });
+        }
+        SlashCommandOutcome::SetLocalModel {
+            provider_plugin_id,
+            model_id,
+        } => {
+            chat.app
+                .apply_local_model_selection(provider_plugin_id, &model_id);
+        }
+        SlashCommandOutcome::SetSessionModel {
+            session_id,
+            provider_plugin_id,
+            model_id,
+        } => chat.start_effect(TuiEffect::SetSessionModel {
+            session_id,
+            provider_plugin_id,
+            model_id,
+        }),
+        SlashCommandOutcome::SetSessionReasoning {
+            session_id,
+            effort,
+            summary,
+            status,
+        } => chat.start_effect(TuiEffect::SetSessionReasoning {
+            session_id,
+            effort,
+            summary,
+            effort_generation: chat.app.pending_reasoning_effort_generation(),
+            status,
+        }),
+        SlashCommandOutcome::PluginCommand {
+            action,
+            execution: _,
+            arguments,
+        } => match action {
+            bcode_command::CommandAction::Plugin {
+                plugin_id,
+                command_id,
+            } => {
+                let working_directory = chat
+                    .app
+                    .working_directory()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+                chat.start_effect(TuiEffect::InvokePluginCommand {
+                    plugin_id,
+                    command_id,
+                    arguments: Some(arguments),
+                    working_directory,
+                    session_id: chat.session_id,
+                });
+            }
+            bcode_command::CommandAction::Host { route } => chat
+                .app
+                .set_status(format!("host slash route pending root navigation: {route}")),
+        },
+        SlashCommandOutcome::Unknown(_)
+        | SlashCommandOutcome::OpenTimeline
+        | SlashCommandOutcome::DraftAgentSelected { .. }
+        | SlashCommandOutcome::PickSession
+        | SlashCommandOutcome::PickModel
+        | SlashCommandOutcome::OpenWorktreeCreateDialog
+        | SlashCommandOutcome::OpenForkSessionWizard
+        | SlashCommandOutcome::CloneSession { .. }
+        | SlashCommandOutcome::OpenRalphHome
+        | SlashCommandOutcome::OpenRalphStartDialog
+        | SlashCommandOutcome::ShowRalphStatus
+        | SlashCommandOutcome::RunRalphLoop
+        | SlashCommandOutcome::ApproveRalphRun
+        | SlashCommandOutcome::StopRalphLoop
+        | SlashCommandOutcome::ListRalphRuns
+        | SlashCommandOutcome::ListRalphIterations
+        | SlashCommandOutcome::ResumeRalphRun
+        | SlashCommandOutcome::OpenRalphProgress
+        | SlashCommandOutcome::BuildRalphPrompt(_)
+        | SlashCommandOutcome::PickSkill
+        | SlashCommandOutcome::InvokeSkill { .. }
+        | SlashCommandOutcome::OpenThinkingSettings(_) => {
+            chat.app.restore_pending_submission(message);
+            chat.app
+                .set_status("slash command pending root screen migration".to_owned());
+        }
+    }
 }
 
 fn apply_submit_message_result(
