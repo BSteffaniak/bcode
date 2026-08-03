@@ -1387,6 +1387,44 @@ mod tests {
     }
 
     #[test]
+    fn unknown_or_unavailable_adapter_remains_bounded_and_understandable() {
+        for (required, expected) in [
+            (true, "response required"),
+            (false, "optional response pending"),
+        ] {
+            let interaction = InteractionViewSummary {
+                producer_id: Some("unknown.producer".to_owned()),
+                exchange_schema: Some("unknown.interaction".to_owned()),
+                exchange_schema_version: Some(u32::MAX),
+                interaction_id: format!("unknown-{required}"),
+                kind: "unknown.interaction".to_owned(),
+                tool_call_id: Some("unknown-call".to_owned()),
+                title: None,
+                required,
+                snapshot: Some(serde_json::json!({
+                    "untrusted": "x".repeat(1_000_000),
+                    "controls": ["not", "interpreted"]
+                })),
+                state: bcode_session_view_models::InteractionViewState::Pending,
+                status_detail: None,
+                resolved: false,
+                resolution: None,
+            };
+            let item = terminal_interaction_item_from_shared(&interaction);
+            assert!(
+                item.text().contains("unknown.interaction"),
+                "{}",
+                item.text()
+            );
+            assert!(item.text().contains(expected));
+            assert!(item.text().contains("active interaction panel"));
+            assert!(item.text().len() < 512);
+            assert!(!item.text().contains("not"));
+            assert!(!item.text().contains(&"x".repeat(64)));
+        }
+    }
+
+    #[test]
     fn pending_interaction_summary_avoids_duplicate_raw_form_payload() {
         let interaction = InteractionViewSummary {
             producer_id: None,

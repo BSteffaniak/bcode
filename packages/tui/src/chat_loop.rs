@@ -3380,6 +3380,55 @@ async fn resolve_interactive_surface_dismissed<W: Write>(
     Ok(())
 }
 
+fn apply_interactive_surface_resolution_result(
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    result: Result<SessionViewActionOutcome, ClientError>,
+) {
+    match result {
+        Ok(SessionViewActionOutcome::InteractionResolved { resolved: true }) => {
+            loop_state.interactive_surface = None;
+            chat.app.invalidate_interaction_surface_layout();
+        }
+        Ok(SessionViewActionOutcome::InteractionResolved { resolved: false }) => {
+            loop_state.interactive_surface = None;
+            chat.app.set_status(
+                "Interactive request was already resolved by another client".to_owned(),
+            );
+        }
+        Ok(_) => retain_interactive_surface_for_retry(
+            chat,
+            loop_state,
+            "Interactive response failed: unexpected daemon response; retry".to_owned(),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to resolve interactive request");
+            retain_interactive_surface_for_retry(
+                chat,
+                loop_state,
+                format!("Interactive response failed; retry: {error}"),
+            );
+        }
+    }
+}
+
+fn retain_interactive_surface_for_retry(
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    status: String,
+) {
+    if let Some(surface) = loop_state.interactive_surface.as_mut() {
+        surface.clear_pending_resolution();
+        if let Some(index) = chat
+            .app
+            .interaction_transcript_index(surface.interaction_id())
+        {
+            chat.app.mark_transcript_item_dirty(index);
+        }
+    }
+    chat.app.set_status(status);
+}
+
 #[allow(clippy::future_not_send)]
 async fn handle_interactive_surface_event<W: Write>(
     context: &ChatEventContext<'_, '_, W>,
@@ -3416,50 +3465,15 @@ async fn handle_interactive_surface_event<W: Write>(
         render::transcript_area_for_frame(&chat.app, context.terminal.area()).width,
     );
     if let Some(resolution) = surface.handle_event(&event) {
-        match execute_session_view_action(
+        let result = execute_session_view_action(
             context.services.client,
             SessionViewAction::ResolveExchange {
                 interaction_id,
                 resolution,
             },
         )
-        .await
-        {
-            Ok(SessionViewActionOutcome::InteractionResolved { resolved: true }) => {
-                loop_state.interactive_surface = None;
-                chat.app.invalidate_interaction_surface_layout();
-            }
-            Ok(SessionViewActionOutcome::InteractionResolved { resolved: false }) => {
-                loop_state.interactive_surface = None;
-                chat.app.set_status(
-                    "Interactive request was already resolved by another client".to_owned(),
-                );
-            }
-            Ok(_) => {
-                surface.clear_pending_resolution();
-                if let Some(index) = chat
-                    .app
-                    .interaction_transcript_index(surface.interaction_id())
-                {
-                    chat.app.mark_transcript_item_dirty(index);
-                }
-                chat.app.set_status(
-                    "Interactive response failed: unexpected daemon response; retry".to_owned(),
-                );
-            }
-            Err(error) => {
-                surface.clear_pending_resolution();
-                if let Some(index) = chat
-                    .app
-                    .interaction_transcript_index(surface.interaction_id())
-                {
-                    chat.app.mark_transcript_item_dirty(index);
-                }
-                tracing::warn!(%error, "failed to resolve interactive request");
-                chat.app
-                    .set_status(format!("Interactive response failed; retry: {error}"));
-            }
-        }
+        .await;
+        apply_interactive_surface_resolution_result(chat, loop_state, result);
     } else if let Some(surface) = loop_state.interactive_surface.as_mut() {
         let current_height = surface.preferred_height(
             render::transcript_area_for_frame(&chat.app, context.terminal.area()).width,
@@ -3978,6 +3992,502 @@ mod scheduler_tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One lifecycle test proves state transfer across all live interaction config dimensions.
+    async fn config_reload_updates_interaction_behavior_without_reopening_or_losing_state() {
+        let static_plugins = vec![bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        )];
+        let mut settings =
+            TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &static_plugins);
+        let mut chat = test_chat();
+        let mut loop_state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            false,
+        );
+        install_question_runtime(&mut loop_state);
+        loop_state.interactive_surface = Some(
+            InteractiveSurfaceState::open(
+                loop_state
+                    .plugin_runtime
+                    .as_ref()
+                    .expect("question runtime"),
+                "question-active",
+                "bcode.question.inline",
+                &serde_json::json!({
+                    "questions": [{
+                        "header": null,
+                        "question": "Explain?",
+                        "options": [],
+                        "control": "radio",
+                        "selection_mode": "single",
+                        "custom": true,
+                        "custom_mode": "additional",
+                        "required": true
+                    }]
+                })
+                .to_string(),
+                &settings.keymap,
+            )
+            .await
+            .expect("question surface"),
+        );
+        let type_text = |surface: &mut InteractiveSurfaceState, text: &str| {
+            for character in text.chars() {
+                assert!(
+                    surface
+                        .handle_event(&Event::Key(KeyStroke {
+                            key: KeyCode::Char(character),
+                            modifiers: bmux_keyboard::Modifiers::NONE,
+                        }))
+                        .is_none()
+                );
+            }
+        };
+        type_text(
+            loop_state
+                .interactive_surface
+                .as_mut()
+                .expect("active question surface"),
+            "Ab",
+        );
+
+        let mut config = bcode_config::BcodeConfig::default();
+        config.tui.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
+        config.tui.interactions.offscreen_focus =
+            bcode_config::TuiInteractionOffscreenFocus::Suspend;
+        config.tui.keybindings.chat = std::collections::BTreeMap::from([
+            ("ctrl+b".to_owned(), "tui.editor.moveCursorLeft".to_owned()),
+            (
+                "ctrl+d".to_owned(),
+                "tui.editor.deleteCharForward".to_owned(),
+            ),
+            ("ctrl+j".to_owned(), "tui.input.newLine".to_owned()),
+            ("ctrl+s".to_owned(), "tui.input.submit".to_owned()),
+        ]);
+        apply_config_result(&mut settings, &mut chat, &mut loop_state, Ok(config));
+
+        assert_eq!(
+            chat.app.tui_config().interactions.placement,
+            bcode_config::TuiInteractionPlacement::Pinned
+        );
+        assert_eq!(
+            chat.app.tui_config().interactions.offscreen_focus,
+            bcode_config::TuiInteractionOffscreenFocus::Suspend
+        );
+        let surface = loop_state
+            .interactive_surface
+            .as_mut()
+            .expect("reload preserves active surface");
+        for (key, expected) in [
+            (
+                'b',
+                bmux_text_edit::TextEditCommand::Move(bmux_text_edit::TextMotion::Left),
+            ),
+            (
+                'd',
+                bmux_text_edit::TextEditCommand::Delete(bmux_text_edit::TextDelete::Forward),
+            ),
+            ('j', bmux_text_edit::TextEditCommand::Insert('\n')),
+        ] {
+            assert_eq!(
+                surface.text_edit_command_for_test(KeyStroke {
+                    key: KeyCode::Char(key),
+                    modifiers: bmux_keyboard::Modifiers {
+                        ctrl: true,
+                        ..bmux_keyboard::Modifiers::NONE
+                    },
+                }),
+                Some(expected)
+            );
+        }
+        let send = |surface: &mut InteractiveSurfaceState, character| {
+            surface.handle_event(&Event::Key(KeyStroke {
+                key: KeyCode::Char(character),
+                modifiers: bmux_keyboard::Modifiers {
+                    ctrl: true,
+                    ..bmux_keyboard::Modifiers::NONE
+                },
+            }))
+        };
+        assert!(send(surface, 'b').is_none());
+        assert!(send(surface, 'd').is_none());
+        assert!(send(surface, 'j').is_none());
+        type_text(surface, "Z");
+        let resolution = send(surface, 's').expect("reloaded submit binding submits");
+        assert_eq!(
+            resolution,
+            bcode_session_models::ToolExchangeResolution::Responded {
+                payload: serde_json::json!({
+                    "status": "answered",
+                    "questions": [{
+                        "question_index": 0,
+                        "selected": [],
+                        "custom": "A\nZ"
+                    }]
+                })
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One lifecycle test proves unchanged state across both retryable failure classes and final confirmation.
+    async fn failed_and_unexpected_resolution_delivery_preserve_surface_state_for_retry() {
+        let static_plugins = vec![bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        )];
+        let settings =
+            TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &static_plugins);
+        let mut chat = test_chat();
+        let mut loop_state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            false,
+        );
+        install_question_runtime(&mut loop_state);
+        loop_state.interactive_surface = Some(
+            InteractiveSurfaceState::open(
+                loop_state
+                    .plugin_runtime
+                    .as_ref()
+                    .expect("question runtime"),
+                "question-retry",
+                "bcode.question.inline",
+                &serde_json::json!({
+                    "questions": [{
+                        "header": null,
+                        "question": "Explain?",
+                        "options": [],
+                        "control": "radio",
+                        "selection_mode": "single",
+                        "custom": true,
+                        "custom_mode": "additional",
+                        "required": true
+                    }]
+                })
+                .to_string(),
+                &settings.keymap,
+            )
+            .await
+            .expect("question surface"),
+        );
+        let surface = loop_state
+            .interactive_surface
+            .as_mut()
+            .expect("active surface");
+        for character in ['A', 'b', 'Ç'] {
+            assert!(
+                surface
+                    .handle_event(&Event::Key(KeyStroke {
+                        key: KeyCode::Char(character),
+                        modifiers: bmux_keyboard::Modifiers::NONE,
+                    }))
+                    .is_none()
+            );
+        }
+        let submitted = surface
+            .handle_event(&Event::Key(KeyStroke {
+                key: KeyCode::Enter,
+                modifiers: bmux_keyboard::Modifiers::NONE,
+            }))
+            .expect("submit custom answer");
+        assert!(surface.has_pending_resolution_for_test());
+
+        apply_interactive_surface_resolution_result(
+            &mut chat,
+            &mut loop_state,
+            Err(ClientError::UnexpectedResponse),
+        );
+        let surface = loop_state
+            .interactive_surface
+            .as_mut()
+            .expect("transport failure retains surface");
+        assert!(!surface.has_pending_resolution_for_test());
+        assert_eq!(
+            surface.handle_event(&Event::Key(KeyStroke {
+                key: KeyCode::Enter,
+                modifiers: bmux_keyboard::Modifiers::NONE,
+            })),
+            Some(submitted.clone())
+        );
+
+        apply_interactive_surface_resolution_result(
+            &mut chat,
+            &mut loop_state,
+            Ok(SessionViewActionOutcome::None),
+        );
+        let surface = loop_state
+            .interactive_surface
+            .as_mut()
+            .expect("unexpected response retains surface");
+        assert!(!surface.has_pending_resolution_for_test());
+        assert_eq!(
+            surface.handle_event(&Event::Key(KeyStroke {
+                key: KeyCode::Enter,
+                modifiers: bmux_keyboard::Modifiers::NONE,
+            })),
+            Some(submitted.clone())
+        );
+
+        apply_interactive_surface_resolution_result(
+            &mut chat,
+            &mut loop_state,
+            Ok(SessionViewActionOutcome::InteractionResolved { resolved: true }),
+        );
+        assert!(loop_state.interactive_surface.is_none());
+
+        observe_interactive_surface_event(
+            &mut loop_state,
+            &SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: "call-question-retry".to_owned(),
+                    exchange_id: "question-retry".to_owned(),
+                    resolution: submitted,
+                },
+            },
+        );
+        assert!(loop_state.interactive_surface.is_none());
+    }
+
+    #[tokio::test]
+    async fn authoritative_resolution_result_is_the_only_local_close_authority() {
+        for (resolved, expected_status) in [
+            (true, None),
+            (
+                false,
+                Some("Interactive request was already resolved by another client"),
+            ),
+        ] {
+            let static_plugins = vec![bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+                bcode_question_plugin::static_plugin(),
+            )];
+            let settings =
+                TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &static_plugins);
+            let mut chat = test_chat();
+            let mut loop_state = ChatLoopState::new(
+                &BcodeClient::default_endpoint(),
+                &BcodeClient::default_endpoint(),
+                false,
+            );
+            install_question_runtime(&mut loop_state);
+            loop_state.interactive_surface = Some(
+                InteractiveSurfaceState::open(
+                    loop_state
+                        .plugin_runtime
+                        .as_ref()
+                        .expect("question runtime"),
+                    "question-close",
+                    "bcode.question.inline",
+                    &serde_json::json!({
+                        "questions": [{
+                            "header": null,
+                            "question": "Proceed?",
+                            "options": [{"label": "Yes", "value": "yes", "description": null}],
+                            "control": "radio",
+                            "selection_mode": "single",
+                            "custom": false,
+                            "custom_mode": "additional",
+                            "required": true
+                        }]
+                    })
+                    .to_string(),
+                    &settings.keymap,
+                )
+                .await
+                .expect("question surface"),
+            );
+
+            apply_interactive_surface_resolution_result(
+                &mut chat,
+                &mut loop_state,
+                Ok(SessionViewActionOutcome::InteractionResolved { resolved }),
+            );
+            assert!(loop_state.interactive_surface.is_none());
+            if let Some(expected_status) = expected_status {
+                assert_eq!(chat.app.status(), expected_status);
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "static-bundled-code-review-plugin",
+        feature = "static-bundled-filesystem-plugin",
+        feature = "static-bundled-plugins",
+        feature = "static-bundled-ralph-plugin",
+        feature = "static-bundled-workflow-plugin"
+    ))]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One end-to-end state-machine scenario proves the normal request/edit/scroll/validate/resolve path.
+    async fn end_to_end_question_exchange_keeps_one_transcript_identity_through_resolution() {
+        let session_id = bcode_session_models::SessionId::new();
+        let exchange_id = "call-question-e2e-question";
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-question-e2e".to_owned(),
+            exchange_id: exchange_id.to_owned(),
+            producer_id: "bcode.question".to_owned(),
+            schema: "bcode.question.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({
+                "questions": [{
+                    "header": null,
+                    "question": "Explain the result",
+                    "options": [],
+                    "control": "radio",
+                    "selection_mode": "single",
+                    "custom": true,
+                    "custom_mode": "additional",
+                    "required": true
+                }]
+            }),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let request_event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolExchangeRequested {
+                request: request.clone(),
+            },
+        };
+        let mut chat = test_chat();
+        chat.session_id = Some(session_id);
+        chat.app = super::super::app::BmuxApp::new_with_history(
+            Some(session_id),
+            std::slice::from_ref(&request_event),
+            &[],
+            false,
+        );
+        let transcript_id = chat
+            .app
+            .transcript()
+            .iter()
+            .find_map(|item| {
+                item.interaction()
+                    .is_some_and(|interaction| interaction.interaction_id == exchange_id)
+                    .then(|| item.source_view_item_id().cloned())
+                    .flatten()
+            })
+            .expect("semantic question transcript identity");
+        let mut state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            false,
+        );
+        install_question_runtime(&mut state);
+        observe_interactive_surface_event(&mut state, &request_event.kind);
+        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
+        let surface = state
+            .interactive_surface
+            .as_mut()
+            .expect("normal bundled request opens a surface");
+        let area = Rect::new(0, 0, 48, surface.preferred_height(48));
+        surface.render_for_test(
+            area,
+            &mut bmux_tui::frame::Frame::new(&mut bmux_tui::buffer::Buffer::empty(area)),
+        );
+
+        assert!(
+            surface
+                .handle_event(&Event::Key(KeyStroke {
+                    key: KeyCode::Enter,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                }))
+                .is_none(),
+            "required validation must remain visible instead of submitting"
+        );
+        for event in [
+            Event::Key(KeyStroke {
+                key: KeyCode::Char('A'),
+                modifiers: bmux_keyboard::Modifiers {
+                    shift: true,
+                    ..bmux_keyboard::Modifiers::NONE
+                },
+            }),
+            Event::Paste("β".to_owned()),
+            Event::Key(KeyStroke {
+                key: KeyCode::Enter,
+                modifiers: bmux_keyboard::Modifiers {
+                    shift: true,
+                    ..bmux_keyboard::Modifiers::NONE
+                },
+            }),
+            Event::Key(KeyStroke {
+                key: KeyCode::Char('Z'),
+                modifiers: bmux_keyboard::Modifiers {
+                    shift: true,
+                    ..bmux_keyboard::Modifiers::NONE
+                },
+            }),
+        ] {
+            assert!(surface.handle_event(&event).is_none());
+        }
+
+        let index = chat
+            .app
+            .interaction_transcript_index(exchange_id)
+            .expect("question transcript index");
+        chat.app.set_active_interaction_layout(Some((
+            exchange_id.to_owned(),
+            surface.preferred_height(48),
+        )));
+        chat.app
+            .set_transcript_viewport_for_details_test(200, 6, 180);
+        let _ = chat.app.scroll_transcript_item_into_view(index);
+        assert_ne!(chat.app.transcript_top_row(6), 14);
+
+        let resolution = surface
+            .handle_event(&Event::Key(KeyStroke {
+                key: KeyCode::Enter,
+                modifiers: bmux_keyboard::Modifiers::NONE,
+            }))
+            .expect("valid mixed-case multiline answer submits");
+        let bcode_session_models::ToolExchangeResolution::Responded { payload } = &resolution
+        else {
+            panic!("question submission must respond");
+        };
+        assert_eq!(payload["questions"][0]["custom"], "Aβ\nZ");
+        apply_interactive_surface_resolution_result(
+            &mut chat,
+            &mut state,
+            Ok(SessionViewActionOutcome::InteractionResolved { resolved: true }),
+        );
+        assert!(state.interactive_surface.is_none());
+
+        let terminal_event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 2,
+            timestamp_ms: 2,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: request.invocation_id,
+                    exchange_id: exchange_id.to_owned(),
+                    resolution: resolution.clone(),
+                },
+            },
+        };
+        chat.app.absorb_session_event(&terminal_event);
+        observe_interactive_surface_event(&mut state, &terminal_event.kind);
+        let resolved_item = chat
+            .app
+            .transcript()
+            .iter()
+            .find(|item| item.source_view_item_id() == Some(&transcript_id))
+            .expect("same transcript identity after terminal event");
+        assert!(resolved_item.interaction().is_some_and(|interaction| {
+            interaction.interaction_id == exchange_id
+                && interaction.resolved
+                && interaction.resolution.as_ref() == Some(&resolution)
+        }));
+    }
+
     #[test]
     fn explicit_reasoning_completion_preserves_newer_pending_generation() {
         let mut chat = test_chat();
@@ -4162,6 +4672,13 @@ mod scheduler_tests {
         assert_eq!(chat.app.pending_reasoning_effort_generation(), Some(newer));
     }
 
+    #[cfg(any(
+        feature = "static-bundled-code-review-plugin",
+        feature = "static-bundled-filesystem-plugin",
+        feature = "static-bundled-plugins",
+        feature = "static-bundled-ralph-plugin",
+        feature = "static-bundled-workflow-plugin"
+    ))]
     fn interaction(id: &str) -> bcode_session_view_models::InteractionViewSummary {
         bcode_session_view_models::InteractionViewSummary {
             producer_id: Some("bcode.question".to_owned()),
@@ -4194,6 +4711,13 @@ mod scheduler_tests {
         );
     }
 
+    #[cfg(any(
+        feature = "static-bundled-code-review-plugin",
+        feature = "static-bundled-filesystem-plugin",
+        feature = "static-bundled-plugins",
+        feature = "static-bundled-ralph-plugin",
+        feature = "static-bundled-workflow-plugin"
+    ))]
     #[tokio::test]
     async fn hydration_reconciles_pending_queue_idempotently_and_removes_stale_entries() {
         let mut state = ChatLoopState::new(
@@ -4217,6 +4741,13 @@ mod scheduler_tests {
         );
     }
 
+    #[cfg(any(
+        feature = "static-bundled-code-review-plugin",
+        feature = "static-bundled-filesystem-plugin",
+        feature = "static-bundled-plugins",
+        feature = "static-bundled-ralph-plugin",
+        feature = "static-bundled-workflow-plugin"
+    ))]
     #[tokio::test]
     async fn hydrated_requests_deduplicate_and_external_resolution_removes_matching_queue_entry() {
         let mut state = ChatLoopState::new(
@@ -4266,6 +4797,13 @@ mod scheduler_tests {
         assert!(chat.app.status().contains("retrying"));
     }
 
+    #[cfg(any(
+        feature = "static-bundled-code-review-plugin",
+        feature = "static-bundled-filesystem-plugin",
+        feature = "static-bundled-plugins",
+        feature = "static-bundled-ralph-plugin",
+        feature = "static-bundled-workflow-plugin"
+    ))]
     #[tokio::test]
     async fn hydrated_multiple_questions_open_in_fifo_order() {
         let mut state = ChatLoopState::new(
@@ -4305,15 +4843,25 @@ mod scheduler_tests {
             state.interactive_surface_queue.interaction_ids(),
             ["second"]
         );
-        state.interactive_surface = None;
-        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
-        assert_eq!(
-            state
-                .interactive_surface
-                .as_ref()
-                .map(InteractiveSurfaceState::interaction_id),
-            Some("second")
+        observe_interactive_surface_event(
+            &mut state,
+            &SessionEventKind::ToolExchangeResolved {
+                event: bcode_session_models::ToolExchangeResolutionEvent {
+                    invocation_id: "call-first".to_owned(),
+                    exchange_id: "first".to_owned(),
+                    resolution: bcode_session_models::ToolExchangeResolution::TimedOut,
+                },
+            },
         );
+        assert!(state.interactive_surface.is_none());
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["second"]
+        );
+        state
+            .interactive_surface_queue
+            .defer_front(Instant::now() - Duration::from_secs(2));
+        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
     }
 
     #[test]
@@ -4345,6 +4893,34 @@ mod scheduler_tests {
         assert_eq!(batch.batch_id, "batch-1");
         assert_eq!(batch.call_index, 1);
         assert_eq!(batch.call_count, 3);
+    }
+
+    #[tokio::test]
+    async fn retain_suspend_and_pinned_policies_route_offscreen_input_deterministically() {
+        let mut chat = test_chat();
+        let state = ChatLoopState::new(
+            &BcodeClient::default_endpoint(),
+            &BcodeClient::default_endpoint(),
+            false,
+        );
+        let terminal_area = Rect::new(0, 0, 80, 24);
+
+        let mut retain = bcode_config::TuiConfig::default();
+        retain.interactions.placement = bcode_config::TuiInteractionPlacement::Transcript;
+        retain.interactions.offscreen_focus = bcode_config::TuiInteractionOffscreenFocus::Retain;
+        chat.app.apply_tui_config(retain);
+        assert!(interaction_input_is_active(&chat, &state, terminal_area));
+
+        let mut suspend = chat.app.tui_config().clone();
+        suspend.interactions.offscreen_focus = bcode_config::TuiInteractionOffscreenFocus::Suspend;
+        chat.app.apply_tui_config(suspend);
+        assert!(!interaction_input_is_active(&chat, &state, terminal_area));
+
+        let mut pinned = chat.app.tui_config().clone();
+        pinned.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
+        chat.app.apply_tui_config(pinned);
+        assert!(interaction_input_is_active(&chat, &state, terminal_area));
+        assert!(state.interactive_surface.is_none());
     }
 
     #[test]

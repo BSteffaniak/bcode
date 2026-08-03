@@ -158,7 +158,9 @@ controller or exchange state. Interaction values and validation remain plugin-ow
 composer edit, selection, newline, and submit bindings are adapted through the terminal plugin host.
 
 Inline interaction rows use the existing indexed transcript layout and viewport. Partial visibility
-is rendered through a bounded scratch frame and clipped into terminal coordinates, including cursor
-and mouse translation. Only one queued interaction is active at a time. Question requests are
-bounded to 32 questions, 100 options per question, 16 KiB question text, 4 KiB option labels, and
-64 KiB custom answers; custom inputs display at most six content rows at once.
+is rendered through a scratch frame capped at 512 rows and 131,072 cells and clipped into terminal
+coordinates, including cursor and mouse translation. Only one queued interaction is active at a
+time; authoritative resolution removes active, opening, or queued state without reopening later.
+Question requests are bounded to 32 questions, 100 options per question, 16 KiB question text, 4 KiB
+option labels, and 64 KiB custom answers; custom inputs display at most six content rows at once.
+Unknown or disabled adapters remain bounded static transcript rows with required/optional status.

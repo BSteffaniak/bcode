@@ -600,6 +600,11 @@ mod tests {
     #[cfg(feature = "static-bundled-loop-plugin")]
     #[test]
     fn disabling_loop_removes_all_manifest_contributions() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime");
+        let _guard = runtime.enter();
         let static_plugins = super::static_bundled_plugins();
         let selected = bcode_plugin::filter_selected_static_plugins(
             &static_plugins,
@@ -729,6 +734,23 @@ mod tests {
         assert_eq!(
             adapter.tui_surface_kind.as_deref(),
             Some("bcode.question.inline")
+        );
+
+        let web = super::interaction_adapter("bcode.question", "bcode.question.request", 1, "web")
+            .expect("web question adapter");
+        assert_eq!(web.platform_id, "web");
+        assert_eq!(web.interaction_kind, adapter.interaction_kind);
+        assert_eq!(web.tui_surface_kind, None);
+        assert!(
+            super::interaction_adapter(
+                "bcode.question",
+                "bcode.question.request",
+                1,
+                "unknown-platform",
+            )
+            .is_some_and(|unknown| {
+                unknown.platform_id == "unknown-platform" && unknown.tui_surface_kind.is_none()
+            })
         );
     }
 

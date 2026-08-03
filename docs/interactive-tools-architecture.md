@@ -88,15 +88,19 @@ adaptation, and terminal painting. The same plugin controller and surface can be
 * pinned above the composer as an overlay that does not alter transcript layout.
 
 Inline surfaces reserve bounded transcript rows. Partially visible surfaces render through a bounded
-scratch frame and are clipped into the viewport; plugin-local coordinates remain stable. Pinned
-surfaces are underpainted by the host before plugin rendering. Neither mode owns canonical answers
-or exchange lifecycle.
+scratch frame and are clipped into the viewport; plugin-local coordinates remain stable. The host
+caps scratch work at 512 rows and 131,072 cells and validates width-by-height before allocation.
+Pinned surfaces are underpainted by the host before plugin rendering. Neither mode owns canonical
+answers or exchange lifecycle.
 
 ## Lifecycle and failure behavior
 
 * Requests and terminal resolutions share one stable interaction transcript ID.
 * Controller validation and answer construction remain plugin-owned.
-* Failed response delivery retains controller and renderer-local text-edit state for retry.
+* Failed response delivery retains controller and renderer-local text-edit state for retry; a
+  surface closes only after authoritative success or confirmed prior resolution.
+* Canonical terminal outcomes are absorbing. Duplicate/stale requests, hydration, and conflicting
+  later terminal delivery cannot reopen or replace the first authoritative result.
 * Remote resolution closes the active surface and updates the semantic transcript item.
 * Unknown adapters remain generic, bounded transcript items rather than being guessed as a known
   interaction type.

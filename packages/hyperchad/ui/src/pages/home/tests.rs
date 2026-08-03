@@ -238,12 +238,14 @@ fn non_tool_interaction_fixture_items() -> Vec<TranscriptViewItem> {
         interaction(
             "resolved",
             true,
-            Some(serde_json::json!({"status": "answered"})),
+            Some(bcode_session_models::ToolExchangeResolution::Responded {
+                payload: serde_json::json!({"status": "answered"}),
+            }),
         ),
         interaction(
             "cancelled",
             true,
-            Some(serde_json::json!({"status": "cancelled"})),
+            Some(bcode_session_models::ToolExchangeResolution::Cancelled),
         ),
     ]
     .into_iter()
@@ -2804,7 +2806,9 @@ fn active_interaction_controls_replace_only_matching_pending_timeline_summary() 
         state: bcode_session_view_models::InteractionViewState::Pending,
         status_detail: None,
         resolved,
-        resolution: resolved.then(|| serde_json::json!({"status": "answered"})),
+        resolution: resolved.then(|| bcode_session_models::ToolExchangeResolution::Responded {
+            payload: serde_json::json!({"status": "answered"}),
+        }),
     };
     let active = interaction("matching", false);
     let matching = transcript_fixture_item(

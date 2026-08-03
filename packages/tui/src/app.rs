@@ -823,7 +823,7 @@ impl BmuxApp {
     }
 
     #[cfg(test)]
-    fn set_transcript_viewport_for_details_test(
+    pub(crate) fn set_transcript_viewport_for_details_test(
         &mut self,
         total_rows: usize,
         viewport_height: u16,

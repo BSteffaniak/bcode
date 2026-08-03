@@ -239,7 +239,7 @@ impl InteractiveSurfaceState {
     }
 
     #[cfg(test)]
-    fn text_edit_command_for_test(
+    pub(crate) fn text_edit_command_for_test(
         &self,
         stroke: bmux_keyboard::KeyStroke,
     ) -> Option<bmux_text_edit::TextEditCommand> {
@@ -365,6 +365,13 @@ impl InteractiveSurfaceState {
             );
         }
         Event::Mouse(mouse)
+    }
+
+    /// Return whether a close resolution is awaiting host confirmation.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn has_pending_resolution_for_test(&self) -> bool {
+        self.pending_resolution.is_some()
     }
 
     /// Clear a pending resolution so the user can retry after host delivery fails.
@@ -499,17 +506,62 @@ mod tests {
         question_surface_with_config(questions, &bcode_config::TuiConfig::default()).await
     }
 
+    fn render_surface_frame(
+        surface: &mut InteractiveSurfaceState,
+        area: Rect,
+        underpaint: bool,
+    ) -> (String, Option<bmux_tui::frame::Cursor>) {
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        if underpaint {
+            frame.fill(area, " ", bmux_tui::prelude::Style::new());
+        }
+        surface.render(area, &mut frame);
+        let cursor = frame.cursor();
+        let text = (0..area.height)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, cursor)
+    }
+
     #[test]
-    fn preferred_height_is_bounded_by_rows_and_checked_cell_budget() {
+    fn preferred_height_is_bounded_at_every_row_and_cell_boundary() {
         assert_eq!(bounded_surface_height(0, u16::MAX), 0);
+        assert_eq!(bounded_surface_height(1, 511), 511);
+        assert_eq!(bounded_surface_height(1, 512), 512);
+        assert_eq!(bounded_surface_height(1, 513), 512);
+
+        let exact_cell_width =
+            u16::try_from(MAX_INTERACTION_SCRATCH_CELLS / 512).expect("cell boundary width");
+        assert_eq!(exact_cell_width, 256);
+        assert_eq!(bounded_surface_height(exact_cell_width, 511), 511);
+        assert_eq!(bounded_surface_height(exact_cell_width, 512), 512);
+        assert_eq!(bounded_surface_height(exact_cell_width, 513), 512);
+
+        let above_cell_width = exact_cell_width + 1;
+        let above_cell_height =
+            u16::try_from(MAX_INTERACTION_SCRATCH_CELLS / usize::from(above_cell_width))
+                .expect("bounded height");
         assert_eq!(
-            bounded_surface_height(1, u16::MAX),
-            MAX_INTERACTION_SCRATCH_ROWS
+            bounded_surface_height(above_cell_width, u16::MAX),
+            above_cell_height
         );
-        assert_eq!(bounded_surface_height(u16::MAX, u16::MAX), 2);
-        let height = bounded_surface_height(400, u16::MAX);
-        assert!(height <= MAX_INTERACTION_SCRATCH_ROWS);
-        assert!(usize::from(height) * 400 <= MAX_INTERACTION_SCRATCH_CELLS);
+        assert!(
+            usize::from(above_cell_height) * usize::from(above_cell_width)
+                <= MAX_INTERACTION_SCRATCH_CELLS
+        );
+        assert!(
+            usize::from(above_cell_height + 1) * usize::from(above_cell_width)
+                > MAX_INTERACTION_SCRATCH_CELLS
+        );
+
+        let maximum_width_height = bounded_surface_height(u16::MAX, u16::MAX);
+        assert_eq!(maximum_width_height, 2);
+        assert!(
+            usize::from(maximum_width_height) * usize::from(u16::MAX)
+                <= MAX_INTERACTION_SCRATCH_CELLS
+        );
     }
 
     #[tokio::test]
@@ -584,6 +636,125 @@ mod tests {
             Event::Mouse(mouse)
                 if mouse.position == bmux_tui::geometry::Point::new(2, 3)
         ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One ordered frame scenario checks clipping, input translation, resize, and repaint together.
+    async fn interaction_frame_sequence_preserves_inline_clipping_cursor_translation_and_pinned_repaint()
+     {
+        let questions = serde_json::json!([{
+            "header": null,
+            "question": "Explain the mixed-case result?",
+            "options": [],
+            "control": "radio",
+            "selection_mode": "single",
+            "custom": true,
+            "custom_mode": "additional",
+            "required": true
+        }]);
+        let mut surface = question_surface(questions.clone()).await;
+        let initial_area = Rect::new(0, 0, 38, surface.preferred_height(38));
+        let (initial, initial_cursor) = render_surface_frame(&mut surface, initial_area, false);
+        let initial_cursor = initial_cursor.expect("initial custom cursor");
+        assert!(initial.contains("Explain the mixed-case result?"));
+
+        for character in ['A', 'b', 'Ç'] {
+            assert!(
+                surface
+                    .handle_event(&Event::Key(KeyStroke {
+                        key: KeyCode::Char(character),
+                        modifiers: Modifiers::NONE,
+                    }))
+                    .is_none()
+            );
+        }
+        let (edited, edited_cursor) = render_surface_frame(&mut surface, initial_area, false);
+        let edited_cursor = edited_cursor.expect("edited custom cursor");
+        assert!(edited.contains("AbÇ"), "{edited}");
+        assert!(edited_cursor.position.x > initial_cursor.position.x);
+
+        let visible_offset = edited_cursor.position.y;
+        let clipped_destination = Rect::new(4, 6, initial_area.width, 1);
+        let mut clipped_buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 48, 16));
+        let mut clipped_frame = Frame::new(&mut clipped_buffer);
+        surface.render_clipped(
+            initial_area,
+            visible_offset,
+            clipped_destination,
+            &mut clipped_frame,
+        );
+        assert_eq!(
+            clipped_frame
+                .cursor()
+                .expect("visible clipped cursor")
+                .position
+                .y,
+            clipped_destination.y
+        );
+        assert!(
+            clipped_buffer
+                .row_symbols(clipped_destination.y)
+                .is_some_and(|row| row.contains("AbÇ"))
+        );
+
+        let click = bmux_tui::geometry::Point::new(7, clipped_destination.y);
+        let translated = InteractiveSurfaceState::translate_clipped_event(
+            Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                click,
+            )),
+            initial_area,
+            visible_offset,
+            clipped_destination,
+        );
+        assert!(matches!(
+            translated,
+            Event::Mouse(mouse)
+                if mouse.position
+                    == bmux_tui::geometry::Point::new(
+                        initial_area.x + click.x - clipped_destination.x,
+                        initial_area.y + visible_offset,
+                    )
+        ));
+
+        let resized_area = Rect::new(1, 2, 26, surface.preferred_height(26).min(8));
+        let sentinel = bmux_tui::style::Style::new().fg(bmux_tui::style::Color::Red);
+        let mut pinned_buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 32, 14));
+        pinned_buffer.fill(resized_area, "x", sentinel);
+        {
+            let mut frame = Frame::new(&mut pinned_buffer);
+            frame.fill(resized_area, " ", bmux_tui::prelude::Style::new());
+            surface.render(resized_area, &mut frame);
+        }
+        assert!(area_points(resized_area).all(|point| {
+            pinned_buffer
+                .get(point)
+                .is_some_and(|cell| !(cell.symbol == "x" && cell.style == sentinel))
+        }));
+
+        let mut compact = question_surface(serde_json::json!([{
+            "header": null,
+            "question": "Done?",
+            "options": [{"label": "Yes", "value": "yes", "description": null}],
+            "control": "radio",
+            "selection_mode": "single",
+            "custom": false,
+            "custom_mode": "additional",
+            "required": false
+        }]))
+        .await;
+        let compact_area = Rect::new(1, 2, 20, compact.preferred_height(20).min(6));
+        pinned_buffer.fill(resized_area, "x", sentinel);
+        {
+            let mut frame = Frame::new(&mut pinned_buffer);
+            frame.fill(resized_area, " ", bmux_tui::prelude::Style::new());
+            compact.render(compact_area, &mut frame);
+        }
+        assert!(area_points(resized_area).all(|point| {
+            pinned_buffer
+                .get(point)
+                .is_some_and(|cell| !(cell.symbol == "x" && cell.style == sentinel))
+        }));
     }
 
     #[tokio::test]

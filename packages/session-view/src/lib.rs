@@ -5462,6 +5462,120 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One scenario exercises every ordering/hydration/rebuild path against one terminal authority.
+    fn generic_terminal_lifecycle_paths_share_one_absorbing_authority() {
+        let session_id = SessionId::new();
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-generic".to_owned(),
+            exchange_id: "generic-interaction".to_owned(),
+            producer_id: "future.plugin".to_owned(),
+            schema: "future.interaction".to_owned(),
+            schema_version: 9,
+            payload: serde_json::json!({"opaque": true}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let first = bcode_session_models::ToolExchangeResolution::Failed {
+            code: "unavailable".to_owned(),
+            message: "consumer disappeared".to_owned(),
+        };
+        let resolution_event = |sequence, resolution| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::ToolExchangeResolved {
+                    event: bcode_session_models::ToolExchangeResolutionEvent {
+                        invocation_id: request.invocation_id.clone(),
+                        exchange_id: request.exchange_id.clone(),
+                        resolution,
+                    },
+                },
+            )
+        };
+        let pending = || InteractionViewSummary {
+            producer_id: Some(request.producer_id.clone()),
+            exchange_schema: Some(request.schema.clone()),
+            exchange_schema_version: Some(request.schema_version),
+            interaction_id: request.exchange_id.clone(),
+            kind: "future.interaction".to_owned(),
+            tool_call_id: Some(request.invocation_id.clone()),
+            title: Some("Future interaction".to_owned()),
+            required: true,
+            snapshot: Some(request.payload.clone()),
+            state: InteractionViewState::Pending,
+            status_detail: None,
+            resolved: false,
+            resolution: None,
+        };
+
+        let mut resolution_first = SessionView::new();
+        resolution_first.apply_event(&resolution_event(1, first.clone()));
+        resolution_first.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolExchangeRequested {
+                request: request.clone(),
+            },
+        ));
+        resolution_first.set_pending_interactions(vec![pending()]);
+        resolution_first.apply_event(&resolution_event(
+            3,
+            bcode_session_models::ToolExchangeResolution::Cancelled,
+        ));
+        resolution_first.rebuild_history_window(&[]);
+        resolution_first.set_pending_interactions(vec![pending()]);
+
+        let mut request_first = SessionView::new();
+        request_first.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolExchangeRequested {
+                request: request.clone(),
+            },
+        ));
+        request_first.apply_event(&resolution_event(2, first.clone()));
+        request_first.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::ToolExchangeRequested {
+                request: request.clone(),
+            },
+        ));
+        request_first.set_pending_interactions(vec![pending()]);
+
+        for view in [&resolution_first, &request_first] {
+            let matching = view
+                .snapshot()
+                .interactions
+                .iter()
+                .filter(|interaction| interaction.interaction_id == "generic-interaction")
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0].resolution.as_ref(), Some(&first));
+            assert!(matching[0].resolved);
+            assert_eq!(matching[0].state, InteractionViewState::ActionError);
+            let transcript = view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        &item.kind,
+                        TranscriptViewItemKind::Interaction { interaction }
+                            if interaction.interaction_id == "generic-interaction"
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(transcript.len(), 1);
+            assert!(matches!(
+                &transcript[0].kind,
+                TranscriptViewItemKind::Interaction { interaction }
+                    if interaction.resolution.as_ref() == Some(&first) && interaction.resolved
+            ));
+        }
+    }
+
+    #[test]
     fn exchange_resolution_variants_have_explicit_terminal_semantics() {
         let variants = [
             (
@@ -5485,6 +5599,11 @@ mod tests {
                 bcode_session_models::ToolExchangeResolution::ConsumerDetached,
                 InteractionViewState::Cancelled,
                 Some("consumer detached"),
+            ),
+            (
+                bcode_session_models::ToolExchangeResolution::TimedOut,
+                InteractionViewState::Cancelled,
+                Some("timed out"),
             ),
             (
                 bcode_session_models::ToolExchangeResolution::Failed {
@@ -5531,6 +5650,27 @@ mod tests {
             assert_eq!(interaction.state, expected_state);
             assert_eq!(interaction.status_detail.as_deref(), expected_detail);
             assert!(interaction.resolved);
+            let transcript_interaction = view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .find(|item| {
+                    matches!(
+                        &item.kind,
+                        TranscriptViewItemKind::Interaction { interaction: projected }
+                            if projected.interaction_id == interaction.interaction_id
+                    )
+                })
+                .expect("terminal interaction transcript identity");
+            assert!(matches!(
+                &transcript_interaction.kind,
+                TranscriptViewItemKind::Interaction { interaction: projected }
+                    if projected.interaction_id == interaction.interaction_id
+                        && projected.state == expected_state
+                        && projected.status_detail.as_deref() == expected_detail
+                        && projected.resolved
+            ));
         }
     }
 

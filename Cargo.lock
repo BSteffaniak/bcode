@@ -1476,6 +1476,7 @@ dependencies = [
  "bcode_workflow_plugin",
  "bcode_worktree_plugin",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

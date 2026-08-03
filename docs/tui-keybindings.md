@@ -20,8 +20,9 @@ Common defaults:
 | `Page Up` / `Page Down` | Scroll the transcript |
 | `Home` / `End` | Jump to transcript start/end |
 | `Up` / `Down` | Navigate composer history |
+| `Ctrl+I` | Restore the active transcript interaction into view |
 
-The composer is Unicode-aware. Arrow keys move by grapheme; `Alt+Left` / `Alt+Right` and `Ctrl+Left` / `Ctrl+Right` move by word. `Ctrl+A` / `Ctrl+E` move to the start or end, while standard character, word, and line deletion bindings are available.
+The composer is Unicode-aware. Arrow keys move by grapheme; `Alt+Left` / `Alt+Right` and `Ctrl+Left` / `Ctrl+Right` move by word. `Ctrl+A` / `Ctrl+E` move to the start or end, while standard character, word, and line deletion bindings are available. Active plugin text inputs consume these same configured edit, selection, newline, and submit actions.
 
 Example overrides:
 
@@ -33,9 +34,22 @@ Example overrides:
 "escape" = "app.interrupt"
 "ctrl+d" = "app.exit"
 "ctrl+f" = "app.search"
+"ctrl+i" = "tui.interaction.focusActive"
 "pageUp" = "transcript.pageUp"
 "pageDown" = "transcript.pageDown"
 ```
+
+## Interactive tools
+
+Terminal interaction placement and hidden-focus behavior are independently configurable:
+
+```toml
+[tui.interactions]
+placement = "transcript"
+offscreen_focus = "retain"
+```
+
+`transcript` and `retain` are the defaults. `placement = "pinned"` fixes the active interaction above the composer. `offscreen_focus = "suspend"` returns ordinary input to the composer while an inline interaction is fully hidden; use `tui.interaction.focusActive` to restore it.
 
 ## Permission dialogs
 
