@@ -1648,6 +1648,10 @@ bcode_plugin_sdk::export_concurrent_plugin!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_plugin_sdk::{
+        NativeServiceContext, PluginConfigContext, ServiceBridge, ServiceCancellation,
+        ServiceEventEmitter, ServiceRequest, TransientProgressLimits,
+    };
     use bcode_session_search::{
         SearchCanonicalGeneration, SessionSearchFilters, SessionSearchQuery, SessionSearchRecord,
     };
@@ -1730,6 +1734,44 @@ mod tests {
             .search(&query, &TopDocs::with_limit(20).order_by_score())
             .expect("search")
             .len()
+    }
+
+    fn service_context(configured_root: &Path, managed_root: &Path) -> NativeServiceContext {
+        NativeServiceContext {
+            plugin_id: PLUGIN_ID.to_owned(),
+            request: ServiceRequest {
+                interface_id: SESSION_SEARCH_INTERFACE_ID.to_owned(),
+                operation: OP_STATUS.to_owned(),
+                payload: Vec::new(),
+            },
+            config: PluginConfigContext {
+                config: serde_json::json!({
+                    "storage_root": configured_root,
+                    "writer_memory_bytes": MIN_WRITER_MEMORY_BYTES,
+                }),
+                state_root: Some(managed_root.to_path_buf()),
+                ..PluginConfigContext::default()
+            },
+            events: ServiceEventEmitter::default(),
+            cancellation: ServiceCancellation::default(),
+            bridge: ServiceBridge::default(),
+            transient_progress_limits: TransientProgressLimits::default(),
+        }
+    }
+
+    #[test]
+    fn explicit_storage_root_takes_precedence_over_managed_root() {
+        let parent = tempfile::tempdir().expect("parent");
+        let configured_root = parent.path().join("configured");
+        let managed_root = parent.path().join("managed");
+        let plugin = TantivySessionSearchPlugin::default();
+
+        let response =
+            plugin.invoke_service_concurrent(service_context(&configured_root, &managed_root));
+
+        assert!(response.error.is_none());
+        assert!(configured_root.exists());
+        assert!(!managed_root.exists());
     }
 
     #[test]
