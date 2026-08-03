@@ -2815,6 +2815,181 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn catalog_product_lifecycle_survives_restart_and_deletion() {
+        let root = unique_temp_dir();
+        let initial_working_directory = test_working_directory();
+        let changed_working_directory = root.join("changed-working-directory");
+        std::fs::create_dir_all(&changed_working_directory).expect("changed cwd creates");
+        let manager = SessionManager::persistent(&root).expect("manager initializes");
+        manager
+            .set_draft_session_composer_draft(
+                initial_working_directory.clone(),
+                "draft before create".to_owned(),
+            )
+            .await
+            .expect("draft persists");
+        let session = manager
+            .create_session(
+                Some("initial".to_owned()),
+                initial_working_directory.clone(),
+            )
+            .await
+            .expect("session creates");
+        manager
+            .append_user_message(session.id, ClientId::new(), "user turn".to_owned())
+            .await
+            .expect("user turn persists");
+        manager
+            .append_assistant_reasoning_activity(
+                session.id,
+                "turn-1".to_owned(),
+                bcode_session_models::ReasoningActivity {
+                    activity_id: "reason-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: Vec::new(),
+                    opaque: false,
+                },
+            )
+            .await
+            .expect("reasoning persists");
+        manager
+            .append_tool_call_requested(
+                session.id,
+                AppendToolCallRequestedInput {
+                    tool_call_id: "tool-1".to_owned(),
+                    tool_name: "fixture.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    ..AppendToolCallRequestedInput::default()
+                },
+            )
+            .await
+            .expect("tool request persists");
+        manager
+            .append_tool_invocation_result(
+                session.id,
+                bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "tool-1".to_owned(),
+                    model_output: "tool output".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: None,
+                },
+            )
+            .await
+            .expect("tool result persists");
+        manager
+            .append_assistant_message(session.id, "assistant output".to_owned())
+            .await
+            .expect("assistant output persists");
+        manager
+            .rename_session(session.id, Some("renamed".to_owned()))
+            .await
+            .expect("rename persists");
+        manager
+            .change_session_working_directory(session.id, changed_working_directory.clone())
+            .await
+            .expect("working directory persists");
+        manager.flush_catalog_updates().await;
+        let listed = manager.list_sessions(&changed_working_directory).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name.as_deref(), Some("renamed"));
+        assert_eq!(
+            listed[0].working_directory,
+            std::fs::canonicalize(&changed_working_directory).expect("changed cwd canonicalizes")
+        );
+        manager.shutdown_catalog_updates().await;
+        drop(manager);
+
+        let restarted = SessionManager::persistent(&root).expect("manager restarts");
+        let listed = restarted.list_sessions(&changed_working_directory).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, session.id);
+        assert_eq!(
+            restarted
+                .draft_session_composer_draft(initial_working_directory.clone())
+                .await
+                .expect("draft reads"),
+            Some("draft before create".to_owned())
+        );
+        let history = restarted
+            .session_history(session.id)
+            .await
+            .expect("history reads");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::AssistantMessage { text } if text == "assistant output"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ToolInvocationResultRecorded { .. }
+        )));
+        restarted
+            .delete_session(session.id)
+            .await
+            .expect("session deletes");
+        restarted.flush_catalog_updates().await;
+        assert!(
+            restarted
+                .list_sessions(&changed_working_directory)
+                .await
+                .is_empty()
+        );
+        restarted.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn sustained_catalog_activity_coalesces_batches_and_restart_keeps_wal_bounded() {
+        let root = unique_temp_dir();
+        let metrics = MetricsRegistry::in_memory();
+        for restart in 0..3 {
+            let manager = SessionManager::persistent_with_metrics(&root, metrics.clone())
+                .expect("manager initializes");
+            let session = manager
+                .create_session(Some(format!("restart {restart}")), test_working_directory())
+                .await
+                .expect("session creates");
+            for event in 0..100 {
+                manager
+                    .append_event(
+                        session.id,
+                        SessionEventKind::SystemMessage {
+                            text: format!("restart {restart} event {event}"),
+                        },
+                    )
+                    .await
+                    .expect("event appends");
+            }
+            manager.shutdown_catalog_updates().await;
+            let wal_bytes = std::fs::metadata(std::path::PathBuf::from(format!(
+                "{}-wal",
+                db::global_catalog_db_path(&root).display()
+            )))
+            .map_or(0, |metadata| metadata.len());
+            assert!(
+                wal_bytes <= 512 * 1024,
+                "restart {restart} exceeded the bounded 512 KiB catalog WAL test budget: {wal_bytes} bytes"
+            );
+        }
+        let snapshot = metrics.snapshot();
+        let scheduled = snapshot
+            .counters
+            .get("session.catalog.scheduled_total")
+            .copied()
+            .unwrap_or(0);
+        let flushes = snapshot
+            .counters
+            .get("session.catalog.flush_total")
+            .copied()
+            .unwrap_or(0);
+        assert!(scheduled >= 300);
+        assert!(flushes > 0 && flushes < scheduled / 2);
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn catalog_updates_publish_batch_metrics_and_remain_bounded_by_session() {
         let root = unique_temp_dir();
         let metrics = MetricsRegistry::in_memory();

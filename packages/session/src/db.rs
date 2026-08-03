@@ -565,6 +565,19 @@ impl GlobalSessionDb {
         Ok(catalog)
     }
 
+    /// Return whether the underlying abstract database has completed terminal close.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the probe operation fails for a reason other than terminal close.
+    pub async fn is_closed(&self) -> SessionDbResult<bool> {
+        match self.db.query_raw("SELECT 1").await {
+            Ok(_) => Ok(false),
+            Err(error) if error.is_connection_error() => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Close the global catalog through the abstract database lifecycle.
     ///
     /// # Errors
@@ -4343,6 +4356,17 @@ mod tests {
                 (name, bytes)
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn global_catalog_close_reaches_abstract_terminal_state() {
+        let root = tempfile::tempdir().expect("temp root");
+        let catalog = GlobalSessionDb::initialize_turso_in_root(root.path())
+            .await
+            .expect("catalog initializes");
+        assert!(!catalog.is_closed().await.expect("open probe"));
+        catalog.close().await.expect("catalog closes");
+        assert!(catalog.is_closed().await.expect("closed probe"));
     }
 
     async fn insert_raw_history_event(
