@@ -297,6 +297,7 @@ regex = { version = "1.12.2", default-features = false }
 reqwest = { version = "0.12.24", default-features = false, features = [
     "json",
     "rustls-tls",
+    "rustls-tls-native-roots",
 ] }
 resvg = { version = "0.47.0", default-features = false }
 rpassword = { version = "7.4.0", default-features = false }
