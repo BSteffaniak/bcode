@@ -529,7 +529,18 @@ async fn retry_bedrock_without_prompt_cache(
 
 async fn bedrock_client(settings: &Settings) -> Client {
     let config = bedrock_sdk_config(settings).await;
-    Client::new(&config)
+    client_context_bearer_token(settings).map_or_else(
+        || Client::new(&config),
+        |token| {
+            let config = aws_sdk_bedrockruntime::config::Builder::from(&config)
+                .bearer_token(aws_sdk_bedrockruntime::config::Token::new(token, None))
+                .auth_scheme_preference([
+                    aws_smithy_runtime_api::client::auth::http::HTTP_BEARER_AUTH_SCHEME_ID,
+                ])
+                .build();
+            Client::from_conf(config)
+        },
+    )
 }
 
 async fn bedrock_sdk_config(settings: &Settings) -> aws_config::SdkConfig {
@@ -563,6 +574,15 @@ async fn bedrock_sdk_config_with_region(
         loader = loader.credentials_provider(credentials);
     }
     loader.load().await
+}
+
+fn client_context_bearer_token(settings: &Settings) -> Option<String> {
+    settings
+        .auth_credentials
+        .get("bearer_token")
+        .or_else(|| settings.env.get("AWS_BEARER_TOKEN_BEDROCK"))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
 }
 
 fn client_context_credentials(settings: &Settings) -> Option<Credentials> {
@@ -2482,10 +2502,19 @@ fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
     if let Some(endpoint_url) = &settings.endpoint_url {
         metadata.insert("endpoint_url".to_string(), endpoint_url.clone());
     }
-    if std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok_and(|value| !value.trim().is_empty()) {
+    if client_context_bearer_token(settings).is_some()
+        || std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok_and(|value| !value.trim().is_empty())
+    {
         metadata.insert(
             "bearer_token_source".to_string(),
-            "AWS_BEARER_TOKEN_BEDROCK".to_string(),
+            if settings.auth_credentials.contains_key("bearer_token") {
+                "provider_auth_context"
+            } else if settings.env.contains_key("AWS_BEARER_TOKEN_BEDROCK") {
+                "request_environment"
+            } else {
+                "AWS_BEARER_TOKEN_BEDROCK"
+            }
+            .to_string(),
         );
     }
     metadata.insert("config_source".to_string(), settings.config_source.clone());
@@ -3992,6 +4021,36 @@ mod tests {
             filtered.models[1]
                 .capabilities
                 .contains(&ModelCapability::PromptCaching)
+        );
+    }
+
+    #[test]
+    fn context_bearer_token_is_resolved_from_auth_credentials() {
+        let settings = Settings {
+            default_model: None,
+            model_ids: Vec::new(),
+            model_ids_are_explicit: false,
+            region: Some("us-east-1".to_string()),
+            region_source: RegionSource::Profile,
+            aws_profile: None,
+            endpoint_url: None,
+            auth_credentials: BTreeMap::from([(
+                "bearer_token".to_string(),
+                "bedrock-token".to_string(),
+            )]),
+            env: BTreeMap::new(),
+            config_source: "test".to_string(),
+        };
+
+        assert_eq!(
+            client_context_bearer_token(&settings).as_deref(),
+            Some("bedrock-token")
+        );
+        assert_eq!(
+            diagnostics_metadata(&settings)
+                .get("bearer_token_source")
+                .map(String::as_str),
+            Some("provider_auth_context")
         );
     }
 
