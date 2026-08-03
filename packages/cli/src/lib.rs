@@ -5,6 +5,7 @@
 //! Command-line interface for Bcode.
 
 mod plugin_cli;
+pub mod retired_catalogs;
 mod session_migration_adapter;
 
 use base64::Engine as _;
@@ -2239,6 +2240,14 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    RetiredCatalogs {
+        /// Apply cleanup. Without this flag, the command is a non-mutating inventory.
+        #[arg(long)]
+        apply: bool,
+        /// Print the inventory/cleanup report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     Repair {
         session_id: Option<SessionId>,
         #[arg(long)]
@@ -2920,6 +2929,9 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
                 output: repair_cli_output(json),
             })
             .await?;
+        }
+        SessionCommand::RetiredCatalogs { apply, json } => {
+            retired_catalogs(apply, json).await?;
         }
         SessionCommand::Repair {
             session_id,
@@ -9617,6 +9629,39 @@ async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliE
         return Err(CliError::PluginCli(
             "model-context reindex verification failed".to_string(),
         ));
+    }
+    Ok(())
+}
+
+async fn retired_catalogs(apply: bool, json: bool) -> Result<(), CliError> {
+    let session_root = bcode_config::default_session_store_dir();
+    let state_dir = session_root.parent().unwrap_or(&session_root);
+    let reports =
+        retired_catalogs::retired_catalog_reports(state_dir, &session_root, apply).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else if reports.is_empty() {
+        println!("No retired build-scoped session catalogs found");
+    } else {
+        for report in reports {
+            println!("namespace: {}", report.namespace);
+            println!("path: {}", display_from_current_dir(&report.path));
+            println!("classification: {:?}", report.classification);
+            println!("daemon evidence: {:?}", report.daemon_evidence);
+            println!("action: {:?}", report.action);
+            println!(
+                "bytes: db={} wal={} shm={} removed={}",
+                report.database_bytes, report.wal_bytes, report.shm_bytes, report.removed_bytes
+            );
+            println!(
+                "drafts: found={} migrated={} skipped_conflicts={}",
+                report.draft_rows, report.migrated_drafts, report.skipped_draft_conflicts
+            );
+            if let Some(error) = report.error {
+                println!("error: {error}");
+            }
+            println!();
+        }
     }
     Ok(())
 }

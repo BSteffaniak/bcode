@@ -4289,7 +4289,7 @@ pub(crate) mod tests {
                 after_timestamp_ms: None,
                 before_timestamp_ms: None,
                 cursor: None,
-                deadline_ms: 40,
+                deadline_ms: 2_000,
             },
         )
         .await

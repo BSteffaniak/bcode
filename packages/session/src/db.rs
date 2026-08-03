@@ -6,7 +6,12 @@
 //! intentionally keeps Turso-specific details at connection boundaries and uses
 //! `switchy` database traits for migrations and repository operations.
 
-use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::current_schema::{global_migrations, session_migrations};
 use crate::db_artifact::{finalized_artifact_reference_from_row, project_artifact_references};
@@ -357,14 +362,124 @@ pub struct FinalizedArtifactReference {
     pub finalized_event_seq: u64,
 }
 
+/// One authoritative draft-session composer row stored in a catalog database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogComposerDraft {
+    /// Normalized launch working directory used as the draft scope key.
+    pub launch_working_directory: PathBuf,
+    /// Draft text.
+    pub text: String,
+    /// Last update timestamp in Unix milliseconds.
+    pub updated_at_ms: u64,
+}
+
 /// Backend-agnostic handle for Bcode's global session catalog database.
 #[derive(Debug, Clone)]
 pub struct GlobalSessionDb {
     db: Arc<Box<dyn Database>>,
-    _catalog_lock: Option<Arc<crate::lease::CatalogLockGuard>>,
+    catalog_lock: Arc<std::sync::Mutex<Option<crate::lease::CatalogLockGuard>>>,
 }
 
 impl GlobalSessionDb {
+    async fn open_observed_connection(
+        path: &Path,
+        metrics: MetricsRegistry,
+        catalog_lock: Option<crate::lease::CatalogLockGuard>,
+    ) -> SessionDbResult<Self> {
+        let open_started = std::time::Instant::now();
+        let db = init_turso_local_with_retry(path).await;
+        DatabaseMetrics::new(metrics.clone(), "session_catalog", "turso").record(
+            DatabaseOperation::Open,
+            None,
+            "none",
+            db.is_ok(),
+            u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        let db = db?;
+        let db: Box<dyn Database> = Box::new(ObservedDatabase::new(
+            db,
+            metrics,
+            "session_catalog",
+            "turso",
+        ));
+        Ok(Self {
+            db: Arc::new(db),
+            catalog_lock: Arc::new(std::sync::Mutex::new(catalog_lock)),
+        })
+    }
+
+    /// Open and initialize the global session catalog under `root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be opened or initialized.
+    pub async fn initialize_turso_in_root(root: &Path) -> SessionDbResult<Self> {
+        Self::initialize_turso_in_root_observed(root, MetricsRegistry::disabled()).await
+    }
+
+    /// Open and initialize the global catalog under `root` with observability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be opened or initialized.
+    pub async fn initialize_turso_in_root_observed(
+        root: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
+        let path = global_catalog_db_path(root);
+        fs::create_dir_all(root)?;
+        let catalog_lock = crate::lease::acquire_catalog_lock(root)?;
+        let catalog = Self::open_observed_connection(&path, metrics, Some(catalog_lock)).await?;
+        run_global_migrations(&**catalog.db).await?;
+        Ok(catalog)
+    }
+
+    /// Open an already initialized global catalog for bounded reading without schema mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be opened or does not contain the expected schema.
+    pub async fn open_existing_turso_in_root(root: &Path) -> SessionDbResult<Self> {
+        Self::open_existing_turso_in_root_observed(root, MetricsRegistry::disabled()).await
+    }
+
+    /// Open an already initialized global catalog with observability and no schema mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be opened or does not contain the expected schema.
+    pub async fn open_existing_turso_in_root_observed(
+        root: &Path,
+        metrics: MetricsRegistry,
+    ) -> SessionDbResult<Self> {
+        let path = global_catalog_db_path(root);
+        if !path.exists() {
+            return Err(SessionDbError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("catalog database does not exist: {}", path.display()),
+            )));
+        }
+        let catalog = Self::open_observed_connection(
+            &path,
+            metrics,
+            Some(crate::lease::acquire_catalog_lock(root)?),
+        )
+        .await?;
+        catalog.verify_schema().await?;
+        Ok(catalog)
+    }
+
+    async fn verify_schema(&self) -> SessionDbResult<()> {
+        for table in ["sessions", "composer_drafts"] {
+            if !self.db.table_exists(table).await? {
+                return Err(SessionDbError::MigrationHistoryIncompatible {
+                    reason: format!("global catalog is missing required table {table}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Open the global session catalog database under `root` and apply cheap schema migrations.
     ///
     /// # Errors
@@ -411,27 +526,28 @@ impl GlobalSessionDb {
         let root = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(root)?;
         let catalog_lock = crate::lease::acquire_catalog_lock(root)?;
-        let open_started = std::time::Instant::now();
-        let db = init_turso_local_with_retry(path).await;
-        DatabaseMetrics::new(metrics.clone(), "session_catalog", "turso").record(
-            DatabaseOperation::Open,
-            None,
-            "none",
-            db.is_ok(),
-            u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
-        let db = db?;
-        let db: Box<dyn Database> = Box::new(ObservedDatabase::new(
-            db,
-            metrics,
-            "session_catalog",
-            "turso",
-        ));
-        run_global_migrations(&*db).await?;
-        Ok(Self {
-            db: Arc::new(db),
-            _catalog_lock: Some(Arc::new(catalog_lock)),
-        })
+        let catalog = Self::open_observed_connection(path, metrics, Some(catalog_lock)).await?;
+        run_global_migrations(&**catalog.db).await?;
+        Ok(catalog)
+    }
+
+    /// Open an existing catalog at an arbitrary path for explicit maintenance that already owns
+    /// the applicable catalog lock. This path never runs schema migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be opened or lacks the expected schema.
+    pub async fn open_existing_turso_without_catalog_lock(path: &Path) -> SessionDbResult<Self> {
+        if !path.exists() {
+            return Err(SessionDbError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("catalog database does not exist: {}", path.display()),
+            )));
+        }
+        let catalog =
+            Self::open_observed_connection(path, MetricsRegistry::disabled(), None).await?;
+        catalog.verify_schema().await?;
+        Ok(catalog)
     }
 
     /// Open the global session catalog database at `path` without acquiring the catalog lock.
@@ -443,37 +559,49 @@ impl GlobalSessionDb {
     ///
     /// Returns an error if the Turso connection cannot be opened or schema migrations fail.
     pub async fn open_turso_without_catalog_lock(path: &Path) -> SessionDbResult<Self> {
-        let db = init_turso_local_with_retry(path).await?;
-        run_global_migrations(&*db).await?;
-        Ok(Self {
-            db: Arc::new(db),
-            _catalog_lock: None,
-        })
+        let catalog =
+            Self::open_observed_connection(path, MetricsRegistry::disabled(), None).await?;
+        run_global_migrations(&**catalog.db).await?;
+        Ok(catalog)
     }
 
-    /// Upsert one session catalog row.
+    /// Close the global catalog through the abstract database lifecycle.
     ///
     /// # Errors
     ///
-    /// Returns an error if the catalog write fails.
-    pub async fn upsert_session(
-        &self,
+    /// Returns an error if backend-specific graceful shutdown fails.
+    pub async fn close(&self) -> SessionDbResult<()> {
+        self.db.close().await?;
+        self.catalog_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        Ok(())
+    }
+
+    async fn upsert_session_on(
+        db: &dyn Database,
         summary: &SessionSummary,
         db_path: &Path,
     ) -> SessionDbResult<()> {
-        let existing = self
-            .db
+        let existing = db
             .select("sessions")
-            .columns(&["session_id"])
+            .columns(&["session_id", "updated_at_ms"])
             .where_eq("session_id", summary.id.to_string())
-            .execute_first(&**self.db)
+            .execute_first(db)
             .await?;
+        if existing.as_ref().is_some_and(|row| {
+            optional_i64(row, "updated_at_ms")
+                .map(i64_to_u64)
+                .is_some_and(|updated_at_ms| updated_at_ms > summary.updated_at_ms)
+        }) {
+            return Ok(());
+        }
         let title = summary.name.clone();
         let working_directory = summary.working_directory.to_string_lossy().to_string();
         let db_path = db_path.to_string_lossy().to_string();
         if existing.is_some() {
-            self.db
-                .update("sessions")
+            db.update("sessions")
                 .value("db_path", db_path)
                 .value("title", title)
                 .value("working_directory", working_directory)
@@ -482,11 +610,10 @@ impl GlobalSessionDb {
                 .value("state", "active")
                 .value("projection_status", "fresh")
                 .where_eq("session_id", summary.id.to_string())
-                .execute(&**self.db)
+                .execute(db)
                 .await?;
         } else {
-            self.db
-                .insert("sessions")
+            db.insert("sessions")
                 .value("session_id", summary.id.to_string())
                 .value("db_path", db_path)
                 .value("title", title)
@@ -495,10 +622,62 @@ impl GlobalSessionDb {
                 .value("updated_at_ms", seq_to_value(summary.updated_at_ms))
                 .value("state", "active")
                 .value("projection_status", "fresh")
-                .execute(&**self.db)
+                .execute(db)
                 .await?;
         }
         Ok(())
+    }
+
+    /// Apply deletions and latest summary rows atomically in one catalog transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot begin, a row cannot be changed, rollback fails,
+    /// or commit fails.
+    pub async fn apply_catalog_batch(
+        &self,
+        root: &Path,
+        summaries: &[SessionSummary],
+        deleted: impl IntoIterator<Item = SessionId>,
+    ) -> SessionDbResult<()> {
+        let transaction = self.db.begin_transaction().await?;
+        let result = async {
+            for session_id in deleted {
+                transaction
+                    .delete("sessions")
+                    .where_eq("session_id", session_id.to_string())
+                    .execute(&*transaction)
+                    .await?;
+            }
+            for summary in summaries {
+                Self::upsert_session_on(&*transaction, summary, &session_db_path(root, summary.id))
+                    .await?;
+            }
+            Ok::<(), SessionDbError>(())
+        }
+        .await;
+        if let Err(error) = result {
+            transaction.rollback().await?;
+            return Err(error);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Upsert the latest catalog rows in one transaction.
+    ///
+    /// Older summaries are ignored so delayed writers cannot regress catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot begin, a row cannot be written, or commit fails.
+    pub async fn upsert_sessions(
+        &self,
+        root: &Path,
+        summaries: &[SessionSummary],
+    ) -> SessionDbResult<()> {
+        self.apply_catalog_batch(root, summaries, std::iter::empty())
+            .await
     }
 
     /// Remove a session catalog row.
@@ -536,6 +715,59 @@ impl GlobalSessionDb {
             .iter()
             .map(session_summary_from_catalog_row)
             .collect()
+    }
+
+    /// Return every authoritative draft-session composer row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query or row conversion fails.
+    pub async fn list_draft_session_composer_drafts(
+        &self,
+    ) -> SessionDbResult<Vec<CatalogComposerDraft>> {
+        self.db
+            .select("composer_drafts")
+            .columns(&["scope_key", "text", "updated_at_ms"])
+            .where_eq("scope_kind", "draft_session")
+            .execute(&**self.db)
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(CatalogComposerDraft {
+                    launch_working_directory: PathBuf::from(required_string(row, "scope_key")?),
+                    text: required_string(row, "text")?,
+                    updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
+                })
+            })
+            .collect()
+    }
+
+    /// Return a complete launch-directory-scoped draft-session composer row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the row is malformed.
+    pub async fn draft_session_composer_draft_record(
+        &self,
+        launch_working_directory: &Path,
+    ) -> SessionDbResult<Option<CatalogComposerDraft>> {
+        let scope_key = launch_working_directory.to_string_lossy().to_string();
+        self.db
+            .select("composer_drafts")
+            .columns(&["scope_key", "text", "updated_at_ms"])
+            .where_eq("scope_kind", "draft_session")
+            .where_eq("scope_key", scope_key)
+            .execute_first(&**self.db)
+            .await?
+            .as_ref()
+            .map(|row| {
+                Ok(CatalogComposerDraft {
+                    launch_working_directory: PathBuf::from(required_string(row, "scope_key")?),
+                    text: required_string(row, "text")?,
+                    updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
+                })
+            })
+            .transpose()
     }
 
     /// Return a launch-directory-scoped draft-session composer draft.
@@ -585,11 +817,18 @@ impl GlobalSessionDb {
         let existing = self
             .db
             .select("composer_drafts")
-            .columns(&["scope_key"])
+            .columns(&["scope_key", "updated_at_ms"])
             .where_eq("scope_kind", "draft_session")
             .where_eq("scope_key", scope_key.clone())
             .execute_first(&**self.db)
             .await?;
+        if existing.as_ref().is_some_and(|row| {
+            optional_i64(row, "updated_at_ms")
+                .map(i64_to_u64)
+                .is_some_and(|existing_updated_at_ms| existing_updated_at_ms >= updated_at_ms)
+        }) {
+            return Ok(());
+        }
         if existing.is_some() {
             self.db
                 .update("composer_drafts")

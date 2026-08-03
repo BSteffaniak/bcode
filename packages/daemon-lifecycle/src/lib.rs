@@ -488,6 +488,60 @@ pub async fn classified_records(
     classified
 }
 
+/// Return whether any live or ambiguous daemon evidence exists for an artifact identity.
+///
+/// `identity` may be a daemon namespace, build fingerprint, or exact artifact ID. Cleanup
+/// callers must refuse mutation when this returns true. Malformed registry records are treated
+/// as ambiguous evidence and therefore fail closed.
+///
+/// # Errors
+///
+/// Returns an error if the registry directory cannot be read.
+pub async fn namespace_has_live_or_ambiguous_evidence(
+    state_dir: &Path,
+    identity: &str,
+) -> Result<bool, DaemonLifecycleError> {
+    let dir = registry_dir(state_dir);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(DaemonLifecycleError::Io { path: dir, source }),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| DaemonLifecycleError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let contents = fs::read(&path).map_err(|source| DaemonLifecycleError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let Ok(record) = serde_json::from_slice::<DaemonRecord>(&contents) else {
+            return Ok(true);
+        };
+        let identity_matches = record.namespace == identity
+            || record.build_fingerprint == identity
+            || record
+                .artifact_id
+                .as_ref()
+                .is_some_and(|artifact_id| artifact_id.as_str() == identity);
+        if !identity_matches {
+            continue;
+        }
+        if !matches!(
+            classify_daemon_record(&record).await,
+            DaemonRecordClassification::UnreachableStale
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Return daemon registry records whose IPC endpoints currently respond and whose server identity
 /// matches the persisted instance record.
 ///

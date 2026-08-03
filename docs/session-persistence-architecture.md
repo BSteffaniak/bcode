@@ -95,10 +95,10 @@ drops every preview while durable request/result history remains authoritative.
     session.db-wal         # database implementation sidecar
     session.db-shm         # database implementation sidecar
     manifest.json          # derived discovery/display cache
-  catalog.db               # legacy derived catalog cache
+  catalog.db               # global summary cache and draft-session state
   catalogs/
     <build-namespace>/
-      catalog.db           # derived catalog cache
+      catalog.db           # retired summary cache and possible draft-session state
   locks/                   # cross-process coordination
   leases/                  # live compatibility-owner metadata
 ```
@@ -110,9 +110,12 @@ Classification:
   repair path.
 * Materialized projection tables are derived from canonical events and may be rebuilt only by a
   controlled migration, reindex, or repair operation.
-* `manifest.json` and every catalog database are disposable discovery caches. Missing, stale, or
-  build-scoped catalog state must never hide a canonical session directory or replace canonical
-  event history.
+* `manifest.json` and catalog `sessions` rows are disposable discovery/display caches. Missing,
+  stale, or build-scoped summary state must never hide a canonical session directory or replace
+  canonical event history.
+* Catalog `composer_drafts` rows are authoritative for draft-session composer state. A catalog
+  database therefore cannot be deleted as a wholly disposable cache until maintenance has
+  preserved any authoritative draft rows it contains.
 * Lock and lease files are coordination metadata, not session history.
 
 ## Catalog discovery
@@ -129,8 +132,47 @@ Catalog discovery is best-effort, bounded, and non-mutating:
 * A damaged session should remain visible with degraded or repair-required state rather than
   disappearing from the catalog.
 
-Build-namespaced catalogs may coexist because they are rebuildable caches. They do not create
-build-specific session storage and cannot choose which session history is opened.
+Build-namespaced catalogs may coexist because their summary rows are rebuildable caches. They do not
+create build-specific session storage and cannot choose which session history is opened. Any
+retired catalog database must still be treated as potentially containing authoritative
+`composer_drafts` rows until explicit maintenance has inspected and preserved them.
+
+## Retired catalog namespaces
+
+`bcode session retired-catalogs` inventories directories under `sessions/catalogs/` without
+mutation. Reports include namespace classification, daemon-evidence disposition, catalog/WAL/SHM
+sizes, authoritative draft count, proposed action, and errors. `--apply` is explicit maintenance.
+
+Cleanup fails closed when matching artifact/build/namespace daemon evidence is live or ambiguous,
+or when any registry record is malformed. It rechecks that evidence after acquiring the session
+catalog maintenance lock. The retired and active catalogs are opened through typed `Database`
+operations; retired draft rows are copied only when their `updated_at_ms` is strictly newer than the
+active row. Equal or older retired drafts are reported as conflicts and skipped. Both databases are
+closed through `Database::close()` before the complete namespace directory is removed. Individual
+WAL/SHM files are never removed independently. Repeating cleanup after successful removal is an
+idempotent empty inventory.
+
+## Catalog update lifecycle
+
+Canonical event append updates the actor's current summary and publishes committed mutation
+notifications immediately. The server's live catalog therefore remains current independently of
+on-disk cache persistence. Persistent summary-cache updates are handed to one session-manager-owned
+coordinator that retains only the newest pending summary per session and flushes all pending
+sessions after a fixed maximum delay. Sustained activity cannot extend that deadline indefinitely,
+and queued memory is bounded by session count rather than event count.
+
+Each flush acquires catalog coordination for one bounded operation, writes the drained summaries in
+one transaction, and closes the database through Switchy's backend-neutral `Database` lifecycle.
+Bcode does not inspect, truncate, or otherwise manage WAL sidecars. Delayed writers compare
+`updated_at_ms` and cannot replace newer catalog rows. A failed pre-commit batch is merged back into
+the latest-value queue without failing the canonical append. Explicit deletion removes pending
+summary state and is serialized with catalog persistence so delayed work cannot resurrect a deleted
+row. Graceful daemon shutdown requests a final bounded flush; abrupt shutdown remains safe because
+canonical session databases remain authoritative.
+
+Draft-session composer reads and writes are synchronous because their catalog rows are authoritative,
+not derived summaries. They use the same bounded database lifecycle but never enter the asynchronous
+summary queue.
 
 ## Session database open modes
 

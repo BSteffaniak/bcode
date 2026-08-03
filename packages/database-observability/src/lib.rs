@@ -1000,6 +1000,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_is_forwarded_and_observed() {
+        let metrics = MetricsRegistry::in_memory();
+        let database = observed(&metrics);
+        database.close().await.expect("close forwards");
+        assert_eq!(
+            metrics.snapshot().counters.get("database.operation.total"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn typed_raw_schema_and_transaction_operations_are_observed() {
         let metrics = MetricsRegistry::default();

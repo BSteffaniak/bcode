@@ -3506,6 +3506,7 @@ async fn run_with_static_bundled_inner(
             _ = shutdown.recv() => break,
         }
     }
+    state.sessions.shutdown_catalog_updates().await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
     state.plugins.deactivate_all().await?;
     let metrics_status = state.metrics.shutdown_persistence();

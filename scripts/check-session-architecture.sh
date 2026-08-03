@@ -3,6 +3,25 @@ set -euo pipefail
 
 violations=0
 
+if ! rg -q 'GlobalSessionDb::open_existing_turso_in_root' packages/session/src/store.rs \
+  || rg -n 'GlobalSessionDb::(?:open_turso_in_root|initialize_turso_in_root)' packages/session/src/store.rs >/tmp/bcode-session-catalog-read-open-mode.txt; then
+  echo "Session catalog read violation: normal store loading must use the non-initializing existing-catalog open mode." >&2
+  cat /tmp/bcode-session-catalog-read-open-mode.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
+if rg -n 'run_global_migrations|migrate|repair|reindex' packages/session/src/store.rs >/tmp/bcode-session-catalog-read-mutation.txt; then
+  echo "Session catalog read violation: normal catalog store paths must not migrate, repair, or reindex." >&2
+  cat /tmp/bcode-session-catalog-read-mutation.txt >&2
+  violations=1
+fi
+
+if rg -n 'GlobalSessionDb::open_turso|upsert_session\(' packages/session/src/actor.rs >/tmp/bcode-session-actor-catalog-io.txt; then
+  echo "Session catalog ownership violation: session actors must schedule latest summaries instead of opening or writing the catalog database." >&2
+  cat /tmp/bcode-session-actor-catalog-io.txt >&2
+  violations=1
+fi
+
 if rg -n 'leases: BTreeMap<SessionId, SessionLeaseGuard>|retains its compatibility lease while dropping idle database' \
   packages/session/src docs/session-persistence-architecture.md --glob '*.rs' --glob '*.md' \
   >/tmp/bcode-session-indefinite-owner.txt; then

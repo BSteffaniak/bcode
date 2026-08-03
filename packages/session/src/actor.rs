@@ -1295,7 +1295,7 @@ impl SessionActor {
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         self.retire_live_text_checkpoint_for_durable_event(&event.kind);
-        self.update_manifest_and_catalog_after_append().await;
+        self.update_manifest_and_schedule_catalog().await;
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
         if let Some(metrics) = &metrics {
@@ -1307,43 +1307,18 @@ impl SessionActor {
         Ok(event)
     }
 
-    async fn update_manifest_and_catalog_after_append(&self) {
+    async fn update_manifest_and_schedule_catalog(&self) {
         let Some(store) = &self.store else {
             return;
         };
-        if let Err(error) = store.write_session_manifest(self.state.summary()).await {
+        let summary = self.state.summary();
+        if let Err(error) = store.write_session_manifest(summary.clone()).await {
             store
                 .metrics()
                 .increment_counter("session.manifest.write_error_total");
             eprintln!("failed to write session manifest: {error}");
         }
-        let catalog = crate::db::GlobalSessionDb::open_turso_in_root_observed(
-            &store.root_path(),
-            store.metrics(),
-        )
-        .await;
-        match catalog {
-            Ok(catalog) => {
-                if let Err(error) = catalog
-                    .upsert_session(
-                        &self.state.summary(),
-                        &crate::db::session_db_path(&store.root_path(), self.state.summary.id),
-                    )
-                    .await
-                {
-                    store
-                        .metrics()
-                        .increment_counter("session.catalog.upsert_error_total");
-                    eprintln!("failed to update session catalog: {error}");
-                }
-            }
-            Err(error) => {
-                store
-                    .metrics()
-                    .increment_counter("session.catalog.open_error_total");
-                eprintln!("failed to open session catalog for update: {error}");
-            }
-        }
+        store.schedule_catalog_summary(summary).await;
     }
 
     async fn append_user_message(

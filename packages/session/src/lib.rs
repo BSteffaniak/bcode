@@ -18,6 +18,7 @@ mod actor;
 mod attach;
 mod attachment;
 mod catalog;
+pub(crate) mod catalog_updates;
 mod context;
 mod current_schema;
 pub mod db;
@@ -1654,13 +1655,17 @@ impl SessionManager {
             return Ok(());
         };
         let launch_working_directory = normalize_working_directory(&launch_working_directory);
-        let db = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
-        db.set_draft_session_composer_draft(
-            &launch_working_directory,
-            &text,
-            self.next_activity_timestamp_ms(),
-        )
-        .await?;
+        let db = db::GlobalSessionDb::initialize_turso_in_root(&store.root_path()).await?;
+        let result = db
+            .set_draft_session_composer_draft(
+                &launch_working_directory,
+                &text,
+                self.next_activity_timestamp_ms(),
+            )
+            .await;
+        let close = db.close().await;
+        result?;
+        close?;
         Ok(())
     }
 
@@ -1677,10 +1682,14 @@ impl SessionManager {
             return Ok(None);
         };
         let launch_working_directory = normalize_working_directory(&launch_working_directory);
-        let db = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
-        Ok(db
+        let db = db::GlobalSessionDb::initialize_turso_in_root(&store.root_path()).await?;
+        let draft = db
             .draft_session_composer_draft(&launch_working_directory)
-            .await?)
+            .await;
+        let close = db.close().await;
+        let draft = draft?;
+        close?;
+        Ok(draft)
     }
 
     /// List known sessions from the session catalog.
@@ -1768,6 +1777,35 @@ impl SessionManager {
             .into_iter()
             .map(|handle| SessionCatalogEntry::from_snapshot(handle.snapshot()))
             .collect()
+    }
+
+    #[cfg(test)]
+    fn fail_next_catalog_flush_before_commit(&self) {
+        if let Some(store) = &self.store {
+            store.fail_next_catalog_flush_before_commit();
+        }
+    }
+
+    #[cfg(test)]
+    async fn pending_catalog_updates(&self) -> usize {
+        match &self.store {
+            Some(store) => store.pending_catalog_updates().await,
+            None => 0,
+        }
+    }
+
+    /// Flush pending derived catalog summaries.
+    pub async fn flush_catalog_updates(&self) {
+        if let Some(store) = &self.store {
+            store.flush_catalog_updates().await;
+        }
+    }
+
+    /// Stop catalog update scheduling after a final bounded flush.
+    pub async fn shutdown_catalog_updates(&self) {
+        if let Some(store) = &self.store {
+            store.shutdown_catalog_updates().await;
+        }
     }
 
     /// Return true once the persistent session catalog has been discovered.
@@ -1894,13 +1932,11 @@ impl SessionManager {
                 .ok_or(SessionError::NotFound(session_id))?;
             inner.load_gates.remove(&session_id);
         }
+        handle.shutdown().await?;
         if let Some(store) = &self.store {
-            let catalog = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await;
-            if let Ok(catalog) = catalog
-                && let Err(error) = catalog.delete_session(session_id).await
-            {
-                eprintln!("failed to remove session from canonical catalog: {error}");
-            }
+            store
+                .delete_catalog_session(session_id, session.updated_at_ms)
+                .await;
             let session_dir = db::session_dir_path(&store.root_path(), session_id);
             if session_dir.exists() {
                 match std::fs::remove_dir_all(&session_dir) {
@@ -1910,7 +1946,6 @@ impl SessionManager {
                 }
             }
         }
-        handle.shutdown().await?;
         Ok(session)
     }
 
@@ -2538,11 +2573,338 @@ mod tests {
     };
     use bcode_metrics::MetricsRegistry;
     use bcode_session_models::{
-        ExecutionSessionContextMode, ExecutionSessionProvenance, SessionVisibility,
+        ExecutionSessionContextMode, ExecutionSessionProvenance, SessionSummary,
+        SessionTitleSource, SessionVisibility,
     };
     use std::collections::BTreeSet;
     use std::time::Duration;
     use switchy::database::query::FilterableQuery;
+
+    #[tokio::test]
+    async fn catalog_draft_listing_and_timestamp_conflicts_preserve_newer_state() {
+        let root = unique_temp_dir();
+        let catalog = db::GlobalSessionDb::initialize_turso_in_root(&root)
+            .await
+            .expect("catalog initializes");
+        let working_directory = test_working_directory();
+        catalog
+            .set_draft_session_composer_draft(&working_directory, "newer", 20)
+            .await
+            .expect("newer draft writes");
+        catalog
+            .set_draft_session_composer_draft(&working_directory, "older", 10)
+            .await
+            .expect("older draft is skipped");
+        let drafts = catalog
+            .list_draft_session_composer_drafts()
+            .await
+            .expect("drafts list");
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].text, "newer");
+        assert_eq!(drafts[0].updated_at_ms, 20);
+        catalog.close().await.expect("catalog closes");
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn draft_session_composer_survives_manager_restart() {
+        let root = unique_temp_dir();
+        let working_directory = test_working_directory();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        manager
+            .set_draft_session_composer_draft(
+                working_directory.clone(),
+                "preserved draft".to_owned(),
+            )
+            .await
+            .expect("draft writes");
+        manager.shutdown_catalog_updates().await;
+        drop(manager);
+
+        let restored = SessionManager::persistent(&root).expect("manager restores");
+        assert_eq!(
+            restored
+                .draft_session_composer_draft(working_directory)
+                .await
+                .expect("draft reads")
+                .as_deref(),
+            Some("preserved draft")
+        );
+        restored.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn stale_catalog_writer_cannot_regress_newer_summary() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("newer".to_owned()), test_working_directory())
+            .await
+            .expect("session creates");
+        manager.flush_catalog_updates().await;
+        let newer = manager
+            .session_summary(session.id)
+            .await
+            .expect("summary exists");
+        let mut older = newer.clone();
+        older.name = Some("stale".to_owned());
+        older.explicit_name = Some("stale".to_owned());
+        older.updated_at_ms = newer.updated_at_ms.saturating_sub(1);
+
+        let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
+            .await
+            .expect("catalog opens");
+        catalog
+            .upsert_sessions(&root, &[older])
+            .await
+            .expect("stale write is safely skipped");
+        let stored = catalog
+            .list_sessions()
+            .await
+            .expect("catalog lists")
+            .into_iter()
+            .find(|summary| summary.id == session.id)
+            .expect("catalog row exists");
+        catalog.close().await.expect("catalog closes");
+        assert_eq!(stored.updated_at_ms, newer.updated_at_ms);
+        assert_eq!(stored.name, newer.name);
+        manager.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn transient_catalog_failure_does_not_fail_append_and_retries_latest_summary() {
+        let root = unique_temp_dir();
+        let metrics = MetricsRegistry::in_memory();
+        let manager = SessionManager::persistent_with_metrics(&root, metrics.clone())
+            .expect("manager should initialize");
+        let session = manager
+            .create_session(Some("retry".to_owned()), test_working_directory())
+            .await
+            .expect("session creates");
+        manager.flush_catalog_updates().await;
+        manager.fail_next_catalog_flush_before_commit();
+        manager
+            .append_event(
+                session.id,
+                SessionEventKind::SystemMessage {
+                    text: "canonical append survives".to_owned(),
+                },
+            )
+            .await
+            .expect("canonical append succeeds independently");
+        let expected = manager
+            .session_summary(session.id)
+            .await
+            .expect("summary exists");
+        manager.flush_catalog_updates().await;
+
+        let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
+            .await
+            .expect("catalog opens");
+        let stored = catalog
+            .list_sessions()
+            .await
+            .expect("catalog lists")
+            .into_iter()
+            .find(|summary| summary.id == session.id)
+            .expect("catalog row exists");
+        catalog.close().await.expect("catalog closes");
+        assert_eq!(stored.updated_at_ms, expected.updated_at_ms);
+        assert_eq!(
+            metrics
+                .snapshot()
+                .counters
+                .get("session.catalog.retry_total"),
+            Some(&1)
+        );
+        manager.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn catalog_tombstone_rejects_delayed_equal_or_older_summary() {
+        let root = unique_temp_dir();
+        let metrics = MetricsRegistry::in_memory();
+        let coordinator =
+            super::catalog_updates::CatalogUpdateCoordinator::new(root.clone(), metrics.clone());
+        coordinator.start();
+        let session_id = SessionId::new();
+        let summary = SessionSummary {
+            id: session_id,
+            name: Some("deleted".to_owned()),
+            explicit_name: Some("deleted".to_owned()),
+            derived_title: None,
+            title_source: SessionTitleSource::Explicit,
+            client_count: 0,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            working_directory: test_working_directory(),
+            import: None,
+            fork: None,
+            execution: None,
+        };
+        coordinator.delete(session_id, 20).await;
+        coordinator.schedule(summary).await;
+        assert_eq!(coordinator.pending_len().await, 0);
+        assert_eq!(coordinator.tombstone_len().await, 1);
+        coordinator.flush().await;
+        assert_eq!(
+            metrics
+                .snapshot()
+                .counters
+                .get("session.catalog.tombstone_skip_total"),
+            Some(&1)
+        );
+        coordinator.shutdown().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn committed_tombstone_rejects_late_summary_resurrection() {
+        let root = unique_temp_dir();
+        let coordinator = super::catalog_updates::CatalogUpdateCoordinator::new(
+            root.clone(),
+            MetricsRegistry::in_memory(),
+        );
+        coordinator.start();
+        let session_id = SessionId::new();
+        let summary = SessionSummary {
+            id: session_id,
+            name: Some("deleted".to_owned()),
+            explicit_name: Some("deleted".to_owned()),
+            derived_title: None,
+            title_source: SessionTitleSource::Explicit,
+            client_count: 0,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            working_directory: test_working_directory(),
+            import: None,
+            fork: None,
+            execution: None,
+        };
+        let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
+            .await
+            .expect("catalog opens");
+        catalog
+            .upsert_sessions(&root, std::slice::from_ref(&summary))
+            .await
+            .expect("summary inserts");
+        catalog.close().await.expect("catalog closes");
+
+        coordinator.delete(session_id, 20).await;
+        coordinator.flush().await;
+        coordinator.schedule(summary).await;
+        coordinator.flush().await;
+
+        let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
+            .await
+            .expect("catalog reopens");
+        assert!(
+            catalog
+                .list_sessions()
+                .await
+                .expect("catalog lists")
+                .iter()
+                .all(|stored| stored.id != session_id)
+        );
+        catalog.close().await.expect("catalog closes");
+        coordinator.shutdown().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn catalog_updates_publish_batch_metrics_and_remain_bounded_by_session() {
+        let root = unique_temp_dir();
+        let metrics = MetricsRegistry::in_memory();
+        let manager = SessionManager::persistent_with_metrics(&root, metrics.clone())
+            .expect("manager should initialize");
+        let session = manager
+            .create_session(Some("metrics".to_owned()), test_working_directory())
+            .await
+            .expect("session creates");
+        for index in 0..50 {
+            manager
+                .append_event(
+                    session.id,
+                    SessionEventKind::SystemMessage {
+                        text: format!("metric event {index}"),
+                    },
+                )
+                .await
+                .expect("event appends");
+        }
+        assert_eq!(manager.pending_catalog_updates().await, 1);
+        manager.flush_catalog_updates().await;
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.gauges.get("session.catalog.pending_sessions"),
+            Some(&0)
+        );
+        assert!(
+            snapshot
+                .counters
+                .get("session.catalog.flush_total")
+                .is_some_and(|count| *count >= 1)
+        );
+        assert!(
+            snapshot
+                .histograms
+                .get("session.catalog.flush_summaries")
+                .is_some_and(|histogram| histogram.count >= 1 && histogram.max == Some(1))
+        );
+        assert!(
+            snapshot
+                .counters
+                .get("session.catalog.coalesced_total")
+                .is_some_and(|count| *count > 0)
+        );
+        manager.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn catalog_updates_coalesce_and_flush_latest_summary() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("coalesce".to_owned()), test_working_directory())
+            .await
+            .expect("session creates");
+        for index in 0..100 {
+            manager
+                .append_event(
+                    session.id,
+                    SessionEventKind::SystemMessage {
+                        text: format!("catalog event {index}"),
+                    },
+                )
+                .await
+                .expect("event appends");
+        }
+        assert_eq!(manager.pending_catalog_updates().await, 1);
+        let expected = manager
+            .session_summary(session.id)
+            .await
+            .expect("summary exists");
+        manager.flush_catalog_updates().await;
+        assert_eq!(manager.pending_catalog_updates().await, 0);
+
+        let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
+            .await
+            .expect("catalog opens");
+        let stored = catalog
+            .list_sessions()
+            .await
+            .expect("catalog lists")
+            .into_iter()
+            .find(|summary| summary.id == session.id)
+            .expect("catalog row exists");
+        catalog.close().await.expect("catalog closes");
+        assert_eq!(stored.updated_at_ms, expected.updated_at_ms);
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
 
     #[tokio::test]
     async fn session_summary_pages_are_bounded_ordered_and_cursor_continuable() {
@@ -7194,11 +7556,13 @@ mod tests {
                 },
             )
             .expect("manager should initialize");
-            manager
+            let session = manager
                 .create_session(Some("canonical".to_owned()), test_working_directory())
                 .await
-                .expect("session")
-                .id
+                .expect("session");
+            manager.flush_catalog_updates().await;
+            manager.shutdown_catalog_updates().await;
+            session.id
         };
         std::fs::remove_file(db::session_dir_path(&root, session_id).join("manifest.json"))
             .expect("remove manifest");
@@ -7462,6 +7826,7 @@ mod tests {
             .create_session(Some("manifested".to_string()), test_working_directory())
             .await
             .expect("session should create");
+        manager.flush_catalog_updates().await;
 
         let manifest_path = root.join(session.id.to_string()).join("manifest.json");
         assert!(manifest_path.exists());
@@ -7478,7 +7843,59 @@ mod tests {
             db::global_catalog_db_path(&root).exists(),
             "all current writers should use the canonical global catalog"
         );
+        manager.shutdown_catalog_updates().await;
 
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn normal_catalog_read_does_not_initialize_missing_schema() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("root creates");
+        let raw = switchy::database_connection::builder()
+            .turso()
+            .with_path(db::global_catalog_db_path(&root))
+            .build()
+            .await
+            .expect("empty catalog creates");
+        raw.close().await.expect("empty catalog closes");
+
+        let before = std::fs::read(db::global_catalog_db_path(&root)).expect("catalog reads");
+        assert!(
+            db::GlobalSessionDb::open_existing_turso_in_root(&root)
+                .await
+                .is_err()
+        );
+        let after = std::fs::read(db::global_catalog_db_path(&root)).expect("catalog reads");
+        assert_eq!(after, before, "normal read must not create catalog schema");
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn stale_catalog_row_without_canonical_directory_is_not_restored() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("deleted catalog row".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session creates");
+        manager.flush_catalog_updates().await;
+        manager.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(db::session_dir_path(&root, session.id))
+            .expect("canonical directory removes");
+
+        let restored = SessionManager::persistent(&root).expect("manager restores");
+        assert!(
+            restored
+                .cached_sessions(&test_working_directory())
+                .await
+                .iter()
+                .all(|summary| summary.id != session.id)
+        );
+        restored.shutdown_catalog_updates().await;
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

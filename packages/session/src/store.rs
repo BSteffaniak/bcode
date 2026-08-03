@@ -63,7 +63,10 @@ impl SessionStore {
     ) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
         let mut summaries = if self.catalog_db_path().exists() {
             match self.load_global_catalog_summaries() {
-                Ok(summaries) => summaries,
+                Ok(summaries) => summaries
+                    .into_iter()
+                    .filter(|summary| db::session_dir_path(&self.root, summary.id).exists())
+                    .collect(),
                 Err(error) => {
                     eprintln!("ignoring unreadable derived session catalog: {error}");
                     Vec::new()
@@ -112,8 +115,6 @@ impl SessionStore {
         if summaries.is_empty() {
             return Ok(summaries);
         }
-
-        self.write_global_catalog_summaries(&summaries)?;
         Ok(summaries)
     }
 
@@ -244,34 +245,6 @@ impl SessionStore {
         Ok(Some(manifest.summary))
     }
 
-    fn write_global_catalog_summaries(
-        &self,
-        summaries: &[SessionSummary],
-    ) -> Result<(), SessionStoreError> {
-        let root = self.root.clone();
-        let summaries = summaries.to_vec();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-            runtime.block_on(async move {
-                let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                for summary in summaries {
-                    catalog
-                        .upsert_session(&summary, &db::session_db_path(&root, summary.id))
-                        .await
-                        .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                }
-                Ok(())
-            })
-        })
-        .join()
-        .map_err(|_| SessionStoreError::CatalogLoad("catalog writer panicked".to_string()))?
-    }
-
     pub(crate) fn write_session_manifest(
         &self,
         summary: &SessionSummary,
@@ -316,13 +289,20 @@ impl SessionStore {
                 .build()
                 .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
             runtime.block_on(async move {
-                let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
+                let catalog = db::GlobalSessionDb::open_existing_turso_in_root(&root)
                     .await
                     .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                catalog
+                let summaries = catalog
                     .list_sessions()
                     .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()));
+                let close = catalog
+                    .close()
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()));
+                let summaries = summaries?;
+                close?;
+                Ok(summaries)
             })
         })
         .join()
