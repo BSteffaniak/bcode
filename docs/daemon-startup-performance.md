@@ -44,6 +44,50 @@ The measured optimizations preserve the architecture boundaries:
 * first materialization attempts a retained-handle copy-on-write clone on supported macOS/Linux filesystems, verifies and synchronizes the clone, and falls back to fused stream copy plus hashing;
 * successful `Hello` remains full readiness—no partial-ready protocol is justified.
 
+## Current session-search release measurements (2026-08-03)
+
+Release-mode validation on macOS arm64 recorded:
+
+* Startup harness, 5 serial samples and 4 concurrent clients:
+  * warm verified handshake p50/p95: 0.743/0.939 ms;
+  * warm status p50/p95: 58.262/73.993 ms against 49.420/55.447 ms process baseline;
+  * cached cold p50/p95: 368.414/384.227 ms;
+  * first cold p50/p95: 357.017/396.619 ms;
+  * search disabled cold p50/p95: 345.524/426.048 ms;
+  * search enabled with empty default provider p50/p95: 332.733/382.439 ms;
+  * 4-client concurrent cold wall time: 328.117 ms.
+* Tantivy, 25,000 records / 26,811,315 normalized bytes:
+  * ingestion 9.387 s (2,663 records/s);
+  * index 4,694,193 bytes, 0.175x amplification;
+  * query p50/p95/p99 0.713/11.741/27.746 ms;
+  * commit p50/p95/p99 84.581/153.853/200.524 ms;
+  * reopen 3.176 ms.
+* Compressed provider, 25,000 records / 21,088,894 normalized bytes:
+  * ingestion 9.081 s;
+  * 342,373 compressed bytes, 1.6% ratio;
+  * warm query p50/p95/p99 0.184/0.230/0.855 ms;
+  * cold query p50/p95/p99 0.422/2.277/2.277 ms;
+  * two concurrent scans 0.725 ms.
+* Canonical hydration, 1,000-event session, 20 hits, 20 runs: p50/p95/p99
+  2.294/23.024/23.024 ms, below the 100 ms p95 budget.
+* Incremental ingestion, 16 sessions x 256 events: 198.914 ms total lag, 20,591 events/s,
+  32 bounded provider calls.
+* Complete real-provider orchestration, 16 sessions and both providers:
+  * first complete backfill 2.132 s;
+  * unchanged idempotent rerun 4.877 ms;
+  * ordinary Tantivy query admitted during backfill 24.058 ms;
+  * final provider roots 18,135 Tantivy bytes and 7,088 compressed-provider bytes;
+  * `/usr/bin/time -l`: 0.23 s user CPU, 0.62 s system CPU, 99,368,960-byte maximum RSS
+    (76,907,192-byte peak footprint).
+* Actual-binary cancellation over 120 historical sessions reached terminal cancelled state within
+  the one-second observation interval after cancellation request.
+
+Startup remains within the locked warm-handshake, warm-overhead, cached-cold, first-cold, and
+concurrent-launch budgets. Provider query, amplification, hydration, cancellation, cooperative-query,
+and incremental-ingestion measurements remain within their existing focused budgets. CPU and peak
+RSS are recorded for the complete multi-provider orchestration process. Provider-local CPU/RSS are
+included in that in-process sample rather than attributed separately.
+
 ## Initial budgets
 
 These product budgets remain locked:

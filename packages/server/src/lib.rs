@@ -31228,6 +31228,157 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
+    #[ignore = "manual complete multi-provider scheduling performance baseline"]
+    async fn benchmark_complete_multi_provider_backfill_rerun_and_concurrent_query() {
+        let _guard = session_search::tests::lock_search_tests().await;
+        let tantivy_root = tempfile::tempdir().expect("tantivy root");
+        let compressed_root = tempfile::tempdir().expect("compressed root");
+        let manifests = vec![
+            (
+                toml::from_str(include_str!(
+                    "../../../plugins/tantivy-session-search-plugin/bcode-plugin.toml"
+                ))
+                .expect("tantivy manifest"),
+                bcode_tantivy_session_search_plugin::static_plugin(),
+            ),
+            (
+                toml::from_str(include_str!(
+                    "../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"
+                ))
+                .expect("compressed manifest"),
+                bcode_compressed_session_search_plugin::static_plugin(),
+            ),
+        ];
+        let configs = BTreeMap::from([
+            (
+                "bcode.tantivy-session-search".to_owned(),
+                bcode_plugin::ResolvedPluginConfig::new(
+                    serde_json::json!({"storage_root": tantivy_root.path()}),
+                    serde_json::json!({"storage_root": tantivy_root.path()}),
+                ),
+            ),
+            (
+                "bcode.compressed-session-search".to_owned(),
+                bcode_plugin::ResolvedPluginConfig::new(
+                    serde_json::json!({"storage_root": compressed_root.path()}),
+                    serde_json::json!({"storage_root": compressed_root.path()}),
+                ),
+            ),
+        ]);
+        let state = Arc::new(session_search::tests::state_with_static_provider_vtables(
+            &manifests, configs,
+        ));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session_count = std::env::var("BCODE_SESSION_SEARCH_COMPLETE_BENCH_SESSIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64);
+        assert!((1..=256).contains(&session_count));
+        let mut session_ids = BTreeSet::new();
+        for index in 0..session_count {
+            let session = state
+                .sessions
+                .create_session(
+                    Some(format!("complete benchmark {index}")),
+                    workspace.path().to_path_buf(),
+                )
+                .await
+                .expect("session");
+            state
+                .sessions
+                .append_context_compacted(session.id, format!("benchmark token {index}"), 0)
+                .await
+                .expect("event");
+            session_ids.insert(session.id);
+        }
+        let request = bcode_session_search::CompleteSessionSearchBackfillRequest {
+            provider_id: None,
+            session_ids,
+            after_timestamp_ms: None,
+            before_timestamp_ms: None,
+            slice_deadline_ms: 30_000,
+        };
+        let query = bcode_session_search::SessionSearchRequest {
+            query: bcode_session_search::SessionSearchQuery::Text {
+                text: "benchmark".to_owned(),
+                mode: bcode_session_search::TextMatchMode::Terms,
+                fields: BTreeSet::new(),
+            },
+            filters: bcode_session_search::SessionSearchFilters::default(),
+            sort: bcode_session_search::SessionSearchSort::ProviderRelevance,
+            limit: 20,
+            cursor: None,
+            deadline_ms: Some(5_000),
+        };
+        let started = Instant::now();
+        let first_state = Arc::clone(&state);
+        let first_request = request.clone();
+        let first = tokio::spawn(async move {
+            session_search::complete_backfill(
+                &first_state,
+                first_request,
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+                None,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let query_started = Instant::now();
+        let _query_response =
+            session_search::search_provider(&state, "bcode.tantivy-session-search", &query)
+                .await
+                .expect("concurrent query");
+        let query_us = query_started.elapsed().as_micros();
+        let first_response = first.await.expect("backfill task").expect("backfill");
+        let first_us = started.elapsed().as_micros();
+        assert!(
+            first_response
+                .providers
+                .iter()
+                .all(|provider| provider.completed_sessions == session_count)
+        );
+
+        let rerun_started = Instant::now();
+        let rerun = session_search::complete_backfill(
+            &state,
+            request,
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+        )
+        .await
+        .expect("rerun");
+        let rerun_us = rerun_started.elapsed().as_micros();
+        assert!(
+            rerun
+                .providers
+                .iter()
+                .all(|provider| provider.completed_sessions == session_count)
+        );
+        println!(
+            "session_search_complete_benchmark sessions={session_count} providers=2 first_us={first_us} rerun_us={rerun_us} concurrent_query_us={query_us} tantivy_bytes={} compressed_bytes={}",
+            directory_size(tantivy_root.path()),
+            directory_size(compressed_root.path()),
+        );
+    }
+
+    fn directory_size(path: &Path) -> u64 {
+        std::fs::read_dir(path).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        directory_size(&path)
+                    } else {
+                        entry.metadata().map_or(0, |metadata| metadata.len())
+                    }
+                })
+                .sum()
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
     async fn real_static_tantivy_and_compressed_providers_complete_and_rerun_idempotently() {
         let _guard = session_search::tests::lock_search_tests().await;
         let tantivy_root = tempfile::tempdir().expect("tantivy root");
