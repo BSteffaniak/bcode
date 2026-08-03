@@ -1,10 +1,13 @@
 //! Terminal-native graph editor projection for portable workflow authoring documents.
 
 use bcode_plugin_sdk::tui::{
-    BoxedPluginTuiSurface, PluginTuiAction, PluginTuiHost, PluginTuiSurface,
-    PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest, PluginWorkflowAuthoringDraft,
-    PluginWorkflowAuthoringEditResult, PluginWorkflowAuthoringPublishResult,
-    PluginWorkflowAuthoringRevision, PluginWorkflowStartResponse,
+    BoxedPluginTuiSurface, PluginStructuredGenerationRequest, PluginTuiAction, PluginTuiHost,
+    PluginTuiSurface, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
+    PluginWorkflowAuthoringDraft, PluginWorkflowAuthoringEditResult,
+    PluginWorkflowAuthoringPublishResult, PluginWorkflowAuthoringRevision,
+    PluginWorkflowGeneratedCandidate, PluginWorkflowGeneratedCandidateAcceptance,
+    PluginWorkflowGeneratedCandidateTarget, PluginWorkflowStartResponse,
+    PluginWorkflowTemplateInstantiationRequest,
 };
 use bcode_workflow::{
     EdgeDefinition, EdgeKind, NodeDefinition, NodeKind, WORKFLOW_AUTHORING_EDIT_VERSION,
@@ -28,6 +31,9 @@ const PALETTE_HEADER_ROWS: u16 = 2;
 const CANVAS_HEADER_ROWS: u16 = 2;
 const GRAPH_PRESENTATION_NAMESPACE: &str = "bcode.graph";
 const GRAPH_PRESENTATION_VERSION: u32 = 1;
+const DEFAULT_DRAFT_ID: &str = "draft-1";
+const MAX_GENERATION_REPAIR_ATTEMPTS: u32 = 3;
+const GENERATION_TIMEOUT_MS: u64 = 300_000;
 
 /// Open the workflow authoring graph editor.
 pub fn open(request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
@@ -111,6 +117,12 @@ enum AuthoringOperation {
     Edit,
     Publish,
     Publishing,
+    Instantiate,
+    Instantiating,
+    Generate,
+    Generating,
+    AcceptGenerated,
+    AcceptingGenerated,
     Start,
     Starting,
 }
@@ -120,6 +132,9 @@ enum AuthoringAsyncResult {
     Draft(Result<Option<Box<PluginWorkflowAuthoringDraft>>, String>),
     BaseRevision(Result<Option<Box<PluginWorkflowAuthoringRevision>>, String>),
     Edit(Result<PluginWorkflowAuthoringEditResult, String>),
+    Instantiate(Result<Box<PluginWorkflowAuthoringDraft>, String>),
+    Generate(Result<serde_json::Value, String>),
+    AcceptGenerated(Result<PluginWorkflowGeneratedCandidateAcceptance, String>),
     Publish(Result<PluginWorkflowAuthoringPublishResult, String>),
     Start(Result<PluginWorkflowStartResponse, String>),
 }
@@ -156,6 +171,21 @@ struct PaletteEntry {
     kind: PaletteEntryKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TemplateIdentity {
+    owner_plugin_id: String,
+    template_id: String,
+    template_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedWorkflowCandidate {
+    prompt: String,
+    document: WorkflowAuthoringDocument,
+    preview: WorkflowCompilationPreview,
+    repair_attempts: u32,
+}
+
 #[derive(Debug)]
 struct WorkflowAuthorSurface {
     document: Option<WorkflowAuthoringDocument>,
@@ -179,6 +209,7 @@ struct WorkflowAuthorSurface {
     generation: Option<u64>,
     parent_session_id: Option<bcode_session_models::SessionId>,
     workspace_snapshot: Option<String>,
+    template_identity: Option<TemplateIdentity>,
     published_revision: Option<u64>,
     producer: WorkflowProducerProvenance,
     operations: BTreeSet<AuthoringOperation>,
@@ -186,6 +217,11 @@ struct WorkflowAuthorSurface {
     pending_edit_batch: Option<WorkflowAuthoringEditBatch>,
     pending_conflict: Option<PendingConflict>,
     inspector_edit: Option<InspectorTextEdit>,
+    prompt_edit: Option<String>,
+    pending_generation_prompt: Option<String>,
+    generation_repair_attempts: u32,
+    generation_diagnostics: Vec<WorkflowValidationDiagnostic>,
+    generated_candidate: Option<GeneratedWorkflowCandidate>,
     connect_source: Option<String>,
     catalog_sender: mpsc::UnboundedSender<Result<WorkflowAuthoringCatalogSnapshot, String>>,
     catalog_receiver: mpsc::UnboundedReceiver<Result<WorkflowAuthoringCatalogSnapshot, String>>,
@@ -222,6 +258,7 @@ impl WorkflowAuthorSurface {
             .get("workspace_snapshot")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let template_identity = template_identity(options);
         let producer = draft
             .and_then(|draft| draft.get("producer"))
             .and_then(|producer| serde_json::from_value(producer.clone()).ok())
@@ -260,6 +297,7 @@ impl WorkflowAuthorSurface {
             generation,
             parent_session_id,
             workspace_snapshot,
+            template_identity,
             published_revision: None,
             producer,
             operations: BTreeSet::new(),
@@ -267,6 +305,11 @@ impl WorkflowAuthorSurface {
             pending_edit_batch: None,
             pending_conflict: None,
             inspector_edit: None,
+            prompt_edit: None,
+            pending_generation_prompt: None,
+            generation_repair_attempts: 0,
+            generation_diagnostics: Vec::new(),
+            generated_candidate: None,
             connect_source: None,
             catalog_sender,
             catalog_receiver,
@@ -276,9 +319,15 @@ impl WorkflowAuthorSurface {
         }
     }
 
-    fn node_entries(&self) -> Vec<(&str, &NodeDefinition)> {
-        self.document
+    fn projection_document(&self) -> Option<&WorkflowAuthoringDocument> {
+        self.generated_candidate
             .as_ref()
+            .map(|candidate| &candidate.document)
+            .or(self.document.as_ref())
+    }
+
+    fn node_entries(&self) -> Vec<(&str, &NodeDefinition)> {
+        self.projection_document()
             .map(|document| {
                 document
                     .definition
@@ -302,8 +351,7 @@ impl WorkflowAuthorSurface {
             .selected_node
             .min(self.node_entries().len().saturating_sub(1));
         self.selected_edge = self.selected_edge.min(
-            self.document
-                .as_ref()
+            self.projection_document()
                 .map_or(0, |document| document.definition.edges.len())
                 .saturating_sub(1),
         );
@@ -828,6 +876,99 @@ impl WorkflowAuthorSurface {
         })
     }
 
+    fn handle_prompt_edit(&mut self, event: &Event) -> bool {
+        let Some(buffer) = self.prompt_edit.as_mut() else {
+            return false;
+        };
+        match event {
+            Event::Key(key) if key.key == KeyCode::Escape => {
+                self.prompt_edit = None;
+                self.status = "Prompt generation cancelled".to_string();
+            }
+            Event::Key(key) if key.key == KeyCode::Enter => {
+                let prompt = buffer.trim().to_string();
+                if prompt.is_empty() {
+                    self.status = "Workflow prompt cannot be empty".to_string();
+                } else {
+                    self.prompt_edit = None;
+                    self.pending_generation_prompt = Some(prompt);
+                    self.generation_repair_attempts = 0;
+                    self.generation_diagnostics.clear();
+                    self.operations.insert(AuthoringOperation::Generate);
+                    self.status = "Generating portable workflow candidate…".to_string();
+                }
+            }
+            Event::Key(key) if key.key == KeyCode::Backspace => {
+                buffer.pop();
+            }
+            Event::Key(key) if let KeyCode::Char(character) = key.key => {
+                if buffer.len() < 8_192 {
+                    buffer.push(character);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn begin_prompt_generation(&mut self) {
+        if self.catalog.is_none() {
+            self.status = "Portable authoring catalog is still loading".to_string();
+            return;
+        }
+        if self.operations.contains(&AuthoringOperation::Generate)
+            || self.operations.contains(&AuthoringOperation::Generating)
+        {
+            self.status = "Workflow generation is already in progress".to_string();
+            return;
+        }
+        self.prompt_edit = Some(String::new());
+        self.status = "Describe the workflow · Enter generate · Esc cancel".to_string();
+    }
+
+    fn accept_generated_candidate(&mut self) {
+        let Some(candidate) = self.generated_candidate.as_ref() else {
+            self.status = "Generate and review a candidate before acceptance".to_string();
+            return;
+        };
+        if !candidate.preview.is_compiled() {
+            self.status =
+                "Resolve all generated-candidate diagnostics before acceptance".to_string();
+            return;
+        }
+        if self
+            .operations
+            .contains(&AuthoringOperation::AcceptGenerated)
+            || self
+                .operations
+                .contains(&AuthoringOperation::AcceptingGenerated)
+        {
+            self.status = "Generated candidate acceptance is already in progress".to_string();
+            return;
+        }
+        self.operations.insert(AuthoringOperation::AcceptGenerated);
+        self.status = "Accepting reviewed candidate as a mutable draft…".to_string();
+    }
+
+    fn instantiate_template(&mut self) {
+        if self.generation.is_some() {
+            self.status = "This template already has a mutable draft".to_string();
+            return;
+        }
+        if self.operations.contains(&AuthoringOperation::Instantiate)
+            || self.operations.contains(&AuthoringOperation::Instantiating)
+        {
+            self.status = "Template instantiation is already in progress".to_string();
+            return;
+        }
+        if self.template_identity.is_none() {
+            self.status = "Exact maintainable template identity is unavailable".to_string();
+            return;
+        }
+        self.operations.insert(AuthoringOperation::Instantiate);
+        self.status = "Instantiating template as a normal mutable authored draft…".to_string();
+    }
+
     fn publish(&mut self) {
         if self.operations.contains(&AuthoringOperation::Publish)
             || self.operations.contains(&AuthoringOperation::Publishing)
@@ -1000,7 +1141,11 @@ impl WorkflowAuthorSurface {
                 &line,
             );
         }
-        if let Some(document) = &self.document {
+        let candidate_document = self
+            .generated_candidate
+            .as_ref()
+            .map(|candidate| &candidate.document);
+        if let Some(document) = candidate_document.or(self.document.as_ref()) {
             for (offset, edge) in document.definition.edges.iter().take(4).enumerate() {
                 let marker = if offset == self.selected_edge {
                     "◆"
@@ -1049,6 +1194,21 @@ impl WorkflowAuthorSurface {
         if let Some(edit) = &self.inspector_edit {
             lines.insert(0, format!("Editing {:?}: {}▏", edit.target, edit.buffer));
         }
+        if let Some(candidate) = &self.generated_candidate {
+            lines.insert(
+                0,
+                format!(
+                    "Generated candidate · repairs={} · compiled={} · prompt={}",
+                    candidate.repair_attempts,
+                    candidate.preview.is_compiled(),
+                    candidate.prompt
+                ),
+            );
+            lines.splice(1..1, generated_candidate_lines(candidate));
+        }
+        if let Some(prompt) = &self.prompt_edit {
+            lines.insert(0, format!("Workflow prompt: {prompt}▏"));
+        }
         for (row, line) in lines
             .iter()
             .skip(self.inspector_scroll)
@@ -1085,7 +1245,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
             frame.write_line(
                 footer,
                 &Line::from(format!(
-                    "{} · Tab panes · node d/x/c · edge e/E · group g · move Shift+HJKL · inspector n/a/t/+/v · R resolve conflict · p publish · s start",
+                    "{} · G generate · A accept candidate · z instantiate · Tab panes · node d/x/c · edge e/E · group g · move Shift+HJKL · inspector n/a/t/+/v · R resolve conflict · p publish · s start",
                     self.status
                 )),
             );
@@ -1094,6 +1254,13 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
 
     #[allow(clippy::too_many_lines)]
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.prompt_edit.is_some() {
+            return if self.handle_prompt_edit(event) {
+                PluginTuiAction::Redraw
+            } else {
+                PluginTuiAction::None
+            };
+        }
         if let Event::Key(key) = event
             && self.inspector_edit.is_some()
         {
@@ -1301,6 +1468,18 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 self.resolve_conflict();
                 true
             }
+            Event::Key(key) if key.key == KeyCode::Char('G') => {
+                self.begin_prompt_generation();
+                true
+            }
+            Event::Key(key) if key.key == KeyCode::Char('A') => {
+                self.accept_generated_candidate();
+                true
+            }
+            Event::Key(key) if key.key == KeyCode::Char('z') => {
+                self.instantiate_template();
+                true
+            }
             Event::Key(key) if key.key == KeyCode::Char('p') => {
                 self.publish();
                 true
@@ -1398,6 +1577,98 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                     Err(error) => self.status = error,
                 }
             }
+        }
+        if self.operations.remove(&AuthoringOperation::Generate) {
+            self.operations.insert(AuthoringOperation::Generating);
+            let Some(prompt) = self.pending_generation_prompt.clone() else {
+                self.operations.remove(&AuthoringOperation::Generating);
+                self.status = "Workflow generation prompt is unavailable".to_string();
+                return PluginTuiAction::Redraw;
+            };
+            let Some(catalog) = self.catalog.clone() else {
+                self.operations.remove(&AuthoringOperation::Generating);
+                self.status = "Portable authoring catalog is unavailable".to_string();
+                return PluginTuiAction::Redraw;
+            };
+            let existing = self.document.clone();
+            let schema = workflow_authoring_document_schema();
+            let request = generation_request(
+                &prompt,
+                &catalog,
+                existing.as_ref(),
+                &self.generation_diagnostics,
+                schema,
+            );
+            let future = host.generate_structured_output(request);
+            let sender = self.authoring_sender.clone();
+            host.spawn(Box::pin(async move {
+                let result = future.await.map_err(|error| error.to_string());
+                let _ = sender.send(AuthoringAsyncResult::Generate(result));
+            }));
+        }
+        if self.operations.remove(&AuthoringOperation::AcceptGenerated) {
+            self.operations
+                .insert(AuthoringOperation::AcceptingGenerated);
+            let Some(candidate) = self.generated_candidate.clone() else {
+                self.operations
+                    .remove(&AuthoringOperation::AcceptingGenerated);
+                self.status = "Generated candidate is unavailable".to_string();
+                return PluginTuiAction::Redraw;
+            };
+            let target = match (
+                self.workflow_id.clone(),
+                self.draft_id.clone(),
+                self.generation,
+            ) {
+                (Some(workflow_id), Some(draft_id), Some(expected_generation)) => {
+                    Some(PluginWorkflowGeneratedCandidateTarget {
+                        workflow_id,
+                        draft_id,
+                        expected_generation,
+                    })
+                }
+                _ => None,
+            };
+            let future =
+                host.accept_generated_workflow_candidate(PluginWorkflowGeneratedCandidate {
+                    document: candidate.document,
+                    target,
+                    draft_id: DEFAULT_DRAFT_ID.to_string(),
+                    repair_attempts: candidate.repair_attempts,
+                });
+            let sender = self.authoring_sender.clone();
+            host.spawn(Box::pin(async move {
+                let result = future.await.map_err(|error| error.to_string());
+                let _ = sender.send(AuthoringAsyncResult::AcceptGenerated(result));
+            }));
+        }
+        if self.operations.remove(&AuthoringOperation::Instantiate) {
+            self.operations.insert(AuthoringOperation::Instantiating);
+            let Some(template) = self.template_identity.clone() else {
+                self.operations.remove(&AuthoringOperation::Instantiating);
+                self.status = "Exact maintainable template identity is unavailable".to_string();
+                return PluginTuiAction::Redraw;
+            };
+            let workflow_id = self.document.as_ref().map_or_else(
+                || unique_authored_workflow_id(&template.template_id),
+                |document| unique_authored_workflow_id(&document.workflow_id),
+            );
+            let future =
+                host.instantiate_workflow_template(PluginWorkflowTemplateInstantiationRequest {
+                    owner_plugin_id: template.owner_plugin_id,
+                    template_id: template.template_id,
+                    template_version: template.template_version,
+                    workflow_id,
+                    draft_id: DEFAULT_DRAFT_ID.to_string(),
+                });
+            let sender = self.authoring_sender.clone();
+            host.spawn(Box::pin(async move {
+                let result = future
+                    .await
+                    .map(Box::new)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(AuthoringAsyncResult::Instantiate(result));
+            }));
         }
         if self.operations.remove(&AuthoringOperation::Publish) {
             self.operations.insert(AuthoringOperation::Publishing);
@@ -1517,6 +1788,112 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                     self.pending_edit_batch = None;
                     self.status = format!("Semantic edit failed: {error}");
                 }
+                AuthoringAsyncResult::Generate(Ok(value)) => {
+                    self.operations.remove(&AuthoringOperation::Generating);
+                    match decode_generated_candidate(value, self.catalog.as_ref()) {
+                        Ok((document, preview)) => {
+                            if preview.is_compiled() {
+                                let prompt =
+                                    self.pending_generation_prompt.clone().unwrap_or_default();
+                                self.generated_candidate = Some(GeneratedWorkflowCandidate {
+                                    prompt,
+                                    document,
+                                    preview,
+                                    repair_attempts: self.generation_repair_attempts,
+                                });
+                                self.status = "Generated candidate is review-only; press A to accept it as a mutable draft".to_string();
+                            } else if self.generation_repair_attempts
+                                < MAX_GENERATION_REPAIR_ATTEMPTS
+                            {
+                                self.generation_repair_attempts += 1;
+                                self.generation_diagnostics = preview.validation.diagnostics;
+                                self.operations.insert(AuthoringOperation::Generate);
+                                self.status = format!(
+                                    "Repairing generated candidate from structured diagnostics ({}/{MAX_GENERATION_REPAIR_ATTEMPTS})",
+                                    self.generation_repair_attempts
+                                );
+                            } else {
+                                self.generated_candidate = Some(GeneratedWorkflowCandidate {
+                                    prompt: self
+                                        .pending_generation_prompt
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    document,
+                                    preview,
+                                    repair_attempts: self.generation_repair_attempts,
+                                });
+                                self.status = "Generated candidate still has diagnostics after three repairs; review without accepting".to_string();
+                            }
+                        }
+                        Err(error)
+                            if self.generation_repair_attempts < MAX_GENERATION_REPAIR_ATTEMPTS =>
+                        {
+                            self.generation_repair_attempts += 1;
+                            self.generation_diagnostics = vec![generation_diagnostic(error)];
+                            self.operations.insert(AuthoringOperation::Generate);
+                            self.status = format!(
+                                "Repairing malformed generated candidate ({}/{MAX_GENERATION_REPAIR_ATTEMPTS})",
+                                self.generation_repair_attempts
+                            );
+                        }
+                        Err(error) => {
+                            self.status = format!(
+                                "Generated candidate rejected after bounded repairs: {error}"
+                            );
+                        }
+                    }
+                }
+                AuthoringAsyncResult::Generate(Err(error)) => {
+                    self.operations.remove(&AuthoringOperation::Generating);
+                    self.status = format!("Workflow generation failed: {error}");
+                }
+                AuthoringAsyncResult::AcceptGenerated(Ok(
+                    PluginWorkflowGeneratedCandidateAcceptance::Created(draft)
+                    | PluginWorkflowGeneratedCandidateAcceptance::Updated(draft),
+                )) => {
+                    self.operations
+                        .remove(&AuthoringOperation::AcceptingGenerated);
+                    self.generated_candidate = None;
+                    self.install_draft(*draft);
+                    self.status = "Accepted generated candidate as a mutable draft; publication remains a separate explicit action".to_string();
+                }
+                AuthoringAsyncResult::AcceptGenerated(Ok(
+                    PluginWorkflowGeneratedCandidateAcceptance::Conflict {
+                        expected_generation,
+                        current_generation,
+                    },
+                )) => {
+                    self.operations
+                        .remove(&AuthoringOperation::AcceptingGenerated);
+                    self.status = format!(
+                        "Generated candidate conflict: expected generation {expected_generation}, current {current_generation}; reload and review again"
+                    );
+                }
+                AuthoringAsyncResult::AcceptGenerated(Ok(
+                    PluginWorkflowGeneratedCandidateAcceptance::Rejected { diagnostics },
+                )) => {
+                    self.operations
+                        .remove(&AuthoringOperation::AcceptingGenerated);
+                    self.diagnostics = diagnostics;
+                    self.status =
+                        "Generated candidate acceptance was rejected with diagnostics".to_string();
+                }
+                AuthoringAsyncResult::AcceptGenerated(Err(error)) => {
+                    self.operations
+                        .remove(&AuthoringOperation::AcceptingGenerated);
+                    self.status = format!("Generated candidate acceptance failed: {error}");
+                }
+                AuthoringAsyncResult::Instantiate(Ok(draft)) => {
+                    self.operations.remove(&AuthoringOperation::Instantiating);
+                    self.install_draft(*draft);
+                    self.status =
+                        "Template instantiated; edit the mutable draft through semantic operations"
+                            .to_string();
+                }
+                AuthoringAsyncResult::Instantiate(Err(error)) => {
+                    self.operations.remove(&AuthoringOperation::Instantiating);
+                    self.status = format!("Template instantiation failed: {error}");
+                }
                 AuthoringAsyncResult::Publish(Ok(
                     PluginWorkflowAuthoringPublishResult::Published { revision, .. },
                 )) => {
@@ -1558,6 +1935,138 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
             PluginTuiAction::None
         }
     }
+}
+
+fn workflow_authoring_document_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "schema_version", "workflow_id", "metadata", "configuration_schema",
+            "definition", "requirements", "run_limits", "producer"
+        ],
+        "properties": {
+            "schema_version": {"type": "integer"},
+            "workflow_id": {"type": "string"},
+            "metadata": {"type": "object"},
+            "configuration_schema": {"type": "object"},
+            "configuration_defaults": {},
+            "plugin_input_defaults": {"type": "object"},
+            "definition": {"type": "object"},
+            "bindings": {"type": "array"},
+            "requirements": {"type": "object"},
+            "run_limits": {"type": "object"},
+            "producer": {"type": "object"},
+            "presentation": {"type": ["object", "null"]}
+        }
+    })
+}
+
+fn generation_request(
+    prompt: &str,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+    existing: Option<&WorkflowAuthoringDocument>,
+    diagnostics: &[WorkflowValidationDiagnostic],
+    output_schema: serde_json::Value,
+) -> PluginStructuredGenerationRequest {
+    let task = if existing.is_some() {
+        "Revise the existing workflow according to the request while preserving unrelated reviewed semantics."
+    } else {
+        "Create a new portable workflow authoring document matching the request."
+    };
+    PluginStructuredGenerationRequest {
+        session_name: "Workflow draft generation".to_string(),
+        system_prompt: format!(
+            "You are the bcode.workflow draft generator. {task} Return only one WorkflowAuthoringDocument. Use only identities and contracts present in the supplied bounded portable catalog. Do not publish, activate, start, grant permissions, include secrets, invent plugin contracts, or access external/private APIs. Generated provenance must be {{\"kind\":\"generated\",\"producer_id\":\"bcode.workflow.prompt\"}}."
+        ),
+        prompt: serde_json::json!({
+            "request": prompt,
+            "portable_catalog": catalog,
+            "existing_document": existing,
+            "diagnostics_from_previous_attempt": diagnostics,
+        })
+        .to_string(),
+        output_name: "workflow_authoring_document".to_string(),
+        output_schema,
+        timeout_ms: GENERATION_TIMEOUT_MS,
+    }
+}
+
+fn decode_generated_candidate(
+    value: serde_json::Value,
+    catalog: Option<&WorkflowAuthoringCatalogSnapshot>,
+) -> Result<(WorkflowAuthoringDocument, WorkflowCompilationPreview), String> {
+    let catalog = catalog.ok_or_else(|| "portable authoring catalog is unavailable".to_string())?;
+    let document: WorkflowAuthoringDocument =
+        serde_json::from_value(value).map_err(|error| error.to_string())?;
+    if document.producer.kind != WorkflowProducerKind::Generated {
+        return Err("generated candidate must retain generated provenance".to_string());
+    }
+    let preview = document.compilation_preview(catalog, document.configuration_defaults.as_ref());
+    Ok((document, preview))
+}
+
+fn generation_diagnostic(message: String) -> WorkflowValidationDiagnostic {
+    WorkflowValidationDiagnostic {
+        code: "generated_candidate_malformed".to_string(),
+        severity: bcode_workflow::WorkflowValidationSeverity::Error,
+        document_path: String::new(),
+        message,
+        remediation: "Return one complete standard WorkflowAuthoringDocument using only the supplied portable catalog".to_string(),
+    }
+}
+
+fn generated_candidate_lines(candidate: &GeneratedWorkflowCandidate) -> Vec<String> {
+    let preview = &candidate.preview;
+    let mut lines = vec![
+        format!("Candidate: {}", candidate.document.metadata.title),
+        format!("  diagnostics={}", preview.validation.diagnostics.len()),
+    ];
+    if let Some(compiled) = &preview.compiled {
+        lines.push(format!(
+            "  capability={:?} · effects={:?}",
+            compiled.effects.maximum_capability, compiled.effects.block_effects
+        ));
+        lines.push(format!(
+            "  resources={} · grants={} · approvals={}",
+            compiled.effects.resources.len(),
+            compiled.permissions.explicit_grant_nodes.len(),
+            compiled.permissions.mutation_approval_nodes.len()
+        ));
+    }
+    lines
+}
+
+fn template_identity(options: &serde_json::Value) -> Option<TemplateIdentity> {
+    let template = options.get("template")?;
+    let contribution = template.get("template")?;
+    Some(TemplateIdentity {
+        owner_plugin_id: template.get("owner_plugin_id")?.as_str()?.to_string(),
+        template_id: contribution.get("template_id")?.as_str()?.to_string(),
+        template_version: u32::try_from(contribution.get("template_version")?.as_u64()?).ok()?,
+    })
+}
+
+fn unique_authored_workflow_id(source: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let base = source
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("{base}-{timestamp:x}-{sequence:x}")
 }
 
 fn authoring_document(options: &serde_json::Value) -> Option<WorkflowAuthoringDocument> {
@@ -3263,6 +3772,115 @@ mod tests {
             kind: PaletteEntryKind::NodeKind,
         };
         assert!(add_node(&editor_document, &agent, &catalog).is_err());
+    }
+
+    #[test]
+    fn prompt_generation_is_bounded_catalog_only_and_review_gated() {
+        let catalog = WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: BTreeSet::new(),
+            blocks: BTreeMap::new(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: BTreeMap::new(),
+            agent_profiles: BTreeSet::new(),
+            skills: BTreeSet::new(),
+        };
+        let request = generation_request(
+            "create a safe approval workflow",
+            &catalog,
+            Some(&document()),
+            &[generation_diagnostic("repair this".to_string())],
+            workflow_authoring_document_schema(),
+        );
+        assert!(
+            request
+                .system_prompt
+                .contains("supplied bounded portable catalog")
+        );
+        assert!(
+            request
+                .system_prompt
+                .contains("Do not publish, activate, start")
+        );
+        assert!(request.prompt.contains("existing_document"));
+        assert!(request.prompt.contains("diagnostics_from_previous_attempt"));
+        assert_eq!(request.timeout_ms, GENERATION_TIMEOUT_MS);
+
+        let mut generated = document();
+        generated.producer = WorkflowProducerProvenance {
+            kind: WorkflowProducerKind::Generated,
+            producer_id: Some("bcode.workflow.prompt".to_string()),
+            source_revision: None,
+        };
+        let (_, preview) = decode_generated_candidate(
+            serde_json::to_value(generated).expect("candidate"),
+            Some(&catalog),
+        )
+        .expect("generated candidate");
+        assert!(preview.validation.valid);
+
+        let mut surface = WorkflowAuthorSurface::new(&serde_json::json!({
+            "template": {"authoring_document": document()}
+        }));
+        surface.install_catalog(catalog);
+        surface.generated_candidate = Some(GeneratedWorkflowCandidate {
+            prompt: "create a safe approval workflow".to_string(),
+            document: document(),
+            preview,
+            repair_attempts: MAX_GENERATION_REPAIR_ATTEMPTS,
+        });
+        assert!(surface.published_revision.is_none());
+        assert!(!surface.operations.contains(&AuthoringOperation::Publish));
+        assert!(!surface.operations.contains(&AuthoringOperation::Start));
+        surface.accept_generated_candidate();
+        assert!(
+            surface
+                .operations
+                .contains(&AuthoringOperation::AcceptGenerated)
+        );
+        assert!(!surface.operations.contains(&AuthoringOperation::Publish));
+        assert!(!surface.operations.contains(&AuthoringOperation::Start));
+    }
+
+    #[test]
+    fn generated_candidates_require_generated_provenance_and_portable_contracts() {
+        let catalog = WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: BTreeSet::new(),
+            blocks: BTreeMap::new(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: BTreeMap::new(),
+            agent_profiles: BTreeSet::new(),
+            skills: BTreeSet::new(),
+        };
+        assert!(decode_generated_candidate(serde_json::json!({}), Some(&catalog)).is_err());
+        assert!(
+            decode_generated_candidate(
+                serde_json::to_value(document()).expect("human candidate"),
+                Some(&catalog)
+            )
+            .is_err()
+        );
+        let mut secret = document();
+        secret.producer.kind = WorkflowProducerKind::Generated;
+        secret
+            .definition
+            .nodes
+            .get_mut("first")
+            .expect("node")
+            .configuration["client_secret"] = serde_json::json!("not allowed");
+        let (_, preview) = decode_generated_candidate(
+            serde_json::to_value(secret).expect("secret candidate"),
+            Some(&catalog),
+        )
+        .expect("decoded candidate");
+        assert!(!preview.validation.valid);
     }
 
     #[test]

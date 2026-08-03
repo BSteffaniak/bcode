@@ -15853,6 +15853,7 @@ async fn handle_describe_workflow_definition(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn workflow_run_inspection(
     state: &ServerState,
     run_id: &str,
@@ -15861,6 +15862,7 @@ async fn workflow_run_inspection(
     let (
         run,
         definition,
+        terminal_output,
         activations,
         waits,
         mutation_approvals,
@@ -15889,6 +15891,23 @@ async fn workflow_run_inspection(
                     run.definition_id, run.definition_version
                 ))
             })?;
+        let terminal_output = store.canonical_terminal_output(run_id)?.map(|output| {
+            bcode_ipc::WorkflowTerminalOutputInspection {
+                version: bcode_ipc::WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION,
+                checksum_sha256: run
+                    .terminal_output_checksum_sha256
+                    .clone()
+                    .expect("canonical terminal output has a checksum"),
+                output_id: output.output_id,
+                node_id: output.node_id,
+                activation_id: output.activation_id,
+                schema_id: output.schema_id,
+                schema_version: output.schema_version,
+                value: output.value,
+                artifact_reference: output.artifact_reference,
+                created_at_ms: output.created_at_ms,
+            }
+        });
         let descendant_runs = store.descendant_run_summaries(run_id, limit)?;
         let mut repeat_outcomes = store.repeat_outcomes(run_id, limit)?;
         for descendant in &descendant_runs {
@@ -15901,6 +15920,7 @@ async fn workflow_run_inspection(
         (
             run,
             definition,
+            terminal_output,
             store.activations_for_run(run_id, limit)?,
             store.waiting_activations(run_id, limit)?,
             store.pending_mutation_approvals(run_id, limit)?,
@@ -15931,6 +15951,7 @@ async fn workflow_run_inspection(
     Ok(bcode_ipc::WorkflowRunInspection {
         run,
         definition,
+        terminal_output,
         activations,
         waits,
         mutation_approvals,
@@ -16314,7 +16335,7 @@ async fn handle_list_workflow_waits(
 #[allow(clippy::too_many_arguments)]
 async fn handle_provide_workflow_input(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     run_id: String,
     node_id: String,
@@ -16333,6 +16354,7 @@ async fn handle_provide_workflow_input(
             value,
             current_unix_millis(),
         )?;
+    drive_workflow_run_and_parents(state, &run_id).await?;
     state.metrics.record_histogram(
         "workflow.input.wait_resolution.duration_ms",
         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -43995,6 +44017,96 @@ library = "test"
         ));
     }
 
+    #[tokio::test]
+    async fn approved_progress_document_creation_crosses_plugin_boundary() {
+        let workspace = tempfile::tempdir().expect("progress workspace");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(
+            tempfile::tempdir().expect("workflow root").path(),
+        )
+        .expect("workflow store");
+        let mut state = test_server_state(SessionManager::default());
+        state.workflow_store = StdMutex::new(store);
+        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &[bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/progress-doc-plugin/bcode-plugin.toml"),
+                bcode_progress_doc_plugin::static_plugin(),
+            )],
+        )
+        .expect("progress plugin host");
+        let content = "# Approved plan\n\n- [ ] Deliver safely\n";
+        let desired_sha256 = {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(content.as_bytes()))
+        };
+        let result: serde_json::Value = state
+            .plugins
+            .invoke_service_json(
+                "bcode.progress-doc",
+                bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+                "progress-doc.create",
+                &bcode_workflow::WorkflowBlockInvocation {
+                    version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                    dispatch_identity: "approved-progress-create".to_string(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    input: serde_json::json!({
+                        "version": 1,
+                        "path": "local-approved-progress.md",
+                        "expected_absent": true,
+                        "expected_sha256": null,
+                        "desired_content": content,
+                        "desired_sha256": desired_sha256,
+                        "approval_provenance": "interaction:approved-progress-1"
+                    }),
+                },
+            )
+            .await
+            .expect("create approved progress document");
+        assert_eq!(result["operation"], "created");
+        assert_eq!(result["content_sha256"], desired_sha256);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("local-approved-progress.md"))
+                .expect("progress content"),
+            content
+        );
+        let replacement = "# Refocused approved plan\n\n- [ ] Continue safely\n";
+        let replacement_sha256 = {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(replacement.as_bytes()))
+        };
+        let replaced: serde_json::Value = state
+            .plugins
+            .invoke_service_json(
+                "bcode.progress-doc",
+                bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+                "progress-doc.replace",
+                &bcode_workflow::WorkflowBlockInvocation {
+                    version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                    dispatch_identity: "approved-progress-refocus".to_string(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    input: serde_json::json!({
+                        "version": 1,
+                        "path": "local-approved-progress.md",
+                        "expected_absent": false,
+                        "expected_sha256": desired_sha256,
+                        "desired_content": replacement,
+                        "desired_sha256": replacement_sha256,
+                        "approval_provenance": "interaction:approved-refocus-1"
+                    }),
+                },
+            )
+            .await
+            .expect("replace approved progress document");
+        assert_eq!(replaced["operation"], "replaced");
+        assert_eq!(replaced["previous_sha256"], desired_sha256);
+        assert_eq!(replaced["content_sha256"], replacement_sha256);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("local-approved-progress.md"))
+                .expect("refocused progress content"),
+            replacement
+        );
+    }
+
     #[test]
     fn progress_document_approval_requires_exact_interaction_provenance() {
         let scope = |provenance: Option<&str>| bcode_workflow::WorkflowMutationGrantScope {
@@ -48235,104 +48347,114 @@ library = "test"
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn permission_resolution_crosses_real_ipc_and_persists_resolution() {
-        let workspace = tempfile::tempdir().expect("permission IPC workspace");
-        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
-            .expect("persistent session manager");
-        let session = sessions
-            .create_session(
-                Some("permission IPC".to_owned()),
-                workspace.path().to_path_buf(),
-            )
-            .await
-            .expect("session");
-        let session_id = session.id;
-        sessions
-            .append_permission_requested(
-                session_id,
-                SessionEventKind::PermissionRequested {
-                    permission_id: "permission-ipc".to_owned(),
-                    tool_call_id: "call-ipc".to_owned(),
-                    producer_plugin_id: Some("test.plugin".to_owned()),
-                    tool_name: "test.tool".to_owned(),
-                    arguments_json: "{}".to_owned(),
-                    batch: None,
-                    policy_source: None,
-                    policy_reason: None,
-                },
-            )
-            .await
-            .expect("permission requested event");
-        let state = Arc::new(test_server_state(sessions));
-        let pending = PendingPermission {
-            summary: PermissionSummary {
-                permission_id: "permission-ipc".to_owned(),
-                session_id,
-                tool_call_id: "call-ipc".to_owned(),
-                tool_name: "test.tool".to_owned(),
-                arguments_json: "{}".to_owned(),
-                batch: None,
-                agent_id: "build".to_owned(),
-                policy_source: None,
-                policy_reason: None,
-                can_remember_policy: false,
-            },
-            decision: Arc::new(Mutex::new(None)),
-            notify: Arc::new(Notify::new()),
-            skill_decision_key: None,
-        };
-        state
-            .pending_permissions
-            .lock()
-            .await
-            .insert("permission-ipc".to_owned(), pending);
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn permission_resolution_crosses_real_ipc_and_persists_resolution() {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(8 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("permission IPC runtime")
+            .block_on(async {
+                let workspace = tempfile::tempdir().expect("permission IPC workspace");
+                let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+                    .expect("persistent session manager");
+                let session = sessions
+                    .create_session(
+                        Some("permission IPC".to_owned()),
+                        workspace.path().to_path_buf(),
+                    )
+                    .await
+                    .expect("session");
+                let session_id = session.id;
+                sessions
+                    .append_permission_requested(
+                        session_id,
+                        SessionEventKind::PermissionRequested {
+                            permission_id: "permission-ipc".to_owned(),
+                            tool_call_id: "call-ipc".to_owned(),
+                            producer_plugin_id: Some("test.plugin".to_owned()),
+                            tool_name: "test.tool".to_owned(),
+                            arguments_json: "{}".to_owned(),
+                            batch: None,
+                            policy_source: None,
+                            policy_reason: None,
+                        },
+                    )
+                    .await
+                    .expect("permission requested event");
+                let state = Arc::new(test_server_state(sessions));
+                let pending = PendingPermission {
+                    summary: PermissionSummary {
+                        permission_id: "permission-ipc".to_owned(),
+                        session_id,
+                        tool_call_id: "call-ipc".to_owned(),
+                        tool_name: "test.tool".to_owned(),
+                        arguments_json: "{}".to_owned(),
+                        batch: None,
+                        agent_id: "build".to_owned(),
+                        policy_source: None,
+                        policy_reason: None,
+                        can_remember_policy: false,
+                    },
+                    decision: Arc::new(Mutex::new(None)),
+                    notify: Arc::new(Notify::new()),
+                    skill_decision_key: None,
+                };
+                state
+                    .pending_permissions
+                    .lock()
+                    .await
+                    .insert("permission-ipc".to_owned(), pending);
 
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
-        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
-        let server_state = Arc::clone(&state);
-        let server = tokio::spawn(async move {
-            loop {
-                let stream = listener.accept().await.expect("client connection");
-                let state = Arc::clone(&server_state);
-                tokio::spawn(async move {
-                    handle_client(stream, state).await.expect("handle client");
+                let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+                let endpoint =
+                    bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+                let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+                let server_state = Arc::clone(&state);
+                let server = tokio::spawn(async move {
+                    loop {
+                        let stream = listener.accept().await.expect("client connection");
+                        let state = Arc::clone(&server_state);
+                        tokio::spawn(async move {
+                            handle_client(stream, state).await.expect("handle client");
+                        });
+                    }
                 });
-            }
-        });
-        let client = bcode_client::BcodeClient::new(endpoint);
-        let permissions = client.list_permissions().await.expect("list permissions");
-        assert_eq!(permissions.len(), 1);
-        assert_eq!(permissions[0].permission_id, "permission-ipc");
-        assert!(
-            client
-                .resolve_permission("permission-ipc".to_owned(), true)
-                .await
-                .expect("resolve permission")
-        );
-        assert!(
-            client
-                .list_permissions()
-                .await
-                .expect("list resolved")
-                .is_empty()
-        );
-        let history = state
-            .sessions
-            .session_history(session_id)
-            .await
-            .expect("permission history");
-        let snapshot = bcode_session_view::build_session_view_snapshot(&history);
-        assert!(snapshot.permissions.is_empty());
-        assert!(snapshot.transcript.items.iter().any(|item| matches!(
-            &item.kind,
-            bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
-                if permission.permission_id == "permission-ipc"
-                    && permission.resolved
-                    && permission.approved == Some(true)
-        )));
-        server.abort();
+                let client = bcode_client::BcodeClient::new(endpoint);
+                let permissions = client.list_permissions().await.expect("list permissions");
+                assert_eq!(permissions.len(), 1);
+                assert_eq!(permissions[0].permission_id, "permission-ipc");
+                assert!(
+                    client
+                        .resolve_permission("permission-ipc".to_owned(), true)
+                        .await
+                        .expect("resolve permission")
+                );
+                assert!(
+                    client
+                        .list_permissions()
+                        .await
+                        .expect("list resolved")
+                        .is_empty()
+                );
+                let history = state
+                    .sessions
+                    .session_history(session_id)
+                    .await
+                    .expect("permission history");
+                let snapshot = bcode_session_view::build_session_view_snapshot(&history);
+                assert!(snapshot.permissions.is_empty());
+                assert!(snapshot.transcript.items.iter().any(|item| matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
+                        if permission.permission_id == "permission-ipc"
+                            && permission.resolved
+                            && permission.approved == Some(true)
+                )));
+                server.abort();
+            });
     }
 
     #[cfg(unix)]
@@ -52181,6 +52303,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn git_commit_workflow_block_requires_exact_grant_and_completes() {
+        let _workflow_runtime_guard = WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
         let repository = tempfile::tempdir().expect("repository");
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -52248,6 +52371,47 @@ event_symbol = "bcode_plugin_handle_event_v1"
             exits: vec!["git.commit".to_string()],
             edges: Vec::new(),
         };
+        let preparation_store = bcode_workflow_store::WorkflowStore::open_in_state_dir(
+            tempfile::tempdir()
+                .expect("preparation workflow root")
+                .path(),
+        )
+        .expect("preparation store");
+        let preparation_state = test_server_state_with_git_and_workflow_store(
+            SessionManager::default(),
+            preparation_store,
+        );
+        let preparation: bcode_git_plugin::PrepareResponse = preparation_state
+            .plugins
+            .invoke_service_json(
+                "bcode.git",
+                bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+                "git.prepare",
+                &bcode_workflow::WorkflowBlockInvocation {
+                    version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                    dispatch_identity: "prepare-exact-commit".to_string(),
+                    workspace_root: repository.path().to_path_buf(),
+                    input: serde_json::json!({
+                        "include_prefixes": ["tracked.txt"],
+                        "exclude_prefixes": [],
+                        "progress_document_path": null,
+                        "project_instruction_fingerprint_sha256": "0".repeat(64),
+                        "max_paths": 10,
+                    }),
+                },
+            )
+            .await
+            .expect("prepare exact commit");
+        let commit_request = bcode_git_plugin::CommitRequest {
+            repo_path: preparation.repository_root,
+            expected_head: preparation.head,
+            expected_repository_identity_sha256: preparation.repository_identity_sha256,
+            expected_snapshot_sha256: preparation.repository_snapshot_sha256,
+            manifest: preparation.manifest,
+            title: "workflow commit".to_string(),
+            description: String::new(),
+            paths: vec![PathBuf::from("tracked.txt")],
+        };
         store
             .persist_definition("git-commit", 1, &definition)
             .expect("definition");
@@ -52260,12 +52424,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 parent_session_id: Some(parent.id.to_string()),
                 binding: None,
                 authored_provenance: None,
-                input: Some(serde_json::json!({
-                    "repo_path": repository.path(),
-                    "expected_head": head,
-                    "message": "workflow commit",
-                    "paths": ["tracked.txt"],
-                })),
+                input: Some(serde_json::to_value(&commit_request).expect("commit request")),
                 created_at_ms: 1,
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -52977,7 +53136,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &[bcode_plugin::StaticBundledPlugin::new(
                 include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
                 bcode_workflow_plugin::static_plugin(),
-            )],
+            )
+            .with_package_root(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../plugins/workflow-plugin"
+            ))],
         )
         .expect("workflow plugin host");
         let roots = workflow_plugin_skill_roots(&host);
@@ -53004,7 +53167,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &[bcode_plugin::StaticBundledPlugin::new(
                 include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
                 bcode_workflow_plugin::static_plugin(),
-            )],
+            )
+            .with_package_root(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../plugins/workflow-plugin"
+            ))],
         )
         .expect("disabled workflow plugin host");
         assert!(workflow_plugin_skill_roots(&disabled).is_empty());
@@ -53979,6 +54146,173 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_ipc::decode_response(&response.payload).expect("decode ping"),
             Response::Ok(ResponsePayload::Pong)
         ));
+        drop(stream);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn providing_input_drives_the_waiting_workflow_to_completion() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("input wake".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "boolean".to_string(),
+            schema: serde_json::json!({"type": "boolean"}),
+        };
+        store
+            .persist_definition(
+                "input-wake",
+                1,
+                &bcode_workflow::WorkflowDefinition {
+                    schema_version: 1,
+                    name: "input-wake".to_string(),
+                    input: schema.clone(),
+                    output: schema.clone(),
+                    nodes: BTreeMap::from([
+                        (
+                            "wait".to_string(),
+                            bcode_workflow::NodeDefinition {
+                                id: "wait".to_string(),
+                                name: "wait".to_string(),
+                                kind: bcode_workflow::NodeKind::Input,
+                                dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                                input: schema.clone(),
+                                output: schema.clone(),
+                                resources: Vec::new(),
+                                configuration: serde_json::json!({}),
+                            },
+                        ),
+                        (
+                            "terminal".to_string(),
+                            bcode_workflow::NodeDefinition {
+                                id: "terminal".to_string(),
+                                name: "terminal".to_string(),
+                                kind: bcode_workflow::NodeKind::Branch,
+                                dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                                input: schema.clone(),
+                                output: schema.clone(),
+                                resources: Vec::new(),
+                                configuration: serde_json::json!({
+                                    "predicate_version": 1,
+                                    "predicate": {
+                                        "version": 1,
+                                        "operation": "equals",
+                                        "path": "",
+                                        "value": true
+                                    },
+                                    "true_entries": [],
+                                    "false_entries": [],
+                                    "true_nodes": [],
+                                    "false_nodes": []
+                                }),
+                            },
+                        ),
+                    ]),
+                    entries: vec!["wait".to_string()],
+                    exits: vec!["terminal".to_string()],
+                    edges: vec![bcode_workflow::EdgeDefinition {
+                        from: "wait".to_string(),
+                        to: "terminal".to_string(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                        transform: None,
+                    }],
+                },
+            )
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "input-wake-run".to_string(),
+                definition_id: "input-wake".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(session.id.to_string()),
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(true)),
+                created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+        drive_workflow_run(&state, "input-wake-run")
+            .await
+            .expect("drive to input wait");
+        let wait = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiting_activations("input-wake-run", 10)
+            .expect("waits")
+            .into_iter()
+            .next()
+            .expect("input wait");
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("client connection");
+            handle_client(stream, server_state)
+                .await
+                .expect("handle client");
+        });
+        let mut stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        let provide = bcode_ipc::request_envelope(
+            1,
+            &Request::ProvideWorkflowInput {
+                run_id: "input-wake-run".to_string(),
+                node_id: "wait".to_string(),
+                activation_id: wait.activation_id,
+                value: serde_json::json!(true),
+            },
+        )
+        .expect("provide request");
+        bcode_ipc::send_envelope(&mut stream, &provide)
+            .await
+            .expect("send input");
+        let response = bcode_ipc::recv_envelope(&mut stream)
+            .await
+            .expect("input response");
+        let response = bcode_ipc::decode_response(&response.payload).expect("decode response");
+        assert!(
+            matches!(
+                response,
+                Response::Ok(ResponsePayload::WorkflowWaitResolved { .. })
+            ),
+            "unexpected input response: {response:?}"
+        );
+        let run = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .run_summary("input-wake-run")
+            .expect("run summary")
+            .expect("run");
+        assert_eq!(run.status, bcode_workflow_store::RunStatus::Completed);
+        let inspection = workflow_run_inspection(&state, "input-wake-run", 10)
+            .await
+            .expect("inspection");
+        let terminal = inspection.terminal_output.expect("terminal output");
+        assert_eq!(
+            run.terminal_output_id.as_deref(),
+            Some(terminal.output_id.as_str())
+        );
+        assert_eq!(
+            run.terminal_output_checksum_sha256.as_deref(),
+            Some(terminal.checksum_sha256.as_str())
+        );
+        assert_eq!(terminal.node_id, "terminal");
+        assert_eq!(terminal.value, serde_json::json!(true));
         drop(stream);
         server.await.expect("server task");
     }

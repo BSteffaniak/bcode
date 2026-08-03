@@ -168,12 +168,21 @@ if ! rg -q 'WorkflowTemplateDocumentSource' packages/plugin/src/lib.rs \
   || ! rg -q 'progress_driven_parent_pins_tranche_and_enforces_all_product_budgets' plugins/workflow-plugin/src/lib.rs \
   || ! rg -q 'local-<workflow-slug>-progress\.md' plugins/workflow-plugin/templates/progress-driven-delivery.workflow.json \
   || ! rg -q '"max_iterations":10' plugins/workflow-plugin/templates/progress-driven-delivery.workflow.json \
+  || ! rg -q '"from":"validation","to":"classify"' plugins/workflow-plugin/templates/implementation-batch.workflow.json \
+  || ! rg -q '"from":"post_format_validation","to":"classify"' plugins/workflow-plugin/templates/implementation-batch.workflow.json \
   || ! rg -q 'WorkflowDescendantRunSummary' packages/workflow-store/src/lib.rs \
   || ! rg -q 'descendant_run_summaries' packages/server/src/lib.rs \
   || ! rg -q 'Runtime-owned counters' plugins/workflow-plugin/src/tui.rs \
   || ! rg -q 'workflow_authoring_catalog' packages/plugin-sdk/src/tui.rs packages/tui/src/plugin_surface_host.rs \
   || ! rg -q 'apply_workflow_authoring_edits' packages/plugin-sdk/src/tui.rs packages/tui/src/plugin_surface_host.rs \
   || ! rg -q 'WorkflowSchemaFormDescription' plugins/workflow-plugin/src/authoring_tui.rs \
+  || ! rg -q 'PluginStructuredGenerationRequest' packages/plugin-sdk/src/tui.rs plugins/workflow-plugin/src/authoring_tui.rs \
+  || ! rg -q 'MAX_GENERATION_REPAIR_ATTEMPTS: u32 = 3' plugins/workflow-plugin/src/authoring_tui.rs \
+  || ! rg -q 'accept_generated_workflow_candidate' packages/plugin-sdk/src/tui.rs packages/tui/src/plugin_surface_host.rs \
+  || ! rg -q 'TurnToolPolicy::Disabled' packages/tui/src/plugin_surface_host.rs \
+  || ! rg -q 'WorkflowTerminalOutputInspection' packages/ipc/src/lib.rs packages/server/src/lib.rs \
+  || ! rg -q 'drive_workflow_run_and_parents\(state, &run_id\)' packages/server/src/lib.rs \
+  || ! rg -q 'later_options\["terminal_output"\]' scripts/release-flagship-workflow-lifecycle.sh \
   || ! rg -q 'WorkflowAuthoringDocument' plugins/workflow-plugin/src/authoring_tui.rs \
   || ! rg -q 'flagship_restart_preserves_wait_approval_repeat_and_composed_status' packages/workflow-store/src/lib.rs \
   || ! rg -q 'durable_input_gate_waits_validates_and_activates_successor' packages/workflow-store/src/lib.rs \

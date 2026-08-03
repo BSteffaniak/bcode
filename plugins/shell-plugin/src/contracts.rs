@@ -100,10 +100,8 @@ pub struct ShellWorkflowCommandResult {
     pub index: u32,
     pub status: ShellWorkflowCommandStatus,
     pub exit_code: Option<i32>,
-    /// Exact accepted exit codes used to classify this command. Version 1 omits this field to
-    /// preserve its published output contract.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accepted_exit_codes: Option<Vec<i32>>,
+    /// Exact accepted exit codes used to classify this command.
+    pub accepted_exit_codes: Vec<i32>,
     pub signal: Option<i32>,
     pub duration_ms: u64,
     pub stdout_preview: String,
@@ -276,7 +274,7 @@ mod tests {
                 index: 0,
                 status: ShellWorkflowCommandStatus::Exited,
                 exit_code: Some(1),
-                accepted_exit_codes: Some(vec![0]),
+                accepted_exit_codes: vec![0],
                 signal: None,
                 duration_ms: 12,
                 stdout_preview: String::new(),

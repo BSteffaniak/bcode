@@ -396,8 +396,15 @@ type = "boolean"
 
 [workflow_templates.configuration_schema.schema.properties.commit_result]
 additionalProperties = false
-required             = ["previous_head", "commit_hash", "paths"]
-type                 = ["object", "null"]
+required = [
+    "previous_head",
+    "commit_hash",
+    "repository_snapshot_sha256",
+    "committed_tree",
+    "paths",
+    "committed_objects",
+]
+type = ["object", "null"]
 
 [workflow_templates.configuration_schema.schema.properties.commit_result.properties.previous_head]
 type = "string"
@@ -405,11 +412,23 @@ type = "string"
 [workflow_templates.configuration_schema.schema.properties.commit_result.properties.commit_hash]
 type = "string"
 
+[workflow_templates.configuration_schema.schema.properties.commit_result.properties.repository_snapshot_sha256]
+pattern = "^[0-9a-f]{64}$"
+type    = "string"
+
+[workflow_templates.configuration_schema.schema.properties.commit_result.properties.committed_tree]
+type = "string"
+
 [workflow_templates.configuration_schema.schema.properties.commit_result.properties.paths]
 items       = { type = "string" }
 maxItems    = 10000
 type        = "array"
 uniqueItems = true
+
+[workflow_templates.configuration_schema.schema.properties.commit_result.properties.committed_objects]
+items    = { type = "object" }
+maxItems = 10000
+type     = "array"
 
 [[workflow_templates.compilation_bindings]]
 configuration_path = "commit_message_skill"
@@ -423,24 +442,8 @@ to   = "git_compose"
 
 [workflow_templates.compilation_bindings.absent_fallback_edge.transform]
 expression = { operation = "object", fields = { preparation = { operation = "input", source = "current", path = "" }, message = { operation = "object", fields = { title = { operation = "constant", value = "Implement verified workflow changes" }, description = { operation = "input", source = "state", path = "implementation_prompt" } } }, no_changes = { operation = "constant", value = "no_op" } } }
-output = { type_name = "bcode.git.compose-commit-request/v1", schema = { type = "object", additionalProperties = false, required = [
-    "preparation",
-    "message",
-    "no_changes",
-], properties = { preparation = { type = "object", additionalProperties = false, required = [
-    "repository_root",
-    "head",
-    "changed_paths",
-], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
-    "path",
-    "status",
-], properties = { path = { type = "string" }, status = { type = "string" } } } } } }, message = { type = "object", additionalProperties = false, required = [
-    "title",
-    "description",
-], properties = { title = { type = "string", minLength = 1, maxLength = 256 }, description = { type = "string", maxLength = 7935 } } }, no_changes = { enum = [
-    "fail",
-    "no_op",
-] } } } }
+output     = { type_name = "bcode.git.compose-commit-request/v1", schema = { type = "object", maxProperties = 8 } }
+
 version = 1
 
 [workflow_templates.definition]
@@ -475,9 +478,13 @@ edges = [
     ] } } } },
     { from = "commit_policy", to = "git_prepare", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "", value = "disabled" }, expected = false }, transform = { version = 1, expression = { operation = "constant", value = { include_prefixes = [
     ], exclude_prefixes = [
-    ], max_paths = 10000 } }, output = { type_name = "bcode.git.prepare-request/v1", schema = { type = "object", additionalProperties = false, required = [
+    ], project_instruction_fingerprint_sha256 = "0000000000000000000000000000000000000000000000000000000000000000", max_paths = 10000 } }, output = { type_name = "bcode.git.prepare-request/v1", schema = { type = "object", additionalProperties = false, required = [
         "max_paths",
-    ], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } } } } },
+        "project_instruction_fingerprint_sha256",
+    ], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, progress_document_path = { type = [
+        "string",
+        "null",
+    ], maxLength = 4096 }, project_instruction_fingerprint_sha256 = { type = "string", pattern = "^[0-9a-fA-F]{64}$" }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } } } } },
     { from = "git_prepare", to = "commit_message", kind = { kind = "direct" }, transform = { version = 1, expression = { operation = "object", fields = { version = { operation = "constant", value = 1 }, repository_root = { operation = "input", source = "current", path = "repository_root" }, expected_head = { operation = "input", source = "current", path = "head" }, paths = { operation = "input", source = "current", path = "changed_paths" } } }, output = { type_name = "bcode.workflow.commit-message-request/v1", schema = { type = "object", additionalProperties = false, required = [
         "version",
         "repository_root",
@@ -487,31 +494,18 @@ edges = [
         "path",
         "status",
     ], properties = { path = { type = "string", minLength = 1, maxLength = 4096 }, status = { type = "string" } } } } } } } } },
-    { from = "commit_message", to = "git_compose", kind = { kind = "direct" }, transform = { version = 1, expression = { operation = "object", fields = { preparation = { operation = "object", fields = { repository_root = { operation = "input", source = "current", path = "repository_root" }, head = { operation = "input", source = "current", path = "expected_head" }, changed_paths = { operation = "input", source = "current", path = "paths" } } }, message = { operation = "object", fields = { title = { operation = "input", source = "current", path = "title" }, description = { operation = "input", source = "current", path = "description" } } }, no_changes = { operation = "constant", value = "no_op" } } }, output = { type_name = "bcode.git.compose-commit-request/v1", schema = { type = "object", additionalProperties = false, required = [
-        "preparation",
-        "message",
-        "no_changes",
-    ], properties = { preparation = { type = "object", additionalProperties = false, required = [
-        "repository_root",
-        "head",
-        "changed_paths",
-    ], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
-        "path",
-        "status",
-    ], properties = { path = { type = "string" }, status = { type = "string" } } } } } }, message = { type = "object", additionalProperties = false, required = [
-        "title",
-        "description",
-    ], properties = { title = { type = "string", minLength = 1, maxLength = 256 }, description = { type = "string", maxLength = 7935 } } }, no_changes = { enum = [
-        "fail",
-        "no_op",
-    ] } } } } } },
+    { from = "commit_message", to = "git_compose", kind = { kind = "direct" }, transform = { version = 1, expression = { operation = "object", fields = { preparation = { operation = "object", fields = { repository_root = { operation = "input", source = "current", path = "repository_root" }, head = { operation = "input", source = "current", path = "expected_head" }, changed_paths = { operation = "input", source = "current", path = "paths" } } }, message = { operation = "object", fields = { title = { operation = "input", source = "current", path = "title" }, description = { operation = "input", source = "current", path = "description" } } }, no_changes = { operation = "constant", value = "no_op" } } }, output = { type_name = "bcode.git.compose-commit-request/v1", schema = { type = "object", maxProperties = 8 } } } },
     { from = "git_compose", to = "commit_decision", kind = { kind = "direct" } },
     { from = "commit_decision", to = "git_commit", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "status", value = "ready" }, expected = true }, transform = { version = 1, expression = { operation = "input", source = "current", path = "request" }, output = { type_name = "bcode.git.commit-request/v1", schema = { type = "object", required = [
         "repo_path",
         "expected_head",
-        "message",
+        "expected_repository_identity_sha256",
+        "expected_snapshot_sha256",
+        "manifest",
+        "title",
+        "description",
         "paths",
-    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } } } } },
+    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } } } } },
     { from = "commit_decision", to = "no_changes", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "status", value = "ready" }, expected = false } },
     { from = "git_commit", to = "commit_result", kind = { kind = "direct" }, transform = { version = 1, expression = { operation = "merge", conflict = "keep_last", objects = [
         { operation = "input", source = "state", path = "" },
@@ -648,14 +642,19 @@ schema = { oneOf = [
     ], properties = { status = { const = "ready" }, request = { type = "object", additionalProperties = false, required = [
         "repo_path",
         "expected_head",
-        "message",
+        "expected_repository_identity_sha256",
+        "expected_snapshot_sha256",
+        "manifest",
+        "title",
+        "description",
         "paths",
-    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
+    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
     { type = "object", additionalProperties = false, required = [
         "status",
     ], properties = { status = { const = "no_changes" } } },
 ] }
 type_name = "bcode.git.compose-commit-result/v1"
+
 
 [workflow_templates.definition.nodes.commit_decision.output]
 schema = { oneOf = [
@@ -665,14 +664,19 @@ schema = { oneOf = [
     ], properties = { status = { const = "ready" }, request = { type = "object", additionalProperties = false, required = [
         "repo_path",
         "expected_head",
-        "message",
+        "expected_repository_identity_sha256",
+        "expected_snapshot_sha256",
+        "manifest",
+        "title",
+        "description",
         "paths",
-    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
+    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
     { type = "object", additionalProperties = false, required = [
         "status",
     ], properties = { status = { const = "no_changes" } } },
 ] }
 type_name = "bcode.git.compose-commit-result/v1"
+
 
 [workflow_templates.definition.nodes.no_changes]
 configuration = { gate_version = 1 }
@@ -689,14 +693,19 @@ schema = { oneOf = [
     ], properties = { status = { const = "ready" }, request = { type = "object", additionalProperties = false, required = [
         "repo_path",
         "expected_head",
-        "message",
+        "expected_repository_identity_sha256",
+        "expected_snapshot_sha256",
+        "manifest",
+        "title",
+        "description",
         "paths",
-    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
+    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
     { type = "object", additionalProperties = false, required = [
         "status",
     ], properties = { status = { const = "no_changes" } } },
 ] }
 type_name = "bcode.git.compose-commit-result/v1"
+
 
 [workflow_templates.definition.nodes.no_changes.output]
 schema = { oneOf = [
@@ -706,14 +715,19 @@ schema = { oneOf = [
     ], properties = { status = { const = "ready" }, request = { type = "object", additionalProperties = false, required = [
         "repo_path",
         "expected_head",
-        "message",
+        "expected_repository_identity_sha256",
+        "expected_snapshot_sha256",
+        "manifest",
+        "title",
+        "description",
         "paths",
-    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
+    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
     { type = "object", additionalProperties = false, required = [
         "status",
     ], properties = { status = { const = "no_changes" } } },
 ] }
 type_name = "bcode.git.compose-commit-result/v1"
+
 
 [workflow_templates.definition.nodes.git_commit]
 id = "git_commit"
@@ -742,17 +756,24 @@ explicit_grant_required = true
 schema = { type = "object", required = [
     "repo_path",
     "expected_head",
-    "message",
+    "expected_repository_identity_sha256",
+    "expected_snapshot_sha256",
+    "manifest",
+    "title",
+    "description",
     "paths",
-], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } }
+], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } }
 type_name = "bcode.git.commit-request/v1"
 
 [workflow_templates.definition.nodes.git_commit.configuration.output]
 schema = { type = "object", required = [
     "previous_head",
     "commit_hash",
+    "repository_snapshot_sha256",
+    "committed_tree",
     "paths",
-], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, paths = { type = "array", items = { type = "string" } } } }
+    "committed_objects",
+], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, repository_snapshot_sha256 = { type = "string" }, committed_tree = { type = "string" }, paths = { type = "array", items = { type = "string" } }, committed_objects = { type = "array", items = { type = "object" } } } }
 type_name = "bcode.git.commit-result/v1"
 
 [[workflow_templates.definition.nodes.git_commit.configuration.resources]]
@@ -767,17 +788,24 @@ resource = "git-ref"
 schema = { type = "object", required = [
     "repo_path",
     "expected_head",
-    "message",
+    "expected_repository_identity_sha256",
+    "expected_snapshot_sha256",
+    "manifest",
+    "title",
+    "description",
     "paths",
-], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } }
+], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } }
 type_name = "bcode.git.commit-request/v1"
 
 [workflow_templates.definition.nodes.git_commit.output]
 schema = { type = "object", required = [
     "previous_head",
     "commit_hash",
+    "repository_snapshot_sha256",
+    "committed_tree",
     "paths",
-], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, paths = { type = "array", items = { type = "string" } } } }
+    "committed_objects",
+], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, repository_snapshot_sha256 = { type = "string" }, committed_tree = { type = "string" }, paths = { type = "array", items = { type = "string" } }, committed_objects = { type = "array", items = { type = "object" } } } }
 type_name = "bcode.git.commit-result/v1"
 
 [workflow_templates.definition.nodes.commit_message]
@@ -862,24 +890,7 @@ capability              = "read_only"
 explicit_grant_required = false
 
 [workflow_templates.definition.nodes.git_compose.configuration.input]
-schema = { type = "object", additionalProperties = false, required = [
-    "preparation",
-    "message",
-    "no_changes",
-], properties = { preparation = { type = "object", additionalProperties = false, required = [
-    "repository_root",
-    "head",
-    "changed_paths",
-], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
-    "path",
-    "status",
-], properties = { path = { type = "string" }, status = { type = "string" } } } } } }, message = { type = "object", additionalProperties = false, required = [
-    "title",
-    "description",
-], properties = { title = { type = "string", minLength = 1, maxLength = 256 }, description = { type = "string", maxLength = 7935 } } }, no_changes = { enum = [
-    "fail",
-    "no_op",
-] } } }
+schema    = { type = "object", maxProperties = 8 }
 type_name = "bcode.git.compose-commit-request/v1"
 
 [workflow_templates.definition.nodes.git_compose.configuration.output]
@@ -890,9 +901,13 @@ schema = { oneOf = [
     ], properties = { status = { const = "ready" }, request = { type = "object", additionalProperties = false, required = [
         "repo_path",
         "expected_head",
-        "message",
+        "expected_repository_identity_sha256",
+        "expected_snapshot_sha256",
+        "manifest",
+        "title",
+        "description",
         "paths",
-    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
+    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
     { type = "object", additionalProperties = false, required = [
         "status",
     ], properties = { status = { const = "no_changes" } } },
@@ -904,24 +919,7 @@ access   = "read"
 resource = "repository"
 
 [workflow_templates.definition.nodes.git_compose.input]
-schema = { type = "object", additionalProperties = false, required = [
-    "preparation",
-    "message",
-    "no_changes",
-], properties = { preparation = { type = "object", additionalProperties = false, required = [
-    "repository_root",
-    "head",
-    "changed_paths",
-], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
-    "path",
-    "status",
-], properties = { path = { type = "string" }, status = { type = "string" } } } } } }, message = { type = "object", additionalProperties = false, required = [
-    "title",
-    "description",
-], properties = { title = { type = "string", minLength = 1, maxLength = 256 }, description = { type = "string", maxLength = 7935 } } }, no_changes = { enum = [
-    "fail",
-    "no_op",
-] } } }
+schema    = { type = "object", maxProperties = 8 }
 type_name = "bcode.git.compose-commit-request/v1"
 
 [workflow_templates.definition.nodes.git_compose.output]
@@ -932,9 +930,13 @@ schema = { oneOf = [
     ], properties = { status = { const = "ready" }, request = { type = "object", additionalProperties = false, required = [
         "repo_path",
         "expected_head",
-        "message",
+        "expected_repository_identity_sha256",
+        "expected_snapshot_sha256",
+        "manifest",
+        "title",
+        "description",
         "paths",
-    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
+    ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, expected_repository_identity_sha256 = { type = "string" }, expected_snapshot_sha256 = { type = "string" }, manifest = { type = "object" }, title = { type = "string" }, description = { type = "string" }, paths = { type = "array", minItems = 1, maxItems = 10000, uniqueItems = true, items = { type = "string" } } } } } },
     { type = "object", additionalProperties = false, required = [
         "status",
     ], properties = { status = { const = "no_changes" } } },
@@ -964,18 +966,15 @@ explicit_grant_required = false
 [workflow_templates.definition.nodes.git_prepare.configuration.input]
 schema = { type = "object", additionalProperties = false, required = [
     "max_paths",
-], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } }
+    "project_instruction_fingerprint_sha256",
+], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, progress_document_path = { type = [
+    "string",
+    "null",
+], maxLength = 4096 }, project_instruction_fingerprint_sha256 = { type = "string", pattern = "^[0-9a-fA-F]{64}$" }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } }
 type_name = "bcode.git.prepare-request/v1"
 
 [workflow_templates.definition.nodes.git_prepare.configuration.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "repository_root",
-    "head",
-    "changed_paths",
-], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
-    "path",
-    "status",
-], properties = { path = { type = "string" }, status = { type = "string" } } } } } }
+schema    = { type = "object", maxProperties = 16 }
 type_name = "bcode.git.prepare-result/v1"
 
 [[workflow_templates.definition.nodes.git_prepare.configuration.resources]]
@@ -985,18 +984,15 @@ resource = "repository"
 [workflow_templates.definition.nodes.git_prepare.input]
 schema = { type = "object", additionalProperties = false, required = [
     "max_paths",
-], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } }
+    "project_instruction_fingerprint_sha256",
+], properties = { include_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, exclude_prefixes = { type = "array", maxItems = 256, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, progress_document_path = { type = [
+    "string",
+    "null",
+], maxLength = 4096 }, project_instruction_fingerprint_sha256 = { type = "string", pattern = "^[0-9a-fA-F]{64}$" }, max_paths = { type = "integer", minimum = 1, maximum = 10000 } } }
 type_name = "bcode.git.prepare-request/v1"
 
 [workflow_templates.definition.nodes.git_prepare.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "repository_root",
-    "head",
-    "changed_paths",
-], properties = { repository_root = { type = "string" }, head = { type = "string" }, changed_paths = { type = "array", maxItems = 10000, items = { type = "object", additionalProperties = false, required = [
-    "path",
-    "status",
-], properties = { path = { type = "string" }, status = { type = "string" } } } } } }
+schema    = { type = "object", maxProperties = 16 }
 type_name = "bcode.git.prepare-result/v1"
 
 [workflow_templates.definition.nodes.verification_repeat]
@@ -1014,13 +1010,15 @@ predicate_version = 1
 [workflow_templates.definition.nodes.verification_repeat.input]
 schema = { type = "object", additionalProperties = false, required = [
     "version",
+    "plan_sha256",
     "passed",
     "commands",
     "artifacts",
-], properties = { version = { const = 1 }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+], properties = { version = { const = 1 }, plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
     "index",
     "status",
     "exit_code",
+    "accepted_exit_codes",
     "signal",
     "duration_ms",
     "stdout_preview",
@@ -1035,7 +1033,7 @@ schema = { type = "object", additionalProperties = false, required = [
 ] }, exit_code = { type = [
     "integer",
     "null",
-] }, signal = { type = [
+] }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 32, uniqueItems = true, items = { type = "integer" } }, signal = { type = [
     "integer",
     "null",
 ] }, duration_ms = { type = "integer", minimum = 0 }, stdout_preview = { type = "string", maxLength = 65536 }, stderr_preview = { type = "string", maxLength = 65536 }, stdout_truncated = { type = "boolean" }, stderr_truncated = { type = "boolean" } } } }, artifacts = { type = "array", items = { type = "object", required = [
@@ -1047,16 +1045,19 @@ schema = { type = "object", additionalProperties = false, required = [
 ] } } } }
 type_name = "bcode.shell.command-plan-result/v1"
 
+
 [workflow_templates.definition.nodes.verification_repeat.output]
 schema = { type = "object", additionalProperties = false, required = [
     "version",
+    "plan_sha256",
     "passed",
     "commands",
     "artifacts",
-], properties = { version = { const = 1 }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+], properties = { version = { const = 1 }, plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
     "index",
     "status",
     "exit_code",
+    "accepted_exit_codes",
     "signal",
     "duration_ms",
     "stdout_preview",
@@ -1071,7 +1072,7 @@ schema = { type = "object", additionalProperties = false, required = [
 ] }, exit_code = { type = [
     "integer",
     "null",
-] }, signal = { type = [
+] }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 32, uniqueItems = true, items = { type = "integer" } }, signal = { type = [
     "integer",
     "null",
 ] }, duration_ms = { type = "integer", minimum = 0 }, stdout_preview = { type = "string", maxLength = 65536 }, stderr_preview = { type = "string", maxLength = 65536 }, stdout_truncated = { type = "boolean" }, stderr_truncated = { type = "boolean" } } } }, artifacts = { type = "array", items = { type = "object", required = [
@@ -1082,6 +1083,7 @@ schema = { type = "object", additionalProperties = false, required = [
     "reference_key",
 ] } } } }
 type_name = "bcode.shell.command-plan-result/v1"
+
 
 [workflow_templates.definition.nodes.verification_decision]
 id        = "verification_decision"
@@ -1100,13 +1102,15 @@ true_nodes        = ["commit_policy"]
 [workflow_templates.definition.nodes.verification_decision.input]
 schema = { type = "object", additionalProperties = false, required = [
     "version",
+    "plan_sha256",
     "passed",
     "commands",
     "artifacts",
-], properties = { version = { const = 1 }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+], properties = { version = { const = 1 }, plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
     "index",
     "status",
     "exit_code",
+    "accepted_exit_codes",
     "signal",
     "duration_ms",
     "stdout_preview",
@@ -1121,7 +1125,7 @@ schema = { type = "object", additionalProperties = false, required = [
 ] }, exit_code = { type = [
     "integer",
     "null",
-] }, signal = { type = [
+] }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 32, uniqueItems = true, items = { type = "integer" } }, signal = { type = [
     "integer",
     "null",
 ] }, duration_ms = { type = "integer", minimum = 0 }, stdout_preview = { type = "string", maxLength = 65536 }, stderr_preview = { type = "string", maxLength = 65536 }, stdout_truncated = { type = "boolean" }, stderr_truncated = { type = "boolean" } } } }, artifacts = { type = "array", items = { type = "object", required = [
@@ -1133,16 +1137,19 @@ schema = { type = "object", additionalProperties = false, required = [
 ] } } } }
 type_name = "bcode.shell.command-plan-result/v1"
 
+
 [workflow_templates.definition.nodes.verification_decision.output]
 schema = { type = "object", additionalProperties = false, required = [
     "version",
+    "plan_sha256",
     "passed",
     "commands",
     "artifacts",
-], properties = { version = { const = 1 }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+], properties = { version = { const = 1 }, plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
     "index",
     "status",
     "exit_code",
+    "accepted_exit_codes",
     "signal",
     "duration_ms",
     "stdout_preview",
@@ -1157,7 +1164,7 @@ schema = { type = "object", additionalProperties = false, required = [
 ] }, exit_code = { type = [
     "integer",
     "null",
-] }, signal = { type = [
+] }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 32, uniqueItems = true, items = { type = "integer" } }, signal = { type = [
     "integer",
     "null",
 ] }, duration_ms = { type = "integer", minimum = 0 }, stdout_preview = { type = "string", maxLength = 65536 }, stderr_preview = { type = "string", maxLength = 65536 }, stdout_truncated = { type = "boolean" }, stderr_truncated = { type = "boolean" } } } }, artifacts = { type = "array", items = { type = "object", required = [
@@ -1168,6 +1175,7 @@ schema = { type = "object", additionalProperties = false, required = [
     "reference_key",
 ] } } } }
 type_name = "bcode.shell.command-plan-result/v1"
+
 
 [workflow_templates.definition.nodes.verified]
 configuration = { gate_version = 1 }
@@ -1370,13 +1378,15 @@ type_name = "bcode.shell.command-plan/v1"
 [workflow_templates.definition.nodes.verification.configuration.output]
 schema = { type = "object", additionalProperties = false, required = [
     "version",
+    "plan_sha256",
     "passed",
     "commands",
     "artifacts",
-], properties = { version = { const = 1 }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+], properties = { version = { const = 1 }, plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
     "index",
     "status",
     "exit_code",
+    "accepted_exit_codes",
     "signal",
     "duration_ms",
     "stdout_preview",
@@ -1391,7 +1401,7 @@ schema = { type = "object", additionalProperties = false, required = [
 ] }, exit_code = { type = [
     "integer",
     "null",
-] }, signal = { type = [
+] }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 32, uniqueItems = true, items = { type = "integer" } }, signal = { type = [
     "integer",
     "null",
 ] }, duration_ms = { type = "integer", minimum = 0 }, stdout_preview = { type = "string", maxLength = 65536 }, stderr_preview = { type = "string", maxLength = 65536 }, stdout_truncated = { type = "boolean" }, stderr_truncated = { type = "boolean" } } } }, artifacts = { type = "array", items = { type = "object", required = [
@@ -1430,13 +1440,15 @@ type_name = "bcode.shell.command-plan/v1"
 [workflow_templates.definition.nodes.verification.output]
 schema = { type = "object", additionalProperties = false, required = [
     "version",
+    "plan_sha256",
     "passed",
     "commands",
     "artifacts",
-], properties = { version = { const = 1 }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+], properties = { version = { const = 1 }, plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
     "index",
     "status",
     "exit_code",
+    "accepted_exit_codes",
     "signal",
     "duration_ms",
     "stdout_preview",
@@ -1451,7 +1463,7 @@ schema = { type = "object", additionalProperties = false, required = [
 ] }, exit_code = { type = [
     "integer",
     "null",
-] }, signal = { type = [
+] }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 32, uniqueItems = true, items = { type = "integer" } }, signal = { type = [
     "integer",
     "null",
 ] }, duration_ms = { type = "integer", minimum = 0 }, stdout_preview = { type = "string", maxLength = 65536 }, stderr_preview = { type = "string", maxLength = 65536 }, stdout_truncated = { type = "boolean" }, stderr_truncated = { type = "boolean" } } } }, artifacts = { type = "array", items = { type = "object", required = [
@@ -1537,7 +1549,7 @@ risk     = "shell and Git mutations require exact approval"
 [[workflow_templates]]
 contribution_version  = 1
 description           = "Create a normal mutable authored draft for a bounded coding implementation batch with workflow-plugin-owned state."
-document_source       = { path = "templates/implementation-batch.workflow.json", sha256 = "35eef0ec533bef912b4b170974c410e03aa6d958caabdabfc0c5568f6de7d192" }
+document_source       = { path = "templates/implementation-batch.workflow.json", sha256 = "4f48ec0122c1f346a69966004b9d3e395774362b4b42032953b47a16ce7bee4f" }
 required_capabilities = ["workflow-production/v1"]
 template_id           = "implementation-batch"
 template_version      = 1
@@ -1550,7 +1562,7 @@ workflow_level = "implementation_batch"
 [[workflow_templates]]
 contribution_version  = 1
 description           = "Call an exact implementation-batch definition up to five times and refocus the progress document after each exhausted batch."
-document_source       = { path = "templates/delivery-tranche.workflow.json", sha256 = "23fc5ff97ac4453906ea2df2923b9b2108ec927b8e667dac69fef04e8cee410b" }
+document_source       = { path = "templates/delivery-tranche.workflow.json", sha256 = "d76e8e5dc6f777f16b67395e9e6da84dbad361274e57e8d1f1ecf616e402449e" }
 required_capabilities = ["workflow-production/v1"]
 required_plugins      = ["bcode.workflow"]
 required_skills       = ["refocus-progress-doc"]
@@ -1565,7 +1577,7 @@ workflow_level = "delivery_tranche"
 [[workflow_templates]]
 contribution_version  = 1
 description           = "Create or attach progress, review tranche-scoped plans, call up to ten exact delivery tranches, and wait durably for operator continuation."
-document_source       = { path = "templates/progress-driven-delivery.workflow.json", sha256 = "d5e738cf5ac0055f2b0403a5fbff977e178aecb7ddb08b70323f701251899b59" }
+document_source       = { path = "templates/progress-driven-delivery.workflow.json", sha256 = "b7490ac557523e87b597f212ee007df47cfaef06a40247b01428a20cdab29d31" }
 required_capabilities = ["workflow-production/v1"]
 required_plugins      = ["bcode.workflow"]
 required_skills       = ["local-progress-doc"]

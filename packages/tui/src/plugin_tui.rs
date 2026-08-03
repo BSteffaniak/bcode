@@ -1350,6 +1350,24 @@ library = "libdynamic_visual_test.dylib"
         panic!("dynamic visual completion timed out");
     }
 
+    fn wait_for_dynamic_text(
+        presentation: &PluginTuiPresentation,
+        invocation_id: &str,
+        expected: &str,
+    ) -> RoutedTuiVisual {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let _ = presentation.poll_dynamic_visuals();
+            if let Some(visual) = dynamic_test_visual(presentation, invocation_id)
+                && routed_text(&visual) == expected
+            {
+                return visual;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("dynamic visual text did not converge to {expected}");
+    }
+
     fn hello_dynamic_library_path() -> std::path::PathBuf {
         let executable = std::env::current_exe().expect("current test executable path");
         let directory = executable.parent().expect("test executable parent");
@@ -1586,9 +1604,8 @@ library = "libdynamic_visual_test.dylib"
         let during_refresh = dynamic_test_visual(&presentation, "call-owner")
             .expect("native fallback during dynamic refresh");
         assert_eq!(during_refresh.route.plugin_id, "bcode.shell");
-        wait_for_dynamic_completion(&presentation);
         let refreshed =
-            dynamic_test_visual(&presentation, "call-owner").expect("refreshed dynamic visual");
+            wait_for_dynamic_text(&presentation, "call-owner", "dynamic:success:artifact-1");
         assert_eq!(routed_text(&refreshed), "dynamic:success:artifact-1");
         let unchanged =
             dynamic_test_visual(&presentation, "call-other").expect("unaffected cached visual");

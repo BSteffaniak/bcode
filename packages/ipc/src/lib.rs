@@ -2053,11 +2053,34 @@ pub struct WorkflowDefinitionRegistrationRequest {
     pub definition: bcode_workflow::WorkflowDefinition,
 }
 
+/// Current bounded canonical terminal-output inspection contract version.
+pub const WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION: u32 = 1;
+
+/// Bounded canonical terminal value exposed through normal workflow inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowTerminalOutputInspection {
+    pub version: u32,
+    pub output_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub schema_id: String,
+    pub schema_version: u32,
+    pub checksum_sha256: String,
+    pub value: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_reference: Option<String>,
+    pub created_at_ms: u64,
+}
+
 /// Bounded aggregate workflow inspection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunInspection {
     pub run: bcode_workflow_store::WorkflowRunSummary,
     pub definition: bcode_workflow_store::StoredWorkflowDefinition,
+    /// Canonical successful terminal value, present only for a completed run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_output: Option<WorkflowTerminalOutputInspection>,
     pub activations: Vec<bcode_workflow_store::WorkflowActivationSummary>,
     pub waits: Vec<bcode_workflow_store::WaitingActivation>,
     pub mutation_approvals: Vec<bcode_workflow_store::WorkflowMutationApproval>,

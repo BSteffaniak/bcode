@@ -30,10 +30,10 @@ struct WorkflowCli {
     /// JSON workflow input for `run`, JSON template configuration, or gate value.
     #[arg(long)]
     input: Option<String>,
-    /// Exact template owner plugin for template describe/start.
+    /// Exact template owner plugin for template describe/instantiate/start.
     #[arg(long)]
     owner: Option<String>,
-    /// Exact owner-local template ID for template describe/start.
+    /// Exact owner-local template ID for template describe/instantiate/start.
     #[arg(long)]
     template: Option<String>,
     /// Exact logical authored-workflow identity for mutable template describe.
@@ -57,6 +57,18 @@ struct WorkflowCli {
     /// Caller-stable run identity for `template-start`.
     #[arg(long)]
     run: Option<String>,
+    /// Exact mutable draft generation for authored publication.
+    #[arg(long)]
+    generation: Option<u64>,
+    /// Exact immutable revision for authored export.
+    #[arg(long)]
+    revision: Option<u64>,
+    /// Portable export bundle JSON for authored import.
+    #[arg(long)]
+    bundle: Option<String>,
+    /// New logical workflow identity for authored import.
+    #[arg(long)]
+    target_workflow: Option<String>,
     /// Parent session identity required by `run`.
     #[arg(long)]
     session: Option<String>,
@@ -90,7 +102,9 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         if let Some(version) = cli.version {
             let key = match cli.action.as_str() {
                 "register" => "version",
-                "template-describe" | "template-start" => "template_version",
+                "template-describe" | "template-instantiate" | "template-start" => {
+                    "template_version"
+                }
                 _ => "definition_version",
             };
             args.insert(key.to_string(), version.to_string());
@@ -103,7 +117,7 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         if let Some(input) = cli.input {
             let key = match cli.action.as_str() {
                 "provide-input" => "value",
-                "template-describe" | "template-start" => "configuration",
+                "template-describe" | "template-instantiate" | "template-start" => "configuration",
                 _ => "input",
             };
             args.insert(key.to_string(), input);
@@ -134,6 +148,18 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         }
         if let Some(run) = cli.run {
             args.insert("run_id".to_string(), run);
+        }
+        if let Some(revision) = cli.revision {
+            args.insert("revision".to_string(), revision.to_string());
+        }
+        if let Some(generation) = cli.generation {
+            args.insert("expected_generation".to_string(), generation.to_string());
+        }
+        if let Some(bundle) = cli.bundle {
+            args.insert("bundle".to_string(), bundle);
+        }
+        if let Some(target_workflow) = cli.target_workflow {
+            args.insert("target_workflow_id".to_string(), target_workflow);
         }
         if let Some(session) = cli.session {
             args.insert("session_id".to_string(), session);

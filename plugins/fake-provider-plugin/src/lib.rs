@@ -806,6 +806,57 @@ fn fake_structured_output_error(error: &dyn std::fmt::Display) -> ProviderError 
     }
 }
 
+fn configured_matching_input(
+    user_text: &str,
+    schema: &serde_json::Value,
+    flagship_lifecycle: bool,
+) -> Result<serde_json::Value, ProviderError> {
+    let input: serde_json::Value =
+        serde_json::from_str(user_text.rsplit("\n\n").next().unwrap_or(user_text))
+            .map_err(|error| fake_structured_output_error(&error))?;
+    if flagship_lifecycle {
+        return flagship_lifecycle_output(&input, schema).ok_or_else(|| ProviderError {
+            code: "no_matching_fake_structured_input".to_string(),
+            category: ProviderErrorCategory::InvalidRequest,
+            message:
+                "fake provider found no flagship lifecycle value matching the requested JSON schema"
+                    .to_string(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        });
+    }
+    let validator = jsonschema::validator_for(schema).map_err(|error| ProviderError {
+        code: "invalid_fake_structured_schema".to_string(),
+        category: ProviderErrorCategory::InvalidRequest,
+        message: error.to_string(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    })?;
+    find_matching_input_value(&input, &validator, 0).ok_or_else(|| ProviderError {
+        code: "no_matching_fake_structured_input".to_string(),
+        category: ProviderErrorCategory::InvalidRequest,
+        message: "fake provider found no input value matching the requested JSON schema"
+            .to_string(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    })
+}
+
 fn configured_fake_structured_output(
     request: &ModelTurnRequest,
     structured: &bcode_model::StructuredOutputRequest,
@@ -818,36 +869,10 @@ fn configured_fake_structured_output(
     else {
         return Ok(None);
     };
-    let value = if configured == "matching_input:" {
-        let input: serde_json::Value =
-            serde_json::from_str(user_text.rsplit("\n\n").next().unwrap_or(user_text))
-                .map_err(|error| fake_structured_output_error(&error))?;
-        let validator =
-            jsonschema::validator_for(&structured.schema).map_err(|error| ProviderError {
-                code: "invalid_structured_output_schema".to_string(),
-                category: ProviderErrorCategory::InvalidRequest,
-                message: error.to_string(),
-                retryable: false,
-                provider_message: None,
-                failure: None,
-                request_id: None,
-                diagnostic_context: Box::default(),
-                sources: Box::default(),
-                retry: None,
-            })?;
-        find_matching_input_value(&input, &validator, 0).ok_or_else(|| ProviderError {
-            code: "no_matching_fake_structured_input".to_string(),
-            category: ProviderErrorCategory::InvalidRequest,
-            message: "fake provider found no input value matching the requested JSON schema"
-                .to_string(),
-            retryable: false,
-            provider_message: None,
-            failure: None,
-            request_id: None,
-            diagnostic_context: Box::default(),
-            sources: Box::default(),
-            retry: None,
-        })?
+    let value = if configured == "flagship_lifecycle:" {
+        configured_matching_input(user_text, &structured.schema, true)?
+    } else if configured == "matching_input:" {
+        configured_matching_input(user_text, &structured.schema, false)?
     } else if let Some(threshold) = configured.strip_prefix("loop_until:") {
         let threshold = threshold
             .parse::<u64>()
@@ -910,6 +935,48 @@ fn configured_fake_structured_output(
             sources: Box::default(),
             retry: None,
         })
+}
+
+fn flagship_lifecycle_output(
+    input: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let validator = jsonschema::validator_for(schema).ok()?;
+    if let Some(value) = find_matching_input_value(input, &validator, 0) {
+        return Some(value);
+    }
+    let repeat = find_object_with_fields(input, &["iterations_completed", "value"])?;
+    let retained = repeat.get("value")?;
+    let state = retained.get("state").unwrap_or(retained).clone();
+    for outcome in ["continue", "completed"] {
+        let candidate = serde_json::json!({
+            "version": 1,
+            "outcome": outcome,
+            "state": state,
+        });
+        if validator.is_valid(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn find_object_with_fields<'a>(
+    value: &'a serde_json::Value,
+    fields: &[&str],
+) -> Option<&'a serde_json::Value> {
+    if fields.iter().all(|field| value.get(*field).is_some()) {
+        return Some(value);
+    }
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_object_with_fields(value, fields)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .find_map(|value| find_object_with_fields(value, fields)),
+        _ => None,
+    }
 }
 
 fn find_matching_input_value(
@@ -2103,6 +2170,47 @@ mod tests {
         assert_eq!(
             find_matching_input_value(&serde_json::json!({"version": 2}), &validator, 0),
             None
+        );
+    }
+
+    #[test]
+    fn flagship_lifecycle_fixture_maps_typed_exhaustion_to_parent_continuation() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["version", "outcome", "state"],
+            "properties": {
+                "version": {"const": 1},
+                "outcome": {"enum": ["completed", "continue"]},
+                "state": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["version", "phase"],
+                    "properties": {
+                        "version": {"const": 1},
+                        "phase": {"const": "exhausted"}
+                    }
+                }
+            }
+        });
+        let input = serde_json::json!({
+            "version": 1,
+            "outcome": "iteration_limit_reached",
+            "iterations_completed": 5,
+            "max_iterations": 5,
+            "cycle_cap": 100,
+            "effective_iteration_bound": 5,
+            "value": {"version": 1, "outcome": "exhausted", "state": {
+                "version": 1, "phase": "exhausted"
+            }}
+        });
+        assert_eq!(
+            flagship_lifecycle_output(&input, &schema),
+            Some(serde_json::json!({
+                "version": 1,
+                "outcome": "continue",
+                "state": {"version": 1, "phase": "exhausted"}
+            }))
         );
     }
 

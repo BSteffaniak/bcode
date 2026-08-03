@@ -135,8 +135,9 @@ multiple ambiguous successful exits, missing output, or schema mismatch fails cl
 stale live or recovery updates cannot replace it. Failed, cancelled, paused, or repair-required runs
 cannot expose successful terminal output.
 
-Normal inspection returns only bounded schema identity, checksum, artifact reference, and value
-preview. It does not load complete artifacts or replay history.
+Normal inspection returns the bounded canonical schema identity, checksum, artifact reference, and
+inline typed terminal value. The inline value is already subject to the workflow store's bounded
+output contract; inspection does not load complete artifacts or replay history.
 
 ## Exact child workflow calls
 

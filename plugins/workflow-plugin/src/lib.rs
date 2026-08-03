@@ -314,9 +314,29 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Describe and configure an exact workflow template",
         ),
         (
+            "workflow.template-instantiate",
+            "Workflow: Edit Template",
+            "Instantiate an exact maintainable template and open the graph editor",
+        ),
+        (
             "workflow.template-start",
             "Workflow: Start Template",
             "Start a validated workflow template",
+        ),
+        (
+            "workflow.author-publish",
+            "Workflow: Publish Authored Draft",
+            "Publish one exact authored draft generation",
+        ),
+        (
+            "workflow.author-export",
+            "Workflow: Export Authored Revision",
+            "Export one exact authored revision and dependency manifest",
+        ),
+        (
+            "workflow.author-import",
+            "Workflow: Import Authored Workflow",
+            "Import one exact portable authored workflow bundle",
         ),
         (
             "workflow.register",
@@ -497,10 +517,28 @@ fn retain_batch_operation_result(
     let Some(value) = value else {
         return Ok(());
     };
+    if let Ok(receipt) =
+        serde_json::from_value::<bcode_git_plugin::VerificationReceipt>(value.clone())
+    {
+        state.latest.verification_receipt = Some(
+            serde_json::to_value(&receipt)
+                .map_err(|error| format!("verification receipt cannot be retained: {error}"))?,
+        );
+        if operation == BatchInputOperation::FormattingPlan
+            && receipt.stage == bcode_git_plugin::VerificationStage::PreFormat
+        {
+            state.operation_context = Some(CodingWorkflowOperationContext::default());
+        }
+        return Ok(());
+    }
     let context = state.operation_context.get_or_insert_with(Default::default);
     if let Ok(snapshot) =
         serde_json::from_value::<bcode_git_plugin::RepositorySnapshot>(value.clone())
     {
+        state.latest.repository_snapshots.push(value);
+        if state.latest.repository_snapshots.len() > 8 {
+            state.latest.repository_snapshots.remove(0);
+        }
         if context.pre_snapshot.is_none() {
             context.pre_snapshot = Some(snapshot);
         } else {
@@ -511,6 +549,9 @@ fn retain_batch_operation_result(
     if let Ok(result) =
         serde_json::from_value::<bcode_shell_plugin::ShellWorkflowCommandPlanResult>(value.clone())
     {
+        if operation == BatchInputOperation::Snapshot && context.pre_snapshot.is_none() {
+            state.latest.formatting_receipt = Some(value);
+        }
         context.command_result = Some(result);
         return Ok(());
     }
@@ -541,12 +582,6 @@ fn retain_batch_operation_result(
             .unwrap_or(value);
         state.latest.completion_assessment = Some(message);
         return Ok(());
-    }
-    if let Ok(receipt) = serde_json::from_value::<bcode_git_plugin::VerificationReceipt>(value) {
-        state.latest.verification_receipt = Some(
-            serde_json::to_value(receipt)
-                .map_err(|error| format!("verification receipt cannot be retained: {error}"))?,
-        );
     }
     Ok(())
 }
@@ -758,7 +793,7 @@ fn invoke_command(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::large_stack_frames)]
 pub(crate) async fn execute_command(
     mut request: InvokeCommandRequest,
 ) -> Result<InvokeCommandResponse, String> {
@@ -828,60 +863,8 @@ pub(crate) async fn execute_command(
             );
             format!("{} available workflow templates", templates.len())
         }
-        "workflow.template-describe" => {
-            let owner_plugin_id = required_arg(&request, "owner_plugin_id")?;
-            let template_id = required_arg(&request, "template_id")?;
-            let template_version = parse_arg::<u32>(&request, "template_version")?;
-            let template = client
-                .describe_workflow_template(owner_plugin_id, template_id, template_version)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "workflow template not found or disabled".to_string())?;
-            options.insert(
-                "template".to_string(),
-                serde_json::to_value(&template).map_err(|error| error.to_string())?,
-            );
-            match (
-                request.args.get("workflow_id"),
-                request.args.get("draft_id"),
-            ) {
-                (Some(workflow_id), Some(draft_id)) => {
-                    let draft = client
-                        .workflow_draft(workflow_id.clone(), draft_id.clone())
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .ok_or_else(|| {
-                            format!("workflow draft not found: {workflow_id}/{draft_id}")
-                        })?;
-                    options.insert(
-                        "draft".to_string(),
-                        serde_json::to_value(draft).map_err(|error| error.to_string())?,
-                    );
-                }
-                (None, None) => {}
-                _ => {
-                    return Err(
-                        "workflow_id and draft_id must be provided together for mutable editing"
-                            .to_string(),
-                    );
-                }
-            }
-            if let Some(session_id) = request.args.get("session_id") {
-                options.insert("session_id".to_string(), serde_json::json!(session_id));
-            }
-            if let Some(configuration) = request.args.get("configuration") {
-                let configuration_schema = template.authoring_document.as_ref().map_or_else(
-                    || template.template.configuration_schema(),
-                    |document| &document.configuration_schema,
-                );
-                let configuration =
-                    validate_template_configuration(&configuration_schema.schema, configuration)?;
-                options.insert("configuration".to_string(), configuration);
-            }
-            format!(
-                "workflow template {} v{}",
-                template.template.template_id, template.template.template_version
-            )
+        "workflow.template-describe" | "workflow.template-instantiate" => {
+            describe_or_instantiate_template(&request, &client, &mut options).await?
         }
         "workflow.template-start" => {
             let owner_plugin_id = required_arg(&request, "owner_plugin_id")?;
@@ -934,6 +917,65 @@ pub(crate) async fn execute_command(
                 .map_err(|error| error.to_string())?;
             options.insert("runs".to_string(), serde_json::json!([started.run]));
             "workflow template started".to_string()
+        }
+        "workflow.author-publish" => {
+            let workflow_id = required_arg(&request, "workflow_id")?;
+            let draft_id = required_arg(&request, "draft_id")?;
+            let expected_generation = parse_arg::<u64>(&request, "expected_generation")?;
+            let result = client
+                .publish_workflow_draft(bcode_ipc::PublishWorkflowDraftRequest {
+                    workflow_id,
+                    draft_id,
+                    expected_generation,
+                    configuration: None,
+                    activate: false,
+                    expected_active_revision: None,
+                    control: bcode_ipc::WorkflowComputationControl::default(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "publication".to_string(),
+                serde_json::to_value(result).map_err(|error| error.to_string())?,
+            );
+            "workflow draft published".to_string()
+        }
+        "workflow.author-export" => {
+            let workflow_id = required_arg(&request, "workflow_id")?;
+            let revision = parse_arg::<u64>(&request, "revision")?;
+            let bundle = client
+                .export_workflow_revision(bcode_ipc::ExportWorkflowRevisionRequest {
+                    workflow_id,
+                    revision,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "export_bundle".to_string(),
+                serde_json::to_value(bundle).map_err(|error| error.to_string())?,
+            );
+            "workflow revision exported".to_string()
+        }
+        "workflow.author-import" => {
+            let bundle = serde_json::from_str(&required_arg(&request, "bundle")?)
+                .map_err(|error| error.to_string())?;
+            let target_workflow_id = required_arg(&request, "target_workflow_id")?;
+            let draft_id = required_arg(&request, "draft_id")?;
+            let imported = client
+                .import_workflow(bcode_ipc::ImportWorkflowRequest {
+                    bundle,
+                    target_workflow_id,
+                    draft_id,
+                    collision_policy: bcode_ipc::WorkflowImportCollisionPolicy::RequireNewWorkflow,
+                    control: bcode_ipc::WorkflowComputationControl::default(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "import_result".to_string(),
+                serde_json::to_value(imported).map_err(|error| error.to_string())?,
+            );
+            "workflow bundle imported".to_string()
         }
         "workflow.register" => {
             let definition_id = required_arg(&request, "definition_id")?;
@@ -999,6 +1041,10 @@ pub(crate) async fn execute_command(
                 (
                     "definition".to_string(),
                     serde_json::json!(inspection.definition),
+                ),
+                (
+                    "terminal_output".to_string(),
+                    serde_json::json!(inspection.terminal_output),
                 ),
                 (
                     "activations".to_string(),
@@ -1114,12 +1160,18 @@ pub(crate) async fn execute_command(
         updated_provider: None,
         updated_thinking: None,
         effects: vec![CommandEffect::OpenPluginSurface {
-            surface_kind: if request.command_id == "workflow.template-describe" {
+            surface_kind: if matches!(
+                request.command_id.as_str(),
+                "workflow.template-describe" | "workflow.template-instantiate"
+            ) {
                 AUTHOR_SURFACE_KIND.to_string()
             } else {
                 STATUS_SURFACE_KIND.to_string()
             },
-            instance_id: if request.command_id == "workflow.template-describe" {
+            instance_id: if matches!(
+                request.command_id.as_str(),
+                "workflow.template-describe" | "workflow.template-instantiate"
+            ) {
                 "workflow-author".to_string()
             } else {
                 "workflow-status".to_string()
@@ -1127,6 +1179,129 @@ pub(crate) async fn execute_command(
             options: serde_json::Value::Object(options),
         }],
     })
+}
+
+#[allow(clippy::too_many_lines)]
+async fn describe_or_instantiate_template(
+    request: &InvokeCommandRequest,
+    client: &bcode_client::BcodeClient,
+    options: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<String, String> {
+    let owner_plugin_id = required_arg(request, "owner_plugin_id")?;
+    let template_id = required_arg(request, "template_id")?;
+    let template_version = parse_arg::<u32>(request, "template_version")?;
+    let template = client
+        .describe_workflow_template(
+            owner_plugin_id.clone(),
+            template_id.clone(),
+            template_version,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "workflow template not found or disabled".to_string())?;
+    options.insert(
+        "template".to_string(),
+        serde_json::to_value(&template).map_err(|error| error.to_string())?,
+    );
+    match (
+        request.args.get("workflow_id"),
+        request.args.get("draft_id"),
+    ) {
+        (Some(workflow_id), Some(draft_id))
+            if request.command_id == "workflow.template-instantiate" =>
+        {
+            let (_, draft) = client
+                .instantiate_workflow_template(bcode_ipc::WorkflowTemplateInstantiationRequest {
+                    owner_plugin_id,
+                    template_id,
+                    template_version,
+                    workflow_id: workflow_id.clone(),
+                    draft_id: draft_id.clone(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "draft".to_string(),
+                serde_json::to_value(draft).map_err(|error| error.to_string())?,
+            );
+        }
+        (Some(workflow_id), Some(draft_id)) => {
+            let draft = client
+                .workflow_draft(workflow_id.clone(), draft_id.clone())
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("workflow draft not found: {workflow_id}/{draft_id}"))?;
+            options.insert(
+                "draft".to_string(),
+                serde_json::to_value(draft).map_err(|error| error.to_string())?,
+            );
+        }
+        (None, None) if request.command_id == "workflow.template-instantiate" => {
+            let workflow_id = request
+                .args
+                .get("new_workflow_id")
+                .cloned()
+                .unwrap_or_else(|| generated_authored_workflow_id(&template_id));
+            let draft_id = request
+                .args
+                .get("new_draft_id")
+                .cloned()
+                .unwrap_or_else(|| "draft-1".to_string());
+            let (_, draft) = client
+                .instantiate_workflow_template(bcode_ipc::WorkflowTemplateInstantiationRequest {
+                    owner_plugin_id,
+                    template_id,
+                    template_version,
+                    workflow_id,
+                    draft_id,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "draft".to_string(),
+                serde_json::to_value(draft).map_err(|error| error.to_string())?,
+            );
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "workflow_id and draft_id must be provided together for mutable editing"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(session_id) = request.args.get("session_id") {
+        options.insert("session_id".to_string(), serde_json::json!(session_id));
+    }
+    if let Some(configuration) = request.args.get("configuration") {
+        let configuration_schema = template.authoring_document.as_ref().map_or_else(
+            || template.template.configuration_schema(),
+            |document| &document.configuration_schema,
+        );
+        let configuration =
+            validate_template_configuration(&configuration_schema.schema, configuration)?;
+        options.insert("configuration".to_string(), configuration);
+    }
+    if request.command_id == "workflow.template-instantiate" {
+        Ok("workflow template instantiated as a mutable graph draft".to_string())
+    } else {
+        Ok(format!(
+            "workflow template {} v{}",
+            template.template.template_id, template.template.template_version
+        ))
+    }
+}
+
+fn generated_authored_workflow_id(template_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{template_id}-{timestamp:x}-{sequence:x}")
 }
 
 fn session_status(request: &ServiceRequest) -> ServiceResponse {
@@ -1494,6 +1669,28 @@ mod tests {
         );
         assert_eq!(repeat.configuration["exhaustion_policy"], "emit_outcome");
         assert!(definition.edges.iter().any(|edge| {
+            edge.from == "validation"
+                && edge.to == "classify"
+                && matches!(
+                    edge.kind,
+                    bcode_workflow::EdgeKind::Conditional {
+                        expected: false,
+                        ..
+                    }
+                )
+        }));
+        assert!(definition.edges.iter().any(|edge| {
+            edge.from == "post_format_validation"
+                && edge.to == "classify"
+                && matches!(
+                    edge.kind,
+                    bcode_workflow::EdgeKind::Conditional {
+                        expected: false,
+                        ..
+                    }
+                )
+        }));
+        assert!(definition.edges.iter().any(|edge| {
             edge.from == "batch_repeat"
                 && edge.to == "implementation"
                 && matches!(
@@ -1508,6 +1705,162 @@ mod tests {
     }
 
     #[test]
+    fn composed_exhaustion_refocus_and_operator_continuation_are_exactly_bounded() {
+        let mut manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
+        bcode_plugin::resolve_external_workflow_templates(
+            &mut manifest,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .expect("external flagship templates");
+        let tranche = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "delivery-tranche")
+            .expect("delivery tranche")
+            .definition();
+        let tranche_repeat = tranche
+            .edges
+            .iter()
+            .find(|edge| edge.from == "batch_repeat" && edge.to == "implementation_batch")
+            .expect("batch repeat edge");
+        assert!(matches!(
+            tranche_repeat.kind,
+            bcode_workflow::EdgeKind::Back {
+                max_iterations: DELIVERY_TRANCHE_BATCH_LIMIT,
+                ..
+            }
+        ));
+        let refocus: bcode_workflow::WorkflowAgentConfiguration =
+            serde_json::from_value(tranche.nodes["refocus"].configuration.clone())
+                .expect("refocus agent");
+        assert_eq!(
+            refocus.skills,
+            [bcode_workflow::AgentSkillSelection {
+                skill_id: "refocus-progress-doc".to_string(),
+                mode: bcode_workflow::AgentSkillActivationMode::Required,
+            }]
+        );
+        assert!(refocus.system_prompt.contains("Apply/Revise/Cancel"));
+
+        let parent = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "progress-driven-delivery")
+            .expect("progress parent")
+            .definition();
+        let gate = &parent.nodes["operator_continuation"];
+        assert_eq!(gate.kind, bcode_workflow::NodeKind::Input);
+        assert_eq!(
+            gate.configuration["choices"],
+            serde_json::json!(["continue", "operator_stopped"])
+        );
+        let second_tranche = parent
+            .edges
+            .iter()
+            .find(|edge| edge.from == "tranche_repeat" && edge.to == "grant_review")
+            .expect("second tranche continuation");
+        assert!(matches!(
+            second_tranche.kind,
+            bcode_workflow::EdgeKind::Back {
+                max_iterations: PROGRESS_DRIVEN_TRANCHE_LIMIT,
+                ..
+            }
+        ));
+        let continued = serde_json::json!({
+            "version": 1,
+            "outcome": "continue",
+            "state": {
+                "version": 1,
+                "objective": "ship",
+                "implementation_prompt": "implement",
+                "completion_condition": "done",
+                "progress_document": {"path": "local-progress.md", "digest_sha256": "a".repeat(64)},
+                "validation_plan": {},
+                "formatting_plan": {},
+                "instruction_fingerprint_sha256": "b".repeat(64),
+                "path_policy": {"include": [], "exclude": ["local-progress.md"]},
+                "phase": "exhausted",
+                "latest": {
+                    "implementation_summary": "later batch",
+                    "repository_snapshots": [],
+                    "verification_receipt": {"verified": true},
+                    "formatting_receipt": {},
+                    "prepared_change_set": {},
+                    "commit_receipt": {},
+                    "completion_assessment": {"condition_met": false}
+                },
+                "artifacts": []
+            }
+        });
+        assert_eq!(
+            second_tranche
+                .transform
+                .as_ref()
+                .expect("state projection")
+                .evaluate(&[bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &continued,
+                }])
+                .expect("second tranche state"),
+            continued["state"]
+        );
+    }
+
+    #[test]
+    fn formatter_result_starts_a_fresh_post_format_verification_context() {
+        let state = serde_json::json!({
+            "version": 1,
+            "objective": "ship",
+            "implementation_prompt": "implement",
+            "completion_condition": "done",
+            "progress_document": {"path": "local-progress.md", "digest_sha256": null},
+            "validation_plan": {},
+            "formatting_plan": {},
+            "instruction_fingerprint_sha256": "a".repeat(64),
+            "path_policy": {"include": [], "exclude": ["local-progress.md"]},
+            "phase": "formatting",
+            "latest": {
+                "implementation_summary": null,
+                "repository_snapshots": [],
+                "verification_receipt": null,
+                "formatting_receipt": null,
+                "prepared_change_set": null,
+                "commit_receipt": null,
+                "completion_assessment": null
+            },
+            "artifacts": [],
+            "operation_context": {
+                "pre_snapshot": null,
+                "post_snapshot": null,
+                "command_result": null
+            }
+        });
+        let mut state: CodingWorkflowState = serde_json::from_value(state).expect("state");
+        retain_batch_operation_result(
+            &mut state,
+            BatchInputOperation::FormattingPlan,
+            Some(serde_json::json!({
+                "version": 1,
+                "stage": "pre_format",
+                "verified": true,
+                "plan_sha256": "b".repeat(64),
+                "instruction_fingerprint_sha256": "a".repeat(64),
+                "repository_snapshot_sha256": "c".repeat(64)
+            })),
+        )
+        .expect("retain receipt");
+        assert_eq!(
+            state.latest.verification_receipt.as_ref().unwrap()["stage"],
+            "pre_format"
+        );
+        assert_eq!(
+            state.operation_context,
+            Some(CodingWorkflowOperationContext::default())
+        );
+    }
+
+    #[test]
     fn batch_outcome_requires_deterministic_and_semantic_completion() {
         let state: CodingWorkflowState = serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -1517,16 +1870,16 @@ mod tests {
             "progress_document": {"path": "local-progress.md", "digest_sha256": null},
             "validation_plan": {},
             "formatting_plan": {},
-            "instruction_fingerprint_sha256": null,
+            "instruction_fingerprint_sha256": "a".repeat(64),
             "path_policy": {"include": [], "exclude": ["local-progress.md"]},
             "phase": "evaluating",
             "latest": {
-                "implementation_summary": null,
+                "implementation_summary": "implemented",
                 "repository_snapshots": [],
                 "verification_receipt": {"verified": true},
-                "formatting_receipt": null,
-                "prepared_change_set": null,
-                "commit_receipt": null,
+                "formatting_receipt": {},
+                "prepared_change_set": {},
+                "commit_receipt": {},
                 "completion_assessment": {"condition_met": true}
             },
             "artifacts": []
@@ -1548,6 +1901,43 @@ mod tests {
         })
         .expect("exhausted");
         assert_eq!(exhausted.outcome, ImplementationBatchOutcome::Exhausted);
+        let mut manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
+        bcode_plugin::resolve_external_workflow_templates(
+            &mut manifest,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .expect("external flagship template");
+        let definition = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "implementation-batch")
+            .expect("implementation batch")
+            .definition();
+        let repeat = definition
+            .edges
+            .iter()
+            .find(|edge| edge.from == "batch_repeat" && edge.to == "implementation")
+            .expect("semantic continuation edge");
+        assert!(matches!(
+            repeat.kind,
+            bcode_workflow::EdgeKind::Back {
+                max_iterations: IMPLEMENTATION_BATCH_ITERATION_LIMIT,
+                ..
+            }
+        ));
+        assert_eq!(
+            repeat
+                .transform
+                .as_ref()
+                .expect("state projection")
+                .evaluate(&[bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &serde_json::to_value(&exhausted).expect("exhausted value"),
+                }])
+                .expect("continued state"),
+            serde_json::to_value(&exhausted.state).expect("state value")
+        );
     }
 
     #[test]
@@ -1733,6 +2123,7 @@ mod tests {
             serde_json::json!({
                 "include_prefixes": [],
                 "exclude_prefixes": [],
+                "project_instruction_fingerprint_sha256": "0".repeat(64),
                 "max_paths": 10_000
             })
         );
@@ -1831,7 +2222,11 @@ mod tests {
             "request": {
                 "repo_path": "/repo",
                 "expected_head": "abc",
-                "message": "Implement workflows",
+                "expected_repository_identity_sha256": "1".repeat(64),
+                "expected_snapshot_sha256": "2".repeat(64),
+                "manifest": {},
+                "title": "Implement workflows",
+                "description": "",
                 "paths": ["src/lib.rs"]
             }
         });

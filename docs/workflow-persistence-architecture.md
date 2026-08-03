@@ -138,8 +138,11 @@ with prepared intent before an external operation is invoked.
 
 ## Canonical terminal output and child composition
 
-A successfully completed workflow may expose one canonical terminal output pointer and checksum. The
-exact successful exit activation commits that output atomically with the terminal run transition.
+Public run inspection includes the bounded canonical terminal value alongside its exact output
+identity, schema identity, checksum, artifact reference, and timestamp. This is a normal bounded
+store lookup; it does not replay workflow history or load referenced artifacts. Child callers still
+consume only this same canonical output. The exact successful exit activation commits that output
+atomically with the terminal run transition.
 Byte-equivalent duplicate settlement is idempotent; conflicting outputs, ambiguous successful exits,
 or stale updates fail closed. Failed, cancelled, paused, and repair-required runs never expose a
 successful terminal output.

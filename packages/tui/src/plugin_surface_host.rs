@@ -7,17 +7,20 @@ use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
 use bcode_plugin_sdk::tui::{
     PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest, PluginSessionViewUpdate,
-    PluginTask, PluginTuiHost, PluginTuiHostError, PluginWorkflowAuthoringCatalogFuture,
-    PluginWorkflowAuthoringDraft, PluginWorkflowAuthoringDraftFuture,
-    PluginWorkflowAuthoringEditFuture, PluginWorkflowAuthoringEditResult,
-    PluginWorkflowAuthoringPreviewFuture, PluginWorkflowAuthoringPublishFuture,
-    PluginWorkflowAuthoringPublishResult, PluginWorkflowAuthoringRevision,
-    PluginWorkflowAuthoringRevisionFuture, PluginWorkflowAuthoringStartFuture,
-    PluginWorkflowAuthoringValidationFuture, PluginWorkflowControlAction,
-    PluginWorkflowControlFuture, PluginWorkflowControlResult, PluginWorkflowInspection,
+    PluginStructuredGenerationFuture, PluginStructuredGenerationRequest, PluginTask, PluginTuiHost,
+    PluginTuiHostError, PluginWorkflowAuthoringCatalogFuture, PluginWorkflowAuthoringDraft,
+    PluginWorkflowAuthoringDraftFuture, PluginWorkflowAuthoringEditFuture,
+    PluginWorkflowAuthoringEditResult, PluginWorkflowAuthoringPreviewFuture,
+    PluginWorkflowAuthoringPublishFuture, PluginWorkflowAuthoringPublishResult,
+    PluginWorkflowAuthoringRevision, PluginWorkflowAuthoringRevisionFuture,
+    PluginWorkflowAuthoringStartFuture, PluginWorkflowAuthoringValidationFuture,
+    PluginWorkflowControlAction, PluginWorkflowControlFuture, PluginWorkflowControlResult,
+    PluginWorkflowGeneratedCandidate, PluginWorkflowGeneratedCandidateAcceptance,
+    PluginWorkflowGeneratedCandidateAcceptanceFuture, PluginWorkflowInspection,
     PluginWorkflowInspectionFuture, PluginWorkflowLookup, PluginWorkflowLookupFuture,
     PluginWorkflowStartFuture, PluginWorkflowStartRequest, PluginWorkflowStartResponse,
-    PluginWorkflowStatus, PluginWorkflowSummary,
+    PluginWorkflowStatus, PluginWorkflowSummary, PluginWorkflowTemplateInstantiationFuture,
+    PluginWorkflowTemplateInstantiationRequest,
 };
 use bcode_session_models::SessionId;
 use bcode_session_view::SessionView;
@@ -195,6 +198,171 @@ impl PluginTuiHost for BcodePluginTuiHost {
                 .workflow_authoring_catalog()
                 .await
                 .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn generate_structured_output(
+        &self,
+        request: PluginStructuredGenerationRequest,
+    ) -> PluginStructuredGenerationFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            if request.timeout_ms == 0 {
+                return Err(PluginTuiHostError::InvalidRequest(
+                    "structured generation timeout must be positive".to_string(),
+                ));
+            }
+            let session = client
+                .create_session(Some(request.session_name))
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            let prompt = format!("{}\n\n{}", request.system_prompt, request.prompt);
+            client
+                .send_user_message_with_execution(
+                    session.id,
+                    prompt,
+                    bcode_ipc::PromptPlacement::FollowUp,
+                    bcode_session_models::TurnExecutionOptions {
+                        tools: bcode_session_models::TurnToolPolicy::Disabled,
+                        structured_output: Some(
+                            bcode_session_models::TurnStructuredOutputRequest {
+                                name: request.output_name,
+                                schema: request.output_schema,
+                                strict: true,
+                            },
+                        ),
+                        ..bcode_session_models::TurnExecutionOptions::default()
+                    },
+                )
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            let started = std::time::Instant::now();
+            let mut cursor = None;
+            let mut assistant = None;
+            loop {
+                let page = client
+                    .session_history_page(
+                        session.id,
+                        bcode_session_models::SessionHistoryQuery {
+                            cursor,
+                            limit: 100,
+                            direction: bcode_session_models::SessionHistoryDirection::Forward,
+                        },
+                    )
+                    .await
+                    .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+                for event in page.events {
+                    cursor = Some(bcode_session_models::SessionHistoryCursor {
+                        sequence: event.sequence,
+                    });
+                    match event.kind {
+                        bcode_session_models::SessionEventKind::AssistantMessage { text } => {
+                            assistant = Some(text);
+                        }
+                        bcode_session_models::SessionEventKind::ModelTurnFinished {
+                            outcome,
+                            message,
+                            ..
+                        } => {
+                            if outcome != bcode_session_models::ModelTurnOutcome::Completed {
+                                return Err(PluginTuiHostError::Internal(format!(
+                                    "structured generation ended with {outcome:?}: {}",
+                                    message.unwrap_or_default()
+                                )));
+                            }
+                            let text = assistant.ok_or_else(|| {
+                                PluginTuiHostError::Internal(
+                                    "structured generation returned no assistant payload"
+                                        .to_string(),
+                                )
+                            })?;
+                            return serde_json::from_str(&text).map_err(|error| {
+                                PluginTuiHostError::Internal(format!(
+                                    "structured generation returned invalid JSON: {error}"
+                                ))
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                if started.elapsed() >= std::time::Duration::from_millis(request.timeout_ms) {
+                    let _ = client.cancel_session_turn(session.id).await;
+                    return Err(PluginTuiHostError::Internal(
+                        "structured generation timed out".to_string(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+    }
+
+    fn accept_generated_workflow_candidate(
+        &self,
+        candidate: PluginWorkflowGeneratedCandidate,
+    ) -> PluginWorkflowGeneratedCandidateAcceptanceFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let producer = candidate.document.producer.clone();
+            if producer.kind != bcode_workflow::WorkflowProducerKind::Generated {
+                return Err(PluginTuiHostError::InvalidRequest(
+                    "generated candidate provenance is required".to_string(),
+                ));
+            }
+            if let Some(target) = candidate.target {
+                return client
+                    .update_workflow_draft(bcode_ipc::UpdateWorkflowDraftRequest {
+                        workflow_id: target.workflow_id,
+                        draft_id: target.draft_id,
+                        expected_generation: target.expected_generation,
+                        document: candidate.document,
+                        producer,
+                    })
+                    .await
+                    .map(|result| match result {
+                        bcode_ipc::WorkflowDraftUpdateResult::Updated(draft) => {
+                            PluginWorkflowGeneratedCandidateAcceptance::Updated(Box::new(
+                                plugin_workflow_authoring_draft(*draft),
+                            ))
+                        }
+                        bcode_ipc::WorkflowDraftUpdateResult::Conflict(conflict) => {
+                            PluginWorkflowGeneratedCandidateAcceptance::Conflict {
+                                expected_generation: conflict.expected_generation,
+                                current_generation: conflict.current_generation,
+                            }
+                        }
+                    })
+                    .map_err(|error| PluginTuiHostError::Internal(error.to_string()));
+            }
+            let (_, draft) = client
+                .create_authored_workflow(bcode_ipc::CreateAuthoredWorkflowRequest {
+                    document: candidate.document,
+                    draft_id: candidate.draft_id,
+                })
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            Ok(PluginWorkflowGeneratedCandidateAcceptance::Created(
+                Box::new(plugin_workflow_authoring_draft(draft)),
+            ))
+        })
+    }
+
+    fn instantiate_workflow_template(
+        &self,
+        request: PluginWorkflowTemplateInstantiationRequest,
+    ) -> PluginWorkflowTemplateInstantiationFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let (_, draft) = client
+                .instantiate_workflow_template(bcode_ipc::WorkflowTemplateInstantiationRequest {
+                    owner_plugin_id: request.owner_plugin_id,
+                    template_id: request.template_id,
+                    template_version: request.template_version,
+                    workflow_id: request.workflow_id,
+                    draft_id: request.draft_id,
+                })
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            Ok(plugin_workflow_authoring_draft(draft))
         })
     }
 
@@ -730,6 +898,9 @@ mod tests {
         let source = include_str!("plugin_surface_host.rs");
         for service in [
             "workflow_authoring_catalog",
+            "generate_structured_output",
+            "accept_generated_workflow_candidate",
+            "instantiate_workflow_template",
             "workflow_authoring_draft",
             "workflow_authoring_revision",
             "apply_workflow_authoring_edits",

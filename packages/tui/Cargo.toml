@@ -64,16 +64,20 @@ url                       = { workspace = true }
 uuid                      = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+bcode_default_agents_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_git_plugin        = { workspace = true, features = ["static-bundled"] }
-bcode_hello_plugin      = { workspace = true }
-bcode_loop_plugin       = { workspace = true, features = ["static-bundled"] }
-bcode_question_plugin   = { workspace = true, features = ["static-bundled"] }
-bcode_shell_plugin      = { workspace = true, features = ["static-bundled"] }
-bcode_vim_edit_plugin   = { workspace = true, features = ["static-bundled"] }
-bcode_workflow_plugin   = { workspace = true, features = ["static-bundled"] }
-insta                   = { workspace = true }
-tempfile                = { workspace = true }
+bcode_git_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_hello_plugin = { workspace = true }
+bcode_loop_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_progress_doc_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_vim_edit_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_workflow_plugin = { workspace = true, features = ["static-bundled"] }
+insta = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default = []

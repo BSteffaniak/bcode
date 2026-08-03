@@ -252,6 +252,86 @@ pub struct PluginWorkflowAuthoringRevision {
     pub document: bcode_workflow::WorkflowAuthoringDocument,
 }
 
+/// Bounded renderer-neutral request for one tool-free structured model generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginStructuredGenerationRequest {
+    pub session_name: String,
+    pub system_prompt: String,
+    pub prompt: String,
+    pub output_name: String,
+    pub output_schema: serde_json::Value,
+    pub timeout_ms: u64,
+}
+
+/// Async structured model-generation result.
+pub type PluginStructuredGenerationFuture =
+    Pin<Box<dyn Future<Output = Result<serde_json::Value, PluginTuiHostError>> + Send + 'static>>;
+
+/// Result of explicitly accepting one generated workflow candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginWorkflowGeneratedCandidateAcceptance {
+    Created(Box<PluginWorkflowAuthoringDraft>),
+    Updated(Box<PluginWorkflowAuthoringDraft>),
+    Conflict {
+        expected_generation: u64,
+        current_generation: u64,
+    },
+    Rejected {
+        diagnostics: Vec<bcode_workflow::WorkflowValidationDiagnostic>,
+    },
+}
+
+/// Async generated-candidate acceptance result.
+pub type PluginWorkflowGeneratedCandidateAcceptanceFuture = Pin<
+    Box<
+        dyn Future<Output = Result<PluginWorkflowGeneratedCandidateAcceptance, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Exact existing draft target for generated candidate replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkflowGeneratedCandidateTarget {
+    pub workflow_id: String,
+    pub draft_id: String,
+    pub expected_generation: u64,
+}
+
+/// Renderer-neutral generated candidate awaiting explicit user acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkflowGeneratedCandidate {
+    pub document: bcode_workflow::WorkflowAuthoringDocument,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PluginWorkflowGeneratedCandidateTarget>,
+    pub draft_id: String,
+    pub repair_attempts: u32,
+}
+
+/// Async workflow-template instantiation result.
+pub type PluginWorkflowTemplateInstantiationFuture = Pin<
+    Box<
+        dyn Future<Output = Result<PluginWorkflowAuthoringDraft, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Renderer-neutral request to instantiate one exact maintainable template as a mutable draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkflowTemplateInstantiationRequest {
+    pub owner_plugin_id: String,
+    pub template_id: String,
+    pub template_version: u32,
+    pub workflow_id: String,
+    pub draft_id: String,
+}
+
 /// Async workflow-authoring revision result.
 pub type PluginWorkflowAuthoringRevisionFuture = Pin<
     Box<
@@ -491,6 +571,46 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Run one bounded, tool-free, structured model turn through the normal session boundary.
+    fn generate_structured_output(
+        &self,
+        _request: PluginStructuredGenerationRequest,
+    ) -> PluginStructuredGenerationFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "structured generation is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Persist one explicitly accepted generated candidate as a new or existing mutable draft.
+    ///
+    /// This operation cannot publish, activate, start, or grant permissions. Existing draft
+    /// replacement remains guarded by exact optimistic generation.
+    fn accept_generated_workflow_candidate(
+        &self,
+        _candidate: PluginWorkflowGeneratedCandidate,
+    ) -> PluginWorkflowGeneratedCandidateAcceptanceFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "generated workflow candidate acceptance is not available from this host"
+                    .to_string(),
+            ))
+        })
+    }
+
+    /// Instantiate one exact maintainable plugin template as normal mutable authored state.
+    fn instantiate_workflow_template(
+        &self,
+        _request: PluginWorkflowTemplateInstantiationRequest,
+    ) -> PluginWorkflowTemplateInstantiationFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow template instantiation is not available from this host".to_string(),
             ))
         })
     }

@@ -3300,13 +3300,7 @@ pub(crate) mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(200));
         assert!(SLOW_SEARCH_STARTED.load(Ordering::SeqCst));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !SLOW_SEARCH_FINISHED.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("slow provider observes cancellation after terminal federated response");
+        wait_for_slow_provider_to_finish().await;
         assert!(SLOW_SEARCH_CANCELLED.load(Ordering::SeqCst));
         assert!(SLOW_SEARCH_FINISHED.load(Ordering::SeqCst));
         assert_eq!(response.hits.len(), 1);

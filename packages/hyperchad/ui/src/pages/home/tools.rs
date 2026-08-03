@@ -73,9 +73,9 @@ pub(super) fn render_tool_lifecycle_with_context(
 ) -> Containers {
     let (status, status_color) = lifecycle_status(tool);
     let timing = timing_summary(tool);
-    let arguments = tool
-        .arguments_json
-        .as_deref()
+    let arguments = (tool.status != ToolInvocationViewStatus::Requested)
+        .then_some(tool.arguments_json.as_deref())
+        .flatten()
         .map(|arguments| bounded_preview(arguments, MAX_INLINE_ARGUMENT_CHARS));
     let result_text = tool
         .result_text
