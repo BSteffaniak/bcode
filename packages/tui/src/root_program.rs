@@ -338,6 +338,241 @@ impl BcodeRuntimeModel {
 
     #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn handle_basic_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
+        if self.loop_state.has_root_plugin_surface() {
+            let action = self
+                .loop_state
+                .handle_root_plugin_surface_event(&event, &self.loop_state.foreground_client())
+                .expect("plugin surface was present");
+            match action {
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+                | bcode_plugin_sdk::tui::PluginTuiAction::Redraw => {}
+                bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome } => {
+                    if let Some((plugin_id, outcome)) = self
+                        .loop_state
+                        .close_root_plugin_surface_with_outcome(outcome)
+                    {
+                        super::palette_flow::apply_plugin_surface_outcome(
+                            &mut self.chat,
+                            &plugin_id,
+                            outcome,
+                        );
+                    }
+                }
+                bcode_plugin_sdk::tui::PluginTuiAction::OpenSession { session_id } => {
+                    self.loop_state.close_root_plugin_surface();
+                    super::session_flow::start_switch_session(
+                        &mut self.chat,
+                        session_id,
+                        super::history_flow::initial_transcript_window_request(self.committed_area),
+                    );
+                }
+                bcode_plugin_sdk::tui::PluginTuiAction::OpenSurface { surface_id } => {
+                    self.chat
+                        .app
+                        .set_status(format!("surface toggle requested: {surface_id}"));
+                }
+                bcode_plugin_sdk::tui::PluginTuiAction::RunCommand { command } => {
+                    self.chat.app.replace_composer_with(&command);
+                    self.loop_state.close_root_plugin_surface();
+                }
+            }
+            return super::invalidation::UiInvalidation::Structural;
+        }
+        if self.loop_state.has_session_fork_flow() {
+            match self
+                .loop_state
+                .handle_session_fork_event(&self.chat, &event)
+            {
+                super::chat_loop::SessionForkRootOutcome::Handled => {}
+                super::chat_loop::SessionForkRootOutcome::Canceled => {
+                    self.chat.app.set_status("fork canceled".to_owned());
+                }
+                super::chat_loop::SessionForkRootOutcome::LoadPrompts {
+                    session_id,
+                    submission,
+                } => {
+                    self.chat
+                        .replace_effect(super::effects::TuiEffect::LoadForkPrompts {
+                            session_id,
+                            submission,
+                        });
+                    self.chat.app.set_status("loading fork prompts…".to_owned());
+                }
+                super::chat_loop::SessionForkRootOutcome::CreateClone {
+                    session_id,
+                    submission,
+                } => {
+                    self.chat
+                        .start_effect(super::effects::TuiEffect::CloneSession {
+                            session_id,
+                            name: submission.name,
+                            switch_after_create: submission.switch_after_create,
+                            install_draft: submission.install_draft,
+                            initial_window_request:
+                                super::history_flow::initial_transcript_window_request(
+                                    self.committed_area,
+                                ),
+                        });
+                    self.chat.app.set_status("cloning session…".to_owned());
+                }
+                super::chat_loop::SessionForkRootOutcome::CreateFork {
+                    session_id,
+                    submission,
+                    prompt,
+                } => {
+                    self.chat
+                        .start_effect(super::effects::TuiEffect::ForkSession {
+                            session_id,
+                            prompt_sequence: prompt.sequence,
+                            name: submission.name,
+                            draft: Some(prompt.text),
+                            switch_after_create: submission.switch_after_create,
+                            install_draft: submission.install_draft,
+                            initial_window_request:
+                                super::history_flow::initial_transcript_window_request(
+                                    self.committed_area,
+                                ),
+                        });
+                    self.chat.app.set_status("forking session…".to_owned());
+                }
+            }
+            return super::invalidation::UiInvalidation::Structural;
+        }
+        if self.loop_state.has_model_picker() {
+            if let Some((provider_plugin_id, action)) = self
+                .loop_state
+                .handle_model_picker_event(self.settings.keymap(), &event)
+            {
+                match action {
+                    super::model_flow::ModelPickerAction::Continue => {
+                        if self.loop_state.has_model_picker() {
+                            return super::invalidation::UiInvalidation::Structural;
+                        }
+                        self.chat
+                            .replace_effect(super::effects::TuiEffect::LoadModelPicker {
+                                provider_plugin_id,
+                            });
+                        self.chat.app.set_status("loading models…".to_owned());
+                    }
+                    super::model_flow::ModelPickerAction::Cancel => {
+                        self.chat.app.set_status("model picker closed".to_owned());
+                    }
+                    super::model_flow::ModelPickerAction::Select(model_id) => {
+                        if let Some(session_id) = self.chat.session_id {
+                            self.chat
+                                .start_effect(super::effects::TuiEffect::SetSessionModel {
+                                    session_id,
+                                    provider_plugin_id,
+                                    model_id,
+                                });
+                            self.chat.app.set_status("applying model…".to_owned());
+                        } else {
+                            self.chat
+                                .app
+                                .apply_local_model_selection(provider_plugin_id, &model_id);
+                        }
+                    }
+                }
+            }
+            return super::invalidation::UiInvalidation::Structural;
+        }
+        if self.loop_state.has_skill_picker() {
+            let action = self
+                .loop_state
+                .handle_skill_picker_event(self.settings.keymap(), &event)
+                .expect("skill picker was present");
+            match action {
+                super::skill_picker::SkillPickerAction::Continue => {}
+                super::skill_picker::SkillPickerAction::Cancel => {
+                    self.chat.app.set_status("skill picker closed".to_owned());
+                }
+                super::skill_picker::SkillPickerAction::Help(skill_id) => {
+                    self.chat
+                        .replace_effect(super::effects::TuiEffect::DescribeSkill { skill_id });
+                    self.chat
+                        .app
+                        .set_status("loading skill details…".to_owned());
+                }
+                super::skill_picker::SkillPickerAction::Activate(skill_id) => {
+                    self.start_root_skill_action(
+                        super::effects::SkillActionKind::Activate,
+                        skill_id,
+                        String::new(),
+                    );
+                }
+                super::skill_picker::SkillPickerAction::Deactivate(skill_id) => {
+                    self.start_root_skill_action(
+                        super::effects::SkillActionKind::Deactivate,
+                        skill_id,
+                        String::new(),
+                    );
+                }
+                super::skill_picker::SkillPickerAction::Invoke {
+                    skill_id,
+                    arguments,
+                } => {
+                    self.start_root_skill_action(
+                        super::effects::SkillActionKind::Invoke,
+                        skill_id,
+                        arguments,
+                    );
+                }
+            }
+            return super::invalidation::UiInvalidation::Structural;
+        }
+        if self.loop_state.has_worktree_create_dialog() {
+            match self
+                .loop_state
+                .handle_worktree_create_dialog_event(self.settings.keymap(), &event)
+            {
+                super::chat_loop::WorktreeCreateDialogRootOutcome::Create {
+                    name,
+                    target,
+                    base,
+                } => {
+                    let attach_session_id = match target {
+                        super::wt_create_dialog::WorktreeCreateTarget::CurrentSession => {
+                            self.chat.session_id
+                        }
+                        super::wt_create_dialog::WorktreeCreateTarget::NewSession => None,
+                    };
+                    self.chat
+                        .start_effect(super::effects::TuiEffect::CreateWorktree {
+                            request: bcode_worktree_models::WorktreeCreateRequest {
+                                name,
+                                cwd: Some(
+                                    self.chat
+                                        .app
+                                        .working_directory()
+                                        .unwrap_or_else(|| self.settings.launch_working_directory())
+                                        .to_path_buf(),
+                                ),
+                                path: None,
+                                branch: None,
+                                new_branch: None,
+                                base_ref: Some(base.model()),
+                                detach: false,
+                                force: false,
+                                attach_session_id,
+                                new_session: target
+                                    == super::wt_create_dialog::WorktreeCreateTarget::NewSession,
+                                no_setup: false,
+                            },
+                        });
+                    self.chat.app.set_status("creating worktree…".to_owned());
+                }
+                super::chat_loop::WorktreeCreateDialogRootOutcome::Canceled => {
+                    self.chat
+                        .app
+                        .set_status("worktree creation canceled".to_owned());
+                }
+                super::chat_loop::WorktreeCreateDialogRootOutcome::Handled => {}
+                super::chat_loop::WorktreeCreateDialogRootOutcome::Unhandled => {
+                    unreachable!("worktree dialog was present")
+                }
+            }
+            return super::invalidation::UiInvalidation::Structural;
+        }
         let damage = match event {
             Event::Resize(_) => super::invalidation::UiInvalidation::Full,
             Event::Focus(_) | Event::Tick => super::invalidation::UiInvalidation::Paint,
@@ -352,6 +587,37 @@ impl BcodeRuntimeModel {
             Event::Key(stroke) => {
                 if self.loop_state.permission_dialog.is_some() {
                     return self.handle_permission_key(stroke);
+                }
+                match self
+                    .loop_state
+                    .handle_timeline_dialog_key(&mut self.chat, stroke)
+                {
+                    super::chat_loop::TimelineDialogRootOutcome::Handled => {
+                        return super::invalidation::UiInvalidation::Structural;
+                    }
+                    super::chat_loop::TimelineDialogRootOutcome::Jump(entry) => {
+                        self.apply_root_timeline_jump(&entry);
+                        return super::invalidation::UiInvalidation::Structural;
+                    }
+                    super::chat_loop::TimelineDialogRootOutcome::Unhandled => {}
+                }
+                match self
+                    .loop_state
+                    .handle_thinking_dialog_key(&mut self.chat, stroke)
+                {
+                    super::chat_loop::ThinkingDialogRootOutcome::Handled => {
+                        return super::invalidation::UiInvalidation::Structural;
+                    }
+                    super::chat_loop::ThinkingDialogRootOutcome::Apply {
+                        effort,
+                        summary,
+                        visible,
+                        mode,
+                    } => {
+                        self.apply_root_thinking_dialog(effort, summary, visible, mode);
+                        return super::invalidation::UiInvalidation::Structural;
+                    }
+                    super::chat_loop::ThinkingDialogRootOutcome::Unhandled => {}
                 }
                 if self.loop_state.has_command_palette() {
                     if let Some(action) = self.loop_state.handle_command_palette_key(stroke) {
@@ -455,6 +721,78 @@ impl BcodeRuntimeModel {
             }
         };
         damage
+    }
+
+    fn start_root_skill_action(
+        &mut self,
+        action: super::effects::SkillActionKind,
+        skill_id: bcode_skill_models::SkillId,
+        arguments: String,
+    ) {
+        match super::skill_flow::start_skill_action(&mut self.chat, action, skill_id, arguments) {
+            Ok(()) => {}
+            Err(error) => self
+                .chat
+                .app
+                .set_status(format!("Skill action unavailable: {error}")),
+        }
+    }
+
+    fn apply_root_timeline_jump(&mut self, entry: &super::timeline_dialog::TimelineEntry) {
+        if let Some(index) = entry.transcript_index()
+            && self.chat.app.jump_to_transcript_index(index)
+        {
+            self.chat
+                .app
+                .set_status("jumped to timeline message".to_owned());
+            return;
+        }
+        let Some(session_id) = self.chat.session_id else {
+            self.chat
+                .app
+                .set_status("timeline requires an active session".to_owned());
+            return;
+        };
+        self.chat
+            .replace_effect(super::effects::TuiEffect::LoadTimelineJump {
+                session_id,
+                sequence: entry.sequence(),
+            });
+        self.chat
+            .app
+            .set_status("loading timeline message…".to_owned());
+    }
+
+    fn apply_root_thinking_dialog(
+        &mut self,
+        effort: Option<String>,
+        summary: Option<String>,
+        visible: bool,
+        mode: bcode_config::TuiThinkingMode,
+    ) {
+        self.chat.app.set_reasoning_visible(visible);
+        self.chat.app.set_reasoning_display_mode(mode);
+        let effort_generation = effort
+            .as_ref()
+            .filter(|effort| self.chat.app.reasoning_effort() != Some(effort.as_str()))
+            .map(|effort| self.chat.app.set_pending_reasoning_effort(effort.clone()));
+        if let Some(session_id) = self.chat.session_id {
+            self.chat
+                .start_effect(super::effects::TuiEffect::SetSessionReasoning {
+                    session_id,
+                    effort,
+                    summary,
+                    effort_generation,
+                    status: "reasoning output settings applied".to_owned(),
+                });
+            self.chat.app.set_status("setting thinking…".to_owned());
+        } else {
+            self.chat.app.apply_reasoning_selection(effort, summary);
+            self.chat.app.set_status(format!(
+                "reasoning output settings applied: {}",
+                self.chat.app.thinking_label()
+            ));
+        }
     }
 
     fn stage_root_submission(&mut self, placement: bcode_ipc::PromptPlacement) {
@@ -621,6 +959,7 @@ impl BcodeRuntimeModel {
             commands.push(self.loop_state.ordered_effect_command(effect, handle));
         }
         if let Some(request) = self.loop_state.next_surface_open_request() {
+            let keymap = self.settings.keymap().clone();
             commands.push(bmux_tui_runtime::Command::start_if_idle(
                 bmux_tui_runtime::CommandKey::new("bcode.interactive_surface_open"),
                 async move {
@@ -630,7 +969,7 @@ impl BcodeRuntimeModel {
                     let result = match runtime {
                         Ok(runtime) => {
                             super::interactive_surface::InteractiveSurfaceState::open_request(
-                                &runtime, &request,
+                                &runtime, &request, &keymap,
                             )
                             .await
                             .map_err(|error| error.to_string())

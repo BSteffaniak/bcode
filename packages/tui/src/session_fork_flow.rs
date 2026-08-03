@@ -68,9 +68,9 @@ pub async fn fork_current_session<W: Write>(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ForkPromptCandidate {
-    sequence: u64,
-    text: String,
+pub struct ForkPromptCandidate {
+    pub sequence: u64,
+    pub text: String,
 }
 
 async fn select_prompt_for_fork<W: Write>(
@@ -78,7 +78,7 @@ async fn select_prompt_for_fork<W: Write>(
     services: &TuiServices<'_>,
     session_id: bcode_session_models::SessionId,
 ) -> Result<Option<ForkPromptCandidate>, TuiError> {
-    let prompts = recent_user_prompts(services, session_id).await?;
+    let prompts = load_recent_user_prompts(services.passive_client, session_id).await?;
     if prompts.is_empty() {
         return Ok(None);
     }
@@ -108,12 +108,11 @@ async fn select_prompt_for_fork<W: Write>(
     }
 }
 
-async fn recent_user_prompts(
-    services: &TuiServices<'_>,
+pub async fn load_recent_user_prompts(
+    client: &bcode_client::BcodeClient,
     session_id: bcode_session_models::SessionId,
 ) -> Result<Vec<ForkPromptCandidate>, TuiError> {
-    let page = match services
-        .passive_client
+    let page = match client
         .session_history_page(
             session_id,
             SessionHistoryQuery {
@@ -144,7 +143,7 @@ fn user_prompt_candidate_from_event(event: &SessionEvent) -> Option<ForkPromptCa
     })
 }
 
-fn render_prompt_picker(
+pub fn render_prompt_picker(
     frame: &mut Frame<'_>,
     prompts: &[ForkPromptCandidate],
     selected: usize,

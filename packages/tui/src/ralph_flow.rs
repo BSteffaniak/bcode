@@ -30,6 +30,234 @@ use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{TuiError, daemon_issue, ralph_start_dialog, ralph_start_dialog_render};
 
+/// Ralph action that does not require a nested terminal screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RalphRootAction {
+    ShowStatus,
+    Run,
+    Approve,
+    Stop,
+    ListRuns,
+    ListIterations,
+    Resume,
+}
+
+/// Presentation returned by one root-runtime Ralph action.
+pub struct RalphRootOutput {
+    pub status: String,
+    pub markdown: Option<String>,
+}
+
+/// Execute a non-interactive Ralph action through the application client boundary.
+#[allow(clippy::too_many_lines)]
+pub async fn execute_root_action(
+    client: &bcode_client::BcodeClient,
+    repo_root: PathBuf,
+    action: RalphRootAction,
+) -> Result<RalphRootOutput, TuiError> {
+    match action {
+        RalphRootAction::ShowStatus => {
+            let response = client
+                .ralph_run_status(RalphRunStatusRequest {
+                    repo_root,
+                    loop_state_dir: None,
+                })
+                .await?;
+            let Some(summary) = response.loop_summary else {
+                return Ok(RalphRootOutput {
+                    status: "no Ralph loops for current repository".to_owned(),
+                    markdown: None,
+                });
+            };
+            Ok(RalphRootOutput {
+                status: "Ralph status shown".to_owned(),
+                markdown: Some(format_status_note(
+                    &summary,
+                    response.active_run.as_ref(),
+                    response.interrupted_runs.len(),
+                )),
+            })
+        }
+        RalphRootAction::Run => {
+            if let Some(draft) = active_unapplied_rebuild_draft(&repo_root)? {
+                return Ok(RalphRootOutput {
+                    status: "active rebuild draft must be applied or canceled before running"
+                        .to_owned(),
+                    markdown: Some(format!(
+                        "Ralph rebuild draft is active\n* Draft: {}\n* Status: {}\n* Target loop: {}\n* Next: View/Revise/Approve/Apply the rebuild draft before preparing another autonomous run. This prevents running against stale loop context.",
+                        draft.draft_id, draft.status, draft.loop_name
+                    )),
+                });
+            }
+            let response = client
+                .run_ralph_loop(RalphRunRequest {
+                    repo_root,
+                    loop_state_dir: None,
+                    max_iterations: None,
+                    no_progress_limit: None,
+                    require_approval: true,
+                })
+                .await?;
+            Ok(RalphRootOutput {
+                status: "Ralph run prepared; approve to start".to_owned(),
+                markdown: Some(format!(
+                    "Ralph run prepared\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}\n* Next: /ralph approve",
+                    response.run.run_id,
+                    response.run.status,
+                    display_from_current_dir(&response.run.state_dir),
+                    response.run.session_id.as_deref().unwrap_or("<none>")
+                )),
+            })
+        }
+        RalphRootAction::Approve => {
+            let response = client
+                .approve_ralph_run(RalphApproveRequest {
+                    repo_root,
+                    loop_state_dir: None,
+                    run_id: None,
+                })
+                .await?;
+            Ok(RalphRootOutput {
+                status: "Ralph run approved".to_owned(),
+                markdown: Some(format!(
+                    "Ralph run approved\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}",
+                    response.run.run_id,
+                    response.run.status,
+                    display_from_current_dir(&response.run.state_dir),
+                    response.run.session_id.as_deref().unwrap_or("<none>")
+                )),
+            })
+        }
+        RalphRootAction::Stop => {
+            let response = client
+                .cancel_ralph_loop(RalphCancelRequest {
+                    repo_root,
+                    run_id: None,
+                    loop_state_dir: None,
+                })
+                .await?;
+            Ok(RalphRootOutput {
+                status: "Ralph stop requested".to_owned(),
+                markdown: Some(format!(
+                    "Ralph stop requested\n* Run: {}\n* Status: {}\n* Cancel requested: {}",
+                    response.run.run_id, response.run.status, response.cancel_requested
+                )),
+            })
+        }
+        RalphRootAction::ListRuns => execute_root_list_runs(client, repo_root).await,
+        RalphRootAction::ListIterations => execute_root_list_iterations(client, repo_root).await,
+        RalphRootAction::Resume => {
+            let response = client
+                .resume_ralph_run(RalphResumeRequest {
+                    repo_root,
+                    loop_state_dir: None,
+                    interrupted_run_id: None,
+                })
+                .await?;
+            Ok(RalphRootOutput {
+                status: "Ralph resume prepared; approval required".to_owned(),
+                markdown: Some(format!(
+                    "Ralph resume prepared\n* Interrupted run: {}\n* New run: {}\n* Status: {}\n* Next: approve before autonomous execution continues",
+                    response.interrupted_run.run_id,
+                    response.resumed_run.run_id,
+                    response.resumed_run.status
+                )),
+            })
+        }
+    }
+}
+
+async fn execute_root_list_runs(
+    client: &bcode_client::BcodeClient,
+    repo_root: PathBuf,
+) -> Result<RalphRootOutput, TuiError> {
+    let response = client
+        .list_ralph_runs(RalphListRunsRequest {
+            repo_root,
+            loop_state_dir: None,
+        })
+        .await?;
+    let Some(summary) = response.loop_summary else {
+        return Ok(RalphRootOutput {
+            status: "no Ralph loops for current repository".to_owned(),
+            markdown: None,
+        });
+    };
+    let runs = if response.runs.is_empty() {
+        "* <none>".to_owned()
+    } else {
+        response
+            .runs
+            .iter()
+            .map(format_run_detail)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(RalphRootOutput {
+        status: "Ralph runs shown".to_owned(),
+        markdown: Some(format!("Ralph runs\n* Loop: {}\n{runs}", summary.loop_name)),
+    })
+}
+
+async fn execute_root_list_iterations(
+    client: &bcode_client::BcodeClient,
+    repo_root: PathBuf,
+) -> Result<RalphRootOutput, TuiError> {
+    let response = client
+        .list_ralph_iterations(RalphListIterationsRequest {
+            repo_root,
+            loop_state_dir: None,
+            run_id: None,
+        })
+        .await?;
+    let Some(summary) = response.loop_summary else {
+        return Ok(RalphRootOutput {
+            status: "no Ralph loops for current repository".to_owned(),
+            markdown: None,
+        });
+    };
+    let run_label = response
+        .run
+        .as_ref()
+        .map_or_else(|| "<none>".to_owned(), |run| run.run_id.clone());
+    let iterations = if response.iterations.is_empty() {
+        "* <none>".to_owned()
+    } else {
+        response
+            .iterations
+            .iter()
+            .map(|iteration| {
+                let stop_reason = iteration
+                    .stop_reason
+                    .as_deref()
+                    .map_or_else(String::new, |reason| format!(" ({reason})"));
+                format!(
+                    "* #{} — {}{}",
+                    iteration.iteration_number, iteration.status, stop_reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let validations = if response.validations.is_empty() {
+        "* <none>".to_owned()
+    } else {
+        response
+            .validations
+            .iter()
+            .map(|validation| format!("* {} — {}", validation.command, validation.status))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(RalphRootOutput {
+        status: "Ralph iterations shown".to_owned(),
+        markdown: Some(format!(
+            "Ralph iterations\n* Loop: {}\n* Run: {run_label}\nIterations:\n{iterations}\nValidations:\n{validations}",
+            summary.loop_name
+        )),
+    })
+}
+
 /// Open the plugin-owned Ralph home UI.
 pub async fn open_home<W: Write>(
     io: &mut TuiIo<'_, '_, W>,

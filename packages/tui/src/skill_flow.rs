@@ -115,7 +115,7 @@ pub async fn pick_skill_for_session<W: Write>(
     }
 }
 
-fn handle_skill_picker_key(
+pub fn handle_skill_picker_key(
     picker: &mut skill_picker::SkillPickerApp,
     keymap: &BmuxKeyMap,
     stroke: KeyStroke,
@@ -277,6 +277,21 @@ fn handle_skill_argument_key(
     }
 }
 
+pub fn format_skill_manifest_markdown(manifest: &bcode_skill_models::SkillManifest) -> String {
+    let description = manifest
+        .summary
+        .description
+        .as_deref()
+        .unwrap_or("no description");
+    super::slash_commands::format_skill_details_markdown(
+        &manifest.summary.name,
+        manifest.summary.id.as_str(),
+        &manifest.summary.source.label,
+        Some(description),
+        &truncate_markdown_for_display(&manifest.instructions, 2_000),
+    )
+}
+
 async fn describe_skill(
     client: &BcodeClient,
     chat: &mut ActiveChat,
@@ -289,20 +304,9 @@ async fn describe_skill(
             return Ok(());
         }
     };
-    let description = manifest
-        .summary
-        .description
-        .as_deref()
-        .unwrap_or("no description");
     chat.push_presentation_note(
         "bcode.host",
-        super::slash_commands::format_skill_details_markdown(
-            &manifest.summary.name,
-            manifest.summary.id.as_str(),
-            &manifest.summary.source.label,
-            Some(description),
-            &truncate_markdown_for_display(&manifest.instructions, 2_000),
-        ),
+        format_skill_manifest_markdown(&manifest),
         bcode_command::CommandTextFormat::Markdown,
     );
     chat.app.set_status(format!("shown skill {skill_id}"));
@@ -317,7 +321,7 @@ pub fn start_invoke_skill_for_session(
     start_skill_action(chat, SkillActionKind::Invoke, skill_id, arguments)
 }
 
-fn start_skill_action(
+pub fn start_skill_action(
     chat: &mut ActiveChat,
     action: SkillActionKind,
     skill_id: SkillId,

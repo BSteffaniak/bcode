@@ -87,6 +87,11 @@ impl WorktreeCreateDialog {
         &self.status
     }
 
+    /// Replace the status text shown by the dialog.
+    pub fn set_status(&mut self, status: String) {
+        self.status = status;
+    }
+
     /// Return the requested worktree name.
     #[must_use]
     pub fn name_text(&self) -> String {

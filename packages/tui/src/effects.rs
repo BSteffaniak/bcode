@@ -170,6 +170,63 @@ pub enum TuiEffect {
         /// Complete command text.
         message: String,
     },
+    /// Execute one non-interactive Ralph action through the root runtime.
+    RalphAction {
+        /// Repository root for the Ralph lifecycle operation.
+        repo_root: std::path::PathBuf,
+        /// Action to execute.
+        action: super::ralph_flow::RalphRootAction,
+    },
+    /// Open a plugin-owned native surface for root-runtime presentation.
+    OpenPluginSurface {
+        /// Plugin owner.
+        plugin_id: String,
+        /// Surface kind.
+        surface_kind: String,
+        /// Instance identity.
+        instance_id: String,
+        /// Plugin-owned options.
+        options: serde_json::Value,
+        /// Working directory context.
+        working_directory: std::path::PathBuf,
+        /// Active session context.
+        session_id: Option<SessionId>,
+    },
+    /// Load bounded recent prompts before root fork selection.
+    LoadForkPrompts {
+        /// Session being forked.
+        session_id: SessionId,
+        /// Dialog submission retained across loading.
+        submission: super::session_fork_dialog::SessionForkDialogSubmission,
+    },
+    /// Load model providers before opening the root model picker.
+    LoadModelProviders,
+    /// Load models for the selected provider.
+    LoadModelPicker {
+        /// Selected provider plugin, or the default provider.
+        provider_plugin_id: Option<String>,
+    },
+    /// Load skills before opening the root skill picker.
+    LoadSkillPicker,
+    /// Load one skill manifest for root picker help.
+    DescribeSkill {
+        /// Skill to describe.
+        skill_id: SkillId,
+    },
+    /// Load reasoning status before opening the root thinking dialog.
+    LoadThinkingDialog {
+        /// Current session, if any.
+        session_id: Option<SessionId>,
+        /// Initially focused setting.
+        focus: super::thinking_dialog::ThinkingDialogFocus,
+    },
+    /// Load a bounded history window around a timeline entry.
+    LoadTimelineJump {
+        /// Active session.
+        session_id: SessionId,
+        /// Selected event sequence.
+        sequence: u64,
+    },
     /// Invoke a plugin-owned command without terminal navigation effects.
     InvokePluginCommand {
         /// Plugin owner.
@@ -465,6 +522,67 @@ pub enum TuiEffectResult {
         /// Command outcome.
         result: Result<super::slash_commands::SlashCommandOutcome, ClientError>,
     },
+    /// Root Ralph action completed.
+    RalphAction {
+        /// Completed action.
+        action: super::ralph_flow::RalphRootAction,
+        /// Presentation result.
+        result: Result<super::ralph_flow::RalphRootOutput, TuiError>,
+    },
+    /// Plugin-owned native surface opened.
+    PluginSurfaceOpened {
+        /// Plugin owner.
+        plugin_id: String,
+        /// Opened surface or error.
+        result: Result<bcode_plugin_sdk::tui::BoxedPluginTuiSurface, TuiError>,
+    },
+    /// Recent fork prompts loaded.
+    ForkPromptsLoaded {
+        /// Session being forked.
+        session_id: SessionId,
+        /// Dialog submission retained across loading.
+        submission: super::session_fork_dialog::SessionForkDialogSubmission,
+        /// Bounded recent prompts.
+        result: Result<Vec<super::session_fork_flow::ForkPromptCandidate>, TuiError>,
+    },
+    /// Model providers for the root picker loaded.
+    ModelProvidersLoaded {
+        /// Loaded plugin service summaries.
+        result: Result<Vec<bcode_ipc::PluginServiceSummary>, ClientError>,
+    },
+    /// Models for the root picker loaded.
+    ModelPickerLoaded {
+        /// Provider used for the model query.
+        provider_plugin_id: Option<String>,
+        /// Loaded normalized model list.
+        result: Result<bcode_model::ModelList, ClientError>,
+    },
+    /// Skills for the root skill picker loaded.
+    SkillPickerLoaded {
+        /// Loaded skill summaries.
+        result: Result<bcode_skill_models::SkillList, ClientError>,
+    },
+    /// Skill details for root picker help loaded.
+    SkillDescribed {
+        /// Requested skill.
+        skill_id: SkillId,
+        /// Loaded manifest.
+        result: Result<bcode_skill_models::SkillManifest, ClientError>,
+    },
+    /// Reasoning status for the root thinking dialog loaded.
+    ThinkingDialogLoaded {
+        /// Initially focused setting.
+        focus: super::thinking_dialog::ThinkingDialogFocus,
+        /// Loaded model status.
+        result: Result<bcode_ipc::SessionModelStatus, ClientError>,
+    },
+    /// Bounded timeline jump history loaded.
+    TimelineJumpLoaded {
+        /// Selected source sequence.
+        sequence: u64,
+        /// Loaded events and bounded-window flags.
+        result: Result<(Vec<bcode_session_models::SessionEvent>, bool, bool), TuiError>,
+    },
     /// Plugin command invocation completed.
     PluginCommandInvoked {
         /// Plugin owner.
@@ -666,7 +784,16 @@ impl TuiEffectResult {
             | Self::SlashPaletteLoaded { .. }
             | Self::CommandPaletteLoaded { .. }
             | Self::SlashCommandExecuted { .. }
+            | Self::ThinkingDialogLoaded { .. }
+            | Self::TimelineJumpLoaded { .. }
             | Self::PluginCommandInvoked { .. } => DaemonObservation::None,
+            Self::RalphAction { result, .. } => DaemonObservation::from_tui_result(result),
+            Self::PluginSurfaceOpened { result, .. } => DaemonObservation::from_tui_result(result),
+            Self::ForkPromptsLoaded { result, .. } => DaemonObservation::from_tui_result(result),
+            Self::ModelProvidersLoaded { result } => DaemonObservation::from_client_result(result),
+            Self::ModelPickerLoaded { result, .. } => DaemonObservation::from_client_result(result),
+            Self::SkillPickerLoaded { result } => DaemonObservation::from_client_result(result),
+            Self::SkillDescribed { result, .. } => DaemonObservation::from_client_result(result),
         }
     }
 }
@@ -742,6 +869,15 @@ enum EffectKey {
     SlashPalette,
     CommandPalette,
     SlashCommand,
+    RalphAction,
+    PluginSurface,
+    ForkPrompts,
+    ModelProviders,
+    ModelPicker,
+    SkillPicker,
+    SkillDescription,
+    ThinkingDialog,
+    TimelineJump,
     PluginCommand(String, String),
     RenameSession(SessionId),
     DeleteSession(SessionId),
@@ -928,6 +1064,15 @@ impl TuiEffect {
             | Self::LoadSlashPalette { .. }
             | Self::LoadCommandPalette
             | Self::ExecuteSlashCommand { .. }
+            | Self::RalphAction { .. }
+            | Self::OpenPluginSurface { .. }
+            | Self::LoadForkPrompts { .. }
+            | Self::LoadModelProviders
+            | Self::LoadModelPicker { .. }
+            | Self::LoadSkillPicker
+            | Self::DescribeSkill { .. }
+            | Self::LoadThinkingDialog { .. }
+            | Self::LoadTimelineJump { .. }
             | Self::InvokePluginCommand { .. } => {
                 unreachable!("daemon start failure for non-foreground effect")
             }
@@ -973,7 +1118,16 @@ impl TuiEffect {
             | Self::SaveDraft { .. }
             | Self::LoadSlashPalette { .. }
             | Self::LoadCommandPalette
-            | Self::ExecuteSlashCommand { .. } => EffectDaemonIntent::Background,
+            | Self::ExecuteSlashCommand { .. }
+            | Self::RalphAction { .. }
+            | Self::OpenPluginSurface { .. }
+            | Self::LoadForkPrompts { .. }
+            | Self::LoadModelProviders
+            | Self::LoadModelPicker { .. }
+            | Self::LoadSkillPicker
+            | Self::DescribeSkill { .. }
+            | Self::LoadThinkingDialog { .. }
+            | Self::LoadTimelineJump { .. } => EffectDaemonIntent::Background,
         }
     }
 }
@@ -1368,6 +1522,15 @@ impl TuiEffect {
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::LoadCommandPalette => EffectKey::CommandPalette,
             Self::ExecuteSlashCommand { .. } => EffectKey::SlashCommand,
+            Self::RalphAction { .. } => EffectKey::RalphAction,
+            Self::OpenPluginSurface { .. } => EffectKey::PluginSurface,
+            Self::LoadForkPrompts { .. } => EffectKey::ForkPrompts,
+            Self::LoadModelProviders => EffectKey::ModelProviders,
+            Self::LoadModelPicker { .. } => EffectKey::ModelPicker,
+            Self::LoadSkillPicker => EffectKey::SkillPicker,
+            Self::DescribeSkill { .. } => EffectKey::SkillDescription,
+            Self::LoadThinkingDialog { .. } => EffectKey::ThinkingDialog,
+            Self::LoadTimelineJump { .. } => EffectKey::TimelineJump,
             Self::InvokePluginCommand {
                 plugin_id,
                 command_id,
@@ -1555,6 +1718,99 @@ impl TuiEffect {
                 };
                 TuiEffectResult::SlashCommandExecuted { message, result }
             }
+            Self::RalphAction { repo_root, action } => TuiEffectResult::RalphAction {
+                action,
+                result: super::ralph_flow::execute_root_action(&client, repo_root, action).await,
+            },
+            Self::OpenPluginSurface {
+                plugin_id,
+                surface_kind,
+                instance_id,
+                options,
+                working_directory,
+                session_id,
+            } => {
+                let result = async {
+                    let options = super::palette_flow::hydrate_root_plugin_surface_options(
+                        &client, session_id, options,
+                    )
+                    .await;
+                    let runtime =
+                        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                            &bcode_plugin::PluginSelection::all_enabled(),
+                            &crate::static_bundled_plugins(),
+                        )
+                        .map_err(|error| TuiError::PluginService {
+                            code: "plugin_runtime_load_failed".to_owned(),
+                            message: error.to_string(),
+                        })?;
+                    crate::plugin_tui::open_plugin_tui_surface(
+                        &runtime,
+                        &plugin_id,
+                        &surface_kind,
+                        bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
+                            instance_id,
+                            repo_path: Some(working_directory),
+                            target: None,
+                            options,
+                        },
+                    )
+                    .await
+                    .map_err(|error| TuiError::PluginService {
+                        code: "tui_surface_open_failed".to_owned(),
+                        message: error.to_string(),
+                    })
+                }
+                .await;
+                TuiEffectResult::PluginSurfaceOpened { plugin_id, result }
+            }
+            Self::LoadForkPrompts {
+                session_id,
+                submission,
+            } => TuiEffectResult::ForkPromptsLoaded {
+                session_id,
+                submission,
+                result: super::session_fork_flow::load_recent_user_prompts(&client, session_id)
+                    .await,
+            },
+            Self::LoadModelProviders => TuiEffectResult::ModelProvidersLoaded {
+                result: client.plugin_services().await.map(|services| {
+                    services
+                        .into_iter()
+                        .filter(|service| {
+                            service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID
+                        })
+                        .collect()
+                }),
+            },
+            Self::LoadModelPicker { provider_plugin_id } => TuiEffectResult::ModelPickerLoaded {
+                result: client.session_model_list(provider_plugin_id.clone()).await,
+                provider_plugin_id,
+            },
+            Self::LoadSkillPicker => TuiEffectResult::SkillPickerLoaded {
+                result: client.list_skills().await,
+            },
+            Self::DescribeSkill { skill_id } => TuiEffectResult::SkillDescribed {
+                skill_id: skill_id.clone(),
+                result: client.describe_skill(skill_id).await,
+            },
+            Self::LoadThinkingDialog { session_id, focus } => {
+                let result = match session_id {
+                    Some(session_id) => client.session_model_status(session_id).await,
+                    None => client.default_model_status().await,
+                };
+                TuiEffectResult::ThinkingDialogLoaded { focus, result }
+            }
+            Self::LoadTimelineJump {
+                session_id,
+                sequence,
+            } => TuiEffectResult::TimelineJumpLoaded {
+                sequence,
+                result: super::history_flow::load_timeline_jump_events(
+                    &client, session_id, sequence,
+                )
+                .await,
+            },
             Self::InvokePluginCommand {
                 plugin_id,
                 command_id,

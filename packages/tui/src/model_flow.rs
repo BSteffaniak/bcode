@@ -104,13 +104,13 @@ pub async fn pick_model_for_session<W: Write>(
     }
 }
 
-enum ModelPickerAction {
+pub enum ModelPickerAction {
     Continue,
     Cancel,
     Select(String),
 }
 
-fn handle_model_picker_key(
+pub fn handle_model_picker_key(
     picker: &mut model_picker::ModelPickerApp,
     keymap: &BmuxKeyMap,
     provider_plugin_id: Option<&str>,

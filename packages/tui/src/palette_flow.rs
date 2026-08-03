@@ -301,9 +301,9 @@ fn insert_surface_session_id(
     }
 }
 
-async fn hydrate_plugin_surface_options(
-    services: &TuiServices<'_>,
-    chat: &ActiveChat,
+pub async fn hydrate_root_plugin_surface_options(
+    client: &bcode_client::BcodeClient,
+    session_id: Option<bcode_session_models::SessionId>,
     options: serde_json::Value,
 ) -> serde_json::Value {
     let mut map = match options {
@@ -316,39 +316,42 @@ async fn hydrate_plugin_surface_options(
             map
         }
     };
-
-    if let Ok(status) = services.passive_client.default_model_status().await
+    if let Ok(status) = client.default_model_status().await
         && let Ok(value) = serde_json::to_value(status)
     {
         map.insert("default_model_status".to_string(), value);
     }
-    if let Ok(status) = services.passive_client.server_status().await
+    if let Ok(status) = client.server_status().await
         && let Ok(value) = serde_json::to_value(status)
     {
         map.insert("server_status".to_string(), value);
     }
-    let session_id = chat.app.session_id();
     insert_surface_session_id(&mut map, session_id);
     if let Some(session_id) = session_id {
-        if let Ok(status) = services
-            .passive_client
-            .session_model_status(session_id)
-            .await
+        if let Ok(status) = client.session_model_status(session_id).await
             && let Ok(value) = serde_json::to_value(status)
         {
             map.insert("session_model_status".to_string(), value);
         }
-        if let Ok(skills) = services.passive_client.active_skills(session_id).await
+        if let Ok(skills) = client.active_skills(session_id).await
             && let Ok(value) = serde_json::to_value(skills)
         {
             map.insert("active_skills".to_string(), value);
         }
     }
-
     serde_json::Value::Object(map)
 }
 
-fn apply_plugin_surface_outcome(
+async fn hydrate_plugin_surface_options(
+    services: &TuiServices<'_>,
+    chat: &ActiveChat,
+    options: serde_json::Value,
+) -> serde_json::Value {
+    hydrate_root_plugin_surface_options(services.passive_client, chat.app.session_id(), options)
+        .await
+}
+
+pub fn apply_plugin_surface_outcome(
     chat: &mut ActiveChat,
     plugin_id: &str,
     outcome: Option<serde_json::Value>,

@@ -127,6 +127,69 @@ pub enum SlashPaletteRootOutcome {
     Submit,
 }
 
+pub enum ThinkingDialogRootOutcome {
+    Unhandled,
+    Handled,
+    Apply {
+        effort: Option<String>,
+        summary: Option<String>,
+        visible: bool,
+        mode: bcode_config::TuiThinkingMode,
+    },
+}
+
+pub enum TimelineDialogRootOutcome {
+    Unhandled,
+    Handled,
+    Jump(super::timeline_dialog::TimelineEntry),
+}
+
+struct RootPluginSurface {
+    plugin_id: String,
+    surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+}
+
+struct RootForkPromptPicker {
+    session_id: bcode_session_models::SessionId,
+    submission: super::session_fork_dialog::SessionForkDialogSubmission,
+    prompts: Vec<super::session_fork_flow::ForkPromptCandidate>,
+    selected: usize,
+}
+
+struct RootModelPicker {
+    provider_plugin_id: Option<String>,
+    picker: super::model_picker::ModelPickerApp,
+}
+
+pub enum SessionForkRootOutcome {
+    Handled,
+    Canceled,
+    LoadPrompts {
+        session_id: bcode_session_models::SessionId,
+        submission: super::session_fork_dialog::SessionForkDialogSubmission,
+    },
+    CreateClone {
+        session_id: bcode_session_models::SessionId,
+        submission: super::session_fork_dialog::SessionForkDialogSubmission,
+    },
+    CreateFork {
+        session_id: bcode_session_models::SessionId,
+        submission: super::session_fork_dialog::SessionForkDialogSubmission,
+        prompt: super::session_fork_flow::ForkPromptCandidate,
+    },
+}
+
+pub enum WorktreeCreateDialogRootOutcome {
+    Unhandled,
+    Handled,
+    Canceled,
+    Create {
+        name: String,
+        target: super::wt_create_dialog::WorktreeCreateTarget,
+        base: super::wt_create_dialog::WorktreeCreateBase,
+    },
+}
+
 pub struct ChatLoopState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
@@ -135,6 +198,13 @@ pub struct ChatLoopState {
     pub(super) permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
+    session_fork_dialog: Option<super::session_fork_dialog::SessionForkDialog>,
+    fork_prompt_picker: Option<RootForkPromptPicker>,
+    plugin_surface: Option<RootPluginSurface>,
+    provider_picker: Option<super::provider_picker::ProviderPickerApp>,
+    model_picker: Option<RootModelPicker>,
+    skill_picker: Option<super::skill_picker::SkillPickerApp>,
+    worktree_create_dialog: Option<super::wt_create_dialog::WorktreeCreateDialog>,
     interactive_surface: Option<InteractiveSurfaceState>,
     interactive_surface_area: Option<Rect>,
     interactive_surface_queue: InteractiveSurfaceQueue,
@@ -170,6 +240,13 @@ impl ChatLoopState {
             permission_dialog: None,
             thinking_dialog: None,
             timeline_dialog: None,
+            session_fork_dialog: None,
+            fork_prompt_picker: None,
+            plugin_surface: None,
+            provider_picker: None,
+            model_picker: None,
+            skill_picker: None,
+            worktree_create_dialog: None,
             interactive_surface: None,
             interactive_surface_area: None,
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
@@ -443,6 +520,457 @@ impl ChatLoopState {
         }
         self.slash_palette = None;
         true
+    }
+
+    pub const fn has_worktree_create_dialog(&self) -> bool {
+        self.worktree_create_dialog.is_some()
+    }
+
+    pub const fn has_root_plugin_surface(&self) -> bool {
+        self.plugin_surface.is_some()
+    }
+
+    pub fn handle_root_plugin_surface_event(
+        &mut self,
+        event: &Event,
+        client: &BcodeClient,
+    ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
+        let surface = self.plugin_surface.as_mut()?;
+        let host = super::plugin_surface_host::root_host(
+            bmux_tui_runtime::InvalidationSignal::new(),
+            client.clone(),
+        );
+        Some(surface.surface.handle_event(event, &host))
+    }
+
+    pub fn close_root_plugin_surface_with_outcome(
+        &mut self,
+        outcome: Option<serde_json::Value>,
+    ) -> Option<(String, Option<serde_json::Value>)> {
+        let surface = self.plugin_surface.take()?;
+        Some((surface.plugin_id, outcome))
+    }
+
+    pub fn close_root_plugin_surface(&mut self) {
+        self.plugin_surface = None;
+    }
+
+    pub fn open_session_fork_dialog(&mut self, chat: &mut ActiveChat) {
+        let Some(session_id) = chat.session_id else {
+            chat.app.set_status("No active session".to_owned());
+            return;
+        };
+        let source_title = chat
+            .app
+            .session_title()
+            .map_or_else(|| session_id.to_string(), ToString::to_string);
+        self.session_fork_dialog = Some(super::session_fork_dialog::SessionForkDialog::new(
+            super::session_fork_dialog::SessionForkDialogMode::Fork,
+            &format!("[fork] {source_title}"),
+        ));
+        chat.app.set_status("configure session fork".to_owned());
+    }
+
+    pub const fn has_session_fork_flow(&self) -> bool {
+        self.session_fork_dialog.is_some() || self.fork_prompt_picker.is_some()
+    }
+
+    pub fn handle_session_fork_event(
+        &mut self,
+        chat: &ActiveChat,
+        event: &Event,
+    ) -> SessionForkRootOutcome {
+        use bmux_tui_components::text_input::TextInputControl;
+
+        if let Some(dialog) = self.session_fork_dialog.as_mut() {
+            match event {
+                Event::Paste(text)
+                    if dialog.focus()
+                        == super::session_fork_dialog::SessionForkDialogFocus::Name =>
+                {
+                    let _ = TextInputControl::new(&super::session_fork_dialog::name_input_policy())
+                        .handle_paste(dialog.name_mut(), text);
+                }
+                Event::Key(stroke) => match stroke.key {
+                    bmux_keyboard::KeyCode::Escape => {
+                        self.session_fork_dialog = None;
+                        return SessionForkRootOutcome::Canceled;
+                    }
+                    bmux_keyboard::KeyCode::Tab => dialog.focus_next(),
+                    bmux_keyboard::KeyCode::Enter => {
+                        let submission = dialog.submission();
+                        self.session_fork_dialog = None;
+                        let session_id = chat.session_id.expect("fork dialog has active session");
+                        if submission.mode
+                            == super::session_fork_dialog::SessionForkDialogMode::Clone
+                        {
+                            return SessionForkRootOutcome::CreateClone {
+                                session_id,
+                                submission,
+                            };
+                        }
+                        return SessionForkRootOutcome::LoadPrompts {
+                            session_id,
+                            submission,
+                        };
+                    }
+                    bmux_keyboard::KeyCode::Left => dialog.value_previous(),
+                    bmux_keyboard::KeyCode::Right => dialog.value_next(),
+                    _ if dialog.focus()
+                        == super::session_fork_dialog::SessionForkDialogFocus::Name =>
+                    {
+                        let _ =
+                            TextInputControl::new(&super::session_fork_dialog::name_input_policy())
+                                .handle_key(dialog.name_mut(), *stroke);
+                    }
+                    _ => {}
+                },
+                Event::Focus(_)
+                | Event::Resize(_)
+                | Event::Tick
+                | Event::User(_)
+                | Event::Paste(_)
+                | Event::Mouse(_) => {}
+            }
+            return SessionForkRootOutcome::Handled;
+        }
+        let picker = self
+            .fork_prompt_picker
+            .as_mut()
+            .expect("fork flow has dialog or prompt picker");
+        if let Event::Key(stroke) = event {
+            match stroke.key {
+                bmux_keyboard::KeyCode::Escape => {
+                    self.fork_prompt_picker = None;
+                    return SessionForkRootOutcome::Canceled;
+                }
+                bmux_keyboard::KeyCode::Enter => {
+                    let prompt = picker.prompts[picker.selected].clone();
+                    let outcome = SessionForkRootOutcome::CreateFork {
+                        session_id: picker.session_id,
+                        submission: picker.submission.clone(),
+                        prompt,
+                    };
+                    self.fork_prompt_picker = None;
+                    return outcome;
+                }
+                bmux_keyboard::KeyCode::Up if picker.selected > 0 => {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                bmux_keyboard::KeyCode::Down
+                    if picker.selected.saturating_add(1) < picker.prompts.len() =>
+                {
+                    picker.selected = picker.selected.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        SessionForkRootOutcome::Handled
+    }
+
+    pub const fn has_model_picker(&self) -> bool {
+        self.provider_picker.is_some() || self.model_picker.is_some()
+    }
+
+    pub fn handle_model_picker_event(
+        &mut self,
+        keymap: &super::keymap::BmuxKeyMap,
+        event: &Event,
+    ) -> Option<(Option<String>, super::model_flow::ModelPickerAction)> {
+        if let Some(picker) = self.provider_picker.as_mut() {
+            match event {
+                Event::Paste(text) => {
+                    let _ = super::text_input_flow::handle_paste(picker.filter_mut(), text);
+                    picker.refresh_filter();
+                }
+                Event::Key(stroke) => match stroke.key {
+                    bmux_keyboard::KeyCode::Escape => {
+                        self.provider_picker = None;
+                        return Some((None, super::model_flow::ModelPickerAction::Cancel));
+                    }
+                    bmux_keyboard::KeyCode::Enter => {
+                        let provider = picker.selected_provider_id();
+                        self.provider_picker = None;
+                        return Some((provider, super::model_flow::ModelPickerAction::Continue));
+                    }
+                    bmux_keyboard::KeyCode::Up => picker.select_previous(),
+                    bmux_keyboard::KeyCode::Down => picker.select_next(),
+                    _ => {
+                        if super::text_input_flow::handle_key(picker.filter_mut(), keymap, *stroke)
+                            != bmux_tui_components::text_input::TextInputOutcome::Ignored
+                        {
+                            picker.refresh_filter();
+                        }
+                    }
+                },
+                Event::Mouse(mouse) => {
+                    if let Some(row) = super::picker_mouse::picker_row_from_mouse(*mouse)
+                        && picker.select_visible(row)
+                    {
+                        let provider = picker.selected_provider_id();
+                        self.provider_picker = None;
+                        return Some((provider, super::model_flow::ModelPickerAction::Continue));
+                    }
+                }
+                Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) => {}
+            }
+            return None;
+        }
+        let model = self.model_picker.as_mut()?;
+        if matches!(event, Event::Key(stroke) if stroke.key == bmux_keyboard::KeyCode::Enter)
+            && let Some(model_id) = model.picker.selected_ignored_model_id()
+        {
+            model.picker.set_status(format!(
+                "{model_id} is ignored; press u to remove state ignore or I to hide ignored models"
+            ));
+            return None;
+        }
+        let action = match event {
+            Event::Paste(text) => {
+                model.picker.focus_filter();
+                let _ = super::text_input_flow::handle_paste(model.picker.filter_mut(), text);
+                model.picker.refresh_filter();
+                super::model_flow::ModelPickerAction::Continue
+            }
+            Event::Key(stroke) => super::model_flow::handle_model_picker_key(
+                &mut model.picker,
+                keymap,
+                model.provider_plugin_id.as_deref(),
+                *stroke,
+            ),
+            Event::Mouse(mouse) => super::picker_mouse::picker_row_from_mouse(*mouse)
+                .filter(|row| model.picker.select_visible(*row))
+                .and_then(|_| model.picker.selected_model_id())
+                .map_or(super::model_flow::ModelPickerAction::Continue, |model_id| {
+                    super::model_flow::ModelPickerAction::Select(model_id)
+                }),
+            Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) => {
+                super::model_flow::ModelPickerAction::Continue
+            }
+        };
+        let provider = model.provider_plugin_id.clone();
+        if !matches!(action, super::model_flow::ModelPickerAction::Continue) {
+            self.model_picker = None;
+        }
+        Some((provider, action))
+    }
+
+    pub const fn has_skill_picker(&self) -> bool {
+        self.skill_picker.is_some()
+    }
+
+    pub fn handle_skill_picker_event(
+        &mut self,
+        keymap: &super::keymap::BmuxKeyMap,
+        event: &Event,
+    ) -> Option<super::skill_picker::SkillPickerAction> {
+        let picker = self.skill_picker.as_mut()?;
+        let action = match event {
+            Event::Paste(text) => {
+                match picker.mode() {
+                    super::skill_picker::SkillPickerMode::Filter => {
+                        let _ = super::text_input_flow::handle_paste(picker.filter_mut(), text);
+                        picker.refresh_filter();
+                    }
+                    super::skill_picker::SkillPickerMode::Argument => {
+                        let _ = super::text_input_flow::handle_paste(picker.argument_mut(), text);
+                    }
+                }
+                super::skill_picker::SkillPickerAction::Continue
+            }
+            Event::Key(stroke) => {
+                super::skill_flow::handle_skill_picker_key(picker, keymap, *stroke)
+            }
+            Event::Mouse(mouse) => {
+                if let Some(row) = super::picker_mouse::picker_row_from_mouse(*mouse)
+                    && picker.select_visible(row)
+                {
+                    picker.start_argument();
+                }
+                super::skill_picker::SkillPickerAction::Continue
+            }
+            Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) => {
+                super::skill_picker::SkillPickerAction::Continue
+            }
+        };
+        if !matches!(action, super::skill_picker::SkillPickerAction::Continue) {
+            self.skill_picker = None;
+        }
+        Some(action)
+    }
+
+    pub fn open_worktree_create_dialog(&mut self, chat: &mut ActiveChat) {
+        let current_session_id = chat.app.session_id();
+        let default_name = current_session_id.map_or_else(
+            || "new-session".to_owned(),
+            |session_id| {
+                chat.app
+                    .session_title()
+                    .map_or_else(|| format!("session-{session_id}"), ToString::to_string)
+            },
+        );
+        self.worktree_create_dialog = Some(super::wt_create_dialog::WorktreeCreateDialog::new(
+            &default_name,
+            current_session_id.is_some(),
+        ));
+        chat.app.set_status("create worktree".to_owned());
+    }
+
+    pub fn handle_worktree_create_dialog_event(
+        &mut self,
+        keymap: &super::keymap::BmuxKeyMap,
+        event: &Event,
+    ) -> WorktreeCreateDialogRootOutcome {
+        use bmux_tui_components::text_input::TextInputControl;
+
+        let Some(dialog) = self.worktree_create_dialog.as_mut() else {
+            return WorktreeCreateDialogRootOutcome::Unhandled;
+        };
+        match event {
+            Event::Paste(text)
+                if dialog.focus() == super::wt_create_dialog::WorktreeCreateFocus::Name =>
+            {
+                let _ = TextInputControl::new(&super::wt_create_dialog::name_input_policy())
+                    .handle_paste(dialog.name_mut(), text);
+            }
+            Event::Key(stroke) => match stroke.key {
+                bmux_keyboard::KeyCode::Escape => {
+                    self.worktree_create_dialog = None;
+                    return WorktreeCreateDialogRootOutcome::Canceled;
+                }
+                bmux_keyboard::KeyCode::Tab => dialog.focus_next(),
+                bmux_keyboard::KeyCode::Enter => {
+                    let name = dialog.name_text();
+                    if name.is_empty() {
+                        dialog.set_status("worktree name is required".to_owned());
+                        return WorktreeCreateDialogRootOutcome::Handled;
+                    }
+                    let outcome = WorktreeCreateDialogRootOutcome::Create {
+                        name,
+                        target: dialog.target(),
+                        base: dialog.base(),
+                    };
+                    self.worktree_create_dialog = None;
+                    return outcome;
+                }
+                bmux_keyboard::KeyCode::Left
+                    if dialog.focus() != super::wt_create_dialog::WorktreeCreateFocus::Name =>
+                {
+                    dialog.previous_choice();
+                }
+                bmux_keyboard::KeyCode::Right
+                    if dialog.focus() != super::wt_create_dialog::WorktreeCreateFocus::Name =>
+                {
+                    dialog.next_choice();
+                }
+                _ if dialog.focus() == super::wt_create_dialog::WorktreeCreateFocus::Name => {
+                    if let Some(motion) = keymap.editor_selection_motion_for_key(*stroke) {
+                        dialog.name_mut().buffer_mut().move_cursor_with_selection(
+                            motion,
+                            bmux_text_edit::SelectionMode::Extend,
+                        );
+                        dialog
+                            .name_mut()
+                            .sync_scroll_to_cursor(&super::wt_create_dialog::name_input_policy());
+                    } else if let Some(command) = keymap.editor_command_for_key(*stroke) {
+                        dialog.name_mut().buffer_mut().apply_command(command);
+                        dialog
+                            .name_mut()
+                            .sync_scroll_to_cursor(&super::wt_create_dialog::name_input_policy());
+                    } else {
+                        let _ =
+                            TextInputControl::new(&super::wt_create_dialog::name_input_policy())
+                                .handle_key(dialog.name_mut(), *stroke);
+                    }
+                }
+                _ => {}
+            },
+            Event::Mouse(mouse)
+                if dialog.focus() == super::wt_create_dialog::WorktreeCreateFocus::Name =>
+            {
+                let _ = TextInputControl::new(&super::wt_create_dialog::name_input_policy())
+                    .handle_mouse(dialog.name_mut(), *mouse);
+            }
+            Event::Focus(_)
+            | Event::Resize(_)
+            | Event::Tick
+            | Event::User(_)
+            | Event::Paste(_)
+            | Event::Mouse(_) => {}
+        }
+        WorktreeCreateDialogRootOutcome::Handled
+    }
+
+    pub fn handle_timeline_dialog_key(
+        &mut self,
+        chat: &mut ActiveChat,
+        stroke: KeyStroke,
+    ) -> TimelineDialogRootOutcome {
+        let Some(dialog) = self.timeline_dialog.as_mut() else {
+            return TimelineDialogRootOutcome::Unhandled;
+        };
+        match stroke.key {
+            bmux_keyboard::KeyCode::Up | bmux_keyboard::KeyCode::Char('k') => {
+                dialog.select_previous();
+            }
+            bmux_keyboard::KeyCode::Down | bmux_keyboard::KeyCode::Char('j') => {
+                dialog.select_next();
+            }
+            bmux_keyboard::KeyCode::PageUp => dialog.page_previous(10),
+            bmux_keyboard::KeyCode::PageDown => dialog.page_next(10),
+            bmux_keyboard::KeyCode::Home => dialog.select_first(),
+            bmux_keyboard::KeyCode::End => dialog.select_last(),
+            bmux_keyboard::KeyCode::Escape => {
+                self.timeline_dialog = None;
+                chat.app.set_status("timeline closed".to_owned());
+                return TimelineDialogRootOutcome::Handled;
+            }
+            bmux_keyboard::KeyCode::Enter => {
+                let selected = dialog.selected_entry().cloned();
+                self.timeline_dialog = None;
+                return selected.map_or(
+                    TimelineDialogRootOutcome::Handled,
+                    TimelineDialogRootOutcome::Jump,
+                );
+            }
+            _ => return TimelineDialogRootOutcome::Unhandled,
+        }
+        chat.app.set_status("timeline".to_owned());
+        TimelineDialogRootOutcome::Handled
+    }
+
+    pub fn handle_thinking_dialog_key(
+        &mut self,
+        chat: &mut ActiveChat,
+        stroke: KeyStroke,
+    ) -> ThinkingDialogRootOutcome {
+        let Some(dialog) = self.thinking_dialog.as_mut() else {
+            return ThinkingDialogRootOutcome::Unhandled;
+        };
+        match stroke.key {
+            bmux_keyboard::KeyCode::Up => dialog.focus_previous(),
+            bmux_keyboard::KeyCode::Down => dialog.focus_next(),
+            bmux_keyboard::KeyCode::Char(' ') => dialog.cycle_focused(),
+            bmux_keyboard::KeyCode::Escape => {
+                self.thinking_dialog = None;
+                chat.app
+                    .set_status("reasoning output settings canceled".to_owned());
+                return ThinkingDialogRootOutcome::Handled;
+            }
+            bmux_keyboard::KeyCode::Enter => {
+                let dialog = self.thinking_dialog.take().expect("dialog checked above");
+                return ThinkingDialogRootOutcome::Apply {
+                    effort: dialog.effort().map(ToOwned::to_owned),
+                    summary: dialog.summary().map(ToOwned::to_owned),
+                    visible: dialog.visible(),
+                    mode: dialog.mode(),
+                };
+            }
+            _ => return ThinkingDialogRootOutcome::Unhandled,
+        }
+        chat.app
+            .set_status("reasoning output setting changed".to_owned());
+        ThinkingDialogRootOutcome::Handled
     }
 
     pub fn session_changed(&mut self, session_id: Option<bcode_session_models::SessionId>) {
@@ -1314,11 +1842,148 @@ pub fn apply_effect_result(
             }
         }
         TuiEffectResult::SlashCommandExecuted { message, result } => match result {
-            Ok(outcome) => apply_root_slash_command_outcome(chat, &message, outcome),
+            Ok(outcome) => apply_root_slash_command_outcome(chat, loop_state, &message, outcome),
             Err(error) => {
                 chat.app.restore_pending_submission(&message);
                 report_nonfatal_client_error(chat, "Slash command failed", &error);
             }
+        },
+        TuiEffectResult::PluginSurfaceOpened { plugin_id, result } => match result {
+            Ok(surface) => {
+                loop_state.plugin_surface = Some(RootPluginSurface { plugin_id, surface });
+                chat.app.set_status("plugin surface opened".to_owned());
+            }
+            Err(error) => report_nonfatal_tui_error(chat, "Plugin surface unavailable", &error),
+        },
+        TuiEffectResult::RalphAction { action, result } => match result {
+            Ok(output) => {
+                if let Some(markdown) = output.markdown {
+                    chat.push_presentation_markdown("bcode.ralph", markdown);
+                }
+                chat.app.set_status(output.status);
+            }
+            Err(error) => {
+                report_nonfatal_tui_error(chat, &format!("Ralph {action:?} action failed"), &error);
+            }
+        },
+        TuiEffectResult::ForkPromptsLoaded {
+            session_id,
+            submission,
+            result,
+        } => match result {
+            Ok(prompts) if prompts.is_empty() => {
+                chat.app
+                    .set_status("No user prompts available to fork".to_owned());
+            }
+            Ok(prompts) => {
+                loop_state.fork_prompt_picker = Some(RootForkPromptPicker {
+                    session_id,
+                    submission,
+                    prompts,
+                    selected: 0,
+                });
+                chat.app
+                    .set_status("select the prompt to edit in the fork".to_owned());
+            }
+            Err(error) => {
+                report_nonfatal_tui_error(chat, "Fork prompt history unavailable", &error);
+            }
+        },
+        TuiEffectResult::ModelProvidersLoaded { result } => match result {
+            Ok(providers) if providers.len() > 1 => {
+                loop_state.provider_picker =
+                    Some(super::provider_picker::ProviderPickerApp::new(providers));
+                chat.app.set_status("select a model provider".to_owned());
+            }
+            Ok(providers) => {
+                let provider_plugin_id =
+                    providers.first().map(|provider| provider.plugin_id.clone());
+                chat.replace_effect(TuiEffect::LoadModelPicker { provider_plugin_id });
+                chat.app.set_status("loading models…".to_owned());
+            }
+            Err(error) => report_nonfatal_client_error(chat, "Model providers unavailable", &error),
+        },
+        TuiEffectResult::ModelPickerLoaded {
+            provider_plugin_id,
+            result,
+        } => match result {
+            Ok(models) => {
+                let status = provider_plugin_id.as_ref().map_or_else(
+                    || "Select a model".to_owned(),
+                    |provider| format!("Select a model from {provider}"),
+                );
+                loop_state.model_picker = Some(RootModelPicker {
+                    provider_plugin_id,
+                    picker: super::model_picker::ModelPickerApp::new_with_status(
+                        models.models,
+                        status,
+                    ),
+                });
+                chat.app.set_status("select a model".to_owned());
+            }
+            Err(error) => report_nonfatal_client_error(chat, "Model list unavailable", &error),
+        },
+        TuiEffectResult::SkillPickerLoaded { result } => match result {
+            Ok(skills) if skills.skills.is_empty() => {
+                chat.app.set_status("no skills available".to_owned());
+                chat.push_presentation_note(
+                    "bcode.host",
+                    "No skills are available.".to_owned(),
+                    bcode_command::CommandTextFormat::PlainText,
+                );
+            }
+            Ok(skills) => {
+                loop_state.skill_picker =
+                    Some(super::skill_picker::SkillPickerApp::new(skills.skills));
+                chat.app.set_status("select a skill".to_owned());
+            }
+            Err(error) => report_nonfatal_client_error(chat, "Skills unavailable", &error),
+        },
+        TuiEffectResult::SkillDescribed { skill_id, result } => match result {
+            Ok(manifest) => {
+                chat.push_presentation_note(
+                    "bcode.host",
+                    super::skill_flow::format_skill_manifest_markdown(&manifest),
+                    bcode_command::CommandTextFormat::Markdown,
+                );
+                chat.app.set_status(format!("shown skill {skill_id}"));
+            }
+            Err(error) => report_nonfatal_client_error(chat, "Skill details unavailable", &error),
+        },
+        TuiEffectResult::ThinkingDialogLoaded { focus, result } => match result {
+            Ok(mut status) => {
+                if let Some(pending_effort) = chat.app.pending_reasoning_effort() {
+                    status.reasoning_effort = Some(pending_effort.to_owned());
+                }
+                chat.app.apply_model_status(status.clone());
+                loop_state.thinking_dialog =
+                    Some(super::thinking_dialog::ThinkingDialogState::new_focused(
+                        chat.app.reasoning_visible(),
+                        chat.app.reasoning_display_mode(),
+                        &status,
+                        focus,
+                    ));
+                chat.app
+                    .set_status("reasoning output settings: enter apply, esc cancel".to_owned());
+            }
+            Err(error) => {
+                report_nonfatal_client_error(chat, "Reasoning output settings unavailable", &error);
+            }
+        },
+        TuiEffectResult::TimelineJumpLoaded { sequence, result } => match result {
+            Ok((events, has_older, has_newer)) => {
+                chat.app
+                    .replace_transcript_window(&events, has_older, has_newer, sequence);
+                if chat.app.transcript_index_for_sequence(sequence).is_some() {
+                    chat.app.request_transcript_top_anchor_sequence(sequence);
+                    chat.app.set_status("jumped to timeline message".to_owned());
+                } else {
+                    chat.app.set_status(format!(
+                        "timeline message seq {sequence} was not in the loaded window"
+                    ));
+                }
+            }
+            Err(error) => report_nonfatal_tui_error(chat, "Timeline jump unavailable", &error),
         },
         TuiEffectResult::PluginCommandInvoked { plugin_id, result } => match result {
             Ok(response) => {
@@ -1336,9 +2001,25 @@ pub fn apply_effect_result(
                         bcode_command::CommandEffect::ToggleSurface { surface_id } => chat
                             .app
                             .set_status(format!("surface toggle requested: {surface_id}")),
-                        bcode_command::CommandEffect::OpenPluginSurface { .. } => chat
-                            .app
-                            .set_status("plugin surface pending root screen migration".to_owned()),
+                        bcode_command::CommandEffect::OpenPluginSurface {
+                            surface_kind,
+                            instance_id,
+                            options,
+                        } => {
+                            chat.replace_effect(TuiEffect::OpenPluginSurface {
+                                plugin_id: plugin_id.clone(),
+                                surface_kind,
+                                instance_id,
+                                options,
+                                working_directory: chat
+                                    .app
+                                    .working_directory()
+                                    .unwrap_or_else(|| std::path::Path::new("."))
+                                    .to_path_buf(),
+                                session_id: chat.session_id,
+                            });
+                            chat.app.set_status("opening plugin surface…".to_owned());
+                        }
                     }
                 }
             }
@@ -1733,6 +2414,7 @@ fn apply_slash_palette_result(
 #[allow(clippy::too_many_lines)]
 fn apply_root_slash_command_outcome(
     chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
     message: &str,
     outcome: super::slash_commands::SlashCommandOutcome,
 ) {
@@ -1843,33 +2525,147 @@ fn apply_root_slash_command_outcome(
                 .app
                 .set_status(format!("host slash route pending root navigation: {route}")),
         },
+        SlashCommandOutcome::OpenTimeline => {
+            let entries = if chat.session_id.is_some() {
+                chat.app.timeline_entries()
+            } else {
+                Vec::new()
+            };
+            loop_state.timeline_dialog =
+                Some(super::timeline_dialog::TimelineDialogState::new(entries));
+            chat.app
+                .set_status("timeline: select a user message".to_owned());
+        }
+        SlashCommandOutcome::DraftAgentSelected {
+            agent_id,
+            agent_name,
+            agent_accent,
+        } => {
+            if chat.app.session_id().is_some() {
+                chat.app.set_pending_agent(agent_id, agent_accent);
+                chat.app
+                    .set_status(agent_selection_status(chat, &agent_name));
+            } else {
+                chat.app.set_current_agent(agent_id, agent_accent);
+                chat.app.set_status(format!("agent set to {agent_name}"));
+            }
+        }
+        SlashCommandOutcome::OpenThinkingSettings(focus) => {
+            chat.replace_effect(TuiEffect::LoadThinkingDialog {
+                session_id: chat.session_id,
+                focus,
+            });
+            chat.app
+                .set_status("loading reasoning output settings…".to_owned());
+        }
+        SlashCommandOutcome::BuildRalphPrompt(kind) => {
+            if let Err(error) = super::ralph_flow::show_prompt(chat, kind) {
+                report_nonfatal_tui_error(chat, "Ralph prompt unavailable", &error);
+            }
+        }
+        SlashCommandOutcome::OpenRalphProgress => {
+            if let Err(error) = super::ralph_flow::open_progress(chat) {
+                report_nonfatal_tui_error(chat, "Ralph progress unavailable", &error);
+            }
+        }
+        SlashCommandOutcome::InvokeSkill {
+            skill_id,
+            arguments,
+        } => {
+            chat.start_effect(TuiEffect::SkillAction {
+                request: Box::new(super::effects::SkillActionRequest {
+                    session_id: chat.session_id,
+                    launch_working_directory: chat
+                        .app
+                        .working_directory()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf(),
+                    skill_id,
+                    action: super::effects::SkillActionKind::Invoke,
+                    arguments,
+                    provider_plugin_id: chat
+                        .app
+                        .selected_provider_plugin_id()
+                        .map(ToOwned::to_owned),
+                    model_id: chat.app.selected_model_id().map(ToOwned::to_owned),
+                    agent_id: chat.app.pending_agent_id().map(ToOwned::to_owned),
+                    reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
+                    reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
+                    reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),
+                    event_sender: chat.event_sender.clone(),
+                }),
+            });
+        }
+        SlashCommandOutcome::CloneSession { session_id, name } => {
+            chat.start_effect(TuiEffect::CloneSession {
+                session_id,
+                name,
+                switch_after_create: true,
+                install_draft: true,
+                initial_window_request: super::history_flow::initial_transcript_window_request(
+                    bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+                ),
+            });
+            chat.app.set_status("cloning session…".to_owned());
+        }
+        SlashCommandOutcome::OpenWorktreeCreateDialog => {
+            loop_state.open_worktree_create_dialog(chat);
+        }
+        SlashCommandOutcome::OpenForkSessionWizard => {
+            loop_state.open_session_fork_dialog(chat);
+        }
+        SlashCommandOutcome::PickModel => {
+            chat.replace_effect(TuiEffect::LoadModelProviders);
+            chat.app.set_status("loading model providers…".to_owned());
+        }
+        SlashCommandOutcome::PickSkill => {
+            chat.replace_effect(TuiEffect::LoadSkillPicker);
+            chat.app.set_status("loading skills…".to_owned());
+        }
+        SlashCommandOutcome::ShowRalphStatus => {
+            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::ShowStatus);
+        }
+        SlashCommandOutcome::RunRalphLoop => {
+            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::Run);
+        }
+        SlashCommandOutcome::ApproveRalphRun => {
+            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::Approve);
+        }
+        SlashCommandOutcome::StopRalphLoop => {
+            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::Stop);
+        }
+        SlashCommandOutcome::ListRalphRuns => {
+            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::ListRuns);
+        }
+        SlashCommandOutcome::ListRalphIterations => {
+            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::ListIterations);
+        }
+        SlashCommandOutcome::ResumeRalphRun => {
+            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::Resume);
+        }
         SlashCommandOutcome::Unknown(_)
-        | SlashCommandOutcome::OpenTimeline
-        | SlashCommandOutcome::DraftAgentSelected { .. }
         | SlashCommandOutcome::PickSession
-        | SlashCommandOutcome::PickModel
-        | SlashCommandOutcome::OpenWorktreeCreateDialog
-        | SlashCommandOutcome::OpenForkSessionWizard
-        | SlashCommandOutcome::CloneSession { .. }
         | SlashCommandOutcome::OpenRalphHome
-        | SlashCommandOutcome::OpenRalphStartDialog
-        | SlashCommandOutcome::ShowRalphStatus
-        | SlashCommandOutcome::RunRalphLoop
-        | SlashCommandOutcome::ApproveRalphRun
-        | SlashCommandOutcome::StopRalphLoop
-        | SlashCommandOutcome::ListRalphRuns
-        | SlashCommandOutcome::ListRalphIterations
-        | SlashCommandOutcome::ResumeRalphRun
-        | SlashCommandOutcome::OpenRalphProgress
-        | SlashCommandOutcome::BuildRalphPrompt(_)
-        | SlashCommandOutcome::PickSkill
-        | SlashCommandOutcome::InvokeSkill { .. }
-        | SlashCommandOutcome::OpenThinkingSettings(_) => {
+        | SlashCommandOutcome::OpenRalphStartDialog => {
             chat.app.restore_pending_submission(message);
             chat.app
                 .set_status("slash command pending root screen migration".to_owned());
         }
     }
+}
+
+fn start_root_ralph_action(chat: &mut ActiveChat, action: super::ralph_flow::RalphRootAction) {
+    let repo_root = chat.app.working_directory().map_or_else(
+        || std::env::current_dir().ok(),
+        |path| Some(path.to_path_buf()),
+    );
+    let Some(repo_root) = repo_root else {
+        chat.app
+            .set_status("Ralph repository root unavailable".to_owned());
+        return;
+    };
+    chat.replace_effect(TuiEffect::RalphAction { repo_root, action });
+    chat.app.set_status("running Ralph action…".to_owned());
 }
 
 fn apply_submit_message_result(
@@ -2833,6 +3629,33 @@ pub fn draw_chat_frame<W: Write>(
         }
         if let Some(dialog) = &mut loop_state.timeline_dialog {
             timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
+        }
+        if let Some(surface) = &mut loop_state.plugin_surface {
+            let area = frame.area();
+            surface.surface.render(area, frame);
+        }
+        if let Some(dialog) = &mut loop_state.session_fork_dialog {
+            super::session_fork_dialog_render::render_dialog(dialog, frame, theme);
+        }
+        if let Some(picker) = &loop_state.fork_prompt_picker {
+            super::session_fork_flow::render_prompt_picker(
+                frame,
+                &picker.prompts,
+                picker.selected,
+                theme,
+            );
+        }
+        if let Some(picker) = &mut loop_state.provider_picker {
+            super::provider_picker_render::render_provider_picker(picker, frame, theme);
+        }
+        if let Some(model) = &mut loop_state.model_picker {
+            super::model_picker_render::render_model_picker(&mut model.picker, frame, theme);
+        }
+        if let Some(picker) = &mut loop_state.skill_picker {
+            super::skill_picker_render::render_skill_picker(picker, frame, theme);
+        }
+        if let Some(dialog) = &mut loop_state.worktree_create_dialog {
+            super::wt_create_dialog_render::render_dialog(dialog, frame, theme);
         }
         if let Some(surface) = &mut loop_state.interactive_surface
             && !surface_area.is_empty()

@@ -197,6 +197,10 @@ impl PluginTuiHost for BcodePluginTuiHost {
     }
 }
 
+pub fn root_host(redraw: InvalidationSignal, client: BcodeClient) -> impl PluginTuiHost {
+    BcodePluginTuiHost::current(redraw, client)
+}
+
 fn workflow_lookup(lookup: PluginWorkflowLookup) -> bcode_ipc::WorkflowRunBindingLookup {
     bcode_ipc::WorkflowRunBindingLookup {
         owner_plugin_id: lookup.owner_plugin_id,
