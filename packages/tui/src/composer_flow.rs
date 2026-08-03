@@ -423,6 +423,65 @@ fn defer_submission_while_session_opens(chat: &mut ActiveChat) -> bool {
     true
 }
 
+pub fn stage_session_message(
+    launch_working_directory: &std::path::Path,
+    chat: &mut ActiveChat,
+    placement: bcode_ipc::PromptPlacement,
+) -> bool {
+    if defer_submission_while_session_opens(chat) {
+        return false;
+    }
+    let session_id = chat.app.session_id();
+    let message = chat.app.take_pending_submission();
+    if message.trim().is_empty() {
+        chat.app.clear_pending_submission(&message);
+        return false;
+    }
+    if slash_registry::slash_command_name(&message).is_some() {
+        chat.app.clear_pending_submission(&message);
+        chat.app
+            .set_status("slash command pending root navigation migration".to_owned());
+        return false;
+    }
+    let agent_id = if session_id.is_some() {
+        chat.app.pending_agent_id().map(ToOwned::to_owned)
+    } else {
+        let current = chat.app.current_agent_id().to_owned();
+        (current != "build").then_some(current)
+    };
+    let draft_provider_plugin_id = session_id
+        .is_none()
+        .then(|| {
+            chat.app
+                .selected_provider_plugin_id()
+                .map(ToOwned::to_owned)
+        })
+        .flatten();
+    let draft_model_id = session_id
+        .is_none()
+        .then(|| chat.app.selected_model_id().map(ToOwned::to_owned))
+        .flatten();
+    chat.start_effect(TuiEffect::SubmitMessage {
+        request: Box::new(SubmitMessageRequest {
+            session_id,
+            launch_working_directory: launch_working_directory.to_path_buf(),
+            message,
+            placement,
+            provider_plugin_id: draft_provider_plugin_id,
+            model_id: draft_model_id,
+            agent_id,
+            reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
+            reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
+            reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),
+            event_sender: chat.event_sender.clone(),
+        }),
+    });
+    chat.app
+        .set_daemon_connection(DaemonConnectionState::Starting);
+    chat.app.set_status("starting daemon…".to_owned());
+    true
+}
+
 /// Submit the staged composer text.
 pub async fn submit_composer<W: Write>(
     io: &mut TuiIo<'_, '_, W>,

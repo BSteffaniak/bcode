@@ -95,6 +95,17 @@ impl PermissionDialogState {
         }
     }
 
+    /// Focus one action by zero-based index.
+    ///
+    /// Returns whether the requested action exists.
+    pub const fn focus_action(&mut self, index: usize) -> bool {
+        if index >= self.action_count() {
+            return false;
+        }
+        self.focused_action = index;
+        true
+    }
+
     /// Focus next action.
     pub const fn focus_next(&mut self) {
         self.focused_action = self.focused_action.saturating_add(1) % self.action_count();

@@ -84,7 +84,7 @@ impl DraftAutosave {
         self.save_at = Some(now + DRAFT_SAVE_DEBOUNCE);
     }
 
-    fn next_save_at(&self) -> Option<Instant> {
+    pub(super) fn next_save_at(&self) -> Option<Instant> {
         self.dirty.then_some(self.save_at).flatten()
     }
 
@@ -108,7 +108,7 @@ impl DraftAutosave {
         (scope, String::new())
     }
 
-    fn mark_dirty_now(&mut self) {
+    pub(super) fn mark_dirty_now(&mut self) {
         self.dirty = true;
         self.save_at = Some(Instant::now());
     }
@@ -119,7 +119,7 @@ pub struct ChatLoopState {
     slash_palette: Option<slash_palette::SlashPalette>,
     effects: TuiEffectRunner,
     daemon_connection: DaemonConnectionMonitor,
-    permission_dialog: Option<PermissionDialogState>,
+    pub(super) permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     interactive_surface: Option<InteractiveSurfaceState>,
@@ -137,6 +137,7 @@ pub struct ChatLoopState {
     markdown_image_capabilities: bmux_image::HostImageCapabilities,
     markdown_image_config: bmux_image::ImageConfig,
     telemetry: super::telemetry::TuiTelemetry,
+    runtime_stats: super::runtime_adapter::RuntimeStatsRecorder,
     request_draft_handoff: RequestDraftHandoff,
     frame_index: u64,
 }
@@ -169,6 +170,7 @@ impl ChatLoopState {
             markdown_image_capabilities: bmux_image::host_caps::detect_from_env(),
             markdown_image_config: bmux_image::ImageConfig::default(),
             telemetry: super::telemetry::TuiTelemetry::new(passive_client.clone(), metrics_enabled),
+            runtime_stats: super::runtime_adapter::RuntimeStatsRecorder::default(),
             request_draft_handoff: RequestDraftHandoff::default(),
             frame_index: 0,
         }
@@ -228,12 +230,66 @@ impl ChatLoopState {
         self.accept_markdown_projection_completion(chat, completion)
     }
 
+    pub fn take_artifact_completion_receiver(
+        &mut self,
+    ) -> tokio::sync::mpsc::Receiver<ActiveArtifactFetchCompletion> {
+        self.artifact_stream.take_completion_receiver()
+    }
+
+    pub fn take_pending_effects(
+        &self,
+        chat: &mut ActiveChat,
+        handle: &bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
+    ) -> (
+        Vec<bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage>>,
+        std::collections::BTreeMap<
+            bcode_session_models::SessionId,
+            std::collections::VecDeque<TuiEffect>,
+        >,
+    ) {
+        self.effects.runtime_work(&mut chat.pending_effects, handle)
+    }
+
+    pub fn ordered_effect_command(
+        &self,
+        effect: TuiEffect,
+        handle: &bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
+    ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
+        self.effects.ordered_command(effect, handle)
+    }
+
+    pub fn take_markdown_completion_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<
+        Option<super::markdown_projection_coordinator::MarkdownProjectionCompletion>,
+    > {
+        self.markdown_projection.completion_receiver()
+    }
+
+    pub const fn observe_daemon(&mut self, chat: &mut ActiveChat, observation: &DaemonObservation) {
+        if let Some(state) = self.daemon_connection.observe(observation) {
+            chat.app.set_daemon_connection(state);
+        }
+    }
+
     pub fn record_runtime_stats(&mut self, stats: &bmux_tui_runtime::RuntimeStats) {
-        super::runtime_adapter::record_stats(&mut self.telemetry, stats);
+        self.runtime_stats.record(&mut self.telemetry, stats);
     }
 
     pub fn flush_telemetry_if_due(&mut self, now: Instant) {
         self.telemetry.flush_if_due(now);
+    }
+
+    pub fn next_telemetry_flush_at(&self) -> Option<Instant> {
+        self.telemetry.next_flush_at()
+    }
+
+    pub fn next_artifact_retry_at(&self) -> Option<Instant> {
+        self.artifact_stream.next_retry_at()
+    }
+
+    pub fn start_due_artifact_fetches(&mut self, now: Instant) {
+        self.artifact_stream.start_due_fetches(now);
     }
 
     fn drain_pending_effects(&mut self, chat: &mut ActiveChat) -> bool {
@@ -402,14 +458,9 @@ impl ChatLoopState {
         self.effects.replace(effect);
     }
 
-    fn abort_matching_effect(&mut self, effect: &TuiEffect) {
-        self.effects.abort_matching(effect);
-    }
-
-    const fn observe_daemon(&mut self, chat: &mut ActiveChat, observation: &DaemonObservation) {
-        if let Some(state) = self.daemon_connection.observe(observation) {
-            chat.app.set_daemon_connection(state);
-        }
+    pub fn queue_effect_cancellation(&mut self, chat: &mut ActiveChat, effect: TuiEffect) {
+        self.effects.abort_matching(&effect);
+        chat.pending_effects.cancel(effect);
     }
 }
 
@@ -522,6 +573,14 @@ impl TuiRuntimeSettings {
 
     pub const fn set_metrics_enabled(&mut self, enabled: bool) {
         self.metrics_enabled = enabled;
+    }
+
+    pub const fn keymap(&self) -> &BmuxKeyMap {
+        &self.keymap
+    }
+
+    pub const fn mouse_scroll_rows(&self) -> usize {
+        self.mouse_scroll_rows
     }
 
     pub fn static_plugins(&self) -> &[bcode_plugin::StaticBundledPlugin] {
@@ -873,7 +932,7 @@ async fn poll_finished_effects(
 }
 
 #[allow(clippy::too_many_lines)]
-fn apply_effect_result(
+pub fn apply_effect_result(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     draft_autosave: &mut DraftAutosave,
@@ -1070,7 +1129,7 @@ fn apply_effect_result(
                 result,
             );
         }
-        TuiEffectResult::AppendPresentationNote { result } => {
+        TuiEffectResult::AppendPresentationNote { result, .. } => {
             if let Err(error) = result {
                 daemon_issue::report_client_issue(
                     &mut chat.app,
@@ -1094,10 +1153,27 @@ fn apply_effect_result(
         TuiEffectResult::CancelTurn { session_id, result } => {
             apply_cancel_turn_result(chat, loop_state, session_id, result);
         }
+        TuiEffectResult::PermissionResolved {
+            permission_id,
+            approved,
+            remember,
+            apply_to_batch,
+            result,
+        } => {
+            apply_permission_resolution_result(
+                chat,
+                loop_state,
+                &permission_id,
+                approved,
+                remember,
+                apply_to_batch,
+                result,
+            );
+        }
     }
 }
 
-fn apply_config_result(
+pub fn apply_config_result(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
@@ -1727,9 +1803,47 @@ fn apply_cancel_runtime_work_result(
     }
 }
 
-fn refresh_permissions_after_cancellation(loop_state: &mut ChatLoopState) {
-    loop_state.abort_matching_effect(&TuiEffect::ListPermissions);
-    loop_state.replace_effect(TuiEffect::ListPermissions);
+fn apply_permission_resolution_result(
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    permission_id: &str,
+    approved: bool,
+    remember: bool,
+    apply_to_batch: bool,
+    result: Result<bool, ClientError>,
+) {
+    match result {
+        Ok(resolved) => {
+            loop_state.permission_dialog = None;
+            chat.replace_effect(TuiEffect::ListPermissions);
+            chat.app.set_status(if !resolved {
+                format!("permission {permission_id} was already resolved")
+            } else if apply_to_batch {
+                format!(
+                    "{} permission batch",
+                    if approved { "approved" } else { "denied" }
+                )
+            } else if approved {
+                if remember {
+                    format!("approved and remembered permission {permission_id}")
+                } else {
+                    format!("approved permission {permission_id}")
+                }
+            } else if remember {
+                format!("denied and remembered permission {permission_id}")
+            } else {
+                format!("denied permission {permission_id}")
+            });
+        }
+        Err(error) => {
+            report_nonfatal_client_error(chat, "Permission resolution unavailable", &error);
+        }
+    }
+}
+
+fn refresh_permissions_after_cancellation(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
+    loop_state.queue_effect_cancellation(chat, TuiEffect::ListPermissions);
+    chat.replace_effect(TuiEffect::ListPermissions);
 }
 
 fn close_permission_dialog_for_session(
@@ -1753,14 +1867,14 @@ fn apply_cancel_turn_result(
     match result {
         Ok(true) if Some(session_id) == chat.app.session_id() => {
             close_permission_dialog_for_session(&mut loop_state.permission_dialog, session_id);
-            refresh_permissions_after_cancellation(loop_state);
+            refresh_permissions_after_cancellation(chat, loop_state);
             chat.app.set_cancelling();
             chat.app
                 .set_status("turn cancellation requested".to_owned());
         }
         Ok(false) if Some(session_id) == chat.app.session_id() => {
             close_permission_dialog_for_session(&mut loop_state.permission_dialog, session_id);
-            refresh_permissions_after_cancellation(loop_state);
+            refresh_permissions_after_cancellation(chat, loop_state);
             chat.app.set_idle();
             chat.app.set_status("no active turn".to_owned());
         }
@@ -1774,7 +1888,7 @@ fn apply_cancel_turn_result(
     }
 }
 
-fn start_cancel_turn(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
+pub fn start_cancel_turn(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
         return;
@@ -1790,7 +1904,7 @@ fn start_cancel_turn(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
     }
 }
 
-fn start_draft_save(chat: &mut ActiveChat, draft_autosave: &mut DraftAutosave) {
+pub fn start_draft_save(chat: &mut ActiveChat, draft_autosave: &mut DraftAutosave) {
     let Some((scope, text)) = draft_autosave.pending_save(chat) else {
         return;
     };
@@ -1798,14 +1912,17 @@ fn start_draft_save(chat: &mut ActiveChat, draft_autosave: &mut DraftAutosave) {
     chat.queue_latest_effect(TuiEffect::SaveDraft { scope, text });
 }
 
-fn update_slash_palette_async(chat: &ActiveChat, loop_state: &mut ChatLoopState) -> bool {
+fn update_slash_palette_async(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
     let current_query = chat.app.composer().text();
     if !current_query.starts_with('/') {
         loop_state.slash_palette = None;
-        loop_state.abort_matching_effect(&TuiEffect::LoadSlashPalette {
-            query: String::new(),
-            session_id: None,
-        });
+        loop_state.queue_effect_cancellation(
+            chat,
+            TuiEffect::LoadSlashPalette {
+                query: String::new(),
+                session_id: None,
+            },
+        );
         return true;
     }
     let query = current_query.to_owned();
@@ -2714,9 +2831,12 @@ fn absorb_bcode_event(
                     loop_state.replace_effect(TuiEffect::ListPermissions);
                 }
                 if matches!(event.kind, SessionEventKind::ModelChanged { .. }) {
-                    loop_state.abort_matching_effect(&TuiEffect::LoadSessionStatus {
-                        session_id: event.session_id,
-                    });
+                    loop_state.queue_effect_cancellation(
+                        chat,
+                        TuiEffect::LoadSessionStatus {
+                            session_id: event.session_id,
+                        },
+                    );
                     loop_state.replace_effect(TuiEffect::LoadSessionModelStatus {
                         session_id: event.session_id,
                     });
@@ -3700,7 +3820,7 @@ fn agent_selection_status(chat: &ActiveChat, agent_name: &str) -> String {
     }
 }
 
-fn cycle_session_agent(chat: &mut ActiveChat) {
+pub fn cycle_session_agent(chat: &mut ActiveChat) {
     if chat.agents.is_empty() {
         chat.app
             .set_status("Agent metadata is still loading".to_owned());

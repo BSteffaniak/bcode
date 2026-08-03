@@ -282,10 +282,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn runtime_stats_map_to_secret_safe_tui_metrics() {
         let client = BcodeClient::default_endpoint();
         let mut telemetry = TuiTelemetry::new(client, true);
-        super::super::runtime_adapter::record_stats(
+        let mut recorder = super::super::runtime_adapter::RuntimeStatsRecorder::default();
+        recorder.record(
             &mut telemetry,
             &bmux_tui_runtime::RuntimeStats {
                 reliable_depth: 3,
@@ -349,6 +351,43 @@ mod tests {
         );
         assert!(telemetry.histograms.iter().any(|((name, _), value)| {
             name == "tui.runtime.presentation_delay_us" && *value == 13
+        }));
+
+        recorder.record(
+            &mut telemetry,
+            &bmux_tui_runtime::RuntimeStats {
+                reliable_depth: 1,
+                reliable_high_water: 7,
+                latest_replaced: 12,
+                redraw_coalesced: 15,
+                frames_presented: 16,
+                presentation_delay_us: 18,
+                ..bmux_tui_runtime::RuntimeStats::default()
+            },
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.latest_replaced_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&12)
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.redraw_coalesced_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&15)
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.frames_presented_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&16)
+        );
+        assert!(telemetry.histograms.iter().any(|((name, _), value)| {
+            name == "tui.runtime.presentation_delay_us" && *value == 5
         }));
     }
 

@@ -589,6 +589,14 @@ impl ArtifactStreamCoordinator {
         self.artifact_fetch_receiver.recv().await
     }
 
+    pub(crate) fn take_completion_receiver(
+        &mut self,
+    ) -> tokio::sync::mpsc::Receiver<ActiveArtifactFetchCompletion> {
+        let (_replacement_sender, replacement_receiver) =
+            tokio::sync::mpsc::channel(ACTIVE_ARTIFACT_COMPLETION_CAPACITY);
+        std::mem::replace(&mut self.artifact_fetch_receiver, replacement_receiver)
+    }
+
     fn defer_active_artifact_fetch(state: &mut ActiveArtifactFetchState, error: &str) {
         tracing::debug!(
             error,

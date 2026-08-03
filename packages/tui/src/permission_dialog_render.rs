@@ -2,6 +2,7 @@
 
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::{display_width, wrap_text_with_continuation};
@@ -79,26 +80,18 @@ fn modal_frame() -> ModalFrame {
     .placement(ModalPlacement::UpperThird)
 }
 
-/// Return approve and deny button hit boxes for a dialog panel area.
+/// Return the permission action button hit boxes for the current dialog state.
 #[must_use]
-pub fn action_areas(dialog: Rect) -> (Rect, Rect) {
+pub fn action_areas(state: &PermissionDialogState, dialog: Rect) -> Vec<Rect> {
     let content = dialog.inset(Insets::new(2, 3, 2, 3));
     let y = content.bottom().saturating_sub(1);
-    let actions = action_buttons(false, false);
-    let areas =
-        ActionRow::new(&actions)
-            .spacing(2)
-            .action_areas(Rect::new(content.x, y, content.width, 1));
-    (
-        areas
-            .first()
-            .copied()
-            .unwrap_or_else(|| Rect::new(content.x, y, 0, 1)),
-        areas
-            .get(1)
-            .copied()
-            .unwrap_or_else(|| Rect::new(content.x, y, 0, 1)),
-    )
+    let actions = action_buttons(
+        state.permission().batch.is_some(),
+        state.permission().can_remember,
+    );
+    ActionRow::new(&actions)
+        .spacing(2)
+        .action_areas(Rect::new(content.x, y, content.width, 1))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -239,21 +232,32 @@ fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Fram
         content.width.saturating_add(6),
         content.height.saturating_add(4),
     );
-    let (approve_area, _) = action_areas(dialog);
+    let areas = action_areas(state, dialog);
     let buttons = action_buttons(
         state.permission().batch.is_some(),
         state.permission().can_remember,
     );
     let focused = state.focused_action_index();
+    let row_area = Rect::new(
+        areas.first().map_or(content.x, |area| area.x),
+        areas
+            .first()
+            .map_or_else(|| content.bottom().saturating_sub(1), |area| area.y),
+        content.width,
+        1,
+    );
     ActionRow::new(&buttons)
         .focused(focused)
         .spacing(2)
         .styles(action_styles())
-        .render_with_fallback_style(
-            Rect::new(approve_area.x, approve_area.y, content.width, 1),
-            frame,
-            ModalTheme::dark(Color::Yellow).text,
+        .render_with_fallback_style(row_area, frame, ModalTheme::dark(Color::Yellow).text);
+    for (index, area) in areas.into_iter().enumerate() {
+        frame.push_hit(
+            HitRegion::new(format!("permission-action:{index}"), area)
+                .role(HitRole::Action)
+                .layer(20),
         );
+    }
 }
 
 fn action_buttons(has_batch: bool, can_remember_policy: bool) -> Vec<ActionButton> {
@@ -316,6 +320,8 @@ mod tests {
     use bcode_session_models::SessionId;
     use bcode_session_view_models::{PermissionBatchView, PermissionView};
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::geometry::Point;
     use uuid::Uuid;
 
     use super::{dialog_area, render_permission_dialog};
@@ -327,6 +333,55 @@ mod tests {
 
         assert!(area.width > 76);
         assert!(area.height > 14);
+    }
+
+    #[test]
+    fn rendered_actions_register_exact_hit_regions_for_every_variant() {
+        let state = PermissionDialogState::new(PermissionView {
+            permission_id: "perm-actions".to_owned(),
+            session_id: Some(SessionId(Uuid::nil())),
+            tool_call_id: "call-actions".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"cargo check"}"#.to_owned(),
+            batch: Some(PermissionBatchView {
+                batch_id: "batch-actions".to_owned(),
+                call_index: 0,
+                call_count: 2,
+            }),
+            agent_id: "build".to_owned(),
+            title: Some("Permission requested: shell.run".to_owned()),
+            policy_source: Some("skill".to_owned()),
+            detail: None,
+            resolved: false,
+            approved: None,
+            can_remember: true,
+        });
+        let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 120, 35));
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+
+        render_permission_dialog(&state, &mut frame);
+
+        let action_hits = frame
+            .hits()
+            .regions()
+            .iter()
+            .filter(|hit| hit.id.as_str().starts_with("permission-action:"))
+            .collect::<Vec<_>>();
+        assert_eq!(action_hits.len(), 6);
+        for (index, hit) in action_hits.into_iter().enumerate() {
+            let event = MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(hit.area.x, hit.area.y),
+            );
+            let expected = format!("permission-action:{index}");
+            assert_eq!(
+                frame
+                    .hits()
+                    .hit_mouse(event)
+                    .map(|resolved| resolved.id().as_str().to_owned()),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

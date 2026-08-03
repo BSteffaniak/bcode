@@ -266,6 +266,19 @@ pub enum TuiEffect {
     },
     /// Request cancellation of the active turn for a session.
     CancelTurn { session_id: SessionId },
+    /// Resolve one pending permission request.
+    ResolvePermission {
+        /// Permission request id.
+        permission_id: String,
+        /// Whether to approve the request.
+        approved: bool,
+        /// Whether to remember the decision.
+        remember: bool,
+        /// Whether the action targets every request in the authorization batch.
+        apply_to_batch: bool,
+        /// Authorization batch id when `apply_to_batch` is true.
+        batch_id: Option<String>,
+    },
 }
 
 /// Daemon connectivity observation reported by completed effects.
@@ -488,6 +501,8 @@ pub enum TuiEffectResult {
     },
     /// Durable presentation note append completed.
     AppendPresentationNote {
+        /// Session whose ordered note append completed.
+        session_id: SessionId,
         /// Daemon response.
         result: Result<(), ClientError>,
     },
@@ -522,6 +537,19 @@ pub enum TuiEffectResult {
         /// Session the request targeted.
         session_id: SessionId,
         /// Daemon response.
+        result: Result<bool, ClientError>,
+    },
+    /// Result for a permission resolution.
+    PermissionResolved {
+        /// Permission request id.
+        permission_id: String,
+        /// Whether the request was approved.
+        approved: bool,
+        /// Whether the decision was remembered.
+        remember: bool,
+        /// Whether the action targeted the authorization batch.
+        apply_to_batch: bool,
+        /// Daemon response indicating whether any request was resolved.
         result: Result<bool, ClientError>,
     },
 }
@@ -573,7 +601,7 @@ impl TuiEffectResult {
             Self::SetSessionReasoning { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
-            Self::AppendPresentationNote { result } => {
+            Self::AppendPresentationNote { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
             Self::SubmitMessage { result, .. } => DaemonObservation::from_client_result(result),
@@ -581,7 +609,9 @@ impl TuiEffectResult {
             Self::CancelRuntimeWork { result, .. } => DaemonObservation::from_client_result(result),
             Self::AttachWorktree { result, .. } => DaemonObservation::from_client_result(result),
             Self::CreateWorktree { result } => DaemonObservation::from_client_result(result),
-            Self::CancelTurn { result, .. } => DaemonObservation::from_client_result(result),
+            Self::CancelTurn { result, .. } | Self::PermissionResolved { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
             Self::ConfigLoaded { .. }
             | Self::AuthSecurityReconciled { .. }
             | Self::SlashPaletteLoaded { .. } => DaemonObservation::None,
@@ -672,13 +702,15 @@ enum EffectKey {
     AttachWorktree(SessionId),
     CreateWorktree,
     CancelTurn(SessionId),
+    ResolvePermission(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EffectSchedule {
+pub enum EffectSchedule {
     StartIfIdle,
     Replace,
     QueueLatest,
+    Cancel,
 }
 
 /// Daemon-backed effect scheduling class.
@@ -794,9 +826,12 @@ impl TuiEffect {
                 status,
                 result: Err(client_error),
             },
-            Self::AppendPresentationNote { .. } => TuiEffectResult::AppendPresentationNote {
-                result: Err(client_error),
-            },
+            Self::AppendPresentationNote { session_id, .. } => {
+                TuiEffectResult::AppendPresentationNote {
+                    session_id,
+                    result: Err(client_error),
+                }
+            }
             Self::CancelRuntimeWork { work_id, .. } => TuiEffectResult::CancelRuntimeWork {
                 work_id,
                 result: Err(client_error),
@@ -814,6 +849,19 @@ impl TuiEffect {
             },
             Self::CancelTurn { session_id } => TuiEffectResult::CancelTurn {
                 session_id,
+                result: Err(client_error),
+            },
+            Self::ResolvePermission {
+                permission_id,
+                approved,
+                remember,
+                apply_to_batch,
+                ..
+            } => TuiEffectResult::PermissionResolved {
+                permission_id,
+                approved,
+                remember,
+                apply_to_batch,
                 result: Err(client_error),
             },
             Self::LoadConfig
@@ -850,7 +898,8 @@ impl TuiEffect {
             | Self::CompactContext { .. }
             | Self::AttachWorktree { .. }
             | Self::CreateWorktree { .. }
-            | Self::CancelTurn { .. } => EffectDaemonIntent::Foreground,
+            | Self::CancelTurn { .. }
+            | Self::ResolvePermission { .. } => EffectDaemonIntent::Foreground,
             Self::OpenSession {
                 allow_daemon_start: false,
                 ..
@@ -867,6 +916,9 @@ impl TuiEffect {
         }
     }
 }
+
+type OrderedPresentationEffects = BTreeMap<SessionId, VecDeque<TuiEffect>>;
+type ScheduledEffects = Vec<(EffectSchedule, TuiEffect)>;
 
 /// Queue of effects requested before the chat loop runner can start them.
 ///
@@ -893,6 +945,19 @@ impl TuiEffectQueue {
     /// Queue the latest effect with this key to run after the current one finishes.
     pub fn queue_latest(&mut self, effect: TuiEffect) {
         self.push(effect, EffectSchedule::QueueLatest);
+    }
+
+    /// Queue an ordered presentation note without collapsing another note for the same session.
+    pub fn start_ordered(&mut self, effect: TuiEffect) {
+        let key = effect.key();
+        debug_assert!(matches!(key, EffectKey::AppendPresentationNote(_, _)));
+        self.effects
+            .insert(key, (EffectSchedule::QueueLatest, effect));
+    }
+
+    /// Cancel active and pending work matching this effect key.
+    pub fn cancel(&mut self, effect: TuiEffect) {
+        self.push(effect, EffectSchedule::Cancel);
     }
 
     fn push(&mut self, effect: TuiEffect, schedule: EffectSchedule) {
@@ -926,8 +991,22 @@ impl TuiEffectQueue {
         })
     }
 
+    /// Drain non-note effects while retaining ordered presentation notes for serialized release.
+    pub(super) fn drain_runtime(&mut self) -> (ScheduledEffects, OrderedPresentationEffects) {
+        let mut effects = Vec::new();
+        let mut notes = BTreeMap::<SessionId, VecDeque<TuiEffect>>::new();
+        for (schedule, effect) in std::mem::take(&mut self.effects).into_values() {
+            if let TuiEffect::AppendPresentationNote { session_id, .. } = &effect {
+                notes.entry(*session_id).or_default().push_back(effect);
+            } else {
+                effects.push((schedule, effect));
+            }
+        }
+        (effects, notes)
+    }
+
     /// Drain queued effects.
-    fn drain(&mut self) -> Vec<(EffectSchedule, TuiEffect)> {
+    pub(super) fn drain(&mut self) -> Vec<(EffectSchedule, TuiEffect)> {
         std::mem::take(&mut self.effects).into_values().collect()
     }
 }
@@ -1031,6 +1110,43 @@ impl TuiEffectRunner {
         self.tasks.insert(key, task);
     }
 
+    /// Convert queued non-note Bcode effects into runtime-owned commands and return ordered notes.
+    pub fn runtime_work(
+        &self,
+        pending_effects: &mut TuiEffectQueue,
+        handle: &bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
+    ) -> (
+        Vec<bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage>>,
+        BTreeMap<SessionId, VecDeque<TuiEffect>>,
+    ) {
+        let (effects, notes) = pending_effects.drain_runtime();
+        let commands = effects
+            .into_iter()
+            .map(|(schedule, effect)| {
+                effect.command(
+                    schedule,
+                    &self.foreground_client,
+                    &self.passive_client,
+                    handle.clone(),
+                )
+            })
+            .collect();
+        (commands, notes)
+    }
+
+    pub fn ordered_command(
+        &self,
+        effect: TuiEffect,
+        handle: &bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
+    ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
+        effect.command(
+            EffectSchedule::StartIfIdle,
+            &self.foreground_client,
+            &self.passive_client,
+            handle.clone(),
+        )
+    }
+
     /// Poll completed effects without blocking on running tasks.
     pub async fn poll_finished(&mut self) -> Vec<TuiEffectResult> {
         let finished = self
@@ -1088,6 +1204,9 @@ impl TuiEffectRunner {
                 EffectSchedule::QueueLatest => {
                     started |= self.queue_latest(effect);
                 }
+                EffectSchedule::Cancel => {
+                    self.abort_matching(&effect);
+                }
             }
         }
         started
@@ -1104,6 +1223,67 @@ impl TuiEffectRunner {
 }
 
 impl TuiEffect {
+    pub(super) fn command_key(&self) -> bmux_tui_runtime::CommandKey {
+        let key = match self {
+            Self::AppendPresentationNote { session_id, .. } => {
+                return bmux_tui_runtime::CommandKey::new(format!(
+                    "bcode.effect.AppendPresentationNote({session_id})"
+                ));
+            }
+            _ => self.key(),
+        };
+        bmux_tui_runtime::CommandKey::new(format!("bcode.effect.{key:?}"))
+    }
+
+    pub(super) fn command(
+        self,
+        schedule: EffectSchedule,
+        foreground_client: &BcodeClient,
+        passive_client: &BcodeClient,
+        handle: bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
+    ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
+        let key = self.command_key();
+        let client = match self.daemon_intent() {
+            EffectDaemonIntent::Background => passive_client.clone(),
+            EffectDaemonIntent::Foreground => foreground_client.clone(),
+        };
+        let future = async move {
+            let (streaming_sender, mut streaming_receiver) =
+                mpsc::channel(TUI_EFFECT_STREAM_CAPACITY);
+            let effect = Box::pin(self.run(client, streaming_sender));
+            tokio::pin!(effect);
+            loop {
+                tokio::select! {
+                    result = &mut effect => {
+                        break Some(super::root_program::BcodeRuntimeMessage::EffectCompleted(
+                            Box::new(result),
+                        ));
+                    }
+                    progress = streaming_receiver.recv() => {
+                        let Some(progress) = progress else {
+                            continue;
+                        };
+                        if handle
+                            .send(super::root_program::BcodeRuntimeMessage::EffectCompleted(
+                                Box::new(progress),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break None;
+                        }
+                    }
+                }
+            }
+        };
+        match schedule {
+            EffectSchedule::StartIfIdle => bmux_tui_runtime::Command::start_if_idle(key, future),
+            EffectSchedule::Replace => bmux_tui_runtime::Command::replace(key, future),
+            EffectSchedule::QueueLatest => bmux_tui_runtime::Command::queue_latest(key, future),
+            EffectSchedule::Cancel => bmux_tui_runtime::Command::cancel(key),
+        }
+    }
+
     fn key(&self) -> EffectKey {
         match self {
             Self::OpenSession { .. } => EffectKey::SessionOpen,
@@ -1139,6 +1319,9 @@ impl TuiEffect {
             Self::AttachWorktree { session_id, .. } => EffectKey::AttachWorktree(*session_id),
             Self::CreateWorktree { .. } => EffectKey::CreateWorktree,
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
+            Self::ResolvePermission { permission_id, .. } => {
+                EffectKey::ResolvePermission(permission_id.clone())
+            }
         }
     }
 
@@ -1388,6 +1571,7 @@ impl TuiEffect {
                 text,
                 format,
             } => TuiEffectResult::AppendPresentationNote {
+                session_id,
                 result: client
                     .append_presentation_note(session_id, source_id, note_id, text, format)
                     .await,
@@ -1460,6 +1644,61 @@ impl TuiEffect {
                     Err(error) => Err(error),
                 },
             },
+            Self::ResolvePermission {
+                permission_id,
+                approved,
+                remember,
+                apply_to_batch,
+                batch_id,
+            } => {
+                let result = if apply_to_batch {
+                    let Some(batch_id) = batch_id else {
+                        return TuiEffectResult::PermissionResolved {
+                            permission_id,
+                            approved,
+                            remember,
+                            apply_to_batch,
+                            result: Err(ClientError::UnexpectedResponse),
+                        };
+                    };
+                    match execute_session_view_action(
+                        &client,
+                        SessionViewAction::ResolvePermissionBatch { batch_id, approved },
+                    )
+                    .await
+                    {
+                        Ok(SessionViewActionOutcome::PermissionBatchResolved {
+                            resolved_count,
+                        }) => Ok(resolved_count > 0),
+                        Ok(_) => Err(ClientError::UnexpectedResponse),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    match execute_session_view_action(
+                        &client,
+                        SessionViewAction::ResolvePermission {
+                            permission_id: permission_id.clone(),
+                            approved,
+                            remember,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(SessionViewActionOutcome::PermissionResolved { resolved }) => {
+                            Ok(resolved)
+                        }
+                        Ok(_) => Err(ClientError::UnexpectedResponse),
+                        Err(error) => Err(error),
+                    }
+                };
+                TuiEffectResult::PermissionResolved {
+                    permission_id,
+                    approved,
+                    remember,
+                    apply_to_batch,
+                    result,
+                }
+            }
         }
     }
 }
@@ -2091,6 +2330,39 @@ mod progress_routing_tests {
             ]
         );
         runner.abort_all();
+    }
+
+    #[test]
+    fn runtime_effect_drain_preserves_every_ordered_note_per_session() {
+        let session_id = SessionId::new();
+        let mut queue = TuiEffectQueue::default();
+        for note_id in ["0001", "0002", "0003"] {
+            queue.start_ordered(TuiEffect::AppendPresentationNote {
+                session_id,
+                source_id: "test".to_owned(),
+                note_id: note_id.to_owned(),
+                text: note_id.to_owned(),
+                format: bcode_command::CommandTextFormat::PlainText,
+            });
+        }
+
+        let (effects, notes) = queue.drain_runtime();
+
+        assert!(effects.is_empty());
+        let queued = notes
+            .get(&session_id)
+            .expect("ordered session queue")
+            .iter()
+            .map(TuiEffect::key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queued,
+            vec![
+                EffectKey::AppendPresentationNote(session_id, "0001".to_owned()),
+                EffectKey::AppendPresentationNote(session_id, "0002".to_owned()),
+                EffectKey::AppendPresentationNote(session_id, "0003".to_owned()),
+            ]
+        );
     }
 
     #[test]

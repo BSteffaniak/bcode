@@ -117,8 +117,18 @@ pub async fn handle_permission_mouse(
     permission_dialog: &mut Option<PermissionDialogState>,
     mouse: MouseEvent,
 ) -> Result<bool, TuiError> {
-    if let Some(approve) = permission_click_approval(permission_dialog.as_ref(), mouse) {
-        resolve_permission_dialog(client, chat, permission_dialog, approve, false, false).await
+    if let Some((approved, remember, apply_to_batch)) =
+        permission_click_selection(permission_dialog.as_ref(), mouse)
+    {
+        resolve_permission_dialog(
+            client,
+            chat,
+            permission_dialog,
+            approved,
+            remember,
+            apply_to_batch,
+        )
+        .await
     } else {
         Ok(false)
     }
@@ -192,24 +202,27 @@ async fn resolve_permission_dialog(
     Ok(true)
 }
 
-fn permission_click_approval(
+fn permission_click_selection(
     permission_dialog: Option<&PermissionDialogState>,
     mouse: MouseEvent,
-) -> Option<bool> {
-    if permission_dialog?.permission().batch.is_some() {
-        return None;
-    }
+) -> Option<(bool, bool, bool)> {
     let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
         return None;
     };
     let area = helpers::terminal_area().ok()?;
     let dialog = permission_dialog_render::dialog_area(area);
-    let (approve_area, deny_area) = permission_dialog_render::action_areas(dialog);
-    if approve_area.contains(mouse.position) {
-        Some(true)
-    } else if deny_area.contains(mouse.position) {
-        Some(false)
-    } else {
-        None
+    let action_areas = permission_dialog_render::action_areas(permission_dialog?, dialog);
+    let index = action_areas
+        .iter()
+        .position(|action_area| action_area.contains(mouse.position))?;
+    let dialog = permission_dialog?;
+    let mut selection = dialog.clone();
+    if !selection.focus_action(index) {
+        return None;
     }
+    Some((
+        selection.focused_approval(),
+        selection.focused_remember(),
+        selection.focused_batch(),
+    ))
 }

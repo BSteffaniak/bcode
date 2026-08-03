@@ -21,7 +21,12 @@ use super::session_flow::ActiveChat;
 #[allow(dead_code)]
 pub enum BcodeRuntimeMessage {
     /// Install root-runtime subscriptions after all application state is owned by the program.
-    Bootstrap,
+    Bootstrap {
+        /// Runtime control handle retained for live cadence reconfiguration.
+        handle: bmux_tui_runtime::RuntimeHandle<Self>,
+    },
+    /// Terminal input backend failure surfaced through the serialized root update path.
+    TerminalInputFailed(std::io::Error),
     /// Reliable terminal input after BMUX decoding and admission classification.
     Terminal(Event),
     /// Ordered canonical/session-view stream update.
@@ -57,7 +62,8 @@ impl BcodeRuntimeMessage {
             Self::TelemetryFlushDue => {
                 Some(bmux_tui_runtime::MessageKey::new("bcode.telemetry_flush"))
             }
-            Self::Bootstrap
+            Self::Bootstrap { .. }
+            | Self::TerminalInputFailed(_)
             | Self::Terminal(_)
             | Self::SessionStream(_)
             | Self::ArtifactFetchCompleted(_)
@@ -105,6 +111,64 @@ pub enum BcodeRuntimeAdmissionError {
     Closed,
 }
 
+#[derive(Default)]
+struct OrderedPresentationQueue {
+    pending: std::collections::BTreeMap<
+        bcode_session_models::SessionId,
+        VecDeque<super::effects::TuiEffect>,
+    >,
+    active: std::collections::BTreeSet<bcode_session_models::SessionId>,
+}
+
+impl OrderedPresentationQueue {
+    fn append(
+        &mut self,
+        notes: std::collections::BTreeMap<
+            bcode_session_models::SessionId,
+            VecDeque<super::effects::TuiEffect>,
+        >,
+    ) {
+        for (session_id, mut pending) in notes {
+            self.pending
+                .entry(session_id)
+                .or_default()
+                .append(&mut pending);
+        }
+    }
+
+    fn complete(&mut self, session_id: bcode_session_models::SessionId) {
+        self.active.remove(&session_id);
+    }
+
+    fn take_ready(&mut self) -> Vec<super::effects::TuiEffect> {
+        let ready = self
+            .pending
+            .keys()
+            .filter(|session_id| !self.active.contains(session_id))
+            .copied()
+            .collect::<Vec<_>>();
+        let mut effects = Vec::with_capacity(ready.len());
+        for session_id in ready {
+            if let Some(effect) = self
+                .pending
+                .get_mut(&session_id)
+                .and_then(VecDeque::pop_front)
+            {
+                self.active.insert(session_id);
+                effects.push(effect);
+            }
+            if self
+                .pending
+                .get(&session_id)
+                .is_some_and(VecDeque::is_empty)
+            {
+                self.pending.remove(&session_id);
+            }
+        }
+        effects
+    }
+}
+
 ///
 /// Presentation caches and nested screen state remain Bcode-owned. This model deliberately does
 /// not expose Bcode types through BMUX contracts.
@@ -120,14 +184,38 @@ pub struct BcodeRuntimeModel {
     pub draft_autosave: DraftAutosave,
     /// Current top-level navigation/screen state.
     pub screen: BcodeRuntimeScreen,
+    /// Runtime control handle used for live cadence replacement.
+    pub runtime_handle: Option<bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>>,
     /// Deferred application messages blocked by an explicit paint or navigation barrier.
     pub deferred: VecDeque<BcodeRuntimeMessage>,
+    /// Bcode-owned per-session ordered presentation-note scheduler.
+    ordered_notes: OrderedPresentationQueue,
     /// Current merged Bcode semantic presentation damage.
     pub invalidation: super::invalidation::UiInvalidation,
+    /// Last successfully committed terminal hit map used for pointer routing.
+    pub committed_hits: bmux_tui::hit::HitMap,
     /// Last successfully committed presentation timestamp.
     pub last_presented_at: Option<Instant>,
     /// Whether the root program should terminate after its dirty state is committed.
     pub exit_requested: bool,
+}
+
+enum RootTimer {
+    Invalidations,
+    ArtifactRetry,
+    StreamingPresentation,
+    TelemetryFlush,
+}
+
+impl RootTimer {
+    fn id(self) -> bmux_tui_runtime::TimerId {
+        bmux_tui_runtime::TimerId::new(match self {
+            Self::Invalidations => "bcode.invalidations",
+            Self::ArtifactRetry => "bcode.artifact_retry",
+            Self::StreamingPresentation => "bcode.streaming_presentation",
+            Self::TelemetryFlush => "bcode.telemetry_flush",
+        })
+    }
 }
 
 impl BcodeRuntimeModel {
@@ -143,10 +231,258 @@ impl BcodeRuntimeModel {
             settings,
             draft_autosave,
             screen: BcodeRuntimeScreen::Chat,
+            runtime_handle: None,
             deferred: VecDeque::new(),
+            ordered_notes: OrderedPresentationQueue::default(),
             invalidation: super::invalidation::UiInvalidation::Full,
+            committed_hits: bmux_tui::hit::HitMap::default(),
             last_presented_at: None,
             exit_requested: false,
+        }
+    }
+
+    fn handle_permission_key(
+        &mut self,
+        stroke: bmux_keyboard::KeyStroke,
+    ) -> super::invalidation::UiInvalidation {
+        let Some(action) = self
+            .settings
+            .keymap()
+            .action_for_key(super::keymap::BmuxScope::Permission, stroke)
+        else {
+            return super::invalidation::UiInvalidation::None;
+        };
+        let Some(dialog) = self.loop_state.permission_dialog.as_mut() else {
+            return super::invalidation::UiInvalidation::None;
+        };
+        match action {
+            super::keymap::BmuxAction::SelectUp => {
+                dialog.focus_previous();
+                self.chat
+                    .app
+                    .set_status(format!("permission choice: {}", dialog.focused_label()));
+            }
+            super::keymap::BmuxAction::SelectDown => {
+                dialog.focus_next();
+                self.chat
+                    .app
+                    .set_status(format!("permission choice: {}", dialog.focused_label()));
+            }
+            super::keymap::BmuxAction::PermissionApprove => {
+                self.queue_permission_resolution(true, false, false);
+            }
+            super::keymap::BmuxAction::PermissionDeny | super::keymap::BmuxAction::SelectCancel => {
+                self.queue_permission_resolution(false, false, false);
+            }
+            super::keymap::BmuxAction::SelectConfirm => {
+                self.queue_focused_permission_resolution();
+            }
+            _ => return super::invalidation::UiInvalidation::None,
+        }
+        super::invalidation::UiInvalidation::Structural
+    }
+
+    fn queue_focused_permission_resolution(&mut self) {
+        let Some(dialog) = self.loop_state.permission_dialog.as_ref() else {
+            return;
+        };
+        self.queue_permission_resolution(
+            dialog.focused_approval(),
+            dialog.focused_remember(),
+            dialog.focused_batch(),
+        );
+    }
+
+    fn queue_permission_resolution(
+        &mut self,
+        approved: bool,
+        remember: bool,
+        apply_to_batch: bool,
+    ) {
+        let Some(dialog) = self.loop_state.permission_dialog.as_ref() else {
+            return;
+        };
+        let permission_id = dialog.permission().permission_id.clone();
+        let batch_id = dialog
+            .permission()
+            .batch
+            .as_ref()
+            .map(|batch| batch.batch_id.clone());
+        let label = dialog.focused_label();
+        self.chat
+            .start_effect(super::effects::TuiEffect::ResolvePermission {
+                permission_id,
+                approved,
+                remember,
+                apply_to_batch,
+                batch_id,
+            });
+        self.loop_state.permission_dialog = None;
+        self.chat
+            .app
+            .set_status(format!("resolving permission: {label}"));
+    }
+
+    fn handle_basic_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
+        match event {
+            Event::Resize(_) => super::invalidation::UiInvalidation::Full,
+            Event::Focus(_) | Event::Tick => super::invalidation::UiInvalidation::Paint,
+            Event::Paste(text) => {
+                self.chat.app.reset_input_history_navigation();
+                self.chat.app.paste_composer_text(&text);
+                self.chat.app.wake_cursor();
+                super::invalidation::UiInvalidation::Structural
+            }
+            Event::Key(stroke) => {
+                if self.loop_state.permission_dialog.is_some() {
+                    return self.handle_permission_key(stroke);
+                }
+                let outcome =
+                    super::input::handle_key(&mut self.chat.app, self.settings.keymap(), stroke);
+                match outcome.request {
+                    super::input::KeyRequest::None => {}
+                    super::input::KeyRequest::Interrupt => {
+                        super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
+                    }
+                    super::input::KeyRequest::CycleAgent => {
+                        super::chat_loop::cycle_session_agent(&mut self.chat);
+                    }
+                    super::input::KeyRequest::CycleThinkingEffort => {
+                        super::thinking_flow::cycle_thinking_effort(&mut self.chat);
+                    }
+                    super::input::KeyRequest::Submit { placement } => {
+                        let launch_working_directory =
+                            self.settings.launch_working_directory().to_path_buf();
+                        if super::composer_flow::stage_session_message(
+                            &launch_working_directory,
+                            &mut self.chat,
+                            placement,
+                        ) {
+                            self.draft_autosave.mark_dirty_now();
+                        }
+                    }
+                }
+                if outcome.redraw {
+                    super::invalidation::UiInvalidation::Structural
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
+            }
+            Event::Mouse(mouse) => {
+                let hit_id = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse);
+                let changed = if self.loop_state.permission_dialog.is_some() {
+                    super::mouse_flow::handle_permission_action_mouse(
+                        hit_id.as_deref(),
+                        &mut self.chat,
+                        &mut self.loop_state.permission_dialog,
+                        mouse,
+                    )
+                } else {
+                    super::mouse_flow::handle_non_permission_mouse(
+                        hit_id.as_deref(),
+                        &mut self.chat,
+                        mouse,
+                        self.settings.mouse_scroll_rows(),
+                    )
+                };
+                if changed {
+                    super::invalidation::UiInvalidation::Structural
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
+            }
+            Event::User(_) => {
+                self.deferred
+                    .push_back(BcodeRuntimeMessage::Terminal(event));
+                super::invalidation::UiInvalidation::None
+            }
+        }
+    }
+
+    fn collect_runtime_work(
+        &mut self,
+        handle: &bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
+    ) -> Vec<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
+        let (mut commands, notes) = self.loop_state.take_pending_effects(&mut self.chat, handle);
+        self.ordered_notes.append(notes);
+        for effect in self.ordered_notes.take_ready() {
+            commands.push(self.loop_state.ordered_effect_command(effect, handle));
+        }
+        commands
+    }
+
+    fn schedule_deadlines(&self) {
+        let Some(handle) = &self.runtime_handle else {
+            return;
+        };
+        let now = Instant::now();
+        let invalidation_at = self
+            .chat
+            .app
+            .invalidation_requests(now, std::time::SystemTime::now())
+            .into_iter()
+            .map(|request| request.at)
+            .min();
+        let deadlines = [
+            (RootTimer::Invalidations, invalidation_at),
+            (
+                RootTimer::ArtifactRetry,
+                self.loop_state.next_artifact_retry_at(),
+            ),
+            (
+                RootTimer::StreamingPresentation,
+                self.chat.app.next_streaming_presentation_deadline(now),
+            ),
+            (
+                RootTimer::TelemetryFlush,
+                self.loop_state.next_telemetry_flush_at(),
+            ),
+        ];
+        for (timer, deadline) in deadlines {
+            if let Some(deadline) = deadline {
+                handle.schedule_timer(timer.id(), deadline);
+            } else {
+                let _cancelled = handle.cancel_timer(&timer.id());
+            }
+        }
+    }
+
+    fn handle_timer(
+        &mut self,
+        timer: &bmux_tui_runtime::TimerId,
+    ) -> super::invalidation::UiInvalidation {
+        let now = Instant::now();
+        match timer.as_str() {
+            "bcode.invalidations" => {
+                let due = self
+                    .chat
+                    .app
+                    .invalidation_requests(now, std::time::SystemTime::now())
+                    .into_iter()
+                    .filter(|request| request.at <= now)
+                    .map(|request| request.key)
+                    .collect::<Vec<_>>();
+                self.chat.app.handle_invalidations(&due, now)
+            }
+            "bcode.artifact_retry" => {
+                self.loop_state.start_due_artifact_fetches(now);
+                super::invalidation::UiInvalidation::None
+            }
+            "bcode.streaming_presentation" => {
+                if self.chat.app.advance_streaming_presentation(now) {
+                    super::invalidation::UiInvalidation::Paint
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
+            }
+            "bcode.telemetry_flush" => {
+                if let Some(handle) = &self.runtime_handle {
+                    self.loop_state.record_runtime_stats(&handle.stats());
+                }
+                self.loop_state.flush_telemetry_if_due(now);
+                super::invalidation::UiInvalidation::None
+            }
+            _ => super::invalidation::UiInvalidation::None,
         }
     }
 
@@ -212,6 +548,7 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
             Duration::ZERO,
             frame_interval,
         )?;
+        program.committed_hits = self.terminal.hits().clone();
         program.presentation_committed(started);
         Ok(bmux_tui_runtime::PresentReport::default())
     }
@@ -219,40 +556,87 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
 
 impl bmux_tui_runtime::Program for BcodeRuntimeModel {
     type Message = BcodeRuntimeMessage;
-    type Error = std::convert::Infallible;
+    type Error = TuiError;
 
+    #[allow(clippy::too_many_lines)]
     fn update(
         &mut self,
         event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
     ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
         let damage = match event {
-            bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Bootstrap) => {
+            bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Bootstrap { handle }) => {
+                self.runtime_handle = Some(handle.clone());
                 let (_replacement_sender, replacement_receiver) = tokio::sync::mpsc::channel(1);
                 let mut session_stream =
                     std::mem::replace(&mut self.chat.event_receiver, replacement_receiver);
-                return Ok(bmux_tui_runtime::Update::redraw().with_subscription(
-                    bmux_tui_runtime::Subscription::new(
-                        bmux_tui_runtime::SubscriptionKey::new("bcode.session_stream"),
-                        move |sender| async move {
-                            while let Some(update) = session_stream.recv().await {
-                                if sender
-                                    .send(BcodeRuntimeMessage::SessionStream(Box::new(update)))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
+                let mut artifact_completions = self.loop_state.take_artifact_completion_receiver();
+                let mut markdown_completions = self.loop_state.take_markdown_completion_receiver();
+                let session_subscription = bmux_tui_runtime::Subscription::new(
+                    bmux_tui_runtime::SubscriptionKey::new("bcode.session_stream"),
+                    move |sender| async move {
+                        while let Some(update) = session_stream.recv().await {
+                            if sender
+                                .send(BcodeRuntimeMessage::SessionStream(Box::new(update)))
+                                .await
+                                .is_err()
+                            {
+                                break;
                             }
-                        },
-                    ),
-                ));
+                        }
+                    },
+                );
+                let artifact_subscription = bmux_tui_runtime::Subscription::new(
+                    bmux_tui_runtime::SubscriptionKey::new("bcode.artifact_completions"),
+                    move |sender| async move {
+                        while let Some(completion) = artifact_completions.recv().await {
+                            if sender
+                                .send(BcodeRuntimeMessage::ArtifactFetchCompleted(Box::new(
+                                    completion,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    },
+                );
+                let markdown_subscription = bmux_tui_runtime::Subscription::new(
+                    bmux_tui_runtime::SubscriptionKey::new("bcode.markdown_completions"),
+                    move |sender| async move {
+                        loop {
+                            if markdown_completions.changed().await.is_err() {
+                                break;
+                            }
+                            let completion = markdown_completions.borrow_and_update().clone();
+                            if sender
+                                .send(BcodeRuntimeMessage::MarkdownProjectionCompleted(Box::new(
+                                    completion,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    },
+                );
+                self.schedule_deadlines();
+                let mut update = bmux_tui_runtime::Update::redraw()
+                    .with_subscription(session_subscription)
+                    .with_subscription(artifact_subscription)
+                    .with_subscription(markdown_subscription);
+                for command in self.collect_runtime_work(&handle) {
+                    update = update.with_command(command);
+                }
+                return Ok(update);
             }
-            bmux_tui_runtime::RuntimeEvent::Terminal(Event::Resize(_)) => {
-                super::invalidation::UiInvalidation::Full
-            }
-            bmux_tui_runtime::RuntimeEvent::Terminal(_)
-            | bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Terminal(_)) => {
-                super::invalidation::UiInvalidation::Structural
+            bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::TerminalInputFailed(
+                error,
+            )) => return Err(error.into()),
+            bmux_tui_runtime::RuntimeEvent::Terminal(event)
+            | bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Terminal(event)) => {
+                self.handle_basic_terminal_event(event)
             }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Invalidations(keys)) => {
                 self.chat.app.handle_invalidations(&keys, Instant::now())
@@ -300,16 +684,39 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     super::invalidation::UiInvalidation::None
                 }
             }
-            bmux_tui_runtime::RuntimeEvent::Message(
-                message @ (BcodeRuntimeMessage::EffectCompleted(_)
-                | BcodeRuntimeMessage::DraftSaveDue
-                | BcodeRuntimeMessage::InteractionRetryDue
-                | BcodeRuntimeMessage::TelemetryFlushDue),
-            ) => {
-                self.deferred.push_back(message);
-                super::invalidation::UiInvalidation::Paint
+            bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
+                result,
+            )) => {
+                if let TuiEffectResult::AppendPresentationNote { session_id, .. } = result.as_ref()
+                {
+                    self.ordered_notes.complete(*session_id);
+                }
+                let previous_frame_interval = self.settings.bmux_runtime_config().frame_interval;
+                let observation = result.daemon_observation();
+                self.loop_state.observe_daemon(&mut self.chat, &observation);
+                super::chat_loop::apply_effect_result(
+                    &mut self.settings,
+                    &mut self.chat,
+                    &mut self.draft_autosave,
+                    &mut self.loop_state,
+                    *result,
+                );
+                let frame_interval = self.settings.bmux_runtime_config().frame_interval;
+                if frame_interval != previous_frame_interval
+                    && let Some(handle) = &self.runtime_handle
+                {
+                    handle.set_frame_interval(frame_interval);
+                }
+                super::invalidation::UiInvalidation::Structural
             }
-            bmux_tui_runtime::RuntimeEvent::Timer(_) => super::invalidation::UiInvalidation::Paint,
+            bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::DraftSaveDue) => {
+                super::chat_loop::start_draft_save(&mut self.chat, &mut self.draft_autosave);
+                super::invalidation::UiInvalidation::None
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(
+                BcodeRuntimeMessage::InteractionRetryDue | BcodeRuntimeMessage::TelemetryFlushDue,
+            ) => super::invalidation::UiInvalidation::None,
+            bmux_tui_runtime::RuntimeEvent::Timer(timer) => self.handle_timer(&timer),
         };
         self.invalidation = self.invalidation.merge(damage);
         let mut update = match self.invalidation {
@@ -321,6 +728,12 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         };
         if self.exit_requested || self.chat.app.should_exit() {
             update = update.merge(bmux_tui_runtime::Update::exit());
+        }
+        self.schedule_deadlines();
+        if let Some(handle) = self.runtime_handle.clone() {
+            for command in self.collect_runtime_work(&handle) {
+                update = update.with_command(command);
+            }
         }
         Ok(update)
     }
@@ -346,16 +759,25 @@ pub fn finish_runtime<P>(
 #[allow(dead_code)]
 pub async fn run<W: std::io::Write>(
     runtime: bmux_tui_runtime::Runtime<BcodeRuntimeModel, BcodeRuntimePresenter<'_, '_, W>>,
+    handle: bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
 ) -> Result<BcodeRuntimeModel, TuiError> {
-    match Box::pin(runtime.run()).await {
+    let input = bmux_tui_runtime::TerminalInput::start::<BcodeRuntimeModel>(
+        handle,
+        BcodeRuntimeMessage::TerminalInputFailed,
+    );
+    let result = match Box::pin(runtime.run()).await {
         Ok(output) => Ok(finish_runtime(output)),
-        Err(bmux_tui_runtime::RuntimeError::Program { error, .. }) => match error {},
-        Err(bmux_tui_runtime::RuntimeError::Presenter { error, mut output }) => {
+        Err(
+            bmux_tui_runtime::RuntimeError::Program { error, mut output }
+            | bmux_tui_runtime::RuntimeError::Presenter { error, mut output },
+        ) => {
             record_runtime_stats(&mut output.program, &output.stats);
             output.program.abort_all_effects();
             Err(error)
         }
-    }
+    };
+    input.request_shutdown();
+    result
 }
 
 /// Construct the root runtime and its bounded admission handle.
@@ -370,8 +792,11 @@ pub fn runtime<'a, 'b, W: std::io::Write>(
     let config = model.settings.bmux_runtime_config();
     let (runtime, handle) =
         bmux_tui_runtime::Runtime::new(model, BcodeRuntimePresenter::new(terminal), config);
+    let bootstrap = BcodeRuntimeMessage::Bootstrap {
+        handle: handle.clone(),
+    };
     assert!(
-        handle.try_send(BcodeRuntimeMessage::Bootstrap).is_ok(),
+        handle.try_send(bootstrap).is_ok(),
         "new root runtime accepts bootstrap message"
     );
     (runtime, handle)
@@ -393,7 +818,10 @@ pub enum BcodeRuntimeScreen {
 
 #[cfg(test)]
 mod tests {
-    use super::{BcodeRuntimeAdmissionError, BcodeRuntimeMessage, admit};
+    use super::{BcodeRuntimeAdmissionError, BcodeRuntimeMessage, OrderedPresentationQueue, admit};
+    use bcode_command::CommandTextFormat;
+    use bcode_session_models::SessionId;
+    use std::collections::{BTreeMap, VecDeque};
     use std::convert::Infallible;
 
     fn assert_runtime_message_is_send<T: Send + 'static>() {}
@@ -416,6 +844,42 @@ mod tests {
             super::BcodeRuntimeModel,
             super::BcodeRuntimePresenter<'static, 'static, Vec<u8>>,
         >();
+    }
+
+    fn note(session_id: SessionId, note_id: &str) -> super::super::effects::TuiEffect {
+        super::super::effects::TuiEffect::AppendPresentationNote {
+            session_id,
+            source_id: "test".to_owned(),
+            note_id: note_id.to_owned(),
+            text: note_id.to_owned(),
+            format: CommandTextFormat::PlainText,
+        }
+    }
+
+    #[test]
+    fn ordered_note_queue_releases_one_per_session_until_typed_completion() {
+        let first_session = SessionId::new();
+        let second_session = SessionId::new();
+        let mut notes = BTreeMap::new();
+        notes.insert(
+            first_session,
+            VecDeque::from([note(first_session, "0001"), note(first_session, "0002")]),
+        );
+        notes.insert(
+            second_session,
+            VecDeque::from([note(second_session, "0003")]),
+        );
+        let mut queue = OrderedPresentationQueue::default();
+        queue.append(notes);
+
+        let first = queue.take_ready();
+        assert_eq!(first.len(), 2);
+        assert!(queue.take_ready().is_empty());
+
+        queue.complete(first_session);
+        let second = queue.take_ready();
+        assert_eq!(second.len(), 1);
+        assert!(queue.take_ready().is_empty());
     }
 
     #[derive(Default)]

@@ -54,17 +54,18 @@ impl ActiveChat {
     ) {
         let source_id = source_id.into();
         if let Some(session_id) = self.app.session_id() {
-            self.start_effect(super::effects::TuiEffect::AppendPresentationNote {
-                session_id,
-                source_id,
-                note_id: format!(
-                    "{:020}-{}",
-                    PRESENTATION_NOTE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-                    uuid::Uuid::new_v4()
-                ),
-                text,
-                format,
-            });
+            self.pending_effects
+                .start_ordered(super::effects::TuiEffect::AppendPresentationNote {
+                    session_id,
+                    source_id,
+                    note_id: format!(
+                        "{:020}-{}",
+                        PRESENTATION_NOTE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                        uuid::Uuid::new_v4()
+                    ),
+                    text,
+                    format,
+                });
             return;
         }
         match format {

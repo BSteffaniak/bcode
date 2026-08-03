@@ -169,6 +169,14 @@ impl MarkdownProjectionCoordinator {
         }
     }
 
+    /// Return a receiver observing the latest completed projection slot.
+    #[must_use]
+    pub fn completion_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<MarkdownProjectionCompletion>> {
+        self.completion_rx.clone()
+    }
+
     /// Wait for the next worker completion.
     pub async fn next_completion(&mut self) -> Option<MarkdownProjectionCompletion> {
         loop {
