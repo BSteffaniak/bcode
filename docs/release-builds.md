@@ -182,8 +182,8 @@ the runner's temporary directory and passes only its path to xtask through
 `WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH`; release automation signs and RFC 3161 timestamps both
 executables with SHA-256 before packaging, verifies both signatures and their RFC 3161 timestamps
 before packaging, and verifies them again after extraction (`signtool verify /pa /all /tw /v`). The
-workflow writes a versioned `windows-signing-x86_64-pc-windows-msvc.json` provenance record for
-public Windows assets. The publish job requires that record to report either signed, timestamped,
+workflow writes a versioned `windows-signing-x86_64-pc-windows-msvc.json` provenance record bound to
+the immutable release commit, release version, and Windows target. The publish job requires that record to report either signed, timestamped,
 pre/post-package verification or the explicit unsigned exception before attaching any files.
 Public signing requires an explicit operator decision before credentials are configured: select an
 Authenticode code-signing certificate or managed signing service whose CI interface can preserve
@@ -213,13 +213,19 @@ The timestamp and channel are diagnostic only. They do not enter daemon routing,
 Run **Release** from GitHub Actions with:
 
 * `version`: release tag/version, such as `v0.1.0`
+* `commit_sha`: immutable full 40-character Git commit SHA to build and optionally publish; dispatch
+  the workflow from that same commit because release jobs verify both the checkout and workflow
+  definition commit exactly match it
 * `publish`: whether to create/update the GitHub release
 * `publish_windows_unsigned`: explicit exception allowing an unsigned Windows artifact when
   `publish=true`; leave false to require configured Authenticode credentials
 
 The build matrix has read-only repository permissions; only the gated publish job receives
-`contents: write`. The workflow builds macOS, Linux, and Windows x64 artifacts, uploads all artifacts with a 14-day
-retention period, and when `publish=true` attaches them to a GitHub release. Release runs for the
-same version are serialized and are not automatically cancelled, avoiding two publishers racing to
+`contents: write`. Uploaded intermediate artifact names include the immutable commit SHA, release
+version, and target so artifacts from different source commits cannot share an identity. The publish
+job checks out the same immutable commit, rejects an existing release tag that resolves elsewhere,
+and sets the release action's target commit explicitly. The workflow builds macOS, Linux, and Windows x64 artifacts, uploads all artifacts with a 14-day retention period,
+and when `publish=true` attaches them to a GitHub release. Release runs for the same commit and
+version are serialized and are not automatically cancelled, avoiding two publishers racing to
 replace the same assets. Allowing unsigned publication is a fallback: if valid signed provenance is
 present, the signed artifact is published and no unsigned marker is emitted.

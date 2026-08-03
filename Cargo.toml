@@ -312,9 +312,11 @@ serde = { version = "1.0.219", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.149", default-features = false, features = [
     "std",
 ] }
-sha2 = { version = "0.10.9", default-features = false, features = [
-    "asm-aarch64",
-] }
+# `sha2`'s `asm-aarch64` feature enables the `sha2-asm` build dependency on
+# every target, including MSVC where its GNU `.S` sources cannot be compiled.
+# Keep the portable implementation so one workspace feature set builds on all
+# supported release targets.
+sha2 = { version = "0.10.9", default-features = false }
 shuck-formatter = { version = "0.0.41", default-features = false }
 ssh-key = { version = "0.6.7", default-features = false, features = [
     "ed25519",

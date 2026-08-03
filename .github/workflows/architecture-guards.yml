@@ -34,6 +34,8 @@ jobs:
         run: scripts/check-build-version-architecture.sh
       - name: Check produced artifact identity matrix
         run: scripts/check-artifact-identity-matrix.sh
+      - name: Check Windows dependency portability
+        run: scripts/check-windows-dependency-portability.sh
 
   model-catalog:
     runs-on: ubuntu-latest

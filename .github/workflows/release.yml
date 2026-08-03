@@ -7,6 +7,10 @@ on:
         description: "Release version/tag, e.g. v0.1.0"
         required: true
         type: string
+      commit_sha:
+        description: "Full 40-character Git commit SHA to build and optionally publish"
+        required: true
+        type: string
       publish:
         description: "Create or update the GitHub release"
         required: true
@@ -22,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}-${{ inputs.version }}
+  group: release-${{ inputs.commit_sha }}-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -48,6 +52,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Verify release checkout
+        shell: pwsh
+        env:
+          EXPECTED_SHA: ${{ inputs.commit_sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          if ($env:EXPECTED_SHA -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Release requires a full 40-character commit SHA, not a mutable ref"
+          }
+          $actual = (git rev-parse HEAD).Trim()
+          if (-not $actual.Equals($env:EXPECTED_SHA, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "release checkout commit $actual does not match requested commit $env:EXPECTED_SHA"
+          }
+          if (-not $env:WORKFLOW_SHA.Equals($env:EXPECTED_SHA, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "release workflow definition commit $env:WORKFLOW_SHA does not match requested commit $env:EXPECTED_SHA"
+          }
 
       - name: Validate release version
         shell: pwsh
@@ -120,9 +143,20 @@ jobs:
               throw "Visual Studio developer shell was not found"
             }
             & $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+            if (-not $?) {
+              throw "Visual Studio developer shell initialization failed"
+            }
           }
           Get-Command cl.exe -ErrorAction Stop | Out-Null
           Get-Command link.exe -ErrorAction Stop | Out-Null
+          $compilerBanner = (& cl.exe 2>&1 | Out-String)
+          if ($compilerBanner -notmatch 'for x64') {
+            throw "MSVC compiler is not configured for the x64 target"
+          }
+          $linkerBanner = (& link.exe /? 2>&1 | Out-String)
+          if ($linkerBanner -notmatch 'X64') {
+            throw "MSVC linker is not configured for the x64 target"
+          }
           ($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH') {
             "$name=$([Environment]::GetEnvironmentVariable($name))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -197,6 +231,11 @@ jobs:
           [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64))
           "WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH=$certificate" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Validate Windows dependency portability
+        if: runner.os == 'Windows'
+        shell: bash
+        run: scripts/check-windows-dependency-portability.sh
+
       - name: Build release artifact
         env:
           APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
@@ -207,7 +246,16 @@ jobs:
         run: cargo xtask release --target ${{ matrix.target }} --version ${{ inputs.version }}
 
       - name: Verify release artifact
-        run: cargo xtask verify-release --target ${{ matrix.target }} --version ${{ inputs.version }}
+        shell: pwsh
+        run: |
+          $verification = cargo xtask verify-release --target ${{ matrix.target }} --version ${{ inputs.version }} 2>&1
+          $verification | Write-Output
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release artifact verification failed"
+          }
+          if ("${{ matrix.target }}" -eq "x86_64-pc-windows-msvc" -and ($verification -notmatch 'verified extracted artifact identity:' -or $verification -notmatch 'verified packaged version:')) {
+            throw "Windows release verification did not execute extracted-product acceptance"
+          }
 
       - name: Smoke-test bundled Tesseract runtime
         if: runner.os == 'Windows'
@@ -229,6 +277,8 @@ jobs:
             }
             @{
               schema_version = 1
+              commit_sha = '${{ inputs.commit_sha }}'
+              version = '${{ inputs.version }}'
               target = $env:RELEASE_TARGET
               signed = $true
               timestamped = $true
@@ -237,6 +287,8 @@ jobs:
           } elseif ($env:PUBLISH_RELEASE -eq 'true' -and $env:PUBLISH_WINDOWS_UNSIGNED -eq 'true') {
             @{
               schema_version = 1
+              commit_sha = '${{ inputs.commit_sha }}'
+              version = '${{ inputs.version }}'
               target = $env:RELEASE_TARGET
               signed = $false
               timestamped = $false
@@ -265,7 +317,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: bcode-${{ inputs.version }}-${{ matrix.target }}
+          name: bcode-${{ inputs.commit_sha }}-${{ inputs.version }}-${{ matrix.target }}
           path: |
             target/dist/bcode-${{ inputs.version }}-${{ matrix.target }}.*
             target/dist/windows-signing-${{ matrix.target }}.json
@@ -282,6 +334,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
@@ -292,9 +350,24 @@ jobs:
         shell: bash
         env:
           RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_COMMIT_SHA: ${{ inputs.commit_sha }}
+          RELEASE_TAG: ${{ inputs.version }}
           PUBLISH_WINDOWS_UNSIGNED: ${{ inputs.publish_windows_unsigned }}
         run: |
           set -euo pipefail
+          [[ "$RELEASE_COMMIT_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          actual_checkout="$(git rev-parse HEAD)"
+          if [[ "${actual_checkout,,}" != "${RELEASE_COMMIT_SHA,,}" ]]; then
+            printf 'Publish checkout %s does not match requested commit %s.\n' "$actual_checkout" "$RELEASE_COMMIT_SHA" >&2
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+            if [[ "${tag_sha,,}" != "${RELEASE_COMMIT_SHA,,}" ]]; then
+              printf 'Existing release tag %s points to %s, not requested commit %s.\n' "$RELEASE_TAG" "$tag_sha" "$RELEASE_COMMIT_SHA" >&2
+              exit 1
+            fi
+          fi
           version="$RELEASE_VERSION"
           expected=(
             "bcode-${version}-aarch64-apple-darwin.zip"
@@ -314,10 +387,10 @@ jobs:
           test "${checksum_count}" -eq "${#expected[@]}"
           signing_provenance='target/dist/windows-signing-x86_64-pc-windows-msvc.json'
           test -f "${signing_provenance}"
-          if jq -e '.schema_version == 1 and .target == "x86_64-pc-windows-msvc" and .signed == true and .timestamped == true and .verification == "pre-and-post-package"' "${signing_provenance}" >/dev/null; then
+          if jq -e --arg commit "$RELEASE_COMMIT_SHA" --arg version "$RELEASE_VERSION" '.schema_version == 1 and .commit_sha == $commit and .version == $version and .target == "x86_64-pc-windows-msvc" and .signed == true and .timestamped == true and .verification == "pre-and-post-package"' "${signing_provenance}" >/dev/null; then
             : # A valid signed artifact always satisfies publication policy, even when an unsigned fallback was allowed.
           elif [[ "$PUBLISH_WINDOWS_UNSIGNED" == 'true' ]]; then
-            jq -e '.schema_version == 1 and .target == "x86_64-pc-windows-msvc" and .signed == false and .timestamped == false and .verification == "explicit-unsigned-publication-exception"' "${signing_provenance}" >/dev/null
+            jq -e --arg commit "$RELEASE_COMMIT_SHA" --arg version "$RELEASE_VERSION" '.schema_version == 1 and .commit_sha == $commit and .version == $version and .target == "x86_64-pc-windows-msvc" and .signed == false and .timestamped == false and .verification == "explicit-unsigned-publication-exception"' "${signing_provenance}" >/dev/null
             printf '%s\n' 'Windows artifact is intentionally unsigned for this publication.' > target/dist/WINDOWS-UNSIGNED.txt
           else
             printf '%s\n' 'Windows signing provenance does not satisfy publication policy.' >&2
@@ -328,6 +401,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.version }}
+          target_commitish: ${{ inputs.commit_sha }}
           name: Bcode ${{ inputs.version }}
           files: target/dist/*
           fail_on_unmatched_files: true

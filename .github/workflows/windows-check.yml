@@ -2,12 +2,17 @@ name: Windows Check
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Full 40-character Git commit SHA containing the Windows changes to validate"
+        required: true
+        type: string
   pull_request:
   push:
     branches: [master]
 
 concurrency:
-  group: windows-check-${{ github.ref }}
+  group: windows-check-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -23,6 +28,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+
+      - name: Verify checkout selection
+        shell: pwsh
+        env:
+          DISPATCH_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          $expected = if ([string]::IsNullOrWhiteSpace($env:DISPATCH_SHA)) { $env:EVENT_SHA } else { $env:DISPATCH_SHA }
+          if ($expected -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Windows validation requires a full 40-character commit SHA, not a mutable ref"
+          }
+          if (-not $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "checkout commit $actual does not match requested commit $expected"
+          }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -36,12 +58,16 @@ jobs:
           $workflow = Get-Content -LiteralPath ".github/workflows/release.yml" -Raw
           $expressionOpen = '$' + '{{ '
           $releaseCommand = 'run: cargo xtask release --target ' + $expressionOpen + 'matrix.target }} --version ' + $expressionOpen + 'inputs.version }}'
-          $verifyCommand = 'run: cargo xtask verify-release --target ' + $expressionOpen + 'matrix.target }} --version ' + $expressionOpen + 'inputs.version }}'
+          $verifyCommand = 'cargo xtask verify-release --target ' + $expressionOpen + 'matrix.target }} --version ' + $expressionOpen + 'inputs.version }}'
           $runtimeSmokeCommand = 'run: cargo xtask smoke-test-tesseract --target ' + $expressionOpen + 'matrix.target }}'
           $artifactGlob = 'target/dist/bcode-' + $expressionOpen + 'inputs.version }}-' + $expressionOpen + 'matrix.target }}.*'
+          $artifactName = 'name: bcode-' + $expressionOpen + 'inputs.commit_sha }}-' + $expressionOpen + 'inputs.version }}-' + $expressionOpen + 'matrix.target }}'
           $artifactCountCheck = 'test "${artifact_count}" -eq "${#expected[@]}"'
           $checksumCountCheck = 'test "${checksum_count}" -eq "${#expected[@]}"'
           $required = @(
+            'commit_sha:',
+            'ref: ${{ inputs.commit_sha }}',
+            'WORKFLOW_SHA: ${{ github.sha }}',
             'target: x86_64-pc-windows-msvc',
             $runtimeSmokeCommand,
             $releaseCommand,
@@ -49,6 +75,10 @@ jobs:
             'uses: actions/upload-artifact@v7',
             'uses: actions/download-artifact@v8',
             $artifactGlob,
+            $artifactName,
+            'target_commitish: ${{ inputs.commit_sha }}',
+            'commit_sha = ''${{ inputs.commit_sha }}''',
+            'version = ''${{ inputs.version }}''',
             'merge-multiple: true',
             $artifactCountCheck,
             $checksumCountCheck
@@ -80,13 +110,28 @@ jobs:
               throw "Visual Studio developer shell was not found"
             }
             & $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+            if (-not $?) {
+              throw "Visual Studio developer shell initialization failed"
+            }
           }
           Get-Command cl.exe -ErrorAction Stop | Out-Null
           Get-Command link.exe -ErrorAction Stop | Out-Null
+          $compilerBanner = (& cl.exe 2>&1 | Out-String)
+          if ($compilerBanner -notmatch 'for x64') {
+            throw "MSVC compiler is not configured for the x64 target"
+          }
+          $linkerBanner = (& link.exe /? 2>&1 | Out-String)
+          if ($linkerBanner -notmatch 'X64') {
+            throw "MSVC linker is not configured for the x64 target"
+          }
           ($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH') {
             "$name=$([Environment]::GetEnvironmentVariable($name))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
+
+      - name: Validate Windows dependency portability
+        shell: pwsh
+        run: bash scripts/check-windows-dependency-portability.sh
 
       - name: Check workspace
         env:
@@ -172,7 +217,14 @@ jobs:
       - name: Build and verify Windows release artifact
         run: |
           cargo xtask release --target x86_64-pc-windows-msvc --version ci
-          cargo xtask verify-release --target x86_64-pc-windows-msvc --version ci
+          $verification = cargo xtask verify-release --target x86_64-pc-windows-msvc --version ci 2>&1
+          $verification | Write-Output
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows release verification failed"
+          }
+          if ($verification -notmatch 'verified extracted artifact identity:' -or $verification -notmatch 'verified packaged version:') {
+            throw "Windows release verification did not execute extracted-product acceptance"
+          }
 
       - name: Smoke-test packaged Tesseract runtime
         run: cargo xtask smoke-test-tesseract --target x86_64-pc-windows-msvc
