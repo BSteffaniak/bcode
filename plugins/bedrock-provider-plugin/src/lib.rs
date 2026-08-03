@@ -2703,14 +2703,31 @@ fn bedrock_dispatch_error(
     } else {
         "unknown"
     };
-    let category = if connector.is_timeout() {
+    let chain = bedrock_error_chain(connector);
+    let credential_chain_failure = bedrock_credential_chain_failure(&chain.sources);
+    let category = if credential_chain_failure {
+        ProviderErrorCategory::Auth
+    } else if connector.is_timeout() {
         ProviderErrorCategory::Timeout
     } else if connector.is_user() {
         ProviderErrorCategory::Config
     } else {
         ProviderErrorCategory::Network
     };
-    let mut normalized = provider_error(code, category, format!("{operation} dispatch failure"));
+    let mut normalized = provider_error(
+        code,
+        category,
+        if credential_chain_failure {
+            "AWS credentials could not be resolved for Bedrock".to_string()
+        } else {
+            format!("{operation} dispatch failure")
+        },
+    );
+    normalized.retryable = !credential_chain_failure
+        && matches!(
+            category,
+            ProviderErrorCategory::Network | ProviderErrorCategory::Timeout
+        );
     normalized
         .diagnostic_context
         .insert("transport_kind".to_string(), "dispatch".to_string());
@@ -2728,8 +2745,13 @@ fn bedrock_dispatch_error(
         "connection_established".to_string(),
         connector.connection_metadata().is_some().to_string(),
     );
+    if credential_chain_failure {
+        normalized.diagnostic_context.insert(
+            "auth_failure_kind".to_string(),
+            "credential_chain_exhausted".to_string(),
+        );
+    }
 
-    let chain = bedrock_error_chain(connector);
     normalized.diagnostic_context.insert(
         "error_chain_depth".to_string(),
         chain.sources.len().to_string(),
@@ -2799,12 +2821,29 @@ fn bedrock_dispatch_error(
     ) {
         normalized.failure = Some(Box::new(bedrock_failure_context(
             bcode_model::ProviderFailureSourceKind::Runtime,
-            "aws_sdk_connector",
+            if credential_chain_failure {
+                "aws_sdk_credential_chain"
+            } else {
+                "aws_sdk_connector"
+            },
             capability,
-            "verify the AWS region, endpoint, credentials, proxy, TLS trust roots, and network policy",
+            if credential_chain_failure {
+                "configure AWS credentials through the selected Bedrock auth profile, AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, web identity, ECS task credentials, or EC2 instance credentials"
+            } else {
+                "verify the AWS region, endpoint, credentials, proxy, TLS trust roots, and network policy"
+            },
         )));
     }
     normalized
+}
+
+fn bedrock_credential_chain_failure(chain: &[&(dyn std::error::Error + 'static)]) -> bool {
+    chain.iter().any(|source| {
+        let message = source.to_string().to_ascii_lowercase();
+        message.contains("no credentials found in chain")
+            || message.contains("credential provider was not enabled")
+            || message.contains("credentials could not be loaded")
+    })
 }
 
 struct BedrockErrorChain<'a> {
@@ -4044,6 +4083,43 @@ mod tests {
                 .map(String::as_str),
             Some("rustls_root")
         );
+    }
+
+    #[test]
+    fn dispatch_error_classifies_missing_credentials_as_non_retryable_auth() {
+        let connector = aws_smithy_runtime_api::client::result::ConnectorError::other(
+            Box::new(std::io::Error::other(
+                "no credentials found in chain. Attempted: Environment: the credential provider was not enabled",
+            )),
+            None,
+        );
+        let dispatch = aws_smithy_runtime_api::client::result::DispatchFailure::builder()
+            .source(connector)
+            .build();
+
+        let error = bedrock_dispatch_error(
+            "bedrock_request_failed",
+            "Bedrock runtime",
+            &dispatch,
+            bcode_model::ProviderFailureCapability::ModelInvocation,
+        );
+
+        assert_eq!(error.category, ProviderErrorCategory::Auth);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.message,
+            "AWS credentials could not be resolved for Bedrock"
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("auth_failure_kind")
+                .map(String::as_str),
+            Some("credential_chain_exhausted")
+        );
+        let failure = error.failure.expect("actionable auth failure");
+        assert_eq!(failure.source, "aws_sdk_credential_chain");
+        assert!(failure.remediation.contains("AWS_PROFILE"));
     }
 
     #[test]
