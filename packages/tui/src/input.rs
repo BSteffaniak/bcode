@@ -101,7 +101,7 @@ pub fn handle_host_action(app: &mut BmuxApp, action: BmuxAction) -> KeyOutcome {
     handle_chat_action(app, Some(action)).unwrap_or_default()
 }
 
-fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<KeyOutcome> {
+pub fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<KeyOutcome> {
     let outcome = match action? {
         BmuxAction::AppExit => {
             if app.composer().is_empty() {

@@ -1039,6 +1039,12 @@ impl TuiEffectRunner {
         }
     }
 
+    /// Return a clone of the foreground client used for user-requested work.
+    #[must_use]
+    pub fn foreground_client(&self) -> BcodeClient {
+        self.foreground_client.clone()
+    }
+
     /// Return the bounded streaming completion capacity.
     #[cfg(test)]
     fn streaming_capacity(&self) -> usize {

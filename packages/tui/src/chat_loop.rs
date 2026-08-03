@@ -74,7 +74,7 @@ impl DraftAutosave {
         )
     }
 
-    fn observe(&mut self, chat: &ActiveChat, now: Instant) {
+    pub(super) fn observe(&mut self, chat: &ActiveChat, now: Instant) {
         let text = chat.app.composer().text();
         if text == self.last_seen_text {
             return;
@@ -86,6 +86,12 @@ impl DraftAutosave {
 
     pub(super) fn next_save_at(&self) -> Option<Instant> {
         self.dirty.then_some(self.save_at).flatten()
+    }
+
+    pub(super) fn reset_for_session_change(&mut self) {
+        self.last_saved_text = None;
+        self.dirty = true;
+        self.save_at = Some(Instant::now());
     }
 
     const fn mark_save_started(&mut self) {
@@ -276,6 +282,10 @@ impl ChatLoopState {
         self.runtime_stats.record(&mut self.telemetry, stats);
     }
 
+    pub fn foreground_client(&self) -> BcodeClient {
+        self.effects.foreground_client()
+    }
+
     pub fn flush_telemetry_if_due(&mut self, now: Instant) {
         self.telemetry.flush_if_due(now);
     }
@@ -290,6 +300,99 @@ impl ChatLoopState {
 
     pub fn start_due_artifact_fetches(&mut self, now: Instant) {
         self.artifact_stream.start_due_fetches(now);
+    }
+
+    pub fn refresh_slash_palette(&mut self, chat: &mut ActiveChat) -> bool {
+        update_slash_palette_async(chat, self)
+    }
+
+    pub fn session_changed(&mut self, session_id: Option<bcode_session_models::SessionId>) {
+        self.request_draft_handoff.clear();
+        self.markdown_projection.invalidate();
+        self.artifact_stream.retain_session(session_id);
+    }
+
+    pub fn prepare_runtime_work(
+        &mut self,
+        chat: &mut ActiveChat,
+    ) -> super::invalidation::UiInvalidation {
+        self.artifact_stream.start_due_fetches(Instant::now());
+        let changed = chat
+            .app
+            .plugin_presentation()
+            .is_some_and(crate::plugin_tui::PluginTuiPresentation::poll_dynamic_visuals)
+            | maybe_start_older_history_load(chat, self)
+            | maybe_start_newer_history_load(chat, self);
+        if changed {
+            super::invalidation::UiInvalidation::Structural
+        } else {
+            super::invalidation::UiInvalidation::None
+        }
+    }
+
+    pub fn next_interactive_surface_retry_at(&self) -> Option<Instant> {
+        self.interactive_surface_queue.next_retry_at()
+    }
+
+    pub fn next_surface_open_request(
+        &self,
+    ) -> Option<super::interactive_surface::InteractiveSurfaceRequest> {
+        if self.interactive_surface.is_some() {
+            return None;
+        }
+        self.interactive_surface_queue
+            .front_ready(Instant::now())
+            .cloned()
+    }
+
+    pub fn complete_interactive_surface_open(
+        &mut self,
+        result: Result<InteractiveSurfaceState, String>,
+    ) -> bool {
+        match result {
+            Ok(surface) => {
+                self.interactive_surface_queue.pop_front();
+                self.interactive_surface = Some(surface);
+                true
+            }
+            Err(error) => {
+                self.interactive_surface_queue.defer_front(Instant::now());
+                tracing::warn!(%error, "failed to open interactive TUI surface");
+                false
+            }
+        }
+    }
+
+    pub const fn has_interactive_surface(&self) -> bool {
+        self.interactive_surface.is_some()
+    }
+
+    pub fn dismiss_interactive_surface(
+        &self,
+    ) -> Option<(String, bcode_session_models::ToolExchangeResolution)> {
+        let surface = self.interactive_surface.as_ref()?;
+        Some((
+            surface.interaction_id().to_owned(),
+            InteractiveSurfaceState::dismissed_resolution(),
+        ))
+    }
+
+    pub fn handle_interactive_surface_event(
+        &mut self,
+        event: &Event,
+    ) -> Option<(String, bcode_session_models::ToolExchangeResolution)> {
+        let surface = self.interactive_surface.as_mut()?;
+        surface
+            .handle_event(event)
+            .map(|resolution| (surface.interaction_id().to_owned(), resolution))
+    }
+
+    pub fn complete_interactive_surface_resolution(&mut self, resolved: bool) {
+        if resolved {
+            self.interactive_surface = None;
+        } else if let Some(surface) = self.interactive_surface.as_mut() {
+            surface.clear_pending_resolution();
+        }
     }
 
     fn drain_pending_effects(&mut self, chat: &mut ActiveChat) -> bool {

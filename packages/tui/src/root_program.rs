@@ -37,6 +37,10 @@ pub enum BcodeRuntimeMessage {
     MarkdownProjectionCompleted(Box<Option<MarkdownProjectionCompletion>>),
     /// Completed Bcode-owned background effect.
     EffectCompleted(Box<TuiEffectResult>),
+    /// Completed attempt to open the next inline interactive surface.
+    InteractiveSurfaceOpened(Result<super::interactive_surface::InteractiveSurfaceState, String>),
+    /// Completed inline interactive surface resolution request.
+    InteractiveSurfaceResolved(Result<bool, bcode_client::ClientError>),
     /// Due Bcode-owned semantic invalidations.
     Invalidations(Vec<InvalidationKey>),
     /// Draft autosave deadline.
@@ -68,6 +72,8 @@ impl BcodeRuntimeMessage {
             | Self::SessionStream(_)
             | Self::ArtifactFetchCompleted(_)
             | Self::EffectCompleted(_)
+            | Self::InteractiveSurfaceOpened(_)
+            | Self::InteractiveSurfaceResolved(_)
             | Self::Invalidations(_)
             | Self::DraftSaveDue
             | Self::InteractionRetryDue => None,
@@ -204,6 +210,8 @@ enum RootTimer {
     Invalidations,
     ArtifactRetry,
     StreamingPresentation,
+    DraftSave,
+    InteractiveSurfaceRetry,
     TelemetryFlush,
 }
 
@@ -213,6 +221,8 @@ impl RootTimer {
             Self::Invalidations => "bcode.invalidations",
             Self::ArtifactRetry => "bcode.artifact_retry",
             Self::StreamingPresentation => "bcode.streaming_presentation",
+            Self::DraftSave => "bcode.draft_save",
+            Self::InteractiveSurfaceRetry => "bcode.interactive_surface_retry",
             Self::TelemetryFlush => "bcode.telemetry_flush",
         })
     }
@@ -323,14 +333,17 @@ impl BcodeRuntimeModel {
             .set_status(format!("resolving permission: {label}"));
     }
 
+    #[allow(clippy::let_and_return)]
     fn handle_basic_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
-        match event {
+        let damage = match event {
             Event::Resize(_) => super::invalidation::UiInvalidation::Full,
             Event::Focus(_) | Event::Tick => super::invalidation::UiInvalidation::Paint,
             Event::Paste(text) => {
                 self.chat.app.reset_input_history_navigation();
                 self.chat.app.paste_composer_text(&text);
                 self.chat.app.wake_cursor();
+                self.loop_state.refresh_slash_palette(&mut self.chat);
+                self.draft_autosave.observe(&self.chat, Instant::now());
                 super::invalidation::UiInvalidation::Structural
             }
             Event::Key(stroke) => {
@@ -362,6 +375,8 @@ impl BcodeRuntimeModel {
                         }
                     }
                 }
+                self.loop_state.refresh_slash_palette(&mut self.chat);
+                self.draft_autosave.observe(&self.chat, Instant::now());
                 if outcome.redraw {
                     super::invalidation::UiInvalidation::Structural
                 } else {
@@ -396,7 +411,64 @@ impl BcodeRuntimeModel {
                     .push_back(BcodeRuntimeMessage::Terminal(event));
                 super::invalidation::UiInvalidation::None
             }
-        }
+        };
+        damage
+    }
+
+    fn root_interactive_surface_host_key(
+        &self,
+        stroke: bmux_keyboard::KeyStroke,
+    ) -> Option<super::keymap::BmuxAction> {
+        let action = self
+            .settings
+            .keymap()
+            .action_for_key(super::keymap::BmuxScope::Chat, stroke)?;
+        (matches!(
+            action,
+            super::keymap::BmuxAction::AppExit | super::keymap::BmuxAction::AppInterrupt
+        ) || matches!(
+            action,
+            super::keymap::BmuxAction::TranscriptPageUp
+                | super::keymap::BmuxAction::TranscriptPageDown
+                | super::keymap::BmuxAction::TranscriptTop
+                | super::keymap::BmuxAction::TranscriptBottom
+                | super::keymap::BmuxAction::TranscriptLineUp
+                | super::keymap::BmuxAction::TranscriptLineDown
+        ))
+        .then_some(action)
+    }
+
+    fn interactive_surface_resolution_command(
+        &self,
+        interaction_id: String,
+        resolution: bcode_session_models::ToolExchangeResolution,
+    ) -> bmux_tui_runtime::Command<BcodeRuntimeMessage> {
+        let client = self.loop_state.foreground_client();
+        bmux_tui_runtime::Command::start_if_idle(
+            bmux_tui_runtime::CommandKey::new("bcode.interactive_surface_resolution"),
+            async move {
+                let result = bcode_session_view::execute_session_view_action(
+                    &client,
+                    bcode_session_view_models::SessionViewAction::ResolveExchange {
+                        interaction_id,
+                        resolution,
+                    },
+                )
+                .await
+                .and_then(|outcome| match outcome {
+                    bcode_session_view_models::SessionViewActionOutcome::InteractionResolved {
+                        resolved,
+                    } => Ok(resolved),
+                    _ => Err(bcode_client::ClientError::UnexpectedResponse),
+                });
+                Some(BcodeRuntimeMessage::InteractiveSurfaceResolved(result))
+            },
+        )
+    }
+
+    fn handle_session_changed(&mut self) {
+        self.loop_state.session_changed(self.chat.session_id);
+        self.draft_autosave.reset_for_session_change();
     }
 
     fn collect_runtime_work(
@@ -407,6 +479,27 @@ impl BcodeRuntimeModel {
         self.ordered_notes.append(notes);
         for effect in self.ordered_notes.take_ready() {
             commands.push(self.loop_state.ordered_effect_command(effect, handle));
+        }
+        if let Some(request) = self.loop_state.next_surface_open_request() {
+            commands.push(bmux_tui_runtime::Command::start_if_idle(
+                bmux_tui_runtime::CommandKey::new("bcode.interactive_surface_open"),
+                async move {
+                    let runtime = super::plugin_tui::load_default_runtime_with_static_bundled(
+                        &super::static_bundled_plugins(),
+                    );
+                    let result = match runtime {
+                        Ok(runtime) => {
+                            super::interactive_surface::InteractiveSurfaceState::open_request(
+                                &runtime, &request,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
+                    Some(BcodeRuntimeMessage::InteractiveSurfaceOpened(result))
+                },
+            ));
         }
         commands
     }
@@ -432,6 +525,11 @@ impl BcodeRuntimeModel {
             (
                 RootTimer::StreamingPresentation,
                 self.chat.app.next_streaming_presentation_deadline(now),
+            ),
+            (RootTimer::DraftSave, self.draft_autosave.next_save_at()),
+            (
+                RootTimer::InteractiveSurfaceRetry,
+                self.loop_state.next_interactive_surface_retry_at(),
             ),
             (
                 RootTimer::TelemetryFlush,
@@ -474,6 +572,10 @@ impl BcodeRuntimeModel {
                 } else {
                     super::invalidation::UiInvalidation::None
                 }
+            }
+            "bcode.draft_save" => {
+                super::chat_loop::start_draft_save(&mut self.chat, &mut self.draft_autosave);
+                super::invalidation::UiInvalidation::None
             }
             "bcode.telemetry_flush" => {
                 if let Some(handle) = &self.runtime_handle {
@@ -636,6 +738,56 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             )) => return Err(error.into()),
             bmux_tui_runtime::RuntimeEvent::Terminal(event)
             | bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Terminal(event)) => {
+                if self.loop_state.has_interactive_surface() {
+                    if let Event::Key(stroke) = event
+                        && let Some(action) = self.root_interactive_surface_host_key(stroke)
+                    {
+                        match action {
+                            super::keymap::BmuxAction::AppInterrupt => {
+                                let Some((interaction_id, resolution)) =
+                                    self.loop_state.dismiss_interactive_surface()
+                                else {
+                                    return Ok(bmux_tui_runtime::Update::none());
+                                };
+                                let command = self.interactive_surface_resolution_command(
+                                    interaction_id,
+                                    resolution,
+                                );
+                                return Ok(bmux_tui_runtime::Update::redraw().with_command(command));
+                            }
+                            super::keymap::BmuxAction::AppExit => self.chat.app.request_exit(),
+                            action => {
+                                let _handled = super::input::handle_chat_action(
+                                    &mut self.chat.app,
+                                    Some(action),
+                                );
+                            }
+                        }
+                        return Ok(bmux_tui_runtime::Update::redraw());
+                    }
+                    if let Event::Mouse(mouse) = event
+                        && matches!(
+                            mouse.kind,
+                            bmux_tui::event::MouseEventKind::ScrollUp
+                                | bmux_tui::event::MouseEventKind::ScrollDown
+                        )
+                    {
+                        let _changed = super::mouse_flow::handle_non_permission_mouse(
+                            None,
+                            &mut self.chat,
+                            mouse,
+                            self.settings.mouse_scroll_rows(),
+                        );
+                        return Ok(bmux_tui_runtime::Update::redraw());
+                    }
+                }
+                if let Some((interaction_id, resolution)) =
+                    self.loop_state.handle_interactive_surface_event(&event)
+                {
+                    let command =
+                        self.interactive_surface_resolution_command(interaction_id, resolution);
+                    return Ok(bmux_tui_runtime::Update::redraw().with_command(command));
+                }
                 self.handle_basic_terminal_event(event)
             }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Invalidations(keys)) => {
@@ -692,6 +844,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     self.ordered_notes.complete(*session_id);
                 }
                 let previous_frame_interval = self.settings.bmux_runtime_config().frame_interval;
+                let previous_session_id = self.chat.session_id;
                 let observation = result.daemon_observation();
                 self.loop_state.observe_daemon(&mut self.chat, &observation);
                 super::chat_loop::apply_effect_result(
@@ -701,6 +854,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     &mut self.loop_state,
                     *result,
                 );
+                if previous_session_id != self.chat.session_id {
+                    self.handle_session_changed();
+                }
                 let frame_interval = self.settings.bmux_runtime_config().frame_interval;
                 if frame_interval != previous_frame_interval
                     && let Some(handle) = &self.runtime_handle
@@ -709,6 +865,40 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 }
                 super::invalidation::UiInvalidation::Structural
             }
+            bmux_tui_runtime::RuntimeEvent::Message(
+                BcodeRuntimeMessage::InteractiveSurfaceOpened(result),
+            ) => {
+                if self.loop_state.complete_interactive_surface_open(result) {
+                    super::invalidation::UiInvalidation::Structural
+                } else {
+                    self.chat
+                        .app
+                        .set_status("Interactive request unavailable; retrying".to_owned());
+                    super::invalidation::UiInvalidation::Paint
+                }
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(
+                BcodeRuntimeMessage::InteractiveSurfaceResolved(result),
+            ) => match result {
+                Ok(resolved) => {
+                    self.loop_state
+                        .complete_interactive_surface_resolution(resolved);
+                    self.chat.app.set_status(if resolved {
+                        "interactive request resolved".to_owned()
+                    } else {
+                        "interactive request was already resolved by another client".to_owned()
+                    });
+                    super::invalidation::UiInvalidation::Structural
+                }
+                Err(error) => {
+                    self.loop_state
+                        .complete_interactive_surface_resolution(false);
+                    self.chat
+                        .app
+                        .set_status(format!("Interactive response failed; retry: {error}"));
+                    super::invalidation::UiInvalidation::Paint
+                }
+            },
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::DraftSaveDue) => {
                 super::chat_loop::start_draft_save(&mut self.chat, &mut self.draft_autosave);
                 super::invalidation::UiInvalidation::None
@@ -719,6 +909,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             bmux_tui_runtime::RuntimeEvent::Timer(timer) => self.handle_timer(&timer),
         };
         self.invalidation = self.invalidation.merge(damage);
+        self.draft_autosave.observe(&self.chat, Instant::now());
+        let housekeeping = self.loop_state.prepare_runtime_work(&mut self.chat);
+        self.invalidation = self.invalidation.merge(housekeeping);
         let mut update = match self.invalidation {
             super::invalidation::UiInvalidation::None => bmux_tui_runtime::Update::none(),
             super::invalidation::UiInvalidation::Full => bmux_tui_runtime::Update::reset(),
