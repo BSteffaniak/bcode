@@ -2731,7 +2731,18 @@ mod tests {
     };
     use bmux_tui::event::{MouseEvent, MouseEventKind};
     use bmux_tui::geometry::Point;
+    use bmux_tui::terminal::Terminal;
     use std::collections::{BTreeMap, BTreeSet};
+
+    fn render_surface(surface: &mut WorkflowAuthorSurface, width: u16, height: u16) -> String {
+        let mut output = Vec::new();
+        let mut terminal = Terminal::new(&mut output, Rect::new(0, 0, width, height));
+        terminal
+            .draw(|frame| surface.render(frame.area(), frame))
+            .expect("render authoring surface");
+        drop(terminal);
+        String::from_utf8(output).expect("terminal UTF-8")
+    }
 
     fn document() -> WorkflowAuthoringDocument {
         let schema = ValueSchema {
@@ -3252,6 +3263,83 @@ mod tests {
             kind: PaletteEntryKind::NodeKind,
         };
         assert!(add_node(&editor_document, &agent, &catalog).is_err());
+    }
+
+    #[test]
+    fn terminal_rendering_covers_viewport_mouse_diagnostics_and_revision_diff() {
+        let mut current = document();
+        current.metadata.title = "Edited workflow".to_string();
+        current
+            .definition
+            .nodes
+            .get_mut("second")
+            .expect("second node")
+            .name = "Reviewed approval".to_string();
+        let options = serde_json::json!({
+            "draft": {
+                "identity": {"workflow_id": "editor-test", "draft_id": "draft-1"},
+                "base_revision": 1,
+                "generation": 2,
+                "document": current,
+                "producer": editor_producer()
+            }
+        });
+        let mut surface = WorkflowAuthorSurface::new(&options);
+        let catalog = WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: BTreeSet::new(),
+            blocks: BTreeMap::new(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: BTreeMap::new(),
+            agent_profiles: BTreeSet::new(),
+            skills: BTreeSet::new(),
+        };
+        surface.install_catalog(catalog);
+        surface.install_base_revision(PluginWorkflowAuthoringRevision {
+            workflow_id: "editor-test".to_string(),
+            revision: 1,
+            document: document(),
+        });
+        surface.selected_node = 1;
+        surface.diagnostics = vec![WorkflowValidationDiagnostic {
+            code: "test_field".to_string(),
+            severity: bcode_workflow::WorkflowValidationSeverity::Error,
+            document_path: "definition.nodes.second.configuration.gate_version".to_string(),
+            message: "gate version requires review".to_string(),
+            remediation: "choose the supported gate version".to_string(),
+        }];
+        surface.selected_schema_field = 1;
+        surface.canvas_scroll = 1;
+        surface.inspector_scroll = 1;
+        surface.last_area = Rect::new(0, 0, 120, 32);
+        assert!(surface.handle_mouse(&MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(90, 5),
+        )));
+        assert_eq!(surface.focus, EditorPane::Inspector);
+
+        let normal = render_surface(&mut surface, 120, 32);
+        for expected in [
+            "Graph canvas",
+            "second  approval",
+            "Diagnostics",
+            "Error definition.nodes.second",
+            "Revision diff before publication",
+            "changes={Executable, Metadata}",
+        ] {
+            assert!(
+                normal.contains(expected),
+                "missing rendered state: {expected}"
+            );
+        }
+        let constrained = render_surface(&mut surface, 54, 14);
+        assert!(constrained.contains("Graph canvas"));
+        assert!(constrained.contains("Inspector"));
+        assert!(surface.canvas_scroll > 0);
+        assert!(surface.inspector_scroll > 0);
     }
 
     #[test]
