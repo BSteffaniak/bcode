@@ -1,12 +1,11 @@
 //! Chat mouse handling for the TUI.
 
-use bcode_client::BcodeClient;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui_components::text_input::TextInputOutcome;
 
 use super::effects::TuiEffect;
 use super::permission_dialog::PermissionDialogState;
-use super::{TuiError, permission_flow, session_flow::ActiveChat};
+use super::session_flow::ActiveChat;
 
 /// Return the hit-region id under a mouse event.
 #[must_use]
@@ -107,71 +106,6 @@ pub fn handle_permission_action_mouse(
 
 fn permission_action_index(hit_id: &str) -> Option<usize> {
     hit_id.strip_prefix("permission-action:")?.parse().ok()
-}
-
-/// Handle one non-modal mouse event.
-pub async fn handle_mouse(
-    hit_id: Option<String>,
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    permission_dialog: &mut Option<PermissionDialogState>,
-    mouse: MouseEvent,
-    scroll_rows: usize,
-) -> Result<bool, TuiError> {
-    if permission_dialog.is_none() {
-        return Ok(handle_non_permission_mouse(
-            hit_id.as_deref(),
-            chat,
-            mouse,
-            scroll_rows,
-        ));
-    }
-    match mouse.kind {
-        MouseEventKind::ScrollUp => match hit_id.as_deref() {
-            Some("composer") => Ok(chat.app.previous_input_history()),
-            _ => Ok(chat.app.scroll_transcript_up(scroll_rows)),
-        },
-        MouseEventKind::ScrollDown => match hit_id.as_deref() {
-            Some("composer") => Ok(chat.app.next_input_history()),
-            _ => Ok(chat.app.scroll_transcript_down(scroll_rows)),
-        },
-        MouseEventKind::Down(MouseButton::Left) if hit_id.as_deref() == Some("latest-bar") => {
-            Ok(chat.app.transition_transcript_to_bottom())
-        }
-        MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
-            permission_flow::handle_permission_mouse(client, chat, permission_dialog, mouse).await
-        }
-        MouseEventKind::Down(MouseButton::Left)
-            if hit_id
-                .as_deref()
-                .and_then(crate::markdown_interaction::contribution_id_from_hit)
-                .is_some() =>
-        {
-            let contribution_id = hit_id
-                .as_deref()
-                .and_then(crate::markdown_interaction::contribution_id_from_hit)
-                .expect("guarded Markdown contribution hit");
-            let focus_changed = chat.app.focus_markdown_contribution(contribution_id);
-            let activated = chat.app.activate_markdown_contribution(contribution_id);
-            Ok(focus_changed || activated)
-        }
-        MouseEventKind::Down(MouseButton::Left) if hit_id.as_deref() == Some("composer") => {
-            Ok(composer_mouse_changed(chat, mouse))
-        }
-        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-            if chat.app.composer_mouse_selection_active() =>
-        {
-            Ok(composer_mouse_changed(chat, mouse))
-        }
-        MouseEventKind::Down(
-            MouseButton::Left | MouseButton::Right | MouseButton::Middle | MouseButton::Other(_),
-        )
-        | MouseEventKind::Up(_)
-        | MouseEventKind::Drag(_)
-        | MouseEventKind::Move
-        | MouseEventKind::ScrollLeft
-        | MouseEventKind::ScrollRight => Ok(false),
-    }
 }
 
 fn composer_mouse_changed(chat: &mut ActiveChat, mouse: MouseEvent) -> bool {

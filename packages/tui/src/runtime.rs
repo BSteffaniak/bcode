@@ -4,15 +4,15 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bcode_client::BcodeClient;
+use bcode_client::{BcodeClient, DaemonAvailability};
 use bcode_session_models::SessionId;
+use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
 
 use super::app::BmuxApp;
 use super::effects::{TuiEffect, TuiEffectQueue};
 use super::startup_action::StartupTuiAction;
-use super::terminal_events::TuiInput;
-use super::{TuiError, chat_loop, history_flow, session_flow};
+use super::{TuiError, chat_loop, history_flow, root_program, session_flow};
 
 /// Attach to a session and run the active chat loop.
 #[allow(clippy::future_not_send, dead_code)]
@@ -60,21 +60,37 @@ pub async fn run_event_loop_with_startup<W: Write>(
     .await
 }
 
-/// Attach to a session and run the native viewer using a caller-owned input stream.
+/// Run a plugin-owned surface as the root runtime's complete standalone screen.
+///
+/// # Errors
+///
+/// Returns startup, plugin, client, or terminal runtime failures.
 #[allow(clippy::future_not_send)]
-pub async fn run_event_loop_with_input<W: Write>(
+pub async fn run_standalone_plugin_surface<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    session_id: SessionId,
-) -> Result<(), TuiError> {
-    Box::pin(run_event_loop_with_input_and_static_bundled(
-        terminal,
-        terminal_events,
-        Some(session_id),
-        StartupTuiAction::None,
-        &super::static_bundled_plugins(),
-    ))
-    .await
+    plugin_id: impl Into<String>,
+    surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+) -> Result<Option<serde_json::Value>, TuiError> {
+    let initialized = initialize_tui(terminal.area(), None, &super::static_bundled_plugins());
+    let passive_client = initialized
+        .client
+        .clone()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
+    let loop_state = chat_loop::ChatLoopState::new(
+        &initialized.client,
+        &passive_client,
+        initialized.settings.metrics_enabled(),
+    );
+    let mut model =
+        root_program::BcodeRuntimeModel::new(initialized.chat, initialized.settings, loop_state);
+    let plugin_id = plugin_id.into();
+    model.queue_standalone_plugin_surface(plugin_id.clone(), surface);
+    let (runtime, handle) = root_program::runtime(terminal, model);
+    let mut model = root_program::run(runtime, handle).await?;
+    Ok(model
+        .take_plugin_surface_result()
+        .filter(|(closed_plugin_id, _)| closed_plugin_id == &plugin_id)
+        .and_then(|(_, outcome)| outcome))
 }
 
 /// Attach to a session, run an optional startup action, and run the active chat loop with caller-provided static bundled plugins.
@@ -85,25 +101,21 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     startup_action: StartupTuiAction,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
 ) -> Result<(), TuiError> {
-    let mut terminal_events = TuiInput::start();
-    Box::pin(run_event_loop_with_input_and_static_bundled(
-        terminal,
-        &mut terminal_events,
-        session_id,
-        startup_action,
-        static_plugins,
-    ))
-    .await
+    let initialized = initialize_tui(terminal.area(), session_id, static_plugins);
+    Box::pin(run_root(terminal, initialized, startup_action)).await
 }
 
-#[allow(clippy::future_not_send)]
-async fn run_event_loop_with_input_and_static_bundled<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
+struct InitializedTui {
+    client: BcodeClient,
+    settings: chat_loop::TuiRuntimeSettings,
+    chat: session_flow::ActiveChat,
+}
+
+fn initialize_tui(
+    terminal_area: Rect,
     session_id: Option<SessionId>,
-    startup_action: StartupTuiAction,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
-) -> Result<(), TuiError> {
+) -> InitializedTui {
     let config = bcode_config::load_config();
     let client = config
         .as_ref()
@@ -166,7 +178,7 @@ async fn run_event_loop_with_input_and_static_bundled<W: Write>(
             });
             if session_id.is_none() {
                 chat.start_effect(TuiEffect::LoadDraftStatus {
-                    launch_working_directory: launch_working_directory.clone(),
+                    launch_working_directory,
                 });
             }
         }
@@ -175,25 +187,45 @@ async fn run_event_loop_with_input_and_static_bundled<W: Write>(
     chat.start_effect(TuiEffect::LoadAgentCatalog);
     if let Some(session_id) = session_id {
         let initial_window_request = session_flow::initial_transcript_window_request(
-            super::render::transcript_area_for_frame(&chat.app, terminal.area()),
+            super::render::transcript_area_for_frame(&chat.app, terminal_area),
         );
         session_flow::start_switch_session(&mut chat, session_id, initial_window_request);
     } else {
         chat.app.set_status("New draft".to_owned());
     }
-    let result = {
-        Box::pin(chat_loop::run_with_client(
-            terminal,
-            terminal_events,
-            &client,
-            &mut settings,
-            &mut chat,
-            startup_action,
-        ))
-        .await
-    };
-    if let Some(event_task) = chat.event_task.take() {
-        event_task.abort();
+    InitializedTui {
+        client,
+        settings,
+        chat,
     }
-    result
+}
+
+async fn run_root<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    initialized: InitializedTui,
+    startup_action: StartupTuiAction,
+) -> Result<(), TuiError> {
+    let passive_client = initialized
+        .client
+        .clone()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
+    let loop_state = chat_loop::ChatLoopState::new(
+        &initialized.client,
+        &passive_client,
+        initialized.settings.metrics_enabled(),
+    );
+    let mut model =
+        root_program::BcodeRuntimeModel::new(initialized.chat, initialized.settings, loop_state);
+    if startup_action == StartupTuiAction::OpenRalphHome {
+        let repo_path = model
+            .chat
+            .app
+            .working_directory()
+            .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
+        let surface = super::ralph_launcher::open_root_ralph_home_surface(repo_path, None).await?;
+        model.queue_plugin_surface("bcode.ralph", surface);
+    }
+    let (runtime, handle) = root_program::runtime(terminal, model);
+    let _model = root_program::run(runtime, handle).await?;
+    Ok(())
 }

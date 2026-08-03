@@ -177,20 +177,8 @@ impl MarkdownProjectionCoordinator {
         self.completion_rx.clone()
     }
 
-    /// Wait for the next worker completion.
-    pub async fn next_completion(&mut self) -> Option<MarkdownProjectionCompletion> {
-        loop {
-            self.completion_rx.changed().await.ok()?;
-            let completion = self.completion_rx.borrow_and_update().clone();
-            if completion.as_ref().is_some_and(|completion| {
-                self.latest_requested.as_ref() == Some(&completion.generation)
-            }) {
-                return completion;
-            }
-        }
-    }
-
     /// Return the newest completed generation, discarding stale completions.
+    #[cfg(test)]
     pub fn try_latest_completion(&mut self) -> Option<MarkdownProjectionCompletion> {
         if !self.completion_rx.has_changed().unwrap_or(false) {
             return None;

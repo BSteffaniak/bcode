@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
+use bcode_client::{BcodeClient, ClientError, MessageAcceptance, SessionList};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
 use bcode_session_models::{
     ProjectionWindowRequest, SessionForkResult, SessionHistoryCursor, SessionHistoryDirection,
@@ -155,6 +155,25 @@ pub enum TuiEffect {
     },
     /// Load host and plugin command-palette contributions.
     LoadCommandPalette,
+    /// Load the bounded session catalog for the root session picker.
+    LoadSessionPicker,
+    /// Import one external session selected by the root picker.
+    ImportSession {
+        source_id: String,
+        external_session_id: String,
+    },
+    /// Rename one session selected by the root picker.
+    RenameSession {
+        session_id: SessionId,
+        name: Option<String>,
+    },
+    /// Delete one session selected by the root picker.
+    DeleteSession { session_id: SessionId },
+    /// Run one bounded transcript search from the root session picker.
+    SearchSessions {
+        request: Box<bcode_session_search::SessionSearchRequest>,
+        policy: bcode_session_search::SessionSearchPlanPolicy,
+    },
     /// Execute a resolved slash command without terminal navigation.
     ExecuteSlashCommand {
         /// Current session.
@@ -176,6 +195,11 @@ pub enum TuiEffect {
         repo_root: std::path::PathBuf,
         /// Action to execute.
         action: super::ralph_flow::RalphRootAction,
+    },
+    /// Create a Ralph loop from root-owned dialog input.
+    RalphStart {
+        /// Validated root dialog request.
+        request: super::ralph_flow::RalphStartRequest,
     },
     /// Open a plugin-owned native surface for root-runtime presentation.
     OpenPluginSurface {
@@ -244,18 +268,6 @@ pub enum TuiEffect {
     SubmitMessage {
         /// Submit request.
         request: Box<SubmitMessageRequest>,
-    },
-    /// Rename a session.
-    RenameSession {
-        /// Session to rename.
-        session_id: SessionId,
-        /// New optional name.
-        name: Option<String>,
-    },
-    /// Delete a session.
-    DeleteSession {
-        /// Session to delete.
-        session_id: SessionId,
     },
     /// Fork a session from a prompt.
     ForkSession {
@@ -515,6 +527,33 @@ pub enum TuiEffectResult {
         /// Contributions result from the application client boundary.
         result: Result<Vec<bcode_command::CommandContribution>, ClientError>,
     },
+    /// Root session-picker catalog load completed.
+    SessionPickerLoaded {
+        /// Bounded catalog result from the application client boundary.
+        result: Result<SessionList, ClientError>,
+    },
+    /// External session import completed.
+    SessionImported {
+        result: Result<(SessionSummary, Vec<bcode_ipc::SessionImportWarning>), ClientError>,
+    },
+    /// Session rename completed.
+    SessionRenamed {
+        result: Result<SessionSummary, ClientError>,
+    },
+    /// Session deletion completed.
+    SessionDeleted {
+        result: Result<SessionSummary, ClientError>,
+    },
+    /// Root picker transcript search completed.
+    SessionsSearched {
+        result: Result<
+            (
+                bcode_session_search::FederatedSessionSearchResponse,
+                Vec<bcode_session_search::HydratedSessionSearchHit>,
+            ),
+            ClientError,
+        >,
+    },
     /// Resolved slash command execution completed.
     SlashCommandExecuted {
         /// Submitted command text.
@@ -528,6 +567,11 @@ pub enum TuiEffectResult {
         action: super::ralph_flow::RalphRootAction,
         /// Presentation result.
         result: Result<super::ralph_flow::RalphRootOutput, TuiError>,
+    },
+    /// Root Ralph loop creation completed.
+    RalphStarted {
+        /// Creation result.
+        result: Result<super::ralph_flow::RalphStartOutput, TuiError>,
     },
     /// Plugin-owned native surface opened.
     PluginSurfaceOpened {
@@ -596,18 +640,6 @@ pub enum TuiEffectResult {
         message: String,
         /// Submit result.
         result: Box<Result<SubmitMessageResult, ClientError>>,
-    },
-    /// Session rename completed.
-    RenameSession {
-        /// Rename result.
-        result: Result<SessionSummary, ClientError>,
-    },
-    /// Session delete completed.
-    DeleteSession {
-        /// Deleted session id.
-        session_id: SessionId,
-        /// Delete result.
-        result: Result<SessionSummary, ClientError>,
     },
     /// Session fork completed.
     ForkSession {
@@ -759,8 +791,6 @@ impl TuiEffectResult {
             }
             Self::PermissionList { result } => DaemonObservation::from_client_result(result),
             Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
-            Self::RenameSession { result } => DaemonObservation::from_client_result(result),
-            Self::DeleteSession { result, .. } => DaemonObservation::from_client_result(result),
             Self::ForkSession { result, .. } => DaemonObservation::from_client_result(result),
             Self::CloneSession { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillAction { result, .. } => DaemonObservation::from_client_result(result),
@@ -783,11 +813,17 @@ impl TuiEffectResult {
             | Self::AuthSecurityReconciled { .. }
             | Self::SlashPaletteLoaded { .. }
             | Self::CommandPaletteLoaded { .. }
+            | Self::SessionPickerLoaded { .. }
+            | Self::SessionImported { .. }
+            | Self::SessionRenamed { .. }
+            | Self::SessionDeleted { .. }
+            | Self::SessionsSearched { .. }
             | Self::SlashCommandExecuted { .. }
             | Self::ThinkingDialogLoaded { .. }
             | Self::TimelineJumpLoaded { .. }
             | Self::PluginCommandInvoked { .. } => DaemonObservation::None,
             Self::RalphAction { result, .. } => DaemonObservation::from_tui_result(result),
+            Self::RalphStarted { result } => DaemonObservation::from_tui_result(result),
             Self::PluginSurfaceOpened { result, .. } => DaemonObservation::from_tui_result(result),
             Self::ForkPromptsLoaded { result, .. } => DaemonObservation::from_tui_result(result),
             Self::ModelProvidersLoaded { result } => DaemonObservation::from_client_result(result),
@@ -868,8 +904,14 @@ enum EffectKey {
     DraftSave,
     SlashPalette,
     CommandPalette,
+    SessionPicker,
+    ImportSession,
+    RenameSession(SessionId),
+    DeleteSession(SessionId),
+    SearchSessions,
     SlashCommand,
     RalphAction,
+    RalphStart,
     PluginSurface,
     ForkPrompts,
     ModelProviders,
@@ -879,8 +921,6 @@ enum EffectKey {
     ThinkingDialog,
     TimelineJump,
     PluginCommand(String, String),
-    RenameSession(SessionId),
-    DeleteSession(SessionId),
     ForkSession(SessionId),
     CloneSession(SessionId),
     SubmitMessage(usize),
@@ -953,13 +993,6 @@ impl TuiEffect {
             },
             Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
                 agents: Err(client_error.to_string()),
-            },
-            Self::RenameSession { .. } => TuiEffectResult::RenameSession {
-                result: Err(client_error),
-            },
-            Self::DeleteSession { session_id } => TuiEffectResult::DeleteSession {
-                session_id,
-                result: Err(client_error),
             },
             Self::ForkSession {
                 switch_after_create,
@@ -1063,8 +1096,14 @@ impl TuiEffect {
             | Self::SaveDraft { .. }
             | Self::LoadSlashPalette { .. }
             | Self::LoadCommandPalette
+            | Self::LoadSessionPicker
+            | Self::ImportSession { .. }
+            | Self::RenameSession { .. }
+            | Self::DeleteSession { .. }
+            | Self::SearchSessions { .. }
             | Self::ExecuteSlashCommand { .. }
             | Self::RalphAction { .. }
+            | Self::RalphStart { .. }
             | Self::OpenPluginSurface { .. }
             | Self::LoadForkPrompts { .. }
             | Self::LoadModelProviders
@@ -1088,8 +1127,6 @@ impl TuiEffect {
             | Self::LoadDraftStatus { .. }
             | Self::LoadSessionStatus { .. }
             | Self::LoadAgentCatalog
-            | Self::RenameSession { .. }
-            | Self::DeleteSession { .. }
             | Self::ForkSession { .. }
             | Self::CloneSession { .. }
             | Self::SubmitMessage { .. }
@@ -1118,8 +1155,14 @@ impl TuiEffect {
             | Self::SaveDraft { .. }
             | Self::LoadSlashPalette { .. }
             | Self::LoadCommandPalette
+            | Self::LoadSessionPicker
+            | Self::ImportSession { .. }
+            | Self::RenameSession { .. }
+            | Self::DeleteSession { .. }
+            | Self::SearchSessions { .. }
             | Self::ExecuteSlashCommand { .. }
             | Self::RalphAction { .. }
+            | Self::RalphStart { .. }
             | Self::OpenPluginSurface { .. }
             | Self::LoadForkPrompts { .. }
             | Self::LoadModelProviders
@@ -1179,6 +1222,11 @@ impl TuiEffectQueue {
         self.effects.insert(effect.key(), (schedule, effect));
     }
 
+    #[cfg(test)]
+    pub fn queued_effect_count(&self) -> usize {
+        self.effects.len()
+    }
+
     /// Return whether an open-session effect is queued for the given session.
     #[cfg(test)]
     pub fn has_open_session(&self, session_id: SessionId) -> bool {
@@ -1193,6 +1241,7 @@ impl TuiEffectQueue {
         })
     }
 
+    /// Return whether a plugin surface-open effect is queued for the given plugin and kind.
     /// Return the projection request queued for one open session.
     #[cfg(test)]
     pub fn open_session_request(&self, session_id: SessionId) -> Option<&ProjectionWindowRequest> {
@@ -1204,6 +1253,11 @@ impl TuiEffectQueue {
             } if *queued == session_id => Some(initial_window_request),
             _ => None,
         })
+    }
+
+    /// Return whether work with the same scheduling key is already queued.
+    pub(super) fn contains_effect(&self, effect: &TuiEffect) -> bool {
+        self.effects.contains_key(&effect.key())
     }
 
     /// Drain non-note effects while retaining ordered presentation notes for serialized release.
@@ -1219,229 +1273,9 @@ impl TuiEffectQueue {
         }
         (effects, notes)
     }
-
-    /// Drain queued effects.
-    pub(super) fn drain(&mut self) -> Vec<(EffectSchedule, TuiEffect)> {
-        std::mem::take(&mut self.effects).into_values().collect()
-    }
 }
 
 const TUI_EFFECT_STREAM_CAPACITY: usize = 64;
-
-pub struct TuiEffectRunner {
-    foreground_client: BcodeClient,
-    passive_client: BcodeClient,
-    tasks: BTreeMap<EffectKey, tokio::task::JoinHandle<TuiEffectResult>>,
-    streaming_sender: mpsc::Sender<TuiEffectResult>,
-    streaming_receiver: mpsc::Receiver<TuiEffectResult>,
-    queued_latest: BTreeMap<EffectKey, TuiEffect>,
-    queued_presentation_notes: BTreeMap<SessionId, VecDeque<TuiEffect>>,
-}
-
-impl TuiEffectRunner {
-    /// Create an effect runner using foreground and passive clients.
-    #[must_use]
-    pub fn new(foreground_client: &BcodeClient, passive_client: &BcodeClient) -> Self {
-        let (streaming_sender, streaming_receiver) = mpsc::channel(TUI_EFFECT_STREAM_CAPACITY);
-        Self {
-            foreground_client: foreground_client.clone(),
-            passive_client: passive_client.clone(),
-            tasks: BTreeMap::new(),
-            streaming_sender,
-            streaming_receiver,
-            queued_latest: BTreeMap::new(),
-            queued_presentation_notes: BTreeMap::new(),
-        }
-    }
-
-    /// Return a clone of the foreground client used for user-requested work.
-    #[must_use]
-    pub fn foreground_client(&self) -> BcodeClient {
-        self.foreground_client.clone()
-    }
-
-    /// Return the bounded streaming completion capacity.
-    #[cfg(test)]
-    fn streaming_capacity(&self) -> usize {
-        self.streaming_receiver.max_capacity()
-    }
-
-    /// Start an effect if another effect with the same key is not running.
-    pub fn start(&mut self, effect: TuiEffect) -> bool {
-        let key = effect.key();
-        if let TuiEffect::AppendPresentationNote { session_id, .. } = &effect {
-            let session_id = *session_id;
-            let active = self
-                .tasks
-                .keys()
-                .any(|key| matches!(key, EffectKey::AppendPresentationNote(active, _) if *active == session_id));
-            let queue = self
-                .queued_presentation_notes
-                .entry(session_id)
-                .or_default();
-            if active || !queue.is_empty() {
-                queue.push_back(effect);
-                return false;
-            }
-        }
-        if self.tasks.contains_key(&key) {
-            return false;
-        }
-        self.spawn(key, effect);
-        true
-    }
-
-    /// Replace any in-flight effect with the same key.
-    pub fn replace(&mut self, effect: TuiEffect) {
-        let key = effect.key();
-        if let Some(task) = self.tasks.remove(&key) {
-            task.abort();
-        }
-        self.spawn(key, effect);
-    }
-
-    /// Queue the latest effect with this key to run after the current one finishes.
-    pub fn queue_latest(&mut self, effect: TuiEffect) -> bool {
-        let key = effect.key();
-        if self.tasks.contains_key(&key) {
-            self.queued_latest.insert(key, effect);
-            return false;
-        }
-        self.spawn(key, effect);
-        true
-    }
-
-    /// Abort an in-flight effect with the same key as the supplied effect.
-    pub fn abort_matching(&mut self, effect: &TuiEffect) {
-        if let Some(task) = self.tasks.remove(&effect.key()) {
-            task.abort();
-        }
-        self.queued_latest.remove(&effect.key());
-    }
-
-    fn spawn(&mut self, key: EffectKey, effect: TuiEffect) {
-        let daemon_intent = effect.daemon_intent();
-        let client = match daemon_intent {
-            EffectDaemonIntent::Background => self.passive_client.clone(),
-            EffectDaemonIntent::Foreground => self.foreground_client.clone(),
-        };
-        let streaming_sender = self.streaming_sender.clone();
-        let task =
-            tokio::spawn(async move { Box::pin(effect.run(client, streaming_sender)).await });
-        self.tasks.insert(key, task);
-    }
-
-    /// Convert queued non-note Bcode effects into runtime-owned commands and return ordered notes.
-    pub fn runtime_work(
-        &self,
-        pending_effects: &mut TuiEffectQueue,
-        handle: &bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
-    ) -> (
-        Vec<bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage>>,
-        BTreeMap<SessionId, VecDeque<TuiEffect>>,
-    ) {
-        let (effects, notes) = pending_effects.drain_runtime();
-        let commands = effects
-            .into_iter()
-            .map(|(schedule, effect)| {
-                effect.command(
-                    schedule,
-                    &self.foreground_client,
-                    &self.passive_client,
-                    handle.clone(),
-                )
-            })
-            .collect();
-        (commands, notes)
-    }
-
-    pub fn ordered_command(
-        &self,
-        effect: TuiEffect,
-        handle: &bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
-    ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
-        effect.command(
-            EffectSchedule::StartIfIdle,
-            &self.foreground_client,
-            &self.passive_client,
-            handle.clone(),
-        )
-    }
-
-    /// Poll completed effects without blocking on running tasks.
-    pub async fn poll_finished(&mut self) -> Vec<TuiEffectResult> {
-        let finished = self
-            .tasks
-            .iter()
-            .filter_map(|(key, task)| task.is_finished().then_some(key.clone()))
-            .collect::<Vec<_>>();
-        let mut results = Vec::with_capacity(finished.len());
-        while let Ok(result) = self.streaming_receiver.try_recv() {
-            results.push(result);
-        }
-        results.reserve(finished.len());
-        for key in finished {
-            let Some(task) = self.tasks.remove(&key) else {
-                continue;
-            };
-            match task.await {
-                Ok(result) => results.push(result),
-                Err(_error) => {}
-            }
-            if let Some(effect) = self.queued_latest.remove(&key) {
-                self.spawn(key.clone(), effect);
-            }
-            let EffectKey::AppendPresentationNote(session_id, _) = key else {
-                continue;
-            };
-            let next = self
-                .queued_presentation_notes
-                .get_mut(&session_id)
-                .and_then(VecDeque::pop_front);
-            if let Some(effect) = next {
-                let key = effect.key();
-                self.spawn(key, effect);
-            } else {
-                self.queued_presentation_notes.remove(&session_id);
-            }
-        }
-        results
-    }
-
-    /// Start all pending effects produced before or during the loop iteration.
-    ///
-    /// Returns true when at least one pending effect was started.
-    pub fn drain_pending(&mut self, pending_effects: &mut TuiEffectQueue) -> bool {
-        let mut started = false;
-        for (schedule, effect) in pending_effects.drain() {
-            match schedule {
-                EffectSchedule::StartIfIdle => {
-                    started |= self.start(effect);
-                }
-                EffectSchedule::Replace => {
-                    self.replace(effect);
-                    started = true;
-                }
-                EffectSchedule::QueueLatest => {
-                    started |= self.queue_latest(effect);
-                }
-                EffectSchedule::Cancel => {
-                    self.abort_matching(&effect);
-                }
-            }
-        }
-        started
-    }
-
-    /// Abort all in-flight effects.
-    pub fn abort_all(&mut self) {
-        self.queued_latest.clear();
-        self.queued_presentation_notes.clear();
-        for (_key, task) in std::mem::take(&mut self.tasks) {
-            task.abort();
-        }
-    }
-}
 
 impl TuiEffect {
     pub(super) fn command_key(&self) -> bmux_tui_runtime::CommandKey {
@@ -1521,8 +1355,14 @@ impl TuiEffect {
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::LoadCommandPalette => EffectKey::CommandPalette,
+            Self::LoadSessionPicker => EffectKey::SessionPicker,
+            Self::ImportSession { .. } => EffectKey::ImportSession,
+            Self::RenameSession { session_id, .. } => EffectKey::RenameSession(*session_id),
+            Self::DeleteSession { session_id } => EffectKey::DeleteSession(*session_id),
+            Self::SearchSessions { .. } => EffectKey::SearchSessions,
             Self::ExecuteSlashCommand { .. } => EffectKey::SlashCommand,
             Self::RalphAction { .. } => EffectKey::RalphAction,
+            Self::RalphStart { .. } => EffectKey::RalphStart,
             Self::OpenPluginSurface { .. } => EffectKey::PluginSurface,
             Self::LoadForkPrompts { .. } => EffectKey::ForkPrompts,
             Self::LoadModelProviders => EffectKey::ModelProviders,
@@ -1536,8 +1376,6 @@ impl TuiEffect {
                 command_id,
                 ..
             } => EffectKey::PluginCommand(plugin_id.clone(), command_id.clone()),
-            Self::RenameSession { session_id, .. } => EffectKey::RenameSession(*session_id),
-            Self::DeleteSession { session_id } => EffectKey::DeleteSession(*session_id),
             Self::ForkSession { session_id, .. } => EffectKey::ForkSession(*session_id),
             Self::CloneSession { session_id, .. } => EffectKey::CloneSession(*session_id),
             Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
@@ -1690,6 +1528,28 @@ impl TuiEffect {
                     .await
                     .map(|contributions| contributions.command_contributions),
             },
+            Self::LoadSessionPicker => TuiEffectResult::SessionPickerLoaded {
+                result: client.list_sessions_with_status().await,
+            },
+            Self::ImportSession {
+                source_id,
+                external_session_id,
+            } => TuiEffectResult::SessionImported {
+                result: client
+                    .import_external_session(source_id, external_session_id)
+                    .await,
+            },
+            Self::RenameSession { session_id, name } => TuiEffectResult::SessionRenamed {
+                result: client.rename_session(session_id, name).await,
+            },
+            Self::DeleteSession { session_id } => TuiEffectResult::SessionDeleted {
+                result: client.delete_session(session_id).await,
+            },
+            Self::SearchSessions { request, policy } => TuiEffectResult::SessionsSearched {
+                result: client
+                    .session_search(*request, policy, Vec::new(), true)
+                    .await,
+            },
             Self::ExecuteSlashCommand {
                 session_id,
                 working_directory,
@@ -1721,6 +1581,9 @@ impl TuiEffect {
             Self::RalphAction { repo_root, action } => TuiEffectResult::RalphAction {
                 action,
                 result: super::ralph_flow::execute_root_action(&client, repo_root, action).await,
+            },
+            Self::RalphStart { request } => TuiEffectResult::RalphStarted {
+                result: super::ralph_flow::execute_root_start(&client, request).await,
             },
             Self::OpenPluginSurface {
                 plugin_id,
@@ -1852,31 +1715,6 @@ impl TuiEffect {
                 .await;
                 TuiEffectResult::PluginCommandInvoked { plugin_id, result }
             }
-            Self::RenameSession { session_id, name } => TuiEffectResult::RenameSession {
-                result: match execute_session_view_action(
-                    &client,
-                    SessionViewAction::RenameSession { session_id, name },
-                )
-                .await
-                {
-                    Ok(SessionViewActionOutcome::SessionRenamed { session }) => Ok(*session),
-                    Ok(_) => Err(ClientError::UnexpectedResponse),
-                    Err(error) => Err(error),
-                },
-            },
-            Self::DeleteSession { session_id } => TuiEffectResult::DeleteSession {
-                session_id,
-                result: match execute_session_view_action(
-                    &client,
-                    SessionViewAction::DeleteSession { session_id },
-                )
-                .await
-                {
-                    Ok(SessionViewActionOutcome::SessionDeleted { session }) => Ok(*session),
-                    Ok(_) => Err(ClientError::UnexpectedResponse),
-                    Err(error) => Err(error),
-                },
-            },
             Self::ForkSession {
                 session_id,
                 prompt_sequence,
@@ -2699,44 +2537,6 @@ mod progress_routing_tests {
         ));
     }
 
-    #[tokio::test]
-    async fn presentation_note_queue_preserves_emission_order_per_session() {
-        let client = BcodeClient::default_endpoint();
-        let mut runner = TuiEffectRunner::new(&client, &client);
-        let session_id = SessionId::new();
-        let note = |note_id: &str| TuiEffect::AppendPresentationNote {
-            session_id,
-            source_id: "test".to_owned(),
-            note_id: note_id.to_owned(),
-            text: note_id.to_owned(),
-            format: bcode_command::CommandTextFormat::PlainText,
-        };
-        let active_key = EffectKey::AppendPresentationNote(session_id, "0001".to_owned());
-        runner.tasks.insert(
-            active_key,
-            tokio::spawn(async { std::future::pending::<TuiEffectResult>().await }),
-        );
-
-        assert!(!runner.start(note("0002")));
-        assert!(!runner.start(note("0003")));
-
-        let queued = runner
-            .queued_presentation_notes
-            .get(&session_id)
-            .expect("notes should queue behind the active append")
-            .iter()
-            .map(TuiEffect::key)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            queued,
-            vec![
-                EffectKey::AppendPresentationNote(session_id, "0002".to_owned()),
-                EffectKey::AppendPresentationNote(session_id, "0003".to_owned()),
-            ]
-        );
-        runner.abort_all();
-    }
-
     #[test]
     fn runtime_effect_drain_preserves_every_ordered_note_per_session() {
         let session_id = SessionId::new();
@@ -2768,49 +2568,5 @@ mod progress_routing_tests {
                 EffectKey::AppendPresentationNote(session_id, "0003".to_owned()),
             ]
         );
-    }
-
-    #[test]
-    fn effect_streaming_completion_channel_is_bounded() {
-        let client = BcodeClient::default_endpoint();
-        let runner = TuiEffectRunner::new(&client, &client);
-        assert_eq!(runner.streaming_capacity(), TUI_EFFECT_STREAM_CAPACITY);
-    }
-
-    #[tokio::test]
-    async fn runner_drains_streaming_session_progress_through_effect_results() {
-        let client = BcodeClient::default_endpoint();
-        let mut runner = TuiEffectRunner::new(&client, &client);
-        let session_id = SessionId::new();
-        let snapshot = bcode_session_models::SessionOpenOperationSnapshot {
-            operation_id: bcode_session_models::SessionOpenOperationId::new(),
-            revision: 1,
-            session_id,
-            source_writer_epoch: Some(3),
-            target_writer_epoch: 4,
-            progress: bcode_session_models::SessionMigrationProgress {
-                stage: bcode_session_models::SessionMigrationStage::CopyingBackup,
-                completed_units: Some(1),
-                total_units: Some(2),
-                unit: Some(bcode_session_models::SessionMigrationProgressUnit::Files),
-                message: "Copying backup".to_owned(),
-            },
-            outcome: None,
-            backup_path: None,
-        };
-        runner
-            .streaming_sender
-            .try_send(TuiEffectResult::SessionOpenProgress {
-                snapshot: snapshot.clone(),
-            })
-            .expect("stream progress result");
-
-        let results = runner.poll_finished().await;
-
-        assert_eq!(results.len(), 1);
-        assert!(matches!(
-            &results[0],
-            TuiEffectResult::SessionOpenProgress { snapshot: actual } if actual == &snapshot
-        ));
     }
 }

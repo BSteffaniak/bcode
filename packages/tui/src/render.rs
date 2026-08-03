@@ -133,6 +133,7 @@ pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
 }
 
 /// Prepare derived frame projections before rendering.
+#[cfg(test)]
 pub fn prepare_frame(app: &mut BmuxApp, area: Rect) -> Option<FrameLayout> {
     prepare_frame_with_bottom_dock(app, area, 0).map(|(layout, _dock)| layout)
 }
@@ -155,6 +156,7 @@ pub fn prepare_frame_with_bottom_dock(
 }
 
 /// Render one TUI frame.
+#[cfg(test)]
 pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     if let Some(layout) = prepare_frame(app, frame.area()) {
         render_prepared(app, frame, layout);

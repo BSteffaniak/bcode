@@ -87,7 +87,7 @@ async fn jump_to_selected_timeline_entry(
         match history_flow::load_timeline_jump_events(client, session_id, entry.sequence()).await {
             Ok(events) => events,
             Err(TuiError::Client(error)) => {
-                super::helpers::report_client_issue(
+                super::daemon_issue::report_client_issue(
                     &mut chat.app,
                     "timeline jump unavailable",
                     &error,

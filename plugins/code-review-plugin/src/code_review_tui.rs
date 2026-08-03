@@ -16005,10 +16005,15 @@ pub(crate) mod tests {
         let changed_file = temp.path().join("changed.rs");
         let full_contents = "pub fn changed() {\n    println!(\"complete detail\");\n}\n";
         std::fs::write(&changed_file, full_contents).expect("exercise file-modifying tool");
+        let display_context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+            Some(temp.path().to_path_buf()),
+        );
         let full_result = format!(
             "wrote {} bytes to {}\n{}",
             full_contents.len(),
-            changed_file.display(),
+            display_context.display_path(&changed_file),
             "full tool detail ".repeat(80)
         );
         let arguments = serde_json::json!({

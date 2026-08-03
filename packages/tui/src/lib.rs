@@ -41,13 +41,13 @@ pub(crate) mod model_picker_render;
 pub(crate) mod mouse_flow;
 pub(crate) mod older_history;
 pub mod onboarding;
+mod onboarding_program;
 pub(crate) mod onboarding_render;
 pub(crate) mod palette_flow;
 pub(crate) mod pending_submission;
 pub(crate) mod pending_submissions;
 pub(crate) mod permission_dialog;
 pub(crate) mod permission_dialog_render;
-pub(crate) mod permission_flow;
 pub(crate) mod permission_present;
 pub(crate) mod picker_mouse;
 pub(crate) mod picker_render;
@@ -67,7 +67,6 @@ mod renderer_fixtures;
 mod root_program;
 pub(crate) mod runtime;
 mod runtime_adapter;
-mod runtime_context;
 pub(crate) mod session_flow;
 pub(crate) mod session_fork_dialog;
 pub(crate) mod session_fork_dialog_render;
@@ -80,14 +79,12 @@ pub(crate) mod skill_flow;
 pub(crate) mod skill_picker;
 pub(crate) mod skill_picker_render;
 pub(crate) mod slash_commands;
-pub(crate) mod slash_flow;
 pub(crate) mod slash_palette;
 pub(crate) mod slash_palette_render;
 pub(crate) mod slash_registry;
 pub(crate) mod startup_action;
 pub(crate) mod telemetry;
 pub(crate) mod temporal;
-pub(crate) mod terminal_events;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod text_input_flow;
@@ -98,7 +95,6 @@ pub(crate) mod thinking_flow;
 pub(crate) mod time_format;
 pub(crate) mod timeline_dialog;
 pub(crate) mod timeline_dialog_render;
-pub(crate) mod timeline_flow;
 pub(crate) mod tool_render_projection;
 #[cfg(test)]
 mod tool_render_projection_tests;
@@ -109,7 +105,6 @@ pub(crate) mod transcript_markdown_cache;
 pub(crate) mod transcript_projection;
 pub(crate) mod transcript_resident_window;
 pub(crate) mod transcript_viewport;
-pub(crate) mod worktree_flow;
 pub(crate) mod wt_create_dialog;
 pub(crate) mod wt_create_dialog_render;
 
@@ -154,17 +149,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_session_models::SessionId;
 use bmux_tui::crossterm::CrosstermTerminalGuard;
-use bmux_tui::event::{
-    Event as BmuxEvent, MouseButton as BmuxMouseButton, MouseEvent as BmuxMouseEvent,
-    MouseEventKind as BmuxMouseEventKind, MouseModifiers as BmuxMouseModifiers,
-};
-use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::terminal::Terminal;
-use crossterm::event::{
-    self as crossterm_event, Event as CrosstermEvent, KeyCode as CrosstermKeyCode,
-    MouseButton as CrosstermMouseButton, MouseEvent as CrosstermMouseEvent,
-    MouseEventKind as CrosstermMouseEventKind,
-};
 
 const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const OLDER_HISTORY_EVENT_LIMIT: usize = 256;
@@ -230,7 +215,7 @@ pub enum TuiError {
 /// # Errors
 ///
 /// Returns I/O, settings, or config errors.
-pub fn run_onboarding() -> Result<(), TuiError> {
+pub async fn run_onboarding() -> Result<(), TuiError> {
     let store = bcode_settings::SettingsStore::default();
     let detection = bcode_settings::detect_setup_environment(current_time_ms());
     store.save_setup_detection_snapshot(&detection)?;
@@ -253,7 +238,7 @@ pub fn run_onboarding() -> Result<(), TuiError> {
         current_time_ms(),
     )?;
     let summary = bcode_settings::SetupConfigSummary::from_config(&config);
-    let mut shell = onboarding::OnboardingShell::load(&store, &summary)?;
+    let shell = onboarding::OnboardingShell::load(&store, &summary)?;
     let recommendations = store.setup_recommendations()?;
     let readiness = bcode_settings::setup_readiness_report(shell.sections(), &recommendations);
     store.save_readiness_report(&readiness, current_time_ms())?;
@@ -266,137 +251,35 @@ pub fn run_onboarding() -> Result<(), TuiError> {
             })?,
             helpers::terminal_area()?,
         );
-        run_onboarding_loop(&mut terminal, &store, &mut shell)
+        run_onboarding_runtime(&mut terminal, store, shell).await
     };
     let _writer = guard.leave()?;
     result
 }
 
-fn run_onboarding_loop<W: io::Write>(
+async fn run_onboarding_runtime<W: io::Write>(
     terminal: &mut Terminal<&mut W>,
-    store: &bcode_settings::SettingsStore,
-    shell: &mut onboarding::OnboardingShell,
+    store: bcode_settings::SettingsStore,
+    shell: onboarding::OnboardingShell,
 ) -> Result<(), TuiError> {
-    loop {
-        terminal.resize(helpers::terminal_area()?);
-        let health = store.health();
-        let readiness = store.readiness_report()?;
-        terminal.draw(|frame| {
-            onboarding_render::render_onboarding(shell, frame, &health, readiness.clone());
-        })?;
-        match crossterm_event::read()? {
-            CrosstermEvent::Resize(width, height) => {
-                terminal.resize(Rect::new(0, 0, width, height));
-            }
-            CrosstermEvent::Key(key) => {
-                if handle_onboarding_key(key.code, store, shell)? {
-                    return Ok(());
-                }
-            }
-            CrosstermEvent::Mouse(mouse) => {
-                let board_area = onboarding_render::onboarding_board_area(terminal.area());
-                let event = BmuxEvent::Mouse(convert_onboarding_mouse(mouse));
-                let _outcome = shell.handle_board_event(board_area, &event);
-            }
-            CrosstermEvent::FocusGained | CrosstermEvent::FocusLost | CrosstermEvent::Paste(_) => {}
-        }
-    }
-}
-
-fn handle_onboarding_key(
-    code: CrosstermKeyCode,
-    store: &bcode_settings::SettingsStore,
-    shell: &mut onboarding::OnboardingShell,
-) -> Result<bool, TuiError> {
-    match code {
-        CrosstermKeyCode::Esc | CrosstermKeyCode::Char('q') => {
-            shell.handle_action(
-                onboarding::OnboardingInputAction::CancelConfirmation,
-                store,
-                current_time_ms(),
-            )?;
-            Ok(true)
-        }
-        CrosstermKeyCode::Right | CrosstermKeyCode::Down | CrosstermKeyCode::Char('j') => {
-            shell.focus_next();
-            Ok(false)
-        }
-        CrosstermKeyCode::Left | CrosstermKeyCode::Up | CrosstermKeyCode::Char('k') => {
-            shell.focus_previous();
-            Ok(false)
-        }
-        _ => {
-            if let Some(action) = onboarding_action_for_key(code) {
-                shell.handle_action(action, store, current_time_ms())?;
-            }
-            Ok(false)
-        }
-    }
-}
-
-const fn onboarding_action_for_key(
-    code: CrosstermKeyCode,
-) -> Option<onboarding::OnboardingInputAction> {
-    match code {
-        CrosstermKeyCode::Enter => Some(onboarding::OnboardingInputAction::Select),
-        CrosstermKeyCode::Char('p') => Some(onboarding::OnboardingInputAction::ToggleProvider),
-        CrosstermKeyCode::Char('a') => Some(onboarding::OnboardingInputAction::ToggleAuthProfile),
-        CrosstermKeyCode::Char('m') => Some(onboarding::OnboardingInputAction::SelectModelProfile),
-        CrosstermKeyCode::Char('r') => {
-            Some(onboarding::OnboardingInputAction::CyclePermissionPreset)
-        }
-        CrosstermKeyCode::Char('i') => Some(onboarding::OnboardingInputAction::ReviewSessionImport),
-        CrosstermKeyCode::Char('g') => Some(onboarding::OnboardingInputAction::ReviewPlugins),
-        CrosstermKeyCode::Char('x') => Some(onboarding::OnboardingInputAction::ApplyPlan),
-        CrosstermKeyCode::Char('y') => Some(onboarding::OnboardingInputAction::Confirm),
-        CrosstermKeyCode::Char('n') => Some(onboarding::OnboardingInputAction::CancelConfirmation),
-        CrosstermKeyCode::Char('c') => Some(onboarding::OnboardingInputAction::Complete),
-        CrosstermKeyCode::Char('s') => Some(onboarding::OnboardingInputAction::Skip),
-        CrosstermKeyCode::Char('l') => Some(onboarding::OnboardingInputAction::Launch),
-        _ => None,
-    }
-}
-
-const fn convert_onboarding_mouse(mouse: CrosstermMouseEvent) -> BmuxMouseEvent {
-    BmuxMouseEvent {
-        kind: convert_onboarding_mouse_kind(mouse.kind),
-        position: Point::new(mouse.column, mouse.row),
-        modifiers: BmuxMouseModifiers {
-            shift: mouse
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::SHIFT),
-            alt: mouse
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::ALT),
-            ctrl: mouse
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::CONTROL),
-        },
-    }
-}
-
-const fn convert_onboarding_mouse_kind(kind: CrosstermMouseEventKind) -> BmuxMouseEventKind {
-    match kind {
-        CrosstermMouseEventKind::Down(button) => {
-            BmuxMouseEventKind::Down(convert_mouse_button(button))
-        }
-        CrosstermMouseEventKind::Up(button) => BmuxMouseEventKind::Up(convert_mouse_button(button)),
-        CrosstermMouseEventKind::Drag(button) => {
-            BmuxMouseEventKind::Drag(convert_mouse_button(button))
-        }
-        CrosstermMouseEventKind::Moved => BmuxMouseEventKind::Move,
-        CrosstermMouseEventKind::ScrollUp => BmuxMouseEventKind::ScrollUp,
-        CrosstermMouseEventKind::ScrollDown => BmuxMouseEventKind::ScrollDown,
-        CrosstermMouseEventKind::ScrollLeft => BmuxMouseEventKind::ScrollLeft,
-        CrosstermMouseEventKind::ScrollRight => BmuxMouseEventKind::ScrollRight,
-    }
-}
-
-const fn convert_mouse_button(button: CrosstermMouseButton) -> BmuxMouseButton {
-    match button {
-        CrosstermMouseButton::Left => BmuxMouseButton::Left,
-        CrosstermMouseButton::Right => BmuxMouseButton::Right,
-        CrosstermMouseButton::Middle => BmuxMouseButton::Middle,
+    let area = terminal.area();
+    let program = onboarding_program::OnboardingProgram::new(store, shell, area)?;
+    let presenter = onboarding_program::OnboardingPresenter::new(terminal);
+    let (runtime, handle) = bmux_tui_runtime::Runtime::new(
+        program,
+        presenter,
+        bmux_tui_runtime::RuntimeConfig::default(),
+    );
+    let input = bmux_tui_runtime::TerminalInput::start::<onboarding_program::OnboardingProgram>(
+        handle,
+        onboarding_program::OnboardingMessage::InputFailed,
+    );
+    let result = runtime.run().await;
+    input.request_shutdown();
+    match result {
+        Ok(_output) => Ok(()),
+        Err(bmux_tui_runtime::RuntimeError::Program { error, .. }) => Err(error),
+        Err(bmux_tui_runtime::RuntimeError::Presenter { error, .. }) => Err(error.into()),
     }
 }
 
@@ -656,7 +539,7 @@ pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), T
             })?,
             helpers::terminal_area()?,
         );
-        code_review_launcher::run_home(&mut terminal, repo_path).await
+        Box::pin(code_review_launcher::run_home(&mut terminal, repo_path)).await
     };
 
     match result {
@@ -694,7 +577,12 @@ pub async fn run_code_review_workspace(
             })?,
             helpers::terminal_area()?,
         );
-        code_review_launcher::run_workspace(&mut terminal, workspace, build_mode).await
+        Box::pin(code_review_launcher::run_workspace(
+            &mut terminal,
+            workspace,
+            build_mode,
+        ))
+        .await
     };
 
     match result {
@@ -729,7 +617,7 @@ pub async fn run_code_review(
             })?,
             helpers::terminal_area()?,
         );
-        code_review_launcher::run(&mut terminal, repo_path, target).await
+        Box::pin(code_review_launcher::run(&mut terminal, repo_path, target)).await
     };
 
     match result {
@@ -761,7 +649,7 @@ pub async fn run_eval_viewer_picker(repo_path: std::path::PathBuf) -> Result<(),
             })?,
             helpers::terminal_area()?,
         );
-        eval_launcher::run_picker(&mut terminal, repo_path).await
+        Box::pin(eval_launcher::run_picker(&mut terminal, repo_path)).await
     };
     let _writer = guard.leave()?;
     result
@@ -786,7 +674,12 @@ pub async fn run_metrics_dashboard(
             })?,
             helpers::terminal_area()?,
         );
-        metrics_launcher::run_dashboard(&mut terminal, repo_path, metrics_path).await
+        Box::pin(metrics_launcher::run_dashboard(
+            &mut terminal,
+            repo_path,
+            metrics_path,
+        ))
+        .await
     };
     let _writer = guard.leave()?;
     result
@@ -813,7 +706,7 @@ pub async fn run_eval_viewer(
             })?,
             helpers::terminal_area()?,
         );
-        eval_launcher::run_viewer(&mut terminal, repo_path, run).await
+        Box::pin(eval_launcher::run_viewer(&mut terminal, repo_path, run)).await
     };
     let _writer = guard.leave()?;
     result

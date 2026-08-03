@@ -8,7 +8,6 @@ use bcode_skill_models::SkillId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinSlashCommand {
     name: &'static str,
-    draft_safe: bool,
 }
 
 impl BuiltinSlashCommand {
@@ -16,12 +15,6 @@ impl BuiltinSlashCommand {
     #[must_use]
     pub const fn name(self) -> &'static str {
         self.name
-    }
-
-    /// Return whether the command can run before a persisted session exists.
-    #[must_use]
-    pub const fn draft_safe(self) -> bool {
-        self.draft_safe
     }
 }
 
@@ -47,130 +40,45 @@ impl SlashCompletion {
 }
 
 const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
-    BuiltinSlashCommand {
-        name: "version",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "sessions",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "resync",
-        draft_safe: false,
-    },
+    BuiltinSlashCommand { name: "version" },
+    BuiltinSlashCommand { name: "sessions" },
+    BuiltinSlashCommand { name: "resync" },
     BuiltinSlashCommand {
         name: "rescan-imports",
-        draft_safe: true,
     },
-    BuiltinSlashCommand {
-        name: "new",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "plan",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "build",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "agent",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "compact",
-        draft_safe: false,
-    },
-    BuiltinSlashCommand {
-        name: "model",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "models",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "set-model",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "provider",
-        draft_safe: true,
-    },
+    BuiltinSlashCommand { name: "new" },
+    BuiltinSlashCommand { name: "plan" },
+    BuiltinSlashCommand { name: "build" },
+    BuiltinSlashCommand { name: "agent" },
+    BuiltinSlashCommand { name: "compact" },
+    BuiltinSlashCommand { name: "model" },
+    BuiltinSlashCommand { name: "models" },
+    BuiltinSlashCommand { name: "set-model" },
+    BuiltinSlashCommand { name: "provider" },
     BuiltinSlashCommand {
         name: "set-provider",
-        draft_safe: true,
     },
     BuiltinSlashCommand {
         name: "context-strategy",
-        draft_safe: false,
     },
-    BuiltinSlashCommand {
-        name: "context",
-        draft_safe: false,
-    },
-    BuiltinSlashCommand {
-        name: "cwd",
-        draft_safe: false,
-    },
-    BuiltinSlashCommand {
-        name: "worktree",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "worktrees",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "fork",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "clone",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "ralph",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "goal",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "skills",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "skill",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "thinking",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "timeline",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
-        name: "stop",
-        draft_safe: false,
-    },
+    BuiltinSlashCommand { name: "context" },
+    BuiltinSlashCommand { name: "cwd" },
+    BuiltinSlashCommand { name: "worktree" },
+    BuiltinSlashCommand { name: "worktrees" },
+    BuiltinSlashCommand { name: "fork" },
+    BuiltinSlashCommand { name: "clone" },
+    BuiltinSlashCommand { name: "ralph" },
+    BuiltinSlashCommand { name: "goal" },
+    BuiltinSlashCommand { name: "skills" },
+    BuiltinSlashCommand { name: "skill" },
+    BuiltinSlashCommand { name: "thinking" },
+    BuiltinSlashCommand { name: "timeline" },
+    BuiltinSlashCommand { name: "stop" },
     BuiltinSlashCommand {
         name: "cancel-runtime",
-        draft_safe: false,
     },
-    BuiltinSlashCommand {
-        name: "runtime",
-        draft_safe: false,
-    },
-    BuiltinSlashCommand {
-        name: "status",
-        draft_safe: false,
-    },
+    BuiltinSlashCommand { name: "runtime" },
+    BuiltinSlashCommand { name: "status" },
 ];
 
 const STATIC_COMPLETIONS: &[SlashCompletion] = &[
@@ -364,26 +272,7 @@ pub enum SlashResolution {
     Unknown,
 }
 
-impl SlashResolution {
-    /// Return true when the resolution is a known slash command.
-    #[must_use]
-    pub const fn is_known(&self) -> bool {
-        matches!(
-            self,
-            Self::Builtin(_) | Self::SkillAlias { .. } | Self::PluginCommand(_)
-        )
-    }
-
-    /// Return true when the command can run before a persisted session exists.
-    #[must_use]
-    pub const fn is_draft_safe(&self) -> bool {
-        match self {
-            Self::Builtin(command) => command.draft_safe(),
-            Self::SkillAlias { .. } => true,
-            Self::PluginCommand(_) | Self::Unknown => false,
-        }
-    }
-}
+impl SlashResolution {}
 
 /// Return static builtin slash command metadata.
 #[must_use]
@@ -479,8 +368,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_is_draft_safe_and_discoverable() {
-        assert!(builtin_command("version").expect("version").draft_safe());
+    fn version_is_discoverable() {
         assert!(static_completions().iter().any(|completion| {
             completion.command() == "/version"
                 && completion.description().contains("build information")

@@ -116,22 +116,6 @@ pub async fn load_timeline_jump_events(
     Ok((events, older.has_more, newer.has_more))
 }
 
-/// Attach to a session and forward live events into the UI event channel.
-pub async fn attach_session_event_stream(
-    client: &BcodeClient,
-    session_id: SessionId,
-    event_sender: mpsc::Sender<SessionStreamUpdate>,
-) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
-    attach_session_event_stream_with_window_request(
-        client,
-        session_id,
-        event_sender,
-        initial_transcript_window_request(bmux_tui::geometry::Rect::new(0, 0, 80, 24)),
-        |_| {},
-    )
-    .await
-}
-
 /// Attach to a session, but hold live event forwarding until the receiver is released.
 pub async fn attach_paused_session_event_stream(
     client: &BcodeClient,

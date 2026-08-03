@@ -1914,27 +1914,6 @@ impl BmuxApp {
         Some(start..start.saturating_add(rows))
     }
 
-    /// Scroll one terminal transcript item into view.
-    pub fn scroll_transcript_item_into_view(&mut self, index: usize) -> bool {
-        let Some(range) = self.transcript_item_row_range(index) else {
-            return false;
-        };
-        let top = self.transcript_top_row(self.viewport.height());
-        let height = usize::from(self.viewport.height()).max(1);
-        let target_top = if range.start < top {
-            range.start
-        } else if range.end > top.saturating_add(height) {
-            range.end.saturating_sub(height)
-        } else {
-            return false;
-        };
-        self.cancel_transcript_scroll_animation_for_manual_scroll();
-        self.mark_manual_transcript_scroll();
-        self.scroll_mode = TranscriptScrollMode::ManualDetached;
-        self.viewport.materialize_top_row(target_top);
-        true
-    }
-
     /// Return active inline interaction identity and reserved rows.
     #[must_use]
     pub fn active_interaction_layout(&self) -> Option<(&str, u16)> {
@@ -1960,15 +1939,6 @@ impl BmuxApp {
             if let Some(index) = self.interaction_transcript_index(&interaction_id) {
                 self.mark_transcript_item_dirty(index);
             }
-        }
-    }
-
-    /// Mark the active interaction transcript entry dirty after renderer-local layout changes.
-    pub fn invalidate_interaction_surface_layout(&mut self) {
-        if let Some((interaction_id, _)) = self.active_interaction_layout.clone()
-            && let Some(index) = self.interaction_transcript_index(&interaction_id)
-        {
-            self.mark_transcript_item_dirty(index);
         }
     }
 
@@ -2113,11 +2083,6 @@ impl BmuxApp {
         &self.key_hints
     }
 
-    /// Store configured key hints for the status line.
-    pub fn set_key_hints(&mut self, key_hints: String) {
-        self.key_hints = key_hints;
-    }
-
     /// Clear any pending multi-tap key activation.
     pub const fn clear_pending_key_activation(&mut self) {
         self.pending_key_activation = None;
@@ -2201,11 +2166,6 @@ impl BmuxApp {
         });
         self.set_status(prompt.to_owned());
         KeyActivationOutcome::Pending
-    }
-
-    /// Store the configured key label for jumping to latest transcript content.
-    pub fn set_jump_to_latest_key_label(&mut self, key_label: String) {
-        self.jump_to_latest_key_label = key_label;
     }
 
     /// Append a plain-text system-style transcript note.

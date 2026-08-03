@@ -210,15 +210,6 @@ fn classify_server_error(code: &str, message: &str) -> TuiDaemonIssue {
     }
 }
 
-/// Return whether a TUI error should degrade the UI instead of exiting it.
-#[must_use]
-pub const fn is_nonfatal_tui_error(error: &TuiError) -> bool {
-    matches!(
-        error,
-        TuiError::Client(_) | TuiError::PluginService { .. } | TuiError::SessionUnavailable { .. }
-    )
-}
-
 /// Return the status text for a recoverable client error, including the underlying error.
 #[must_use]
 pub fn client_issue_status(label: &str, error: &ClientError) -> String {

@@ -35,6 +35,8 @@ pub enum BcodeRuntimeMessage {
     ArtifactFetchCompleted(Box<ActiveArtifactFetchCompletion>),
     /// Latest Markdown projection completion.
     MarkdownProjectionCompleted(Box<Option<MarkdownProjectionCompletion>>),
+    /// Plugin surface host invalidation became pending.
+    PluginSurfaceInvalidated,
     /// Completed Bcode-owned background effect.
     EffectCompleted(Box<TuiEffectResult>),
     /// Completed attempt to open the next inline interactive surface.
@@ -71,6 +73,7 @@ impl BcodeRuntimeMessage {
             | Self::Terminal(_)
             | Self::SessionStream(_)
             | Self::ArtifactFetchCompleted(_)
+            | Self::PluginSurfaceInvalidated
             | Self::EffectCompleted(_)
             | Self::InteractiveSurfaceOpened(_)
             | Self::InteractiveSurfaceResolved(_)
@@ -190,6 +193,8 @@ pub struct BcodeRuntimeModel {
     pub draft_autosave: DraftAutosave,
     /// Current top-level navigation/screen state.
     pub screen: BcodeRuntimeScreen,
+    /// Previously active root screen retained while temporary native-session navigation runs.
+    suspended_screen: Option<BcodeRuntimeScreen>,
     /// Runtime control handle used for live cadence replacement.
     pub runtime_handle: Option<bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>>,
     /// Deferred application messages blocked by an explicit paint or navigation barrier.
@@ -204,6 +209,10 @@ pub struct BcodeRuntimeModel {
     pub committed_area: bmux_tui::geometry::Rect,
     /// Last successfully committed presentation timestamp.
     pub last_presented_at: Option<Instant>,
+    /// Whether closing the root plugin surface should terminate this runtime invocation.
+    exit_after_plugin_surface: bool,
+    /// Standalone plugin close result returned to the launcher.
+    plugin_surface_result: Option<(String, Option<serde_json::Value>)>,
     /// Whether the root program should terminate after its dirty state is committed.
     pub exit_requested: bool,
 }
@@ -243,6 +252,7 @@ impl BcodeRuntimeModel {
             settings,
             draft_autosave,
             screen: BcodeRuntimeScreen::Chat,
+            suspended_screen: None,
             runtime_handle: None,
             deferred: VecDeque::new(),
             ordered_notes: OrderedPresentationQueue::default(),
@@ -250,8 +260,129 @@ impl BcodeRuntimeModel {
             committed_hits: bmux_tui::hit::HitMap::default(),
             committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
             last_presented_at: None,
+            exit_after_plugin_surface: false,
+            plugin_surface_result: None,
             exit_requested: false,
         }
+    }
+
+    fn active_screen(&self) -> BcodeRuntimeScreen {
+        self.loop_state.active_root_screen()
+    }
+
+    fn synchronize_screen(&mut self) -> super::invalidation::UiInvalidation {
+        let next = self.active_screen();
+        if next == self.screen {
+            return super::invalidation::UiInvalidation::None;
+        }
+        self.screen = next;
+        super::invalidation::UiInvalidation::Structural
+    }
+
+    const fn suspend_screen_for_session_navigation(&mut self) {
+        self.suspended_screen = Some(self.screen);
+        self.screen = BcodeRuntimeScreen::Chat;
+    }
+
+    fn resume_screen_after_session_navigation(&mut self) {
+        let expected = self.suspended_screen.take();
+        let active = self.active_screen();
+        self.screen = expected
+            .filter(|screen| *screen == active)
+            .unwrap_or(active);
+    }
+
+    pub fn handle_ralph_surface_action(
+        &mut self,
+        action: super::ralph_launcher::RalphHomeAction,
+    ) -> super::invalidation::UiInvalidation {
+        use super::ralph_flow::RalphRootAction;
+
+        let action = match action {
+            super::ralph_launcher::RalphHomeAction::Plan => RalphRootAction::Plan,
+            super::ralph_launcher::RalphHomeAction::SaveDraft => RalphRootAction::SaveDraft,
+            super::ralph_launcher::RalphHomeAction::ViewDraft => RalphRootAction::ViewDraft,
+            super::ralph_launcher::RalphHomeAction::ReviseDraft => RalphRootAction::ReviseDraft,
+            super::ralph_launcher::RalphHomeAction::ApproveDraft => RalphRootAction::ApproveDraft,
+            super::ralph_launcher::RalphHomeAction::ApplyDraftToLoop => {
+                RalphRootAction::ApplyDraftToLoop
+            }
+            super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
+                RalphRootAction::CreateFromDraft
+            }
+            super::ralph_launcher::RalphHomeAction::Run
+            | super::ralph_launcher::RalphHomeAction::Goal => RalphRootAction::Run,
+            super::ralph_launcher::RalphHomeAction::Approve => RalphRootAction::Approve,
+            super::ralph_launcher::RalphHomeAction::Stop => RalphRootAction::Stop,
+            super::ralph_launcher::RalphHomeAction::Resume => RalphRootAction::Resume,
+            super::ralph_launcher::RalphHomeAction::Status => RalphRootAction::ShowStatus,
+            super::ralph_launcher::RalphHomeAction::Runs => RalphRootAction::ListRuns,
+            super::ralph_launcher::RalphHomeAction::Iterations => RalphRootAction::ListIterations,
+            super::ralph_launcher::RalphHomeAction::Open => RalphRootAction::OpenProgress,
+            super::ralph_launcher::RalphHomeAction::Audit => RalphRootAction::Audit,
+            super::ralph_launcher::RalphHomeAction::Replan => RalphRootAction::Replan,
+            super::ralph_launcher::RalphHomeAction::RebuildLoopContext => {
+                self.chat
+                    .app
+                    .set_status("Ralph rebuild is unavailable from this surface".to_owned());
+                return super::invalidation::UiInvalidation::Structural;
+            }
+            super::ralph_launcher::RalphHomeAction::Start => {
+                self.loop_state.open_ralph_start_dialog(&mut self.chat);
+                return super::invalidation::UiInvalidation::Structural;
+            }
+        };
+        if action.requires_client() {
+            let repo_root = self.chat.app.working_directory().map_or_else(
+                || self.settings.launch_working_directory().to_path_buf(),
+                std::path::Path::to_path_buf,
+            );
+            self.chat
+                .replace_effect(super::effects::TuiEffect::RalphAction { repo_root, action });
+            self.chat.app.set_status("running Ralph action…".to_owned());
+        } else if let Err(error) =
+            super::ralph_flow::execute_root_local_action(&mut self.chat, action)
+        {
+            self.chat
+                .app
+                .set_status(format!("Ralph action failed: {error}"));
+        }
+        super::invalidation::UiInvalidation::Structural
+    }
+
+    /// Return whether a root plugin surface is active.
+    #[cfg(test)]
+    pub const fn has_plugin_surface(&self) -> bool {
+        self.loop_state.has_root_plugin_surface()
+    }
+
+    /// Queue a plugin-owned surface that should be active when the root runtime starts.
+    pub fn queue_plugin_surface(
+        &mut self,
+        plugin_id: impl Into<String>,
+        surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+    ) {
+        self.loop_state
+            .queue_root_plugin_surface(plugin_id, surface);
+        let _invalidation = self.synchronize_screen();
+        self.invalidation = super::invalidation::UiInvalidation::Full;
+    }
+
+    /// Queue a plugin-owned surface as the complete standalone product screen.
+    pub fn queue_standalone_plugin_surface(
+        &mut self,
+        plugin_id: impl Into<String>,
+        surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+    ) {
+        self.queue_plugin_surface(plugin_id, surface);
+        self.exit_after_plugin_surface = true;
+    }
+
+    /// Take the close result produced by a standalone plugin surface.
+    pub const fn take_plugin_surface_result(
+        &mut self,
+    ) -> Option<(String, Option<serde_json::Value>)> {
+        self.plugin_surface_result.take()
     }
 
     fn handle_permission_key(
@@ -336,9 +467,48 @@ impl BcodeRuntimeModel {
             .set_status(format!("resolving permission: {label}"));
     }
 
+    fn apply_plugin_surface_close(
+        &mut self,
+        plugin_id: &str,
+        outcome: Option<serde_json::Value>,
+    ) -> super::invalidation::UiInvalidation {
+        if self.exit_after_plugin_surface {
+            self.plugin_surface_result = Some((plugin_id.to_owned(), outcome));
+            self.exit_requested = true;
+            return super::invalidation::UiInvalidation::Structural;
+        }
+        if plugin_id == "bcode.ralph" {
+            let action = outcome
+                .and_then(|value| value.get("ralph_action").cloned())
+                .and_then(|value| serde_json::from_value(value).ok());
+            if let Some(action) = action {
+                return self.handle_ralph_surface_action(action);
+            }
+            self.chat.app.set_status("Ralph UI closed".to_owned());
+            return super::invalidation::UiInvalidation::Structural;
+        }
+        super::palette_flow::apply_plugin_surface_outcome(&mut self.chat, plugin_id, outcome);
+        super::invalidation::UiInvalidation::Structural
+    }
+
+    fn finish_terminal_route_update(
+        &mut self,
+        damage: super::invalidation::UiInvalidation,
+    ) -> super::invalidation::UiInvalidation {
+        damage.merge(self.synchronize_screen())
+    }
+
+    #[allow(clippy::let_and_return, clippy::too_many_lines)]
+    fn route_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
+        let damage = self.handle_basic_terminal_event(event);
+        self.finish_terminal_route_update(damage)
+    }
+
     #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn handle_basic_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
-        if self.loop_state.has_root_plugin_surface() {
+        if self.loop_state.has_root_plugin_surface()
+            && !self.loop_state.root_plugin_surface_is_suspended()
+        {
             let action = self
                 .loop_state
                 .handle_root_plugin_surface_event(&event, &self.loop_state.foreground_client())
@@ -351,15 +521,13 @@ impl BcodeRuntimeModel {
                         .loop_state
                         .close_root_plugin_surface_with_outcome(outcome)
                     {
-                        super::palette_flow::apply_plugin_surface_outcome(
-                            &mut self.chat,
-                            &plugin_id,
-                            outcome,
-                        );
+                        return self.apply_plugin_surface_close(&plugin_id, outcome);
                     }
                 }
                 bcode_plugin_sdk::tui::PluginTuiAction::OpenSession { session_id } => {
-                    self.loop_state.close_root_plugin_surface();
+                    self.suspend_screen_for_session_navigation();
+                    self.loop_state
+                        .suspend_root_plugin_surface_for_session(session_id);
                     super::session_flow::start_switch_session(
                         &mut self.chat,
                         session_id,
@@ -374,6 +542,56 @@ impl BcodeRuntimeModel {
                 bcode_plugin_sdk::tui::PluginTuiAction::RunCommand { command } => {
                     self.chat.app.replace_composer_with(&command);
                     self.loop_state.close_root_plugin_surface();
+                }
+            }
+            return super::invalidation::UiInvalidation::Structural;
+        }
+        if self.loop_state.has_session_picker() {
+            match self.loop_state.handle_session_picker_event(
+                &mut self.chat,
+                self.settings.keymap(),
+                &event,
+            ) {
+                super::chat_loop::SessionPickerRootOutcome::Create => {
+                    super::session_flow::switch_to_draft_session(&mut self.chat);
+                    self.chat
+                        .replace_effect(super::effects::TuiEffect::LoadDraftStatus {
+                            launch_working_directory: self
+                                .settings
+                                .launch_working_directory()
+                                .to_path_buf(),
+                        });
+                }
+                super::chat_loop::SessionPickerRootOutcome::SearchHit(hit) => {
+                    match super::session_flow::start_switch_session_from_search_hit(
+                        &mut self.chat,
+                        &hit,
+                        super::history_flow::initial_transcript_window_request(self.committed_area),
+                    ) {
+                        Ok(()) => self
+                            .chat
+                            .app
+                            .set_status("opening search result…".to_owned()),
+                        Err(error) => self
+                            .chat
+                            .app
+                            .set_status(format!("search result unavailable: {error:?}")),
+                    }
+                }
+                super::chat_loop::SessionPickerRootOutcome::Select(session_id) => {
+                    super::session_flow::start_switch_session(
+                        &mut self.chat,
+                        session_id,
+                        super::history_flow::initial_transcript_window_request(self.committed_area),
+                    );
+                    self.chat.app.set_status("opening session…".to_owned());
+                }
+                super::chat_loop::SessionPickerRootOutcome::Canceled => {
+                    self.chat.app.set_status("session picker closed".to_owned());
+                }
+                super::chat_loop::SessionPickerRootOutcome::Handled => {}
+                super::chat_loop::SessionPickerRootOutcome::Unhandled => {
+                    unreachable!("session picker was present");
                 }
             }
             return super::invalidation::UiInvalidation::Structural;
@@ -520,6 +738,51 @@ impl BcodeRuntimeModel {
             }
             return super::invalidation::UiInvalidation::Structural;
         }
+        if self.loop_state.has_ralph_start_dialog() {
+            match self
+                .loop_state
+                .handle_ralph_start_dialog_event(&event, self.settings.keymap())
+                .expect("Ralph start dialog was present")
+            {
+                super::ralph_start_dialog::RalphStartDialogOutcome::Handled => {}
+                super::ralph_start_dialog::RalphStartDialogOutcome::Canceled => {
+                    self.chat.app.set_status("Ralph start canceled".to_owned());
+                }
+                super::ralph_start_dialog::RalphStartDialogOutcome::Submit => {
+                    let mut dialog = self
+                        .loop_state
+                        .take_ralph_start_dialog()
+                        .expect("Ralph start dialog was present");
+                    if dialog.loop_name_text().is_empty() {
+                        dialog.set_status("Ralph loop name is required");
+                        self.loop_state.restore_ralph_start_dialog(dialog);
+                    } else {
+                        let repo_root = self.chat.app.working_directory().map_or_else(
+                            || self.settings.launch_working_directory().to_path_buf(),
+                            std::path::Path::to_path_buf,
+                        );
+                        self.chat
+                            .start_effect(super::effects::TuiEffect::RalphStart {
+                                request: super::ralph_flow::RalphStartRequest {
+                                    loop_name: dialog.loop_name_text(),
+                                    repo_root,
+                                    session_id: self.chat.session_id,
+                                    session_title: self
+                                        .chat
+                                        .app
+                                        .session_title()
+                                        .map(ToOwned::to_owned),
+                                    work_area_path: dialog.work_area_path_text(),
+                                    branch: dialog.branch_text(),
+                                    validation_commands: dialog.validation_command_texts(),
+                                },
+                            });
+                        self.chat.app.set_status("creating Ralph loop…".to_owned());
+                    }
+                }
+            }
+            return super::invalidation::UiInvalidation::Structural;
+        }
         if self.loop_state.has_worktree_create_dialog() {
             match self
                 .loop_state
@@ -644,6 +907,15 @@ impl BcodeRuntimeModel {
                     .settings
                     .keymap()
                     .action_for_key(super::keymap::BmuxScope::Chat, stroke)
+                    == Some(super::keymap::BmuxAction::ClipboardPasteImage)
+                {
+                    self.paste_clipboard_image();
+                    return super::invalidation::UiInvalidation::Structural;
+                }
+                if self
+                    .settings
+                    .keymap()
+                    .action_for_key(super::keymap::BmuxScope::Chat, stroke)
                     == Some(super::keymap::BmuxAction::CommandPaletteOpen)
                 {
                     self.loop_state.open_command_palette(&mut self.chat);
@@ -763,6 +1035,32 @@ impl BcodeRuntimeModel {
             .set_status("loading timeline message…".to_owned());
     }
 
+    fn paste_clipboard_image(&mut self) {
+        let working_directory = self.chat.app.working_directory().map_or_else(
+            || self.settings.launch_working_directory().to_path_buf(),
+            std::path::Path::to_path_buf,
+        );
+        match super::clipboard_image::save_clipboard_image(
+            self.chat.app.session_id(),
+            &working_directory,
+        ) {
+            Ok(artifact) => {
+                let text = super::clipboard_image::pasted_image_text(&artifact.model);
+                self.chat.app.reset_input_history_navigation();
+                self.chat.app.paste_composer_text(&text);
+                self.chat.app.wake_cursor();
+                self.chat.app.set_status(format!(
+                    "Image pasted: {}; source saved in session artifacts",
+                    bcode_plugin_sdk::path::display_from_current_dir(&artifact.model)
+                ));
+            }
+            Err(error) => self
+                .chat
+                .app
+                .set_status(format!("image paste failed: {error}")),
+        }
+    }
+
     fn apply_root_thinking_dialog(
         &mut self,
         effort: Option<String>,
@@ -843,6 +1141,28 @@ impl BcodeRuntimeModel {
                                 .to_path_buf(),
                         });
                 }
+                "session.switch" | "session.rename" | "session.delete" => {
+                    self.loop_state.open_session_picker(&mut self.chat);
+                }
+                "session.fork" => self.loop_state.open_session_fork_dialog(&mut self.chat),
+                "session.clone" => {
+                    if let Some(session_id) = self.chat.session_id {
+                        self.chat
+                            .start_effect(super::effects::TuiEffect::CloneSession {
+                                session_id,
+                                name: None,
+                                switch_after_create: true,
+                                install_draft: true,
+                                initial_window_request:
+                                    super::history_flow::initial_transcript_window_request(
+                                        self.committed_area,
+                                    ),
+                            });
+                        self.chat.app.set_status("cloning session…".to_owned());
+                    } else {
+                        self.chat.app.set_status("No active session".to_owned());
+                    }
+                }
                 "turn.cancel" => {
                     super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
                 }
@@ -864,9 +1184,10 @@ impl BcodeRuntimeModel {
                     );
                     self.chat.app.set_status("help shown".to_owned());
                 }
-                route => self.chat.app.set_status(format!(
-                    "command route pending root screen migration: {route}"
-                )),
+                route => self
+                    .chat
+                    .app
+                    .set_status(format!("unsupported host command route: {route}")),
             },
             bcode_command::CommandAction::Plugin {
                 plugin_id,
@@ -980,6 +1301,19 @@ impl BcodeRuntimeModel {
                 },
             ));
         }
+        if let Some(invalidation) = self.loop_state.root_plugin_surface_invalidation() {
+            commands.push(bmux_tui_runtime::Command::start_if_idle(
+                bmux_tui_runtime::CommandKey::new("bcode.plugin_surface_invalidation"),
+                async move {
+                    invalidation.wait().await;
+                    Some(BcodeRuntimeMessage::PluginSurfaceInvalidated)
+                },
+            ));
+        } else {
+            commands.push(bmux_tui_runtime::Command::cancel(
+                bmux_tui_runtime::CommandKey::new("bcode.plugin_surface_invalidation"),
+            ));
+        }
         commands
     }
 
@@ -1068,8 +1402,11 @@ impl BcodeRuntimeModel {
     }
 
     #[allow(dead_code)]
-    pub fn abort_all_effects(&mut self) {
+    pub fn shutdown_owned_work(&mut self) {
         self.loop_state.abort_all_effects();
+        if let Some(event_task) = self.chat.event_task.take() {
+            event_task.abort();
+        }
     }
 
     /// Mark the currently accumulated semantic damage as successfully presented.
@@ -1276,7 +1613,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         self.interactive_surface_resolution_command(interaction_id, resolution);
                     return Ok(bmux_tui_runtime::Update::redraw().with_command(command));
                 }
-                self.handle_basic_terminal_event(event)
+                self.route_terminal_event(event)
             }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Invalidations(keys)) => {
                 self.chat.app.handle_invalidations(&keys, Instant::now())
@@ -1291,13 +1628,83 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 }
             }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::SessionStream(update)) => {
-                if self
+                let refresh_permissions = matches!(
+                    update.as_ref(),
+                    super::history_flow::SessionStreamUpdate::Event(event)
+                        if matches!(
+                            event.as_ref(),
+                            bcode_ipc::Event::Session(session_event)
+                                if matches!(
+                                    session_event.kind,
+                                    bcode_session_models::SessionEventKind::PermissionRequested { .. }
+                                        | bcode_session_models::SessionEventKind::PermissionResolved { .. }
+                                )
+                        )
+                );
+                let changed = self
                     .loop_state
-                    .apply_session_stream_update(&mut self.chat, *update)
-                {
+                    .apply_session_stream_update(&mut self.chat, *update);
+                if refresh_permissions {
+                    self.chat
+                        .replace_effect(super::effects::TuiEffect::ListPermissions);
+                }
+                if changed {
                     super::invalidation::UiInvalidation::Structural
                 } else {
                     super::invalidation::UiInvalidation::None
+                }
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(
+                BcodeRuntimeMessage::PluginSurfaceInvalidated,
+            ) => {
+                let client = self.loop_state.foreground_client();
+                match self.loop_state.poll_root_plugin_surface(&client) {
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome }) => {
+                        if let Some((plugin_id, outcome)) = self
+                            .loop_state
+                            .close_root_plugin_surface_with_outcome(outcome)
+                        {
+                            self.apply_plugin_surface_close(&plugin_id, outcome)
+                        } else {
+                            super::invalidation::UiInvalidation::Structural
+                        }
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::OpenSession { session_id }) => {
+                        let initial_window_request =
+                            super::history_flow::initial_transcript_window_request(
+                                super::render::transcript_area_for_frame(
+                                    &self.chat.app,
+                                    self.committed_area,
+                                ),
+                            );
+                        self.suspend_screen_for_session_navigation();
+                        self.loop_state
+                            .suspend_root_plugin_surface_for_session(session_id);
+                        super::session_flow::start_switch_session(
+                            &mut self.chat,
+                            session_id,
+                            initial_window_request,
+                        );
+                        self.handle_session_changed();
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::OpenSurface { surface_id }) => {
+                        self.chat
+                            .app
+                            .set_status(format!("surface toggle requested: {surface_id}"));
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::RunCommand { command }) => {
+                        self.chat.app.replace_composer_with(&command);
+                        self.loop_state.close_root_plugin_surface();
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::Redraw) => {
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::None) | None => {
+                        super::invalidation::UiInvalidation::None
+                    }
                 }
             }
             bmux_tui_runtime::RuntimeEvent::Message(
@@ -1327,6 +1734,18 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
                 result,
             )) => {
+                let navigation_session = self
+                    .loop_state
+                    .root_plugin_surface_pending_session_navigation();
+                let navigation_result = match result.as_ref() {
+                    TuiEffectResult::SessionOpened {
+                        session_id, result, ..
+                    } if navigation_session == Some(*session_id) => Some((
+                        *session_id,
+                        result.as_ref().map(|_| ()).map_err(ToString::to_string),
+                    )),
+                    _ => None,
+                };
                 if let TuiEffectResult::AppendPresentationNote { session_id, .. } = result.as_ref()
                 {
                     self.ordered_notes.complete(*session_id);
@@ -1344,6 +1763,14 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 );
                 if previous_session_id != self.chat.session_id {
                     self.handle_session_changed();
+                }
+                if let Some((session_id, navigation_result)) = navigation_result {
+                    let _completed = self
+                        .loop_state
+                        .complete_root_plugin_session_navigation(session_id, navigation_result);
+                    self.resume_screen_after_session_navigation();
+                } else {
+                    let _invalidation = self.synchronize_screen();
                 }
                 let frame_interval = self.settings.bmux_runtime_config().frame_interval;
                 if frame_interval != previous_frame_interval
@@ -1397,8 +1824,12 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             bmux_tui_runtime::RuntimeEvent::Timer(timer) => self.handle_timer(&timer),
         };
         self.invalidation = self.invalidation.merge(damage);
+        let route_invalidation = self.synchronize_screen();
+        self.invalidation = self.invalidation.merge(route_invalidation);
         self.draft_autosave.observe(&self.chat, Instant::now());
-        let housekeeping = self.loop_state.prepare_runtime_work(&mut self.chat);
+        let housekeeping = self
+            .loop_state
+            .prepare_runtime_work(&mut self.chat, self.committed_area);
         self.invalidation = self.invalidation.merge(housekeeping);
         let mut update = match self.invalidation {
             super::invalidation::UiInvalidation::None => bmux_tui_runtime::Update::none(),
@@ -1432,7 +1863,7 @@ pub fn finish_runtime<P>(
     mut output: bmux_tui_runtime::RuntimeOutput<BcodeRuntimeModel, P>,
 ) -> BcodeRuntimeModel {
     record_runtime_stats(&mut output.program, &output.stats);
-    output.program.abort_all_effects();
+    output.program.shutdown_owned_work();
     output.program
 }
 
@@ -1453,7 +1884,7 @@ pub async fn run<W: std::io::Write>(
             | bmux_tui_runtime::RuntimeError::Presenter { error, mut output },
         ) => {
             record_runtime_stats(&mut output.program, &output.stats);
-            output.program.abort_all_effects();
+            output.program.shutdown_owned_work();
             Err(error)
         }
     };
@@ -1483,18 +1914,38 @@ pub fn runtime<'a, 'b, W: std::io::Write>(
     (runtime, handle)
 }
 
+/// Root route whose state, input, rendering, and effects remain owned by Bcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(dead_code)]
 pub enum BcodeRuntimeScreen {
     /// Normal chat/session presentation.
     #[default]
     Chat,
-    /// Plugin-contributed terminal surface.
+    /// Plugin-contributed terminal surface, including Ralph home flows.
     PluginSurface,
-    /// Session picker or transcript-search surface.
+    /// Session catalog and transcript-search picker.
     SessionPicker,
-    /// Onboarding/setup surface.
-    Onboarding,
+    /// Provider/model selection flow.
+    ModelPicker,
+    /// Skill selection and invocation flow.
+    SkillPicker,
+    /// Session fork/create flow.
+    SessionFork,
+    /// Worktree creation flow.
+    WorktreeCreate,
+    /// Ralph loop creation flow.
+    RalphStart,
+    /// Host/plugin command palette.
+    CommandPalette,
+    /// Slash completion palette.
+    SlashPalette,
+    /// Permission interaction overlay.
+    Permission,
+    /// Reasoning/thinking configuration overlay.
+    Thinking,
+    /// Timeline navigation overlay.
+    Timeline,
+    /// Session-owned plugin interaction surface.
+    InteractiveSurface,
 }
 
 #[cfg(test)]
@@ -1561,6 +2012,497 @@ mod tests {
         let second = queue.take_ready();
         assert_eq!(second.len(), 1);
         assert!(queue.take_ready().is_empty());
+    }
+
+    fn root_test_chat() -> super::super::session_flow::ActiveChat {
+        let (event_sender, event_receiver) = super::super::history_flow::session_stream_channel();
+        super::super::session_flow::ActiveChat {
+            app: super::super::app::BmuxApp::new_with_history(None, &[], &[], false),
+            agents: super::super::session_flow::AgentCatalog::default(),
+            session_id: None,
+            event_sender,
+            event_receiver,
+            event_task: None,
+            opening_session_id: None,
+            opening_session_progress: None,
+            opening_session_anchor_sequence: None,
+            pending_effects: super::super::effects::TuiEffectQueue::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn root_submission_queues_runtime_effect_work() {
+        let mut chat = root_test_chat();
+        chat.app.replace_composer_with("hello root runtime");
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        model.chat.app.stage_submission();
+
+        model.stage_root_submission(bcode_ipc::PromptPlacement::Steering);
+
+        assert_eq!(model.chat.queued_effect_count(), 1);
+        assert_eq!(model.chat.app.composer().text(), "");
+    }
+
+    #[tokio::test]
+    async fn root_screen_tracks_owned_routes_and_returns_to_chat() {
+        let chat = root_test_chat();
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+
+        model.loop_state.open_command_palette(&mut model.chat);
+        assert!(model.synchronize_screen().needs_render());
+        assert_eq!(model.screen, super::BcodeRuntimeScreen::CommandPalette);
+
+        let escape = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Escape,
+            modifiers: bmux_keyboard::Modifiers::NONE,
+        });
+        let _damage = model.route_terminal_event(escape);
+        assert_eq!(model.screen, super::BcodeRuntimeScreen::Chat);
+    }
+
+    #[tokio::test]
+    async fn root_session_picker_is_a_retained_route_and_escape_returns_to_chat() {
+        let chat = root_test_chat();
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+
+        model.loop_state.open_session_picker(&mut model.chat);
+        assert!(model.synchronize_screen().needs_render());
+        assert_eq!(model.screen, super::BcodeRuntimeScreen::SessionPicker);
+        let escape = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Escape,
+            modifiers: bmux_keyboard::Modifiers::NONE,
+        });
+        let _damage = model.route_terminal_event(escape);
+
+        assert_eq!(model.screen, super::BcodeRuntimeScreen::Chat);
+        assert!(!model.loop_state.has_session_picker());
+    }
+
+    #[tokio::test]
+    async fn root_plugin_session_navigation_retains_and_resumes_surface() {
+        struct NavigationSurface {
+            resumed: std::sync::Arc<std::sync::Mutex<Vec<bcode_session_models::SessionId>>>,
+        }
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for NavigationSurface {
+            fn id(&self) -> &'static str {
+                "test-navigation"
+            }
+
+            fn title(&self) -> &'static str {
+                "Test Navigation"
+            }
+
+            fn render(
+                &mut self,
+                _area: bmux_tui::geometry::Rect,
+                _frame: &mut bmux_tui::frame::Frame<'_>,
+            ) {
+            }
+
+            fn handle_event(
+                &mut self,
+                _event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+            }
+
+            fn session_navigation_finished(
+                &mut self,
+                session_id: bcode_session_models::SessionId,
+                result: Result<(), String>,
+            ) {
+                result.expect("navigation succeeds");
+                self.resumed.lock().expect("resumed lock").push(session_id);
+            }
+        }
+
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        let resumed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        state.queue_root_plugin_surface(
+            "test.plugin",
+            Box::new(NavigationSurface {
+                resumed: std::sync::Arc::clone(&resumed),
+            }),
+        );
+        let session_id = bcode_session_models::SessionId::new();
+
+        assert!(state.suspend_root_plugin_surface_for_session(session_id));
+        assert!(state.root_plugin_surface_is_suspended());
+        assert!(state.complete_root_plugin_session_navigation(session_id, Ok(())));
+        assert!(!state.root_plugin_surface_is_suspended());
+        assert_eq!(
+            state.active_root_plugin_surface_id(),
+            Some("test-navigation")
+        );
+        assert_eq!(*resumed.lock().expect("resumed lock"), [session_id]);
+    }
+
+    #[tokio::test]
+    async fn root_request_draft_handoff_waits_for_committed_paint() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut chat = root_test_chat();
+        chat.session_id = Some(session_id);
+        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut model = super::BcodeRuntimeModel::new(
+            chat,
+            settings,
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false),
+        );
+        let draft = |revision, text: &str| {
+            super::super::history_flow::SessionStreamUpdate::Event(Box::new(
+                bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                        event: bcode_session_models::ToolRequestDraftEvent {
+                            output_position: None,
+                            turn_id: "turn-live".to_owned(),
+                            tool_call_id: "call-write".to_owned(),
+                            tool_name: "filesystem.write".to_owned(),
+                            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                            schema: "bcode.filesystem.request-draft.write".to_owned(),
+                            schema_version: 1,
+                            placement: bcode_session_models::ToolContributionPlacement::Request,
+                            generation: 1,
+                            revision,
+                            operation:
+                                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                                    start_offset: 0,
+                                    text: text.to_owned(),
+                                },
+                            argument_bytes: text.len(),
+                            truncated: false,
+                        },
+                    },
+                }),
+            ))
+        };
+
+        for update in [draft(1, ""), draft(2, r#"{"path":"live.txt""#)] {
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::SessionStream(
+                    Box::new(update),
+                )),
+            )
+            .expect("root update");
+        }
+        let first = model.chat.app.session_view_snapshot().tools["call-write"]
+            .request_draft
+            .as_ref()
+            .expect("first draft painted");
+        assert!(first.preview.is_empty());
+
+        model.presentation_committed(std::time::Instant::now());
+        let second = model.chat.app.session_view_snapshot().tools["call-write"]
+            .request_draft
+            .as_ref()
+            .expect("deferred draft applied");
+        assert_eq!(second.preview, r#"{"path":"live.txt""#);
+    }
+
+    #[tokio::test]
+    async fn ralph_surface_effect_updates_root_screen_state() {
+        struct RalphSurface;
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for RalphSurface {
+            fn id(&self) -> &'static str {
+                "ralph-home"
+            }
+
+            fn title(&self) -> &'static str {
+                "Ralph"
+            }
+
+            fn render(
+                &mut self,
+                _area: bmux_tui::geometry::Rect,
+                _frame: &mut bmux_tui::frame::Frame<'_>,
+            ) {
+            }
+
+            fn handle_event(
+                &mut self,
+                _event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+            }
+        }
+
+        let chat = root_test_chat();
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut model = super::BcodeRuntimeModel::new(
+            chat,
+            settings,
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false),
+        );
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(
+                    super::super::effects::TuiEffectResult::PluginSurfaceOpened {
+                        plugin_id: "bcode.ralph".to_owned(),
+                        result: Ok(Box::new(RalphSurface)),
+                    },
+                ),
+            )),
+        )
+        .expect("root update");
+
+        assert!(model.has_plugin_surface());
+        assert_eq!(model.screen, super::BcodeRuntimeScreen::PluginSurface);
+    }
+
+    #[tokio::test]
+    async fn temporary_plugin_navigation_restores_root_route() {
+        struct NavigationSurface;
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for NavigationSurface {
+            fn id(&self) -> &'static str {
+                "test-navigation"
+            }
+
+            fn title(&self) -> &'static str {
+                "Test Navigation"
+            }
+
+            fn render(
+                &mut self,
+                _area: bmux_tui::geometry::Rect,
+                _frame: &mut bmux_tui::frame::Frame<'_>,
+            ) {
+            }
+
+            fn handle_event(
+                &mut self,
+                _event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+            }
+        }
+
+        let chat = root_test_chat();
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        model.queue_plugin_surface("test.plugin", Box::new(NavigationSurface));
+        let session_id = bcode_session_models::SessionId::new();
+
+        model.suspend_screen_for_session_navigation();
+        assert!(
+            model
+                .loop_state
+                .suspend_root_plugin_surface_for_session(session_id)
+        );
+        assert_eq!(model.screen, super::BcodeRuntimeScreen::Chat);
+        assert!(
+            model
+                .loop_state
+                .complete_root_plugin_session_navigation(session_id, Ok(()))
+        );
+        model.resume_screen_after_session_navigation();
+
+        assert_eq!(model.screen, super::BcodeRuntimeScreen::PluginSurface);
+    }
+
+    #[tokio::test]
+    async fn standalone_plugin_surface_close_exits_with_owned_outcome() {
+        let chat = root_test_chat();
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let expected = serde_json::json!({"selected": "workspace"});
+        model.exit_after_plugin_surface = true;
+
+        let invalidation = model.apply_plugin_surface_close("test.plugin", Some(expected.clone()));
+
+        assert!(invalidation.needs_render());
+        assert!(model.exit_requested);
+        assert_eq!(
+            model.take_plugin_surface_result(),
+            Some(("test.plugin".to_owned(), Some(expected)))
+        );
+    }
+
+    #[tokio::test]
+    async fn root_ralph_local_action_returns_to_chat_without_generic_outcome_decode() {
+        let chat = root_test_chat();
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+
+        let invalidation = model.apply_plugin_surface_close(
+            "bcode.ralph",
+            Some(serde_json::json!({"ralph_action": "open"})),
+        );
+
+        assert!(invalidation.needs_render());
+        assert!(model.chat.app.status().contains("no Ralph loops"));
+    }
+
+    #[derive(Default)]
+    struct LatencyAcceptanceProgram {
+        application_messages: usize,
+        terminal_latency: Option<std::time::Duration>,
+        timer_latency: Option<std::time::Duration>,
+        probe_started: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    }
+
+    impl bmux_tui_runtime::Program for LatencyAcceptanceProgram {
+        type Message = u64;
+        type Error = Infallible;
+
+        fn update(
+            &mut self,
+            event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
+        ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
+            let probe_started = *self.probe_started.lock().expect("probe lock");
+            match event {
+                bmux_tui_runtime::RuntimeEvent::Message(_) => {
+                    self.application_messages = self.application_messages.saturating_add(1);
+                }
+                bmux_tui_runtime::RuntimeEvent::Terminal(_) => {
+                    self.terminal_latency = probe_started.map(|started| started.elapsed());
+                }
+                bmux_tui_runtime::RuntimeEvent::Timer(_) => {
+                    self.timer_latency = probe_started.map(|started| started.elapsed());
+                }
+            }
+            Ok(
+                if self.application_messages == 10_000
+                    && self.terminal_latency.is_some()
+                    && self.timer_latency.is_some()
+                {
+                    bmux_tui_runtime::Update::exit()
+                } else {
+                    bmux_tui_runtime::Update::none()
+                },
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_and_timer_latency_stay_within_flood_acceptance_budget() {
+        const ACCEPTANCE_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+        let probe_started = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let config = bmux_tui_runtime::RuntimeConfig {
+            reliable_capacity: 20_000,
+            messages_per_turn: 4,
+            processing_time_per_turn: std::time::Duration::from_millis(1),
+            frame_interval: None,
+            ..bmux_tui_runtime::RuntimeConfig::default()
+        };
+        let (runtime, handle) = bmux_tui_runtime::Runtime::new(
+            LatencyAcceptanceProgram {
+                probe_started: std::sync::Arc::clone(&probe_started),
+                ..LatencyAcceptanceProgram::default()
+            },
+            bmux_tui_runtime::HeadlessPresenter::default(),
+            config,
+        );
+        for value in 0..10_000 {
+            handle.try_send(value).expect("configured flood fits");
+        }
+        *probe_started.lock().expect("probe lock") = Some(std::time::Instant::now());
+        handle
+            .try_send_terminal(bmux_tui::event::Event::Tick)
+            .expect("terminal admission remains independent");
+        handle.schedule_timer(
+            bmux_tui_runtime::TimerId::new("acceptance-latency"),
+            std::time::Instant::now(),
+        );
+
+        let output = runtime
+            .run()
+            .await
+            .unwrap_or_else(|_| panic!("runtime acceptance succeeds"));
+        let terminal_latency = output.program.terminal_latency.expect("terminal delivered");
+        let timer_latency = output.program.timer_latency.expect("timer delivered");
+        assert!(
+            terminal_latency <= ACCEPTANCE_BUDGET,
+            "terminal latency {terminal_latency:?} exceeded {ACCEPTANCE_BUDGET:?}"
+        );
+        assert!(
+            timer_latency <= ACCEPTANCE_BUDGET,
+            "timer latency {timer_latency:?} exceeded {ACCEPTANCE_BUDGET:?}"
+        );
     }
 
     #[derive(Default)]

@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use bcode_client::{BcodeClient, ClientError};
 use bcode_command::{
@@ -470,6 +471,22 @@ impl Field {
     }
 }
 
+enum LoopSurfaceCompletion {
+    WorkflowLookup(
+        Result<
+            Option<bcode_plugin_sdk::tui::PluginWorkflowSummary>,
+            bcode_plugin_sdk::tui::PluginTuiHostError,
+        >,
+    ),
+    WorkflowStart {
+        request: Box<PluginWorkflowStartRequest>,
+        result: Result<
+            bcode_plugin_sdk::tui::PluginWorkflowStartResponse,
+            bcode_plugin_sdk::tui::PluginTuiHostError,
+        >,
+    },
+}
+
 struct LoopSurface {
     session_id: Option<SessionId>,
     prompt: TextInputState,
@@ -480,6 +497,7 @@ struct LoopSurface {
     failed_workflow_start: Option<PluginWorkflowStartRequest>,
     pending_workflow_lookup: bool,
     active_workflow: Option<bcode_plugin_sdk::tui::PluginWorkflowSummary>,
+    completions: Arc<Mutex<Vec<LoopSurfaceCompletion>>>,
     status: String,
     prompt_area: Rect,
     condition_area: Rect,
@@ -498,6 +516,7 @@ impl LoopSurface {
             failed_workflow_start: None,
             pending_workflow_lookup: false,
             active_workflow: None,
+            completions: Arc::new(Mutex::new(Vec::new())),
             status: "checking for an active loop…".to_owned(),
             prompt_area: Rect::new(0, 0, 0, 0),
             condition_area: Rect::new(0, 0, 0, 0),
@@ -607,6 +626,98 @@ impl LoopSurface {
         PluginTuiAction::Redraw
     }
 
+    fn begin_workflow_lookup(&mut self, host: &dyn PluginTuiHost) {
+        if self.pending_workflow_lookup {
+            return;
+        }
+        self.pending_workflow_lookup = true;
+        let lookup = PluginWorkflowBinding {
+            owner_plugin_id: PLUGIN_ID.to_string(),
+            workflow_kind: WORKFLOW_KIND.to_string(),
+            scope_key: self
+                .session_id
+                .map_or_else(String::new, |id| id.to_string()),
+            display_label: Some("Loop".to_string()),
+            single_active: true,
+        }
+        .lookup();
+        let completion = Arc::clone(&self.completions);
+        let future = host.associated_workflow(lookup);
+        host.spawn(Box::pin(async move {
+            let result = future.await;
+            completion
+                .lock()
+                .expect("loop surface completion lock")
+                .push(LoopSurfaceCompletion::WorkflowLookup(result));
+        }));
+    }
+
+    fn begin_workflow_start(&mut self, host: &dyn PluginTuiHost) {
+        let Some(request) = self.pending_workflow_start.take() else {
+            return;
+        };
+        let completion = Arc::clone(&self.completions);
+        let future = host.start_workflow(request.clone());
+        host.spawn(Box::pin(async move {
+            let result = future.await;
+            completion
+                .lock()
+                .expect("loop surface completion lock")
+                .push(LoopSurfaceCompletion::WorkflowStart {
+                    request: Box::new(request),
+                    result,
+                });
+        }));
+    }
+
+    fn apply_completions(&mut self) -> PluginTuiAction {
+        let completions = {
+            let mut pending = self
+                .completions
+                .lock()
+                .expect("loop surface completion lock");
+            std::mem::take(&mut *pending)
+        };
+        let mut action = PluginTuiAction::None;
+        for completion in completions {
+            match completion {
+                LoopSurfaceCompletion::WorkflowLookup(result) => {
+                    self.active_workflow = result.unwrap_or_else(|error| {
+                        self.status = format!("failed to inspect active loop: {error}");
+                        None
+                    });
+                    if !self.status.starts_with("failed to inspect") {
+                        self.status = self.active_workflow.as_ref().map_or_else(
+                            || "Tab changes field · Ctrl+Enter starts · Esc cancels".to_owned(),
+                            format_plugin_workflow_status,
+                        );
+                    }
+                    action = PluginTuiAction::Redraw;
+                }
+                LoopSurfaceCompletion::WorkflowStart { request, result } => match result {
+                    Ok(started) => {
+                        return PluginTuiAction::Close {
+                            outcome: Some(serde_json::json!({
+                                "status": "loop started through durable workflow runtime",
+                                "append_text": "Loop started. Use /loop status, /loop stop, or /loop resume.",
+                                "run_id": started.run_id,
+                                "runtime_work_id": started.runtime_work_id,
+                            })),
+                        };
+                    }
+                    Err(error) => {
+                        self.failed_workflow_start = Some(*request);
+                        self.status = format!(
+                            "failed to start durable loop workflow: {error}; submit again to retry"
+                        );
+                        action = PluginTuiAction::Redraw;
+                    }
+                },
+            }
+        }
+        action
+    }
+
     fn render_input(
         area: Rect,
         frame: &mut Frame<'_>,
@@ -707,61 +818,13 @@ impl PluginTuiSurface for LoopSurface {
         }
     }
 
-    fn drain_effects<'a>(
-        &'a mut self,
-        host: &'a dyn PluginTuiHost,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginTuiAction> + Send + 'a>> {
-        Box::pin(async move {
-            if !self.pending_workflow_lookup {
-                self.pending_workflow_lookup = true;
-                let lookup = PluginWorkflowBinding {
-                    owner_plugin_id: PLUGIN_ID.to_string(),
-                    workflow_kind: WORKFLOW_KIND.to_string(),
-                    scope_key: self
-                        .session_id
-                        .map_or_else(String::new, |id| id.to_string()),
-                    display_label: Some("Loop".to_string()),
-                    single_active: true,
-                }
-                .lookup();
-                match host.associated_workflow(lookup).await {
-                    Ok(run) => {
-                        self.active_workflow = run;
-                        self.status = self.active_workflow.as_ref().map_or_else(
-                            || "Tab changes field · Ctrl+Enter starts · Esc cancels".to_owned(),
-                            format_plugin_workflow_status,
-                        );
-                    }
-                    Err(error) => {
-                        self.status = format!("failed to inspect active loop: {error}");
-                    }
-                }
-                return PluginTuiAction::Redraw;
-            }
-            let Some(request) = self.pending_workflow_start.take() else {
-                return PluginTuiAction::None;
-            };
-            match host.start_workflow(request.clone()).await {
-                Ok(started) => PluginTuiAction::Close {
-                    outcome: Some(serde_json::json!({
-                        "status": "loop started through durable workflow runtime",
-                        "append_text": "Loop started. Use /loop status, /loop stop, or /loop resume.",
-                        "run_id": started.run_id,
-                        "runtime_work_id": started.runtime_work_id,
-                    })),
-                },
-                Err(error) => {
-                    self.failed_workflow_start = Some(request);
-                    self.status = format!(
-                        "failed to start durable loop workflow: {error}; submit again to retry"
-                    );
-                    PluginTuiAction::Redraw
-                }
-            }
-        })
+    fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        self.begin_workflow_lookup(host);
+        self.begin_workflow_start(host);
+        self.apply_completions()
     }
 
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if let Event::Key(stroke) = event {
             if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
                 return PluginTuiAction::Close { outcome: None };
@@ -775,16 +838,21 @@ impl PluginTuiSurface for LoopSurface {
                 return PluginTuiAction::Redraw;
             }
             if stroke.key == KeyCode::Enter && stroke.modifiers.ctrl {
-                return self.start();
+                let action = self.start();
+                self.begin_workflow_start(host);
+                return action;
             }
             if stroke.key == KeyCode::Enter && self.field != Field::Limit {
                 self.active_state_mut().buffer_mut().insert_char('\n');
                 return PluginTuiAction::Redraw;
             }
             if stroke.key == KeyCode::Enter && self.field == Field::Limit {
-                return self.start();
+                let action = self.start();
+                self.begin_workflow_start(host);
+                return action;
             }
         }
+        self.begin_workflow_start(host);
         self.focus_from_click(event);
         if self.field != Field::Limit
             && matches!(event, Event::Mouse(mouse) if mouse.position.x >= self.active_area().x && mouse.position.x < self.active_area().right() && mouse.position.y >= self.active_area().y && mouse.position.y < self.active_area().bottom() && matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown))
@@ -1196,7 +1264,9 @@ mod tests {
     }
 
     impl PluginTuiHost for TestHost {
-        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn(&self, task: bcode_plugin_sdk::tui::PluginTask) {
+            drop(tokio::spawn(task));
+        }
         fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
         fn request_redraw(&self) {}
 
@@ -1227,7 +1297,9 @@ mod tests {
     }
 
     impl PluginTuiHost for FailingHost {
-        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn(&self, task: bcode_plugin_sdk::tui::PluginTask) {
+            drop(tokio::spawn(task));
+        }
         fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
         fn request_redraw(&self) {}
 
@@ -1534,6 +1606,20 @@ mod tests {
         )));
     }
 
+    async fn poll_surface_until_action(
+        surface: &mut LoopSurface,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiAction {
+        for _ in 0..100 {
+            let action = surface.poll(host);
+            if !matches!(action, PluginTuiAction::None) {
+                return action;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("loop surface did not produce an action");
+    }
+
     #[tokio::test]
     async fn start_surface_routes_one_typed_request_through_workflow_host() {
         let session_id = SessionId::new();
@@ -1543,12 +1629,13 @@ mod tests {
         surface.condition = text_state("done");
         surface.limit = text_state("2");
         assert!(matches!(
-            surface.drain_effects(&host).await,
+            poll_surface_until_action(&mut surface, &host).await,
             PluginTuiAction::Redraw
         ));
         assert_eq!(surface.start(), PluginTuiAction::Redraw);
+        surface.begin_workflow_start(&host);
         assert!(matches!(
-            surface.drain_effects(&host).await,
+            poll_surface_until_action(&mut surface, &host).await,
             PluginTuiAction::Close { .. }
         ));
         let request = host
@@ -1595,12 +1682,13 @@ mod tests {
         surface.condition = text_state("done");
         surface.limit = text_state("2");
         assert!(matches!(
-            surface.drain_effects(&host).await,
+            poll_surface_until_action(&mut surface, &host).await,
             PluginTuiAction::Redraw
         ));
         assert_eq!(surface.start(), PluginTuiAction::Redraw);
+        surface.begin_workflow_start(&host);
         assert!(matches!(
-            surface.drain_effects(&host).await,
+            poll_surface_until_action(&mut surface, &host).await,
             PluginTuiAction::Redraw
         ));
         assert_eq!(host.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1611,7 +1699,7 @@ mod tests {
                 .status
                 .contains("failed to start durable loop workflow")
         );
-        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        assert_eq!(surface.poll(&host), PluginTuiAction::None);
         assert_eq!(
             host.attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1620,8 +1708,9 @@ mod tests {
         assert_eq!(surface.start(), PluginTuiAction::Redraw);
         assert!(surface.failed_workflow_start.is_none());
         assert!(surface.pending_workflow_start.is_some());
+        surface.begin_workflow_start(&host);
         assert!(matches!(
-            surface.drain_effects(&host).await,
+            poll_surface_until_action(&mut surface, &host).await,
             PluginTuiAction::Redraw
         ));
         assert_eq!(

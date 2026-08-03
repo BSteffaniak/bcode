@@ -1,111 +1,21 @@
 //! Session fork/clone flow for the TUI.
 
-use std::io::Write;
-
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
     SessionHistoryQuery,
 };
-use bmux_keyboard::KeyCode;
-use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
-use bmux_tui_components::text_input::TextInputControl;
 
-use super::effects::TuiEffect;
-use super::helpers;
-use super::runtime_context::{TuiIo, TuiServices};
-use super::session_flow::ActiveChat;
-use super::{TuiError, session_fork_dialog, session_fork_dialog_render};
+use super::TuiError;
 
-/// Open the fork dialog for the current session.
-pub async fn fork_current_session<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
-    let source_title = chat
-        .app
-        .session_title()
-        .map_or_else(|| session_id.to_string(), ToString::to_string);
-    let mut dialog = session_fork_dialog::SessionForkDialog::new(
-        session_fork_dialog::SessionForkDialogMode::Fork,
-        &format!("[fork] {source_title}"),
-    );
-    let submission = run_dialog(io, &mut dialog, services.theme).await?;
-    let prompt = match select_prompt_for_fork(io, services, session_id).await {
-        Ok(Some(prompt)) => prompt,
-        Ok(None) => {
-            chat.app.set_status("fork canceled".to_owned());
-            return Ok(());
-        }
-        Err(TuiError::Client(error)) => {
-            helpers::report_client_issue(&mut chat.app, "fork prompt history unavailable", &error);
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    chat.start_effect(TuiEffect::ForkSession {
-        session_id,
-        prompt_sequence: prompt.sequence,
-        name: submission.name,
-        draft: Some(prompt.text),
-        switch_after_create: submission.switch_after_create,
-        install_draft: submission.install_draft,
-        initial_window_request: super::history_flow::initial_transcript_window_request(
-            super::render::transcript_area_for_frame(&chat.app, io.terminal.area()),
-        ),
-    });
-    chat.app.set_status("forking session…".to_owned());
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ForkPromptCandidate {
     pub sequence: u64,
     pub text: String,
-}
-
-async fn select_prompt_for_fork<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    session_id: bcode_session_models::SessionId,
-) -> Result<Option<ForkPromptCandidate>, TuiError> {
-    let prompts = load_recent_user_prompts(services.passive_client, session_id).await?;
-    if prompts.is_empty() {
-        return Ok(None);
-    }
-    let mut selected = 0_usize;
-    loop {
-        io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| render_prompt_picker(frame, &prompts, selected, services.theme))?;
-        let Some(event) = io.input.recv().await? else {
-            continue;
-        };
-        match event {
-            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
-            Event::Key(stroke) => match stroke.key {
-                KeyCode::Escape => return Ok(None),
-                KeyCode::Enter => return Ok(prompts.get(selected).cloned()),
-                KeyCode::Up if selected > 0 => selected = selected.saturating_sub(1),
-                KeyCode::Down if selected + 1 < prompts.len() => selected += 1,
-                _ => {}
-            },
-            Event::Paste(_)
-            | Event::Mouse(_)
-            | Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
-            | Event::Tick
-            | Event::User(_) => {}
-        }
-    }
 }
 
 pub async fn load_recent_user_prompts(
@@ -255,77 +165,4 @@ fn one_line(text: &str) -> String {
         output.push('…');
     }
     output
-}
-
-/// Open the clone dialog for the current session, create the clone, and optionally switch to it.
-pub async fn clone_current_session<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
-    let source_title = chat
-        .app
-        .session_title()
-        .map_or_else(|| session_id.to_string(), ToString::to_string);
-    let mut dialog = session_fork_dialog::SessionForkDialog::new(
-        session_fork_dialog::SessionForkDialogMode::Clone,
-        &format!("[clone] {source_title}"),
-    );
-    let submission = run_dialog(io, &mut dialog, services.theme).await?;
-    chat.start_effect(TuiEffect::CloneSession {
-        session_id,
-        name: submission.name,
-        switch_after_create: submission.switch_after_create,
-        install_draft: submission.install_draft,
-        initial_window_request: super::history_flow::initial_transcript_window_request(
-            super::render::transcript_area_for_frame(&chat.app, io.terminal.area()),
-        ),
-    });
-    chat.app.set_status("cloning session…".to_owned());
-    Ok(())
-}
-
-async fn run_dialog<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    dialog: &mut session_fork_dialog::SessionForkDialog,
-    theme: super::render::TuiTheme,
-) -> Result<session_fork_dialog::SessionForkDialogSubmission, TuiError> {
-    loop {
-        io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| session_fork_dialog_render::render_dialog(dialog, frame, theme))?;
-        let Some(event) = io.input.recv().await? else {
-            continue;
-        };
-        match event {
-            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
-            Event::Paste(text)
-                if dialog.focus() == session_fork_dialog::SessionForkDialogFocus::Name =>
-            {
-                let _ = TextInputControl::new(&session_fork_dialog::name_input_policy())
-                    .handle_paste(dialog.name_mut(), &text);
-            }
-            Event::Key(stroke) => match stroke.key {
-                KeyCode::Escape => return Err(TuiError::Canceled),
-                KeyCode::Tab => dialog.focus_next(),
-                KeyCode::Enter => return Ok(dialog.submission()),
-                KeyCode::Left => dialog.value_previous(),
-                KeyCode::Right => dialog.value_next(),
-                _ if dialog.focus() == session_fork_dialog::SessionForkDialogFocus::Name => {
-                    let _ = TextInputControl::new(&session_fork_dialog::name_input_policy())
-                        .handle_key(dialog.name_mut(), stroke);
-                }
-                _ => {}
-            },
-            Event::Paste(_)
-            | Event::Mouse(_)
-            | Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
-            | Event::Tick
-            | Event::User(_) => {}
-        }
-    }
 }

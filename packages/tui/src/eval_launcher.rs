@@ -22,26 +22,14 @@ pub async fn run_picker<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
 ) -> Result<(), TuiError> {
-    let runtime = load_eval_tui_runtime()?;
-    let mut surface = crate::plugin_tui::open_plugin_tui_surface(
-        &runtime,
-        EVAL_PLUGIN_ID,
+    Box::pin(run_surface(
+        terminal,
+        repo_path,
         EVAL_RUN_PICKER_SURFACE_KIND,
-        bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
-            instance_id: "eval-run-picker".to_string(),
-            repo_path: Some(repo_path),
-            target: None,
-            options: serde_json::json!({ "runs_root": DEFAULT_RUNS_ROOT }),
-        },
-    )
+        "eval-run-picker".to_string(),
+        serde_json::json!({ "runs_root": DEFAULT_RUNS_ROOT }),
+    ))
     .await
-    .map_err(|error| TuiError::PluginService {
-        code: "tui_surface_open_failed".to_string(),
-        message: error.to_string(),
-    })?;
-    let _outcome =
-        crate::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
-    Ok(())
 }
 
 /// Run the eval run viewer surface for an optional run path.
@@ -57,7 +45,6 @@ pub async fn run_viewer<W: Write>(
     repo_path: PathBuf,
     run: Option<PathBuf>,
 ) -> Result<(), TuiError> {
-    let runtime = load_eval_tui_runtime()?;
     let (surface_kind, instance_id, options) = run.map_or_else(
         || {
             (
@@ -74,7 +61,26 @@ pub async fn run_viewer<W: Write>(
             )
         },
     );
-    let mut surface = crate::plugin_tui::open_plugin_tui_surface(
+    Box::pin(run_surface(
+        terminal,
+        repo_path,
+        surface_kind,
+        instance_id,
+        options,
+    ))
+    .await
+}
+
+#[allow(clippy::future_not_send)]
+async fn run_surface<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    repo_path: PathBuf,
+    surface_kind: &str,
+    instance_id: String,
+    options: serde_json::Value,
+) -> Result<(), TuiError> {
+    let runtime = load_eval_tui_runtime()?;
+    let surface = crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
         EVAL_PLUGIN_ID,
         surface_kind,
@@ -90,8 +96,12 @@ pub async fn run_viewer<W: Write>(
         code: "tui_surface_open_failed".to_string(),
         message: error.to_string(),
     })?;
-    let _outcome =
-        crate::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
+    let _outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
+        terminal,
+        EVAL_PLUGIN_ID,
+        surface,
+    ))
+    .await?;
     Ok(())
 }
 

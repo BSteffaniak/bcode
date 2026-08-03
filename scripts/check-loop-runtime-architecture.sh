@@ -457,8 +457,8 @@ if ! rg -U 'persisted results must retain provider order despite reverse complet
   violations=1
 fi
 
-if ! rg -U 'SlashCommandOutcome::CancelTurn[\s\S]*TuiEffect::CancelTurn[\s\S]*set_cancelling\(\)' packages/tui/src/composer_flow.rs >/dev/null; then
-  echo "Runtime architecture violation: composer cancellation does not enter immediate Cancelling UI state." >&2
+if ! rg -U 'SlashCommandOutcome::CancelTurn[\s\S]*TuiEffect::CancelTurn[\s\S]*set_cancelling\(\)' packages/tui/src/chat_loop.rs >/dev/null; then
+  echo "Runtime architecture violation: root slash cancellation does not enter immediate Cancelling UI state." >&2
   violations=1
 fi
 if ! rg -U 'Ok\(true\)[\s\S]*set_cancelling\(\)[\s\S]*turn cancellation requested' packages/tui/src/chat_loop.rs >/dev/null; then
@@ -1371,6 +1371,21 @@ fi
 if ! grep -F 'template_id           = "implementation-verification-commit"' plugins/workflow-plugin/bcode-plugin.toml >/dev/null \
   || ! grep -F 'required_plugins      = ["bcode.shell", "bcode.git"]' plugins/workflow-plugin/bcode-plugin.toml >/dev/null; then
   echo "Runtime architecture violation: reference-template identity/requirements must remain workflow-plugin owned." >&2
+  violations=1
+fi
+
+if rg -n 'crossterm(_event)?::read\(|TuiInput::(new|recv)|run_onboarding_loop' \
+  packages/tui/src --glob '*.rs' >/tmp/bcode-tui-direct-input-loops.txt; then
+  echo "Runtime architecture violation: TUI screens must receive input through the managed runtime boundary." >&2
+  cat /tmp/bcode-tui-direct-input-loops.txt >&2
+  violations=1
+fi
+
+if rg -n 'terminal\.draw\(' packages/tui/src --glob '*.rs' \
+  --glob '!chat_loop.rs' --glob '!onboarding_program.rs' \
+  >/tmp/bcode-tui-direct-draws.txt; then
+  echo "Runtime architecture violation: terminal drawing escaped an approved runtime presenter boundary." >&2
+  cat /tmp/bcode-tui-direct-draws.txt >&2
   violations=1
 fi
 

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use bcode_config::TuiConfig;
-use bmux_keyboard::{KeyCode, KeyStroke, parse_key_stroke};
+use bmux_keyboard::{KeyStroke, parse_key_stroke};
 
 /// Key handling scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -247,41 +247,6 @@ impl BmuxKeyMap {
         })
     }
 
-    /// Return compact chat key hints from configured bindings.
-    #[must_use]
-    pub fn chat_hints(&self) -> String {
-        [
-            (BmuxAction::InputSubmitSteering, "send"),
-            (BmuxAction::AppInterrupt, "interrupt"),
-            (BmuxAction::AppExit, "exit"),
-            (BmuxAction::ClipboardPasteImage, "paste image"),
-            (BmuxAction::CommandPaletteOpen, "palette"),
-            (BmuxAction::AgentCycle, "agent"),
-            (BmuxAction::ThinkingEffortCycle, "think"),
-        ]
-        .into_iter()
-        .filter_map(|(action, label)| {
-            self.key_for_action(BmuxScope::Chat, action)
-                .map(|stroke| format!("{} {label}", key_label(stroke)))
-        })
-        .collect::<Vec<_>>()
-        .join(" · ")
-    }
-
-    /// Return the compact key label for a chat action.
-    #[must_use]
-    pub fn chat_action_label(&self, action: BmuxAction) -> Option<String> {
-        self.key_for_action(BmuxScope::Chat, action).map(key_label)
-    }
-
-    fn key_for_action(&self, scope: BmuxScope, action: BmuxAction) -> Option<KeyStroke> {
-        self.bindings.get(&scope).and_then(|bindings| {
-            bindings
-                .iter()
-                .find_map(|binding| (binding.action == action).then_some(binding.stroke))
-        })
-    }
-
     /// Return the configured editor command for `stroke`.
     #[must_use]
     pub fn editor_command_for_key(
@@ -415,48 +380,6 @@ impl BmuxKeyMap {
             | BmuxAction::SkillHelp => return None,
         })
     }
-}
-
-fn key_label(stroke: KeyStroke) -> String {
-    let mut parts = Vec::new();
-    if stroke.modifiers.ctrl {
-        parts.push("ctrl".to_owned());
-    }
-    if stroke.modifiers.alt {
-        parts.push("alt".to_owned());
-    }
-    if stroke.modifiers.shift {
-        parts.push("shift".to_owned());
-    }
-    if stroke.modifiers.super_key {
-        parts.push("super".to_owned());
-    }
-    if stroke.modifiers.hyper {
-        parts.push("hyper".to_owned());
-    }
-    if stroke.modifiers.meta {
-        parts.push("meta".to_owned());
-    }
-    parts.push(match stroke.key {
-        KeyCode::Char(ch) => ch.to_string(),
-        KeyCode::Enter => "enter".to_owned(),
-        KeyCode::Tab => "tab".to_owned(),
-        KeyCode::Backspace => "backspace".to_owned(),
-        KeyCode::Delete => "delete".to_owned(),
-        KeyCode::Escape => "escape".to_owned(),
-        KeyCode::Space => "space".to_owned(),
-        KeyCode::Up => "up".to_owned(),
-        KeyCode::Down => "down".to_owned(),
-        KeyCode::Left => "left".to_owned(),
-        KeyCode::Right => "right".to_owned(),
-        KeyCode::Home => "home".to_owned(),
-        KeyCode::End => "end".to_owned(),
-        KeyCode::PageUp => "pageUp".to_owned(),
-        KeyCode::PageDown => "pageDown".to_owned(),
-        KeyCode::Insert => "insert".to_owned(),
-        KeyCode::F(index) => format!("f{index}"),
-    });
-    parts.join("+")
 }
 
 fn default_bindings() -> BTreeMap<BmuxScope, Vec<BmuxKeyBinding>> {

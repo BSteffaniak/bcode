@@ -10,6 +10,8 @@ use serde::Deserialize;
 
 use crate::TuiError;
 
+const CODE_REVIEW_PLUGIN_ID: &str = "bcode.code_review";
+
 /// Review home outcome returned by the code review home plugin surface.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -36,9 +38,9 @@ pub async fn run_home<W: Write>(
     repo_path: PathBuf,
 ) -> Result<ReviewHomeOutcome, TuiError> {
     let runtime = load_code_review_tui_runtime()?;
-    let mut surface = crate::plugin_tui::open_plugin_tui_surface(
+    let surface = crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
-        "bcode.code_review",
+        CODE_REVIEW_PLUGIN_ID,
         "code-review-home",
         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
             instance_id: "code-review-home".to_string(),
@@ -48,13 +50,14 @@ pub async fn run_home<W: Write>(
         },
     )
     .await
-    .map_err(|error| TuiError::PluginService {
-        code: "tui_surface_open_failed".to_string(),
-        message: error.to_string(),
-    })?;
-    let close_outcome =
-        crate::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
-    Ok(parse_review_home_outcome(close_outcome))
+    .map_err(|error| map_surface_open_error(&error))?;
+    let outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
+        terminal,
+        CODE_REVIEW_PLUGIN_ID,
+        surface,
+    ))
+    .await?;
+    Ok(parse_review_home_outcome(outcome))
 }
 
 /// Run a full-screen local Git review from a durable workspace.
@@ -69,13 +72,13 @@ pub async fn run_workspace<W: Write>(
     build_mode: bool,
 ) -> Result<Option<SessionId>, TuiError> {
     let target = target_from_workspace(&workspace);
-    run_with_workspace(
+    Box::pin(run_with_workspace(
         terminal,
         workspace.repo_root.clone(),
         target,
         Some(workspace),
         build_mode,
-    )
+    ))
     .await
 }
 
@@ -90,7 +93,7 @@ pub async fn run<W: Write>(
     repo_path: PathBuf,
     target: ReviewTarget,
 ) -> Result<Option<SessionId>, TuiError> {
-    run_with_workspace(terminal, repo_path, target, None, false).await
+    Box::pin(run_with_workspace(terminal, repo_path, target, None, false)).await
 }
 
 #[allow(clippy::future_not_send)]
@@ -107,9 +110,9 @@ async fn run_with_workspace<W: Write>(
         "target": target,
     });
     let runtime = load_code_review_tui_runtime()?;
-    let mut surface = crate::plugin_tui::open_plugin_tui_surface(
+    let surface = crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
-        "bcode.code_review",
+        CODE_REVIEW_PLUGIN_ID,
         "code-review",
         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
             instance_id: "code-review".to_string(),
@@ -119,17 +122,12 @@ async fn run_with_workspace<W: Write>(
         },
     )
     .await
-    .map_err(|error| TuiError::PluginService {
-        code: "tui_surface_open_failed".to_string(),
-        message: error.to_string(),
-    })?;
-    let mut input = crate::terminal_events::TuiInput::start();
-    let _close_outcome = run_with_retained_surface(
+    .map_err(|error| map_surface_open_error(&error))?;
+    let _outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
         terminal,
-        &mut input,
-        surface.as_mut(),
-        bcode_client::BcodeClient::default_endpoint(),
-    )
+        CODE_REVIEW_PLUGIN_ID,
+        surface,
+    ))
     .await?;
     Ok(None)
 }
@@ -145,35 +143,10 @@ fn load_code_review_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, Tui
     })
 }
 
-#[allow(clippy::future_not_send)]
-pub(crate) async fn run_with_retained_surface<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    input: &mut crate::terminal_events::TuiInput,
-    surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
-    client: bcode_client::BcodeClient,
-) -> Result<Option<serde_json::Value>, TuiError> {
-    loop {
-        match crate::plugin_surface_host::run_plugin_surface_until_navigation_with_input_and_client(
-            terminal,
-            input,
-            surface,
-            client.clone(),
-        )
-        .await?
-        {
-            crate::plugin_surface_host::PluginSurfaceRunOutcome::Closed(outcome) => {
-                return Ok(outcome);
-            }
-            crate::plugin_surface_host::PluginSurfaceRunOutcome::OpenSession(session_id) => {
-                let result = crate::runtime::run_event_loop_with_input(terminal, input, session_id)
-                    .await
-                    .map_err(|error| error.to_string());
-                surface.session_navigation_finished(session_id, result.clone());
-                if let Err(message) = result {
-                    tracing::warn!(%session_id, %message, "linked session navigation failed");
-                }
-            }
-        }
+fn map_surface_open_error(error: &impl ToString) -> TuiError {
+    TuiError::PluginService {
+        code: "tui_surface_open_failed".to_string(),
+        message: error.to_string(),
     }
 }
 

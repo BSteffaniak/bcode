@@ -23,7 +23,7 @@ pub async fn run_dashboard<W: Write>(
 ) -> Result<(), TuiError> {
     let runtime = load_metrics_tui_runtime()?;
     let metrics_path = metrics_path.unwrap_or_else(default_metrics_path);
-    let mut surface = crate::plugin_tui::open_plugin_tui_surface(
+    let surface = crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
         METRICS_PLUGIN_ID,
         METRICS_DASHBOARD_SURFACE_KIND,
@@ -39,8 +39,12 @@ pub async fn run_dashboard<W: Write>(
         code: "tui_surface_open_failed".to_string(),
         message: error.to_string(),
     })?;
-    let _outcome =
-        crate::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
+    let _outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
+        terminal,
+        METRICS_PLUGIN_ID,
+        surface,
+    ))
+    .await?;
     Ok(())
 }
 

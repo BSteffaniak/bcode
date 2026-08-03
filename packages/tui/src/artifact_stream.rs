@@ -557,36 +557,14 @@ impl ArtifactStreamCoordinator {
             .min()
     }
 
-    pub(crate) fn try_next_completion(&mut self) -> Option<ActiveArtifactFetchCompletion> {
-        self.artifact_fetch_receiver.try_recv().ok()
+    #[cfg(test)]
+    pub(crate) async fn next_completion(&mut self) -> Option<ActiveArtifactFetchCompletion> {
+        self.artifact_fetch_receiver.recv().await
     }
 
     #[cfg(test)]
     pub(crate) fn completion_capacity(&self) -> usize {
         self.artifact_fetch_receiver.max_capacity()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn enqueue_test_completion(&self, session_id: SessionId) {
-        let _result = self
-            .artifact_fetch_sender
-            .try_send(ActiveArtifactFetchCompletion {
-                session_id,
-                key: (
-                    session_id,
-                    "test-tool".to_owned(),
-                    "test-artifact".to_owned(),
-                    "test-reference".to_owned(),
-                ),
-                requested_offset: 0,
-                requested_end: 0,
-                target_revision: 1,
-                result: Err(ClientError::UnexpectedResponse),
-            });
-    }
-
-    pub(crate) async fn next_completion(&mut self) -> Option<ActiveArtifactFetchCompletion> {
-        self.artifact_fetch_receiver.recv().await
     }
 
     pub(crate) fn take_completion_receiver(

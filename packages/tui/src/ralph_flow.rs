@@ -1,8 +1,6 @@
 //! Ralph loop TUI flow.
 
-use std::io::Write;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_ipc::{
     RalphApproveRequest, RalphCancelRequest, RalphLifecycleRequest, RalphListIterationsRequest,
@@ -13,22 +11,9 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
 use bcode_worktree_models::WorktreeCreateRequest;
-use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_text_edit::{SelectionMode, TextEditBuffer};
-use bmux_tui::event::{Event, FocusEvent, MouseEvent};
-use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::input::TextInput;
-use bmux_tui::prelude::{Line, Style, Widget};
-use bmux_tui::style::Color;
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
-use bmux_tui_components::text_input::{TextInputControl, TextInputState};
 
-use super::helpers;
-use super::keymap::BmuxKeyMap;
-use super::runtime_context::{TuiIo, TuiServices};
+use super::TuiError;
 use super::session_flow::ActiveChat;
-use super::{TuiError, daemon_issue, ralph_start_dialog, ralph_start_dialog_render};
 
 /// Ralph action that does not require a nested terminal screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,12 +25,198 @@ pub enum RalphRootAction {
     ListRuns,
     ListIterations,
     Resume,
+    Plan,
+    SaveDraft,
+    ViewDraft,
+    ReviseDraft,
+    ApproveDraft,
+    ApplyDraftToLoop,
+    CreateFromDraft,
+    OpenProgress,
+    Audit,
+    Replan,
+}
+
+impl RalphRootAction {
+    pub const fn requires_client(self) -> bool {
+        matches!(
+            self,
+            Self::ShowStatus
+                | Self::Run
+                | Self::Approve
+                | Self::Stop
+                | Self::ListRuns
+                | Self::ListIterations
+                | Self::Resume
+        )
+    }
 }
 
 /// Presentation returned by one root-runtime Ralph action.
 pub struct RalphRootOutput {
     pub status: String,
     pub markdown: Option<String>,
+}
+
+pub fn execute_root_local_action(
+    chat: &mut ActiveChat,
+    action: RalphRootAction,
+) -> Result<RalphRootOutput, TuiError> {
+    match action {
+        RalphRootAction::SaveDraft => save_setup_draft(chat)?,
+        RalphRootAction::ViewDraft => view_setup_draft(chat)?,
+        RalphRootAction::ReviseDraft => revise_setup_draft(chat)?,
+        RalphRootAction::ApproveDraft => approve_setup_draft(chat)?,
+        RalphRootAction::ApplyDraftToLoop => apply_draft_to_existing_loop(chat)?,
+        RalphRootAction::OpenProgress => open_progress(chat)?,
+        RalphRootAction::Audit => show_prompt(chat, ralph_state::RalphPromptKind::Audit)?,
+        RalphRootAction::Replan => show_prompt(chat, ralph_state::RalphPromptKind::Replan)?,
+        RalphRootAction::Plan | RalphRootAction::CreateFromDraft => {
+            return Err(TuiError::PluginService {
+                code: "ralph_async_local_action_requires_effect".to_owned(),
+                message: "Ralph action requires root effect scheduling".to_owned(),
+            });
+        }
+        RalphRootAction::ShowStatus
+        | RalphRootAction::Run
+        | RalphRootAction::Approve
+        | RalphRootAction::Stop
+        | RalphRootAction::ListRuns
+        | RalphRootAction::ListIterations
+        | RalphRootAction::Resume => {
+            return Err(TuiError::PluginService {
+                code: "ralph_remote_action_requires_effect".to_owned(),
+                message: "Ralph daemon action requires root effect scheduling".to_owned(),
+            });
+        }
+    }
+    Ok(RalphRootOutput {
+        status: flash_message_for_root_action(action),
+        markdown: None,
+    })
+}
+
+fn flash_message_for_root_action(action: RalphRootAction) -> String {
+    match action {
+        RalphRootAction::SaveDraft => "Ralph setup draft saved".to_owned(),
+        RalphRootAction::ViewDraft => "Ralph setup draft shown".to_owned(),
+        RalphRootAction::ReviseDraft => "Ralph setup revision prompt prepared".to_owned(),
+        RalphRootAction::ApproveDraft => "Ralph setup draft approval applied".to_owned(),
+        RalphRootAction::ApplyDraftToLoop => "Ralph rebuild draft applied".to_owned(),
+        RalphRootAction::OpenProgress => "Ralph progress path shown".to_owned(),
+        RalphRootAction::Audit => "Ralph audit prompt prepared".to_owned(),
+        RalphRootAction::Replan => "Ralph replan prompt prepared".to_owned(),
+        RalphRootAction::Plan
+        | RalphRootAction::CreateFromDraft
+        | RalphRootAction::ShowStatus
+        | RalphRootAction::Run
+        | RalphRootAction::Approve
+        | RalphRootAction::Stop
+        | RalphRootAction::ListRuns
+        | RalphRootAction::ListIterations
+        | RalphRootAction::Resume => "Ralph action completed".to_owned(),
+    }
+}
+
+pub struct RalphStartRequest {
+    pub loop_name: String,
+    pub repo_root: PathBuf,
+    pub session_id: Option<bcode_session_models::SessionId>,
+    pub session_title: Option<String>,
+    pub work_area_path: Option<String>,
+    pub branch: Option<String>,
+    pub validation_commands: Vec<String>,
+}
+
+pub struct RalphStartOutput {
+    pub status: String,
+    pub markdown: String,
+}
+
+pub async fn execute_root_start(
+    client: &bcode_client::BcodeClient,
+    request: RalphStartRequest,
+) -> Result<RalphStartOutput, TuiError> {
+    let RalphStartRequest {
+        loop_name,
+        repo_root,
+        session_id,
+        session_title,
+        work_area_path,
+        branch,
+        validation_commands,
+    } = request;
+    let state =
+        ralph_state::create_initial_loop_state(&loop_name, &repo_root, session_title.as_deref())?;
+    ralph_state::set_validation_commands(&state.state_dir, &validation_commands, "setup")?;
+    if let Some(session_id) = session_id {
+        let history = client
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit: 64,
+                    direction: SessionHistoryDirection::Backward,
+                },
+            )
+            .await?;
+        ralph_state::write_context_pack(&state, session_title.as_deref(), &history.events)?;
+        ralph_state::generate_progress_doc_from_context(&state, &loop_name, &repo_root)?;
+    }
+    let work_area = client
+        .create_worktree(WorktreeCreateRequest {
+            name: format!("ralph-{loop_name}"),
+            cwd: Some(repo_root),
+            path: work_area_path.map(PathBuf::from),
+            branch: None,
+            new_branch: branch,
+            base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
+            detach: false,
+            force: false,
+            attach_session_id: None,
+            new_session: true,
+            no_setup: false,
+        })
+        .await?;
+    let work_area_session_id = work_area
+        .session
+        .as_ref()
+        .map(|session| session.id.to_string());
+    ralph_state::record_work_area(
+        &state,
+        &work_area.path,
+        work_area.branch.as_deref(),
+        work_area_session_id.as_deref(),
+    )?;
+    if let Some(session) = &work_area.session {
+        let _event = client
+            .record_ralph_lifecycle(RalphLifecycleRequest {
+                session_id: session.id,
+                loop_name: loop_name.clone(),
+                state_dir: state.state_dir.clone(),
+                kind: "work_area_created".to_owned(),
+                message: "Created Ralph isolated work area".to_owned(),
+                occurred_at_ms: now_ms(),
+            })
+            .await?;
+    }
+    let validation_summary = if validation_commands.is_empty() {
+        "<none>".to_owned()
+    } else {
+        validation_commands.join("; ")
+    };
+    Ok(RalphStartOutput {
+        status: "Ralph loop created".to_owned(),
+        markdown: format!(
+            "Ralph loop created\n* Loop: {loop_name}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Validation: {}\n* Next: review docs if desired, then prepare a run and approve/start it",
+            display_from_current_dir(&state.charter_doc_path),
+            display_from_current_dir(&state.progress_doc_path),
+            display_from_current_dir(&state.state_dir),
+            display_from_current_dir(&work_area.path),
+            work_area_session_id.as_deref().unwrap_or("<none>"),
+            validation_summary
+        ),
+    })
 }
 
 /// Execute a non-interactive Ralph action through the application client boundary.
@@ -164,6 +335,20 @@ pub async fn execute_root_action(
                 )),
             })
         }
+        RalphRootAction::Plan
+        | RalphRootAction::SaveDraft
+        | RalphRootAction::ViewDraft
+        | RalphRootAction::ReviseDraft
+        | RalphRootAction::ApproveDraft
+        | RalphRootAction::ApplyDraftToLoop
+        | RalphRootAction::CreateFromDraft
+        | RalphRootAction::OpenProgress
+        | RalphRootAction::Audit
+        | RalphRootAction::Replan => Err(TuiError::PluginService {
+            code: "ralph_local_action_requires_app_state".to_owned(),
+            message: "Ralph local setup actions must execute on the serialized root model"
+                .to_owned(),
+        }),
     }
 }
 
@@ -256,126 +441,6 @@ async fn execute_root_list_iterations(
             summary.loop_name
         )),
     })
-}
-
-/// Open the plugin-owned Ralph home UI.
-pub async fn open_home<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let mut flash_message: Option<String> = None;
-    loop {
-        let repo_root = current_repo_root(chat)?;
-        match super::ralph_launcher::run_home_with_input(
-            io.terminal,
-            io.input,
-            repo_root,
-            flash_message.as_deref(),
-        )
-        .await?
-        {
-            super::ralph_launcher::RalphHomeOutcome::Action(action) => {
-                match dispatch_home_action(action, io, services, chat).await {
-                    Ok(()) => {
-                        if action == super::ralph_launcher::RalphHomeAction::RebuildLoopContext {
-                            return Ok(());
-                        }
-                        flash_message = Some(flash_message_for_action(action));
-                    }
-                    Err(TuiError::Canceled) => {
-                        chat.app.set_status("Ralph action canceled".to_owned());
-                        flash_message = Some(
-                            "Action canceled. Choose the next Ralph action when ready.".to_owned(),
-                        );
-                    }
-                    Err(error) if daemon_issue::is_nonfatal_tui_error(&error) => {
-                        daemon_issue::report_tui_issue(
-                            &mut chat.app,
-                            "Ralph action unavailable",
-                            &error,
-                        );
-                        flash_message = Some(
-                            "Ralph action unavailable; daemon/plugin issue was reported in chat."
-                                .to_owned(),
-                        );
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            super::ralph_launcher::RalphHomeOutcome::Exit => {
-                chat.app.set_status("Ralph UI closed".to_owned());
-                return Ok(());
-            }
-        }
-    }
-}
-
-fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> String {
-    match action {
-        super::ralph_launcher::RalphHomeAction::Plan => {
-            "Guided setup started. Next: answer the assistant's clarifying questions in chat."
-                .to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::SaveDraft => {
-            "Setup draft saved. Next: review it, then approve setup draft.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::ViewDraft => {
-            "Setup draft shown. Next: approve it or ask Ralph to revise it.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::ReviseDraft => {
-            "Revision prompt prepared. Submit it, then save setup draft again.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::RebuildLoopContext => {
-            "Rebuild setup started. Answer questions, then save/approve/apply the draft.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::ApproveDraft => {
-            "Setup draft approved. Next: create the loop from the approved draft.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
-            "Loop created from setup draft. Next: prepare a run.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::ApplyDraftToLoop => {
-            "Existing loop context rebuilt from draft. Next: review status or prepare run."
-                .to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Start => {
-            "Setup complete. Next: review the docs if desired, then prepare a run.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Run
-        | super::ralph_launcher::RalphHomeAction::Goal => {
-            "Run prepared. Next: approve/start the prepared run.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Approve => {
-            "Run approved. Next: watch status/iterations, or stop if needed.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Stop => {
-            "Stop requested. Next: refresh status, then resume, audit, or replan.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Resume => {
-            "Resume requested. Next: watch status/iterations.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Status => {
-            "Status written to chat. Next: choose the recommended Ralph action below.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Runs => {
-            "Runs written to chat. Next: choose an available action for the latest run.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Iterations => {
-            "Iterations written to chat. Next: continue, audit, replan, or resume as appropriate."
-                .to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Open => {
-            "Progress doc path written to chat. Next: prepare/run or recalibrate as needed."
-                .to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Audit => {
-            "Audit prompt written to chat. Next: run the audit or replan from findings.".to_owned()
-        }
-        super::ralph_launcher::RalphHomeAction::Replan => {
-            "Replan prompt written to chat. Next: apply the replan, then prepare a run.".to_owned()
-        }
-    }
 }
 
 fn markdown_preview(text: Option<&str>) -> String {
@@ -560,80 +625,6 @@ fn approve_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
     Ok(())
 }
 
-async fn create_loop_from_draft(
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    let Some(draft) = ralph_state::latest_setup_draft(&repo_root)? else {
-        chat.app.set_status("no Ralph setup draft found".to_owned());
-        return Ok(());
-    };
-    if draft.mode != ralph_state::RalphSetupDraftMode::NewLoop {
-        chat.push_presentation_markdown("bcode.ralph", format!(
-            "Ralph setup draft is not a new-loop draft\n* Draft: {}\n* Mode: {}\n* Next: use Apply draft to loop for rebuild drafts",
-            draft.draft_id, draft.mode
-        ));
-        chat.app
-            .set_status("Ralph setup draft is not a new-loop draft".to_owned());
-        return Ok(());
-    }
-    let readiness = draft.readiness();
-    if !readiness.ready() {
-        chat.push_presentation_markdown("bcode.ralph", format!(
-            "Ralph setup draft is not approved for loop creation\n* Draft: {}\n* Has charter: {}\n* Has progress: {}\n* Approved: {}\n* Next: save and approve the setup draft before creating the loop",
-            draft.draft_id, readiness.has_charter, readiness.has_progress, readiness.approved
-        ));
-        chat.app
-            .set_status("Ralph setup draft is not ready".to_owned());
-        return Ok(());
-    }
-    let state = ralph_state::create_loop_from_setup_draft(
-        &draft.draft_id,
-        &repo_root,
-        chat.app.session_title(),
-    )?;
-    let work_area = services
-        .client
-        .create_worktree(WorktreeCreateRequest {
-            name: format!("ralph-{}", draft.loop_name),
-            cwd: Some(repo_root),
-            path: draft.work_area_path.clone(),
-            branch: None,
-            new_branch: draft.branch.clone(),
-            base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
-            detach: false,
-            force: false,
-            attach_session_id: None,
-            new_session: true,
-            no_setup: false,
-        })
-        .await?;
-    let work_area_session_id = work_area
-        .session
-        .as_ref()
-        .map(|session| session.id.to_string());
-    ralph_state::record_work_area(
-        &state,
-        &work_area.path,
-        work_area.branch.as_deref(),
-        work_area_session_id.as_deref(),
-    )?;
-    chat.push_presentation_markdown("bcode.ralph", format!(
-        "Ralph loop created from setup draft\n* Draft: {}\n* Loop: {}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Next: prepare a run, then approve/start it",
-        draft.draft_id,
-        draft.loop_name,
-        display_from_current_dir(&state.charter_doc_path),
-        display_from_current_dir(&state.progress_doc_path),
-        display_from_current_dir(&state.state_dir),
-        display_from_current_dir(&work_area.path),
-        work_area_session_id.as_deref().unwrap_or("<none>")
-    ));
-    chat.app
-        .set_status("Ralph loop created from setup draft".to_owned());
-    Ok(())
-}
-
 fn latest_assistant_message(chat: &ActiveChat) -> Option<String> {
     chat.app
         .transcript()
@@ -788,406 +779,6 @@ fn save_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
     Ok(())
 }
 
-fn rebuild_setup_prompt(
-    draft: &ralph_state::RalphSetupDraft,
-    loop_summary: &ralph_state::RalphLoopSummary,
-) -> String {
-    format!(
-        "We are rebuilding context for an existing Ralph loop because its current charter/progress may be nonsense or stubbed.\n\n\
-         Existing loop:\n\
-         * Name: {loop_name}\n\
-         * State dir: {state_dir}\n\
-         * Charter path: {charter_path}\n\
-         * Progress path: {progress_path}\n\n\
-         Treat this as a fresh setup pass for the existing loop. Do not preserve meaningless existing charter/progress text. Preserve only real constraints from the repo/session and ask clarifying questions if essential.\n\n\
-         Produce the replacement artifact in this exact shape when ready:\n\n\
-         RALPH_SETUP_DRAFT_START\n\
-         loop_name: {draft_loop_name}\n\
-         branch: <optional branch name or <none>>\n\
-         worktree_path: <optional absolute path or <none>>\n\
-         validation:\n\
-         - <command>\n\n\
-         --- charter.md ---\n\
-         <complete replacement charter markdown>\n\n\
-         --- progress.md ---\n\
-         <complete replacement progress markdown with actionable checklist items>\n\
-         RALPH_SETUP_DRAFT_END\n\n\
-         Initial context pack:\n\n{source_context}",
-        loop_name = loop_summary.loop_name,
-        state_dir = display_from_current_dir(&loop_summary.state_dir),
-        charter_path = display_from_current_dir(&loop_summary.charter_doc_path),
-        progress_path = display_from_current_dir(&loop_summary.progress_doc_path),
-        draft_loop_name = draft.loop_name,
-        source_context = draft.source_context
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RalphRebuildField {
-    Intent,
-    Problem,
-    Constraints,
-    Validation,
-}
-
-struct RalphRebuildDialog {
-    intent: TextInputState,
-    problem: TextInputState,
-    constraints: TextInputState,
-    validation: TextInputState,
-    focused_field: RalphRebuildField,
-    status: String,
-}
-
-impl RalphRebuildDialog {
-    fn new(loop_summary: &ralph_state::RalphLoopSummary, validation_commands: &[String]) -> Self {
-        Self {
-            intent: TextInputState::new(TextEditBuffer::from_text(format!(
-                "Rebuild this Ralph loop so it has accurate charter/progress context for {}.",
-                loop_summary.loop_name
-            ))),
-            problem: TextInputState::new(TextEditBuffer::from_text(
-                "The current charter/progress may be stubbed, nonsense, stale, or not grounded in the actual repository/session state.",
-            )),
-            constraints: TextInputState::new(TextEditBuffer::from_text(
-                "Preserve run history. Do not overwrite files until I approve/apply the draft. Ignore meaningless existing context.",
-            )),
-            validation: TextInputState::new(TextEditBuffer::from_text(
-                validation_commands.join("; "),
-            )),
-            focused_field: RalphRebuildField::Intent,
-            status:
-                "Fill in context, Tab between fields, Enter starts the guided Ralph conversation."
-                    .to_owned(),
-        }
-    }
-
-    const fn focused_input_mut(&mut self) -> &mut TextInputState {
-        match self.focused_field {
-            RalphRebuildField::Intent => &mut self.intent,
-            RalphRebuildField::Problem => &mut self.problem,
-            RalphRebuildField::Constraints => &mut self.constraints,
-            RalphRebuildField::Validation => &mut self.validation,
-        }
-    }
-
-    const fn focus_next(&mut self) {
-        self.focused_field = match self.focused_field {
-            RalphRebuildField::Intent => RalphRebuildField::Problem,
-            RalphRebuildField::Problem => RalphRebuildField::Constraints,
-            RalphRebuildField::Constraints => RalphRebuildField::Validation,
-            RalphRebuildField::Validation => RalphRebuildField::Intent,
-        };
-    }
-
-    fn validation_commands(&self) -> Vec<String> {
-        self.validation
-            .buffer()
-            .text()
-            .split(';')
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
-            .map(ToOwned::to_owned)
-            .collect()
-    }
-
-    fn user_context(&self) -> String {
-        format!(
-            "User-provided rebuild context:\n\nIntent:\n{}\n\nCurrent problem:\n{}\n\nConstraints / non-goals:\n{}\n",
-            self.intent.buffer().text().trim(),
-            self.problem.buffer().text().trim(),
-            self.constraints.buffer().text().trim()
-        )
-    }
-}
-
-fn render_rebuild_dialog(
-    dialog: &mut RalphRebuildDialog,
-    loop_summary: &ralph_state::RalphLoopSummary,
-    frame: &mut Frame<'_>,
-    theme: super::render::TuiTheme,
-) {
-    let modal = ModalFrame::new(
-        ModalSizing::new(Size::new(96, 30), Size::new(118, 34), Insets::all(4)),
-        ModalTheme::dark(theme.accent),
-    )
-    .title(" Ralph rebuild setup ")
-    .padding(Insets::new(1, 2, 1, 2))
-    .placement(ModalPlacement::UpperThird);
-    modal.render(frame.area(), frame);
-    let content = modal.content_area(frame.area());
-    let mut row = content.y;
-    render_rebuild_line(
-        &modal,
-        content,
-        &mut row,
-        frame,
-        "Guided rebuild conversation for existing loop context. Nothing is overwritten here.",
-    );
-    render_rebuild_line(
-        &modal,
-        content,
-        &mut row,
-        frame,
-        &format!("Loop: {}", loop_summary.loop_name),
-    );
-    render_rebuild_line(
-        &modal,
-        content,
-        &mut row,
-        frame,
-        &format!(
-            "State: {}",
-            display_from_current_dir(&loop_summary.state_dir)
-        ),
-    );
-    row = row.saturating_add(1);
-    render_rebuild_input(
-        dialog,
-        &modal,
-        content,
-        &mut row,
-        frame,
-        RalphRebuildField::Intent,
-        "Intent / goal",
-    );
-    render_rebuild_input(
-        dialog,
-        &modal,
-        content,
-        &mut row,
-        frame,
-        RalphRebuildField::Problem,
-        "What is wrong now?",
-    );
-    render_rebuild_input(
-        dialog,
-        &modal,
-        content,
-        &mut row,
-        frame,
-        RalphRebuildField::Constraints,
-        "Constraints / non-goals",
-    );
-    render_rebuild_input(
-        dialog,
-        &modal,
-        content,
-        &mut row,
-        frame,
-        RalphRebuildField::Validation,
-        "Validation commands (; separated)",
-    );
-    row = row.saturating_add(1);
-    render_rebuild_line(
-        &modal,
-        content,
-        &mut row,
-        frame,
-        "After Enter, Bcode sends this scoped Ralph rebuild turn automatically; no composer handoff.",
-    );
-    render_rebuild_line(
-        &modal,
-        content,
-        &mut row,
-        frame,
-        "Next response stays in the chat transcript, then use Save/View/Approve/Apply in Ralph.",
-    );
-    row = content.bottom().saturating_sub(2);
-    render_rebuild_line(
-        &modal,
-        content,
-        &mut row,
-        frame,
-        "Enter start conversation · Tab field · Esc cancel",
-    );
-    render_rebuild_line(&modal, content, &mut row, frame, &dialog.status);
-}
-
-fn render_rebuild_line(
-    modal: &ModalFrame,
-    content: Rect,
-    row: &mut u16,
-    frame: &mut Frame<'_>,
-    text: &str,
-) {
-    if *row >= content.bottom() {
-        return;
-    }
-    modal.render_line(
-        Rect::new(content.x, *row, content.width, 1),
-        &Line::from(text.to_owned()),
-        frame,
-    );
-    *row = row.saturating_add(1);
-}
-
-fn render_rebuild_input(
-    dialog: &mut RalphRebuildDialog,
-    modal: &ModalFrame,
-    content: Rect,
-    row: &mut u16,
-    frame: &mut Frame<'_>,
-    field: RalphRebuildField,
-    label: &str,
-) {
-    render_rebuild_line(modal, content, row, frame, label);
-    if *row >= content.bottom() {
-        return;
-    }
-    let input_area = Rect::new(content.x, *row, content.width, 1);
-    let focused = dialog.focused_field == field;
-    let input = match field {
-        RalphRebuildField::Intent => &mut dialog.intent,
-        RalphRebuildField::Problem => &mut dialog.problem,
-        RalphRebuildField::Constraints => &mut dialog.constraints,
-        RalphRebuildField::Validation => &mut dialog.validation,
-    };
-    input.set_content_area(input_area, &ralph_start_dialog::input_policy());
-    TextInput::new(input.buffer())
-        .style(Style::new().fg(Color::Yellow).bg(Color::Black))
-        .selection_style(Style::new().fg(Color::Black).bg(Color::Yellow))
-        .vertical_scroll(input.vertical_scroll())
-        .cursor_visible(focused)
-        .render(input_area, frame);
-    *row = row.saturating_add(2);
-}
-
-async fn collect_rebuild_context<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    loop_summary: &ralph_state::RalphLoopSummary,
-    default_validation_commands: &[String],
-) -> Result<Option<RalphRebuildDialog>, TuiError> {
-    let mut dialog = RalphRebuildDialog::new(loop_summary, default_validation_commands);
-    loop {
-        io.terminal.resize(helpers::terminal_area()?);
-        io.terminal.draw(|frame| {
-            render_rebuild_dialog(&mut dialog, loop_summary, frame, services.theme);
-        })?;
-        let Some(event) = io.input.recv().await? else {
-            continue;
-        };
-        match event {
-            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
-            Event::Paste(text) => {
-                dialog.focused_input_mut().buffer_mut().insert_str(&text);
-                dialog
-                    .focused_input_mut()
-                    .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
-            }
-            Event::Key(key) => match key.key {
-                KeyCode::Escape => return Ok(None),
-                KeyCode::Tab => dialog.focus_next(),
-                KeyCode::Enter => return Ok(Some(dialog)),
-                _ => handle_rebuild_dialog_key(&mut dialog, services.keymap, key),
-            },
-            Event::Mouse(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {}
-        }
-    }
-}
-
-fn handle_rebuild_dialog_key(
-    dialog: &mut RalphRebuildDialog,
-    keymap: &BmuxKeyMap,
-    stroke: KeyStroke,
-) {
-    if let Some(motion) = keymap.editor_selection_motion_for_key(stroke) {
-        dialog
-            .focused_input_mut()
-            .buffer_mut()
-            .move_cursor_with_selection(motion, SelectionMode::Extend);
-        dialog
-            .focused_input_mut()
-            .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
-        return;
-    }
-    if let Some(command) = keymap.editor_command_for_key(stroke) {
-        dialog
-            .focused_input_mut()
-            .buffer_mut()
-            .apply_command(command);
-        dialog
-            .focused_input_mut()
-            .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
-        return;
-    }
-    let _ = TextInputControl::new(&ralph_start_dialog::input_policy())
-        .handle_key(dialog.focused_input_mut(), stroke);
-}
-
-/// Start an LLM-guided rebuild setup draft for the latest existing loop.
-pub async fn rebuild_loop_context<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    let Some(loop_summary) = ralph_state::latest_loop(&repo_root)? else {
-        chat.app
-            .set_status("no Ralph loop found to rebuild".to_owned());
-        return Ok(());
-    };
-    let default_validation_commands = ralph_state::default_validation_commands(&repo_root);
-    let Some(dialog) =
-        collect_rebuild_context(io, services, &loop_summary, &default_validation_commands).await?
-    else {
-        chat.app.set_status("Ralph rebuild canceled".to_owned());
-        return Ok(());
-    };
-    let mut source_context = setup_source_context(services, chat).await?;
-    source_context.push_str("\n\n");
-    source_context.push_str(&dialog.user_context());
-    source_context.push_str("\nExisting Ralph loop files:\n* charter: ");
-    source_context.push_str(&display_from_current_dir(&loop_summary.charter_doc_path).to_string());
-    source_context.push_str("\n* progress: ");
-    source_context.push_str(&display_from_current_dir(&loop_summary.progress_doc_path).to_string());
-    source_context.push_str("\n* state dir: ");
-    source_context.push_str(&display_from_current_dir(&loop_summary.state_dir).to_string());
-    source_context.push('\n');
-    let draft = ralph_state::create_setup_draft(ralph_state::RalphSetupDraftCreateRequest {
-        repo_root: repo_root.clone(),
-        loop_name: loop_summary.loop_name.clone(),
-        session_title: chat.app.session_title().map(ToOwned::to_owned),
-        source_context,
-        validation_commands: dialog.validation_commands(),
-        mode: ralph_state::RalphSetupDraftMode::RebuildExistingLoop,
-        target_state_dir: Some(loop_summary.state_dir.clone()),
-    })?;
-    let prompt = rebuild_setup_prompt(&draft, &loop_summary);
-    append_setup_transcript(
-        &draft,
-        &format!(
-            "## Created rebuild setup draft\n\nTarget state dir: {}\n\n{}",
-            display_from_current_dir(&loop_summary.state_dir),
-            prompt
-        ),
-    )?;
-    let session_id =
-        super::session_flow::persist_draft_session(io.terminal, services.client, chat).await?;
-    services
-        .client
-        .send_user_message(
-            session_id,
-            prompt.clone(),
-            bcode_ipc::PromptPlacement::FollowUp,
-        )
-        .await?;
-    chat.push_presentation_markdown("bcode.ralph", format!(
-        "Ralph rebuild conversation started\n* Draft: {}\n* Target loop: {}\n* Target state: {}\n* Transcript: {}\n* Assistant turn: started automatically from the guided rebuild context\n* Next: answer Ralph's questions here, then Save/View/Approve/Apply the setup draft from Ralph UI",
-        draft.draft_id,
-        loop_summary.loop_name,
-        display_from_current_dir(&loop_summary.state_dir),
-        draft
-            .setup_transcript_path
-            .as_ref()
-            .map_or_else(|| "<none>".to_owned(), |path| display_from_current_dir(path).to_string())
-    ));
-    chat.app
-        .set_status("Ralph rebuild conversation started".to_owned());
-    Ok(())
-}
-
 fn apply_draft_to_existing_loop(chat: &mut ActiveChat) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
     let Some(draft) = ralph_state::latest_setup_draft(&repo_root)? else {
@@ -1227,527 +818,6 @@ fn apply_draft_to_existing_loop(chat: &mut ActiveChat) -> Result<(), TuiError> {
 }
 
 /// Start an LLM-guided Ralph setup draft instead of immediately creating loop files.
-pub async fn plan_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    let default_name = chat
-        .app
-        .session_title()
-        .map_or_else(|| "new-ralph-loop".to_owned(), ToString::to_string);
-    let validation_commands = ralph_state::default_validation_commands(&repo_root);
-    let source_context = setup_source_context(services, chat).await?;
-    let draft = ralph_state::create_setup_draft(ralph_state::RalphSetupDraftCreateRequest {
-        repo_root: repo_root.clone(),
-        loop_name: default_name,
-        session_title: chat.app.session_title().map(ToOwned::to_owned),
-        source_context,
-        validation_commands,
-        mode: ralph_state::RalphSetupDraftMode::NewLoop,
-        target_state_dir: None,
-    })?;
-    let prompt = guided_setup_prompt(&draft);
-    append_setup_transcript(
-        &draft,
-        &format!(
-            "## Created setup draft\n\nRepo: {}\n\nInitial context:\n\n{}",
-            display_from_current_dir(&repo_root),
-            draft.source_context
-        ),
-    )?;
-    chat.push_presentation_markdown("bcode.ralph", format!(
-        "Ralph guided setup draft created\n* Draft: {}\n* Status: {}\n* Repo: {}\n* Next: answer the assistant's clarifying questions; approve only after charter/progress are meaningful",
-        draft.draft_id,
-        draft.status,
-        display_from_current_dir(&repo_root)
-    ));
-    chat.app.composer_mut().clear();
-    chat.app.composer_mut().insert_str(&prompt);
-    chat.app.set_status(
-        "Ralph setup draft created; submit the guided setup prompt to start planning".to_owned(),
-    );
-    Ok(())
-}
-
-async fn setup_source_context(
-    services: &TuiServices<'_>,
-    chat: &ActiveChat,
-) -> Result<String, TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        return Ok("No active session history was available. Ask the user for the loop goal, constraints, non-goals, validation expectations, and definition of done.".to_owned());
-    };
-    let history = services
-        .client
-        .session_history_page(
-            session_id,
-            SessionHistoryQuery {
-                cursor: None,
-                limit: 64,
-                direction: SessionHistoryDirection::Backward,
-            },
-        )
-        .await?;
-    Ok(history
-        .events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            bcode_session_models::SessionEventKind::UserMessage { text, .. } => {
-                Some(format!("User: {text}"))
-            }
-            bcode_session_models::SessionEventKind::AssistantMessage { text, .. }
-            | bcode_session_models::SessionEventKind::AssistantResponseSegment { text, .. } => {
-                Some(format!("Assistant: {text}"))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n"))
-}
-
-fn guided_setup_prompt(draft: &ralph_state::RalphSetupDraft) -> String {
-    format!(
-        "Start Ralph guided setup for draft `{draft_id}`.\n\n\
-         Goal: do not create loop files yet. First help me clarify the goal, constraints, non-goals, validation, and definition of done. Ask focused clarifying questions until the loop is well specified. Then draft a meaningful `charter.md` and `progress.md` for review.\n\n\
-         Required process:\n\
-         1. Summarize what you understand from the context.\n\
-         2. Ask the minimum necessary clarifying questions.\n\
-         3. After answers, produce a final setup artifact in this exact shape so Ralph can save it reliably:\n\n\
-         RALPH_SETUP_DRAFT_START\n\
-         loop_name: <name>\n\
-         branch: <optional branch name or <none>>\n\
-         worktree_path: <optional absolute path or <none>>\n\
-         validation:\n\
-         - <command>\n\n\
-         --- charter.md ---\n\
-         <complete charter markdown>\n\n\
-         --- progress.md ---\n\
-         <complete progress markdown with actionable checklist items>\n\
-         RALPH_SETUP_DRAFT_END\n\n\
-         4. Do not claim setup is complete until I explicitly approve creating the loop from the draft.\n\n\
-         Current draft status: {status}\n\
-         Proposed loop name: {loop_name}\n\
-         Validation commands: {validation}\n\n\
-         Captured context:\n{context}",
-        draft_id = draft.draft_id,
-        status = draft.status,
-        loop_name = draft.loop_name,
-        validation = if draft.validation_commands.is_empty() {
-            "<none>".to_owned()
-        } else {
-            draft.validation_commands.join("; ")
-        },
-        context = draft.source_context
-    )
-}
-
-async fn dispatch_home_action<W: Write>(
-    action: super::ralph_launcher::RalphHomeAction,
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    match action {
-        super::ralph_launcher::RalphHomeAction::Plan => plan_loop(services, chat).await,
-        super::ralph_launcher::RalphHomeAction::SaveDraft => save_setup_draft(chat),
-        super::ralph_launcher::RalphHomeAction::ViewDraft => view_setup_draft(chat),
-        super::ralph_launcher::RalphHomeAction::ReviseDraft => revise_setup_draft(chat),
-        super::ralph_launcher::RalphHomeAction::RebuildLoopContext => {
-            rebuild_loop_context(io, services, chat).await
-        }
-        super::ralph_launcher::RalphHomeAction::ApproveDraft => approve_setup_draft(chat),
-        super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
-            create_loop_from_draft(services, chat).await
-        }
-        super::ralph_launcher::RalphHomeAction::ApplyDraftToLoop => {
-            apply_draft_to_existing_loop(chat)
-        }
-        super::ralph_launcher::RalphHomeAction::Start => start_loop(io, services, chat).await,
-        super::ralph_launcher::RalphHomeAction::Run
-        | super::ralph_launcher::RalphHomeAction::Goal => run_loop(services, chat).await,
-        super::ralph_launcher::RalphHomeAction::Approve => approve_run(services, chat).await,
-        super::ralph_launcher::RalphHomeAction::Stop => stop_loop(services, chat).await,
-        super::ralph_launcher::RalphHomeAction::Resume => resume_run(services, chat).await,
-        super::ralph_launcher::RalphHomeAction::Status => show_status(services, chat).await,
-        super::ralph_launcher::RalphHomeAction::Runs => list_runs(services, chat).await,
-        super::ralph_launcher::RalphHomeAction::Iterations => list_iterations(services, chat).await,
-        super::ralph_launcher::RalphHomeAction::Open => open_progress(chat),
-        super::ralph_launcher::RalphHomeAction::Audit => {
-            show_prompt(chat, ralph_state::RalphPromptKind::Audit)
-        }
-        super::ralph_launcher::RalphHomeAction::Replan => {
-            show_prompt(chat, ralph_state::RalphPromptKind::Replan)
-        }
-    }
-}
-
-/// Show latest Ralph loop status for the current repository.
-pub async fn show_status(
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    let response = services
-        .client
-        .ralph_run_status(RalphRunStatusRequest {
-            repo_root,
-            loop_state_dir: None,
-        })
-        .await?;
-    let Some(summary) = response.loop_summary else {
-        chat.app
-            .set_status("no Ralph loops for current repository".to_owned());
-        return Ok(());
-    };
-    chat.push_presentation_markdown(
-        "bcode.ralph",
-        format_status_note(
-            &summary,
-            response.active_run.as_ref(),
-            response.interrupted_runs.len(),
-        ),
-    );
-    chat.app.set_status("Ralph status shown".to_owned());
-    Ok(())
-}
-
-/// Prepare the latest Ralph loop through the server-side runner API.
-pub async fn run_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    if let Some(draft) = active_unapplied_rebuild_draft(&repo_root)? {
-        chat.push_presentation_markdown("bcode.ralph", format!(
-            "Ralph rebuild draft is active\n* Draft: {}\n* Status: {}\n* Target loop: {}\n* Next: View/Revise/Approve/Apply the rebuild draft before preparing another autonomous run. This prevents running against stale loop context.",
-            draft.draft_id, draft.status, draft.loop_name
-        ));
-        chat.app.set_status(
-            "active rebuild draft must be applied or canceled before running".to_owned(),
-        );
-        return Ok(());
-    }
-    let response = services
-        .client
-        .run_ralph_loop(RalphRunRequest {
-            repo_root,
-            loop_state_dir: None,
-            max_iterations: None,
-            no_progress_limit: None,
-            require_approval: true,
-        })
-        .await?;
-    chat.push_presentation_markdown("bcode.ralph", format!(
-        "Ralph run prepared\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}\n* Next: /ralph approve",
-        response.run.run_id,
-        response.run.status,
-        display_from_current_dir(&response.run.state_dir),
-        response.run.session_id.as_deref().unwrap_or("<none>")
-    ));
-    chat.app
-        .set_status("Ralph run prepared; approve to start".to_owned());
-    Ok(())
-}
-
-/// Approve and start the latest prepared Ralph run through the server-side runner API.
-pub async fn approve_run(
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    let response = services
-        .client
-        .approve_ralph_run(RalphApproveRequest {
-            repo_root,
-            loop_state_dir: None,
-            run_id: None,
-        })
-        .await?;
-    chat.push_presentation_markdown(
-        "bcode.ralph",
-        format!(
-            "Ralph run approved\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}",
-            response.run.run_id,
-            response.run.status,
-            display_from_current_dir(&response.run.state_dir),
-            response.run.session_id.as_deref().unwrap_or("<none>")
-        ),
-    );
-    chat.app.set_status("Ralph run approved".to_owned());
-    Ok(())
-}
-
-fn format_run_detail(run: &RalphRunSummary) -> String {
-    let stop_reason = run
-        .stop_reason
-        .as_deref()
-        .map_or_else(String::new, |reason| format!(" ({reason})"));
-    let error = run
-        .error_message
-        .as_deref()
-        .map_or_else(String::new, |message| {
-            format!(
-                "\n  Error: {}\n  Recovery: {}",
-                compact_failure_message(message),
-                recovery_hint(run.stop_reason.as_deref(), Some(message))
-            )
-        });
-    format!(
-        "* {} — {}{}{}\n  Session: {}",
-        run.run_id,
-        run.status,
-        stop_reason,
-        error,
-        run.session_id.as_deref().unwrap_or("<none>")
-    )
-}
-
-fn compact_failure_message(message: &str) -> String {
-    const MAX_LEN: usize = 240;
-    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single_line.len() <= MAX_LEN {
-        single_line
-    } else {
-        format!("{}…", &single_line[..MAX_LEN])
-    }
-}
-
-fn recovery_hint(stop_reason: Option<&str>, error_message: Option<&str>) -> &'static str {
-    let reason = stop_reason.unwrap_or_default().to_ascii_lowercase();
-    let message = error_message.unwrap_or_default().to_ascii_lowercase();
-    if reason.contains("daemon restart") || message.contains("daemon restart") {
-        "use Resume safely; if resume is unavailable, audit/replan before retrying"
-    } else if message.contains("rate") || message.contains("429") {
-        "wait and retry, or switch provider/model if the limit persists"
-    } else if message.contains("context")
-        && (message.contains("large") || message.contains("length"))
-    {
-        "compact/replan context, then retry the run"
-    } else if message.contains("permission") || message.contains("denied") {
-        "grant/approve the required permission, then resume or retry"
-    } else if reason.contains("model_turn_failed") {
-        "open Iterations for turn details, then Retry/Resume or Audit/Replan"
-    } else {
-        "open Iterations for details; retry only after the cause is understood"
-    }
-}
-
-/// List recent Ralph runs for the current repository.
-pub async fn list_runs(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    let response = services
-        .client
-        .list_ralph_runs(RalphListRunsRequest {
-            repo_root,
-            loop_state_dir: None,
-        })
-        .await?;
-    let Some(summary) = response.loop_summary else {
-        chat.app
-            .set_status("no Ralph loops for current repository".to_owned());
-        return Ok(());
-    };
-    let runs = if response.runs.is_empty() {
-        "* <none>".to_owned()
-    } else {
-        response
-            .runs
-            .iter()
-            .map(format_run_detail)
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    chat.push_presentation_markdown(
-        "bcode.ralph",
-        format!("Ralph runs\n* Loop: {}\n{}", summary.loop_name, runs),
-    );
-    chat.app.set_status("Ralph runs shown".to_owned());
-    Ok(())
-}
-
-/// List iterations for the latest Ralph run in the current repository.
-pub async fn list_iterations(
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    let response = services
-        .client
-        .list_ralph_iterations(RalphListIterationsRequest {
-            repo_root,
-            loop_state_dir: None,
-            run_id: None,
-        })
-        .await?;
-    let Some(summary) = response.loop_summary else {
-        chat.app
-            .set_status("no Ralph loops for current repository".to_owned());
-        return Ok(());
-    };
-    let run_label = response
-        .run
-        .as_ref()
-        .map_or_else(|| "<none>".to_owned(), |run| run.run_id.clone());
-    let iterations = if response.iterations.is_empty() {
-        "* <none>".to_owned()
-    } else {
-        response
-            .iterations
-            .iter()
-            .map(|iteration| {
-                let stop_reason = iteration
-                    .stop_reason
-                    .as_deref()
-                    .map_or_else(String::new, |reason| format!(" ({reason})"));
-                let error =
-                    iteration
-                        .error_message
-                        .as_deref()
-                        .map_or_else(String::new, |message| {
-                            format!(
-                                "\n  Error: {}\n  Recovery: {}",
-                                compact_failure_message(message),
-                                recovery_hint(iteration.stop_reason.as_deref(), Some(message))
-                            )
-                        });
-                format!(
-                    "* #{} — {}{}{}",
-                    iteration.iteration_number, iteration.status, stop_reason, error
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let validations = if response.validations.is_empty() {
-        "* <none>".to_owned()
-    } else {
-        response
-            .validations
-            .iter()
-            .map(|validation| {
-                format!(
-                    "* {} — {}{}",
-                    validation.command,
-                    validation.status,
-                    validation
-                        .exit_code
-                        .map_or_else(String::new, |code| format!(" (exit {code})"))
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    chat.push_presentation_markdown(
-        "bcode.ralph",
-        format!(
-            "Ralph iterations\n* Loop: {}\n* Run: {}\nIterations:\n{}\nValidations:\n{}",
-            summary.loop_name, run_label, iterations, validations
-        ),
-    );
-    chat.app.set_status("Ralph iterations shown".to_owned());
-    Ok(())
-}
-
-/// Prepare an approval-gated resume run for the latest interrupted Ralph run.
-pub async fn resume_run(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    let response = services
-        .client
-        .resume_ralph_run(RalphResumeRequest {
-            repo_root,
-            loop_state_dir: None,
-            interrupted_run_id: None,
-        })
-        .await?;
-    chat.push_presentation_markdown("bcode.ralph", format!(
-        "Ralph resume prepared\n* Interrupted run: {}\n* New run: {}\n* Status: {}\n* Next: approve before autonomous execution continues",
-        response.interrupted_run.run_id,
-        response.resumed_run.run_id,
-        response.resumed_run.status
-    ));
-    chat.app
-        .set_status("Ralph resume prepared; approval required".to_owned());
-    Ok(())
-}
-
-/// Request cancellation for the active Ralph loop run.
-pub async fn stop_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    let response = services
-        .client
-        .cancel_ralph_loop(RalphCancelRequest {
-            repo_root,
-            run_id: None,
-            loop_state_dir: None,
-        })
-        .await?;
-    chat.push_presentation_markdown(
-        "bcode.ralph",
-        format!(
-            "Ralph stop requested\n* Run: {}\n* Status: {}\n* Cancel requested: {}",
-            response.run.run_id, response.run.status, response.cancel_requested
-        ),
-    );
-    chat.app.set_status("Ralph stop requested".to_owned());
-    Ok(())
-}
-
-fn format_status_note(
-    summary: &RalphStatusSummary,
-    active_run: Option<&RalphRunSummary>,
-    interrupted_run_count: usize,
-) -> String {
-    let run_status = active_run.map_or_else(
-        || "none".to_owned(),
-        |run| {
-            format!(
-                "{} ({}){}{}{}{}",
-                run.run_id,
-                run.status,
-                run.runtime_work_id
-                    .as_deref()
-                    .map_or_else(String::new, |work_id| format!(", work: {work_id}")),
-                run.stop_reason
-                    .as_deref()
-                    .map_or_else(String::new, |reason| format!(", stop: {reason}")),
-                run.error_message
-                    .as_deref()
-                    .map_or_else(String::new, |message| {
-                        format!(
-                            ", error: {}, recovery: {}",
-                            compact_failure_message(message),
-                            recovery_hint(run.stop_reason.as_deref(), Some(message))
-                        )
-                    }),
-                if run.cancel_requested {
-                    ", cancel requested"
-                } else {
-                    ""
-                }
-            )
-        },
-    );
-    let validation_commands = if summary.validation_commands.is_empty() {
-        "<none>".to_owned()
-    } else {
-        summary.validation_commands.join("; ")
-    };
-    format!(
-        "Ralph loop status\n* Loop: {}\n* Status: {}\n* Active run: {}\n* Interrupted runs: {}\n* Iterations: {}\n* Checklist: {} checked, {} unchecked\n* Validation: {}\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
-        summary.loop_name,
-        summary.status,
-        run_status,
-        interrupted_run_count,
-        summary.iteration_count,
-        summary.checked_count,
-        summary.unchecked_count,
-        validation_commands,
-        summary.next_action,
-        display_from_current_dir(&summary.progress_doc_path),
-        display_from_current_dir(&summary.state_dir),
-        summary.work_area_path.as_ref().map_or_else(
-            || "<none>".to_owned(),
-            |path| display_from_current_dir(path).to_string()
-        ),
-        summary.session_id.as_deref().unwrap_or("<none>")
-    )
-}
-
-/// Build and show a Ralph orchestration prompt for the current repository.
 pub fn show_prompt(
     chat: &mut ActiveChat,
     kind: ralph_state::RalphPromptKind,
@@ -1811,6 +881,130 @@ fn current_repo_root(chat: &ActiveChat) -> Result<std::path::PathBuf, TuiError> 
         .map_err(TuiError::Io)
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn format_run_detail(run: &RalphRunSummary) -> String {
+    let stop_reason = run
+        .stop_reason
+        .as_deref()
+        .map_or_else(String::new, |reason| format!(" ({reason})"));
+    let error = run
+        .error_message
+        .as_deref()
+        .map_or_else(String::new, |message| {
+            format!(
+                "\n  Error: {}\n  Recovery: {}",
+                compact_failure_message(message),
+                recovery_hint(run.stop_reason.as_deref(), Some(message))
+            )
+        });
+    format!(
+        "* {} — {}{}{}\n  Session: {}",
+        run.run_id,
+        run.status,
+        stop_reason,
+        error,
+        run.session_id.as_deref().unwrap_or("<none>")
+    )
+}
+
+fn compact_failure_message(message: &str) -> String {
+    const MAX_LEN: usize = 240;
+    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.len() <= MAX_LEN {
+        single_line
+    } else {
+        format!("{}…", &single_line[..MAX_LEN])
+    }
+}
+
+fn recovery_hint(stop_reason: Option<&str>, error_message: Option<&str>) -> &'static str {
+    let reason = stop_reason.unwrap_or_default().to_ascii_lowercase();
+    let message = error_message.unwrap_or_default().to_ascii_lowercase();
+    if reason.contains("daemon restart") || message.contains("daemon restart") {
+        "use Resume safely; if resume is unavailable, audit/replan before retrying"
+    } else if message.contains("rate") || message.contains("429") {
+        "wait and retry, or switch provider/model if the limit persists"
+    } else if message.contains("context")
+        && (message.contains("large") || message.contains("length"))
+    {
+        "compact/replan context, then retry the run"
+    } else if message.contains("permission") || message.contains("denied") {
+        "grant/approve the required permission, then resume or retry"
+    } else if reason.contains("model_turn_failed") {
+        "open Iterations for turn details, then Retry/Resume or Audit/Replan"
+    } else {
+        "open Iterations for details; retry only after the cause is understood"
+    }
+}
+
+fn format_status_note(
+    summary: &RalphStatusSummary,
+    active_run: Option<&RalphRunSummary>,
+    interrupted_run_count: usize,
+) -> String {
+    let run_status = active_run.map_or_else(
+        || "none".to_owned(),
+        |run| {
+            format!(
+                "{} ({}){}{}{}{}",
+                run.run_id,
+                run.status,
+                run.runtime_work_id
+                    .as_deref()
+                    .map_or_else(String::new, |work_id| format!(", work: {work_id}")),
+                run.stop_reason
+                    .as_deref()
+                    .map_or_else(String::new, |reason| format!(", stop: {reason}")),
+                run.error_message
+                    .as_deref()
+                    .map_or_else(String::new, |message| {
+                        format!(
+                            ", error: {}, recovery: {}",
+                            compact_failure_message(message),
+                            recovery_hint(run.stop_reason.as_deref(), Some(message))
+                        )
+                    }),
+                if run.cancel_requested {
+                    ", cancel requested"
+                } else {
+                    ""
+                }
+            )
+        },
+    );
+    let validation_commands = if summary.validation_commands.is_empty() {
+        "<none>".to_owned()
+    } else {
+        summary.validation_commands.join("; ")
+    };
+    format!(
+        "Ralph loop status\n* Loop: {}\n* Status: {}\n* Active run: {}\n* Interrupted runs: {}\n* Iterations: {}\n* Checklist: {} checked, {} unchecked\n* Validation: {}\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
+        summary.loop_name,
+        summary.status,
+        run_status,
+        interrupted_run_count,
+        summary.iteration_count,
+        summary.checked_count,
+        summary.unchecked_count,
+        validation_commands,
+        summary.next_action,
+        display_from_current_dir(&summary.progress_doc_path),
+        display_from_current_dir(&summary.state_dir),
+        summary.work_area_path.as_ref().map_or_else(
+            || "<none>".to_owned(),
+            |path| display_from_current_dir(path).to_string()
+        ),
+        summary.session_id.as_deref().unwrap_or("<none>")
+    )
+}
+
 fn active_unapplied_rebuild_draft(
     repo_root: &std::path::Path,
 ) -> Result<Option<ralph_state::RalphSetupDraft>, TuiError> {
@@ -1823,183 +1017,4 @@ fn active_unapplied_rebuild_draft(
                     | ralph_state::RalphSetupDraftStatus::ConvertedToLoop
             )
         }))
-}
-
-/// Start the Ralph loop setup flow.
-pub async fn start_loop<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let default_name = chat
-        .app
-        .session_title()
-        .map_or_else(|| "new-ralph-loop".to_owned(), ToString::to_string);
-    let repo_root = chat
-        .app
-        .working_directory()
-        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
-    let default_validation_commands = ralph_state::default_validation_commands(&repo_root);
-    let mut dialog =
-        ralph_start_dialog::RalphStartDialog::new(&default_name, &default_validation_commands);
-    loop {
-        io.terminal.resize(helpers::terminal_area()?);
-        io.terminal.draw(|frame| {
-            ralph_start_dialog_render::render_dialog(&mut dialog, frame, services.theme);
-        })?;
-        let Some(event) = io.input.recv().await? else {
-            continue;
-        };
-        match event {
-            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
-            Event::Paste(text) => {
-                let _ = TextInputControl::new(&ralph_start_dialog::input_policy())
-                    .handle_paste(dialog.focused_input_mut(), &text);
-            }
-            Event::Key(stroke) => match stroke.key {
-                KeyCode::Escape => return Err(TuiError::Canceled),
-                KeyCode::Tab => dialog.focus_next(),
-                KeyCode::Enter => {
-                    if confirm_start_loop(&mut dialog, services, chat).await? {
-                        return Ok(());
-                    }
-                }
-                _ => handle_loop_name_key(&mut dialog, services.keymap, stroke),
-            },
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
-            Event::Mouse(mouse) => handle_loop_name_mouse(&mut dialog, mouse),
-        }
-    }
-}
-
-async fn confirm_start_loop(
-    dialog: &mut ralph_start_dialog::RalphStartDialog,
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<bool, TuiError> {
-    let loop_name = dialog.loop_name_text();
-    if loop_name.is_empty() {
-        dialog.set_status("Ralph loop name is required");
-        return Ok(false);
-    }
-    let repo_root = chat
-        .app
-        .working_directory()
-        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
-    let state =
-        ralph_state::create_initial_loop_state(&loop_name, &repo_root, chat.app.session_title())?;
-    let validation_commands = dialog.validation_command_texts();
-    ralph_state::set_validation_commands(&state.state_dir, &validation_commands, "setup")?;
-    if let Some(session_id) = chat.app.session_id() {
-        let history = services
-            .client
-            .session_history_page(
-                session_id,
-                SessionHistoryQuery {
-                    cursor: None,
-                    limit: 64,
-                    direction: SessionHistoryDirection::Backward,
-                },
-            )
-            .await?;
-        ralph_state::write_context_pack(&state, chat.app.session_title(), &history.events)?;
-        ralph_state::generate_progress_doc_from_context(&state, &loop_name, &repo_root)?;
-    }
-    let work_area = services
-        .client
-        .create_worktree(WorktreeCreateRequest {
-            name: format!("ralph-{loop_name}"),
-            cwd: Some(repo_root),
-            path: dialog.work_area_path_text().map(PathBuf::from),
-            branch: None,
-            new_branch: dialog.branch_text(),
-            base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
-            detach: false,
-            force: false,
-            attach_session_id: None,
-            new_session: true,
-            no_setup: false,
-        })
-        .await?;
-    let work_area_session_id = work_area
-        .session
-        .as_ref()
-        .map(|session| session.id.to_string());
-    ralph_state::record_work_area(
-        &state,
-        &work_area.path,
-        work_area.branch.as_deref(),
-        work_area_session_id.as_deref(),
-    )?;
-    if let Some(session) = &work_area.session {
-        let _event = services
-            .client
-            .record_ralph_lifecycle(RalphLifecycleRequest {
-                session_id: session.id,
-                loop_name: loop_name.clone(),
-                state_dir: state.state_dir.clone(),
-                kind: "work_area_created".to_owned(),
-                message: "Created Ralph isolated work area".to_owned(),
-                occurred_at_ms: now_ms(),
-            })
-            .await?;
-    }
-    let validation_summary = if validation_commands.is_empty() {
-        "<none>".to_owned()
-    } else {
-        validation_commands.join("; ")
-    };
-    chat.push_presentation_markdown("bcode.ralph", format!(
-        "Ralph loop created\n* Loop: {loop_name}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Validation: {}\n* Next: review docs if desired, then prepare a run and approve/start it",
-        display_from_current_dir(&state.charter_doc_path),
-        display_from_current_dir(&state.progress_doc_path),
-        display_from_current_dir(&state.state_dir),
-        display_from_current_dir(&work_area.path),
-        work_area_session_id.as_deref().unwrap_or("<none>"),
-        validation_summary
-    ));
-    chat.app.set_status("Ralph loop created".to_owned());
-    Ok(true)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
-fn handle_loop_name_key(
-    dialog: &mut ralph_start_dialog::RalphStartDialog,
-    keymap: &BmuxKeyMap,
-    stroke: KeyStroke,
-) {
-    if let Some(motion) = keymap.editor_selection_motion_for_key(stroke) {
-        dialog
-            .focused_input_mut()
-            .buffer_mut()
-            .move_cursor_with_selection(motion, SelectionMode::Extend);
-        dialog
-            .focused_input_mut()
-            .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
-        return;
-    }
-    if let Some(command) = keymap.editor_command_for_key(stroke) {
-        dialog
-            .focused_input_mut()
-            .buffer_mut()
-            .apply_command(command);
-        dialog
-            .focused_input_mut()
-            .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
-        return;
-    }
-    let _ = TextInputControl::new(&ralph_start_dialog::input_policy())
-        .handle_key(dialog.focused_input_mut(), stroke);
-}
-
-fn handle_loop_name_mouse(dialog: &mut ralph_start_dialog::RalphStartDialog, mouse: MouseEvent) {
-    let _ = TextInputControl::new(&ralph_start_dialog::input_policy())
-        .handle_mouse(dialog.focused_input_mut(), mouse);
 }

@@ -242,11 +242,11 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         return Ok(());
     }
     if cli.onboard {
-        handle_onboard_command(&OnboardOptions::default())?;
+        handle_onboard_command(&OnboardOptions::default()).await?;
         return Ok(());
     }
     if cli.command.is_none() && should_auto_start_onboarding()? {
-        handle_onboard_command(&OnboardOptions::default())?;
+        handle_onboard_command(&OnboardOptions::default()).await?;
         return Ok(());
     }
     match cli.command.unwrap_or_default() {
@@ -258,22 +258,25 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             skip_launch,
             control_center,
             secure_import_env,
-        } => handle_onboard_flags(
-            reset,
-            onboard_output_mode(dry_run, non_interactive),
-            provider,
-            if skip_launch {
-                OnboardLaunchMode::SkipLaunch
-            } else {
-                OnboardLaunchMode::LaunchWhenReady
-            },
-            if control_center {
-                OnboardExperienceMode::ControlCenter
-            } else {
-                OnboardExperienceMode::FirstRun
-            },
-            secure_import_env,
-        )?,
+        } => {
+            handle_onboard_flags(
+                reset,
+                onboard_output_mode(dry_run, non_interactive),
+                provider,
+                if skip_launch {
+                    OnboardLaunchMode::SkipLaunch
+                } else {
+                    OnboardLaunchMode::LaunchWhenReady
+                },
+                if control_center {
+                    OnboardExperienceMode::ControlCenter
+                } else {
+                    OnboardExperienceMode::FirstRun
+                },
+                secure_import_env,
+            )
+            .await?
+        }
         Commands::ArtifactId => println!("{}", bcode_ipc::ArtifactId::current()),
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
@@ -1012,7 +1015,7 @@ async fn handle_web_command(
     result
 }
 
-fn handle_onboard_flags(
+async fn handle_onboard_flags(
     reset: bool,
     output_mode: OnboardOutputMode,
     provider: Option<String>,
@@ -1028,6 +1031,7 @@ fn handle_onboard_flags(
         experience_mode,
         secure_import_env,
     })
+    .await
 }
 
 const fn onboard_output_mode(dry_run: bool, non_interactive: bool) -> OnboardOutputMode {
@@ -1134,7 +1138,7 @@ fn import_onboarding_env_credential(
     Ok(())
 }
 
-fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
+async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
     let store = bcode_settings::SettingsStore::default();
     if options.reset {
         store.reset_database()?;
@@ -1210,7 +1214,7 @@ fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
         }
         return Ok(());
     }
-    bcode_tui::run_onboarding()?;
+    bcode_tui::run_onboarding().await?;
     Ok(())
 }
 

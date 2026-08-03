@@ -1,119 +1,13 @@
-//! Skill picker and skill action flow for the TUI.
+//! Root-owned skill picker and action semantics.
 
-use std::io::Write;
+use bmux_keyboard::{KeyCode, KeyStroke};
+
+use bcode_skill_models::SkillId;
 
 use super::effects::{SkillActionKind, SkillActionRequest, TuiEffect};
-use super::runtime_context::{TuiIo, TuiServices};
-use bcode_client::BcodeClient;
-use bcode_skill_models::SkillId;
-use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::{Event, FocusEvent};
-use bmux_tui::geometry::Rect;
-
-use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
-use super::picker_mouse::picker_row_from_mouse;
-use super::{
-    TuiError, session_flow::ActiveChat, skill_picker, skill_picker_render, text_input_flow,
-};
-
-#[allow(clippy::too_many_lines)]
-/// Pick and perform a skill action for the active session.
-pub async fn pick_skill_for_session<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let skills = match services.passive_client.list_skills().await {
-        Ok(skills) => skills,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "skills unavailable", &error);
-            return Ok(());
-        }
-    };
-    if skills.skills.is_empty() {
-        chat.app.set_status("no skills available".to_owned());
-        chat.push_presentation_note(
-            "bcode.host",
-            "No skills are available.".to_owned(),
-            bcode_command::CommandTextFormat::PlainText,
-        );
-        return Ok(());
-    }
-    let mut picker = skill_picker::SkillPickerApp::new(skills.skills);
-    loop {
-        io.terminal.resize(helpers::terminal_area()?);
-        io.terminal.draw(|frame| {
-            skill_picker_render::render_skill_picker(&mut picker, frame, services.theme);
-        })?;
-        let Some(event) = io.input.recv().await? else {
-            continue;
-        };
-        match event {
-            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
-            Event::Paste(text) => match picker.mode() {
-                skill_picker::SkillPickerMode::Filter => {
-                    let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
-                    picker.refresh_filter();
-                }
-                skill_picker::SkillPickerMode::Argument => {
-                    let _ = text_input_flow::handle_paste(picker.argument_mut(), &text);
-                }
-            },
-            Event::Key(stroke) => {
-                match handle_skill_picker_key(&mut picker, services.keymap, stroke) {
-                    skill_picker::SkillPickerAction::Continue => {}
-                    skill_picker::SkillPickerAction::Cancel => return Ok(()),
-                    skill_picker::SkillPickerAction::Help(skill_id) => {
-                        if let Err(error) =
-                            describe_skill(services.passive_client, chat, skill_id).await
-                        {
-                            helpers::report_client_error(
-                                &mut chat.app,
-                                "skill help failed",
-                                &error,
-                            );
-                        }
-                        return Ok(());
-                    }
-                    skill_picker::SkillPickerAction::Activate(skill_id) => {
-                        start_skill_action(
-                            chat,
-                            SkillActionKind::Activate,
-                            skill_id,
-                            String::new(),
-                        )?;
-                        return Ok(());
-                    }
-                    skill_picker::SkillPickerAction::Deactivate(skill_id) => {
-                        start_skill_action(
-                            chat,
-                            SkillActionKind::Deactivate,
-                            skill_id,
-                            String::new(),
-                        )?;
-                        return Ok(());
-                    }
-                    skill_picker::SkillPickerAction::Invoke {
-                        skill_id,
-                        arguments,
-                    } => {
-                        start_skill_action(chat, SkillActionKind::Invoke, skill_id, arguments)?;
-                        return Ok(());
-                    }
-                }
-            }
-            Event::Mouse(mouse) => {
-                if let Some(row) = picker_row_from_mouse(mouse)
-                    && picker.select_visible(row)
-                {
-                    picker.start_argument();
-                }
-            }
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
-        }
-    }
-}
+use super::session_flow::ActiveChat;
+use super::{TuiError, skill_picker, text_input_flow};
 
 pub fn handle_skill_picker_key(
     picker: &mut skill_picker::SkillPickerApp,
@@ -290,35 +184,6 @@ pub fn format_skill_manifest_markdown(manifest: &bcode_skill_models::SkillManife
         Some(description),
         &truncate_markdown_for_display(&manifest.instructions, 2_000),
     )
-}
-
-async fn describe_skill(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    skill_id: SkillId,
-) -> Result<(), TuiError> {
-    let manifest = match client.describe_skill(skill_id.clone()).await {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "skill details unavailable", &error);
-            return Ok(());
-        }
-    };
-    chat.push_presentation_note(
-        "bcode.host",
-        format_skill_manifest_markdown(&manifest),
-        bcode_command::CommandTextFormat::Markdown,
-    );
-    chat.app.set_status(format!("shown skill {skill_id}"));
-    Ok(())
-}
-
-pub fn start_invoke_skill_for_session(
-    chat: &mut ActiveChat,
-    skill_id: SkillId,
-    arguments: String,
-) -> Result<(), TuiError> {
-    start_skill_action(chat, SkillActionKind::Invoke, skill_id, arguments)
 }
 
 pub fn start_skill_action(

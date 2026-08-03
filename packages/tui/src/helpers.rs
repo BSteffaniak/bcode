@@ -1,17 +1,12 @@
 //! Shared helpers for TUI flows.
 
-use std::io::{self, Write};
+use std::io;
 
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::keyboard::TextKeymap;
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
-use bmux_tui::terminal::Terminal;
 use crossterm::terminal::size;
-
-use super::TuiError;
-use super::app::BmuxApp;
-use super::daemon_issue;
 
 /// Apply a key stroke to a text buffer using the default text-input bindings.
 ///
@@ -46,24 +41,6 @@ const fn shifted_text_character(stroke: KeyStroke) -> Option<char> {
         KeyCode::Char(ch) => Some(ch),
         _ => None,
     }
-}
-
-/// Report a client error in status and transcript.
-pub fn report_client_error(app: &mut BmuxApp, label: &str, error: &TuiError) {
-    daemon_issue::report_tui_issue(app, label, error);
-}
-
-/// Report a recoverable daemon/client issue in status and transcript.
-pub fn report_client_issue(app: &mut BmuxApp, label: &str, error: &bcode_client::ClientError) {
-    daemon_issue::report_client_issue(app, label, error);
-}
-
-/// Resize a terminal from current crossterm dimensions.
-pub fn resize_from_terminal<W: Write>(terminal: &mut Terminal<&mut W>) -> io::Result<bool> {
-    let area = terminal_area()?;
-    let resized = terminal.area() != area;
-    terminal.resize(area);
-    Ok(resized)
 }
 
 /// Return the current terminal area.

@@ -1,6 +1,5 @@
 //! Generic UI invalidation primitives.
 
-use std::collections::BTreeMap;
 use std::time::Instant;
 
 /// Opaque key identifying a coalescable UI invalidation source.
@@ -38,42 +37,6 @@ impl InvalidationRequest {
     }
 }
 
-/// Coalescing queue of future invalidation requests.
-#[derive(Debug, Default, Clone)]
-pub struct InvalidationQueue {
-    pending: BTreeMap<InvalidationKey, Instant>,
-}
-
-impl InvalidationQueue {
-    /// Replace all pending requests with `requests`.
-    pub fn replace(&mut self, requests: impl IntoIterator<Item = InvalidationRequest>) {
-        self.pending.clear();
-        for request in requests {
-            self.pending.insert(request.key, request.at);
-        }
-    }
-
-    /// Return the next time any invalidation is due.
-    #[must_use]
-    pub fn next_at(&self) -> Option<Instant> {
-        self.pending.values().min().copied()
-    }
-
-    /// Remove and return all invalidation keys due at `now`.
-    pub fn take_due(&mut self, now: Instant) -> Vec<InvalidationKey> {
-        let due = self
-            .pending
-            .iter()
-            .filter(|(_, at)| **at <= now)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        for key in &due {
-            self.pending.remove(key);
-        }
-        due
-    }
-}
-
 /// Rendering invalidation severity and semantic damage level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UiInvalidation {
@@ -91,6 +54,7 @@ pub enum UiInvalidation {
 
 impl UiInvalidation {
     /// Return whether a terminal draw is needed.
+    #[cfg(test)]
     #[must_use]
     pub const fn needs_render(self) -> bool {
         !matches!(self, Self::None)

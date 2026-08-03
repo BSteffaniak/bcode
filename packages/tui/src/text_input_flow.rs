@@ -1,7 +1,7 @@
 //! Shared text-input helpers for picker and modal flows.
 
 use bmux_keyboard::KeyStroke;
-use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
+use bmux_text_edit::SelectionMode;
 use bmux_tui_components::text_input::{
     TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
 };
@@ -20,12 +20,12 @@ pub fn empty_state() -> TextInputState {
     TextInputState::default()
 }
 
-/// Create text-input state from text, optionally selecting all text initially.
+/// Create text-input state initialized with text and optional select-all state.
 #[must_use]
-pub fn state_with_text(text: &str, select_all: bool) -> TextInputState {
-    let mut buffer = TextEditBuffer::from_text(text);
+pub fn state_with_text(text: impl Into<String>, select_all: bool) -> TextInputState {
+    let mut buffer = bmux_text_edit::TextEditBuffer::from_text(text);
     if select_all {
-        buffer.move_cursor_with_selection(TextMotion::Start, SelectionMode::Extend);
+        buffer.select_all();
     }
     TextInputState::new(buffer)
 }

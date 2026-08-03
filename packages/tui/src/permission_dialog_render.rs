@@ -62,6 +62,7 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
 
 /// Return the permission dialog panel area for a terminal area.
 #[must_use]
+#[cfg(test)]
 pub fn dialog_area(area: Rect) -> Rect {
     modal_frame().panel_area(area)
 }

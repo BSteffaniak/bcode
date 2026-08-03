@@ -357,6 +357,7 @@ impl InteractiveSurfaceState {
     }
 
     /// Translate a mouse event from a clipped destination into full-surface coordinates.
+    #[cfg(test)]
     #[must_use]
     pub fn translate_clipped_event(
         event: Event,
@@ -379,13 +380,6 @@ impl InteractiveSurfaceState {
             );
         }
         Event::Mouse(mouse)
-    }
-
-    /// Return whether a close resolution is awaiting host confirmation.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn has_pending_resolution_for_test(&self) -> bool {
-        self.pending_resolution.is_some()
     }
 
     /// Clear a pending resolution so the user can retry after host delivery fails.

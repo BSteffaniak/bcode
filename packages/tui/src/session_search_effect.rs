@@ -532,60 +532,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn picker_loop_replacement_dispatches_only_latest_generation() {
-        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
-        let first_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let latest_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut effect = SessionSearchEffect::default();
-        let mut picker = super::super::session_picker::SessionPickerApp::new(Vec::new());
-
-        let dispatches = std::sync::Arc::clone(&first_dispatches);
-        effect.replace_with(
-            move || {
-                dispatches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::future::ready(Some((completion(0).response, Vec::new())))
-            },
-            completion_tx.clone(),
-        );
-        tokio::time::sleep(SESSION_SEARCH_DEBOUNCE / 2).await;
-        let dispatches = std::sync::Arc::clone(&latest_dispatches);
-        let latest_generation = effect.replace_with(
-            move || {
-                dispatches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::future::ready(Some((completion(0).response, Vec::new())))
-            },
-            completion_tx,
-        );
-
-        let accepted = tokio::time::timeout(SESSION_SEARCH_DEBOUNCE * 2, async {
-            loop {
-                if let Some(completion) = completion_rx.recv().await
-                    && let Some(accepted) = effect.accept(completion)
-                {
-                    break accepted;
-                }
-            }
-        })
-        .await
-        .expect("latest picker completion");
-        assert_eq!(accepted.generation, latest_generation);
-        picker.set_search_results(&accepted.response, accepted.hydrated_hits);
-        assert_eq!(
-            picker.mode(),
-            super::super::session_picker::SessionPickerMode::TranscriptSearch
-        );
-        assert_eq!(
-            first_dispatches.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
-        assert_eq!(
-            latest_dispatches.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-        assert!(completion_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
     async fn rapid_replacement_dispatches_only_latest_query_after_debounce() {
         let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
         let first_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

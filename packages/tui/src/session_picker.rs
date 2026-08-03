@@ -144,11 +144,6 @@ impl SessionPickerApp {
         self.last_import.as_ref()
     }
 
-    /// Clear the most recent external import warning panel.
-    pub fn clear_last_import(&mut self) {
-        self.last_import = None;
-    }
-
     /// Replace sessions.
     pub fn replace_sessions(&mut self, sessions: Vec<SessionSummary>) {
         self.sessions = sessions;

@@ -4,47 +4,34 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-use bcode_client::{BcodeClient, ClientError, DaemonAvailability};
+use bcode_client::{BcodeClient, ClientError};
 use bcode_command::CommandAction;
 use bcode_config::TuiConfig;
 use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
-use bcode_plugin::PluginRuntimeHost;
 use bcode_session_models::SessionEventKind;
-use bcode_session_view::execute_session_view_action;
-use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
 use bmux_keyboard::KeyStroke;
-use bmux_tui::event::{Event, FocusEvent, MouseEventKind};
+use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
 
 use super::activity::ActivityState;
 use super::artifact_stream::{ActiveArtifactFetchCompletion, ArtifactStreamCoordinator};
-use super::clipboard_image;
 use super::command_palette::BmuxCommandPalette;
 use super::daemon_issue;
-use super::effects::{DaemonObservation, TuiEffect, TuiEffectResult, TuiEffectRunner};
-use super::helpers;
+use super::effects::{DaemonObservation, TuiEffect, TuiEffectResult};
 use super::interactive_surface::{
     InteractiveSurfaceQueue, InteractiveSurfaceRequest, InteractiveSurfaceState,
 };
-use super::invalidation::InvalidationQueue;
-use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
+use super::keymap::BmuxKeyMap;
 use super::permission_dialog::PermissionDialogState;
-use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::{self, ActiveChat};
-use super::terminal_events::TuiInput;
 use super::{
-    TuiError, command_palette_render, composer_flow, history_flow, input, input::KeyRequest,
-    mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
-    slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
-    timeline_dialog_render, timeline_flow,
+    TuiError, command_palette_render, history_flow, permission_dialog_render, render,
+    slash_palette, slash_palette_render, thinking_dialog_render, timeline_dialog_render,
 };
 
-const DEFAULT_TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
-const BCODE_EVENT_DRAIN_BUDGET: usize = 32;
-const ARTIFACT_COMPLETION_DRAIN_BUDGET: usize = 8;
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 #[derive(Debug, Clone)]
 pub struct DraftAutosave {
@@ -111,10 +98,6 @@ impl DraftAutosave {
         Some((self.scope(chat), chat.app.composer().text().to_owned()))
     }
 
-    const fn clear_scope_request(scope: ComposerDraftScope) -> (ComposerDraftScope, String) {
-        (scope, String::new())
-    }
-
     pub(super) fn mark_dirty_now(&mut self) {
         self.dirty = true;
         self.save_at = Some(Instant::now());
@@ -147,6 +130,8 @@ pub enum TimelineDialogRootOutcome {
 struct RootPluginSurface {
     plugin_id: String,
     surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+    invalidation: bmux_tui_runtime::InvalidationSignal,
+    pending_session_navigation: Option<bcode_session_models::SessionId>,
 }
 
 struct RootForkPromptPicker {
@@ -179,6 +164,15 @@ pub enum SessionForkRootOutcome {
     },
 }
 
+pub enum SessionPickerRootOutcome {
+    Unhandled,
+    Handled,
+    Canceled,
+    Create,
+    Select(bcode_session_models::SessionId),
+    SearchHit(bcode_session_search::HydratedSessionSearchHit),
+}
+
 pub enum WorktreeCreateDialogRootOutcome {
     Unhandled,
     Handled,
@@ -193,7 +187,8 @@ pub enum WorktreeCreateDialogRootOutcome {
 pub struct ChatLoopState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
-    effects: TuiEffectRunner,
+    foreground_client: BcodeClient,
+    passive_client: BcodeClient,
     daemon_connection: DaemonConnectionMonitor,
     pub(super) permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
@@ -205,10 +200,11 @@ pub struct ChatLoopState {
     model_picker: Option<RootModelPicker>,
     skill_picker: Option<super::skill_picker::SkillPickerApp>,
     worktree_create_dialog: Option<super::wt_create_dialog::WorktreeCreateDialog>,
+    ralph_start_dialog: Option<super::ralph_start_dialog::RalphStartDialog>,
     interactive_surface: Option<InteractiveSurfaceState>,
     interactive_surface_area: Option<Rect>,
+    session_picker: Option<super::session_picker::SessionPickerApp>,
     interactive_surface_queue: InteractiveSurfaceQueue,
-    plugin_runtime: Option<PluginRuntimeHost>,
     artifact_stream: ArtifactStreamCoordinator,
     markdown_projection: super::markdown_projection_coordinator::MarkdownProjectionCoordinator,
     markdown_presentation: Option<super::markdown_image::MarkdownPresentationRuntime>,
@@ -235,7 +231,8 @@ impl ChatLoopState {
         Self {
             palette: None,
             slash_palette: None,
-            effects: TuiEffectRunner::new(foreground_client, passive_client),
+            foreground_client: foreground_client.clone(),
+            passive_client: passive_client.clone(),
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             thinking_dialog: None,
@@ -247,10 +244,11 @@ impl ChatLoopState {
             model_picker: None,
             skill_picker: None,
             worktree_create_dialog: None,
+            ralph_start_dialog: None,
             interactive_surface: None,
             interactive_surface_area: None,
+            session_picker: None,
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
-            plugin_runtime: None,
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
             markdown_projection:
                 super::markdown_projection_coordinator::MarkdownProjectionCoordinator::new(),
@@ -339,7 +337,19 @@ impl ChatLoopState {
             std::collections::VecDeque<TuiEffect>,
         >,
     ) {
-        self.effects.runtime_work(&mut chat.pending_effects, handle)
+        let (effects, notes) = chat.pending_effects.drain_runtime();
+        let commands = effects
+            .into_iter()
+            .map(|(schedule, effect)| {
+                effect.command(
+                    schedule,
+                    &self.foreground_client,
+                    &self.passive_client,
+                    handle.clone(),
+                )
+            })
+            .collect();
+        (commands, notes)
     }
 
     pub fn ordered_effect_command(
@@ -347,7 +357,12 @@ impl ChatLoopState {
         effect: TuiEffect,
         handle: &bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
     ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
-        self.effects.ordered_command(effect, handle)
+        effect.command(
+            super::effects::EffectSchedule::StartIfIdle,
+            &self.foreground_client,
+            &self.passive_client,
+            handle.clone(),
+        )
     }
 
     pub fn take_markdown_completion_receiver(
@@ -369,7 +384,7 @@ impl ChatLoopState {
     }
 
     pub fn foreground_client(&self) -> BcodeClient {
-        self.effects.foreground_client()
+        self.foreground_client.clone()
     }
 
     pub fn flush_telemetry_if_due(&mut self, now: Instant) {
@@ -398,7 +413,7 @@ impl ChatLoopState {
 
     pub fn open_command_palette(&mut self, chat: &mut ActiveChat) {
         self.palette = Some(BmuxCommandPalette::new());
-        self.replace_effect(TuiEffect::LoadCommandPalette);
+        chat.replace_effect(TuiEffect::LoadCommandPalette);
         chat.app
             .set_status("command palette: type to filter, enter to run, esc close".to_owned());
     }
@@ -522,6 +537,56 @@ impl ChatLoopState {
         true
     }
 
+    pub fn open_ralph_start_dialog(&mut self, chat: &mut ActiveChat) {
+        let default_name = chat
+            .app
+            .session_title()
+            .map_or_else(|| "new-ralph-loop".to_owned(), ToString::to_string);
+        let repo_root = chat.app.working_directory().map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        );
+        let validation_commands = bcode_ralph::default_validation_commands(&repo_root);
+        self.ralph_start_dialog = Some(super::ralph_start_dialog::RalphStartDialog::new(
+            &default_name,
+            &validation_commands,
+        ));
+        chat.app.set_status("configure Ralph loop".to_owned());
+    }
+
+    pub const fn has_ralph_start_dialog(&self) -> bool {
+        self.ralph_start_dialog.is_some()
+    }
+
+    pub fn handle_ralph_start_dialog_event(
+        &mut self,
+        event: &Event,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> Option<super::ralph_start_dialog::RalphStartDialogOutcome> {
+        let dialog = self.ralph_start_dialog.as_mut()?;
+        let outcome = dialog.handle_event(event, keymap);
+        if matches!(
+            outcome,
+            super::ralph_start_dialog::RalphStartDialogOutcome::Canceled
+        ) {
+            self.ralph_start_dialog = None;
+        }
+        Some(outcome)
+    }
+
+    pub const fn take_ralph_start_dialog(
+        &mut self,
+    ) -> Option<super::ralph_start_dialog::RalphStartDialog> {
+        self.ralph_start_dialog.take()
+    }
+
+    pub fn restore_ralph_start_dialog(
+        &mut self,
+        dialog: super::ralph_start_dialog::RalphStartDialog,
+    ) {
+        self.ralph_start_dialog = Some(dialog);
+    }
+
     pub const fn has_worktree_create_dialog(&self) -> bool {
         self.worktree_create_dialog.is_some()
     }
@@ -530,17 +595,104 @@ impl ChatLoopState {
         self.plugin_surface.is_some()
     }
 
+    pub fn queue_root_plugin_surface(
+        &mut self,
+        plugin_id: impl Into<String>,
+        surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+    ) {
+        let invalidation = bmux_tui_runtime::InvalidationSignal::new();
+        invalidation.request();
+        self.plugin_surface = Some(RootPluginSurface {
+            plugin_id: plugin_id.into(),
+            surface,
+            invalidation,
+            pending_session_navigation: None,
+        });
+    }
+
+    pub const fn suspend_root_plugin_surface_for_session(
+        &mut self,
+        session_id: bcode_session_models::SessionId,
+    ) -> bool {
+        let Some(surface) = self.plugin_surface.as_mut() else {
+            return false;
+        };
+        surface.pending_session_navigation = Some(session_id);
+        true
+    }
+
+    pub fn complete_root_plugin_session_navigation(
+        &mut self,
+        session_id: bcode_session_models::SessionId,
+        result: Result<(), String>,
+    ) -> bool {
+        let Some(surface) = self.plugin_surface.as_mut() else {
+            return false;
+        };
+        if surface.pending_session_navigation != Some(session_id) {
+            return false;
+        }
+        surface.pending_session_navigation = None;
+        surface
+            .surface
+            .session_navigation_finished(session_id, result);
+        surface.invalidation.request();
+        true
+    }
+
+    pub fn root_plugin_surface_is_suspended(&self) -> bool {
+        self.plugin_surface
+            .as_ref()
+            .is_some_and(|surface| surface.pending_session_navigation.is_some())
+    }
+
+    pub const fn root_plugin_surface_pending_session_navigation(
+        &self,
+    ) -> Option<bcode_session_models::SessionId> {
+        match self.plugin_surface.as_ref() {
+            Some(surface) => surface.pending_session_navigation,
+            None => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn active_root_plugin_surface_id(&self) -> Option<&'static str> {
+        self.plugin_surface
+            .as_ref()
+            .map(|surface| surface.surface.id())
+    }
+
     pub fn handle_root_plugin_surface_event(
         &mut self,
         event: &Event,
         client: &BcodeClient,
     ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
         let surface = self.plugin_surface.as_mut()?;
-        let host = super::plugin_surface_host::root_host(
-            bmux_tui_runtime::InvalidationSignal::new(),
-            client.clone(),
-        );
+        let host =
+            super::plugin_surface_host::root_host(surface.invalidation.clone(), client.clone());
         Some(surface.surface.handle_event(event, &host))
+    }
+
+    pub fn root_plugin_surface_invalidation(&self) -> Option<bmux_tui_runtime::InvalidationSignal> {
+        self.plugin_surface
+            .as_ref()
+            .map(|surface| surface.invalidation.clone())
+    }
+
+    pub fn poll_root_plugin_surface(
+        &mut self,
+        client: &BcodeClient,
+    ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
+        let surface = self.plugin_surface.as_mut()?;
+        let host =
+            super::plugin_surface_host::root_host(surface.invalidation.clone(), client.clone());
+        let invalidated = surface.invalidation.take();
+        let action = surface.surface.poll(&host);
+        if invalidated && matches!(action, bcode_plugin_sdk::tui::PluginTuiAction::None) {
+            Some(bcode_plugin_sdk::tui::PluginTuiAction::Redraw)
+        } else {
+            Some(action)
+        }
     }
 
     pub fn close_root_plugin_surface_with_outcome(
@@ -982,8 +1134,11 @@ impl ChatLoopState {
     pub fn prepare_runtime_work(
         &mut self,
         chat: &mut ActiveChat,
+        frame_area: Rect,
     ) -> super::invalidation::UiInvalidation {
         self.artifact_stream.start_due_fetches(Instant::now());
+        self.request_latest_markdown_projection(chat, frame_area.width);
+        record_artifact_stream_stats(self);
         let changed = chat
             .app
             .plugin_presentation()
@@ -1034,8 +1189,284 @@ impl ChatLoopState {
         self.interactive_surface_area
     }
 
+    pub const fn has_session_picker(&self) -> bool {
+        self.session_picker.is_some()
+    }
+
+    pub fn open_session_picker(&mut self, chat: &mut ActiveChat) {
+        let mut picker = super::session_picker::SessionPickerApp::new(Vec::new());
+        picker.set_loading_status("Loading sessions…".to_owned());
+        self.session_picker = Some(picker);
+        chat.replace_effect(TuiEffect::LoadSessionPicker);
+        chat.app.set_status("session picker".to_owned());
+    }
+
+    pub fn apply_session_picker_result(
+        &mut self,
+        result: Result<bcode_client::SessionList, bcode_client::ClientError>,
+    ) {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(session_list) => {
+                let count = session_list.sessions.len();
+                picker.replace_sessions(session_list.sessions);
+                picker.set_status(format!("{count} sessions"));
+                picker.set_idle_empty_message();
+            }
+            Err(error) => picker.set_status(format!("Session catalog unavailable: {error}")),
+        }
+    }
+
+    pub fn apply_session_import_result(
+        &mut self,
+        result: Result<
+            (
+                bcode_session_models::SessionSummary,
+                Vec<bcode_ipc::SessionImportWarning>,
+            ),
+            bcode_client::ClientError,
+        >,
+    ) -> Option<bcode_session_models::SessionId> {
+        let picker = self.session_picker.as_mut()?;
+        match result {
+            Ok((session, warnings)) => {
+                let session_id = session.id;
+                picker.set_last_import(Some((session, warnings)));
+                self.session_picker = None;
+                Some(session_id)
+            }
+            Err(error) => {
+                picker.set_status(format!("Import failed: {error}"));
+                None
+            }
+        }
+    }
+
+    pub fn apply_session_mutation_result(
+        &mut self,
+        action: &str,
+        result: Result<bcode_session_models::SessionSummary, bcode_client::ClientError>,
+    ) {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(_) => picker.finish_mutation(format!("Session {action}; refreshing…")),
+            Err(error) => picker.finish_mutation(format!("Session {action} failed: {error}")),
+        }
+    }
+
+    pub fn apply_session_search_result(
+        &mut self,
+        result: Result<
+            (
+                bcode_session_search::FederatedSessionSearchResponse,
+                Vec<bcode_session_search::HydratedSessionSearchHit>,
+            ),
+            bcode_client::ClientError,
+        >,
+    ) {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        match result {
+            Ok((response, _)) if response.hits.is_empty() => {
+                picker.set_status("No transcript matches".to_owned());
+            }
+            Ok((response, hydrated)) => picker.set_search_results(&response, hydrated),
+            Err(error) => picker.set_status(format!("Transcript search failed: {error}")),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn handle_session_picker_event(
+        &mut self,
+        chat: &mut ActiveChat,
+        keymap: &super::keymap::BmuxKeyMap,
+        event: &Event,
+    ) -> SessionPickerRootOutcome {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return SessionPickerRootOutcome::Unhandled;
+        };
+        match event {
+            Event::Paste(text) => {
+                let _ = super::text_input_flow::handle_paste(picker.active_input_mut(), text);
+                if picker.mode() == super::session_picker::SessionPickerMode::Filter {
+                    picker.refresh_filter();
+                }
+            }
+            Event::Key(stroke) => match picker.mode() {
+                super::session_picker::SessionPickerMode::Filter => {
+                    let search = *stroke
+                        == bmux_keyboard::KeyStroke::with_modifiers(
+                            bmux_keyboard::KeyCode::Char('f'),
+                            bmux_keyboard::Modifiers {
+                                ctrl: true,
+                                ..bmux_keyboard::Modifiers::NONE
+                            },
+                        );
+                    if search {
+                        let query = picker.filter().buffer().text().trim().to_owned();
+                        if query.is_empty() {
+                            picker.set_status(
+                                "Type a transcript query, then press Ctrl-F".to_owned(),
+                            );
+                        } else {
+                            picker.set_status("Searching transcripts…".to_owned());
+                            chat.replace_effect(TuiEffect::SearchSessions {
+                                request: Box::new(root_session_search_request(query)),
+                                policy: bcode_session_search::SessionSearchPlanPolicy::default(),
+                            });
+                        }
+                    } else if let Some(action) =
+                        keymap.action_for_key(super::keymap::BmuxScope::SessionPicker, *stroke)
+                    {
+                        match action {
+                            super::keymap::BmuxAction::SelectCancel => {
+                                self.session_picker = None;
+                                return SessionPickerRootOutcome::Canceled;
+                            }
+                            super::keymap::BmuxAction::SessionNew => {
+                                self.session_picker = None;
+                                return SessionPickerRootOutcome::Create;
+                            }
+                            super::keymap::BmuxAction::SessionRename => {
+                                picker.start_rename();
+                            }
+                            super::keymap::BmuxAction::SessionDelete => {
+                                picker.start_delete_confirmation();
+                            }
+                            super::keymap::BmuxAction::SelectConfirm => {
+                                if let Some(import) = picker
+                                    .selected_import()
+                                    .filter(|import| import.imported_at_ms == 0)
+                                    .cloned()
+                                {
+                                    picker.set_status("Importing session…".to_owned());
+                                    chat.replace_effect(TuiEffect::ImportSession {
+                                        source_id: import.source_id,
+                                        external_session_id: import.external_session_id,
+                                    });
+                                } else if let Some(session_id) = picker.selected_session_id() {
+                                    self.session_picker = None;
+                                    return SessionPickerRootOutcome::Select(session_id);
+                                }
+                            }
+                            super::keymap::BmuxAction::SelectUp => picker.select_previous(),
+                            super::keymap::BmuxAction::SelectDown => picker.select_next(),
+                            _ => {}
+                        }
+                    } else if super::text_input_flow::handle_key(
+                        picker.filter_mut(),
+                        keymap,
+                        *stroke,
+                    ) != bmux_tui_components::text_input::TextInputOutcome::Ignored
+                    {
+                        picker.refresh_filter();
+                    }
+                }
+                super::session_picker::SessionPickerMode::Rename => {
+                    if stroke.key == bmux_keyboard::KeyCode::Escape {
+                        picker.cancel_rename();
+                    } else if stroke.key == bmux_keyboard::KeyCode::Enter {
+                        if let Some(session_id) = picker.selected_session_id() {
+                            let name = picker.rename().buffer().text().trim();
+                            let name = (!name.is_empty()).then(|| name.to_owned());
+                            picker.finish_mutation("Renaming session…".to_owned());
+                            chat.replace_effect(TuiEffect::RenameSession { session_id, name });
+                        }
+                    } else {
+                        let _ = super::text_input_flow::handle_key(
+                            picker.rename_mut(),
+                            keymap,
+                            *stroke,
+                        );
+                    }
+                }
+                super::session_picker::SessionPickerMode::DeleteConfirm => match stroke.key {
+                    bmux_keyboard::KeyCode::Escape | bmux_keyboard::KeyCode::Char('n' | 'N') => {
+                        picker.cancel_delete();
+                    }
+                    bmux_keyboard::KeyCode::Char('y' | 'Y') => {
+                        if let Some(session_id) = picker.selected_session_id() {
+                            picker.finish_mutation("Deleting session…".to_owned());
+                            chat.replace_effect(TuiEffect::DeleteSession { session_id });
+                        }
+                    }
+                    _ => {}
+                },
+                super::session_picker::SessionPickerMode::TranscriptSearch => match stroke.key {
+                    bmux_keyboard::KeyCode::Escape => picker.close_search_results(),
+                    bmux_keyboard::KeyCode::Enter => {
+                        if let Some(hit) = picker.selected_search_result().cloned() {
+                            self.session_picker = None;
+                            return SessionPickerRootOutcome::SearchHit(hit);
+                        }
+                    }
+                    bmux_keyboard::KeyCode::Up => picker.select_previous(),
+                    bmux_keyboard::KeyCode::Down => picker.select_next(),
+                    _ => {}
+                },
+            },
+            Event::Mouse(mouse) => {
+                if let Some(row) = super::picker_mouse::picker_row_from_mouse(*mouse) {
+                    let _selected = picker.select_visible(row);
+                }
+            }
+            Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) => {}
+        }
+        SessionPickerRootOutcome::Handled
+    }
+
     pub const fn has_interactive_surface(&self) -> bool {
         self.interactive_surface.is_some()
+    }
+
+    pub fn active_root_screen(&self) -> super::root_program::BcodeRuntimeScreen {
+        use super::root_program::BcodeRuntimeScreen;
+
+        if self.has_root_plugin_surface() && !self.root_plugin_surface_is_suspended() {
+            return BcodeRuntimeScreen::PluginSurface;
+        }
+        if self.has_session_picker() {
+            return BcodeRuntimeScreen::SessionPicker;
+        }
+        if self.has_session_fork_flow() {
+            return BcodeRuntimeScreen::SessionFork;
+        }
+        if self.has_ralph_start_dialog() {
+            return BcodeRuntimeScreen::RalphStart;
+        }
+        if self.has_worktree_create_dialog() {
+            return BcodeRuntimeScreen::WorktreeCreate;
+        }
+        if self.provider_picker.is_some() || self.model_picker.is_some() {
+            return BcodeRuntimeScreen::ModelPicker;
+        }
+        if self.has_skill_picker() {
+            return BcodeRuntimeScreen::SkillPicker;
+        }
+        if self.has_command_palette() {
+            return BcodeRuntimeScreen::CommandPalette;
+        }
+        if self.has_slash_palette() {
+            return BcodeRuntimeScreen::SlashPalette;
+        }
+        if self.permission_dialog.is_some() {
+            return BcodeRuntimeScreen::Permission;
+        }
+        if self.thinking_dialog.is_some() {
+            return BcodeRuntimeScreen::Thinking;
+        }
+        if self.timeline_dialog.is_some() {
+            return BcodeRuntimeScreen::Timeline;
+        }
+        if self.has_interactive_surface() {
+            return BcodeRuntimeScreen::InteractiveSurface;
+        }
+        BcodeRuntimeScreen::Chat
     }
 
     pub fn dismiss_interactive_surface(
@@ -1064,14 +1495,6 @@ impl ChatLoopState {
         } else if let Some(surface) = self.interactive_surface.as_mut() {
             surface.clear_pending_resolution();
         }
-    }
-
-    fn drain_pending_effects(&mut self, chat: &mut ActiveChat) -> bool {
-        self.effects.drain_pending(&mut chat.pending_effects)
-    }
-
-    async fn poll_finished_effects(&mut self) -> Vec<TuiEffectResult> {
-        self.effects.poll_finished().await
     }
 
     fn accept_markdown_projection_completion(
@@ -1119,13 +1542,6 @@ impl ChatLoopState {
                 false
             }
         }
-    }
-
-    fn poll_markdown_projection_completion(&mut self, chat: &mut ActiveChat) -> bool {
-        let Some(completion) = self.markdown_projection.try_latest_completion() else {
-            return false;
-        };
-        self.accept_markdown_projection_completion(chat, completion)
     }
 
     fn request_latest_markdown_projection(&mut self, chat: &ActiveChat, width: u16) {
@@ -1176,39 +1592,7 @@ impl ChatLoopState {
         );
     }
 
-    async fn poll_markdown_completions(&mut self, chat: &mut ActiveChat) -> bool {
-        let mut changed = self.poll_markdown_projection_completion(chat);
-        let mut index = 0;
-        while index < self.markdown_image_tasks.len() {
-            if !self.markdown_image_tasks[index].is_finished() {
-                index += 1;
-                continue;
-            }
-            let task = self.markdown_image_tasks.swap_remove(index);
-            if let Ok(completion) = task.await
-                && let Some(markdown) = &mut self.markdown_presentation
-            {
-                changed |= markdown.complete(completion);
-            }
-        }
-        let mut index = 0;
-        while index < self.markdown_mermaid_tasks.len() {
-            if !self.markdown_mermaid_tasks[index].is_finished() {
-                index += 1;
-                continue;
-            }
-            let task = self.markdown_mermaid_tasks.swap_remove(index);
-            if let Ok(completion) = task.await
-                && let Some(mermaid) = &mut self.markdown_mermaid
-            {
-                changed |= mermaid.complete(completion);
-            }
-        }
-        changed
-    }
-
     pub fn abort_all_effects(&mut self) {
-        self.effects.abort_all();
         self.markdown_projection.invalidate();
         if let Some(markdown) = &mut self.markdown_presentation {
             markdown.cancel_all();
@@ -1224,16 +1608,7 @@ impl ChatLoopState {
         }
     }
 
-    fn start_effect(&mut self, effect: TuiEffect) -> bool {
-        self.effects.start(effect)
-    }
-
-    fn replace_effect(&mut self, effect: TuiEffect) {
-        self.effects.replace(effect);
-    }
-
-    pub fn queue_effect_cancellation(&mut self, chat: &mut ActiveChat, effect: TuiEffect) {
-        self.effects.abort_matching(&effect);
+    pub fn queue_effect_cancellation(chat: &mut ActiveChat, effect: TuiEffect) {
         chat.pending_effects.cancel(effect);
     }
 }
@@ -1349,6 +1724,10 @@ impl TuiRuntimeSettings {
         self.metrics_enabled = enabled;
     }
 
+    pub const fn metrics_enabled(&self) -> bool {
+        self.metrics_enabled
+    }
+
     pub const fn keymap(&self) -> &BmuxKeyMap {
         &self.keymap
     }
@@ -1370,292 +1749,7 @@ impl TuiRuntimeSettings {
     }
 }
 
-struct ChatEventContext<'a, 'b, W: Write> {
-    services: TuiServices<'a>,
-    terminal: &'a mut Terminal<&'b mut W>,
-    terminal_events: &'a mut TuiInput,
-    mouse_scroll_rows: usize,
-}
-
-impl<'a, 'b, W: Write> ChatEventContext<'a, 'b, W> {
-    const fn flow_context(&mut self) -> (TuiIo<'_, 'b, W>, TuiServices<'a>) {
-        let services = self.services;
-        let io = TuiIo {
-            terminal: self.terminal,
-            input: self.terminal_events,
-        };
-        (io, services)
-    }
-}
-
-/// Run the active chat UI loop.
-#[allow(clippy::future_not_send)]
-#[allow(clippy::too_many_lines)]
-pub async fn run_with_client<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
-    settings: &mut TuiRuntimeSettings,
-    chat: &mut ActiveChat,
-    startup_action: super::startup_action::StartupTuiAction,
-) -> Result<(), TuiError> {
-    let passive_client = client
-        .clone()
-        .with_daemon_availability(DaemonAvailability::RequireRunning);
-    let mut loop_state = ChatLoopState::new(client, &passive_client, settings.metrics_enabled);
-    let result = run_chat_loop(
-        terminal,
-        terminal_events,
-        client,
-        &passive_client,
-        settings,
-        chat,
-        startup_action,
-        &mut loop_state,
-    )
-    .await;
-    loop_state.abort_all_effects();
-    result
-}
-
-#[allow(
-    clippy::future_not_send,
-    clippy::too_many_arguments,
-    clippy::too_many_lines
-)]
-async fn run_chat_loop<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
-    passive_client: &BcodeClient,
-    settings: &mut TuiRuntimeSettings,
-    chat: &mut ActiveChat,
-    startup_action: super::startup_action::StartupTuiAction,
-    loop_state: &mut ChatLoopState,
-) -> Result<(), TuiError> {
-    loop_state.drain_pending_effects(chat);
-    sync_chat_key_labels(chat, &settings.keymap);
-    let mut draft_autosave = DraftAutosave::new(
-        settings.launch_working_directory.clone(),
-        chat.app.composer().text().to_owned(),
-    );
-    let mut invalidation_queue = InvalidationQueue::default();
-    refresh_invalidation_queue(chat, &mut invalidation_queue);
-    let mut needs_redraw = true;
-    let initial_frame_interval = settings
-        .frame_interval
-        .unwrap_or(DEFAULT_TARGET_FRAME_INTERVAL);
-    let mut last_redraw = Instant::now()
-        .checked_sub(initial_frame_interval)
-        .unwrap_or_else(Instant::now);
-
-    let mut startup_action = Some(startup_action);
-
-    while !chat.app.should_exit() {
-        sync_chat_key_labels(chat, &settings.keymap);
-        loop_state.telemetry.flush_if_due(Instant::now());
-        record_artifact_stream_stats(loop_state);
-        if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
-            needs_redraw = true;
-        }
-        if drain_bcode_events(chat, loop_state, BCODE_EVENT_DRAIN_BUDGET) {
-            needs_redraw = true;
-        }
-        if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
-            needs_redraw = true;
-        }
-        loop_state.request_latest_markdown_projection(
-            chat,
-            render::transcript_area_for_frame(&chat.app, terminal.area()).width,
-        );
-        if loop_state.poll_markdown_completions(chat).await {
-            needs_redraw = true;
-        }
-
-        if handle_loop_housekeeping(settings, chat, &mut draft_autosave, loop_state).await {
-            needs_redraw = true;
-        }
-
-        if helpers::resize_from_terminal(terminal)? {
-            needs_redraw = true;
-        }
-
-        draft_autosave.observe(chat, Instant::now());
-        if let Some(save_at) = draft_autosave.next_save_at()
-            && Instant::now() >= save_at
-        {
-            start_draft_save(chat, &mut draft_autosave);
-        }
-
-        let redraw_at = next_redraw_at(last_redraw, settings.bmux_runtime_config().frame_interval);
-        if needs_redraw && Instant::now() >= redraw_at {
-            let schedule_delay = Instant::now().saturating_duration_since(redraw_at);
-            draw_chat_frame(
-                terminal,
-                chat,
-                loop_state,
-                schedule_delay,
-                settings.bmux_runtime_config().frame_interval,
-            )?;
-            if let Some(action) = startup_action.take()
-                && action == super::startup_action::StartupTuiAction::OpenRalphHome
-            {
-                let mut io = TuiIo {
-                    terminal,
-                    input: terminal_events,
-                };
-                let services = TuiServices {
-                    client,
-                    passive_client,
-                    launch_working_directory: settings.launch_working_directory(),
-                    keymap: &settings.keymap,
-                    theme: render::TuiTheme::for_app(&chat.app),
-                };
-                if let Err(error) = super::ralph_flow::open_home(&mut io, &services, chat).await {
-                    if daemon_issue::is_nonfatal_tui_error(&error) {
-                        daemon_issue::report_tui_issue(&mut chat.app, "Ralph unavailable", &error);
-                    } else {
-                        return Err(error);
-                    }
-                }
-            }
-            refresh_invalidation_queue(chat, &mut invalidation_queue);
-            loop_state.request_draft_handoff.mark_painted();
-            needs_redraw = false;
-            if drain_bcode_events(chat, loop_state, BCODE_EVENT_DRAIN_BUDGET) {
-                needs_redraw = true;
-            }
-            last_redraw = Instant::now();
-        }
-
-        let event = next_chat_loop_event(
-            terminal_events,
-            &mut invalidation_queue,
-            chat,
-            &mut loop_state.artifact_stream,
-            &mut loop_state.markdown_projection,
-            ChatLoopDeadlines {
-                interaction_retry: loop_state.interactive_surface_queue.next_retry_at(),
-                telemetry_flush: loop_state.telemetry.next_flush_at(),
-                redraw: needs_redraw.then_some(redraw_at),
-                draft_save: draft_autosave.next_save_at(),
-                streaming_presentation: chat
-                    .app
-                    .next_streaming_presentation_deadline(Instant::now()),
-                session_stream_blocked: loop_state.request_draft_handoff.blocks_session_stream(),
-            },
-        )
-        .await?;
-        let before_session_id = chat.session_id;
-        match event {
-            ChatLoopEvent::Terminal(event) => {
-                let event_invalidation = if matches!(event, Event::Resize(_)) {
-                    super::invalidation::UiInvalidation::Full
-                } else {
-                    super::invalidation::UiInvalidation::Structural
-                };
-                let mut context = ChatEventContext {
-                    services: TuiServices {
-                        client,
-                        passive_client,
-                        launch_working_directory: settings.launch_working_directory(),
-                        keymap: &settings.keymap,
-                        theme: render::TuiTheme::for_app(&chat.app),
-                    },
-                    terminal,
-                    terminal_events,
-                    mouse_scroll_rows: settings.mouse_scroll_rows,
-                };
-                match handle_event(&mut context, chat, loop_state, event, &mut draft_autosave).await
-                {
-                    Ok(handled) => {
-                        if handled {
-                            needs_redraw = event_invalidation.needs_render();
-                        }
-                    }
-                    Err(error) if is_nonfatal_tui_daemon_error(&error) => {
-                        report_nonfatal_tui_error(chat, "Daemon unavailable", &error);
-                        needs_redraw = true;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            ChatLoopEvent::SessionStream(update) => {
-                loop_state.request_draft_handoff.deferred.push_back(*update);
-                if drain_bcode_events(chat, loop_state, BCODE_EVENT_DRAIN_BUDGET) {
-                    needs_redraw = true;
-                }
-                if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
-                    needs_redraw = true;
-                }
-            }
-            ChatLoopEvent::ArtifactFetchCompleted(completion) => {
-                needs_redraw |= handle_artifact_completion(chat, loop_state, *completion);
-            }
-            ChatLoopEvent::TimedInvalidations(keys) => {
-                if chat
-                    .app
-                    .handle_invalidations(&keys, Instant::now())
-                    .needs_render()
-                {
-                    needs_redraw = true;
-                }
-            }
-            ChatLoopEvent::MarkdownProjectionCompleted(completion) => {
-                if let Some(completion) = *completion {
-                    needs_redraw |=
-                        loop_state.accept_markdown_projection_completion(chat, completion);
-                }
-            }
-            ChatLoopEvent::Timer => {
-                needs_redraw |= chat.app.advance_streaming_presentation(Instant::now());
-            }
-        }
-        if before_session_id != chat.session_id {
-            loop_state.request_draft_handoff.clear();
-            loop_state.markdown_projection.invalidate();
-            loop_state.artifact_stream.retain_session(chat.session_id);
-            draft_autosave.last_saved_text = None;
-            draft_autosave.dirty = true;
-            draft_autosave.save_at = Some(Instant::now());
-        }
-    }
-
-    Ok(())
-}
-
-enum ChatLoopEvent {
-    Terminal(Event),
-    SessionStream(Box<history_flow::SessionStreamUpdate>),
-    ArtifactFetchCompleted(Box<ActiveArtifactFetchCompletion>),
-    TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
-    MarkdownProjectionCompleted(
-        Box<Option<super::markdown_projection_coordinator::MarkdownProjectionCompletion>>,
-    ),
-    Timer,
-}
-
-async fn handle_loop_housekeeping(
-    settings: &mut TuiRuntimeSettings,
-    chat: &mut ActiveChat,
-    draft_autosave: &mut DraftAutosave,
-    loop_state: &mut ChatLoopState,
-) -> bool {
-    let mut needs_redraw = false;
-    needs_redraw |= poll_finished_effects(settings, chat, draft_autosave, loop_state).await;
-    needs_redraw |= chat
-        .app
-        .plugin_presentation()
-        .is_some_and(crate::plugin_tui::PluginTuiPresentation::poll_dynamic_visuals);
-    needs_redraw |= loop_state.drain_pending_effects(chat);
-    needs_redraw |= maybe_start_interactive_surface(chat, loop_state).await;
-    loop_state.artifact_stream.start_due_fetches(Instant::now());
-    needs_redraw |= maybe_start_older_history_load(chat, loop_state);
-    needs_redraw |= maybe_start_newer_history_load(chat, loop_state);
-    needs_redraw
-}
-
-fn maybe_start_older_history_load(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
+fn maybe_start_older_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatLoopState) -> bool {
     if !chat.app.should_load_older_history() {
         return false;
     }
@@ -1665,14 +1759,17 @@ fn maybe_start_older_history_load(chat: &mut ActiveChat, loop_state: &mut ChatLo
     let Some(session_id) = chat.session_id else {
         return false;
     };
-    let started = loop_state.start_effect(TuiEffect::LoadOlderHistory { session_id, cursor });
+    let started = !chat
+        .pending_effects
+        .contains_effect(&TuiEffect::LoadOlderHistory { session_id, cursor });
+    chat.start_effect(TuiEffect::LoadOlderHistory { session_id, cursor });
     if started {
         chat.app.set_loading_older_history(true);
     }
     started
 }
 
-fn maybe_start_newer_history_load(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
+fn maybe_start_newer_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatLoopState) -> bool {
     if !chat.app.should_load_newer_history() {
         return false;
     }
@@ -1682,27 +1779,14 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, loop_state: &mut ChatLo
     let Some(session_id) = chat.session_id else {
         return false;
     };
-    let started = loop_state.start_effect(TuiEffect::LoadNewerHistory { session_id, cursor });
+    let started = !chat
+        .pending_effects
+        .contains_effect(&TuiEffect::LoadNewerHistory { session_id, cursor });
+    chat.start_effect(TuiEffect::LoadNewerHistory { session_id, cursor });
     if started {
         chat.app.set_loading_newer_history(true);
     }
     started
-}
-
-async fn poll_finished_effects(
-    settings: &mut TuiRuntimeSettings,
-    chat: &mut ActiveChat,
-    draft_autosave: &mut DraftAutosave,
-    loop_state: &mut ChatLoopState,
-) -> bool {
-    let results = loop_state.poll_finished_effects().await;
-    let needs_redraw = !results.is_empty();
-    for result in results {
-        let daemon_observation = result.daemon_observation();
-        loop_state.observe_daemon(chat, &daemon_observation);
-        apply_effect_result(settings, chat, draft_autosave, loop_state, result);
-    }
-    needs_redraw
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1841,6 +1925,31 @@ pub fn apply_effect_result(
                 }
             }
         }
+        TuiEffectResult::SessionPickerLoaded { result } => {
+            loop_state.apply_session_picker_result(result);
+        }
+        TuiEffectResult::SessionImported { result } => {
+            if let Some(session_id) = loop_state.apply_session_import_result(result) {
+                super::session_flow::start_switch_session(
+                    chat,
+                    session_id,
+                    super::history_flow::initial_transcript_window_request(
+                        bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+                    ),
+                );
+            }
+        }
+        TuiEffectResult::SessionRenamed { result } => {
+            loop_state.apply_session_mutation_result("renamed", result);
+            chat.replace_effect(TuiEffect::LoadSessionPicker);
+        }
+        TuiEffectResult::SessionDeleted { result } => {
+            loop_state.apply_session_mutation_result("deleted", result);
+            chat.replace_effect(TuiEffect::LoadSessionPicker);
+        }
+        TuiEffectResult::SessionsSearched { result } => {
+            loop_state.apply_session_search_result(result);
+        }
         TuiEffectResult::SlashCommandExecuted { message, result } => match result {
             Ok(outcome) => apply_root_slash_command_outcome(chat, loop_state, &message, outcome),
             Err(error) => {
@@ -1850,10 +1959,17 @@ pub fn apply_effect_result(
         },
         TuiEffectResult::PluginSurfaceOpened { plugin_id, result } => match result {
             Ok(surface) => {
-                loop_state.plugin_surface = Some(RootPluginSurface { plugin_id, surface });
+                loop_state.queue_root_plugin_surface(plugin_id, surface);
                 chat.app.set_status("plugin surface opened".to_owned());
             }
             Err(error) => report_nonfatal_tui_error(chat, "Plugin surface unavailable", &error),
+        },
+        TuiEffectResult::RalphStarted { result } => match result {
+            Ok(output) => {
+                chat.push_presentation_markdown("bcode.ralph", output.markdown);
+                chat.app.set_status(output.status);
+            }
+            Err(error) => report_nonfatal_tui_error(chat, "Ralph loop creation failed", &error),
         },
         TuiEffectResult::RalphAction { action, result } => match result {
             Ok(output) => {
@@ -2027,12 +2143,6 @@ pub fn apply_effect_result(
         },
         TuiEffectResult::SubmitMessage { message, result } => {
             apply_submit_message_result(chat, &message, *result);
-        }
-        TuiEffectResult::RenameSession { result } => {
-            apply_rename_session_result(chat, result);
-        }
-        TuiEffectResult::DeleteSession { session_id, result } => {
-            apply_delete_session_result(chat, session_id, result);
         }
         TuiEffectResult::ForkSession {
             switch_after_create,
@@ -2454,6 +2564,8 @@ fn apply_root_slash_command_outcome(
         SlashCommandOutcome::NewDraftSession => session_flow::switch_to_draft_session(chat),
         SlashCommandOutcome::CancelTurn { session_id } => {
             chat.start_effect(TuiEffect::CancelTurn { session_id });
+            chat.app.set_cancelling();
+            chat.app.set_status("requesting cancellation…".to_owned());
         }
         SlashCommandOutcome::CancelRuntimeWork {
             session_id,
@@ -2643,13 +2755,29 @@ fn apply_root_slash_command_outcome(
         SlashCommandOutcome::ResumeRalphRun => {
             start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::Resume);
         }
-        SlashCommandOutcome::Unknown(_)
-        | SlashCommandOutcome::PickSession
-        | SlashCommandOutcome::OpenRalphHome
-        | SlashCommandOutcome::OpenRalphStartDialog => {
+        SlashCommandOutcome::OpenRalphStartDialog => {
+            loop_state.open_ralph_start_dialog(chat);
+        }
+        SlashCommandOutcome::PickSession => {
+            loop_state.open_session_picker(chat);
+        }
+        SlashCommandOutcome::OpenRalphHome => {
+            chat.replace_effect(TuiEffect::OpenPluginSurface {
+                plugin_id: "bcode.ralph".to_owned(),
+                surface_kind: "ralph-home".to_owned(),
+                instance_id: "ralph-home".to_owned(),
+                options: serde_json::Value::Null,
+                working_directory: chat.app.working_directory().map_or_else(
+                    || std::path::PathBuf::from("."),
+                    std::path::Path::to_path_buf,
+                ),
+                session_id: chat.session_id,
+            });
+            chat.app.set_status("opening Ralph UI…".to_owned());
+        }
+        SlashCommandOutcome::Unknown(_) => {
             chat.app.restore_pending_submission(message);
-            chat.app
-                .set_status("slash command pending root screen migration".to_owned());
+            chat.app.set_status("unknown slash command".to_owned());
         }
     }
 }
@@ -2745,39 +2873,6 @@ fn ensure_session_stream_after_foreground_wake(chat: &mut ActiveChat) {
             0, 0, 80, 24,
         )),
     );
-}
-
-fn apply_rename_session_result(
-    chat: &mut ActiveChat,
-    result: Result<bcode_session_models::SessionSummary, ClientError>,
-) {
-    match result {
-        Ok(session) => {
-            chat.app.apply_session_summary(&session);
-            chat.app.set_status("Session renamed".to_owned());
-        }
-        Err(error) => {
-            daemon_issue::report_client_issue(&mut chat.app, "session rename failed", &error);
-        }
-    }
-}
-
-fn apply_delete_session_result(
-    chat: &mut ActiveChat,
-    session_id: bcode_session_models::SessionId,
-    result: Result<bcode_session_models::SessionSummary, ClientError>,
-) {
-    match result {
-        Ok(_session) => {
-            if chat.app.session_id() == Some(session_id) {
-                session_flow::switch_to_draft_session(chat);
-            }
-            chat.app.set_status("Session deleted".to_owned());
-        }
-        Err(error) => {
-            daemon_issue::report_client_issue(&mut chat.app, "session delete failed", &error);
-        }
-    }
 }
 
 fn apply_fork_session_result(
@@ -3070,8 +3165,8 @@ fn apply_permission_resolution_result(
     }
 }
 
-fn refresh_permissions_after_cancellation(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
-    loop_state.queue_effect_cancellation(chat, TuiEffect::ListPermissions);
+fn refresh_permissions_after_cancellation(chat: &mut ActiveChat) {
+    ChatLoopState::queue_effect_cancellation(chat, TuiEffect::ListPermissions);
     chat.replace_effect(TuiEffect::ListPermissions);
 }
 
@@ -3096,14 +3191,14 @@ fn apply_cancel_turn_result(
     match result {
         Ok(true) if Some(session_id) == chat.app.session_id() => {
             close_permission_dialog_for_session(&mut loop_state.permission_dialog, session_id);
-            refresh_permissions_after_cancellation(chat, loop_state);
+            refresh_permissions_after_cancellation(chat);
             chat.app.set_cancelling();
             chat.app
                 .set_status("turn cancellation requested".to_owned());
         }
         Ok(false) if Some(session_id) == chat.app.session_id() => {
             close_permission_dialog_for_session(&mut loop_state.permission_dialog, session_id);
-            refresh_permissions_after_cancellation(chat, loop_state);
+            refresh_permissions_after_cancellation(chat);
             chat.app.set_idle();
             chat.app.set_status("no active turn".to_owned());
         }
@@ -3117,20 +3212,21 @@ fn apply_cancel_turn_result(
     }
 }
 
-pub fn start_cancel_turn(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
+pub fn start_cancel_turn(chat: &mut ActiveChat, _loop_state: &mut ChatLoopState) {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
         return;
     };
-    let started = loop_state.start_effect(TuiEffect::CancelTurn { session_id });
-    if started {
-        chat.app.set_cancelling();
-        chat.app
-            .set_status("turn cancellation requested".to_owned());
-    } else {
+    let effect = TuiEffect::CancelTurn { session_id };
+    if chat.pending_effects.contains_effect(&effect) {
         chat.app
             .set_status("turn cancellation already requested".to_owned());
+        return;
     }
+    chat.start_effect(effect);
+    chat.app.set_cancelling();
+    chat.app
+        .set_status("turn cancellation requested".to_owned());
 }
 
 pub fn start_draft_save(chat: &mut ActiveChat, draft_autosave: &mut DraftAutosave) {
@@ -3145,7 +3241,7 @@ fn update_slash_palette_async(chat: &mut ActiveChat, loop_state: &mut ChatLoopSt
     let current_query = chat.app.composer().text();
     if !current_query.starts_with('/') {
         loop_state.slash_palette = None;
-        loop_state.queue_effect_cancellation(
+        ChatLoopState::queue_effect_cancellation(
             chat,
             TuiEffect::LoadSlashPalette {
                 query: String::new(),
@@ -3163,15 +3259,11 @@ fn update_slash_palette_async(chat: &mut ActiveChat, loop_state: &mut ChatLoopSt
     if previous.is_none() {
         loop_state.slash_palette = None;
     }
-    loop_state.replace_effect(TuiEffect::LoadSlashPalette {
+    chat.replace_effect(TuiEffect::LoadSlashPalette {
         query,
         session_id: chat.app.session_id(),
     });
     true
-}
-
-const fn is_nonfatal_tui_daemon_error(error: &TuiError) -> bool {
-    daemon_issue::is_nonfatal_tui_error(error)
 }
 
 fn report_nonfatal_tui_error(chat: &mut ActiveChat, label: &str, error: &TuiError) {
@@ -3219,47 +3311,6 @@ fn record_artifact_stream_stats(loop_state: &mut ChatLoopState) {
         "tui.artifact.backlog",
         i64::try_from(stats.backlog).unwrap_or(i64::MAX),
     );
-}
-
-fn next_redraw_at(last_redraw: Instant, frame_interval: Option<Duration>) -> Instant {
-    frame_interval
-        .and_then(|interval| last_redraw.checked_add(interval))
-        .unwrap_or(last_redraw)
-}
-
-#[cfg(test)]
-mod render_cadence_tests {
-    use super::{TuiRuntimeSettings, next_redraw_at};
-    use bcode_config::{TuiConfig, TuiRenderConfig};
-    use std::path::PathBuf;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn configured_cadence_and_reload_drive_redraw_deadline() {
-        let mut settings = TuiRuntimeSettings::bootstrap(PathBuf::from("."), &[]);
-        let start = Instant::now();
-        assert_eq!(
-            next_redraw_at(start, settings.frame_interval),
-            start + Duration::from_secs_f64(1.0 / 60.0)
-        );
-        let mut config = TuiConfig {
-            render: TuiRenderConfig { max_fps: 20 },
-            ..TuiConfig::default()
-        };
-        settings.apply_tui_config(&config);
-        assert_eq!(
-            settings.bmux_runtime_config().frame_interval,
-            Some(Duration::from_millis(50))
-        );
-        assert_eq!(
-            next_redraw_at(start, settings.frame_interval),
-            start + Duration::from_millis(50)
-        );
-        config.render.max_fps = 0;
-        settings.apply_tui_config(&config);
-        assert_eq!(settings.bmux_runtime_config().frame_interval, None);
-        assert_eq!(next_redraw_at(start, settings.frame_interval), start);
-    }
 }
 
 fn markdown_destination_cache_source(
@@ -3630,6 +3681,24 @@ pub fn draw_chat_frame<W: Write>(
         if let Some(dialog) = &mut loop_state.timeline_dialog {
             timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
         }
+        if let Some(surface) = &mut loop_state.interactive_surface
+            && !surface_area.is_empty()
+        {
+            if pinned {
+                frame.fill(surface_area, " ", bmux_tui::prelude::Style::new());
+                surface.render(surface_area, frame);
+            } else if let Some(placement) = inline_placement {
+                surface.render_clipped(
+                    placement.full_area,
+                    placement.visible_content_offset,
+                    placement.destination,
+                    frame,
+                );
+            }
+        }
+        if let Some(picker) = &mut loop_state.session_picker {
+            super::session_picker_render::render_picker(picker, frame, theme);
+        }
         if let Some(surface) = &mut loop_state.plugin_surface {
             let area = frame.area();
             surface.surface.render(area, frame);
@@ -3654,23 +3723,11 @@ pub fn draw_chat_frame<W: Write>(
         if let Some(picker) = &mut loop_state.skill_picker {
             super::skill_picker_render::render_skill_picker(picker, frame, theme);
         }
+        if let Some(dialog) = &mut loop_state.ralph_start_dialog {
+            super::ralph_start_dialog_render::render_dialog(dialog, frame, theme);
+        }
         if let Some(dialog) = &mut loop_state.worktree_create_dialog {
             super::wt_create_dialog_render::render_dialog(dialog, frame, theme);
-        }
-        if let Some(surface) = &mut loop_state.interactive_surface
-            && !surface_area.is_empty()
-        {
-            if pinned {
-                frame.fill(surface_area, " ", bmux_tui::prelude::Style::new());
-                surface.render(surface_area, frame);
-            } else if let Some(placement) = inline_placement {
-                surface.render_clipped(
-                    placement.full_area,
-                    placement.visible_content_offset,
-                    placement.destination,
-                    frame,
-                );
-            }
         }
     })?;
     loop_state.interactive_surface_area = loop_state
@@ -3734,6 +3791,21 @@ pub fn draw_chat_frame<W: Write>(
     Ok(())
 }
 
+fn root_session_search_request(query: String) -> bcode_session_search::SessionSearchRequest {
+    bcode_session_search::SessionSearchRequest {
+        query: bcode_session_search::SessionSearchQuery::Text {
+            text: query,
+            mode: bcode_session_search::TextMatchMode::Terms,
+            fields: std::collections::BTreeSet::new(),
+        },
+        filters: bcode_session_search::SessionSearchFilters::default(),
+        sort: bcode_session_search::SessionSearchSort::ProviderRelevance,
+        limit: 20,
+        cursor: None,
+        deadline_ms: Some(5_000),
+    }
+}
+
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -3779,41 +3851,12 @@ fn inline_interaction_surface_placement(
     })
 }
 
-fn inline_interaction_surface_area(
-    app: &super::app::BmuxApp,
-    body: Option<Rect>,
-    interaction_id: Option<&str>,
-) -> Option<Rect> {
-    inline_interaction_surface_placement(app, body, interaction_id)
-        .map(|placement| placement.destination)
-}
-
 fn interactive_surface_height(surface: &mut InteractiveSurfaceState, viewport: Rect) -> u16 {
     let preferred = surface.preferred_height(viewport.width);
     let maximum = viewport.height.saturating_mul(2).div_ceil(3);
     preferred
         .min(maximum)
         .min(viewport.height.saturating_sub(1))
-}
-
-fn interactive_surface_area(surface: &mut InteractiveSurfaceState, viewport: Rect) -> Rect {
-    let height = interactive_surface_height(surface, viewport);
-    Rect::new(
-        viewport.x,
-        viewport.bottom().saturating_sub(height),
-        viewport.width,
-        height,
-    )
-}
-
-#[cfg(test)]
-fn take_bcode_events(
-    receiver: &mut tokio::sync::mpsc::Receiver<history_flow::SessionStreamUpdate>,
-    budget: usize,
-) -> Vec<history_flow::SessionStreamUpdate> {
-    (0..budget)
-        .map_while(|_| receiver.try_recv().ok())
-        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -3871,47 +3914,6 @@ fn request_handoff_paint_id(update: &history_flow::SessionStreamUpdate) -> Optio
     }
 }
 
-fn take_next_bcode_event(
-    receiver: &mut tokio::sync::mpsc::Receiver<history_flow::SessionStreamUpdate>,
-    handoff: &mut RequestDraftHandoff,
-) -> Option<history_flow::SessionStreamUpdate> {
-    handoff
-        .deferred
-        .pop_front()
-        .or_else(|| receiver.try_recv().ok())
-}
-
-fn drain_bcode_events(
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    budget: usize,
-) -> bool {
-    loop_state.telemetry.set_gauge(
-        "tui.session_event.queue_depth",
-        i64::try_from(chat.event_receiver.len()).unwrap_or(i64::MAX),
-    );
-    let mut needs_redraw = false;
-    for _ in 0..budget {
-        let Some(update) = take_next_bcode_event(
-            &mut chat.event_receiver,
-            &mut loop_state.request_draft_handoff,
-        ) else {
-            break;
-        };
-        if loop_state.request_draft_handoff.blocks_session_stream() {
-            loop_state.request_draft_handoff.deferred.push_front(update);
-            break;
-        }
-        let paint_id = request_handoff_paint_id(&update).map(ToOwned::to_owned);
-        let changed = absorb_session_stream_update(chat, loop_state, update);
-        loop_state
-            .request_draft_handoff
-            .observe_applied(paint_id, changed);
-        needs_redraw |= changed;
-    }
-    needs_redraw
-}
-
 fn handle_artifact_completion(
     chat: &ActiveChat,
     loop_state: &mut ChatLoopState,
@@ -3926,21 +3928,6 @@ fn handle_artifact_completion(
                 |presentation| presentation.deliver_artifact_chunk(chunk),
             )
         })
-}
-
-fn drain_artifact_completions(
-    chat: &ActiveChat,
-    loop_state: &mut ChatLoopState,
-    budget: usize,
-) -> bool {
-    let mut needs_redraw = false;
-    for _ in 0..budget {
-        let Some(completion) = loop_state.artifact_stream.try_next_completion() else {
-            break;
-        };
-        needs_redraw |= handle_artifact_completion(chat, loop_state, completion);
-    }
-    needs_redraw
 }
 
 fn absorb_session_stream_update(
@@ -4012,10 +3999,10 @@ fn apply_session_stream_resynchronization(
     }
     loop_state.interactive_surface = None;
     loop_state.interactive_surface_queue.clear();
-    loop_state.replace_effect(TuiEffect::LoadSessionStatus {
+    chat.replace_effect(TuiEffect::LoadSessionStatus {
         session_id: attached.session.id,
     });
-    loop_state.replace_effect(TuiEffect::ListPermissions);
+    chat.replace_effect(TuiEffect::ListPermissions);
     loop_state
         .telemetry
         .add_counter("tui.session_view.resync_completed_total", 1);
@@ -4088,16 +4075,16 @@ fn absorb_bcode_event(
                     .apply_agent_to_app(&mut chat.app, agent_id.clone());
             } else {
                 if matches!(event.kind, SessionEventKind::PermissionRequested { .. }) {
-                    loop_state.replace_effect(TuiEffect::ListPermissions);
+                    chat.replace_effect(TuiEffect::ListPermissions);
                 }
                 if matches!(event.kind, SessionEventKind::ModelChanged { .. }) {
-                    loop_state.queue_effect_cancellation(
+                    ChatLoopState::queue_effect_cancellation(
                         chat,
                         TuiEffect::LoadSessionStatus {
                             session_id: event.session_id,
                         },
                     );
-                    loop_state.replace_effect(TuiEffect::LoadSessionModelStatus {
+                    chat.replace_effect(TuiEffect::LoadSessionModelStatus {
                         session_id: event.session_id,
                     });
                 }
@@ -4107,7 +4094,7 @@ fn absorb_bcode_event(
                         | SessionEventKind::PluginStatusNote { .. }
                         | SessionEventKind::InertHistory { .. }
                 ) {
-                    loop_state.replace_effect(TuiEffect::LoadPluginStatus {
+                    chat.replace_effect(TuiEffect::LoadPluginStatus {
                         session_id: event.session_id,
                     });
                 }
@@ -4118,7 +4105,7 @@ fn absorb_bcode_event(
                         .is_some_and(|dialog| dialog.permission_id() == permission_id)
                 {
                     loop_state.permission_dialog = None;
-                    loop_state.replace_effect(TuiEffect::ListPermissions);
+                    chat.replace_effect(TuiEffect::ListPermissions);
                 }
                 chat.app.absorb_session_event(&event);
                 observe_interactive_surface_event(loop_state, &event.kind);
@@ -4386,692 +4373,6 @@ fn observe_interactive_surface_event(loop_state: &mut ChatLoopState, event: &Ses
     }
 }
 
-async fn maybe_start_interactive_surface(
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-) -> bool {
-    if loop_state.interactive_surface.is_some()
-        || loop_state
-            .interactive_surface_queue
-            .front_ready(Instant::now())
-            .is_none()
-    {
-        return false;
-    }
-    let runtime = loop_state.plugin_runtime.get_or_insert_with(|| {
-        super::plugin_tui::load_default_runtime_with_static_bundled(
-            &super::static_bundled_plugins(),
-        )
-        .expect("load plugin runtime for interactive TUI surfaces")
-    });
-    let opened = InteractiveSurfaceState::open_request(
-        runtime,
-        loop_state
-            .interactive_surface_queue
-            .front_ready(Instant::now())
-            .expect("ready request checked above"),
-        &BmuxKeyMap::from_config(chat.app.tui_config()),
-    )
-    .await;
-    match opened {
-        Ok(surface) => {
-            loop_state.interactive_surface_queue.pop_front();
-            loop_state.interactive_surface = Some(surface);
-            chat.app.invalidate_interaction_surface_layout();
-            true
-        }
-        Err(error) => {
-            loop_state
-                .interactive_surface_queue
-                .defer_front(Instant::now());
-            tracing::warn!(%error, "failed to open interactive TUI surface");
-            chat.app.set_status(format!(
-                "Interactive request unavailable; retrying: {error}"
-            ));
-            true
-        }
-    }
-}
-
-async fn next_artifact_fetch_event(
-    artifact_stream: &mut ArtifactStreamCoordinator,
-) -> ChatLoopEvent {
-    artifact_stream.next_completion().await.map_or_else(
-        || ChatLoopEvent::TimedInvalidations(Vec::new()),
-        |completion| ChatLoopEvent::ArtifactFetchCompleted(Box::new(completion)),
-    )
-}
-
-fn try_next_ready_artifact_event(
-    artifact_stream: &mut ArtifactStreamCoordinator,
-) -> Option<ChatLoopEvent> {
-    artifact_stream
-        .try_next_completion()
-        .map(|completion| ChatLoopEvent::ArtifactFetchCompleted(Box::new(completion)))
-}
-
-struct ChatLoopDeadlines {
-    interaction_retry: Option<Instant>,
-    telemetry_flush: Option<Instant>,
-    redraw: Option<Instant>,
-    draft_save: Option<Instant>,
-    streaming_presentation: Option<Instant>,
-    session_stream_blocked: bool,
-}
-
-async fn next_chat_loop_event(
-    terminal_events: &mut TuiInput,
-    invalidation_queue: &mut InvalidationQueue,
-    chat: &mut ActiveChat,
-    artifact_stream: &mut ArtifactStreamCoordinator,
-    markdown_projection: &mut super::markdown_projection_coordinator::MarkdownProjectionCoordinator,
-    deadlines: ChatLoopDeadlines,
-) -> Result<ChatLoopEvent, TuiError> {
-    if let Some(event) = try_next_ready_artifact_event(artifact_stream) {
-        return Ok(event);
-    }
-    let now = Instant::now();
-    let due = invalidation_queue.take_due(now);
-    if !due.is_empty() {
-        return Ok(ChatLoopEvent::TimedInvalidations(due));
-    }
-    let next_timer_at = [
-        invalidation_queue.next_at(),
-        artifact_stream.next_retry_at(),
-        deadlines.interaction_retry,
-        deadlines.telemetry_flush,
-        deadlines.redraw,
-        deadlines.draft_save,
-        deadlines.streaming_presentation,
-    ]
-    .into_iter()
-    .flatten()
-    .min();
-    if let Some(next_at) = next_timer_at {
-        let delay = next_at.saturating_duration_since(now);
-        return tokio::select! {
-            markdown_completion = markdown_projection.next_completion() => {
-                Ok(ChatLoopEvent::MarkdownProjectionCompleted(Box::new(markdown_completion)))
-            },
-            artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
-            bcode_event = chat.event_receiver.recv(), if !deadlines.session_stream_blocked => Ok(bcode_event.map_or_else(
-                || ChatLoopEvent::TimedInvalidations(Vec::new()),
-                |update| ChatLoopEvent::SessionStream(Box::new(update)),
-            )),
-            event = terminal_events.recv() => event.map(|event| {
-                event.map_or_else(
-                    || ChatLoopEvent::TimedInvalidations(Vec::new()),
-                    ChatLoopEvent::Terminal,
-                )
-            }),
-            () = tokio::time::sleep(delay) => {
-                let now = Instant::now();
-                let due = invalidation_queue.take_due(now);
-                if due.is_empty() {
-                    Ok(ChatLoopEvent::Timer)
-                } else {
-                    Ok(ChatLoopEvent::TimedInvalidations(due))
-                }
-            },
-        };
-    }
-    tokio::select! {
-        markdown_completion = markdown_projection.next_completion() => {
-            Ok(ChatLoopEvent::MarkdownProjectionCompleted(Box::new(
-                markdown_completion,
-            )))
-        },
-        artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
-        bcode_event = chat.event_receiver.recv(), if !deadlines.session_stream_blocked => Ok(bcode_event.map_or_else(
-            || ChatLoopEvent::TimedInvalidations(Vec::new()),
-            |update| ChatLoopEvent::SessionStream(Box::new(update)),
-        )),
-        event = terminal_events.recv() => event.map(|event| {
-            event.map_or_else(
-                || ChatLoopEvent::TimedInvalidations(Vec::new()),
-                ChatLoopEvent::Terminal,
-            )
-        }),
-    }
-}
-
-fn sync_chat_key_labels(chat: &mut ActiveChat, keymap: &BmuxKeyMap) {
-    chat.app.set_key_hints(keymap.chat_hints());
-    if let Some(label) = keymap.chat_action_label(BmuxAction::TranscriptBottom) {
-        chat.app.set_jump_to_latest_key_label(label);
-    }
-}
-
-fn refresh_invalidation_queue(chat: &ActiveChat, queue: &mut InvalidationQueue) {
-    queue.replace(
-        chat.app
-            .invalidation_requests(Instant::now(), SystemTime::now()),
-    );
-}
-
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
-async fn handle_event<W: Write>(
-    context: &mut ChatEventContext<'_, '_, W>,
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    event: Event,
-    draft_autosave: &mut DraftAutosave,
-) -> Result<bool, TuiError> {
-    match event {
-        Event::Resize(size) => {
-            context
-                .terminal
-                .resize(Rect::new(0, 0, size.width, size.height));
-            Ok(true)
-        }
-        Event::Mouse(mouse)
-            if loop_state.interactive_surface.is_some()
-                && interactive_surface_event_route(
-                    context.services.keymap,
-                    &Event::Mouse(mouse),
-                ) == InteractiveSurfaceEventRoute::TranscriptMouse =>
-        {
-            let hit_id = mouse_flow::mouse_hit_id(context.terminal.hits(), mouse);
-            mouse_flow::handle_mouse(
-                hit_id,
-                context.services.client,
-                chat,
-                &mut loop_state.permission_dialog,
-                mouse,
-                context.mouse_scroll_rows,
-            )
-            .await
-        }
-        Event::Mouse(mouse)
-            if loop_state.interactive_surface.is_some()
-                && interactive_surface_event_route(
-                    context.services.keymap,
-                    &Event::Mouse(mouse),
-                ) == InteractiveSurfaceEventRoute::HostMouse =>
-        {
-            let surface_area = loop_state
-                .interactive_surface
-                .as_mut()
-                .map(|surface| {
-                    interactive_surface_area(
-                        surface,
-                        render::transcript_area_for_frame(&chat.app, context.terminal.area()),
-                    )
-                })
-                .expect("active interactive surface");
-            if surface_area.contains(mouse.position) {
-                handle_interactive_surface_event(context, chat, loop_state, Event::Mouse(mouse))
-                    .await
-            } else {
-                let hit_id = mouse_flow::mouse_hit_id(context.terminal.hits(), mouse);
-                mouse_flow::handle_mouse(
-                    hit_id,
-                    context.services.client,
-                    chat,
-                    &mut loop_state.permission_dialog,
-                    mouse,
-                    context.mouse_scroll_rows,
-                )
-                .await
-            }
-        }
-        Event::Key(stroke)
-            if loop_state.interactive_surface.is_some()
-                && matches!(
-                    interactive_surface_event_route(context.services.keymap, &Event::Key(stroke)),
-                    InteractiveSurfaceEventRoute::Host(_)
-                ) =>
-        {
-            handle_interactive_surface_host_key(context, chat, loop_state, stroke).await
-        }
-        event @ (Event::Key(_)
-        | Event::Paste(_)
-        | Event::Focus(_)
-        | Event::Tick
-        | Event::Mouse(_))
-            if loop_state.interactive_surface.is_some()
-                && interaction_input_is_active(chat, loop_state, context.terminal.area()) =>
-        {
-            handle_interactive_surface_event(context, chat, loop_state, event).await
-        }
-        Event::Key(stroke) => {
-            handle_chat_key(context, chat, loop_state, stroke, draft_autosave).await
-        }
-        Event::Paste(text) => {
-            if let Some(palette) = &mut loop_state.palette {
-                palette.state_mut().query.insert_str(&text);
-                return Ok(true);
-            }
-            chat.app.reset_input_history_navigation();
-            chat.app.paste_composer_text(&text);
-            chat.app.wake_cursor();
-            update_slash_palette_async(chat, loop_state);
-            Ok(true)
-        }
-        Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
-        Event::Mouse(mouse) => {
-            if loop_state.palette.is_some() {
-                let (mut io, services) = context.flow_context();
-                return palette_flow::handle_palette_mouse(
-                    &mut io,
-                    &services,
-                    chat,
-                    &mut loop_state.palette,
-                    mouse,
-                )
-                .await;
-            }
-            if loop_state.slash_palette.is_some() {
-                return Ok(slash_flow::handle_slash_palette_mouse(
-                    chat,
-                    &mut loop_state.slash_palette,
-                    context.terminal,
-                    mouse,
-                ));
-            }
-            let hit_id = mouse_flow::mouse_hit_id(context.terminal.hits(), mouse);
-            mouse_flow::handle_mouse(
-                hit_id,
-                context.services.client,
-                chat,
-                &mut loop_state.permission_dialog,
-                mouse,
-                context.mouse_scroll_rows,
-            )
-            .await
-        }
-        Event::User(_) => Ok(false),
-    }
-}
-
-fn interaction_input_is_active(
-    chat: &ActiveChat,
-    loop_state: &ChatLoopState,
-    terminal_area: Rect,
-) -> bool {
-    if chat.app.tui_config().interactions.placement == bcode_config::TuiInteractionPlacement::Pinned
-        || chat.app.tui_config().interactions.offscreen_focus
-            == bcode_config::TuiInteractionOffscreenFocus::Retain
-    {
-        return true;
-    }
-    let Some(surface) = loop_state.interactive_surface.as_ref() else {
-        return false;
-    };
-    let body = render::transcript_area_for_frame(&chat.app, terminal_area);
-    inline_interaction_surface_area(&chat.app, Some(body), Some(surface.interaction_id()))
-        .is_some_and(|area| !area.is_empty())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InteractiveSurfaceEventRoute {
-    Host(BmuxAction),
-    TranscriptMouse,
-    HostMouse,
-    Surface,
-}
-
-fn interactive_surface_event_route(
-    keymap: &BmuxKeyMap,
-    event: &Event,
-) -> InteractiveSurfaceEventRoute {
-    // Host-owned transcript and app actions win first. Wheel events always scroll the
-    // transcript, while other pointer events are classified by dock bounds at dispatch.
-    match event {
-        Event::Key(stroke) => interactive_surface_host_key(keymap, *stroke).map_or(
-            InteractiveSurfaceEventRoute::Surface,
-            InteractiveSurfaceEventRoute::Host,
-        ),
-        Event::Mouse(mouse)
-            if matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            ) =>
-        {
-            InteractiveSurfaceEventRoute::TranscriptMouse
-        }
-        Event::Mouse(_) => InteractiveSurfaceEventRoute::HostMouse,
-        Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::Resize(_) | Event::User(_) => {
-            InteractiveSurfaceEventRoute::Surface
-        }
-    }
-}
-
-#[allow(clippy::future_not_send)]
-async fn handle_interactive_surface_host_key<W: Write>(
-    context: &ChatEventContext<'_, '_, W>,
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    stroke: KeyStroke,
-) -> Result<bool, TuiError> {
-    match interactive_surface_host_key(context.services.keymap, stroke) {
-        Some(BmuxAction::AppExit) => {
-            chat.app.request_exit();
-            Ok(true)
-        }
-        Some(BmuxAction::AppInterrupt) => {
-            resolve_interactive_surface_dismissed(context, chat, loop_state).await?;
-            Ok(true)
-        }
-        Some(BmuxAction::InteractionFocusActive) => {
-            let Some(surface) = loop_state.interactive_surface.as_ref() else {
-                return Ok(false);
-            };
-            let Some(index) = chat
-                .app
-                .interaction_transcript_index(surface.interaction_id())
-            else {
-                return Ok(false);
-            };
-            Ok(chat.app.scroll_transcript_item_into_view(index))
-        }
-        Some(action) if is_transcript_action(action) => {
-            Ok(input::handle_host_action(&mut chat.app, action).redraw)
-        }
-        _ => Ok(false),
-    }
-}
-
-fn interactive_surface_host_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> Option<BmuxAction> {
-    let action = keymap.action_for_key(BmuxScope::Chat, stroke)?;
-    (matches!(action, BmuxAction::AppExit | BmuxAction::AppInterrupt)
-        || is_transcript_action(action))
-    .then_some(action)
-}
-
-const fn is_transcript_action(action: BmuxAction) -> bool {
-    matches!(
-        action,
-        BmuxAction::TranscriptPageUp
-            | BmuxAction::TranscriptPageDown
-            | BmuxAction::TranscriptTop
-            | BmuxAction::TranscriptBottom
-            | BmuxAction::TranscriptLineUp
-            | BmuxAction::TranscriptLineDown
-            | BmuxAction::InteractionFocusActive
-    )
-}
-
-#[allow(clippy::future_not_send)]
-async fn resolve_interactive_surface_dismissed<W: Write>(
-    context: &ChatEventContext<'_, '_, W>,
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-) -> Result<(), TuiError> {
-    let Some(surface) = loop_state.interactive_surface.take() else {
-        return Ok(());
-    };
-    let interaction_id = surface.interaction_id().to_owned();
-    let outcome = match execute_session_view_action(
-        context.services.client,
-        SessionViewAction::ResolveExchange {
-            interaction_id,
-            resolution: InteractiveSurfaceState::dismissed_resolution(),
-        },
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            loop_state.interactive_surface = Some(surface);
-            chat.app
-                .set_status(format!("Interactive dismissal failed; retry: {error}"));
-            return Ok(());
-        }
-    };
-    if !matches!(
-        outcome,
-        SessionViewActionOutcome::InteractionResolved {
-            resolved: true | false
-        }
-    ) {
-        loop_state.interactive_surface = Some(surface);
-        chat.app.set_status(
-            "Interactive dismissal failed: unexpected daemon response; retry".to_owned(),
-        );
-        return Ok(());
-    }
-    chat.app
-        .set_status("interactive request dismissed".to_owned());
-    Ok(())
-}
-
-fn apply_interactive_surface_resolution_result(
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    result: Result<SessionViewActionOutcome, ClientError>,
-) {
-    match result {
-        Ok(SessionViewActionOutcome::InteractionResolved { resolved: true }) => {
-            loop_state.interactive_surface = None;
-            chat.app.invalidate_interaction_surface_layout();
-        }
-        Ok(SessionViewActionOutcome::InteractionResolved { resolved: false }) => {
-            loop_state.interactive_surface = None;
-            chat.app.set_status(
-                "Interactive request was already resolved by another client".to_owned(),
-            );
-        }
-        Ok(_) => retain_interactive_surface_for_retry(
-            chat,
-            loop_state,
-            "Interactive response failed: unexpected daemon response; retry".to_owned(),
-        ),
-        Err(error) => {
-            tracing::warn!(%error, "failed to resolve interactive request");
-            retain_interactive_surface_for_retry(
-                chat,
-                loop_state,
-                format!("Interactive response failed; retry: {error}"),
-            );
-        }
-    }
-}
-
-fn retain_interactive_surface_for_retry(
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    status: String,
-) {
-    if let Some(surface) = loop_state.interactive_surface.as_mut() {
-        surface.clear_pending_resolution();
-        if let Some(index) = chat
-            .app
-            .interaction_transcript_index(surface.interaction_id())
-        {
-            chat.app.mark_transcript_item_dirty(index);
-        }
-    }
-    chat.app.set_status(status);
-}
-
-#[allow(clippy::future_not_send)]
-async fn handle_interactive_surface_event<W: Write>(
-    context: &ChatEventContext<'_, '_, W>,
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    event: Event,
-) -> Result<bool, TuiError> {
-    let Some(surface) = &mut loop_state.interactive_surface else {
-        return Ok(false);
-    };
-    let event = if chat.app.tui_config().interactions.placement
-        == bcode_config::TuiInteractionPlacement::Transcript
-    {
-        let body = render::transcript_area_for_frame(&chat.app, context.terminal.area());
-        if let Some(placement) = inline_interaction_surface_placement(
-            &chat.app,
-            Some(body),
-            Some(surface.interaction_id()),
-        ) {
-            InteractiveSurfaceState::translate_clipped_event(
-                event,
-                placement.full_area,
-                placement.visible_content_offset,
-                placement.destination,
-            )
-        } else {
-            event
-        }
-    } else {
-        event
-    };
-    let interaction_id = surface.interaction_id().to_owned();
-    let previous_height = surface.preferred_height(
-        render::transcript_area_for_frame(&chat.app, context.terminal.area()).width,
-    );
-    if let Some(resolution) = surface.handle_event(&event) {
-        let result = execute_session_view_action(
-            context.services.client,
-            SessionViewAction::ResolveExchange {
-                interaction_id,
-                resolution,
-            },
-        )
-        .await;
-        apply_interactive_surface_resolution_result(chat, loop_state, result);
-    } else if let Some(surface) = loop_state.interactive_surface.as_mut() {
-        let current_height = surface.preferred_height(
-            render::transcript_area_for_frame(&chat.app, context.terminal.area()).width,
-        );
-        if current_height != previous_height {
-            chat.app.invalidate_interaction_surface_layout();
-        } else if let Some(index) = chat.app.interaction_transcript_index(&interaction_id) {
-            chat.app.mark_transcript_item_dirty(index);
-        }
-    }
-    Ok(true)
-}
-
-async fn handle_chat_key<W: Write>(
-    context: &mut ChatEventContext<'_, '_, W>,
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    stroke: KeyStroke,
-    draft_autosave: &mut DraftAutosave,
-) -> Result<bool, TuiError> {
-    if loop_state.timeline_dialog.is_some() {
-        return timeline_flow::handle_timeline_key(
-            context.services.client,
-            chat,
-            &mut loop_state.timeline_dialog,
-            stroke,
-        )
-        .await;
-    }
-    if loop_state.thinking_dialog.is_some() {
-        return thinking_flow::handle_thinking_key(
-            context.services.client,
-            chat,
-            &mut loop_state.thinking_dialog,
-            stroke,
-        )
-        .await;
-    }
-    if loop_state.slash_palette.is_some() {
-        if let Some(dialog) = {
-            let (mut io, services) = context.flow_context();
-            slash_flow::handle_slash_palette_key(
-                &mut io,
-                &services,
-                chat,
-                &mut loop_state.slash_palette,
-                stroke,
-            )
-            .await?
-            .flatten()
-        } {
-            apply_composer_modal_request(loop_state, dialog);
-        }
-        return Ok(true);
-    }
-    if loop_state.permission_dialog.is_some() {
-        return permission_flow::handle_permission_key(
-            context.services.client,
-            context.services.keymap,
-            chat,
-            &mut loop_state.permission_dialog,
-            stroke,
-        )
-        .await;
-    }
-    if loop_state.palette.is_some() {
-        let (mut io, services) = context.flow_context();
-        return palette_flow::handle_palette_key(
-            &mut io,
-            &services,
-            chat,
-            &mut loop_state.palette,
-            stroke,
-        )
-        .await;
-    }
-    if is_palette_open_key(context.services.keymap, stroke) {
-        loop_state.palette = Some(palette_flow::open_palette(&context.services, chat).await);
-        chat.app
-            .set_status("command palette: type to filter, enter to run, esc close".to_owned());
-        return Ok(true);
-    }
-    if is_clipboard_image_paste_key(context.services.keymap, stroke) {
-        paste_clipboard_image(chat);
-        update_slash_palette_async(chat, loop_state);
-        return Ok(true);
-    }
-    let outcome = input::handle_key(&mut chat.app, context.services.keymap, stroke);
-    if chat.app.should_exit() {
-        return Ok(true);
-    }
-    update_slash_palette_async(chat, loop_state);
-    handle_chat_key_request(
-        context,
-        chat,
-        loop_state,
-        outcome.request,
-        Some(draft_autosave),
-    )
-    .await?;
-    Ok(outcome.redraw)
-}
-
-async fn handle_chat_key_request<W: Write>(
-    context: &mut ChatEventContext<'_, '_, W>,
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    request: KeyRequest,
-    draft_autosave: Option<&mut DraftAutosave>,
-) -> Result<(), TuiError> {
-    match request {
-        KeyRequest::None => {}
-        KeyRequest::Interrupt => {
-            start_cancel_turn(chat, loop_state);
-        }
-        KeyRequest::CycleAgent => cycle_session_agent(chat),
-        KeyRequest::CycleThinkingEffort => {
-            thinking_flow::cycle_thinking_effort(chat);
-        }
-        KeyRequest::Submit { placement } => {
-            let pre_submit_scope = draft_autosave.as_ref().map(|autosave| autosave.scope(chat));
-            let (mut io, services) = context.flow_context();
-            match composer_flow::submit_composer(&mut io, &services, chat, placement).await {
-                Ok(Some(request)) => {
-                    apply_composer_modal_request(loop_state, request);
-                }
-                Ok(None) => {}
-                Err(error) => helpers::report_client_error(&mut chat.app, "send failed", &error),
-            }
-            if let Some(autosave) = draft_autosave {
-                if let Some(scope) = pre_submit_scope {
-                    let (scope, text) = DraftAutosave::clear_scope_request(scope);
-                    chat.queue_latest_effect(TuiEffect::SaveDraft { scope, text });
-                }
-                autosave.mark_dirty_now();
-                start_draft_save(chat, autosave);
-            }
-        }
-    }
-    Ok(())
-}
-
 fn agent_selection_status(chat: &ActiveChat, agent_name: &str) -> String {
     if matches!(chat.app.activity(), ActivityState::Idle) {
         format!("agent {agent_name} selected")
@@ -5107,1735 +4408,5 @@ pub fn cycle_session_agent(chat: &mut ActiveChat) {
     }
 }
 
-fn apply_composer_modal_request(
-    loop_state: &mut ChatLoopState,
-    request: composer_flow::ComposerModalRequest,
-) {
-    match request {
-        composer_flow::ComposerModalRequest::Thinking(dialog) => {
-            loop_state.thinking_dialog = Some(dialog);
-        }
-        composer_flow::ComposerModalRequest::Timeline(dialog) => {
-            loop_state.timeline_dialog = Some(dialog);
-        }
-    }
-}
-
-fn is_palette_open_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool {
-    keymap.action_for_key(BmuxScope::Chat, stroke) == Some(BmuxAction::CommandPaletteOpen)
-}
-
-fn is_clipboard_image_paste_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool {
-    keymap.action_for_key(BmuxScope::Chat, stroke) == Some(BmuxAction::ClipboardPasteImage)
-}
-
-fn paste_clipboard_image(chat: &mut ActiveChat) {
-    let launch_working_directory = chat
-        .app
-        .working_directory()
-        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()));
-    let Ok(launch_working_directory) = launch_working_directory else {
-        chat.app
-            .set_status("image paste failed: current directory unavailable".to_owned());
-        return;
-    };
-    match clipboard_image::save_clipboard_image(chat.app.session_id(), &launch_working_directory) {
-        Ok(artifact) => {
-            let text = clipboard_image::pasted_image_text(&artifact.model);
-            chat.app.reset_input_history_navigation();
-            chat.app.paste_composer_text(&text);
-            chat.app.wake_cursor();
-            chat.app.set_status(format!(
-                "Image pasted: {}; source saved in session artifacts",
-                display_from_current_dir(&artifact.model)
-            ));
-        }
-        Err(error) => {
-            chat.app.set_status(format!("image paste failed: {error}"));
-        }
-    }
-}
-
 #[cfg(test)]
-mod scheduler_tests {
-    use super::*;
-    use bmux_keyboard::KeyCode;
-    #[test]
-    fn markdown_fallback_overwrites_and_clears_reserved_rows() {
-        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 12, 3));
-        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
-        write_markdown_fallback(&mut frame, Rect::new(0, 0, 12, 3), "failed\nsource");
-
-        let rendered = (0..3)
-            .map(|row| {
-                (0..12)
-                    .filter_map(|column| {
-                        frame
-                            .buffer()
-                            .get(bmux_tui::geometry::Point::new(column, row))
-                            .map(|cell| cell.symbol.as_str())
-                    })
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert!(rendered[0].starts_with("failed"));
-        assert!(rendered[1].starts_with("source"));
-        assert!(rendered[2].trim().is_empty());
-    }
-
-    #[test]
-    fn rich_destination_geometry_preserves_renderer_reserved_rectangle() {
-        let placeholder = Rect::new(3, 4, 20, 5);
-        assert_eq!(markdown_image_destination_rect(placeholder), placeholder);
-        assert_eq!(markdown_mermaid_destination_rect(placeholder), placeholder);
-    }
-
-    #[test]
-    fn markdown_destination_cache_source_is_typed_and_stable() {
-        let web = bcode_markdown_render::resolve_markdown_destination(
-            "https://example.com/image.png",
-            None,
-        );
-        assert_eq!(
-            markdown_destination_cache_source(&web),
-            "https://example.com/image.png"
-        );
-    }
-
-    #[tokio::test]
-    async fn production_live_event_handler_observes_presentation_artifacts() {
-        let session_id = bcode_session_models::SessionId::new();
-        let mut app =
-            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
-        )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
-            &bundled,
-            &bcode_plugin::PluginSelection::all_enabled(),
-        )
-        .expect("select shell plugin");
-        let host =
-            bcode_plugin::PluginHost::load_static_plugins(&selected).expect("load shell plugin");
-        app.set_plugin_host(std::sync::Arc::new(host));
-        let mut artifact_stream = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
-        let event = bcode_session_models::SessionLiveEvent {
-            session_id,
-            kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
-                update: bcode_tool::ToolPresentationUpdate {
-                    invocation_id: "call-shell".to_owned(),
-                    producer_id: "bcode.shell".to_owned(),
-                    generation: 0,
-                    revision: 1,
-                    identity: bcode_tool::ToolPresentationIdentity::Primary,
-                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
-                    schema: "bcode.shell.run".to_owned(),
-                    schema_version: 1,
-                    artifact: Some(bcode_tool::ToolContributionArtifact {
-                        artifact_id: "call-shell-shell-run".to_owned(),
-                        reference_key: "shell_recording".to_owned(),
-                        content_type: Some(
-                            "application/x-bcode-shell-recording; version=3".to_owned(),
-                        ),
-                        storage_uri: "untrusted://opaque".to_owned(),
-                        committed_bytes: 128,
-                        revision: 128,
-                        finalized: false,
-                        availability: None,
-                    }),
-                    payload: serde_json::json!({"mode": "terminal", "timeout_ms": 30_000}),
-                },
-            },
-        };
-
-        absorb_session_live_event(&mut app, &mut artifact_stream, &event);
-
-        let stats = artifact_stream.drain_stats();
-        assert_eq!(stats.observed_targets, 1);
-        assert_eq!(stats.fetches_started, 1);
-        assert_eq!(stats.backlog, 1);
-    }
-
-    #[tokio::test]
-    async fn terminal_invocation_rejects_late_presentation_artifact_before_hydration() {
-        let session_id = bcode_session_models::SessionId::new();
-        let history = [bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
-                record: bcode_session_models::ToolInvocationResultRecord {
-                    invocation_id: "call-shell".to_owned(),
-                    model_output: "finished".to_owned(),
-                    is_error: false,
-                    presentation: None,
-                    result: None,
-                },
-            },
-        }];
-        let mut app =
-            super::super::app::BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
-        )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
-            &bundled,
-            &bcode_plugin::PluginSelection::all_enabled(),
-        )
-        .expect("select shell plugin");
-        let host =
-            bcode_plugin::PluginHost::load_static_plugins(&selected).expect("load shell plugin");
-        app.set_plugin_host(std::sync::Arc::new(host));
-        assert!(app.tool_invocation_is_terminal("call-shell"));
-        let mut artifact_stream = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
-        let event = bcode_session_models::SessionLiveEvent {
-            session_id,
-            kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
-                update: bcode_tool::ToolPresentationUpdate {
-                    invocation_id: "call-shell".to_owned(),
-                    producer_id: "bcode.shell".to_owned(),
-                    generation: 0,
-                    revision: 99,
-                    identity: bcode_tool::ToolPresentationIdentity::Primary,
-                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
-                    schema: "bcode.shell.run".to_owned(),
-                    schema_version: 1,
-                    artifact: Some(bcode_tool::ToolContributionArtifact {
-                        artifact_id: "late-shell-run".to_owned(),
-                        reference_key: "shell_recording".to_owned(),
-                        content_type: Some(
-                            "application/x-bcode-shell-recording; version=3".to_owned(),
-                        ),
-                        storage_uri: "untrusted://opaque".to_owned(),
-                        committed_bytes: 128,
-                        revision: 99,
-                        finalized: false,
-                        availability: None,
-                    }),
-                    payload: serde_json::json!({"mode": "terminal"}),
-                },
-            },
-        };
-
-        absorb_session_live_event(&mut app, &mut artifact_stream, &event);
-
-        let stats = artifact_stream.drain_stats();
-        assert_eq!(stats.observed_targets, 0);
-        assert_eq!(stats.fetches_started, 0);
-        assert!(app.tool_invocation_is_terminal("call-shell"));
-        assert_eq!(app.transcript().len(), 1);
-    }
-
-    #[test]
-    fn invocation_progress_updates_runtime_activity_without_transcript_duplication() {
-        let session_id = bcode_session_models::SessionId::new();
-        let history = [bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-progress".to_owned(),
-                producer_plugin_id: Some("bcode.filesystem".to_owned()),
-                tool_name: "filesystem.find".to_owned(),
-                arguments_json: "{}".to_owned(),
-                working_directory: None,
-            },
-        }];
-        let mut app =
-            super::super::app::BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-        let transcript_len = app.transcript().len();
-        let mut artifact_stream = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
-        let event = bcode_session_models::SessionLiveEvent {
-            session_id,
-            kind: bcode_session_models::SessionLiveEventKind::ToolInvocationProgress {
-                event: bcode_session_models::ToolInvocationLifecycleEvent {
-                    invocation_id: "call-progress".to_owned(),
-                    sequence: 1,
-                    stage: bcode_session_models::ToolInvocationLifecycleStage::Progress,
-                    message: Some("find: scanned 25 entries".to_owned()),
-                    metadata: serde_json::Value::Null,
-                },
-            },
-        };
-
-        absorb_session_live_event(&mut app, &mut artifact_stream, &event);
-
-        assert_eq!(app.transcript().len(), transcript_len);
-        assert!(!app.tool_invocation_is_terminal("call-progress"));
-        assert!(matches!(
-            app.activity(),
-            super::super::activity::ActivityState::RuntimeWork { detail }
-                if detail == "running tool"
-        ));
-    }
-
-    fn test_chat() -> ActiveChat {
-        let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
-        ActiveChat {
-            app: super::super::app::BmuxApp::new_with_history(None, &[], &[], false),
-            agents: super::super::session_flow::AgentCatalog::default(),
-            session_id: None,
-            event_sender,
-            event_receiver,
-            event_task: None,
-            opening_session_id: None,
-            opening_session_progress: None,
-            opening_session_anchor_sequence: None,
-            pending_effects: super::super::effects::TuiEffectQueue::default(),
-        }
-    }
-
-    #[tokio::test]
-    async fn config_reload_replaces_adapter_state_and_applies_disabled_route() {
-        let static_plugins = vec![bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
-        )];
-        let extensions = vec![bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
-            "bcode.shell",
-            bcode_shell_plugin::shell_tui_registry,
-        )];
-        let initial = super::super::plugin_tui::load_default_presentation_with_static_bundled(
-            &bcode_plugin::PluginSelection::all_enabled(),
-            bcode_config::TuiVisualAdapterConfig::default(),
-            &static_plugins,
-            &extensions,
-        )
-        .expect("initial shell presentation");
-        initial.bump_visual_revision_for_test("call-active");
-
-        let mut chat = test_chat();
-        chat.app.set_plugin_presentation(Arc::new(initial));
-        assert_eq!(
-            chat.app
-                .plugin_presentation()
-                .expect("initial presentation")
-                .visual_revision("call-active"),
-            1
-        );
-        let mut settings =
-            TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &static_plugins);
-        settings.tui_extensions = extensions;
-        let mut loop_state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-        let mut config = bcode_config::BcodeConfig::default();
-        config
-            .tui
-            .visual_adapters
-            .disabled
-            .insert("bcode.shell/shell-run-request-card".to_owned());
-
-        apply_config_result(&mut settings, &mut chat, &mut loop_state, Ok(config));
-
-        let reloaded = chat
-            .app
-            .plugin_presentation()
-            .expect("reloaded presentation");
-        assert_eq!(reloaded.visual_revision("call-active"), 0);
-        assert!(
-            reloaded
-                .visual_route("bcode.tool.request.shell.run", 1, Some("bcode.shell"))
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)] // One lifecycle test proves state transfer across all live interaction config dimensions.
-    async fn config_reload_updates_interaction_behavior_without_reopening_or_losing_state() {
-        let static_plugins = vec![bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-            bcode_question_plugin::static_plugin(),
-        )];
-        let mut settings =
-            TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &static_plugins);
-        let mut chat = test_chat();
-        let mut loop_state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-        install_question_runtime(&mut loop_state);
-        loop_state.interactive_surface = Some(
-            InteractiveSurfaceState::open(
-                loop_state
-                    .plugin_runtime
-                    .as_ref()
-                    .expect("question runtime"),
-                "question-active",
-                "bcode.question.inline",
-                &serde_json::json!({
-                    "questions": [{
-                        "header": null,
-                        "question": "Explain?",
-                        "options": [],
-                        "control": "radio",
-                        "selection_mode": "single",
-                        "custom": true,
-                        "custom_mode": "additional",
-                        "required": true
-                    }]
-                })
-                .to_string(),
-                &settings.keymap,
-            )
-            .await
-            .expect("question surface"),
-        );
-        let type_text = |surface: &mut InteractiveSurfaceState, text: &str| {
-            for character in text.chars() {
-                assert!(
-                    surface
-                        .handle_event(&Event::Key(KeyStroke {
-                            key: KeyCode::Char(character),
-                            modifiers: bmux_keyboard::Modifiers::NONE,
-                        }))
-                        .is_none()
-                );
-            }
-        };
-        type_text(
-            loop_state
-                .interactive_surface
-                .as_mut()
-                .expect("active question surface"),
-            "Ab",
-        );
-
-        let mut config = bcode_config::BcodeConfig::default();
-        config.tui.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
-        config.tui.interactions.offscreen_focus =
-            bcode_config::TuiInteractionOffscreenFocus::Suspend;
-        config.tui.keybindings.chat = std::collections::BTreeMap::from([
-            ("ctrl+b".to_owned(), "tui.editor.moveCursorLeft".to_owned()),
-            (
-                "ctrl+d".to_owned(),
-                "tui.editor.deleteCharForward".to_owned(),
-            ),
-            ("ctrl+j".to_owned(), "tui.input.newLine".to_owned()),
-            ("ctrl+s".to_owned(), "tui.input.submit".to_owned()),
-        ]);
-        apply_config_result(&mut settings, &mut chat, &mut loop_state, Ok(config));
-
-        assert_eq!(
-            chat.app.tui_config().interactions.placement,
-            bcode_config::TuiInteractionPlacement::Pinned
-        );
-        assert_eq!(
-            chat.app.tui_config().interactions.offscreen_focus,
-            bcode_config::TuiInteractionOffscreenFocus::Suspend
-        );
-        let surface = loop_state
-            .interactive_surface
-            .as_mut()
-            .expect("reload preserves active surface");
-        for (key, expected) in [
-            (
-                'b',
-                bmux_text_edit::TextEditCommand::Move(bmux_text_edit::TextMotion::Left),
-            ),
-            (
-                'd',
-                bmux_text_edit::TextEditCommand::Delete(bmux_text_edit::TextDelete::Forward),
-            ),
-            ('j', bmux_text_edit::TextEditCommand::Insert('\n')),
-        ] {
-            assert_eq!(
-                surface.text_edit_command_for_test(KeyStroke {
-                    key: KeyCode::Char(key),
-                    modifiers: bmux_keyboard::Modifiers {
-                        ctrl: true,
-                        ..bmux_keyboard::Modifiers::NONE
-                    },
-                }),
-                Some(expected)
-            );
-        }
-        let send = |surface: &mut InteractiveSurfaceState, character| {
-            surface.handle_event(&Event::Key(KeyStroke {
-                key: KeyCode::Char(character),
-                modifiers: bmux_keyboard::Modifiers {
-                    ctrl: true,
-                    ..bmux_keyboard::Modifiers::NONE
-                },
-            }))
-        };
-        assert!(send(surface, 'b').is_none());
-        assert!(send(surface, 'd').is_none());
-        assert!(send(surface, 'j').is_none());
-        type_text(surface, "Z");
-        let resolution = send(surface, 's').expect("reloaded submit binding submits");
-        assert_eq!(
-            resolution,
-            bcode_session_models::ToolExchangeResolution::Responded {
-                payload: serde_json::json!({
-                    "status": "answered",
-                    "questions": [{
-                        "question_index": 0,
-                        "selected": [],
-                        "custom": "A\nZ"
-                    }]
-                })
-            }
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)] // One lifecycle test proves unchanged state across both retryable failure classes and final confirmation.
-    async fn failed_and_unexpected_resolution_delivery_preserve_surface_state_for_retry() {
-        let static_plugins = vec![bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-            bcode_question_plugin::static_plugin(),
-        )];
-        let settings =
-            TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &static_plugins);
-        let mut chat = test_chat();
-        let mut loop_state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-        install_question_runtime(&mut loop_state);
-        loop_state.interactive_surface = Some(
-            InteractiveSurfaceState::open(
-                loop_state
-                    .plugin_runtime
-                    .as_ref()
-                    .expect("question runtime"),
-                "question-retry",
-                "bcode.question.inline",
-                &serde_json::json!({
-                    "questions": [{
-                        "header": null,
-                        "question": "Explain?",
-                        "options": [],
-                        "control": "radio",
-                        "selection_mode": "single",
-                        "custom": true,
-                        "custom_mode": "additional",
-                        "required": true
-                    }]
-                })
-                .to_string(),
-                &settings.keymap,
-            )
-            .await
-            .expect("question surface"),
-        );
-        let surface = loop_state
-            .interactive_surface
-            .as_mut()
-            .expect("active surface");
-        for character in ['A', 'b', 'Ç'] {
-            assert!(
-                surface
-                    .handle_event(&Event::Key(KeyStroke {
-                        key: KeyCode::Char(character),
-                        modifiers: bmux_keyboard::Modifiers::NONE,
-                    }))
-                    .is_none()
-            );
-        }
-        let submitted = surface
-            .handle_event(&Event::Key(KeyStroke {
-                key: KeyCode::Enter,
-                modifiers: bmux_keyboard::Modifiers::NONE,
-            }))
-            .expect("submit custom answer");
-        assert!(surface.has_pending_resolution_for_test());
-
-        apply_interactive_surface_resolution_result(
-            &mut chat,
-            &mut loop_state,
-            Err(ClientError::UnexpectedResponse),
-        );
-        let surface = loop_state
-            .interactive_surface
-            .as_mut()
-            .expect("transport failure retains surface");
-        assert!(!surface.has_pending_resolution_for_test());
-        assert_eq!(
-            surface.handle_event(&Event::Key(KeyStroke {
-                key: KeyCode::Enter,
-                modifiers: bmux_keyboard::Modifiers::NONE,
-            })),
-            Some(submitted.clone())
-        );
-
-        apply_interactive_surface_resolution_result(
-            &mut chat,
-            &mut loop_state,
-            Ok(SessionViewActionOutcome::None),
-        );
-        let surface = loop_state
-            .interactive_surface
-            .as_mut()
-            .expect("unexpected response retains surface");
-        assert!(!surface.has_pending_resolution_for_test());
-        assert_eq!(
-            surface.handle_event(&Event::Key(KeyStroke {
-                key: KeyCode::Enter,
-                modifiers: bmux_keyboard::Modifiers::NONE,
-            })),
-            Some(submitted.clone())
-        );
-
-        apply_interactive_surface_resolution_result(
-            &mut chat,
-            &mut loop_state,
-            Ok(SessionViewActionOutcome::InteractionResolved { resolved: true }),
-        );
-        assert!(loop_state.interactive_surface.is_none());
-
-        observe_interactive_surface_event(
-            &mut loop_state,
-            &SessionEventKind::ToolExchangeResolved {
-                event: bcode_session_models::ToolExchangeResolutionEvent {
-                    invocation_id: "call-question-retry".to_owned(),
-                    exchange_id: "question-retry".to_owned(),
-                    resolution: submitted,
-                },
-            },
-        );
-        assert!(loop_state.interactive_surface.is_none());
-    }
-
-    #[tokio::test]
-    async fn authoritative_resolution_result_is_the_only_local_close_authority() {
-        for (resolved, expected_status) in [
-            (true, None),
-            (
-                false,
-                Some("Interactive request was already resolved by another client"),
-            ),
-        ] {
-            let static_plugins = vec![bcode_plugin::StaticBundledPlugin::new(
-                include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-                bcode_question_plugin::static_plugin(),
-            )];
-            let settings =
-                TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &static_plugins);
-            let mut chat = test_chat();
-            let mut loop_state = ChatLoopState::new(
-                &BcodeClient::default_endpoint(),
-                &BcodeClient::default_endpoint(),
-                false,
-            );
-            install_question_runtime(&mut loop_state);
-            loop_state.interactive_surface = Some(
-                InteractiveSurfaceState::open(
-                    loop_state
-                        .plugin_runtime
-                        .as_ref()
-                        .expect("question runtime"),
-                    "question-close",
-                    "bcode.question.inline",
-                    &serde_json::json!({
-                        "questions": [{
-                            "header": null,
-                            "question": "Proceed?",
-                            "options": [{"label": "Yes", "value": "yes", "description": null}],
-                            "control": "radio",
-                            "selection_mode": "single",
-                            "custom": false,
-                            "custom_mode": "additional",
-                            "required": true
-                        }]
-                    })
-                    .to_string(),
-                    &settings.keymap,
-                )
-                .await
-                .expect("question surface"),
-            );
-
-            apply_interactive_surface_resolution_result(
-                &mut chat,
-                &mut loop_state,
-                Ok(SessionViewActionOutcome::InteractionResolved { resolved }),
-            );
-            assert!(loop_state.interactive_surface.is_none());
-            if let Some(expected_status) = expected_status {
-                assert_eq!(chat.app.status(), expected_status);
-            }
-        }
-    }
-
-    #[cfg(any(
-        feature = "static-bundled-code-review-plugin",
-        feature = "static-bundled-filesystem-plugin",
-        feature = "static-bundled-plugins",
-        feature = "static-bundled-ralph-plugin",
-        feature = "static-bundled-workflow-plugin"
-    ))]
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)] // One end-to-end state-machine scenario proves the normal request/edit/scroll/validate/resolve path.
-    async fn end_to_end_question_exchange_keeps_one_transcript_identity_through_resolution() {
-        let session_id = bcode_session_models::SessionId::new();
-        let exchange_id = "call-question-e2e-question";
-        let request = bcode_session_models::ToolExchangeRequest {
-            invocation_id: "call-question-e2e".to_owned(),
-            exchange_id: exchange_id.to_owned(),
-            producer_id: "bcode.question".to_owned(),
-            schema: "bcode.question.request".to_owned(),
-            schema_version: 1,
-            payload: serde_json::json!({
-                "questions": [{
-                    "header": null,
-                    "question": "Explain the result",
-                    "options": [],
-                    "control": "radio",
-                    "selection_mode": "single",
-                    "custom": true,
-                    "custom_mode": "additional",
-                    "required": true
-                }]
-            }),
-            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
-        };
-        let request_event = bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::ToolExchangeRequested {
-                request: request.clone(),
-            },
-        };
-        let mut chat = test_chat();
-        chat.session_id = Some(session_id);
-        chat.app = super::super::app::BmuxApp::new_with_history(
-            Some(session_id),
-            std::slice::from_ref(&request_event),
-            &[],
-            false,
-        );
-        let transcript_id = chat
-            .app
-            .transcript()
-            .iter()
-            .find_map(|item| {
-                item.interaction()
-                    .is_some_and(|interaction| interaction.interaction_id == exchange_id)
-                    .then(|| item.source_view_item_id().cloned())
-                    .flatten()
-            })
-            .expect("semantic question transcript identity");
-        let mut state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-        install_question_runtime(&mut state);
-        observe_interactive_surface_event(&mut state, &request_event.kind);
-        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
-        let surface = state
-            .interactive_surface
-            .as_mut()
-            .expect("normal bundled request opens a surface");
-        let area = Rect::new(0, 0, 48, surface.preferred_height(48));
-        surface.render_for_test(
-            area,
-            &mut bmux_tui::frame::Frame::new(&mut bmux_tui::buffer::Buffer::empty(area)),
-        );
-
-        assert!(
-            surface
-                .handle_event(&Event::Key(KeyStroke {
-                    key: KeyCode::Enter,
-                    modifiers: bmux_keyboard::Modifiers::NONE,
-                }))
-                .is_none(),
-            "required validation must remain visible instead of submitting"
-        );
-        for event in [
-            Event::Key(KeyStroke {
-                key: KeyCode::Char('A'),
-                modifiers: bmux_keyboard::Modifiers {
-                    shift: true,
-                    ..bmux_keyboard::Modifiers::NONE
-                },
-            }),
-            Event::Paste("β".to_owned()),
-            Event::Key(KeyStroke {
-                key: KeyCode::Enter,
-                modifiers: bmux_keyboard::Modifiers {
-                    shift: true,
-                    ..bmux_keyboard::Modifiers::NONE
-                },
-            }),
-            Event::Key(KeyStroke {
-                key: KeyCode::Char('Z'),
-                modifiers: bmux_keyboard::Modifiers {
-                    shift: true,
-                    ..bmux_keyboard::Modifiers::NONE
-                },
-            }),
-        ] {
-            assert!(surface.handle_event(&event).is_none());
-        }
-
-        let index = chat
-            .app
-            .interaction_transcript_index(exchange_id)
-            .expect("question transcript index");
-        chat.app.set_active_interaction_layout(Some((
-            exchange_id.to_owned(),
-            surface.preferred_height(48),
-        )));
-        chat.app
-            .set_transcript_viewport_for_details_test(200, 6, 180);
-        let _ = chat.app.scroll_transcript_item_into_view(index);
-        assert_ne!(chat.app.transcript_top_row(6), 14);
-
-        let resolution = surface
-            .handle_event(&Event::Key(KeyStroke {
-                key: KeyCode::Enter,
-                modifiers: bmux_keyboard::Modifiers::NONE,
-            }))
-            .expect("valid mixed-case multiline answer submits");
-        let bcode_session_models::ToolExchangeResolution::Responded { payload } = &resolution
-        else {
-            panic!("question submission must respond");
-        };
-        assert_eq!(payload["questions"][0]["custom"], "Aβ\nZ");
-        apply_interactive_surface_resolution_result(
-            &mut chat,
-            &mut state,
-            Ok(SessionViewActionOutcome::InteractionResolved { resolved: true }),
-        );
-        assert!(state.interactive_surface.is_none());
-
-        let terminal_event = bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 2,
-            timestamp_ms: 2,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::ToolExchangeResolved {
-                event: bcode_session_models::ToolExchangeResolutionEvent {
-                    invocation_id: request.invocation_id,
-                    exchange_id: exchange_id.to_owned(),
-                    resolution: resolution.clone(),
-                },
-            },
-        };
-        chat.app.absorb_session_event(&terminal_event);
-        observe_interactive_surface_event(&mut state, &terminal_event.kind);
-        let resolved_item = chat
-            .app
-            .transcript()
-            .iter()
-            .find(|item| item.source_view_item_id() == Some(&transcript_id))
-            .expect("same transcript identity after terminal event");
-        assert!(resolved_item.interaction().is_some_and(|interaction| {
-            interaction.interaction_id == exchange_id
-                && interaction.resolved
-                && interaction.resolution.as_ref() == Some(&resolution)
-        }));
-    }
-
-    #[test]
-    fn explicit_reasoning_completion_preserves_newer_pending_generation() {
-        let mut chat = test_chat();
-        let session_id = bcode_session_models::SessionId::new();
-        chat.session_id = Some(session_id);
-        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let older = chat.app.set_pending_reasoning_effort("low".to_owned());
-        let newer = chat.app.set_pending_reasoning_effort("high".to_owned());
-
-        apply_set_session_reasoning_result(
-            &mut chat,
-            session_id,
-            Some("low".to_owned()),
-            Some(older),
-            "reasoning effort set to low".to_owned(),
-            Ok(()),
-        );
-
-        assert_eq!(chat.app.reasoning_effort(), Some("high"));
-        assert_eq!(chat.app.pending_reasoning_effort_generation(), Some(newer));
-    }
-
-    #[test]
-    fn failed_explicit_reasoning_update_retains_pending_selection() {
-        let mut chat = test_chat();
-        let session_id = bcode_session_models::SessionId::new();
-        chat.session_id = Some(session_id);
-        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let generation = chat.app.set_pending_reasoning_effort("high".to_owned());
-
-        apply_set_session_reasoning_result(
-            &mut chat,
-            session_id,
-            Some("high".to_owned()),
-            Some(generation),
-            "reasoning effort set to high".to_owned(),
-            Err(ClientError::UnexpectedResponse),
-        );
-
-        assert_eq!(chat.app.reasoning_effort(), Some("high"));
-        assert_eq!(
-            chat.app.pending_reasoning_effort_generation(),
-            Some(generation)
-        );
-    }
-
-    #[test]
-    fn successful_submit_clears_only_captured_reasoning_generation() {
-        let mut chat = test_chat();
-        let session_id = bcode_session_models::SessionId::new();
-        chat.session_id = Some(session_id);
-        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let captured = chat.app.set_pending_reasoning_effort("low".to_owned());
-        let newer = chat.app.set_pending_reasoning_effort("high".to_owned());
-
-        apply_submit_message_result(
-            &mut chat,
-            "prompt",
-            Ok(super::super::effects::SubmitMessageResult {
-                session_id,
-                created_session: None,
-                acceptance: bcode_client::MessageAcceptance::sent(),
-                committed_agent_id: None,
-                committed_reasoning_effort_generation: Some(captured),
-                event_task: None,
-                event_stream_release: None,
-            }),
-        );
-
-        assert_eq!(chat.app.reasoning_effort(), Some("high"));
-        assert_eq!(chat.app.pending_reasoning_effort_generation(), Some(newer));
-    }
-
-    #[test]
-    fn same_session_reconnect_preserves_newer_pending_reasoning() {
-        let session_id = bcode_session_models::SessionId::new();
-        let mut previous =
-            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let generation = previous.set_pending_reasoning_effort("high".to_owned());
-        let mut reattached =
-            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-
-        reattached.take_same_session_reasoning_state_from(&previous);
-
-        assert_eq!(reattached.reasoning_effort(), Some("high"));
-        assert_eq!(
-            reattached.pending_reasoning_effort_generation(),
-            Some(generation)
-        );
-    }
-
-    #[tokio::test]
-    async fn initial_submit_installs_session_before_releasing_event_stream() {
-        let mut chat = test_chat();
-        chat.app.replace_composer_with("initial prompt");
-        chat.app.stage_submission();
-        let session_id = bcode_session_models::SessionId::new();
-        let (release_sender, mut release_receiver) = tokio::sync::oneshot::channel();
-        let event_task = tokio::spawn(std::future::pending());
-
-        apply_submit_message_result(
-            &mut chat,
-            "initial prompt",
-            Ok(super::super::effects::SubmitMessageResult {
-                session_id,
-                created_session: None,
-                acceptance: bcode_client::MessageAcceptance::sent(),
-                committed_agent_id: None,
-                committed_reasoning_effort_generation: None,
-                event_task: Some(event_task),
-                event_stream_release: Some(release_sender),
-            }),
-        );
-
-        assert_eq!(chat.session_id, Some(session_id));
-        assert!(matches!(
-            release_receiver.try_recv(),
-            Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        ));
-        assert!(chat.event_task.is_some());
-        if let Some(event_task) = chat.event_task.take() {
-            event_task.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn initial_skill_invocation_installs_session_before_releasing_event_stream() {
-        let mut chat = test_chat();
-        let generation = chat.app.set_pending_reasoning_effort("high".to_owned());
-        let session_id = bcode_session_models::SessionId::new();
-        let (release_sender, mut release_receiver) = tokio::sync::oneshot::channel();
-        let event_task = tokio::spawn(std::future::pending());
-
-        apply_skill_action_result(
-            &mut chat,
-            super::super::effects::SkillActionKind::Invoke,
-            &bcode_skill_models::SkillId::new("review"),
-            Ok(super::super::effects::SkillActionResult {
-                session_id,
-                created_session: None,
-                event_task: Some(event_task),
-                acceptance: Some(bcode_client::MessageAcceptance::sent()),
-                committed_agent_id: None,
-                committed_reasoning_effort_generation: Some(generation),
-                event_stream_release: Some(release_sender),
-            }),
-        );
-
-        assert_eq!(chat.session_id, Some(session_id));
-        assert_eq!(chat.app.pending_reasoning_effort_generation(), None);
-        assert!(matches!(
-            release_receiver.try_recv(),
-            Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        ));
-        if let Some(event_task) = chat.event_task.take() {
-            event_task.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn skill_invocation_completion_preserves_newer_reasoning_selection() {
-        let mut chat = test_chat();
-        let captured = chat.app.set_pending_reasoning_effort("low".to_owned());
-        let newer = chat.app.set_pending_reasoning_effort("high".to_owned());
-
-        apply_skill_action_result(
-            &mut chat,
-            super::super::effects::SkillActionKind::Invoke,
-            &bcode_skill_models::SkillId::new("review"),
-            Ok(super::super::effects::SkillActionResult {
-                session_id: bcode_session_models::SessionId::new(),
-                created_session: None,
-                event_task: None,
-                acceptance: Some(bcode_client::MessageAcceptance::sent()),
-                committed_agent_id: None,
-                committed_reasoning_effort_generation: Some(captured),
-                event_stream_release: None,
-            }),
-        );
-
-        assert_eq!(chat.app.reasoning_effort(), Some("high"));
-        assert_eq!(chat.app.pending_reasoning_effort_generation(), Some(newer));
-    }
-
-    #[cfg(any(
-        feature = "static-bundled-code-review-plugin",
-        feature = "static-bundled-filesystem-plugin",
-        feature = "static-bundled-plugins",
-        feature = "static-bundled-ralph-plugin",
-        feature = "static-bundled-workflow-plugin"
-    ))]
-    fn interaction(id: &str) -> bcode_session_view_models::InteractionViewSummary {
-        bcode_session_view_models::InteractionViewSummary {
-            producer_id: Some("bcode.question".to_owned()),
-            exchange_schema: Some("bcode.question.request".to_owned()),
-            exchange_schema_version: Some(1),
-            interaction_id: id.to_owned(),
-            kind: "bcode.question".to_owned(),
-            tool_call_id: Some(format!("call-{id}")),
-            title: Some("Question".to_owned()),
-            required: true,
-            snapshot: Some(serde_json::json!({"questions": []})),
-            state: bcode_session_view_models::InteractionViewState::Pending,
-            status_detail: None,
-            resolved: false,
-            resolution: None,
-        }
-    }
-
-    fn install_question_runtime(state: &mut ChatLoopState) {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-            bcode_question_plugin::static_plugin(),
-        );
-        state.plugin_runtime = Some(
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection::all_enabled(),
-                &[plugin],
-            )
-            .expect("question runtime"),
-        );
-    }
-
-    #[cfg(any(
-        feature = "static-bundled-code-review-plugin",
-        feature = "static-bundled-filesystem-plugin",
-        feature = "static-bundled-plugins",
-        feature = "static-bundled-ralph-plugin",
-        feature = "static-bundled-workflow-plugin"
-    ))]
-    #[tokio::test]
-    async fn hydration_reconciles_pending_queue_idempotently_and_removes_stale_entries() {
-        let mut state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-        let first = interaction("first");
-        let second = interaction("second");
-        reconcile_interactive_surfaces(&mut state, &[first.clone(), second.clone()]);
-        reconcile_interactive_surfaces(&mut state, &[first, second.clone()]);
-        assert_eq!(
-            state.interactive_surface_queue.interaction_ids(),
-            ["first", "second"]
-        );
-
-        reconcile_interactive_surfaces(&mut state, &[second]);
-        assert_eq!(
-            state.interactive_surface_queue.interaction_ids(),
-            ["second"]
-        );
-    }
-
-    #[cfg(any(
-        feature = "static-bundled-code-review-plugin",
-        feature = "static-bundled-filesystem-plugin",
-        feature = "static-bundled-plugins",
-        feature = "static-bundled-ralph-plugin",
-        feature = "static-bundled-workflow-plugin"
-    ))]
-    #[tokio::test]
-    async fn hydrated_requests_deduplicate_and_external_resolution_removes_matching_queue_entry() {
-        let mut state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-        let request = interaction("question-1");
-        reconcile_interactive_surfaces(&mut state, std::slice::from_ref(&request));
-        reconcile_interactive_surfaces(&mut state, &[request]);
-        assert_eq!(
-            state.interactive_surface_queue.interaction_ids(),
-            ["question-1"]
-        );
-
-        observe_interactive_surface_event(
-            &mut state,
-            &SessionEventKind::ToolExchangeResolved {
-                event: bcode_session_models::ToolExchangeResolutionEvent {
-                    invocation_id: "call-question-1".to_owned(),
-                    exchange_id: "question-1".to_owned(),
-                    resolution: bcode_session_models::ToolExchangeResolution::ConsumerDetached,
-                },
-            },
-        );
-        assert!(state.interactive_surface_queue.interaction_ids().is_empty());
-    }
-
-    #[tokio::test]
-    async fn failed_surface_open_is_retained_and_retried_after_delay() {
-        let mut state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-        state.interactive_surface_queue.enqueue(
-            InteractiveSurfaceRequest::new("broken", "unknown.surface", "{}"),
-            None,
-        );
-        let mut chat = test_chat();
-        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
-        assert_eq!(
-            state.interactive_surface_queue.interaction_ids(),
-            ["broken"]
-        );
-        assert!(state.interactive_surface_queue.next_retry_at().is_some());
-        assert!(chat.app.status().contains("retrying"));
-    }
-
-    #[cfg(any(
-        feature = "static-bundled-code-review-plugin",
-        feature = "static-bundled-filesystem-plugin",
-        feature = "static-bundled-plugins",
-        feature = "static-bundled-ralph-plugin",
-        feature = "static-bundled-workflow-plugin"
-    ))]
-    #[tokio::test]
-    async fn hydrated_multiple_questions_open_in_fifo_order() {
-        let mut state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-        install_question_runtime(&mut state);
-        let payload = serde_json::json!({
-            "questions": [{
-                "header": null,
-                "question": "Proceed?",
-                "options": [{"label": "Yes", "value": "yes", "description": null}],
-                "control": "radio",
-                "selection_mode": "single",
-                "custom": false,
-                "custom_mode": "additional",
-                "required": true
-            }]
-        });
-        let mut first = interaction("first");
-        first.snapshot = Some(payload.clone());
-        let mut second = interaction("second");
-        second.snapshot = Some(payload);
-        reconcile_interactive_surfaces(&mut state, &[first, second]);
-        let mut chat = test_chat();
-
-        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
-        assert_eq!(
-            state
-                .interactive_surface
-                .as_ref()
-                .map(InteractiveSurfaceState::interaction_id),
-            Some("first")
-        );
-        assert_eq!(
-            state.interactive_surface_queue.interaction_ids(),
-            ["second"]
-        );
-        observe_interactive_surface_event(
-            &mut state,
-            &SessionEventKind::ToolExchangeResolved {
-                event: bcode_session_models::ToolExchangeResolutionEvent {
-                    invocation_id: "call-first".to_owned(),
-                    exchange_id: "first".to_owned(),
-                    resolution: bcode_session_models::ToolExchangeResolution::TimedOut,
-                },
-            },
-        );
-        assert!(state.interactive_surface.is_none());
-        assert_eq!(
-            state.interactive_surface_queue.interaction_ids(),
-            ["second"]
-        );
-        state
-            .interactive_surface_queue
-            .defer_front(Instant::now() - Duration::from_secs(2));
-        assert!(maybe_start_interactive_surface(&mut chat, &mut state).await);
-    }
-
-    #[test]
-    fn permission_hydration_preserves_batch_and_policy_semantics() {
-        let session_id = bcode_session_models::SessionId::new();
-        let permission = permission_summary_view(bcode_ipc::PermissionSummary {
-            permission_id: "permission-1".to_owned(),
-            session_id,
-            tool_call_id: "call-1".to_owned(),
-            tool_name: "shell.run".to_owned(),
-            arguments_json: r#"{"command":"cargo test"}"#.to_owned(),
-            batch: Some(bcode_ipc::PermissionBatchCorrelation {
-                batch_id: "batch-1".to_owned(),
-                call_index: 1,
-                call_count: 3,
-            }),
-            agent_id: "build".to_owned(),
-            policy_source: Some("skill".to_owned()),
-            policy_reason: Some("requires approval".to_owned()),
-            can_remember_policy: true,
-        });
-
-        assert_eq!(permission.session_id, Some(session_id));
-        assert_eq!(permission.tool_name, "shell.run");
-        assert_eq!(permission.policy_source.as_deref(), Some("skill"));
-        assert_eq!(permission.detail.as_deref(), Some("requires approval"));
-        assert!(permission.can_remember);
-        let batch = permission.batch.expect("batch correlation");
-        assert_eq!(batch.batch_id, "batch-1");
-        assert_eq!(batch.call_index, 1);
-        assert_eq!(batch.call_count, 3);
-    }
-
-    #[tokio::test]
-    async fn retain_suspend_and_pinned_policies_route_offscreen_input_deterministically() {
-        let mut chat = test_chat();
-        let state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-        let terminal_area = Rect::new(0, 0, 80, 24);
-
-        let mut retain = bcode_config::TuiConfig::default();
-        retain.interactions.placement = bcode_config::TuiInteractionPlacement::Transcript;
-        retain.interactions.offscreen_focus = bcode_config::TuiInteractionOffscreenFocus::Retain;
-        chat.app.apply_tui_config(retain);
-        assert!(interaction_input_is_active(&chat, &state, terminal_area));
-
-        let mut suspend = chat.app.tui_config().clone();
-        suspend.interactions.offscreen_focus = bcode_config::TuiInteractionOffscreenFocus::Suspend;
-        chat.app.apply_tui_config(suspend);
-        assert!(!interaction_input_is_active(&chat, &state, terminal_area));
-
-        let mut pinned = chat.app.tui_config().clone();
-        pinned.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
-        chat.app.apply_tui_config(pinned);
-        assert!(interaction_input_is_active(&chat, &state, terminal_area));
-        assert!(state.interactive_surface.is_none());
-    }
-
-    #[test]
-    fn active_surface_routing_preserves_all_semantic_transcript_actions() {
-        let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
-        for (key, expected) in [
-            (KeyCode::PageUp, BmuxAction::TranscriptPageUp),
-            (KeyCode::PageDown, BmuxAction::TranscriptPageDown),
-        ] {
-            assert_eq!(
-                interactive_surface_event_route(
-                    &keymap,
-                    &Event::Key(KeyStroke {
-                        key,
-                        modifiers: bmux_keyboard::Modifiers::NONE,
-                    }),
-                ),
-                InteractiveSurfaceEventRoute::Host(expected)
-            );
-        }
-        for (key, expected) in [
-            (KeyCode::Home, BmuxAction::TranscriptTop),
-            (KeyCode::End, BmuxAction::TranscriptBottom),
-            (KeyCode::Up, BmuxAction::TranscriptLineUp),
-            (KeyCode::Down, BmuxAction::TranscriptLineDown),
-        ] {
-            assert_eq!(
-                interactive_surface_event_route(
-                    &keymap,
-                    &Event::Key(KeyStroke {
-                        key,
-                        modifiers: bmux_keyboard::Modifiers {
-                            ctrl: true,
-                            ..bmux_keyboard::Modifiers::NONE
-                        },
-                    }),
-                ),
-                InteractiveSurfaceEventRoute::Host(expected)
-            );
-        }
-    }
-
-    #[test]
-    fn active_surface_routing_honors_custom_transcript_bindings() {
-        let mut config = bcode_config::TuiConfig::default();
-        config.keybindings.chat = std::collections::BTreeMap::from([(
-            "alt+u".to_owned(),
-            "transcript.pageUp".to_owned(),
-        )]);
-        let keymap = BmuxKeyMap::from_config(&config);
-        assert_eq!(
-            interactive_surface_event_route(
-                &keymap,
-                &Event::Key(KeyStroke {
-                    key: KeyCode::Char('u'),
-                    modifiers: bmux_keyboard::Modifiers {
-                        alt: true,
-                        ..bmux_keyboard::Modifiers::NONE
-                    },
-                }),
-            ),
-            InteractiveSurfaceEventRoute::Host(BmuxAction::TranscriptPageUp)
-        );
-    }
-
-    #[test]
-    fn active_surface_routing_reserves_mouse_wheel_for_transcript() {
-        let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
-        for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
-            assert_eq!(
-                interactive_surface_event_route(
-                    &keymap,
-                    &Event::Mouse(bmux_tui::event::MouseEvent::new(
-                        kind,
-                        bmux_tui::geometry::Point::new(4, 8),
-                    )),
-                ),
-                InteractiveSurfaceEventRoute::TranscriptMouse
-            );
-        }
-        assert_eq!(
-            interactive_surface_event_route(
-                &keymap,
-                &Event::Mouse(bmux_tui::event::MouseEvent::new(
-                    MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                    bmux_tui::geometry::Point::new(4, 8),
-                )),
-            ),
-            InteractiveSurfaceEventRoute::HostMouse
-        );
-    }
-
-    #[test]
-    fn cancellation_closes_only_the_matching_session_permission_dialog() {
-        let session_id = bcode_session_models::SessionId::new();
-        let other_session_id = bcode_session_models::SessionId::new();
-        let permission = |session_id| {
-            PermissionDialogState::new(permission_summary_view(bcode_ipc::PermissionSummary {
-                permission_id: "permission-1".to_owned(),
-                session_id,
-                tool_call_id: "call-1".to_owned(),
-                tool_name: "example.tool".to_owned(),
-                arguments_json: "{}".to_owned(),
-                batch: Some(bcode_ipc::PermissionBatchCorrelation {
-                    batch_id: "batch-1".to_owned(),
-                    call_index: 0,
-                    call_count: 2,
-                }),
-                agent_id: "build".to_owned(),
-                policy_source: None,
-                policy_reason: None,
-                can_remember_policy: false,
-            }))
-        };
-        let mut dialog = Some(permission(session_id));
-
-        close_permission_dialog_for_session(&mut dialog, other_session_id);
-        assert!(dialog.is_some());
-        close_permission_dialog_for_session(&mut dialog, session_id);
-        assert!(dialog.is_none());
-    }
-
-    fn request_draft_update(
-        session_id: bcode_session_models::SessionId,
-        revision: u64,
-        text: &str,
-    ) -> history_flow::SessionStreamUpdate {
-        history_flow::SessionStreamUpdate::Event(Box::new(BcodeEvent::SessionLive(
-            bcode_session_models::SessionLiveEvent {
-                session_id,
-                kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
-                    event: bcode_session_models::ToolRequestDraftEvent {
-                        output_position: None,
-                        turn_id: "turn-live".to_owned(),
-                        tool_call_id: "call-write".to_owned(),
-                        tool_name: "filesystem.write".to_owned(),
-                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
-                        schema: "bcode.filesystem.request-draft.write".to_owned(),
-                        schema_version: 1,
-                        placement: bcode_session_models::ToolContributionPlacement::Request,
-                        generation: 1,
-                        revision,
-                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
-                            start_offset: 0,
-                            text: text.to_owned(),
-                        },
-                        argument_bytes: text.len(),
-                        truncated: false,
-                    },
-                },
-            },
-        )))
-    }
-
-    fn request_draft_remove(
-        session_id: bcode_session_models::SessionId,
-        revision: u64,
-    ) -> history_flow::SessionStreamUpdate {
-        history_flow::SessionStreamUpdate::Event(Box::new(BcodeEvent::SessionLive(
-            bcode_session_models::SessionLiveEvent {
-                session_id,
-                kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
-                    event: bcode_session_models::ToolRequestDraftEvent {
-                        output_position: None,
-                        turn_id: "turn-live".to_owned(),
-                        tool_call_id: "call-write".to_owned(),
-                        tool_name: "filesystem.write".to_owned(),
-                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
-                        schema: "bcode.filesystem.request-draft.write".to_owned(),
-                        schema_version: 1,
-                        placement: bcode_session_models::ToolContributionPlacement::Request,
-                        generation: 1,
-                        revision,
-                        operation: bcode_session_models::ToolRequestDraftOperation::Remove {
-                            reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
-                        },
-                        argument_bytes: 0,
-                        truncated: false,
-                    },
-                },
-            },
-        )))
-    }
-
-    fn canonical_write_request(
-        session_id: bcode_session_models::SessionId,
-    ) -> history_flow::SessionStreamUpdate {
-        history_flow::SessionStreamUpdate::Event(Box::new(BcodeEvent::Session(
-            bcode_session_models::SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 1,
-                timestamp_ms: 1,
-                session_id,
-                provenance: None,
-                kind: bcode_session_models::SessionEventKind::ToolCallRequested {
-                    tool_call_id: "call-write".to_owned(),
-                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
-                    tool_name: "filesystem.write".to_owned(),
-                    arguments_json: r#"{"path":"live.txt","contents":"complete"}"#.to_owned(),
-                    working_directory: None,
-                },
-            },
-        )))
-    }
-
-    #[tokio::test]
-    async fn fast_request_draft_handoff_paints_each_surviving_revision_and_canonical_request() {
-        let session_id = bcode_session_models::SessionId::new();
-        let mut chat = test_chat();
-        chat.session_id = Some(session_id);
-        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        for update in [
-            request_draft_update(session_id, 1, ""),
-            request_draft_update(session_id, 2, r#"{"path":"live.txt","contents":"part"#),
-            request_draft_update(
-                session_id,
-                3,
-                r#"{"path":"live.txt","contents":"complete"}"#,
-            ),
-            request_draft_remove(session_id, 4),
-            canonical_write_request(session_id),
-        ] {
-            chat.event_sender
-                .try_send(update)
-                .expect("queue stream update");
-        }
-        let mut state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-
-        for expected in [
-            "",
-            r#"{"path":"live.txt","contents":"part"#,
-            r#"{"path":"live.txt","contents":"complete"}"#,
-        ] {
-            assert!(drain_bcode_events(
-                &mut chat,
-                &mut state,
-                BCODE_EVENT_DRAIN_BUDGET
-            ));
-            let draft = chat.app.session_view_snapshot().tools["call-write"]
-                .request_draft
-                .as_ref()
-                .expect("draft remains for paint");
-            assert_eq!(draft.preview, expected);
-            assert!(state.request_draft_handoff.blocks_session_stream());
-            state.request_draft_handoff.mark_painted();
-        }
-
-        assert!(drain_bcode_events(
-            &mut chat,
-            &mut state,
-            BCODE_EVENT_DRAIN_BUDGET
-        ));
-        let tool = &chat.app.session_view_snapshot().tools["call-write"];
-        assert!(tool.request_draft.is_none());
-        assert_eq!(
-            tool.arguments_json.as_deref(),
-            Some(r#"{"path":"live.txt","contents":"complete"}"#)
-        );
-        assert!(state.request_draft_handoff.blocks_session_stream());
-    }
-
-    #[tokio::test]
-    async fn atomic_request_paints_started_state_before_canonical_request() {
-        let session_id = bcode_session_models::SessionId::new();
-        let mut chat = test_chat();
-        chat.session_id = Some(session_id);
-        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        for update in [
-            request_draft_update(session_id, 1, ""),
-            request_draft_remove(session_id, 2),
-            canonical_write_request(session_id),
-        ] {
-            chat.event_sender
-                .try_send(update)
-                .expect("queue stream update");
-        }
-        let mut state = ChatLoopState::new(
-            &BcodeClient::default_endpoint(),
-            &BcodeClient::default_endpoint(),
-            false,
-        );
-
-        assert!(drain_bcode_events(
-            &mut chat,
-            &mut state,
-            BCODE_EVENT_DRAIN_BUDGET
-        ));
-        let draft = chat.app.session_view_snapshot().tools["call-write"]
-            .request_draft
-            .as_ref()
-            .expect("provider start state remains for paint");
-        assert!(draft.preview.is_empty());
-        assert!(state.request_draft_handoff.blocks_session_stream());
-
-        state.request_draft_handoff.mark_painted();
-        assert!(drain_bcode_events(
-            &mut chat,
-            &mut state,
-            BCODE_EVENT_DRAIN_BUDGET
-        ));
-        let tool = &chat.app.session_view_snapshot().tools["call-write"];
-        assert!(tool.request_draft.is_none());
-        assert!(tool.arguments_json.is_some());
-        assert!(state.request_draft_handoff.blocks_session_stream());
-    }
-
-    #[test]
-    fn daemon_queue_draining_obeys_its_per_tick_budget() {
-        let (sender, mut receiver) = crate::history_flow::session_stream_channel();
-        for revision in 0..100 {
-            sender
-                .try_send(history_flow::SessionStreamUpdate::Event(Box::new(
-                    BcodeEvent::SessionCatalogUpdated { revision },
-                )))
-                .expect("daemon event");
-        }
-
-        assert_eq!(take_bcode_events(&mut receiver, 32).len(), 32);
-        assert!(receiver.try_recv().is_ok());
-    }
-
-    #[test]
-    fn ready_artifact_completion_precedes_a_saturated_daemon_queue() {
-        let mut chat = test_chat();
-        for revision in 0..256 {
-            chat.event_sender
-                .try_send(history_flow::SessionStreamUpdate::Event(Box::new(
-                    BcodeEvent::SessionCatalogUpdated { revision },
-                )))
-                .expect("daemon event");
-        }
-        let session_id = bcode_session_models::SessionId::new();
-        let mut artifacts = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
-        artifacts.enqueue_test_completion(session_id);
-
-        assert!(matches!(
-            try_next_ready_artifact_event(&mut artifacts),
-            Some(ChatLoopEvent::ArtifactFetchCompleted(_))
-        ));
-        assert!(chat.event_receiver.try_recv().is_ok());
-        assert!(chat.event_receiver.try_recv().is_ok());
-    }
-
-    #[test]
-    fn session_open_progress_formats_determinate_bytes() {
-        let snapshot = progress_snapshot(
-            bcode_session_models::SessionId::new(),
-            Some(512),
-            Some(1024),
-            Some(bcode_session_models::SessionMigrationProgressUnit::Bytes),
-        );
-        let status = session_open_progress_status(&snapshot);
-        assert!(status.contains("epoch 3 → 4"));
-        assert!(status.contains("██████░░░░░░"));
-        assert!(status.contains("512 B / 1.0 KiB"));
-    }
-
-    #[test]
-    fn session_open_progress_formats_indeterminate_stage() {
-        let snapshot = progress_snapshot(bcode_session_models::SessionId::new(), None, None, None);
-        let status = session_open_progress_status(&snapshot);
-        assert!(status.contains("Upgrading session (epoch 3 → 4)"));
-        assert!(status.contains("Preparing session backup"));
-    }
-
-    #[test]
-    fn session_open_ready_waits_for_attach_before_reporting_success() {
-        let session_id = bcode_session_models::SessionId::new();
-        let snapshot = bcode_session_models::SessionOpenOperationSnapshot {
-            operation_id: bcode_session_models::SessionOpenOperationId::new(),
-            revision: 2,
-            session_id,
-            source_writer_epoch: Some(3),
-            target_writer_epoch: 5,
-            progress: bcode_session_models::SessionMigrationProgress {
-                stage: bcode_session_models::SessionMigrationStage::Complete,
-                completed_units: None,
-                total_units: None,
-                unit: None,
-                message: "Session storage is ready".to_owned(),
-            },
-            outcome: Some(bcode_session_models::SessionOpenTerminalOutcome::Ready),
-            backup_path: None,
-        };
-        assert_eq!(
-            session_open_progress_status(&snapshot),
-            "Session storage validated; attaching writable runtime…"
-        );
-    }
-
-    #[test]
-    fn session_open_progress_ignores_stale_session_updates() {
-        let mut chat = test_chat();
-        let opening = bcode_session_models::SessionId::new();
-        chat.opening_session_id = Some(opening);
-        chat.app.set_status("opening session".to_owned());
-        let stale = progress_snapshot(
-            bcode_session_models::SessionId::new(),
-            Some(1),
-            Some(2),
-            Some(bcode_session_models::SessionMigrationProgressUnit::Files),
-        );
-        assert!(!apply_session_open_progress(&mut chat, &stale));
-        assert_eq!(chat.app.status(), "opening session");
-
-        let current = progress_snapshot(
-            opening,
-            Some(1),
-            Some(2),
-            Some(bcode_session_models::SessionMigrationProgressUnit::Files),
-        );
-        assert!(apply_session_open_progress(&mut chat, &current));
-        assert_eq!(chat.opening_session_progress.as_ref(), Some(&current));
-        assert!(chat.app.status().contains("1 / 2 files"));
-        assert!(!apply_session_open_progress(&mut chat, &current));
-
-        let mut older = current.clone();
-        older.revision = 0;
-        assert!(!apply_session_open_progress(&mut chat, &older));
-
-        let mut newer = current.clone();
-        newer.revision = 2;
-        newer.progress.completed_units = Some(2);
-        assert!(apply_session_open_progress(&mut chat, &newer));
-        assert!(chat.app.status().contains("2 / 2 files"));
-
-        let mut replacement = newer.clone();
-        replacement.operation_id = bcode_session_models::SessionOpenOperationId::new();
-        replacement.revision = 0;
-        replacement.progress.message = "Reclassified after reconnect".to_owned();
-        assert!(apply_session_open_progress(&mut chat, &replacement));
-        assert_eq!(chat.opening_session_progress.as_ref(), Some(&replacement));
-    }
-
-    fn progress_snapshot(
-        session_id: bcode_session_models::SessionId,
-        completed_units: Option<u64>,
-        total_units: Option<u64>,
-        unit: Option<bcode_session_models::SessionMigrationProgressUnit>,
-    ) -> bcode_session_models::SessionOpenOperationSnapshot {
-        bcode_session_models::SessionOpenOperationSnapshot {
-            operation_id: bcode_session_models::SessionOpenOperationId::new(),
-            revision: 1,
-            session_id,
-            source_writer_epoch: Some(3),
-            target_writer_epoch: 4,
-            progress: bcode_session_models::SessionMigrationProgress {
-                stage: bcode_session_models::SessionMigrationStage::PlanningBackup,
-                completed_units,
-                total_units,
-                unit,
-                message: "Preparing session backup".to_owned(),
-            },
-            outcome: None,
-            backup_path: None,
-        }
-    }
-}
+mod scheduler_tests {}

@@ -151,6 +151,51 @@ impl RalphStartDialog {
             .collect()
     }
 
+    /// Handle one terminal event and report whether the dialog should submit or cancel.
+    pub fn handle_event(
+        &mut self,
+        event: &bmux_tui::event::Event,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> RalphStartDialogOutcome {
+        use bmux_keyboard::KeyCode;
+        use bmux_tui::event::Event;
+        use bmux_tui_components::text_input::TextInputControl;
+
+        match event {
+            Event::Paste(text) => {
+                let _ = TextInputControl::new(&input_policy())
+                    .handle_paste(self.focused_input_mut(), text);
+            }
+            Event::Key(stroke) => match stroke.key {
+                KeyCode::Escape => return RalphStartDialogOutcome::Canceled,
+                KeyCode::Tab => self.focus_next(),
+                KeyCode::Enter => return RalphStartDialogOutcome::Submit,
+                _ => {
+                    if let Some(motion) = keymap.editor_selection_motion_for_key(*stroke) {
+                        self.focused_input_mut()
+                            .buffer_mut()
+                            .move_cursor_with_selection(motion, SelectionMode::Extend);
+                        self.focused_input_mut()
+                            .sync_scroll_to_cursor(&input_policy());
+                    } else if let Some(command) = keymap.editor_command_for_key(*stroke) {
+                        self.focused_input_mut().buffer_mut().apply_command(command);
+                        self.focused_input_mut()
+                            .sync_scroll_to_cursor(&input_policy());
+                    } else {
+                        let _ = TextInputControl::new(&input_policy())
+                            .handle_key(self.focused_input_mut(), *stroke);
+                    }
+                }
+            },
+            Event::Mouse(mouse) => {
+                let _ = TextInputControl::new(&input_policy())
+                    .handle_mouse(self.focused_input_mut(), *mouse);
+            }
+            Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {}
+        }
+        RalphStartDialogOutcome::Handled
+    }
+
     /// Return status text.
     #[must_use]
     pub fn status(&self) -> &str {
@@ -161,6 +206,17 @@ impl RalphStartDialog {
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
     }
+}
+
+/// Outcome from one root-owned Ralph start dialog update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RalphStartDialogOutcome {
+    /// Input was handled and the dialog remains open.
+    Handled,
+    /// Submit the current dialog values.
+    Submit,
+    /// Close without submitting.
+    Canceled,
 }
 
 /// Return the text-input policy used by Ralph start fields.

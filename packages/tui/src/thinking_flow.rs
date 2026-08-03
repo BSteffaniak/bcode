@@ -1,13 +1,6 @@
 //! Thinking settings dialog input flow for the TUI.
 
-use bcode_client::BcodeClient;
-use bcode_session_view::execute_session_view_action;
-use bcode_session_view_models::SessionViewAction;
-use bmux_keyboard::{KeyCode, KeyStroke};
-
-use super::TuiError;
 use super::session_flow::ActiveChat;
-use super::thinking_dialog::ThinkingDialogState;
 
 /// Cycle the selected reasoning effort locally for the next message.
 pub fn cycle_thinking_effort(chat: &mut ActiveChat) {
@@ -28,99 +21,6 @@ pub fn cycle_thinking_effort(chat: &mut ActiveChat) {
 #[cfg(test)]
 fn next_effort_value(values: &[String], current: Option<&str>) -> Option<String> {
     bcode_model::next_reasoning_effort_value(values, current)
-}
-
-/// Handle one thinking-dialog key.
-pub async fn handle_thinking_key(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    thinking_dialog: &mut Option<ThinkingDialogState>,
-    stroke: KeyStroke,
-) -> Result<bool, TuiError> {
-    let Some(dialog) = thinking_dialog else {
-        return Ok(false);
-    };
-    match stroke.key {
-        KeyCode::Up => {
-            dialog.focus_previous();
-            chat.app.set_status("reasoning output settings".to_owned());
-            Ok(true)
-        }
-        KeyCode::Down => {
-            dialog.focus_next();
-            chat.app.set_status("reasoning output settings".to_owned());
-            Ok(true)
-        }
-        KeyCode::Char(' ') => {
-            dialog.cycle_focused();
-            chat.app
-                .set_status("reasoning output setting changed".to_owned());
-            Ok(true)
-        }
-        KeyCode::Enter => apply_thinking_dialog(client, chat, thinking_dialog).await,
-        KeyCode::Escape => {
-            *thinking_dialog = None;
-            chat.app
-                .set_status("reasoning output settings canceled".to_owned());
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
-}
-
-async fn apply_thinking_dialog(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    thinking_dialog: &mut Option<ThinkingDialogState>,
-) -> Result<bool, TuiError> {
-    let Some(dialog) = thinking_dialog.take() else {
-        return Ok(false);
-    };
-    let effort = dialog.effort().map(ToOwned::to_owned);
-    let summary = dialog.summary().map(ToOwned::to_owned);
-    let visible = dialog.visible();
-    let mode = dialog.mode();
-    let effort_generation = effort
-        .as_ref()
-        .filter(|effort| chat.app.reasoning_effort() != Some(effort.as_str()))
-        .map(|effort| chat.app.set_pending_reasoning_effort(effort.clone()));
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.apply_reasoning_selection(effort, summary);
-        chat.app.set_reasoning_visible(visible);
-        chat.app.set_reasoning_display_mode(mode);
-        chat.app.set_status(format!(
-            "reasoning output settings applied: {}",
-            chat.app.thinking_label()
-        ));
-        return Ok(true);
-    };
-    execute_session_view_action(
-        client,
-        SessionViewAction::SetReasoning {
-            session_id,
-            effort,
-            summary,
-        },
-    )
-    .await?;
-    if let Some(generation) = effort_generation {
-        chat.app.clear_pending_reasoning_effort(generation);
-    }
-    chat.app.set_reasoning_visible(visible);
-    chat.app.set_reasoning_display_mode(mode);
-    if let Ok(status) = client.session_model_status(session_id).await {
-        chat.app.apply_model_status(status);
-    }
-    let mode = match chat.app.reasoning_display_mode() {
-        bcode_config::TuiThinkingMode::All => "all",
-        bcode_config::TuiThinkingMode::Summary => "summary",
-        bcode_config::TuiThinkingMode::Raw => "raw",
-    };
-    chat.app.set_status(format!(
-        "reasoning output settings applied: {} · displayed reasoning: {mode}",
-        chat.app.thinking_label()
-    ));
-    Ok(true)
 }
 
 #[cfg(test)]
