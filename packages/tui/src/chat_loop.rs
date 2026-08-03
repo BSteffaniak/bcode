@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bcode_client::{BcodeClient, ClientError, DaemonAvailability};
+use bcode_command::CommandAction;
 use bcode_config::TuiConfig;
 use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
 use bcode_plugin::PluginRuntimeHost;
@@ -120,6 +121,12 @@ impl DraftAutosave {
     }
 }
 
+pub enum SlashPaletteRootOutcome {
+    Unhandled,
+    Handled,
+    Submit,
+}
+
 pub struct ChatLoopState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
@@ -129,6 +136,7 @@ pub struct ChatLoopState {
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     interactive_surface: Option<InteractiveSurfaceState>,
+    interactive_surface_area: Option<Rect>,
     interactive_surface_queue: InteractiveSurfaceQueue,
     plugin_runtime: Option<PluginRuntimeHost>,
     artifact_stream: ArtifactStreamCoordinator,
@@ -163,6 +171,7 @@ impl ChatLoopState {
             thinking_dialog: None,
             timeline_dialog: None,
             interactive_surface: None,
+            interactive_surface_area: None,
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
             plugin_runtime: None,
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
@@ -306,6 +315,136 @@ impl ChatLoopState {
         update_slash_palette_async(chat, self)
     }
 
+    pub const fn has_command_palette(&self) -> bool {
+        self.palette.is_some()
+    }
+
+    pub fn open_command_palette(&mut self, chat: &mut ActiveChat) {
+        self.palette = Some(BmuxCommandPalette::new());
+        self.replace_effect(TuiEffect::LoadCommandPalette);
+        chat.app
+            .set_status("command palette: type to filter, enter to run, esc close".to_owned());
+    }
+
+    pub fn handle_command_palette_key(&mut self, stroke: KeyStroke) -> Option<CommandAction> {
+        let palette = self.palette.as_mut()?;
+        let items = palette.cloned_items();
+        let widget = bmux_tui::palette::CommandPalette::new(&items);
+        match widget.handle_key(palette.state_mut(), 12, stroke) {
+            bmux_tui::palette::CommandPaletteKeyOutcome::Ignored
+            | bmux_tui::palette::CommandPaletteKeyOutcome::QueryEdited
+            | bmux_tui::palette::CommandPaletteKeyOutcome::SelectionMoved => None,
+            bmux_tui::palette::CommandPaletteKeyOutcome::Canceled => {
+                self.palette = None;
+                None
+            }
+            bmux_tui::palette::CommandPaletteKeyOutcome::Activated(index) => {
+                let action = palette.contribution_at(index).map(|item| item.action);
+                self.palette = None;
+                action
+            }
+        }
+    }
+
+    pub fn handle_command_palette_mouse(
+        &mut self,
+        mouse: bmux_tui::event::MouseEvent,
+        frame_area: Rect,
+    ) -> Option<CommandAction> {
+        let index = super::picker_mouse::command_palette_row_in_area(
+            mouse,
+            super::command_palette_render::palette_area(frame_area),
+        )?;
+        let palette = self.palette.as_mut()?;
+        let action = palette.contribution_at(index).map(|item| item.action);
+        self.palette = None;
+        action
+    }
+
+    pub const fn has_slash_palette(&self) -> bool {
+        self.slash_palette.is_some()
+    }
+
+    pub fn handle_slash_palette_key(
+        &mut self,
+        chat: &mut ActiveChat,
+        stroke: KeyStroke,
+    ) -> SlashPaletteRootOutcome {
+        let Some(palette) = self.slash_palette.as_mut() else {
+            return SlashPaletteRootOutcome::Unhandled;
+        };
+        match stroke.key {
+            bmux_keyboard::KeyCode::Up if stroke.modifiers.is_empty() => {
+                palette.move_previous();
+                SlashPaletteRootOutcome::Handled
+            }
+            bmux_keyboard::KeyCode::Down if stroke.modifiers.is_empty() => {
+                palette.move_next();
+                SlashPaletteRootOutcome::Handled
+            }
+            bmux_keyboard::KeyCode::Tab if stroke.modifiers.is_empty() => {
+                let command = palette.selected_command().map(str::to_owned);
+                self.slash_palette = None;
+                if let Some(command) = command {
+                    chat.app.reset_input_history_navigation();
+                    chat.app.replace_composer_with(&command);
+                }
+                SlashPaletteRootOutcome::Handled
+            }
+            bmux_keyboard::KeyCode::Enter if stroke.modifiers.is_empty() => {
+                if palette.selected_matches(chat.app.composer().text()) {
+                    self.slash_palette = None;
+                    chat.app.stage_submission();
+                    SlashPaletteRootOutcome::Submit
+                } else {
+                    let command = palette.selected_command().map(str::to_owned);
+                    self.slash_palette = None;
+                    if let Some(command) = command {
+                        chat.app.reset_input_history_navigation();
+                        chat.app.replace_composer_with(&command);
+                    }
+                    SlashPaletteRootOutcome::Handled
+                }
+            }
+            bmux_keyboard::KeyCode::Escape if stroke.modifiers.is_empty() => {
+                self.slash_palette = None;
+                chat.app.set_status("slash completions hidden".to_owned());
+                SlashPaletteRootOutcome::Handled
+            }
+            _ => SlashPaletteRootOutcome::Unhandled,
+        }
+    }
+
+    pub fn handle_slash_palette_mouse(
+        &mut self,
+        chat: &mut ActiveChat,
+        mouse: bmux_tui::event::MouseEvent,
+        frame_area: Rect,
+    ) -> bool {
+        let Some(palette) = self.slash_palette.as_mut() else {
+            return false;
+        };
+        let Some(row) = super::slash_palette_render::slash_palette_row_from_mouse(
+            frame_area,
+            chat.app.composer_content_area(),
+            mouse.position.x,
+            mouse.position.y,
+            palette.item_count(),
+        ) else {
+            self.slash_palette = None;
+            return true;
+        };
+        if let Some(command) = palette
+            .select_visible_row(row, usize::from(frame_area.height))
+            .map(str::to_owned)
+        {
+            chat.app.reset_input_history_navigation();
+            chat.app.replace_composer_with(&command);
+        }
+        self.slash_palette = None;
+        true
+    }
+
     pub fn session_changed(&mut self, session_id: Option<bcode_session_models::SessionId>) {
         self.request_draft_handoff.clear();
         self.markdown_projection.invalidate();
@@ -361,6 +500,10 @@ impl ChatLoopState {
                 false
             }
         }
+    }
+
+    pub const fn active_interactive_surface_area(&self) -> Option<Rect> {
+        self.interactive_surface_area
     }
 
     pub const fn has_interactive_surface(&self) -> bool {
@@ -1156,6 +1299,44 @@ pub fn apply_effect_result(
         TuiEffectResult::SlashPaletteLoaded { query, palette } => {
             apply_slash_palette_result(chat, loop_state, &query, palette);
         }
+        TuiEffectResult::CommandPaletteLoaded { result } => {
+            if loop_state.palette.is_some() {
+                match result {
+                    Ok(contributions) => {
+                        loop_state.palette = Some(BmuxCommandPalette::with_command_contributions(
+                            contributions,
+                        ));
+                    }
+                    Err(error) => chat.app.set_status(format!(
+                        "plugin commands unavailable; using host commands: {error}"
+                    )),
+                }
+            }
+        }
+        TuiEffectResult::PluginCommandInvoked { plugin_id, result } => match result {
+            Ok(response) => {
+                if let Some(message) = response.message {
+                    chat.app.set_status(message);
+                }
+                for effect in response.effects {
+                    match effect {
+                        bcode_command::CommandEffect::Status { message } => {
+                            chat.app.set_status(message);
+                        }
+                        bcode_command::CommandEffect::AppendText { text, format } => {
+                            chat.push_presentation_note(plugin_id.clone(), text, format);
+                        }
+                        bcode_command::CommandEffect::ToggleSurface { surface_id } => chat
+                            .app
+                            .set_status(format!("surface toggle requested: {surface_id}")),
+                        bcode_command::CommandEffect::OpenPluginSurface { .. } => chat
+                            .app
+                            .set_status("plugin surface pending root screen migration".to_owned()),
+                    }
+                }
+            }
+            Err(error) => report_nonfatal_tui_error(chat, "Plugin command failed", &error),
+        },
         TuiEffectResult::SubmitMessage { message, result } => {
             apply_submit_message_result(chat, &message, *result);
         }
@@ -2520,6 +2701,10 @@ pub fn draw_chat_frame<W: Write>(
             }
         }
     })?;
+    loop_state.interactive_surface_area = loop_state
+        .interactive_surface
+        .as_ref()
+        .map(|_| surface_area);
     loop_state.telemetry.record_histogram(
         "tui.frame.changed_cells",
         u64::try_from(draw_stats.changed_cells).unwrap_or(u64::MAX),

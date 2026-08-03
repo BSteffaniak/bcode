@@ -200,6 +200,8 @@ pub struct BcodeRuntimeModel {
     pub invalidation: super::invalidation::UiInvalidation,
     /// Last successfully committed terminal hit map used for pointer routing.
     pub committed_hits: bmux_tui::hit::HitMap,
+    /// Last successfully committed terminal frame area.
+    pub committed_area: bmux_tui::geometry::Rect,
     /// Last successfully committed presentation timestamp.
     pub last_presented_at: Option<Instant>,
     /// Whether the root program should terminate after its dirty state is committed.
@@ -246,6 +248,7 @@ impl BcodeRuntimeModel {
             ordered_notes: OrderedPresentationQueue::default(),
             invalidation: super::invalidation::UiInvalidation::Full,
             committed_hits: bmux_tui::hit::HitMap::default(),
+            committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
             last_presented_at: None,
             exit_requested: false,
         }
@@ -333,7 +336,7 @@ impl BcodeRuntimeModel {
             .set_status(format!("resolving permission: {label}"));
     }
 
-    #[allow(clippy::let_and_return)]
+    #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn handle_basic_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
         let damage = match event {
             Event::Resize(_) => super::invalidation::UiInvalidation::Full,
@@ -349,6 +352,42 @@ impl BcodeRuntimeModel {
             Event::Key(stroke) => {
                 if self.loop_state.permission_dialog.is_some() {
                     return self.handle_permission_key(stroke);
+                }
+                if self.loop_state.has_command_palette() {
+                    if let Some(action) = self.loop_state.handle_command_palette_key(stroke) {
+                        self.apply_root_command_action(action);
+                    }
+                    return super::invalidation::UiInvalidation::Structural;
+                }
+                if self.loop_state.has_slash_palette() {
+                    match self
+                        .loop_state
+                        .handle_slash_palette_key(&mut self.chat, stroke)
+                    {
+                        super::chat_loop::SlashPaletteRootOutcome::Handled => {
+                            return super::invalidation::UiInvalidation::Structural;
+                        }
+                        super::chat_loop::SlashPaletteRootOutcome::Submit => {
+                            let launch_working_directory =
+                                self.settings.launch_working_directory().to_path_buf();
+                            let _staged = super::composer_flow::stage_session_message(
+                                &launch_working_directory,
+                                &mut self.chat,
+                                bcode_ipc::PromptPlacement::Steering,
+                            );
+                            return super::invalidation::UiInvalidation::Structural;
+                        }
+                        super::chat_loop::SlashPaletteRootOutcome::Unhandled => {}
+                    }
+                }
+                if self
+                    .settings
+                    .keymap()
+                    .action_for_key(super::keymap::BmuxScope::Chat, stroke)
+                    == Some(super::keymap::BmuxAction::CommandPaletteOpen)
+                {
+                    self.loop_state.open_command_palette(&mut self.chat);
+                    return super::invalidation::UiInvalidation::Structural;
                 }
                 let outcome =
                     super::input::handle_key(&mut self.chat.app, self.settings.keymap(), stroke);
@@ -384,6 +423,23 @@ impl BcodeRuntimeModel {
                 }
             }
             Event::Mouse(mouse) => {
+                if self.loop_state.has_command_palette() {
+                    if let Some(action) = self
+                        .loop_state
+                        .handle_command_palette_mouse(mouse, self.committed_area)
+                    {
+                        self.apply_root_command_action(action);
+                    }
+                    return super::invalidation::UiInvalidation::Structural;
+                }
+                if self.loop_state.has_slash_palette() {
+                    let _handled = self.loop_state.handle_slash_palette_mouse(
+                        &mut self.chat,
+                        mouse,
+                        self.committed_area,
+                    );
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 let hit_id = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse);
                 let changed = if self.loop_state.permission_dialog.is_some() {
                     super::mouse_flow::handle_permission_action_mouse(
@@ -413,6 +469,69 @@ impl BcodeRuntimeModel {
             }
         };
         damage
+    }
+
+    fn apply_root_command_action(&mut self, action: bcode_command::CommandAction) {
+        match action {
+            bcode_command::CommandAction::Host { route } => match route.as_str() {
+                "session.new" => {
+                    super::session_flow::switch_to_draft_session(&mut self.chat);
+                    self.chat
+                        .replace_effect(super::effects::TuiEffect::LoadDraftStatus {
+                            launch_working_directory: self
+                                .settings
+                                .launch_working_directory()
+                                .to_path_buf(),
+                        });
+                }
+                "turn.cancel" => {
+                    super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
+                }
+                "context.compact" => {
+                    if let Some(session_id) = self.chat.session_id {
+                        self.chat
+                            .start_effect(super::effects::TuiEffect::CompactContext { session_id });
+                        self.chat.app.set_status("compacting context…".to_owned());
+                    } else {
+                        self.chat.app.set_status("No active session".to_owned());
+                    }
+                }
+                "help" => {
+                    self.chat.push_presentation_note(
+                        "bcode.host",
+                        "# TUI help\n\n* Use the command palette for sessions, cancellation, and context compaction."
+                            .to_owned(),
+                        bcode_command::CommandTextFormat::Markdown,
+                    );
+                    self.chat.app.set_status("help shown".to_owned());
+                }
+                route => self.chat.app.set_status(format!(
+                    "command route pending root screen migration: {route}"
+                )),
+            },
+            bcode_command::CommandAction::Plugin {
+                plugin_id,
+                command_id,
+            } => {
+                let working_directory = self
+                    .chat
+                    .app
+                    .working_directory()
+                    .unwrap_or_else(|| self.settings.launch_working_directory())
+                    .to_path_buf();
+                self.chat
+                    .start_effect(super::effects::TuiEffect::InvokePluginCommand {
+                        plugin_id,
+                        command_id,
+                        arguments: None,
+                        working_directory,
+                        session_id: self.chat.session_id,
+                    });
+                self.chat
+                    .app
+                    .set_status("running plugin command…".to_owned());
+            }
+        }
     }
 
     fn root_interactive_surface_host_key(
@@ -651,6 +770,7 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
             frame_interval,
         )?;
         program.committed_hits = self.terminal.hits().clone();
+        program.committed_area = self.terminal.area();
         program.presentation_committed(started);
         Ok(bmux_tui_runtime::PresentReport::default())
     }
@@ -781,8 +901,16 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         return Ok(bmux_tui_runtime::Update::redraw());
                     }
                 }
-                if let Some((interaction_id, resolution)) =
-                    self.loop_state.handle_interactive_surface_event(&event)
+                let route_to_surface = match event {
+                    Event::Mouse(mouse) if self.loop_state.has_interactive_surface() => self
+                        .loop_state
+                        .active_interactive_surface_area()
+                        .is_some_and(|area| area.contains(mouse.position)),
+                    _ => true,
+                };
+                if route_to_surface
+                    && let Some((interaction_id, resolution)) =
+                        self.loop_state.handle_interactive_surface_event(&event)
                 {
                     let command =
                         self.interactive_surface_resolution_command(interaction_id, resolution);

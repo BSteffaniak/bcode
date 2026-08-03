@@ -24,7 +24,7 @@ pub fn render_palette(palette: &mut BmuxCommandPalette, frame: &mut Frame<'_>, t
     widget.render(area, frame, palette.state_mut());
 }
 
-fn palette_area(area: Rect) -> Rect {
+pub fn palette_area(area: Rect) -> Rect {
     let width = area.width.saturating_sub(4).min(72);
     let height = area.height.saturating_sub(4).min(12);
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);

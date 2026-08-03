@@ -153,6 +153,21 @@ pub enum TuiEffect {
         /// Active session, if any.
         session_id: Option<SessionId>,
     },
+    /// Load host and plugin command-palette contributions.
+    LoadCommandPalette,
+    /// Invoke a plugin-owned command without terminal navigation effects.
+    InvokePluginCommand {
+        /// Plugin owner.
+        plugin_id: String,
+        /// Command identifier.
+        command_id: String,
+        /// Optional command arguments.
+        arguments: Option<String>,
+        /// Working directory context.
+        working_directory: std::path::PathBuf,
+        /// Active session context.
+        session_id: Option<SessionId>,
+    },
     /// Submit a user message through the daemon-backed session pipeline.
     SubmitMessage {
         /// Submit request.
@@ -423,6 +438,18 @@ pub enum TuiEffectResult {
         /// Loaded palette state.
         palette: slash_palette::SlashPalette,
     },
+    /// Command palette contributions load completed.
+    CommandPaletteLoaded {
+        /// Contributions result from the application client boundary.
+        result: Result<Vec<bcode_command::CommandContribution>, ClientError>,
+    },
+    /// Plugin command invocation completed.
+    PluginCommandInvoked {
+        /// Plugin owner.
+        plugin_id: String,
+        /// Typed command response.
+        result: Result<bcode_command::InvokeCommandResponse, TuiError>,
+    },
     /// Submit message completed.
     SubmitMessage {
         /// Message text originally submitted.
@@ -614,7 +641,9 @@ impl TuiEffectResult {
             }
             Self::ConfigLoaded { .. }
             | Self::AuthSecurityReconciled { .. }
-            | Self::SlashPaletteLoaded { .. } => DaemonObservation::None,
+            | Self::SlashPaletteLoaded { .. }
+            | Self::CommandPaletteLoaded { .. }
+            | Self::PluginCommandInvoked { .. } => DaemonObservation::None,
         }
     }
 }
@@ -688,6 +717,8 @@ enum EffectKey {
     PermissionList,
     DraftSave,
     SlashPalette,
+    CommandPalette,
+    PluginCommand(String, String),
     RenameSession(SessionId),
     DeleteSession(SessionId),
     ForkSession(SessionId),
@@ -870,7 +901,9 @@ impl TuiEffect {
             | Self::LoadNewerHistory { .. }
             | Self::ListPermissions
             | Self::SaveDraft { .. }
-            | Self::LoadSlashPalette { .. } => {
+            | Self::LoadSlashPalette { .. }
+            | Self::LoadCommandPalette
+            | Self::InvokePluginCommand { .. } => {
                 unreachable!("daemon start failure for non-foreground effect")
             }
         }
@@ -899,7 +932,8 @@ impl TuiEffect {
             | Self::AttachWorktree { .. }
             | Self::CreateWorktree { .. }
             | Self::CancelTurn { .. }
-            | Self::ResolvePermission { .. } => EffectDaemonIntent::Foreground,
+            | Self::ResolvePermission { .. }
+            | Self::InvokePluginCommand { .. } => EffectDaemonIntent::Foreground,
             Self::OpenSession {
                 allow_daemon_start: false,
                 ..
@@ -912,7 +946,8 @@ impl TuiEffect {
             | Self::LoadNewerHistory { .. }
             | Self::ListPermissions
             | Self::SaveDraft { .. }
-            | Self::LoadSlashPalette { .. } => EffectDaemonIntent::Background,
+            | Self::LoadSlashPalette { .. }
+            | Self::LoadCommandPalette => EffectDaemonIntent::Background,
         }
     }
 }
@@ -1305,6 +1340,12 @@ impl TuiEffect {
             Self::ListPermissions => EffectKey::PermissionList,
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
+            Self::LoadCommandPalette => EffectKey::CommandPalette,
+            Self::InvokePluginCommand {
+                plugin_id,
+                command_id,
+                ..
+            } => EffectKey::PluginCommand(plugin_id.clone(), command_id.clone()),
             Self::RenameSession { session_id, .. } => EffectKey::RenameSession(*session_id),
             Self::DeleteSession { session_id } => EffectKey::DeleteSession(*session_id),
             Self::ForkSession { session_id, .. } => EffectKey::ForkSession(*session_id),
@@ -1452,6 +1493,53 @@ impl TuiEffect {
             Self::LoadSlashPalette { query, session_id } => {
                 let palette = slash_palette::SlashPalette::new(&client, session_id, &query).await;
                 TuiEffectResult::SlashPaletteLoaded { query, palette }
+            }
+            Self::LoadCommandPalette => TuiEffectResult::CommandPaletteLoaded {
+                result: client
+                    .plugin_contributions()
+                    .await
+                    .map(|contributions| contributions.command_contributions),
+            },
+            Self::InvokePluginCommand {
+                plugin_id,
+                command_id,
+                arguments,
+                working_directory,
+                session_id,
+            } => {
+                let mut args = BTreeMap::new();
+                args.insert("cwd".to_owned(), working_directory.display().to_string());
+                if let Some(session_id) = session_id {
+                    args.insert("session_id".to_owned(), session_id.to_string());
+                }
+                if let Some(arguments) = arguments.filter(|value| !value.is_empty()) {
+                    args.insert("arguments".to_owned(), arguments);
+                }
+                let result = async {
+                    let payload = serde_json::to_vec(&bcode_command::InvokeCommandRequest {
+                        command_id,
+                        args,
+                    })?;
+                    let response = client
+                        .invoke_plugin_service(
+                            plugin_id.clone(),
+                            bcode_command::COMMAND_INTERFACE_ID.to_owned(),
+                            bcode_command::OP_INVOKE_COMMAND.to_owned(),
+                            payload,
+                        )
+                        .await?;
+                    if let Some(error) = response.error {
+                        return Err(TuiError::PluginService {
+                            code: error.code,
+                            message: error.message,
+                        });
+                    }
+                    Ok(serde_json::from_slice::<
+                        bcode_command::InvokeCommandResponse,
+                    >(&response.payload)?)
+                }
+                .await;
+                TuiEffectResult::PluginCommandInvoked { plugin_id, result }
             }
             Self::RenameSession { session_id, name } => TuiEffectResult::RenameSession {
                 result: match execute_session_view_action(
