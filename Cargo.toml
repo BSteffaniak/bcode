@@ -244,6 +244,9 @@ aws-sdk-bedrockruntime = { version = "1.130.0", default-features = false, featur
     "rt-tokio",
     "rustls",
 ] }
+aws-smithy-runtime-api = { version = "1.14.0", default-features = false, features = [
+    "client",
+] }
 aws-smithy-types = { version = "1.4.7", default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 brush-parser = { version = "0.4.0", default-features = false }

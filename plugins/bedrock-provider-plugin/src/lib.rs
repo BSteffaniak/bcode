@@ -2602,8 +2602,13 @@ fn bedrock_sdk_error(
             aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => {
                 ("timeout", ProviderErrorCategory::Timeout)
             }
-            aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(_) => {
-                ("dispatch", ProviderErrorCategory::Network)
+            aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(dispatch) => {
+                return bedrock_dispatch_error(
+                    "bedrock_request_failed",
+                    "Bedrock runtime",
+                    dispatch,
+                    bcode_model::ProviderFailureCapability::ModelInvocation,
+                );
             }
             aws_sdk_bedrockruntime::error::SdkError::ResponseError(_) => {
                 ("response", ProviderErrorCategory::Network)
@@ -2671,6 +2676,299 @@ fn bedrock_failure_context(
         source: source.into(),
         capability,
         remediation: remediation.into(),
+    }
+}
+
+const MAX_BEDROCK_ERROR_CHAIN_DEPTH: usize = 16;
+const MAX_BEDROCK_SOURCE_MESSAGE_CHARS: usize = 512;
+
+#[allow(clippy::too_many_lines)]
+fn bedrock_dispatch_error(
+    code: &str,
+    operation: &str,
+    dispatch: &aws_smithy_runtime_api::client::result::DispatchFailure,
+    capability: bcode_model::ProviderFailureCapability,
+) -> ProviderError {
+    let connector = dispatch
+        .as_connector_error()
+        .expect("AWS dispatch failures contain a connector error");
+    let connector_kind = if connector.is_timeout() {
+        "timeout"
+    } else if connector.is_io() {
+        "io"
+    } else if connector.is_user() {
+        "user"
+    } else if connector.is_other() {
+        "other"
+    } else {
+        "unknown"
+    };
+    let category = if connector.is_timeout() {
+        ProviderErrorCategory::Timeout
+    } else if connector.is_user() {
+        ProviderErrorCategory::Config
+    } else {
+        ProviderErrorCategory::Network
+    };
+    let mut normalized = provider_error(code, category, format!("{operation} dispatch failure"));
+    normalized
+        .diagnostic_context
+        .insert("transport_kind".to_string(), "dispatch".to_string());
+    normalized.diagnostic_context.insert(
+        "connector_error_kind".to_string(),
+        connector_kind.to_string(),
+    );
+    if let Some(retry_kind) = connector.as_other() {
+        normalized.diagnostic_context.insert(
+            "connector_retry_kind".to_string(),
+            retry_kind.to_string().replace(' ', "_"),
+        );
+    }
+    normalized.diagnostic_context.insert(
+        "connection_established".to_string(),
+        connector.connection_metadata().is_some().to_string(),
+    );
+
+    let chain = bedrock_error_chain(connector);
+    normalized.diagnostic_context.insert(
+        "error_chain_depth".to_string(),
+        chain.sources.len().to_string(),
+    );
+    if chain.truncated {
+        normalized
+            .diagnostic_context
+            .insert("error_chain_truncated".to_string(), "true".to_string());
+    }
+    if let Some(io_error) = preferred_bedrock_io_error(&chain.sources) {
+        normalized.diagnostic_context.insert(
+            "io_error_kind".to_string(),
+            bedrock_io_error_kind(io_error.kind()).to_string(),
+        );
+        if let Some(os_error) = io_error.raw_os_error() {
+            normalized
+                .diagnostic_context
+                .insert("os_error_code".to_string(), os_error.to_string());
+        }
+    }
+    if let Some(tls_error) = chain
+        .sources
+        .iter()
+        .find_map(|source| source.downcast_ref::<rustls::Error>())
+    {
+        normalized.diagnostic_context.insert(
+            "tls_error_kind".to_string(),
+            bedrock_rustls_error_kind(tls_error).to_string(),
+        );
+    }
+    if let Some(root) = chain.sources.last() {
+        let (root_source, root_code) = bedrock_error_source_identity(
+            *root,
+            chain.sources.len().saturating_sub(1),
+            chain.sources.len(),
+        );
+        normalized
+            .diagnostic_context
+            .insert("root_error_source".to_string(), root_source);
+        normalized
+            .diagnostic_context
+            .insert("root_error_code".to_string(), root_code);
+        normalized.diagnostic_context.insert(
+            "root_error_message".to_string(),
+            safe_bedrock_source_message(&root.to_string()),
+        );
+    }
+    normalized.sources.push(ProviderErrorSource {
+        source: "aws_sdk".to_string(),
+        code: Some("dispatch".to_string()),
+        message: None,
+    });
+    normalized
+        .sources
+        .extend(chain.sources.iter().enumerate().map(|(index, source)| {
+            let (source_name, source_code) =
+                bedrock_error_source_identity(*source, index, chain.sources.len());
+            ProviderErrorSource {
+                source: source_name,
+                code: Some(source_code),
+                message: Some(safe_bedrock_source_message(&source.to_string())),
+            }
+        }));
+    if matches!(
+        category,
+        ProviderErrorCategory::Auth | ProviderErrorCategory::Config
+    ) {
+        normalized.failure = Some(Box::new(bedrock_failure_context(
+            bcode_model::ProviderFailureSourceKind::Runtime,
+            "aws_sdk_connector",
+            capability,
+            "verify the AWS region, endpoint, credentials, proxy, TLS trust roots, and network policy",
+        )));
+    }
+    normalized
+}
+
+struct BedrockErrorChain<'a> {
+    sources: Vec<&'a (dyn std::error::Error + 'static)>,
+    truncated: bool,
+}
+
+fn bedrock_error_chain<'a>(error: &'a (dyn std::error::Error + 'static)) -> BedrockErrorChain<'a> {
+    let mut sources = Vec::new();
+    let mut source = bedrock_nested_error_source(error);
+    while let Some(current) = source
+        && sources.len() < MAX_BEDROCK_ERROR_CHAIN_DEPTH
+    {
+        sources.push(current);
+        source = bedrock_nested_error_source(current);
+    }
+    BedrockErrorChain {
+        sources,
+        truncated: source.is_some(),
+    }
+}
+
+fn bedrock_nested_error_source<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    error.source().or_else(|| {
+        error.downcast_ref::<std::io::Error>().and_then(|error| {
+            error
+                .get_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static))
+        })
+    })
+}
+
+fn preferred_bedrock_io_error<'a>(
+    chain: &[&'a (dyn std::error::Error + 'static)],
+) -> Option<&'a std::io::Error> {
+    let errors = chain
+        .iter()
+        .filter_map(|source| source.downcast_ref::<std::io::Error>())
+        .collect::<Vec<_>>();
+    errors
+        .iter()
+        .rev()
+        .copied()
+        .find(|error| error.kind() != std::io::ErrorKind::Other)
+        .or_else(|| errors.last().copied())
+}
+
+fn bedrock_error_source_identity(
+    source: &(dyn std::error::Error + 'static),
+    index: usize,
+    chain_len: usize,
+) -> (String, String) {
+    if let Some(io_error) = source.downcast_ref::<std::io::Error>() {
+        return (
+            if index + 1 == chain_len {
+                "io_root"
+            } else {
+                "io"
+            }
+            .to_string(),
+            bedrock_io_error_kind(io_error.kind()).to_string(),
+        );
+    }
+    if let Some(tls_error) = source.downcast_ref::<rustls::Error>() {
+        return (
+            if index + 1 == chain_len {
+                "rustls_root"
+            } else {
+                "rustls"
+            }
+            .to_string(),
+            bedrock_rustls_error_kind(tls_error).to_string(),
+        );
+    }
+    let message = source.to_string().to_ascii_lowercase();
+    let code = if message.contains("dns") {
+        "dns"
+    } else if message.contains("proxy") || message.contains("tunnel") {
+        "proxy"
+    } else if message.contains("certificate") || message.contains("tls") {
+        "tls"
+    } else if message.contains("connect") || message.contains("tcp") {
+        "connect"
+    } else {
+        "unknown"
+    };
+    (
+        if index + 1 == chain_len {
+            "transport_root"
+        } else {
+            "transport"
+        }
+        .to_string(),
+        code.to_string(),
+    )
+}
+
+fn safe_bedrock_source_message(message: &str) -> String {
+    let sanitized = sanitize_provider_diagnostic(message);
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let prefix = chars
+        .by_ref()
+        .take(MAX_BEDROCK_SOURCE_MESSAGE_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…[TRUNCATED]")
+    } else {
+        prefix
+    }
+}
+
+const fn bedrock_io_error_kind(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::ConnectionRefused => "connection_refused",
+        std::io::ErrorKind::ConnectionReset => "connection_reset",
+        std::io::ErrorKind::HostUnreachable => "host_unreachable",
+        std::io::ErrorKind::NetworkUnreachable => "network_unreachable",
+        std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+        std::io::ErrorKind::NotConnected => "not_connected",
+        std::io::ErrorKind::AddrNotAvailable => "address_not_available",
+        std::io::ErrorKind::NetworkDown => "network_down",
+        std::io::ErrorKind::BrokenPipe => "broken_pipe",
+        std::io::ErrorKind::TimedOut => "timed_out",
+        std::io::ErrorKind::Interrupted => "interrupted",
+        std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+        std::io::ErrorKind::InvalidData => "invalid_data",
+        _ => "other",
+    }
+}
+
+const fn bedrock_rustls_error_kind(error: &rustls::Error) -> &'static str {
+    match error {
+        rustls::Error::InvalidCertificate(certificate_error) => {
+            bedrock_certificate_error_kind(certificate_error)
+        }
+        rustls::Error::NoCertificatesPresented => "no_certificates_presented",
+        rustls::Error::PeerIncompatible(_) => "peer_incompatible",
+        rustls::Error::PeerMisbehaved(_) => "peer_misbehaved",
+        rustls::Error::NoApplicationProtocol => "no_application_protocol",
+        rustls::Error::AlertReceived(_) => "alert_received",
+        _ => "tls_protocol_error",
+    }
+}
+
+const fn bedrock_certificate_error_kind(error: &rustls::CertificateError) -> &'static str {
+    match error {
+        rustls::CertificateError::BadEncoding => "certificate_bad_encoding",
+        rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
+            "certificate_expired"
+        }
+        rustls::CertificateError::NotValidYet
+        | rustls::CertificateError::NotValidYetContext { .. } => "certificate_not_valid_yet",
+        rustls::CertificateError::Revoked => "certificate_revoked",
+        rustls::CertificateError::UnknownIssuer => "certificate_unknown_issuer",
+        rustls::CertificateError::BadSignature => "certificate_bad_signature",
+        rustls::CertificateError::NotValidForName
+        | rustls::CertificateError::NotValidForNameContext { .. } => {
+            "certificate_not_valid_for_name"
+        }
+        _ => "certificate_error",
     }
 }
 
@@ -2792,9 +3090,12 @@ where
         bedrock::error::SdkError::TimeoutError(_) => {
             bedrock_transport_error("timeout", ProviderErrorCategory::Timeout)
         }
-        bedrock::error::SdkError::DispatchFailure(_) => {
-            bedrock_transport_error("dispatch", ProviderErrorCategory::Network)
-        }
+        bedrock::error::SdkError::DispatchFailure(dispatch) => bedrock_dispatch_error(
+            "bedrock_model_discovery_failed",
+            "Bedrock model discovery",
+            dispatch,
+            bcode_model::ProviderFailureCapability::ModelDiscovery,
+        ),
         bedrock::error::SdkError::ResponseError(_) => {
             bedrock_transport_error("response", ProviderErrorCategory::Network)
         }
@@ -2844,8 +3145,13 @@ fn bedrock_stream_error<R>(
             aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => {
                 ("timeout", ProviderErrorCategory::Timeout)
             }
-            aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(_) => {
-                ("dispatch", ProviderErrorCategory::Network)
+            aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(dispatch) => {
+                return bedrock_dispatch_error(
+                    "bedrock_stream_failed",
+                    "Bedrock stream",
+                    dispatch,
+                    bcode_model::ProviderFailureCapability::ModelInvocation,
+                );
             }
             aws_sdk_bedrockruntime::error::SdkError::ResponseError(_) => {
                 ("response", ProviderErrorCategory::Network)
@@ -3647,6 +3953,96 @@ mod tests {
             filtered.models[1]
                 .capabilities
                 .contains(&ModelCapability::PromptCaching)
+        );
+    }
+
+    #[test]
+    fn dispatch_error_preserves_connector_root_cause() {
+        let connector = aws_smithy_runtime_api::client::result::ConnectorError::io(Box::new(
+            std::io::Error::from(std::io::ErrorKind::NetworkUnreachable),
+        ));
+        let dispatch = aws_smithy_runtime_api::client::result::DispatchFailure::builder()
+            .source(connector)
+            .build();
+
+        let error = bedrock_dispatch_error(
+            "bedrock_request_failed",
+            "Bedrock runtime",
+            &dispatch,
+            bcode_model::ProviderFailureCapability::ModelInvocation,
+        );
+
+        assert_eq!(error.category, ProviderErrorCategory::Network);
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("connector_error_kind")
+                .map(String::as_str),
+            Some("io")
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("io_error_kind")
+                .map(String::as_str),
+            Some("network_unreachable")
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("root_error_source")
+                .map(String::as_str),
+            Some("io_root")
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("root_error_message")
+                .map(String::as_str),
+            Some("network unreachable")
+        );
+        assert!(matches!(
+            error.sources.as_slice(),
+            [
+                ProviderErrorSource { source: aws, code: Some(dispatch), .. },
+                ProviderErrorSource { source: root, code: Some(root_code), .. }
+            ] if aws == "aws_sdk"
+                && dispatch == "dispatch"
+                && root == "io_root"
+                && root_code == "network_unreachable"
+        ));
+    }
+
+    #[test]
+    fn dispatch_error_classifies_tls_unknown_issuer() {
+        let tls = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        let connector = aws_smithy_runtime_api::client::result::ConnectorError::io(Box::new(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, tls),
+        ));
+        let dispatch = aws_smithy_runtime_api::client::result::DispatchFailure::builder()
+            .source(connector)
+            .build();
+
+        let error = bedrock_dispatch_error(
+            "bedrock_request_failed",
+            "Bedrock runtime",
+            &dispatch,
+            bcode_model::ProviderFailureCapability::ModelInvocation,
+        );
+
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("tls_error_kind")
+                .map(String::as_str),
+            Some("certificate_unknown_issuer")
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("root_error_source")
+                .map(String::as_str),
+            Some("rustls_root")
         );
     }
 
