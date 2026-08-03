@@ -8445,12 +8445,128 @@ fn reqwest_provider_error(code: &'static str, error: &reqwest::Error) -> Provide
     normalized
         .diagnostic_context
         .insert("transport_kind".to_string(), transport_code.to_string());
+    if let Some(io_error) = error_chain_source::<std::io::Error>(error) {
+        normalized.diagnostic_context.insert(
+            "io_error_kind".to_string(),
+            io_error_kind_name(io_error.kind()).to_string(),
+        );
+        if let Some(os_error) = io_error.raw_os_error() {
+            normalized
+                .diagnostic_context
+                .insert("os_error_code".to_string(), os_error.to_string());
+        }
+    }
+    if let Some(tls_error) = error_chain_source::<rustls::Error>(error) {
+        normalized.diagnostic_context.insert(
+            "tls_error_kind".to_string(),
+            rustls_error_kind(tls_error).to_string(),
+        );
+    }
     normalized.sources.push(ProviderErrorSource {
         source: "reqwest".to_string(),
         code: Some(transport_code.to_string()),
         message: None,
     });
     normalized
+}
+
+fn error_chain_source<'a, T>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a T>
+where
+    T: std::error::Error + 'static,
+{
+    let mut source = error.source();
+    while let Some(current) = source {
+        if let Some(matched) = current.downcast_ref::<T>() {
+            return Some(matched);
+        }
+        source = current.source();
+    }
+    None
+}
+
+const fn io_error_kind_name(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::ConnectionRefused => "connection_refused",
+        std::io::ErrorKind::ConnectionReset => "connection_reset",
+        std::io::ErrorKind::HostUnreachable => "host_unreachable",
+        std::io::ErrorKind::NetworkUnreachable => "network_unreachable",
+        std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+        std::io::ErrorKind::NotConnected => "not_connected",
+        std::io::ErrorKind::AddrInUse => "address_in_use",
+        std::io::ErrorKind::AddrNotAvailable => "address_not_available",
+        std::io::ErrorKind::NetworkDown => "network_down",
+        std::io::ErrorKind::BrokenPipe => "broken_pipe",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        std::io::ErrorKind::WouldBlock => "would_block",
+        std::io::ErrorKind::InvalidInput => "invalid_input",
+        std::io::ErrorKind::InvalidData => "invalid_data",
+        std::io::ErrorKind::TimedOut => "timed_out",
+        std::io::ErrorKind::WriteZero => "write_zero",
+        std::io::ErrorKind::StorageFull => "storage_full",
+        std::io::ErrorKind::NotSeekable => "not_seekable",
+        std::io::ErrorKind::QuotaExceeded => "quota_exceeded",
+        std::io::ErrorKind::FileTooLarge => "file_too_large",
+        std::io::ErrorKind::ResourceBusy => "resource_busy",
+        std::io::ErrorKind::ExecutableFileBusy => "executable_file_busy",
+        std::io::ErrorKind::Deadlock => "deadlock",
+        std::io::ErrorKind::CrossesDevices => "crosses_devices",
+        std::io::ErrorKind::TooManyLinks => "too_many_links",
+        std::io::ErrorKind::InvalidFilename => "invalid_filename",
+        std::io::ErrorKind::ArgumentListTooLong => "argument_list_too_long",
+        std::io::ErrorKind::Interrupted => "interrupted",
+        std::io::ErrorKind::Unsupported => "unsupported",
+        std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+        std::io::ErrorKind::OutOfMemory => "out_of_memory",
+        _ => "other",
+    }
+}
+
+const fn rustls_error_kind(error: &rustls::Error) -> &'static str {
+    match error {
+        rustls::Error::InvalidCertificate(certificate_error) => {
+            rustls_certificate_error_kind(certificate_error)
+        }
+        rustls::Error::NoCertificatesPresented => "no_certificates_presented",
+        rustls::Error::PeerIncompatible(_) => "peer_incompatible",
+        rustls::Error::PeerMisbehaved(_) => "peer_misbehaved",
+        rustls::Error::NoApplicationProtocol => "no_application_protocol",
+        rustls::Error::AlertReceived(_) => "alert_received",
+        _ => "tls_protocol_error",
+    }
+}
+
+const fn rustls_certificate_error_kind(error: &rustls::CertificateError) -> &'static str {
+    match error {
+        rustls::CertificateError::BadEncoding => "certificate_bad_encoding",
+        rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
+            "certificate_expired"
+        }
+        rustls::CertificateError::NotValidYet
+        | rustls::CertificateError::NotValidYetContext { .. } => "certificate_not_valid_yet",
+        rustls::CertificateError::Revoked => "certificate_revoked",
+        rustls::CertificateError::UnhandledCriticalExtension => {
+            "certificate_unhandled_critical_extension"
+        }
+        rustls::CertificateError::UnknownIssuer => "certificate_unknown_issuer",
+        rustls::CertificateError::UnknownRevocationStatus => {
+            "certificate_unknown_revocation_status"
+        }
+        rustls::CertificateError::ExpiredRevocationList => "certificate_expired_revocation_list",
+        rustls::CertificateError::BadSignature => "certificate_bad_signature",
+        rustls::CertificateError::NotValidForName
+        | rustls::CertificateError::NotValidForNameContext { .. } => {
+            "certificate_not_valid_for_name"
+        }
+        rustls::CertificateError::InvalidPurpose
+        | rustls::CertificateError::InvalidPurposeContext { .. } => "certificate_invalid_purpose",
+        rustls::CertificateError::InvalidOcspResponse => "certificate_invalid_ocsp_response",
+        rustls::CertificateError::ApplicationVerificationFailure => {
+            "certificate_application_verification_failure"
+        }
+        _ => "certificate_error",
+    }
 }
 
 #[cfg(test)]
@@ -11691,6 +11807,18 @@ mod tests {
         assert!(error.provider_message.is_none());
         assert!(error.sources.iter().all(|source| source.message.is_none()));
         assert!(!format!("{error:?}").contains("do-not-expose"));
+    }
+
+    #[test]
+    fn transport_error_helpers_preserve_typed_safe_causes() {
+        let io_error = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(io_error_kind_name(io_error.kind()), "connection_refused");
+        assert_eq!(
+            rustls_error_kind(&rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            )),
+            "certificate_unknown_issuer"
+        );
     }
 
     #[test]

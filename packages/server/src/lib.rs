@@ -19350,7 +19350,7 @@ async fn retry_after_provider_error(
     append_system_event(
         state,
         session_id,
-        provider_retry_message(policy, delay, attempt),
+        provider_retry_message(policy, error, delay, attempt),
     )
     .await;
 
@@ -19363,7 +19363,12 @@ async fn retry_after_provider_error(
     }
 }
 
-fn provider_retry_message(policy: &ProviderRetryPolicy, delay: Duration, attempt: u64) -> String {
+fn provider_retry_message(
+    policy: &ProviderRetryPolicy,
+    error: &bcode_model::ProviderError,
+    delay: Duration,
+    attempt: u64,
+) -> String {
     let reason = match policy.kind {
         ProviderRetryPolicyKind::Overload => Some("Model provider is overloaded."),
         ProviderRetryPolicyKind::NoProgressTimeout => {
@@ -19376,17 +19381,72 @@ fn provider_retry_message(policy: &ProviderRetryPolicy, delay: Duration, attempt
         || format!("attempt {attempt}"),
         |max_retries| format!("attempt {attempt}/{max_retries}"),
     );
+    let detail = provider_error_detail(error);
     if let Some(reason) = reason {
         return format!(
-            "{reason} Retrying automatically in {} ({attempt}).",
+            "{reason} {detail} Retrying automatically in {} ({attempt}).",
             format_retry_delay(delay),
         );
     }
     format!(
-        "Model provider error matched retry rule {:?}. Retrying automatically in {} ({attempt}).",
+        "Model provider error matched retry rule {:?}. {detail} Retrying automatically in {} ({attempt}).",
         policy.display_name,
         format_retry_delay(delay),
     )
+}
+
+fn provider_error_detail(error: &bcode_model::ProviderError) -> String {
+    let category = provider_error_category_name(error.category);
+    let mut metadata = error
+        .diagnostic_context
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    metadata.extend(error.sources.iter().map(|source| {
+        let code = source.code.as_deref().map_or_else(
+            || source.source.clone(),
+            |code| format!("{}/{code}", source.source),
+        );
+        source
+            .message
+            .as_deref()
+            .filter(|message| *message != error.message)
+            .map_or_else(
+                || format!("source={code}"),
+                |message| format!("source={code}: {message}"),
+            )
+    }));
+    if let Some(request_id) = error.request_id.as_deref() {
+        metadata.push(format!("request_id={request_id}"));
+    }
+    let metadata = if metadata.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", metadata.join("; "))
+    };
+    bcode_model_provider_runtime::sanitize_provider_diagnostic(&format!(
+        "Underlying error: {category}/{} — {}{metadata}.",
+        error.code, error.message
+    ))
+}
+
+const fn provider_error_category_name(
+    category: bcode_model::ProviderErrorCategory,
+) -> &'static str {
+    match category {
+        bcode_model::ProviderErrorCategory::Config => "config",
+        bcode_model::ProviderErrorCategory::Auth => "auth",
+        bcode_model::ProviderErrorCategory::RateLimit => "rate_limit",
+        bcode_model::ProviderErrorCategory::Network => "network",
+        bcode_model::ProviderErrorCategory::Timeout => "timeout",
+        bcode_model::ProviderErrorCategory::ModelNotFound => "model_not_found",
+        bcode_model::ProviderErrorCategory::ContextLength => "context_length",
+        bcode_model::ProviderErrorCategory::InvalidRequest => "invalid_request",
+        bcode_model::ProviderErrorCategory::UnsupportedFeature => "unsupported_feature",
+        bcode_model::ProviderErrorCategory::ProviderInternal => "provider_internal",
+        bcode_model::ProviderErrorCategory::Overloaded => "overloaded",
+        bcode_model::ProviderErrorCategory::Cancelled => "cancelled",
+    }
 }
 
 fn provider_retry_delay(
@@ -42849,9 +42909,70 @@ library = "test"
             Duration::from_mins(10)
         );
         assert_eq!(
-            provider_retry_message(&policy, Duration::from_mins(10), 42),
-            "Model provider reported a transient error. Retrying automatically in 600s (attempt 42)."
+            provider_retry_message(&policy, &error, Duration::from_mins(10), 42),
+            "Model provider reported a transient error. Underlying error: network/connection_reset — connection reset. Retrying automatically in 600s (attempt 42)."
         );
+    }
+
+    #[test]
+    fn retry_message_exposes_safe_normalized_provider_diagnostics() {
+        let error = bcode_model::ProviderError {
+            code: "request_failed".to_string(),
+            category: bcode_model::ProviderErrorCategory::Network,
+            message: "provider network request failed".to_string(),
+            retryable: true,
+            provider_message: None,
+            failure: None,
+            request_id: Some("req_123".into()),
+            diagnostic_context: Box::new(BTreeMap::from([
+                (
+                    "io_error_kind".to_string(),
+                    "connection_refused".to_string(),
+                ),
+                ("transport_kind".to_string(), "connect".to_string()),
+            ])),
+            sources: Box::new(vec![bcode_model::ProviderErrorSource {
+                source: "reqwest".to_string(),
+                code: Some("connect".to_string()),
+                message: None,
+            }]),
+            retry: None,
+        };
+        let policy = ProviderRetryPolicy {
+            id: "builtin.transient".to_string(),
+            display_name: "transient provider error".to_string(),
+            max_retries: None,
+            initial_delay_ms: 1_000,
+            max_delay_ms: 600_000,
+            use_provider_retry_hint: true,
+            kind: ProviderRetryPolicyKind::Transient,
+        };
+
+        assert_eq!(
+            provider_retry_message(&policy, &error, Duration::from_secs(1), 1),
+            "Model provider reported a transient error. Underlying error: network/request_failed — provider network request failed (io_error_kind=connection_refused; transport_kind=connect; source=reqwest/connect; request_id=req_123). Retrying automatically in 1s (attempt 1)."
+        );
+    }
+
+    #[test]
+    fn retry_message_sanitizes_normalized_provider_diagnostics() {
+        let error = bcode_model::ProviderError {
+            code: "request_failed".to_string(),
+            category: bcode_model::ProviderErrorCategory::Network,
+            message: "request failed with api_key=do-not-expose".to_string(),
+            retryable: true,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        };
+
+        let detail = provider_error_detail(&error);
+
+        assert!(detail.contains("api_key=[REDACTED]"));
+        assert!(!detail.contains("do-not-expose"));
     }
 
     #[test]

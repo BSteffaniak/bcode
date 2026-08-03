@@ -304,6 +304,7 @@ rusqlite = { version = "=0.32.1", default-features = false, features = [
     "backup",
     "bundled",
 ] }
+rustls = { version = "0.23.42", default-features = false, features = ["std"] }
 schemars = { version = "1.2.1", default-features = false, features = [
     "derive",
     "std",
