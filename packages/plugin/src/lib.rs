@@ -874,6 +874,9 @@ pub struct PluginService {
     /// Workflow blocks exposed through this service.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_blocks: Vec<bcode_workflow::WorkflowBlockDefinition>,
+    /// Concise workflow authoring actions contributed by this service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflow_authoring_actions: Vec<bcode_workflow::WorkflowAuthoringActionDescriptor>,
     /// Operations this service explicitly exposes to active tool invocations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invocation_operations: Vec<String>,
@@ -2955,6 +2958,7 @@ impl PluginRegistry {
             .expect("loaded plugin tool presentation contracts must be valid");
         let mut template_identities = BTreeSet::new();
         let mut block_identities = BTreeSet::new();
+        let mut action_identities = BTreeSet::new();
         for manifest in manifests.values() {
             for template in &manifest.workflow_templates {
                 template
@@ -2991,6 +2995,26 @@ impl PluginRegistry {
                     block
                         .validate()
                         .expect("manifest workflow block contract must be valid");
+                }
+                for action in &service.workflow_authoring_actions {
+                    assert_eq!(
+                        action.plugin_id, manifest.id,
+                        "workflow authoring action owner must match manifest"
+                    );
+                    assert!(
+                        action_identities.insert(action.catalog_key()),
+                        "workflow authoring action identity/version must be unique"
+                    );
+                    let blocks = manifest
+                        .services
+                        .iter()
+                        .flat_map(|service| &service.workflow_blocks)
+                        .cloned()
+                        .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+                        .collect::<BTreeMap<_, _>>();
+                    action
+                        .validate(&blocks)
+                        .expect("manifest workflow authoring action contract must be valid");
                 }
             }
         }
@@ -3051,6 +3075,19 @@ impl PluginRegistry {
             .values()
             .flat_map(|manifest| &manifest.services)
             .flat_map(|service| &service.workflow_blocks)
+            .cloned()
+            .collect()
+    }
+
+    /// Return all loaded, validated workflow authoring action declarations in deterministic order.
+    #[must_use]
+    pub fn workflow_authoring_actions(
+        &self,
+    ) -> Vec<bcode_workflow::WorkflowAuthoringActionDescriptor> {
+        self.manifests
+            .values()
+            .flat_map(|manifest| &manifest.services)
+            .flat_map(|service| &service.workflow_authoring_actions)
             .cloned()
             .collect()
     }
@@ -7251,6 +7288,7 @@ library = "libexample_plugin.dylib"
                     concurrency: None,
                     class: None,
                     workflow_blocks: Vec::new(),
+                    workflow_authoring_actions: Vec::new(),
                     invocation_operations: Vec::new(),
                 }],
                 tui_surfaces: Vec::new(),
@@ -7478,6 +7516,7 @@ library = "libexample_plugin.dylib"
                 description: None,
                 class: Some(PluginInvocationClass::ToolExecution),
                 workflow_blocks: Vec::new(),
+                workflow_authoring_actions: Vec::new(),
                 invocation_operations: Vec::new(),
                 concurrency: None,
             }];
@@ -7613,6 +7652,7 @@ library = "libexample_plugin.dylib"
                 description: None,
                 class: Some(PluginInvocationClass::ModelProvider),
                 workflow_blocks: Vec::new(),
+                workflow_authoring_actions: Vec::new(),
                 invocation_operations: Vec::new(),
                 concurrency: None,
             }];
@@ -8122,6 +8162,7 @@ library = "libexample_plugin.dylib"
                 concurrency: None,
                 class: None,
                 workflow_blocks: Vec::new(),
+                workflow_authoring_actions: Vec::new(),
                 invocation_operations: Vec::new(),
             }],
             tui_surfaces: Vec::new(),

@@ -15,8 +15,10 @@ pub use bcode_workflow::{
     WorkflowDefinition, WorkflowDefinitionIdentity, WorkflowError, WorkflowEvent,
     WorkflowEventReceiver, WorkflowEventSender, WorkflowGrantScope, WorkflowOutcome, WorkflowPlan,
     WorkflowPolicyGrant, WorkflowPolicyPreflight, WorkflowPolicyRequest, WorkflowRunObserver,
-    WorkflowRunSnapshot, WorkflowSourceFormat, WorkflowSpec, WorkflowToolCapability,
-    authorize_workflow_policy, decode_workflow_authoring_source, fan_out, field, parallel,
+    WorkflowRunSnapshot, WorkflowSourceDocument, WorkflowSourceFormat,
+    WorkflowSourceLoweringResult, WorkflowSourceMap, WorkflowSourceMapEntry, WorkflowSourceProfile,
+    WorkflowSourceStep, WorkflowSpec, WorkflowToolCapability, authorize_workflow_policy,
+    decode_workflow_authoring_source, fan_out, field, lower_workflow_authoring_source, parallel,
     parallel_named_with_policy, preflight_workflow_policy, workflow_event_channel,
 };
 use schemars::JsonSchema;

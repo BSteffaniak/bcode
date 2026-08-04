@@ -436,7 +436,9 @@ fn handle_workflow_author_command(
                 source_format,
                 draft_id,
             } => {
-                let document = read_workflow_authoring_document(&file, source_format.as_deref())?;
+                let document =
+                    read_workflow_authoring_document(client, &file, source_format.as_deref())
+                        .await?;
                 print_json(
                     &client
                         .create_authored_workflow(bcode_ipc::CreateAuthoredWorkflowRequest {
@@ -477,7 +479,9 @@ fn handle_workflow_author_command(
                 draft_id,
                 expected_generation,
             } => {
-                let document = read_workflow_authoring_document(&file, source_format.as_deref())?;
+                let document =
+                    read_workflow_authoring_document(client, &file, source_format.as_deref())
+                        .await?;
                 let producer = document.producer.clone();
                 print_json(
                     &client
@@ -726,7 +730,9 @@ fn handle_workflow_author_command(
                 operation_id,
                 timeout_ms,
             } => {
-                let document = read_workflow_authoring_document(&file, source_format.as_deref())?;
+                let document =
+                    read_workflow_authoring_document(client, &file, source_format.as_deref())
+                        .await?;
                 print_json(
                     &client
                         .validate_workflow_authoring_with_control(
@@ -749,7 +755,9 @@ fn handle_workflow_author_command(
                             .to_string(),
                     ));
                 }
-                let document = read_workflow_authoring_document(&file, source_format.as_deref())?;
+                let document =
+                    read_workflow_authoring_document(client, &file, source_format.as_deref())
+                        .await?;
                 let configuration = configuration
                     .as_deref()
                     .map(read_bounded_json)
@@ -955,7 +963,8 @@ async fn handle_workflow_preset_command(
     Ok(())
 }
 
-fn read_workflow_authoring_document(
+async fn read_workflow_authoring_document(
+    client: &BcodeClient,
     path: &Path,
     explicit_format: Option<&str>,
 ) -> Result<bcode_workflow::WorkflowAuthoringDocument, CliError> {
@@ -988,6 +997,7 @@ fn read_workflow_authoring_document(
     })?;
     let format = match explicit_format {
         Some("json") => bcode_workflow::WorkflowSourceFormat::Json,
+        Some("yaml" | "yml") => bcode_workflow::WorkflowSourceFormat::Yaml,
         Some("toml") => bcode_workflow::WorkflowSourceFormat::Toml,
         Some(format) => {
             return Err(CliError::InvalidArguments(format!(
@@ -996,7 +1006,7 @@ fn read_workflow_authoring_document(
         }
         None if path == Path::new("-") => {
             return Err(CliError::InvalidArguments(
-                "workflow source from stdin requires --source-format json|toml".to_string(),
+                "workflow source from stdin requires --source-format json|yaml|toml".to_string(),
             ));
         }
         None => bcode_workflow::WorkflowSourceFormat::from_file_name(
@@ -1010,7 +1020,9 @@ fn read_workflow_authoring_document(
         )
         .map_err(|error| CliError::InvalidArguments(error.to_string()))?,
     };
-    bcode_workflow::decode_workflow_authoring_source(source, format)
+    let catalog = client.workflow_authoring_catalog().await?;
+    bcode_workflow::lower_workflow_authoring_source(source, format, &catalog)
+        .map(|lowered| lowered.document)
         .map_err(|error| CliError::InvalidArguments(error.to_string()))
 }
 
@@ -1751,12 +1763,12 @@ enum WorkflowStartSelection {
 
 #[derive(Debug, Subcommand)]
 enum WorkflowAuthorCommand {
-    /// Create one logical workflow and initial draft from JSON or TOML.
+    /// Create one logical workflow and initial draft from JSON, YAML, or TOML.
     Create {
         #[arg(value_name = "FILE", default_value = "-")]
         file: PathBuf,
         /// Explicit source format for stdin or to override the file extension.
-        #[arg(long, value_parser = ["json", "toml"])]
+        #[arg(long, value_parser = ["json", "yaml", "yml", "toml"])]
         source_format: Option<String>,
         /// Stable identity for the initial mutable draft.
         #[arg(long)]
@@ -1793,12 +1805,12 @@ enum WorkflowAuthorCommand {
         #[command(subcommand)]
         command: WorkflowRevisionCommand,
     },
-    /// Replace one exact draft generation from JSON or TOML.
+    /// Replace one exact draft generation from JSON, YAML, or TOML.
     Update {
         #[arg(value_name = "FILE", default_value = "-")]
         file: PathBuf,
         /// Explicit source format for stdin or to override the file extension.
-        #[arg(long, value_parser = ["json", "toml"])]
+        #[arg(long, value_parser = ["json", "yaml", "yml", "toml"])]
         source_format: Option<String>,
         #[arg(long)]
         workflow_id: String,
@@ -1959,12 +1971,12 @@ enum WorkflowAuthorCommand {
     },
     /// Print the portable authoring catalog as JSON.
     Catalog,
-    /// Validate one authoring document from JSON or TOML (stdin is `-`).
+    /// Validate one authoring document from JSON, YAML, or TOML (stdin is `-`).
     Validate {
         #[arg(value_name = "FILE", default_value = "-")]
         file: PathBuf,
         /// Explicit source format for stdin or to override the file extension.
-        #[arg(long, value_parser = ["json", "toml"])]
+        #[arg(long, value_parser = ["json", "yaml", "yml", "toml"])]
         source_format: Option<String>,
         #[arg(long)]
         operation_id: Option<String>,
@@ -1976,7 +1988,7 @@ enum WorkflowAuthorCommand {
         #[arg(value_name = "FILE", default_value = "-")]
         file: PathBuf,
         /// Explicit source format for stdin or to override the file extension.
-        #[arg(long, value_parser = ["json", "toml"])]
+        #[arg(long, value_parser = ["json", "yaml", "yml", "toml"])]
         source_format: Option<String>,
         /// Optional runtime configuration JSON file or stdin (`-`).
         #[arg(long, value_name = "FILE")]
@@ -13046,12 +13058,21 @@ mod workflow_source_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let json = root.join("fixtures/workflows/source-defined-input.workflow.json");
         let toml = root.join("fixtures/workflows/source-defined-input.workflow.toml");
-        let json_document =
-            read_workflow_authoring_document(&json, None).expect("primary CLI JSON source");
-        let toml_document =
-            read_workflow_authoring_document(&toml, None).expect("primary CLI TOML source");
+        let json_document = bcode_workflow::decode_workflow_authoring_source(
+            &std::fs::read_to_string(&json).expect("JSON file"),
+            bcode_workflow::WorkflowSourceFormat::Json,
+        )
+        .expect("primary CLI JSON source");
+        let toml_document = bcode_workflow::decode_workflow_authoring_source(
+            &std::fs::read_to_string(&toml).expect("TOML file"),
+            bcode_workflow::WorkflowSourceFormat::Toml,
+        )
+        .expect("primary CLI TOML source");
         assert_eq!(json_document, toml_document);
-        assert!(read_workflow_authoring_document(&json, Some("yaml")).is_err());
+        assert_eq!(
+            bcode_workflow::WorkflowSourceFormat::from_file_name("workflow.yaml").expect("YAML"),
+            bcode_workflow::WorkflowSourceFormat::Yaml
+        );
     }
 }
 

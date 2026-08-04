@@ -14892,6 +14892,13 @@ async fn workflow_authoring_catalog_snapshot(
         .into_iter()
         .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
         .collect::<BTreeMap<_, _>>();
+    let authoring_actions = state
+        .plugins
+        .registry()
+        .workflow_authoring_actions()
+        .into_iter()
+        .map(|action| (action.catalog_key(), action))
+        .collect::<BTreeMap<_, _>>();
     let agent_profiles = list_agent_profiles(state)
         .await
         .into_iter()
@@ -14931,6 +14938,7 @@ async fn workflow_authoring_catalog_snapshot(
         workflow_definitions,
         agent_profiles,
         skills,
+        authoring_actions,
     };
     catalog
         .validate()

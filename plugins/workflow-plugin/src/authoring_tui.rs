@@ -3451,6 +3451,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
             skills: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         };
         let entries = palette_entries(&catalog);
         assert!(entries.iter().any(|entry| entry.identity == "agent"));
@@ -3504,6 +3505,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
             skills: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         };
         let entry = palette_entries(&catalog)
             .into_iter()
@@ -3872,6 +3874,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
             skills: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         };
         let request = generation_request(
             "create a safe approval workflow",
@@ -3943,6 +3946,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
             skills: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         };
         assert!(decode_generated_candidate(serde_json::json!({}), Some(&catalog)).is_err());
         assert!(
@@ -4036,6 +4040,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
             skills: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         };
         surface.install_catalog(catalog);
         surface.install_base_revision(PluginWorkflowAuthoringRevision {

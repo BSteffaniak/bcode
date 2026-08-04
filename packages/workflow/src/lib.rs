@@ -1715,7 +1715,9 @@ const MAX_WORKFLOW_AUTHORING_REQUIREMENTS: usize = 4_096;
 const MAX_WORKFLOW_AUTHORING_PRESENTATION_NAMESPACES: usize = 32;
 const MAX_WORKFLOW_AUTHORING_PRESENTATION_BYTES: usize = 131_072;
 /// Portable workflow-authoring catalog contract version.
-pub const WORKFLOW_AUTHORING_CATALOG_VERSION: u32 = 1;
+pub const WORKFLOW_AUTHORING_CATALOG_VERSION: u32 = 2;
+/// Plugin-contributed workflow-authoring action descriptor contract version.
+pub const WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION: u32 = 1;
 /// Portable workflow compilation preview contract version.
 pub const WORKFLOW_COMPILATION_PREVIEW_VERSION: u32 = 1;
 /// Portable authored-workflow export bundle contract version.
@@ -2899,6 +2901,70 @@ fn describe_schema_fields(
     Ok(())
 }
 
+/// Versioned plugin-contributed concise workflow action descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringActionDescriptor {
+    /// Descriptor contract version.
+    pub version: u32,
+    /// Stable concise action key, such as `run`.
+    pub action_key: String,
+    /// Exact action version.
+    pub action_version: u32,
+    /// Owning plugin identity.
+    pub plugin_id: String,
+    /// Accepted concise payload schema.
+    pub input: ValueSchema,
+    /// Exact target workflow block catalog identity.
+    pub target_block: String,
+    /// Deterministic payload adaptation expressed in the generic transform contract.
+    pub input_adapter: WorkflowTransform,
+}
+
+impl WorkflowAuthoringActionDescriptor {
+    /// Return the exact action catalog identity.
+    #[must_use]
+    pub fn catalog_key(&self) -> String {
+        format!("{}@{}", self.action_key, self.action_version)
+    }
+
+    /// Validate this descriptor against the target block catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed identities or schemas, unavailable
+    /// target blocks, owner mismatch, or an invalid deterministic adapter.
+    pub fn validate(
+        &self,
+        blocks: &BTreeMap<String, WorkflowBlockDefinition>,
+    ) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION || self.action_version == 0
+        {
+            return Err(authoring_error(
+                "catalog.authoring_actions.version",
+                "workflow authoring action versions must be current and nonzero",
+            ));
+        }
+        validate_authoring_id("catalog.authoring_actions.action_key", &self.action_key)?;
+        validate_authoring_id("catalog.authoring_actions.plugin_id", &self.plugin_id)?;
+        validate_runtime_value_schema("catalog.authoring_actions.input", &self.input)?;
+        self.input_adapter.validate()?;
+        let block = blocks.get(&self.target_block).ok_or_else(|| {
+            authoring_error(
+                "catalog.authoring_actions.target_block",
+                format!("target block '{}' is unavailable", self.target_block),
+            )
+        })?;
+        if block.plugin_id != self.plugin_id || self.input_adapter.output != block.input {
+            return Err(authoring_error(
+                "catalog.authoring_actions.target_block",
+                "action owner and adapter output must match the exact target block",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Portable catalog snapshot consumed by pure workflow authoring validation and compilation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2925,6 +2991,9 @@ pub struct WorkflowAuthoringCatalogSnapshot {
     /// Portable available skill identities.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub skills: BTreeSet<String>,
+    /// Versioned plugin-contributed concise authoring actions keyed by exact action identity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub authoring_actions: BTreeMap<String, WorkflowAuthoringActionDescriptor>,
 }
 
 /// Kind of authored requirement evaluated against a current catalog snapshot.
@@ -2991,7 +3060,8 @@ impl WorkflowAuthoringCatalogSnapshot {
             + self.node_configuration_schemas.len()
             + self.workflow_definitions.len()
             + self.agent_profiles.len()
-            + self.skills.len();
+            + self.skills.len()
+            + self.authoring_actions.len();
         if entry_count > MAX_WORKFLOW_AUTHORING_REQUIREMENTS {
             return Err(authoring_error(
                 "catalog",
@@ -3051,6 +3121,21 @@ impl WorkflowAuthoringCatalogSnapshot {
                 return Err(authoring_error(
                     "catalog.workflow_definitions",
                     format!("catalog definition key '{key}' does not match exact content identity"),
+                ));
+            }
+        }
+        for (key, action) in &self.authoring_actions {
+            action.validate(&self.blocks)?;
+            if key != &action.catalog_key() {
+                return Err(authoring_error(
+                    "catalog.authoring_actions",
+                    format!("action key '{key}' does not match exact descriptor identity"),
+                ));
+            }
+            if !self.plugins.contains(&action.plugin_id) {
+                return Err(authoring_error(
+                    "catalog.authoring_actions.plugin_id",
+                    format!("action owner '{}' is unavailable", action.plugin_id),
                 ));
             }
         }
@@ -3626,12 +3711,133 @@ pub fn workflow_authoring_semantic_diff(
     })
 }
 
-/// Portable source encoding for one [`WorkflowAuthoringDocument`].
+/// Current portable workflow source document version.
+pub const WORKFLOW_SOURCE_DOCUMENT_VERSION: u32 = 1;
+/// Current portable workflow source map version.
+pub const WORKFLOW_SOURCE_MAP_VERSION: u32 = 1;
+/// Current portable workflow source lowering result version.
+pub const WORKFLOW_SOURCE_LOWERING_VERSION: u32 = 1;
+/// Maximum concise steps accepted in one workflow source document.
+pub const MAX_WORKFLOW_SOURCE_STEPS: usize = 1_000;
+
+/// Explicit authoring profile selected structurally from a workflow source document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSourceProfile {
+    /// Ordered concise steps that lower into the canonical authoring graph.
+    Concise,
+    /// The complete canonical [`WorkflowAuthoringDocument`] contract.
+    Canonical,
+}
+
+/// One renderer-neutral concise action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WorkflowSourceAction {
+    /// Exact plugin workflow block identity and typed input.
+    Uses {
+        /// Stable `plugin_id/block_id@version` identity.
+        uses: String,
+        /// Typed block input.
+        #[serde(default = "empty_json_object", rename = "with")]
+        input: serde_json::Value,
+    },
+    /// Plugin-contributed shorthand action and opaque typed payload.
+    Shorthand(BTreeMap<String, serde_json::Value>),
+}
+
+/// One ordered concise workflow step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSourceStep {
+    /// Optional stable author-supplied identity. Omitted identities are generated from source order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Optional display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Explicit predecessor identities. Omission selects the immediately preceding step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    /// Exactly one generic action.
+    #[serde(flatten)]
+    pub action: WorkflowSourceAction,
+}
+
+/// Versioned concise workflow source document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSourceDocument {
+    /// Concise source contract version.
+    pub workflow_source_version: u32,
+    /// Stable logical workflow identity.
+    pub workflow_id: String,
+    /// User-facing title.
+    pub title: String,
+    /// Optional user-facing description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Discovery labels.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// Runtime configuration schema. Omission selects a closed empty object.
+    #[serde(default = "empty_workflow_source_configuration_schema")]
+    pub configuration_schema: ValueSchema,
+    /// Optional runtime configuration defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_defaults: Option<serde_json::Value>,
+    /// Portable run limits.
+    #[serde(default)]
+    pub run_limits: WorkflowRunLimitPolicy,
+    /// Ordered concise steps.
+    pub steps: Vec<WorkflowSourceStep>,
+}
+
+/// One deterministic concise-source to canonical-node mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSourceMapEntry {
+    /// Zero-based concise step index.
+    pub step_index: usize,
+    /// Stable source path.
+    pub source_path: String,
+    /// Deterministic canonical node identity.
+    pub node_id: String,
+}
+
+/// Bounded deterministic source map for a lowering operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSourceMap {
+    /// Source-map contract version.
+    pub version: u32,
+    /// Ordered mappings in concise step order.
+    pub entries: Vec<WorkflowSourceMapEntry>,
+}
+
+/// Portable result of decoding and lowering one workflow source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSourceLoweringResult {
+    /// Lowering result contract version.
+    pub version: u32,
+    /// Structurally selected source profile.
+    pub profile: WorkflowSourceProfile,
+    /// Canonical authoring document used by all durable application operations.
+    pub document: WorkflowAuthoringDocument,
+    /// Concise source mapping; empty for canonical source.
+    pub source_map: WorkflowSourceMap,
+    /// Deterministic canonical source validation report.
+    pub validation: WorkflowValidationReport,
+}
+
+/// Portable source encoding for one authored workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowSourceFormat {
     /// JavaScript Object Notation.
     Json,
+    /// YAML 1.2 syntax restricted to JSON-compatible values.
+    Yaml,
     /// TOML 1.x document syntax.
     Toml,
 }
@@ -3641,8 +3847,8 @@ impl WorkflowSourceFormat {
     ///
     /// # Errors
     ///
-    /// Returns an error when the file name does not end in `.json`, `.workflow.json`, `.toml`, or
-    /// `.workflow.toml`. The function never guesses by trying multiple parsers.
+    /// Returns an error when the file name has no supported JSON, YAML, or TOML suffix. The
+    /// function never guesses by trying multiple parsers.
     pub fn from_file_name(file_name: &str) -> Result<Self, WorkflowError> {
         let normalized = file_name.to_ascii_lowercase();
         if normalized
@@ -3652,6 +3858,13 @@ impl WorkflowSourceFormat {
             return Ok(Self::Json);
         }
         if normalized
+            .strip_suffix(".yaml")
+            .or_else(|| normalized.strip_suffix(".yml"))
+            .is_some_and(|stem| !stem.is_empty())
+        {
+            return Ok(Self::Yaml);
+        }
+        if normalized
             .strip_suffix(".toml")
             .is_some_and(|stem| !stem.is_empty())
         {
@@ -3659,15 +3872,15 @@ impl WorkflowSourceFormat {
         }
         Err(authoring_error(
             "source.format",
-            "workflow source format requires an explicit format or a .json/.toml file name",
+            "workflow source format requires an explicit format or a .json/.yaml/.yml/.toml file name",
         ))
     }
 }
 
-/// Decode and semantically validate one bounded authored-workflow source document.
+/// Decode one bounded canonical authored-workflow source document.
 ///
-/// JSON and TOML are adapters into the same [`WorkflowAuthoringDocument`]. No format-specific
-/// value is retained after decoding.
+/// JSON, YAML, and TOML are adapters into the same [`WorkflowAuthoringDocument`]. No
+/// format-specific value is retained after decoding.
 ///
 /// # Errors
 ///
@@ -3677,13 +3890,101 @@ pub fn decode_workflow_authoring_source(
     source: &str,
     format: WorkflowSourceFormat,
 ) -> Result<WorkflowAuthoringDocument, WorkflowError> {
+    let value = decode_workflow_source_value(source, format)?;
+    let document: WorkflowAuthoringDocument = serde_json::from_value(value).map_err(|error| {
+        authoring_error(
+            workflow_source_format_path(format),
+            format!("invalid canonical workflow document: {error}"),
+        )
+    })?;
+    document.validate()?;
+    Ok(document)
+}
+
+/// Decode and structurally select a concise or canonical source profile, then lower it to the
+/// canonical authoring document.
+///
+/// # Errors
+///
+/// Returns an error for malformed or ambiguous source, unsupported versions, invalid concise
+/// structure, unavailable actions, or an invalid lowered canonical document.
+pub fn lower_workflow_authoring_source(
+    source: &str,
+    format: WorkflowSourceFormat,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<WorkflowSourceLoweringResult, WorkflowError> {
+    let value = decode_workflow_source_value(source, format)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| authoring_error("source", "workflow source document must be an object"))?;
+    let concise = object.contains_key("workflow_source_version");
+    let canonical = object.contains_key("schema_version");
+    if concise == canonical {
+        return Err(authoring_error(
+            "source.profile",
+            "workflow source must declare exactly one of workflow_source_version or schema_version",
+        ));
+    }
+    let (profile, document, source_map) = if concise {
+        let source_document: WorkflowSourceDocument =
+            serde_json::from_value(value).map_err(|error| {
+                authoring_error(
+                    "source.concise",
+                    format!("invalid concise workflow source: {error}"),
+                )
+            })?;
+        let (document, source_map) = source_document.lower(catalog)?;
+        (WorkflowSourceProfile::Concise, document, source_map)
+    } else {
+        let document: WorkflowAuthoringDocument =
+            serde_json::from_value(value).map_err(|error| {
+                authoring_error(
+                    "source.canonical",
+                    format!("invalid canonical workflow source: {error}"),
+                )
+            })?;
+        document.validate()?;
+        (
+            WorkflowSourceProfile::Canonical,
+            document,
+            WorkflowSourceMap {
+                version: WORKFLOW_SOURCE_MAP_VERSION,
+                entries: Vec::new(),
+            },
+        )
+    };
+    let validation = document.validation_report();
+    if !validation.is_valid() {
+        return Err(authoring_error(
+            "source.lowered",
+            validation
+                .diagnostics
+                .first()
+                .map_or("lowered workflow is invalid", |diagnostic| {
+                    diagnostic.message.as_str()
+                }),
+        ));
+    }
+    Ok(WorkflowSourceLoweringResult {
+        version: WORKFLOW_SOURCE_LOWERING_VERSION,
+        profile,
+        document,
+        source_map,
+        validation,
+    })
+}
+
+fn decode_workflow_source_value(
+    source: &str,
+    format: WorkflowSourceFormat,
+) -> Result<serde_json::Value, WorkflowError> {
     if source.len() > MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
         return Err(authoring_error(
             "source",
             format!("workflow source exceeds {MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES} bytes"),
         ));
     }
-    let document: WorkflowAuthoringDocument = match format {
+    let value = match format {
         WorkflowSourceFormat::Json => {
             let mut deserializer = serde_json::Deserializer::from_str(source);
             let value = DuplicateRejectingJsonValue::deserialize(&mut deserializer)
@@ -3701,20 +4002,12 @@ pub fn decode_workflow_authoring_source(
             deserializer.end().map_err(|error| {
                 authoring_error(
                     "source.json",
-                    format!(
-                        "invalid JSON workflow source at line {}, column {}: {error}",
-                        error.line(),
-                        error.column()
-                    ),
+                    format!("invalid trailing JSON workflow source: {error}"),
                 )
             })?;
-            serde_json::from_value(value).map_err(|error| {
-                authoring_error(
-                    "source.json",
-                    format!("invalid JSON workflow document: {error}"),
-                )
-            })?
+            value
         }
+        WorkflowSourceFormat::Yaml => decode_workflow_yaml_value(source)?,
         WorkflowSourceFormat::Toml => {
             let mut value: serde_json::Value = toml::from_str(source).map_err(|error| {
                 let location = error.span().map_or_else(String::new, |span| {
@@ -3726,16 +4019,342 @@ pub fn decode_workflow_authoring_source(
                 )
             })?;
             decode_workflow_toml_null_markers(&mut value, 0)?;
-            serde_json::from_value(value).map_err(|error| {
-                authoring_error(
-                    "source.toml",
-                    format!("invalid TOML workflow document: {error}"),
-                )
-            })?
+            value
         }
     };
-    document.validate()?;
-    Ok(document)
+    validate_authoring_json_value(workflow_source_format_path(format), &value)?;
+    Ok(value)
+}
+
+const fn workflow_source_format_path(format: WorkflowSourceFormat) -> &'static str {
+    match format {
+        WorkflowSourceFormat::Json => "source.json",
+        WorkflowSourceFormat::Yaml => "source.yaml",
+        WorkflowSourceFormat::Toml => "source.toml",
+    }
+}
+
+fn decode_workflow_yaml_value(source: &str) -> Result<serde_json::Value, WorkflowError> {
+    let value: yaml_serde::Value = yaml_serde::from_str(source).map_err(|error| {
+        authoring_error(
+            "source.yaml",
+            format!("invalid YAML workflow source: {error}"),
+        )
+    })?;
+    yaml_value_to_json(value, "source.yaml", 0)
+}
+
+fn yaml_value_to_json(
+    value: yaml_serde::Value,
+    path: &str,
+    depth: usize,
+) -> Result<serde_json::Value, WorkflowError> {
+    if depth > MAX_WORKFLOW_AUTHORING_JSON_DEPTH {
+        return Err(authoring_error(
+            path,
+            format!("YAML value depth exceeds {MAX_WORKFLOW_AUTHORING_JSON_DEPTH}"),
+        ));
+    }
+    match value {
+        yaml_serde::Value::Null => Ok(serde_json::Value::Null),
+        yaml_serde::Value::Bool(value) => Ok(serde_json::Value::Bool(value)),
+        yaml_serde::Value::Number(value) => {
+            serde_json::to_value(value).map_err(|error| authoring_error(path, error.to_string()))
+        }
+        yaml_serde::Value::String(value) => Ok(serde_json::Value::String(value)),
+        yaml_serde::Value::Sequence(values) => values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| yaml_value_to_json(value, &format!("{path}[{index}]"), depth + 1))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        yaml_serde::Value::Mapping(values) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in values {
+                let yaml_serde::Value::String(key) = key else {
+                    return Err(authoring_error(path, "YAML mapping keys must be strings"));
+                };
+                if object.contains_key(&key) {
+                    return Err(authoring_error(
+                        format!("{path}.{key}"),
+                        "duplicate YAML mapping key",
+                    ));
+                }
+                let value = yaml_value_to_json(value, &format!("{path}.{key}"), depth + 1)?;
+                object.insert(key, value);
+            }
+            Ok(serde_json::Value::Object(object))
+        }
+        yaml_serde::Value::Tagged(_) => {
+            Err(authoring_error(path, "custom YAML tags are unsupported"))
+        }
+    }
+}
+
+fn empty_json_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn empty_workflow_source_configuration_schema() -> ValueSchema {
+    ValueSchema {
+        type_name: "bcode.workflow.source-configuration/v1".to_string(),
+        schema: serde_json::json!({
+            "$schema": WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "additionalProperties": false
+        }),
+    }
+}
+
+impl WorkflowSourceDocument {
+    /// Deterministically lower this concise source through one portable catalog snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, invalid identities, duplicate or missing step
+    /// dependencies, malformed action declarations, unavailable actions or blocks, invalid typed
+    /// inputs, or an invalid canonical result.
+    #[allow(clippy::too_many_lines)]
+    pub fn lower(
+        &self,
+        catalog: &WorkflowAuthoringCatalogSnapshot,
+    ) -> Result<(WorkflowAuthoringDocument, WorkflowSourceMap), WorkflowError> {
+        catalog.validate()?;
+        if self.workflow_source_version != WORKFLOW_SOURCE_DOCUMENT_VERSION {
+            return Err(authoring_error(
+                "workflow_source_version",
+                format!(
+                    "unsupported workflow source version {}; expected {}",
+                    self.workflow_source_version, WORKFLOW_SOURCE_DOCUMENT_VERSION
+                ),
+            ));
+        }
+        validate_authoring_id("workflow_id", &self.workflow_id)?;
+        WorkflowAuthoringMetadata {
+            title: self.title.clone(),
+            description: self.description.clone(),
+            labels: self.labels.clone(),
+        }
+        .validate()?;
+        validate_runtime_value_schema("configuration_schema", &self.configuration_schema)?;
+        self.run_limits.validate()?;
+        if self.steps.is_empty() || self.steps.len() > MAX_WORKFLOW_SOURCE_STEPS {
+            return Err(authoring_error(
+                "steps",
+                format!("concise workflows require 1..={MAX_WORKFLOW_SOURCE_STEPS} steps"),
+            ));
+        }
+
+        let mut node_ids = Vec::with_capacity(self.steps.len());
+        let mut seen = BTreeSet::new();
+        for (index, step) in self.steps.iter().enumerate() {
+            let node_id = step
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("step_{:04}", index + 1));
+            validate_authoring_id(&format!("steps[{index}].id"), &node_id)?;
+            if !seen.insert(node_id.clone()) {
+                return Err(authoring_error(
+                    format!("steps[{index}].id"),
+                    format!("duplicate concise step identity '{node_id}'"),
+                ));
+            }
+            node_ids.push(node_id);
+        }
+
+        let mut nodes = BTreeMap::new();
+        let mut edges = Vec::new();
+        let mut entries = Vec::new();
+        let mut outgoing = BTreeSet::new();
+        let mut plugin_input_defaults = BTreeMap::new();
+        let mut source_entries = Vec::with_capacity(self.steps.len());
+        for (index, step) in self.steps.iter().enumerate() {
+            let node_id = &node_ids[index];
+            let (block, input) = lower_workflow_source_action(&step.action, catalog, index)?;
+            let predecessors = if step.needs.is_empty() && index > 0 {
+                vec![node_ids[index - 1].clone()]
+            } else {
+                step.needs.clone()
+            };
+            if predecessors.is_empty() {
+                entries.push(node_id.clone());
+            }
+            for predecessor in predecessors {
+                let predecessor_index = node_ids
+                    .iter()
+                    .position(|candidate| candidate == &predecessor)
+                    .ok_or_else(|| {
+                        authoring_error(
+                            format!("steps[{index}].needs"),
+                            format!("unknown predecessor '{predecessor}'"),
+                        )
+                    })?;
+                if predecessor_index >= index {
+                    return Err(authoring_error(
+                        format!("steps[{index}].needs"),
+                        "concise dependencies must reference an earlier step",
+                    ));
+                }
+                outgoing.insert(predecessor.clone());
+                edges.push(EdgeDefinition {
+                    from: predecessor,
+                    to: node_id.clone(),
+                    kind: EdgeKind::Direct,
+                    transform: None,
+                });
+            }
+            let node = NodeDefinition {
+                id: node_id.clone(),
+                name: step.name.clone().unwrap_or_else(|| node_id.clone()),
+                kind: NodeKind::PluginBlock,
+                dataflow: WorkflowNodeDataflowPolicy::Direct,
+                input: block.input.clone(),
+                output: block.output.clone(),
+                resources: block.resources.clone(),
+                configuration: serde_json::to_value(&block).map_err(|error| {
+                    authoring_error(
+                        format!("steps[{index}]"),
+                        format!("target block cannot be serialized: {error}"),
+                    )
+                })?,
+            };
+            plugin_input_defaults.insert(node_id.clone(), input);
+            nodes.insert(node_id.clone(), node);
+            source_entries.push(WorkflowSourceMapEntry {
+                step_index: index,
+                source_path: format!("steps[{index}]"),
+                node_id: node_id.clone(),
+            });
+        }
+        let exits = node_ids
+            .iter()
+            .filter(|node_id| !outgoing.contains(*node_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let first_id = entries
+            .first()
+            .ok_or_else(|| authoring_error("steps", "concise workflow has no entry step"))?;
+        let first = nodes
+            .get(first_id)
+            .ok_or_else(|| authoring_error("steps", "concise workflow entry node is missing"))?;
+        let last_id = exits
+            .first()
+            .ok_or_else(|| authoring_error("steps", "concise workflow has no exit step"))?;
+        let last = nodes
+            .get(last_id)
+            .ok_or_else(|| authoring_error("steps", "concise workflow exit node is missing"))?;
+        let document = WorkflowAuthoringDocument {
+            schema_version: WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+            workflow_id: self.workflow_id.clone(),
+            metadata: WorkflowAuthoringMetadata {
+                title: self.title.clone(),
+                description: self.description.clone(),
+                labels: self.labels.clone(),
+            },
+            configuration_schema: self.configuration_schema.clone(),
+            configuration_defaults: self.configuration_defaults.clone(),
+            plugin_input_defaults,
+            definition: WorkflowDefinition {
+                schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: self.title.clone(),
+                input: first.input.clone(),
+                output: last.output.clone(),
+                nodes,
+                entries,
+                exits,
+                edges,
+            },
+            bindings: Vec::new(),
+            requirements: WorkflowRequirementSummary::default(),
+            run_limits: self.run_limits.clone(),
+            producer: WorkflowProducerProvenance {
+                kind: WorkflowProducerKind::Human,
+                producer_id: None,
+                source_revision: None,
+            },
+            presentation: None,
+        };
+        document.validate()?;
+        Ok((
+            document,
+            WorkflowSourceMap {
+                version: WORKFLOW_SOURCE_MAP_VERSION,
+                entries: source_entries,
+            },
+        ))
+    }
+}
+
+fn lower_workflow_source_action(
+    action: &WorkflowSourceAction,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+    index: usize,
+) -> Result<(WorkflowBlockDefinition, serde_json::Value), WorkflowError> {
+    match action {
+        WorkflowSourceAction::Uses { uses, input } => {
+            let block = catalog.blocks.get(uses).ok_or_else(|| {
+                authoring_error(
+                    format!("steps[{index}].uses"),
+                    format!("exact workflow block '{uses}' is unavailable"),
+                )
+            })?;
+            block
+                .input
+                .validate_value(&format!("steps[{index}].with"), input)?;
+            Ok((block.clone(), input.clone()))
+        }
+        WorkflowSourceAction::Shorthand(fields) => {
+            if fields.len() != 1 {
+                return Err(authoring_error(
+                    format!("steps[{index}]"),
+                    "concise steps must declare exactly one shorthand action",
+                ));
+            }
+            let (action_key, payload) = fields.first_key_value().expect("one action field");
+            let matches = catalog
+                .authoring_actions
+                .values()
+                .filter(|descriptor| descriptor.action_key == *action_key)
+                .collect::<Vec<_>>();
+            let descriptor = match matches.as_slice() {
+                [descriptor] => *descriptor,
+                [] => {
+                    return Err(authoring_error(
+                        format!("steps[{index}].{action_key}"),
+                        format!("workflow authoring action '{action_key}' is unavailable"),
+                    ));
+                }
+                _ => {
+                    return Err(authoring_error(
+                        format!("steps[{index}].{action_key}"),
+                        format!("workflow authoring action '{action_key}' is ambiguous"),
+                    ));
+                }
+            };
+            descriptor
+                .input
+                .validate_value(&format!("steps[{index}].{action_key}"), payload)?;
+            let input = descriptor
+                .input_adapter
+                .evaluate(&[WorkflowTransformInput {
+                    name: WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: payload,
+                }])?;
+            let block = catalog
+                .blocks
+                .get(&descriptor.target_block)
+                .ok_or_else(|| {
+                    authoring_error(
+                        format!("steps[{index}].{action_key}"),
+                        "validated action target block became unavailable",
+                    )
+                })?;
+            block
+                .input
+                .validate_value(&format!("steps[{index}].{action_key}"), &input)?;
+            Ok((block.clone(), input))
+        }
+    }
 }
 
 struct DuplicateRejectingJsonValue(serde_json::Value);
@@ -10034,6 +10653,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
             skills: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         };
         catalog.validate().expect("shell example catalog");
         let preview = document.compilation_preview(&catalog, None);
@@ -10083,6 +10703,96 @@ mod tests {
                 .compilation_preview(&catalog, None)
                 .compiled
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn canonical_yaml_decodes_to_identical_semantics() {
+        let document = authored_document();
+        let yaml = yaml_serde::to_string(&document).expect("YAML source");
+        let decoded = decode_workflow_authoring_source(&yaml, WorkflowSourceFormat::Yaml)
+            .expect("canonical YAML workflow");
+        assert_eq!(decoded, document);
+        assert!(
+            decode_workflow_authoring_source("key: !custom value", WorkflowSourceFormat::Yaml)
+                .is_err()
+        );
+        assert!(
+            decode_workflow_authoring_source("? [complex]\n: value", WorkflowSourceFormat::Yaml)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn concise_source_lowers_deterministically_through_exact_actions() {
+        let block = WorkflowBlockDefinition {
+            block_id: "example.echo".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            operation: "example.echo".to_string(),
+            input: ValueSchema {
+                type_name: "example.input/v1".to_string(),
+                schema: serde_json::json!({"type": "string"}),
+            },
+            output: ValueSchema {
+                type_name: "example.output/v1".to_string(),
+                schema: serde_json::json!({"type": "string"}),
+            },
+            effect: WorkflowBlockEffect::ReadOnly,
+            resources: Vec::new(),
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::ReadOnly,
+                explicit_grant_required: false,
+            },
+            timeout_ms: 30_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+        };
+        let key = workflow_block_catalog_key(&block);
+        let action = WorkflowAuthoringActionDescriptor {
+            version: WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION,
+            action_key: "echo".to_string(),
+            action_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            input: block.input.clone(),
+            target_block: key.clone(),
+            input_adapter: WorkflowTransform {
+                version: WORKFLOW_TRANSFORM_VERSION,
+                expression: WorkflowTransformExpression::Input {
+                    source: WORKFLOW_TRANSFORM_SOURCE_CURRENT.to_string(),
+                    path: String::new(),
+                },
+                output: block.input.clone(),
+            },
+        };
+        let mut catalog = authoring_catalog();
+        catalog.plugins.insert("bcode.example".to_string());
+        catalog.blocks.insert(key, block);
+        catalog
+            .authoring_actions
+            .insert(action.catalog_key(), action);
+        let source = r"
+workflow_source_version: 1
+workflow_id: example/concise
+title: Concise
+steps:
+  - echo: first
+  - id: final
+    echo: second
+";
+        let first = lower_workflow_authoring_source(source, WorkflowSourceFormat::Yaml, &catalog)
+            .expect("concise source");
+        let second = lower_workflow_authoring_source(source, WorkflowSourceFormat::Yaml, &catalog)
+            .expect("repeat lowering");
+        assert_eq!(first, second);
+        assert_eq!(first.profile, WorkflowSourceProfile::Concise);
+        assert_eq!(first.source_map.entries[0].node_id, "step_0001");
+        assert_eq!(first.source_map.entries[1].node_id, "final");
+        assert_eq!(first.document.definition.edges[0].from, "step_0001");
+        assert_eq!(first.document.definition.edges[0].to, "final");
+        assert_eq!(
+            first.document.plugin_input_defaults["final"],
+            serde_json::json!("second")
         );
     }
 
@@ -10261,7 +10971,10 @@ mod tests {
         nested.push('1');
         nested.push_str(&"]".repeat(MAX_WORKFLOW_AUTHORING_JSON_DEPTH + 2));
         assert!(decode_workflow_authoring_source(&nested, WorkflowSourceFormat::Toml).is_err());
-        assert!(WorkflowSourceFormat::from_file_name("workflow.yaml").is_err());
+        assert_eq!(
+            WorkflowSourceFormat::from_file_name("workflow.yaml").expect("YAML suffix"),
+            WorkflowSourceFormat::Yaml
+        );
     }
 
     #[test]
@@ -10437,6 +11150,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string(), "review".to_string()]),
             skills: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         }
     }
 

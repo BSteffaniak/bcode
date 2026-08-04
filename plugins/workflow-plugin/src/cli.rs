@@ -21,10 +21,10 @@ struct WorkflowCli {
     /// Exact positive definition version.
     #[arg(long)]
     version: Option<u32>,
-    /// Path to an editable JSON or TOML `WorkflowAuthoringDocument` source file.
+    /// Path to an editable JSON, YAML, or TOML `WorkflowAuthoringDocument` source file.
     #[arg(long)]
     source: Option<PathBuf>,
-    /// Explicit source format (`json` or `toml`); otherwise inferred from the file name.
+    /// Explicit source format (`json`, `yaml`, or `toml`); otherwise inferred from the file name.
     #[arg(long)]
     source_format: Option<String>,
     /// Path to a compiled workflow definition JSON document for registration.
@@ -94,6 +94,7 @@ fn load_workflow_source(
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let format = match explicit_format {
         Some("json") => bcode_workflow::WorkflowSourceFormat::Json,
+        Some("yaml" | "yml") => bcode_workflow::WorkflowSourceFormat::Yaml,
         Some("toml") => bcode_workflow::WorkflowSourceFormat::Toml,
         Some(format) => return Err(format!("unsupported workflow source format '{format}'")),
         None => bcode_workflow::WorkflowSourceFormat::from_file_name(
