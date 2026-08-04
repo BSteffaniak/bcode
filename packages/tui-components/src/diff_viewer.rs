@@ -531,6 +531,47 @@ mod diff_tests {
     use super::*;
 
     #[test]
+    fn applies_caller_supplied_summary_styles() {
+        let custom = Style::new().fg(Color::Magenta).bg(Color::Blue);
+        let rows = diff_viewer_rows_with_style(
+            DiffViewerInput {
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
+                label: "file.rs",
+                old_text: "before",
+                new_text: "after",
+                old_start_line: 1,
+                new_start_line: 1,
+                line_numbers_known: true,
+                title: "Changed",
+                subtitle: None,
+                argument_bytes: None,
+                truncated: false,
+                layout: DiffViewerLayout::Unified,
+            },
+            80,
+            DiffViewerStyle {
+                muted: custom,
+                title: custom,
+                label: custom,
+            },
+        );
+
+        assert!(
+            rows[0]
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(Color::Blue))
+        );
+        assert!(
+            rows[1]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(Color::Magenta))
+        );
+    }
+
+    #[test]
     fn diff_includes_headers_context_and_counts() {
         let diff = diff_from_text("src/lib.rs", "a\nb\nc\n", "a\nbb\nc\n");
         assert_eq!(diff.added, 1);
@@ -647,6 +688,29 @@ impl DiffViewerLayout {
     }
 }
 
+/// Semantic styles used by diff viewer summary chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffViewerStyle {
+    /// Secondary text and card-border style.
+    pub muted: Style,
+    /// Preview title style.
+    pub title: Style,
+    /// Changed-path label style.
+    pub label: Style,
+}
+
+impl Default for DiffViewerStyle {
+    fn default() -> Self {
+        Self {
+            muted: Style::new().fg(Color::BrightBlack),
+            title: Style::new().fg(Color::Cyan),
+            label: Style::new()
+                .fg(Color::BrightWhite)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
 /// Input used to render diff viewer rows.
 #[derive(Debug, Clone, Copy)]
 pub struct DiffViewerInput<'a> {
@@ -680,6 +744,16 @@ pub struct DiffViewerInput<'a> {
 /// Render diff viewer rows.
 #[must_use]
 pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
+    diff_viewer_rows_with_style(input, width, DiffViewerStyle::default())
+}
+
+/// Render diff viewer rows with caller-supplied semantic styles.
+#[must_use]
+pub fn diff_viewer_rows_with_style(
+    input: DiffViewerInput<'_>,
+    width: u16,
+    style: DiffViewerStyle,
+) -> Vec<Line> {
     let mut diff = diff_from_text_at_lines_with_palette(
         input.label,
         input.old_text,
@@ -697,52 +771,50 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
     }
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![
-        Span::styled("  ", muted_style()),
+        Span::styled("  ", style.muted),
         Span::styled(
             format!(
                 "{} · {}",
                 input.title,
                 mode_label(input.old_text.is_empty())
             ),
-            Style::new().fg(Color::Cyan),
+            style.title,
         ),
     ]));
     rows.push(Line::from_spans(vec![
-        Span::styled("  ", muted_style()),
+        Span::styled("  ", style.muted),
         Span::styled(
             format!("{}  +{} -{}", diff.label, diff.added, diff.removed),
-            Style::new()
-                .fg(Color::BrightWhite)
-                .add_modifier(Modifier::BOLD),
+            style.label,
         ),
     ]));
     rows.push(Line::from_spans(vec![
-        Span::styled("  ", muted_style()),
-        Span::styled(change_summary(diff.added, diff.removed), muted_style()),
+        Span::styled("  ", style.muted),
+        Span::styled(change_summary(diff.added, diff.removed), style.muted),
     ]));
 
     if let Some(argument_bytes) = input.argument_bytes {
         rows.push(Line::from_spans(vec![
-            Span::styled("  ", muted_style()),
+            Span::styled("  ", style.muted),
             Span::styled(
                 format!("received: {}", format_preview_bytes(argument_bytes)),
-                muted_style(),
+                style.muted,
             ),
         ]));
     }
     if let Some(subtitle) = input.subtitle {
         rows.push(Line::from_spans(vec![
-            Span::styled("  ", muted_style()),
-            Span::styled(subtitle.to_owned(), muted_style()),
+            Span::styled("  ", style.muted),
+            Span::styled(subtitle.to_owned(), style.muted),
         ]));
     }
 
     if input.truncated {
         rows.push(Line::from_spans(vec![
-            Span::styled("  ", muted_style()),
+            Span::styled("  ", style.muted),
             Span::styled(
                 "preview truncated; showing available diff rows",
-                muted_style(),
+                style.muted,
             ),
         ]));
     }
@@ -767,8 +839,8 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
         "live preview · /diff for full view".to_owned()
     };
     rows.push(Line::from_spans(vec![
-        Span::styled("  ", muted_style()),
-        Span::styled(progress, muted_style()),
+        Span::styled("  ", style.muted),
+        Span::styled(progress, style.muted),
     ]));
 
     let preview = inline_preview(&visible_lines, MAX_INLINE_DIFF_ROWS);
@@ -778,9 +850,14 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
     } else {
         card_width(&preview, width.saturating_sub(2))
     };
-    rows.push(card_border('┌', '─', '┐', card_width));
-    rows.extend(render_preview_rows(&preview, resolved_layout, card_width));
-    rows.push(card_border('└', '─', '┘', card_width));
+    rows.push(card_border('┌', '─', '┐', card_width, style.muted));
+    rows.extend(render_preview_rows(
+        &preview,
+        resolved_layout,
+        card_width,
+        style,
+    ));
+    rows.push(card_border('└', '─', '┘', card_width, style.muted));
     rows
 }
 
@@ -788,6 +865,7 @@ fn render_preview_rows(
     preview: &[PreviewRow<'_>],
     layout: DiffViewerLayout,
     card_width: u16,
+    _style: DiffViewerStyle,
 ) -> Vec<Line> {
     if layout == DiffViewerLayout::SideBySide {
         return render_side_by_side_preview(preview, card_width);
@@ -797,7 +875,9 @@ fn render_preview_rows(
     for row in preview {
         let rendered = match row {
             PreviewRow::Line(line) => render_diff_line(line, card_width),
-            PreviewRow::Hidden { count, .. } => vec![hidden_row(*count, card_width)],
+            PreviewRow::Hidden { count, .. } => {
+                vec![hidden_row(*count, card_width)]
+            }
         };
         let remaining = MAX_INLINE_DIFF_RENDER_ROWS.saturating_sub(rendered_rows);
         if remaining == 0 {
@@ -1275,13 +1355,13 @@ fn card_width(preview: &[PreviewRow<'_>], available_width: u16) -> u16 {
     .unwrap_or(u16::MAX)
 }
 
-fn card_border(left: char, fill: char, right: char, width: u16) -> Line {
+fn card_border(left: char, fill: char, right: char, width: u16, style: Style) -> Line {
     let inner_width = usize::from(width.saturating_sub(2));
     Line::from_spans(vec![
-        Span::styled("  ", muted_style()),
+        Span::styled("  ", style),
         Span::styled(
             format!("{left}{}{right}", fill.to_string().repeat(inner_width)),
-            muted_style(),
+            style,
         ),
     ])
 }

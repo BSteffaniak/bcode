@@ -31,9 +31,44 @@ const SOURCE_CARD_MIN_WIDTH: usize = 16;
 const SOURCE_CARD_UNNUMBERED_CHROME_WIDTH: usize = 4;
 const SOURCE_CARD_NUMBERED_CHROME_WIDTH: usize = 7;
 
+/// Semantic styles used by source viewer cards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceViewerStyle {
+    /// Base style patched beneath source and syntax token styles.
+    pub source: Style,
+    /// Card border style.
+    pub border: Style,
+    /// Line-number gutter style.
+    pub gutter: Style,
+    /// Omission and truncation message style.
+    pub truncated: Style,
+}
+
+impl Default for SourceViewerStyle {
+    fn default() -> Self {
+        let muted = Style::new().fg(Color::BrightBlack);
+        Self {
+            source: Style::new(),
+            border: muted,
+            gutter: muted,
+            truncated: muted,
+        }
+    }
+}
+
 /// Render source text using the same card and gutter language as the diff viewer.
 #[must_use]
 pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line> {
+    source_viewer_rows_with_style(input, width, SourceViewerStyle::default())
+}
+
+/// Render source text with caller-supplied semantic card styles.
+#[must_use]
+pub fn source_viewer_rows_with_style(
+    input: SourceViewerInput<'_>,
+    width: u16,
+    style: SourceViewerStyle,
+) -> Vec<Line> {
     let lines = input.contents.lines().collect::<Vec<_>>();
     let displayed = lines.len().min(input.max_lines);
     let last_line = input.start_line.saturating_add(displayed.saturating_sub(1));
@@ -63,24 +98,35 @@ pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line>
         }
     };
     let mut rows = Vec::new();
-    rows.push(card_border(card_width, "┌", "┐"));
+    rows.push(card_border(card_width, "┌", "┐", style.border));
     for (index, spans) in highlighted.into_iter().enumerate() {
+        let spans = spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, style.source.patch(span.style)))
+            .collect();
         let chunks = wrap_spans(spans, body_width);
         for (chunk_index, chunk) in chunks.into_iter().enumerate() {
             let number = (chunk_index == 0 && input.line_numbers)
                 .then(|| input.start_line.saturating_add(index));
-            rows.push(source_card_row(chunk, number, number_width, card_width));
+            rows.push(source_card_row(
+                chunk,
+                number,
+                number_width,
+                card_width,
+                style,
+            ));
         }
     }
     if lines.len() > displayed {
         rows.push(source_card_row(
-            vec![Span::styled(input.truncated_message, muted_style())],
+            vec![Span::styled(input.truncated_message, style.truncated)],
             None,
             number_width,
             card_width,
+            style,
         ));
     }
-    rows.push(card_border(card_width, "└", "┘"));
+    rows.push(card_border(card_width, "└", "┘", style.border));
     rows
 }
 
@@ -115,9 +161,10 @@ fn source_card_row(
     line_number: Option<usize>,
     number_width: usize,
     width: u16,
+    style: SourceViewerStyle,
 ) -> Line {
-    let gutter = gutter_style();
-    let mut card = vec![Span::styled("│ ", muted_style())];
+    let gutter = style.gutter;
+    let mut card = vec![Span::styled("│ ", style.border)];
     if number_width > 0 {
         card.push(Span::styled(
             line_number.map_or_else(
@@ -132,23 +179,23 @@ fn source_card_row(
     pad_card_spans(
         &mut card,
         usize::from(width).saturating_sub(2),
-        Style::new(),
+        style.source,
     );
-    card.push(Span::styled(" │", muted_style()));
+    card.push(Span::styled(" │", style.border));
     Line::from_spans(
-        std::iter::once(Span::styled("  ", muted_style()))
+        std::iter::once(Span::styled("  ", style.border))
             .chain(card)
             .collect::<Vec<_>>(),
     )
 }
 
-fn card_border(width: u16, left: &str, right: &str) -> Line {
+fn card_border(width: u16, left: &str, right: &str, style: Style) -> Line {
     let inner = usize::from(width.saturating_sub(2));
     Line::from_spans(vec![
-        Span::styled("  ", muted_style()),
-        Span::styled(left, muted_style()),
-        Span::styled("─".repeat(inner), muted_style()),
-        Span::styled(right, muted_style()),
+        Span::styled("  ", style),
+        Span::styled(left, style),
+        Span::styled("─".repeat(inner), style),
+        Span::styled(right, style),
     ])
 }
 
@@ -210,14 +257,6 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
         output = output.add_modifier(bmux_tui::prelude::Modifier::BOLD);
     }
     output
-}
-
-pub(crate) const fn muted_style() -> Style {
-    Style::new().fg(Color::BrightBlack)
-}
-
-pub(crate) const fn gutter_style() -> Style {
-    Style::new().fg(Color::BrightBlack)
 }
 
 pub(crate) fn pad_card_spans(spans: &mut Vec<Span>, target_width: usize, style: Style) {
@@ -367,6 +406,42 @@ mod tests {
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_str()))
             .sum()
+    }
+
+    #[test]
+    fn applies_caller_supplied_source_card_styles() {
+        let custom = Style::new().fg(Color::Magenta).bg(Color::Blue);
+        let rows = source_viewer_rows_with_style(
+            SourceViewerInput {
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
+                label: "file.txt",
+                contents: "content",
+                start_line: 1,
+                max_lines: 30,
+                truncated_message: "truncated",
+                line_numbers: true,
+            },
+            40,
+            SourceViewerStyle {
+                source: custom,
+                border: custom,
+                gutter: custom,
+                truncated: custom,
+            },
+        );
+
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .all(|span| { span.style.bg == Some(Color::Blue) })
+        );
+        assert!(
+            rows.first()
+                .into_iter()
+                .flat_map(|row| &row.spans)
+                .all(|span| span.style.fg == Some(Color::Magenta))
+        );
     }
 
     #[test]
