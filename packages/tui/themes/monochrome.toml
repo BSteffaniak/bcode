@@ -1,0 +1,55 @@
+display_name   = "Monochrome"
+extends        = ["terminal-native"]
+id             = "monochrome"
+schema_version = 1
+
+[styles."border.focused"]
+modifiers = ["bold"]
+
+[styles."selection.active"]
+modifiers = ["reversed", "bold"]
+
+[styles."state.info"]
+modifiers = ["italic"]
+
+[styles."state.success"]
+modifiers = ["bold"]
+
+[styles."state.warning"]
+modifiers = ["bold", "underline"]
+
+[styles."state.error"]
+modifiers = ["bold", "reversed"]
+
+[styles."tool.running.title"]
+modifiers = ["italic"]
+
+[styles."tool.waiting.title"]
+modifiers = ["bold", "underline"]
+
+[styles."tool.succeeded.title"]
+modifiers = ["bold"]
+
+[styles."tool.failed.title"]
+modifiers = ["bold", "reversed"]
+
+[styles."tool.cancelled.title"]
+modifiers = ["crossed_out"]
+
+[styles."tool.timed_out.title"]
+modifiers = ["bold", "underline"]
+
+[styles."diff.added"]
+modifiers = ["bold"]
+
+[styles."diff.removed"]
+modifiers = ["crossed_out"]
+
+[styles."diff.hunk"]
+modifiers = ["underline"]
+
+[styles."diff.added_emphasis"]
+modifiers = ["bold", "underline"]
+
+[styles."diff.removed_emphasis"]
+modifiers = ["crossed_out", "underline"]

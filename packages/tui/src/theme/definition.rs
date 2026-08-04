@@ -187,6 +187,22 @@ impl ThemeCatalog {
             "builtin:terminal-native-structured",
             include_str!("../../themes/terminal-native-structured.toml"),
         )?);
+        catalog.insert(parse_theme_definition(
+            "builtin:bcode-dark",
+            include_str!("../../themes/bcode-dark.toml"),
+        )?);
+        catalog.insert(parse_theme_definition(
+            "builtin:bcode-light",
+            include_str!("../../themes/bcode-light.toml"),
+        )?);
+        catalog.insert(parse_theme_definition(
+            "builtin:monochrome",
+            include_str!("../../themes/monochrome.toml"),
+        )?);
+        catalog.insert(parse_theme_definition(
+            "builtin:high-contrast",
+            include_str!("../../themes/high-contrast.toml"),
+        )?);
         Ok(catalog)
     }
 
@@ -994,7 +1010,7 @@ indicator = "exit-code"
     #[test]
     fn bundled_themes_use_the_runtime_loader() {
         let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
-        assert_eq!(catalog.definitions.len(), 2);
+        assert_eq!(catalog.definitions.len(), 6);
         let native_definition = catalog
             .definitions
             .get("terminal-native")
@@ -1021,6 +1037,46 @@ indicator = "exit-code"
         assert_eq!(
             structured.containers["tool.succeeded"].layout,
             ContainerLayout::Panel
+        );
+
+        let dark = catalog
+            .resolve(&ThemeSelection::new("bcode-dark"))
+            .expect("dark resolves");
+        assert_eq!(
+            dark.style("canvas").and_then(|style| style.bg),
+            Some(Color::Rgb(11, 16, 32))
+        );
+        assert!(
+            dark.style("diff.added_row")
+                .and_then(|style| style.bg)
+                .is_some()
+        );
+
+        let light = catalog
+            .resolve(&ThemeSelection::new("bcode-light"))
+            .expect("light resolves");
+        assert_eq!(
+            light.style("canvas").and_then(|style| style.bg),
+            Some(Color::Rgb(248, 250, 252))
+        );
+
+        let monochrome = catalog
+            .resolve(&ThemeSelection::new("monochrome"))
+            .expect("monochrome resolves");
+        assert!(
+            monochrome
+                .style("tool.failed.title")
+                .is_some_and(|style| style.modifiers.contains(Modifier::REVERSED))
+        );
+
+        let high_contrast = catalog
+            .resolve(&ThemeSelection::new("high-contrast"))
+            .expect("high contrast resolves");
+        assert_eq!(
+            high_contrast
+                .style("state.error")
+                .and_then(|style| style.fg),
+            Some(Color::BrightRed)
         );
     }
 }

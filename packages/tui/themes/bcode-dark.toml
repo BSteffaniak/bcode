@@ -1,0 +1,88 @@
+display_name   = "Bcode Dark"
+extends        = ["terminal-native-structured"]
+id             = "bcode-dark"
+schema_version = 1
+
+[palette]
+accent             = "#7dd3fc"
+background         = "#0b1020"
+border             = "#334155"
+error              = "#fb7185"
+error_background   = "#3f1420"
+info               = "#38bdf8"
+muted              = "#94a3b8"
+muted_background   = "#172033"
+selection          = "#243454"
+success            = "#4ade80"
+success_background = "#123522"
+text               = "#e2e8f0"
+warning            = "#fbbf24"
+warning_background = "#422f10"
+
+[styles.canvas]
+bg = "$background"
+fg = "$text"
+
+[styles."text.primary"]
+fg = "$text"
+
+[styles."text.muted"]
+fg = "$muted"
+
+[styles."border.default"]
+fg = "$border"
+
+[styles."border.focused"]
+fg        = "$accent"
+modifiers = ["bold"]
+
+[styles."selection.active"]
+bg        = "$selection"
+fg        = "$text"
+modifiers = ["bold"]
+
+[styles."source.border"]
+fg = "$border"
+
+[styles."source.gutter"]
+fg = "$muted"
+
+[styles."source.truncated"]
+fg = "$warning"
+
+[styles."diff.text"]
+fg = "$text"
+
+[styles."diff.muted"]
+fg = "$muted"
+
+[styles."diff.title"]
+fg        = "$accent"
+modifiers = ["bold"]
+
+[styles."diff.label"]
+fg        = "$text"
+modifiers = ["bold"]
+
+[styles."diff.added"]
+fg = "$success"
+
+[styles."diff.removed"]
+fg = "$error"
+
+[styles."diff.hunk"]
+fg = "$info"
+
+[styles."diff.added_row"]
+bg = "$success_background"
+
+[styles."diff.removed_row"]
+bg = "$error_background"
+
+[styles."diff.added_emphasis"]
+bg        = "#1d5734"
+modifiers = ["bold"]
+
+[styles."diff.removed_emphasis"]
+bg        = "#672033"
+modifiers = ["bold"]

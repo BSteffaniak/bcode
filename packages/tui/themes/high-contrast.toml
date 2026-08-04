@@ -1,0 +1,74 @@
+display_name   = "High Contrast"
+extends        = ["terminal-native-structured"]
+id             = "high-contrast"
+schema_version = 1
+
+[palette]
+accent             = "ansi:bright_cyan"
+error              = "ansi:bright_red"
+error_background   = "ansi:black"
+info               = "ansi:bright_blue"
+muted              = "ansi:white"
+muted_background   = "ansi:black"
+success            = "ansi:bright_green"
+success_background = "ansi:black"
+text               = "ansi:bright_white"
+warning            = "ansi:bright_yellow"
+warning_background = "ansi:black"
+
+[styles.canvas]
+bg = "ansi:black"
+fg = "$text"
+
+[styles."text.primary"]
+fg = "$text"
+
+[styles."text.muted"]
+fg = "$muted"
+
+[styles."border.default"]
+fg        = "$text"
+modifiers = ["bold"]
+
+[styles."border.focused"]
+fg        = "$accent"
+modifiers = ["bold", "underline"]
+
+[styles."selection.active"]
+bg        = "ansi:bright_white"
+fg        = "ansi:black"
+modifiers = ["bold"]
+
+[styles."state.success"]
+fg        = "$success"
+modifiers = ["bold"]
+
+[styles."state.warning"]
+fg        = "$warning"
+modifiers = ["bold", "underline"]
+
+[styles."state.error"]
+fg        = "$error"
+modifiers = ["bold", "reversed"]
+
+[styles."diff.added"]
+fg        = "$success"
+modifiers = ["bold"]
+
+[styles."diff.removed"]
+fg        = "$error"
+modifiers = ["bold"]
+
+[styles."diff.hunk"]
+fg        = "$accent"
+modifiers = ["bold", "underline"]
+
+[styles."diff.added_emphasis"]
+bg        = "$success"
+fg        = "ansi:black"
+modifiers = ["bold"]
+
+[styles."diff.removed_emphasis"]
+bg        = "$error"
+fg        = "ansi:bright_white"
+modifiers = ["bold"]
