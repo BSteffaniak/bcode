@@ -46,7 +46,7 @@ use std::{
 use bcode_mermaid_render::{
     MermaidCancellationToken, MermaidRenderRequest, MermaidRenderedOutput, render_mermaid,
 };
-use bcode_syntax_render::SyntaxHighlighter;
+use bcode_syntax_render::{SyntaxHighlighter, SyntaxPalette};
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use hyperchad_color::Color as HyperChadColor;
 use hyperchad_markdown::{MarkdownOptions, markdown_to_container_with_options};
@@ -334,6 +334,8 @@ pub struct MarkdownRenderOptions {
     pub width: u16,
     /// Theme used for terminal Markdown styles.
     pub theme: MarkdownTheme,
+    /// Semantic syntax palette for fenced code blocks.
+    pub syntax: Option<SyntaxPalette>,
     /// Trusted context used only to resolve relative destinations.
     pub document_context: Option<MarkdownDocumentContext>,
     /// Mermaid contribution behavior.
@@ -364,6 +366,7 @@ impl Default for MarkdownRenderOptions {
         Self {
             width: 80,
             theme: MarkdownTheme::default(),
+            syntax: None,
             document_context: None,
             mermaid: MermaidRenderMode::Disabled,
             mermaid_width: 1600,
@@ -393,6 +396,13 @@ impl MarkdownRenderOptions {
     #[must_use]
     pub const fn with_theme(mut self, theme: MarkdownTheme) -> Self {
         self.theme = theme;
+        self
+    }
+
+    /// Return options with a semantic syntax palette for fenced code blocks.
+    #[must_use]
+    pub const fn with_syntax_palette(mut self, palette: SyntaxPalette) -> Self {
+        self.syntax = Some(palette);
         self
     }
 
@@ -2414,6 +2424,7 @@ fn render_markdown_projection(
     let mut renderer = TerminalMarkdownRenderer::new(
         options.width,
         options.theme,
+        options.syntax,
         table_alignments,
         alert_kinds,
         options.image_reserved_rows,
@@ -3074,12 +3085,14 @@ struct TerminalMarkdownRenderer {
     image_reserved_rows: usize,
     mermaid_reserved_rows: usize,
     theme: MarkdownTheme,
+    syntax: Option<SyntaxPalette>,
 }
 
 impl TerminalMarkdownRenderer {
     fn new(
         width: u16,
         theme: MarkdownTheme,
+        syntax: Option<SyntaxPalette>,
         table_alignments: Vec<Vec<Alignment>>,
         alert_kinds: Vec<Option<BlockQuoteKind>>,
         image_reserved_rows: u16,
@@ -3102,6 +3115,7 @@ impl TerminalMarkdownRenderer {
             image_reserved_rows: usize::from(image_reserved_rows.max(1)),
             mermaid_reserved_rows: usize::from(mermaid_reserved_rows.max(1)),
             theme,
+            syntax,
         }
     }
 
@@ -3123,6 +3137,7 @@ impl TerminalMarkdownRenderer {
             image_reserved_rows: self.image_reserved_rows,
             mermaid_reserved_rows: self.mermaid_reserved_rows,
             theme: self.theme,
+            syntax: self.syntax,
         }
     }
 
@@ -3465,7 +3480,7 @@ impl TerminalMarkdownRenderer {
         nested.flush_line();
         let mut code_rows = nested.finish();
         if let Some(language) = language {
-            apply_code_block_syntax_highlighting(language, &mut code_rows, self.theme);
+            apply_code_block_syntax_highlighting(language, &mut code_rows, self.theme, self.syntax);
         }
         if code_rows.is_empty() {
             code_rows.push(Line::default());
@@ -3770,7 +3785,8 @@ fn lines_for_table_cell(
     style: TextStyle,
     theme: MarkdownTheme,
 ) -> Vec<Vec<Span>> {
-    let mut renderer = TerminalMarkdownRenderer::new(u16::MAX, theme, Vec::new(), Vec::new(), 1, 1);
+    let mut renderer =
+        TerminalMarkdownRenderer::new(u16::MAX, theme, None, Vec::new(), Vec::new(), 1, 1);
     renderer.in_table_collection = true;
     renderer.render_container_children(container, style.merge_container(container, theme));
     renderer.flush_line();
@@ -3906,8 +3922,9 @@ fn apply_code_block_syntax_highlighting(
     language: &str,
     code_rows: &mut [Line],
     theme: MarkdownTheme,
+    syntax: Option<SyntaxPalette>,
 ) {
-    let highlighter = SyntaxHighlighter::new();
+    let highlighter = syntax.map_or_else(SyntaxHighlighter::new, SyntaxHighlighter::with_palette);
     if !highlighter.can_highlight(language) {
         return;
     }

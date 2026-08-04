@@ -106,6 +106,7 @@ fn theme_transition_config(curve: TuiAccentTransitionCurve) -> TuiConfig {
             accent_transition: TuiAccentTransitionMode::Transition,
             accent_transition_ms: 100,
             accent_transition_curve: curve,
+            ..TuiThemeConfig::default()
         },
         ..TuiConfig::default()
     }
@@ -428,6 +429,7 @@ fn immediate_theme_transition_ignores_curve() {
             accent_transition: TuiAccentTransitionMode::Immediate,
             accent_transition_ms: 100,
             accent_transition_curve: TuiAccentTransitionCurve::EaseIn,
+            ..TuiThemeConfig::default()
         },
         ..TuiConfig::default()
     });

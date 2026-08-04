@@ -291,6 +291,7 @@ fn read_rows(
         let numbered = !kind.contains("artifact");
         rows.extend(source_viewer_rows(
             SourceViewerInput {
+                syntax_palette: None,
                 label: text(payload, "path").unwrap_or_default(),
                 contents,
                 start_line: payload

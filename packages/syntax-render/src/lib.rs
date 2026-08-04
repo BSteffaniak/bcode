@@ -21,7 +21,7 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME: OnceLock<Theme> = OnceLock::new();
+static DEFAULT_THEME: OnceLock<Theme> = OnceLock::new();
 
 /// Renderer-neutral syntax-highlighted text span.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,14 +58,78 @@ pub struct SyntaxStyle {
 }
 
 /// Terminal syntax highlighter backed by syntect's bundled syntaxes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SyntaxHighlighter;
+///
+/// The optional palette remaps syntax scope colors into application-supplied
+/// semantic colors while preserving Syntect's syntax parsing and font-style
+/// modifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxHighlighter {
+    palette: Option<SyntaxPalette>,
+}
+
+/// Semantic syntax color palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyntaxPalette {
+    /// Plain source text.
+    pub text: SyntaxColor,
+    /// Comments and documentation.
+    pub comment: SyntaxColor,
+    /// Keywords and control flow.
+    pub keyword: SyntaxColor,
+    /// Function and method names.
+    pub function: SyntaxColor,
+    /// Variables, fields, and parameters.
+    pub variable: SyntaxColor,
+    /// String and character literals.
+    pub string: SyntaxColor,
+    /// Numeric and boolean literals.
+    pub number: SyntaxColor,
+    /// Type and namespace names.
+    pub type_name: SyntaxColor,
+    /// Operators.
+    pub operator: SyntaxColor,
+    /// Punctuation and delimiters.
+    pub punctuation: SyntaxColor,
+}
+
+/// Portable RGB syntax color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyntaxColor {
+    /// Red channel.
+    pub r: u8,
+    /// Green channel.
+    pub g: u8,
+    /// Blue channel.
+    pub b: u8,
+}
+
+impl SyntaxColor {
+    /// Create an RGB syntax color.
+    #[must_use]
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+}
+
+impl Default for SyntaxHighlighter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SyntaxHighlighter {
-    /// Create a syntax highlighter.
+    /// Create a syntax highlighter using the bundled default syntax theme.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self { palette: None }
+    }
+
+    /// Create a syntax highlighter using an application-supplied semantic palette.
+    #[must_use]
+    pub const fn with_palette(palette: SyntaxPalette) -> Self {
+        Self {
+            palette: Some(palette),
+        }
     }
 
     /// Return whether a syntax can be detected for a path or language hint.
@@ -89,9 +153,11 @@ impl SyntaxHighlighter {
         let Some(syntax) = syntax_for(path_or_language) else {
             return plain_syntax_spans(line);
         };
-        let mut highlighter = HighlightLines::new(syntax, theme());
-        highlight_line_tokens_with(&mut highlighter, line)
-            .unwrap_or_else(|| plain_syntax_spans(line))
+        let mut highlighter = HighlightLines::new(syntax, default_theme());
+        highlight_line_tokens_with(&mut highlighter, line).map_or_else(
+            || plain_syntax_spans_with_palette(line, self.palette),
+            |spans| remap_spans(spans, self.palette),
+        )
     }
 
     /// Highlight multiple lines using a path or language hint.
@@ -111,14 +177,19 @@ impl SyntaxHighlighter {
         lines: &[&str],
     ) -> Vec<Vec<SyntaxSpan>> {
         let Some(syntax) = syntax_for(path_or_language) else {
-            return lines.iter().map(|line| plain_syntax_spans(line)).collect();
+            return lines
+                .iter()
+                .map(|line| plain_syntax_spans_with_palette(line, self.palette))
+                .collect();
         };
-        let mut highlighter = HighlightLines::new(syntax, theme());
+        let mut highlighter = HighlightLines::new(syntax, default_theme());
         lines
             .iter()
             .map(|line| {
-                highlight_line_tokens_with(&mut highlighter, line)
-                    .unwrap_or_else(|| plain_syntax_spans(line))
+                highlight_line_tokens_with(&mut highlighter, line).map_or_else(
+                    || plain_syntax_spans_with_palette(line, self.palette),
+                    |spans| remap_spans(spans, self.palette),
+                )
             })
             .collect()
     }
@@ -128,8 +199,8 @@ fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
-fn theme() -> &'static Theme {
-    THEME.get_or_init(|| {
+fn default_theme() -> &'static Theme {
+    DEFAULT_THEME.get_or_init(|| {
         let themes = ThemeSet::load_defaults();
         themes
             .themes
@@ -200,8 +271,70 @@ fn highlight_line_tokens_with(
     })
 }
 
+fn plain_syntax_spans_with_palette(line: &str, palette: Option<SyntaxPalette>) -> Vec<SyntaxSpan> {
+    vec![SyntaxSpan::new(
+        line.to_owned(),
+        palette.map_or_else(default_syntax_style, |palette| syntax_style(palette.text)),
+    )]
+}
+
 fn plain_syntax_spans(line: &str) -> Vec<SyntaxSpan> {
-    vec![SyntaxSpan::new(line.to_owned(), default_syntax_style())]
+    plain_syntax_spans_with_palette(line, None)
+}
+
+fn remap_spans(mut spans: Vec<SyntaxSpan>, palette: Option<SyntaxPalette>) -> Vec<SyntaxSpan> {
+    let Some(palette) = palette else {
+        return spans;
+    };
+    for span in &mut spans {
+        let color = classify_scope_color(span.style, default_syntax_style(), palette);
+        span.style.foreground_r = color.r;
+        span.style.foreground_g = color.g;
+        span.style.foreground_b = color.b;
+    }
+    spans
+}
+
+fn classify_scope_color(
+    style: SyntaxStyle,
+    default: SyntaxStyle,
+    palette: SyntaxPalette,
+) -> SyntaxColor {
+    // Syntect's bundled theme supplies stable source scope colors. Map those
+    // known colors to semantic categories; unknown scope colors remain plain
+    // text rather than leaking the bundled dark palette into a caller theme.
+    match (style.foreground_r, style.foreground_g, style.foreground_b) {
+        (101, 115, 126) | (92, 99, 112) => palette.comment,
+        (180, 142, 173) | (198, 120, 221) => palette.keyword,
+        (143, 161, 179) | (220, 220, 170) => palette.function,
+        (192, 197, 206) | (156, 220, 254) => palette.variable,
+        (163, 190, 140) | (206, 145, 120) => palette.string,
+        (208, 135, 112) | (181, 206, 168) => palette.number,
+        (235, 203, 139) | (78, 201, 176) => palette.type_name,
+        (197, 200, 198) | (212, 212, 212) => palette.operator,
+        channels
+            if channels
+                == (
+                    default.foreground_r,
+                    default.foreground_g,
+                    default.foreground_b,
+                ) =>
+        {
+            palette.text
+        }
+        _ => palette.punctuation,
+    }
+}
+
+const fn syntax_style(color: SyntaxColor) -> SyntaxStyle {
+    SyntaxStyle {
+        foreground_r: color.r,
+        foreground_g: color.g,
+        foreground_b: color.b,
+        bold: false,
+        italic: false,
+        underline: false,
+    }
 }
 
 const fn default_syntax_style() -> SyntaxStyle {
@@ -250,7 +383,32 @@ const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{SyntaxHighlighter, syntax_for};
+    use super::{SyntaxColor, SyntaxHighlighter, SyntaxPalette, syntax_for};
+
+    #[test]
+    fn semantic_palette_replaces_bundled_dark_colors() {
+        let palette = SyntaxPalette {
+            text: SyntaxColor::rgb(1, 1, 1),
+            comment: SyntaxColor::rgb(2, 2, 2),
+            keyword: SyntaxColor::rgb(3, 3, 3),
+            function: SyntaxColor::rgb(4, 4, 4),
+            variable: SyntaxColor::rgb(5, 5, 5),
+            string: SyntaxColor::rgb(6, 6, 6),
+            number: SyntaxColor::rgb(7, 7, 7),
+            type_name: SyntaxColor::rgb(8, 8, 8),
+            operator: SyntaxColor::rgb(9, 9, 9),
+            punctuation: SyntaxColor::rgb(10, 10, 10),
+        };
+        let spans = SyntaxHighlighter::with_palette(palette)
+            .highlight_line_tokens("rust", "// comment\nfn main() { let value = 42; }");
+
+        assert!(spans.iter().all(|span| {
+            let red = span.style.foreground_r;
+            (1..=10).contains(&red)
+                && span.style.foreground_g == red
+                && span.style.foreground_b == red
+        }));
+    }
 
     #[test]
     fn detects_curated_syntaxes_from_languages_and_paths() {

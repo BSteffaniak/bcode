@@ -136,7 +136,7 @@ impl ThemeTransitionState {
         }
     }
 
-    fn set_target(&mut self, target: Color, config: TuiThemeConfig, now: Instant) {
+    fn set_target(&mut self, target: Color, config: &TuiThemeConfig, now: Instant) {
         if self.target_accent == target {
             self.displayed_accent = self.accent_at(now);
             return;
@@ -526,9 +526,7 @@ impl BmuxApp {
         has_older_history: bool,
     ) -> Self {
         let now = Instant::now();
-        let initial_theme = ResolvedTheme {
-            accent: super::theme::PENDING_AGENT_METADATA_ACCENT,
-        };
+        let initial_theme = super::theme::resolve_initial_theme();
         let mut app = Self {
             session_id,
             selected_auth_profile: None,
@@ -1314,7 +1312,7 @@ impl BmuxApp {
     /// Advance theme animations for the supplied time.
     pub fn update_theme_animation(&mut self, now: Instant) -> UiInvalidation {
         let accent = self.theme_transition.update(now);
-        self.presented_theme = PresentedTheme { accent };
+        self.presented_theme = self.target_theme.presented(accent);
         UiInvalidation::Paint
     }
 
@@ -1322,7 +1320,7 @@ impl BmuxApp {
     #[cfg(test)]
     pub fn animated_accent(&mut self, target_accent: Color, now: Instant) -> Color {
         self.theme_transition
-            .set_target(target_accent, self.tui_config.theme, now);
+            .set_target(target_accent, &self.tui_config.theme, now);
         self.update_theme_animation(now);
         self.presented_theme.accent
     }
@@ -1345,7 +1343,7 @@ impl BmuxApp {
         let target = super::theme::resolve_theme(self);
         self.target_theme = target;
         self.theme_transition
-            .set_target(target.accent, self.tui_config.theme, now);
+            .set_target(target.accent, &self.tui_config.theme, now);
         self.update_theme_animation(now);
     }
 
@@ -3269,9 +3267,7 @@ impl BmuxApp {
                 self.update_theme_animation(now);
                 if !self.theme_transition_active(now) {
                     self.theme_transition.finish();
-                    self.presented_theme = PresentedTheme {
-                        accent: self.target_theme.accent,
-                    };
+                    self.presented_theme = self.target_theme.presented(self.target_theme.accent);
                 }
                 invalidation.merge(UiInvalidation::Paint)
             } else if let Some(invocation_id) = tool_elapsed_invalidation_invocation_id(key) {

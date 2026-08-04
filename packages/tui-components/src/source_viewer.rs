@@ -5,13 +5,16 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[cfg(feature = "syntax")]
-use bcode_syntax_render::{SyntaxHighlighter, SyntaxStyle};
+use bcode_syntax_render::{SyntaxHighlighter, SyntaxPalette, SyntaxStyle};
 
 /// Input used to render a source viewer card.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceViewerInput<'a> {
     /// Path or language hint used for syntax highlighting.
     pub label: &'a str,
+    /// Optional semantic syntax palette.
+    #[cfg(feature = "syntax")]
+    pub syntax_palette: Option<SyntaxPalette>,
     /// Source text to display.
     pub contents: &'a str,
     /// Absolute, one-based number of the first source line.
@@ -49,7 +52,16 @@ pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line>
     let body_width = usize::from(card_width)
         .saturating_sub(source_card_chrome_width(number_width))
         .max(1);
-    let highlighted = highlight_lines(input.label, &lines[..displayed]);
+    let highlighted = {
+        #[cfg(feature = "syntax")]
+        {
+            highlight_lines(input.label, &lines[..displayed], input.syntax_palette)
+        }
+        #[cfg(not(feature = "syntax"))]
+        {
+            highlight_lines(input.label, &lines[..displayed])
+        }
+    };
     let mut rows = Vec::new();
     rows.push(card_border(card_width, "┌", "┐"));
     for (index, spans) in highlighted.into_iter().enumerate() {
@@ -160,8 +172,8 @@ fn wrap_spans(spans: Vec<Span>, width: usize) -> Vec<Vec<Span>> {
 }
 
 #[cfg(feature = "syntax")]
-fn highlight_lines(hint: &str, lines: &[&str]) -> Vec<Vec<Span>> {
-    let highlighter = SyntaxHighlighter::new();
+fn highlight_lines(hint: &str, lines: &[&str], palette: Option<SyntaxPalette>) -> Vec<Vec<Span>> {
+    let highlighter = palette.map_or_else(SyntaxHighlighter::new, SyntaxHighlighter::with_palette);
     if !highlighter.can_highlight(hint) {
         return lines
             .iter()
@@ -245,6 +257,8 @@ mod tests {
     fn renders_absolute_aligned_line_numbers() {
         let rows = source_viewer_rows(
             SourceViewerInput {
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
                 label: "file.rs",
                 contents: "nine\nten",
                 start_line: 9,
@@ -264,6 +278,8 @@ mod tests {
         let width = 24;
         let rows = source_viewer_rows(
             SourceViewerInput {
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
                 label: "file.rs",
                 contents: "a source line long enough to wrap",
                 start_line: 42,
@@ -289,6 +305,8 @@ mod tests {
     fn short_source_uses_content_sized_card() {
         let rows = source_viewer_rows(
             SourceViewerInput {
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
                 label: "file.rs",
                 contents: "let x = 1;",
                 start_line: 1,
@@ -310,6 +328,8 @@ mod tests {
     fn omitted_long_lines_do_not_expand_source_card() {
         let rows = source_viewer_rows(
             SourceViewerInput {
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
                 label: "file.rs",
                 contents: "short\nthis omitted line is intentionally extremely long and should not size the card",
                 start_line: 1,
@@ -327,6 +347,8 @@ mod tests {
     fn unicode_source_width_uses_terminal_cells() {
         let rows = source_viewer_rows(
             SourceViewerInput {
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
                 label: "file.txt",
                 contents: "界界",
                 start_line: 1,
@@ -351,6 +373,8 @@ mod tests {
     fn supports_unnumbered_source_cards() {
         let output = rendered(&source_viewer_rows(
             SourceViewerInput {
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
                 label: "artifact",
                 contents: "content",
                 start_line: 1,

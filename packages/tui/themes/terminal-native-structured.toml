@@ -1,0 +1,73 @@
+display_name   = "Terminal Native — Structured Tools"
+extends        = ["terminal-native"]
+id             = "terminal-native-structured"
+schema_version = 1
+
+[palette]
+error_background   = "#2a1216"
+muted_background   = "#181818"
+success_background = "#102418"
+warning_background = "#2a2110"
+
+[styles."tool.requested.container"]
+bg = "$muted_background"
+
+[styles."tool.running.container"]
+bg = "$muted_background"
+
+[styles."tool.waiting.container"]
+bg = "$warning_background"
+
+[styles."tool.succeeded.container"]
+bg = "$success_background"
+
+[styles."tool.failed.container"]
+bg = "$error_background"
+
+[styles."tool.cancelled.container"]
+bg = "$muted_background"
+
+[styles."tool.timed_out.container"]
+bg = "$warning_background"
+
+[containers."tool.requested"]
+border    = "left"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.running"]
+border    = "left"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.waiting"]
+border    = "left"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.succeeded"]
+border    = "left"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.failed"]
+border    = "left"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.cancelled"]
+border    = "left"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.timed_out"]
+border    = "left"
+layout    = "panel"
+padding_x = 1
+width     = "full"

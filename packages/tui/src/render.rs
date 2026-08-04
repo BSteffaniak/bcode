@@ -80,13 +80,22 @@ const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 #[derive(Debug, Clone, Copy)]
 pub struct TuiTheme {
     pub accent: Color,
+    pub text: Style,
+    pub muted: Style,
+    pub border: Style,
+    pub selection: Style,
 }
 
 impl TuiTheme {
     #[must_use]
     pub const fn for_app(app: &BmuxApp) -> Self {
+        let theme = app.presented_theme();
         Self {
-            accent: app.presented_theme().accent,
+            accent: theme.accent,
+            text: theme.text,
+            muted: theme.muted,
+            border: theme.border,
+            selection: theme.selection,
         }
     }
 
@@ -97,12 +106,17 @@ impl TuiTheme {
         configured_accent: Option<&str>,
         agent_metadata_hydrated: bool,
     ) -> Self {
+        let theme = super::theme::resolve_initial_theme();
         Self {
             accent: super::theme::target_agent_accent(
                 agent_id,
                 configured_accent,
                 agent_metadata_hydrated,
             ),
+            text: theme.text,
+            muted: theme.muted,
+            border: theme.border,
+            selection: theme.selection,
         }
     }
 }
@@ -286,7 +300,7 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         latest_bar,
         status,
         composer,
-        composer_content: composer_panel(TuiTheme::for_app(app).accent).inner_area(composer),
+        composer_content: composer_panel(TuiTheme::for_app(app)).inner_area(composer),
     })
 }
 
@@ -888,9 +902,9 @@ const fn composer_area(area: Rect, composer_height: u16) -> Rect {
     )
 }
 
-fn composer_panel(accent: Color) -> Panel {
+fn composer_panel(theme: TuiTheme) -> Panel {
     Panel::new()
-        .border(Border::single().style(Style::new().fg(accent)))
+        .border(Border::single().style(theme.border.patch(Style::new().fg(theme.accent))))
         .title(" Message ")
         .padding(Insets::new(0, 1, 0, 1))
 }
@@ -905,15 +919,18 @@ fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiThe
 }
 
 fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
-    let muted = Style::new().fg(Color::BrightBlack);
-    let accent = Style::new().fg(theme.accent);
+    let muted = theme.muted;
+    let accent = theme.text.patch(Style::new().fg(theme.accent));
     let session_title = app
         .session_title()
         .map_or_else(|| "Untitled session".to_owned(), ToOwned::to_owned);
     let mut line = ChromeLine::new(" · ", muted)
         .required(
             "bcode".to_owned(),
-            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            theme
+                .text
+                .patch(Style::new().fg(theme.accent))
+                .add_modifier(Modifier::BOLD),
             false,
         )
         .required(app.display_agent_id().to_owned(), accent, false)
@@ -1046,6 +1063,8 @@ pub fn markdown_render_options(
     width: u16,
 ) -> MarkdownRenderOptions {
     let mut options = MarkdownRenderOptions::new(width)
+        .with_theme(app.presented_theme().markdown)
+        .with_syntax_palette(app.presented_theme().syntax)
         .with_document_id(format!("transcript:{}", item.id().get()))
         .with_streaming(item.streaming())
         .with_link_destination_fallbacks(true)
@@ -3920,7 +3939,7 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: 
     if area.is_empty() {
         return;
     }
-    let panel = composer_panel(theme.accent);
+    let panel = composer_panel(theme);
     panel.render(area, frame);
     let inner = panel.inner_area(area);
     app.set_composer_content_area(inner);
@@ -3931,7 +3950,9 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: 
     );
     TextInput::new(app.composer())
         .placeholder("Ask Bcode…")
-        .placeholder_style(Style::new().fg(Color::BrightBlack))
+        .placeholder_style(theme.muted)
+        .style(theme.text)
+        .selection_style(theme.selection)
         .vertical_scroll(app.composer_scroll_offset_for_render())
         .cursor_visible(app.cursor_visible())
         .render(inner, frame);

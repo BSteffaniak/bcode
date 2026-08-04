@@ -2177,9 +2177,24 @@ pub enum TuiAccentTransitionCurve {
 }
 
 /// Terminal UI theme rendering configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "theme")]
 pub struct TuiThemeConfig {
+    /// Selected theme id or explicit configured theme name.
+    #[serde(default = "default_tui_theme_name")]
+    pub name: String,
+    /// Ordered theme overlays applied after the selected base theme.
+    #[serde(default)]
+    pub overlays: Vec<String>,
+    /// Light/dark variant selection behavior.
+    #[serde(default)]
+    pub variant: TuiThemeVariant,
+    /// Additional authorized theme files or directories.
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    /// Policy for applying agent-provided accent metadata.
+    #[serde(default)]
+    pub agent_accent: TuiAgentAccentPolicy,
     /// How accent color changes should be applied.
     #[serde(default)]
     pub accent_transition: TuiAccentTransitionMode,
@@ -2194,7 +2209,7 @@ pub struct TuiThemeConfig {
 impl TuiThemeConfig {
     /// Return the effective accent transition duration in milliseconds.
     #[must_use]
-    pub const fn effective_accent_transition_ms(self) -> u64 {
+    pub const fn effective_accent_transition_ms(&self) -> u64 {
         if matches!(self.accent_transition, TuiAccentTransitionMode::Immediate) {
             0
         } else {
@@ -2206,6 +2221,11 @@ impl TuiThemeConfig {
 impl Default for TuiThemeConfig {
     fn default() -> Self {
         Self {
+            name: default_tui_theme_name(),
+            overlays: Vec::new(),
+            variant: TuiThemeVariant::Auto,
+            paths: Vec::new(),
+            agent_accent: TuiAgentAccentPolicy::AgentWithThemeFallback,
             accent_transition: TuiAccentTransitionMode::Transition,
             accent_transition_ms: default_tui_accent_transition_ms(),
             accent_transition_curve: TuiAccentTransitionCurve::EaseOut,
@@ -2213,8 +2233,36 @@ impl Default for TuiThemeConfig {
     }
 }
 
+fn default_tui_theme_name() -> String {
+    "terminal-native".to_owned()
+}
+
 const fn default_tui_accent_transition_ms() -> u64 {
     220
+}
+
+/// Terminal theme variant selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiThemeVariant {
+    /// Detect the terminal background and select the corresponding variant.
+    #[default]
+    Auto,
+    /// Select the theme's dark variant.
+    Dark,
+    /// Select the theme's light variant.
+    Light,
+}
+
+/// Policy for resolving an agent-provided accent against the selected theme.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiAgentAccentPolicy {
+    /// Ignore agent accent metadata and use only the selected theme.
+    ThemeOnly,
+    /// Prefer valid agent metadata and fall back to the selected theme accent.
+    #[default]
+    AgentWithThemeFallback,
 }
 
 /// Terminal UI accent color transition behavior.
@@ -5595,6 +5643,7 @@ const fn streaming_curve_name(curve: StreamingInterpolationCurveConfig) -> &'sta
 }
 
 fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
+    write_tui_theme_toml(output, &tui.theme);
     if !tui.keybindings.is_empty() {
         write_tui_keybinding_section(output, "chat", &tui.keybindings.chat);
         write_tui_keybinding_section(output, "permission", &tui.keybindings.permission);
@@ -5611,6 +5660,81 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
         tui_thinking_mode_name(tui.thinking.mode)
     )
     .expect("writing to string should not fail");
+}
+
+fn write_tui_theme_toml(output: &mut String, theme: &TuiThemeConfig) {
+    if theme == &TuiThemeConfig::default() {
+        return;
+    }
+    writeln!(output, "[tui.theme]").expect("writing to string should not fail");
+    writeln!(output, "name = {}", toml_string(&theme.name))
+        .expect("writing to string should not fail");
+    if !theme.overlays.is_empty() {
+        write!(output, "overlays = [").expect("writing to string should not fail");
+        for (index, overlay) in theme.overlays.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&toml_string(overlay));
+        }
+        output.push_str("]\n");
+    }
+    writeln!(
+        output,
+        "variant = {}",
+        toml_string(match theme.variant {
+            TuiThemeVariant::Auto => "auto",
+            TuiThemeVariant::Dark => "dark",
+            TuiThemeVariant::Light => "light",
+        })
+    )
+    .expect("writing to string should not fail");
+    if !theme.paths.is_empty() {
+        write!(output, "paths = [").expect("writing to string should not fail");
+        for (index, path) in theme.paths.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&toml_string(&path.to_string_lossy()));
+        }
+        output.push_str("]\n");
+    }
+    writeln!(
+        output,
+        "agent_accent = {}",
+        toml_string(match theme.agent_accent {
+            TuiAgentAccentPolicy::ThemeOnly => "theme_only",
+            TuiAgentAccentPolicy::AgentWithThemeFallback => "agent_with_theme_fallback",
+        })
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "accent_transition = {}",
+        toml_string(match theme.accent_transition {
+            TuiAccentTransitionMode::Immediate => "immediate",
+            TuiAccentTransitionMode::Transition => "transition",
+        })
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "accent_transition_ms = {}",
+        theme.accent_transition_ms
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "accent_transition_curve = {}",
+        toml_string(match theme.accent_transition_curve {
+            TuiAccentTransitionCurve::Linear => "linear",
+            TuiAccentTransitionCurve::EaseIn => "ease_in",
+            TuiAccentTransitionCurve::EaseOut => "ease_out",
+            TuiAccentTransitionCurve::EaseInOut => "ease_in_out",
+        })
+    )
+    .expect("writing to string should not fail");
+    output.push('\n');
 }
 
 const fn tui_thinking_mode_name(mode: TuiThinkingMode) -> &'static str {
@@ -6561,9 +6685,10 @@ mod tests {
         BcodeConfig, CompactionBackend, CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot,
         ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc, InvariantGuidanceMode,
         InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc, TuiAccentTransitionCurve,
-        TuiInteractionOffscreenFocus, TuiInteractionPlacement, TuiMouseConfig, TuiRenderConfig,
-        TuiVisualAdapterConfig, default_config_paths_from, default_permissions_state_path,
-        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
+        TuiAgentAccentPolicy, TuiInteractionOffscreenFocus, TuiInteractionPlacement,
+        TuiMouseConfig, TuiRenderConfig, TuiThemeVariant, TuiVisualAdapterConfig,
+        default_config_paths_from, default_permissions_state_path, load_config_from_paths,
+        load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
         register_runtime_auth_subscription, set_openai_compatible_sshenv_auth_method,
@@ -6572,6 +6697,7 @@ mod tests {
     use bcode_agent_policy_models::Action;
     use bcode_plugin::{PluginSelection, PluginSelectionMode};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7660,6 +7786,11 @@ triple_click_select = "all"
         let config: BcodeConfig = toml::from_str(
             r#"
 [tui.theme]
+name = "terminal-native-structured"
+overlays = ["high-contrast-status"]
+variant = "dark"
+paths = ["themes/custom.toml"]
+agent_accent = "theme_only"
 accent_transition = "transition"
 accent_transition_ms = 180
 accent_transition_curve = "ease_in_out"
@@ -7667,11 +7798,25 @@ accent_transition_curve = "ease_in_out"
         )
         .expect("config should parse");
 
+        assert_eq!(config.tui.theme.name, "terminal-native-structured");
+        assert_eq!(config.tui.theme.overlays, ["high-contrast-status"]);
+        assert_eq!(config.tui.theme.variant, TuiThemeVariant::Dark);
+        assert_eq!(
+            config.tui.theme.paths,
+            [PathBuf::from("themes/custom.toml")]
+        );
+        assert_eq!(
+            config.tui.theme.agent_accent,
+            TuiAgentAccentPolicy::ThemeOnly
+        );
         assert_eq!(config.tui.theme.accent_transition_ms, 180);
         assert_eq!(
             config.tui.theme.accent_transition_curve,
             TuiAccentTransitionCurve::EaseInOut
         );
+        let rendered = super::config_to_toml(&config);
+        let round_trip: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
+        assert_eq!(round_trip.tui.theme, config.tui.theme);
     }
 
     #[test]

@@ -58,6 +58,7 @@ serde                     = { workspace = true, features = ["derive", "std"] }
 serde_json                = { workspace = true }
 thiserror                 = { workspace = true }
 tokio                     = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+toml                      = { workspace = true }
 tracing                   = { workspace = true }
 unicode-segmentation      = { workspace = true }
 url                       = { workspace = true }

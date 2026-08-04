@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 use bmux_tui::prelude::Modifier;
 
 #[cfg(feature = "syntax")]
-use bcode_syntax_render::{SyntaxHighlighter, SyntaxStyle};
+use bcode_syntax_render::{SyntaxHighlighter, SyntaxPalette, SyntaxStyle};
 
 /// Maximum number of source lines rendered by [`source_preview_lines`].
 pub const DEFAULT_SOURCE_PREVIEW_MAX_LINES: usize = 30;
@@ -20,6 +20,9 @@ pub struct SourcePreviewOptions<'a> {
     pub syntax_hint: &'a str,
     /// Available terminal width in cells.
     pub width: u16,
+    /// Optional semantic syntax palette.
+    #[cfg(feature = "syntax")]
+    pub syntax_palette: Option<SyntaxPalette>,
     /// Maximum number of source lines to render.
     pub max_lines: usize,
     /// Prefix shown before every source line.
@@ -41,6 +44,8 @@ impl<'a> SourcePreviewOptions<'a> {
         Self {
             syntax_hint,
             width,
+            #[cfg(feature = "syntax")]
+            syntax_palette: None,
             max_lines: DEFAULT_SOURCE_PREVIEW_MAX_LINES,
             line_prefix: "  │ ",
             prefix_style: Style::new().fg(Color::BrightBlack),
@@ -48,6 +53,14 @@ impl<'a> SourcePreviewOptions<'a> {
             truncated_message: "  … preview truncated",
             truncated_style: Style::new().fg(Color::BrightBlack),
         }
+    }
+
+    /// Set the semantic syntax palette.
+    #[cfg(feature = "syntax")]
+    #[must_use]
+    pub const fn syntax_palette(mut self, palette: SyntaxPalette) -> Self {
+        self.syntax_palette = Some(palette);
+        self
     }
 
     /// Set the maximum rendered source lines.
@@ -101,7 +114,16 @@ pub fn source_preview_lines(contents: &str, options: &SourcePreviewOptions<'_>) 
         display_lines.push(line.to_owned());
     }
 
-    let highlighted_lines = highlight_lines(options.syntax_hint, &display_lines);
+    let highlighted_lines = {
+        #[cfg(feature = "syntax")]
+        {
+            highlight_lines(options.syntax_hint, &display_lines, options.syntax_palette)
+        }
+        #[cfg(not(feature = "syntax"))]
+        {
+            highlight_lines(options.syntax_hint, &display_lines)
+        }
+    };
     let mut rows = highlighted_lines
         .into_iter()
         .map(|spans| preview_line(spans, options, max_width))
@@ -169,8 +191,12 @@ impl SourceSpan {
 }
 
 #[cfg(feature = "syntax")]
-fn highlight_lines(syntax_hint: &str, lines: &[String]) -> Vec<Vec<SourceSpan>> {
-    let highlighter = SyntaxHighlighter::new();
+fn highlight_lines(
+    syntax_hint: &str,
+    lines: &[String],
+    palette: Option<SyntaxPalette>,
+) -> Vec<Vec<SourceSpan>> {
+    let highlighter = palette.map_or_else(SyntaxHighlighter::new, SyntaxHighlighter::with_palette);
     if !highlighter.can_highlight(syntax_hint) {
         return plain_lines(lines);
     }
@@ -278,6 +304,35 @@ mod tests {
     }
 
     use bmux_tui::prelude::Line;
+
+    #[test]
+    #[cfg(feature = "syntax")]
+    fn source_preview_accepts_semantic_syntax_palette() {
+        use bcode_syntax_render::{SyntaxColor, SyntaxPalette};
+
+        let color = SyntaxColor::rgb(7, 8, 9);
+        let palette = SyntaxPalette {
+            text: color,
+            comment: color,
+            keyword: color,
+            function: color,
+            variable: color,
+            string: color,
+            number: color,
+            type_name: color,
+            operator: color,
+            punctuation: color,
+        };
+        let rows = source_preview_lines(
+            "fn main() {}",
+            &SourcePreviewOptions::new("rust", 80).syntax_palette(palette),
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| { span.style.fg == Some(bmux_tui::style::Color::Rgb(7, 8, 9)) })
+        );
+    }
 
     #[test]
     fn limits_preview_lines() {

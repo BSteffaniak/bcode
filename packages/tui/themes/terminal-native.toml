@@ -1,0 +1,187 @@
+display_name   = "Terminal Native"
+id             = "terminal-native"
+schema_version = 1
+
+[palette]
+accent     = "ansi:cyan"
+background = "terminal"
+error      = "ansi:red"
+info       = "ansi:cyan"
+muted      = "ansi:bright_black"
+success    = "ansi:green"
+text       = "terminal"
+warning    = "ansi:yellow"
+
+[styles.canvas]
+fg = "$text"
+
+[styles."text.primary"]
+fg = "$text"
+
+[styles."text.muted"]
+fg = "$muted"
+
+[styles."border.default"]
+fg = "$muted"
+
+[styles."border.focused"]
+fg = "$accent"
+
+[styles."state.info"]
+fg = "$info"
+
+[styles."state.success"]
+fg = "$success"
+
+[styles."state.warning"]
+fg = "$warning"
+
+[styles."state.error"]
+fg = "$error"
+
+[styles."selection.active"]
+modifiers = ["reversed"]
+
+[styles."markdown.text"]
+fg = "$text"
+
+[styles."markdown.heading"]
+fg        = "$accent"
+modifiers = ["bold"]
+
+[styles."markdown.link"]
+fg        = "ansi:blue"
+modifiers = ["underline"]
+
+[styles."markdown.inline_code"]
+fg = "$warning"
+
+[styles."markdown.code_block_text"]
+fg = "$warning"
+
+[styles."markdown.code_block_border"]
+fg = "$muted"
+
+[styles."markdown.blockquote_bar"]
+fg = "$muted"
+
+[styles."markdown.alert_note"]
+fg = "ansi:blue"
+
+[styles."markdown.alert_tip"]
+fg = "$success"
+
+[styles."markdown.alert_important"]
+fg = "ansi:magenta"
+
+[styles."markdown.alert_warning"]
+fg = "$warning"
+
+[styles."markdown.alert_caution"]
+fg = "$error"
+
+[styles."markdown.list_marker"]
+fg = "$muted"
+
+[styles."markdown.task_checked"]
+fg = "$success"
+
+[styles."markdown.task_unchecked"]
+fg = "$muted"
+
+[styles."markdown.table_border"]
+fg = "$muted"
+
+[styles."markdown.horizontal_rule"]
+fg = "$muted"
+
+[styles."syntax.text"]
+fg = "$text"
+
+[styles."syntax.comment"]
+fg = "$muted"
+
+[styles."syntax.keyword"]
+fg = "ansi:blue"
+
+[styles."syntax.function"]
+fg = "$accent"
+
+[styles."syntax.variable"]
+fg = "ansi:bright_cyan"
+
+[styles."syntax.string"]
+fg = "$success"
+
+[styles."syntax.number"]
+fg = "$warning"
+
+[styles."syntax.type"]
+fg = "ansi:cyan"
+
+[styles."syntax.operator"]
+fg = "$text"
+
+[styles."syntax.punctuation"]
+fg = "$text"
+
+[styles."transcript.user.label"]
+fg        = "$accent"
+modifiers = ["bold"]
+
+[styles."transcript.assistant.label"]
+fg        = "$success"
+modifiers = ["bold"]
+
+[styles."transcript.reasoning.label"]
+fg        = "$muted"
+modifiers = ["italic"]
+
+[styles."tool.requested.title"]
+fg = "$muted"
+
+[styles."tool.running.title"]
+fg = "$info"
+
+[styles."tool.waiting.title"]
+fg = "$warning"
+
+[styles."tool.succeeded.title"]
+fg = "$success"
+
+[styles."tool.failed.title"]
+fg = "$error"
+
+[styles."tool.cancelled.title"]
+fg = "$muted"
+
+[styles."tool.timed_out.title"]
+fg        = "$warning"
+modifiers = ["bold"]
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+layout = "plain"
+
+[containers."tool.running"]
+layout = "plain"
+
+[containers."tool.waiting"]
+layout = "plain"
+
+[containers."tool.succeeded"]
+layout = "plain"
+
+[containers."tool.failed"]
+layout = "plain"
+
+[containers."tool.cancelled"]
+layout = "plain"
+
+[containers."tool.timed_out"]
+layout = "plain"
