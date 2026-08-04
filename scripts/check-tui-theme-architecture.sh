@@ -66,6 +66,29 @@ if rg -n 'frame\.fill\(area, " ", Style::new\(\)\.fg\(Color::White\)\.bg\(Color:
   fail "Markdown source overlay must consume resolved semantic styles"
 fi
 
+if rg -n 'Color::Blue|Color::Green|Color::Red|Color::Magenta|Color::Cyan|Color::BrightBlack' \
+  packages/tui/src/render.rs | rg 'TranscriptItemKind|push_assistant_rows|push_reasoning_rows|push_permission_request_rows|push_pending_submission_rows|statusline_spans|history_banner_rows' >/dev/null; then
+  fail "transcript and status-line semantics must consume active resolved styles"
+fi
+
+if rg -n 'frame\.fill\(area, " ", Style::new\(\)\.fg\(Color::White\)\.bg\(Color::Black\)' \
+  plugins/model-plugin/src/lib.rs \
+  plugins/skills-plugin/src/lib.rs \
+  plugins/worktree-plugin/src/lib.rs \
+  plugins/workflow-plugin/src/tui.rs; then
+  fail "migrated plugin command surfaces must consume renderer-owned semantic themes"
+fi
+
+if rg -n 'Color::|frame\.fill\(area, " ", Style::new\(\)' \
+  plugins/ralph-plugin/src/lib.rs; then
+  fail "migrated Ralph home surface must consume renderer-owned semantic themes"
+fi
+
+if rg -n 'Color::|frame\.fill\(area, " ", Style::new\(\)' \
+  plugins/workflow-plugin/src/authoring_tui.rs; then
+  fail "workflow authoring surface must consume renderer-owned semantic themes"
+fi
+
 if rg -n 'SyntaxHighlighter::new\(\)' \
   plugins/filesystem-plugin/src \
   --glob '*.rs'; then

@@ -22,8 +22,8 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::style::{Color, Style};
-use bmux_tui::text::Line;
+use bmux_tui::style::{Modifier, Style};
+use bmux_tui::text::{Line, Span};
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
@@ -184,6 +184,36 @@ struct GeneratedWorkflowCandidate {
     document: WorkflowAuthoringDocument,
     preview: WorkflowCompilationPreview,
     repair_attempts: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthorSurfaceTheme {
+    canvas: Style,
+    text: Style,
+    muted: Style,
+    focused: Style,
+    selection: Style,
+}
+
+impl AuthorSurfaceTheme {
+    fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
+        theme.map_or_else(
+            || Self {
+                canvas: Style::new(),
+                text: Style::new(),
+                muted: Style::new().add_modifier(Modifier::DIM),
+                focused: Style::new().add_modifier(Modifier::BOLD),
+                selection: Style::new().add_modifier(Modifier::REVERSED),
+            },
+            |theme| Self {
+                canvas: theme.canvas,
+                text: theme.text,
+                muted: theme.muted,
+                focused: theme.focused,
+                selection: theme.selection,
+            },
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -1058,8 +1088,14 @@ impl WorkflowAuthorSurface {
         }
     }
 
-    fn render_palette(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        draw_pane(frame, area, "Palette", self.focus == EditorPane::Palette);
+    fn render_palette(&mut self, area: Rect, frame: &mut Frame<'_>, theme: AuthorSurfaceTheme) {
+        draw_pane(
+            frame,
+            area,
+            "Palette",
+            self.focus == EditorPane::Palette,
+            theme,
+        );
         if area.height <= PALETTE_HEADER_ROWS {
             return;
         }
@@ -1087,16 +1123,22 @@ impl WorkflowAuthorSurface {
                 area,
                 u16::try_from(row).unwrap_or(u16::MAX) + PALETTE_HEADER_ROWS,
                 &format!("{marker} {} [{kind}]", entry.label),
+                if marker == "▶" {
+                    theme.selection
+                } else {
+                    theme.text
+                },
             );
         }
     }
 
-    fn render_canvas(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_canvas(&mut self, area: Rect, frame: &mut Frame<'_>, theme: AuthorSurfaceTheme) {
         draw_pane(
             frame,
             area,
             "Graph canvas",
             self.focus == EditorPane::Canvas,
+            theme,
         );
         if area.height <= CANVAS_HEADER_ROWS {
             return;
@@ -1113,6 +1155,7 @@ impl WorkflowAuthorSurface {
             area,
             1,
             &format!("{} nodes · {edges} edges", nodes.len()),
+            theme.muted,
         );
         let node_visible = visible.saturating_sub(edges.min(4));
         for (row, (id, node)) in nodes
@@ -1139,6 +1182,11 @@ impl WorkflowAuthorSurface {
                 area,
                 u16::try_from(row).unwrap_or(u16::MAX) + CANVAS_HEADER_ROWS,
                 &line,
+                if marker == "▶" {
+                    theme.selection
+                } else {
+                    theme.text
+                },
             );
         }
         let candidate_document = self
@@ -1163,17 +1211,23 @@ impl WorkflowAuthorSurface {
                         "{marker} edge {} → {} [{:?}]",
                         edge.from, edge.to, edge.kind
                     ),
+                    if marker == "◆" {
+                        theme.focused
+                    } else {
+                        theme.muted
+                    },
                 );
             }
         }
     }
 
-    fn render_inspector(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_inspector(&self, area: Rect, frame: &mut Frame<'_>, theme: AuthorSurfaceTheme) {
         draw_pane(
             frame,
             area,
             "Inspector",
             self.focus == EditorPane::Inspector,
+            theme,
         );
         let selected_field = self
             .schema_fields()
@@ -1220,6 +1274,33 @@ impl WorkflowAuthorSurface {
                 area,
                 u16::try_from(row).unwrap_or(u16::MAX) + 1,
                 line,
+                theme.text,
+            );
+        }
+    }
+    fn render_themed(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        let theme = AuthorSurfaceTheme::resolve(theme);
+        self.last_area = area;
+        frame.fill(area, " ", theme.canvas);
+        let (palette, canvas, inspector, footer) = editor_rects(area);
+        self.render_palette(palette, frame, theme);
+        self.render_canvas(canvas, frame, theme);
+        self.render_inspector(inspector, frame, theme);
+        if footer.height > 0 {
+            frame.write_line(
+                footer,
+                &Line::from_spans(vec![Span::styled(
+                    format!(
+                        "{} · G generate · A accept candidate · z instantiate · Tab panes · node d/x/c · edge e/E · group g · move Shift+HJKL · inspector n/a/t/+/v · R resolve conflict · p publish · s start",
+                        self.status
+                    ),
+                    theme.muted,
+                )]),
             );
         }
     }
@@ -1235,21 +1316,16 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        self.last_area = area;
-        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
-        let (palette, canvas, inspector, footer) = editor_rects(area);
-        self.render_palette(palette, frame);
-        self.render_canvas(canvas, frame);
-        self.render_inspector(inspector, frame);
-        if footer.height > 0 {
-            frame.write_line(
-                footer,
-                &Line::from(format!(
-                    "{} · G generate · A accept candidate · z instantiate · Tab panes · node d/x/c · edge e/E · group g · move Shift+HJKL · inspector n/a/t/+/v · R resolve conflict · p publish · s start",
-                    self.status
-                )),
-            );
-        }
+        self.render_themed(area, frame, None);
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        self.render_themed(area, frame, theme);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3193,24 +3269,33 @@ const fn editor_rects(area: Rect) -> (Rect, Rect, Rect, Rect) {
     (palette, canvas, inspector, footer)
 }
 
-fn draw_pane(frame: &mut Frame<'_>, area: Rect, title: &str, focused: bool) {
+fn draw_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    focused: bool,
+    theme: AuthorSurfaceTheme,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let prefix = if focused { "▶ " } else { "  " };
     frame.write_line(
         Rect::new(area.x, area.y, area.width, 1),
-        &Line::from(format!("{prefix}{title}")),
+        &Line::from_spans(vec![Span::styled(
+            format!("{prefix}{title}"),
+            if focused { theme.focused } else { theme.muted },
+        )]),
     );
 }
 
-fn write_row(frame: &mut Frame<'_>, area: Rect, row: u16, text: &str) {
+fn write_row(frame: &mut Frame<'_>, area: Rect, row: u16, text: &str, style: Style) {
     if row >= area.height || area.width == 0 {
         return;
     }
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
-        &Line::from(text.to_string()),
+        &Line::from_spans(vec![Span::styled(text.to_string(), style)]),
     );
 }
 

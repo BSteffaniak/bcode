@@ -827,6 +827,113 @@ struct WorktreeCommandSurface {
     session_id: Option<bcode_session_models::SessionId>,
 }
 
+struct WorktreeSurfaceTheme {
+    canvas: Style,
+    text: Style,
+    muted: Style,
+    focused: Style,
+    selection: Style,
+}
+
+impl WorktreeSurfaceTheme {
+    fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
+        theme.map_or_else(
+            || Self {
+                canvas: Style::new(),
+                text: Style::new(),
+                muted: Style::new().add_modifier(Modifier::DIM),
+                focused: Style::new().add_modifier(Modifier::BOLD),
+                selection: Style::new().add_modifier(Modifier::REVERSED),
+            },
+            |theme| Self {
+                canvas: theme.canvas,
+                text: theme.text,
+                muted: theme.muted,
+                focused: theme.focused,
+                selection: theme.selection,
+            },
+        )
+    }
+}
+
+impl WorktreeCommandSurface {
+    fn render_themed(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        let theme = WorktreeSurfaceTheme::resolve(theme);
+        frame.fill(area, " ", theme.canvas);
+        write_line(
+            frame,
+            area,
+            area.y,
+            Line::from_spans(vec![Span::styled(
+                self.title,
+                theme.focused.add_modifier(Modifier::BOLD),
+            )]),
+        );
+        write_line(
+            frame,
+            area,
+            area.y.saturating_add(1),
+            Line::from_spans(vec![Span::styled(
+                format!("Repo: {}", display(&self.repo_path, &self.repo_path)),
+                theme.muted,
+            )]),
+        );
+        let mut y = area.y.saturating_add(3);
+        for (index, line) in self.lines.iter().enumerate() {
+            let selected = self.is_selectable() && index > 0 && self.selected == index - 1;
+            let marker = if self.is_selectable() && index > 0 {
+                if selected { "› " } else { "  " }
+            } else {
+                ""
+            };
+            write_line(
+                frame,
+                area,
+                y,
+                Line::from_spans(vec![Span::styled(
+                    format!("{marker}{line}"),
+                    if selected {
+                        theme.selection
+                    } else {
+                        theme.text
+                    },
+                )]),
+            );
+            y = y.saturating_add(1);
+        }
+        if self.id == "command.work-tree.createSession" {
+            write_line(
+                frame,
+                area,
+                y,
+                Line::from_spans(vec![Span::styled(
+                    format!("Name: {}", self.create_name),
+                    theme.text,
+                )]),
+            );
+        }
+        if let Some(status) = &self.status {
+            write_line(
+                frame,
+                area,
+                area.y.saturating_add(area.height.saturating_sub(2)),
+                Line::from_spans(vec![Span::styled(status.clone(), theme.focused)]),
+            );
+        }
+        write_line(
+            frame,
+            area,
+            area.y.saturating_add(area.height.saturating_sub(1)),
+            Line::from_spans(vec![Span::styled("Enter/Esc/q closes", theme.muted)]),
+        );
+    }
+}
+
 impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
     fn id(&self) -> &'static str {
         self.id
@@ -837,62 +944,16 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
-        write_line(
-            frame,
-            area,
-            area.y,
-            Line::from_spans(vec![Span::styled(
-                self.title,
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )]),
-        );
-        write_line(
-            frame,
-            area,
-            area.y.saturating_add(1),
-            Line::from(format!(
-                "Repo: {}",
-                display(&self.repo_path, &self.repo_path)
-            )),
-        );
-        let mut y = area.y.saturating_add(3);
-        for (index, line) in self.lines.iter().enumerate() {
-            let display_line = if self.is_selectable() && index > 0 {
-                let marker = if self.selected == index.saturating_sub(1) {
-                    "› "
-                } else {
-                    "  "
-                };
-                format!("{marker}{line}")
-            } else {
-                line.clone()
-            };
-            write_line(frame, area, y, Line::from(display_line));
-            y = y.saturating_add(1);
-        }
-        if self.id == "command.work-tree.createSession" {
-            write_line(
-                frame,
-                area,
-                y,
-                Line::from(format!("Name: {}", self.create_name)),
-            );
-        }
-        if let Some(status) = &self.status {
-            write_line(
-                frame,
-                area,
-                area.y.saturating_add(area.height.saturating_sub(2)),
-                Line::from(status.clone()),
-            );
-        }
-        write_line(
-            frame,
-            area,
-            area.y.saturating_add(area.height.saturating_sub(1)),
-            Line::from("Enter/Esc/q closes"),
-        );
+        self.render_themed(area, frame, None);
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        self.render_themed(area, frame, theme);
     }
 
     fn handle_event(

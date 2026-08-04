@@ -20,7 +20,7 @@ use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 
 /// Ralph home native TUI surface kind.
 pub const RALPH_HOME_SURFACE_KIND: &str = "ralph-home";
@@ -199,6 +199,32 @@ impl PluginTuiSurfaceFactory for RalphHomeSurfaceFactory {
 enum RalphHomeScreen {
     Dashboard,
     RebuildIntro,
+}
+
+struct RalphSurfaceTheme {
+    canvas: Style,
+    text: Style,
+    focused: Style,
+    selection: Style,
+}
+
+impl RalphSurfaceTheme {
+    fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
+        theme.map_or_else(
+            || Self {
+                canvas: Style::new(),
+                text: Style::new(),
+                focused: Style::new().add_modifier(Modifier::BOLD),
+                selection: Style::new().add_modifier(Modifier::REVERSED),
+            },
+            |theme| Self {
+                canvas: theme.canvas,
+                text: theme.text,
+                focused: theme.focused,
+                selection: theme.selection,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -407,7 +433,13 @@ impl RalphHomeSurface {
         kinds.into_iter().filter_map(action_for_kind).collect()
     }
 
-    fn render_current_draft(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
+    fn render_current_draft(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        mut y: u16,
+        theme: &RalphSurfaceTheme,
+    ) -> u16 {
         let Some(draft) = &self.setup_draft else {
             return y;
         };
@@ -418,7 +450,7 @@ impl RalphHomeSurface {
             y,
             Line::from_spans(vec![Span::styled(
                 "Setup draft",
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                theme.focused.add_modifier(Modifier::BOLD),
             )]),
         );
         y = y.saturating_add(1);
@@ -450,14 +482,20 @@ impl RalphHomeSurface {
         y
     }
 
-    fn render_runs(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
+    fn render_runs(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        mut y: u16,
+        theme: &RalphSurfaceTheme,
+    ) -> u16 {
         write_line(
             frame,
             area,
             y,
             Line::from_spans(vec![Span::styled(
                 "Runs",
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                theme.focused.add_modifier(Modifier::BOLD),
             )]),
         );
         y = y.saturating_add(1);
@@ -499,14 +537,20 @@ impl RalphHomeSurface {
         y
     }
 
-    fn render_current_loop(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
+    fn render_current_loop(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        mut y: u16,
+        theme: &RalphSurfaceTheme,
+    ) -> u16 {
         write_line(
             frame,
             area,
             y,
             Line::from_spans(vec![Span::styled(
                 "Current loop",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                theme.focused.add_modifier(Modifier::BOLD),
             )]),
         );
         y = y.saturating_add(1);
@@ -551,14 +595,20 @@ impl RalphHomeSurface {
         y
     }
 
-    fn render_actions(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
+    fn render_actions(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        mut y: u16,
+        theme: &RalphSurfaceTheme,
+    ) -> u16 {
         write_line(
             frame,
             area,
             y,
             Line::from_spans(vec![Span::styled(
                 "Actions",
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                theme.focused.add_modifier(Modifier::BOLD),
             )]),
         );
         y = y.saturating_add(1);
@@ -566,9 +616,9 @@ impl RalphHomeSurface {
             let selected = index == self.selected_action;
             let marker = if selected { "›" } else { " " };
             let style = if selected {
-                Style::new().fg(Color::Black).bg(Color::White)
+                theme.selection
             } else {
-                Style::new().fg(Color::White).bg(Color::Black)
+                theme.text
             };
             write_line(
                 frame,
@@ -588,7 +638,7 @@ impl RalphHomeSurface {
         }
         y.saturating_add(1)
     }
-    fn render_rebuild_intro(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_rebuild_intro(&self, frame: &mut Frame<'_>, area: Rect, theme: &RalphSurfaceTheme) {
         let mut y = area.y;
         write_line(
             frame,
@@ -596,7 +646,7 @@ impl RalphHomeSurface {
             y,
             Line::from_spans(vec![Span::styled(
                 "Rebuild Ralph loop context",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                theme.focused.add_modifier(Modifier::BOLD),
             )]),
         );
         y = y.saturating_add(2);
@@ -674,6 +724,78 @@ impl RalphHomeSurface {
             );
         }
     }
+    fn render_themed(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        let theme = RalphSurfaceTheme::resolve(theme);
+        frame.fill(area, " ", theme.canvas);
+        if self.screen == RalphHomeScreen::RebuildIntro {
+            self.render_rebuild_intro(frame, area, &theme);
+            return;
+        }
+        let mut y = area.y;
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from_spans(vec![Span::styled(
+                "Ralph autonomous workflow",
+                theme.focused.add_modifier(Modifier::BOLD),
+            )]),
+        );
+        y = y.saturating_add(2);
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from_spans(vec![Span::styled(
+                format!("Repo: {}", display_from_current_dir(&self.repo_path)),
+                theme.text,
+            )]),
+        );
+        y = y.saturating_add(1);
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from_spans(vec![
+                Span::styled("Next: ", theme.focused.add_modifier(Modifier::BOLD)),
+                Span::styled(self.next_step(), theme.text),
+            ]),
+        );
+        y = y.saturating_add(2);
+        y = self.render_current_draft(frame, area, y, &theme);
+        if self.setup_draft.is_some() {
+            y = y.saturating_add(1);
+        }
+        y = self.render_current_loop(frame, area, y, &theme);
+        y = y.saturating_add(1);
+        y = self.render_runs(frame, area, y, &theme);
+        y = y.saturating_add(1);
+        let _ = self.render_actions(frame, area, y, &theme);
+
+        let status_y = area.y.saturating_add(area.height.saturating_sub(2));
+        write_line(
+            frame,
+            area,
+            status_y,
+            Line::from_spans(vec![Span::styled(
+                "Keys: ↑/↓ select · Enter run · r refresh · q close",
+                theme.text,
+            )]),
+        );
+        if let Some(message) = &self.status_message {
+            write_line(
+                frame,
+                area,
+                status_y.saturating_add(1),
+                Line::from_spans(vec![Span::styled(message.clone(), theme.focused)]),
+            );
+        }
+    }
 }
 
 impl PluginTuiSurface for RalphHomeSurface {
@@ -686,70 +808,16 @@ impl PluginTuiSurface for RalphHomeSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
-        if self.screen == RalphHomeScreen::RebuildIntro {
-            self.render_rebuild_intro(frame, area);
-            return;
-        }
-        let mut y = area.y;
-        write_line(
-            frame,
-            area,
-            y,
-            Line::from_spans(vec![Span::styled(
-                "Ralph autonomous workflow",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )]),
-        );
-        y = y.saturating_add(2);
-        write_line(
-            frame,
-            area,
-            y,
-            Line::from(format!(
-                "Repo: {}",
-                display_from_current_dir(&self.repo_path)
-            )),
-        );
-        y = y.saturating_add(1);
-        write_line(
-            frame,
-            area,
-            y,
-            Line::from_spans(vec![
-                Span::styled(
-                    "Next: ",
-                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(self.next_step()),
-            ]),
-        );
-        y = y.saturating_add(2);
-        y = self.render_current_draft(frame, area, y);
-        if self.setup_draft.is_some() {
-            y = y.saturating_add(1);
-        }
-        y = self.render_current_loop(frame, area, y);
-        y = y.saturating_add(1);
-        y = self.render_runs(frame, area, y);
-        y = y.saturating_add(1);
-        let _ = self.render_actions(frame, area, y);
+        self.render_themed(area, frame, None);
+    }
 
-        let status_y = area.y.saturating_add(area.height.saturating_sub(2));
-        write_line(
-            frame,
-            area,
-            status_y,
-            Line::from("Keys: ↑/↓ select · Enter run · r refresh · q close"),
-        );
-        if let Some(message) = &self.status_message {
-            write_line(
-                frame,
-                area,
-                status_y.saturating_add(1),
-                Line::from(message.clone()),
-            );
-        }
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        self.render_themed(area, frame, theme);
     }
 
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {

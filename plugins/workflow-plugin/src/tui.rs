@@ -8,8 +8,8 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::style::{Color, Style};
-use bmux_tui::text::Line;
+use bmux_tui::style::Style;
+use bmux_tui::text::{Line, Span};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
@@ -178,17 +178,35 @@ struct WorkflowStatusSurface {
     selected_approval: usize,
 }
 
-impl PluginTuiSurface for WorkflowStatusSurface {
-    fn id(&self) -> &'static str {
-        "bcode.workflow-status"
-    }
+struct WorkflowSurfaceTheme {
+    canvas: Style,
+    text: Style,
+}
 
-    fn title(&self) -> &'static str {
-        "Workflow Status"
+impl WorkflowSurfaceTheme {
+    fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
+        theme.map_or_else(
+            || Self {
+                canvas: Style::new(),
+                text: Style::new(),
+            },
+            |theme| Self {
+                canvas: theme.canvas,
+                text: theme.text,
+            },
+        )
     }
+}
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
+impl WorkflowStatusSurface {
+    fn render_themed(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        let theme = WorkflowSurfaceTheme::resolve(theme);
+        frame.fill(area, " ", theme.canvas);
         for (offset, row) in surface_lines(&self.options, self.selected_approval)
             .into_iter()
             .enumerate()
@@ -199,9 +217,32 @@ impl PluginTuiSurface for WorkflowStatusSurface {
             let offset = u16::try_from(offset).expect("workflow status has fewer than u16 rows");
             frame.write_line(
                 Rect::new(area.x, area.y.saturating_add(offset), area.width, 1),
-                &Line::from(row),
+                &Line::from_spans(vec![Span::styled(row, theme.text)]),
             );
         }
+    }
+}
+
+impl PluginTuiSurface for WorkflowStatusSurface {
+    fn id(&self) -> &'static str {
+        "bcode.workflow-status"
+    }
+
+    fn title(&self) -> &'static str {
+        "Workflow Status"
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        self.render_themed(area, frame, None);
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        self.render_themed(area, frame, theme);
     }
 
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {

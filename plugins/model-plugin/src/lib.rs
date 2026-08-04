@@ -13,7 +13,7 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::style::{Color, Modifier, Style};
+use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -238,6 +238,69 @@ struct ModelCommandSurface {
     lines: Vec<String>,
 }
 
+struct SurfaceTheme {
+    canvas: Style,
+    text: Style,
+    muted: Style,
+    focused: Style,
+}
+
+impl SurfaceTheme {
+    fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
+        theme.map_or_else(
+            || Self {
+                canvas: Style::new(),
+                text: Style::new(),
+                muted: Style::new().add_modifier(Modifier::DIM),
+                focused: Style::new().add_modifier(Modifier::BOLD),
+            },
+            |theme| Self {
+                canvas: theme.canvas,
+                text: theme.text,
+                muted: theme.muted,
+                focused: theme.focused,
+            },
+        )
+    }
+}
+
+impl ModelCommandSurface {
+    fn render_themed(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        let theme = SurfaceTheme::resolve(theme);
+        frame.fill(area, " ", theme.canvas);
+        write_line(
+            frame,
+            area,
+            area.y,
+            Line::from_spans(vec![Span::styled(
+                self.title,
+                theme.focused.add_modifier(Modifier::BOLD),
+            )]),
+        );
+        let mut y = area.y.saturating_add(2);
+        for line in &self.lines {
+            write_line(
+                frame,
+                area,
+                y,
+                Line::from_spans(vec![Span::styled(line.clone(), theme.text)]),
+            );
+            y = y.saturating_add(1);
+        }
+        write_line(
+            frame,
+            area,
+            area.y.saturating_add(area.height.saturating_sub(1)),
+            Line::from_spans(vec![Span::styled("Enter/Esc/q closes", theme.muted)]),
+        );
+    }
+}
+
 impl bcode_plugin_sdk::tui::PluginTuiSurface for ModelCommandSurface {
     fn id(&self) -> &'static str {
         self.id
@@ -248,27 +311,16 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ModelCommandSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
-        write_line(
-            frame,
-            area,
-            area.y,
-            Line::from_spans(vec![Span::styled(
-                self.title,
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )]),
-        );
-        let mut y = area.y.saturating_add(2);
-        for line in &self.lines {
-            write_line(frame, area, y, Line::from(line.clone()));
-            y = y.saturating_add(1);
-        }
-        write_line(
-            frame,
-            area,
-            area.y.saturating_add(area.height.saturating_sub(1)),
-            Line::from("Enter/Esc/q closes"),
-        );
+        self.render_themed(area, frame, None);
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        self.render_themed(area, frame, theme);
     }
 
     fn handle_event(

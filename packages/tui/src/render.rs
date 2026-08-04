@@ -12,6 +12,7 @@ thread_local! {
     }) };
     static MARKDOWN_DETAILS_OPEN: RefCell<BTreeMap<String, bool>> = const { RefCell::new(BTreeMap::new()) };
     static PLUGIN_VISUAL_THEME: Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const { Cell::new(None) };
+    static TRANSCRIPT_THEME: Cell<Option<super::theme::PresentedTheme>> = const { Cell::new(None) };
 }
 
 /// Synchronize layout-affecting Markdown presentation state for row generation.
@@ -22,6 +23,7 @@ pub fn set_markdown_details_open(details_open: &BTreeMap<String, bool>) {
 /// Synchronize renderer-owned plugin visual presentation for row generation.
 pub fn set_plugin_visual_theme(theme: &super::theme::PresentedTheme) {
     PLUGIN_VISUAL_THEME.with(|state| state.set(Some(plugin_tui_theme(theme))));
+    TRANSCRIPT_THEME.with(|state| state.set(Some(*theme)));
 }
 
 fn semantic_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
@@ -29,6 +31,15 @@ fn semantic_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
         state.get().unwrap_or_else(|| {
             let initial = super::theme::resolve_initial_theme();
             plugin_tui_theme(&initial.presented(initial.accent))
+        })
+    })
+}
+
+fn semantic_state_theme() -> super::theme::PresentedTheme {
+    TRANSCRIPT_THEME.with(|state| {
+        state.get().unwrap_or_else(|| {
+            let initial = super::theme::resolve_initial_theme();
+            initial.presented(initial.accent)
         })
     })
 }
@@ -1757,7 +1768,7 @@ pub fn history_banner_rows(has_older_history: bool, loading_older_history: bool)
     history_banner_text(has_older_history, loading_older_history).map_or_else(Vec::new, |text| {
         vec![Line::from_spans(vec![Span::styled(
             text,
-            Style::new().fg(Color::BrightBlack),
+            semantic_theme().muted,
         )])]
     })
 }
@@ -1860,7 +1871,7 @@ fn push_transcript_item_rows(
                     rows,
                     &item.display_role(),
                     markdown,
-                    Color::Blue,
+                    semantic_theme().focused,
                     width,
                     true,
                 );
@@ -1870,7 +1881,7 @@ fn push_transcript_item_rows(
                     &item.display_role(),
                     item.text(),
                     item.text_format(),
-                    Color::Blue,
+                    semantic_theme().focused,
                     true,
                     width,
                 );
@@ -1959,7 +1970,11 @@ fn push_transcript_item_rows(
                 rows,
                 "Permission",
                 item.text(),
-                if *approved { Color::Green } else { Color::Red },
+                if *approved {
+                    semantic_state_theme().success
+                } else {
+                    semantic_state_theme().error
+                },
                 width,
             );
         }
@@ -1969,7 +1984,7 @@ fn push_transcript_item_rows(
                     rows,
                     &item.display_role(),
                     markdown,
-                    Color::BrightBlack,
+                    semantic_theme().muted,
                     width,
                     false,
                 );
@@ -1979,7 +1994,7 @@ fn push_transcript_item_rows(
                     &item.display_role(),
                     item.text(),
                     item.text_format(),
-                    Color::BrightBlack,
+                    semantic_theme().muted,
                     false,
                     width,
                 );
@@ -1989,10 +2004,16 @@ fn push_transcript_item_rows(
             push_meta_block(rows, item.text(), width);
         }
         TranscriptItemKind::Skill => {
-            push_detail_block(rows, "Skill", item.text(), Color::Magenta, width);
+            push_detail_block(rows, "Skill", item.text(), semantic_theme().focused, width);
         }
         TranscriptItemKind::SkillError => {
-            push_detail_block(rows, "Skill error", item.text(), Color::Red, width);
+            push_detail_block(
+                rows,
+                "Skill error",
+                item.text(),
+                semantic_state_theme().error,
+                width,
+            );
         }
         TranscriptItemKind::ToolRequestDraft { draft } => {
             let artifact = bcode_session_models::ToolArtifact {
@@ -2113,14 +2134,20 @@ fn push_transcript_item_rows(
             }
         }
         TranscriptItemKind::Interaction { interaction: _ } => {
-            push_detail_block(rows, &item.display_role(), item.text(), Color::Cyan, width);
+            push_detail_block(
+                rows,
+                &item.display_role(),
+                item.text(),
+                semantic_state_theme().info,
+                width,
+            );
         }
         TranscriptItemKind::Generic => {
             push_detail_block(
                 rows,
                 &item.display_role(),
                 item.text(),
-                Color::BrightBlack,
+                semantic_theme().muted,
                 width,
             );
         }
@@ -2138,19 +2165,19 @@ fn push_assistant_rows(
     } else {
         "Bcode"
     };
-    let color = if item.streaming() {
-        Color::Cyan
+    let heading_style = if item.streaming() {
+        semantic_state_theme().info
     } else {
-        Color::Green
+        semantic_state_theme().success
     };
     if let Some(markdown) = markdown {
-        push_markdown_projection_block(rows, title, markdown, color, width, true);
+        push_markdown_projection_block(rows, title, markdown, heading_style, width, true);
     } else if item.text_format() == TextFormat::Markdown {
         push_markdown_block_with_streaming(
             rows,
             title,
             item.text(),
-            color,
+            heading_style,
             width,
             true,
             item.streaming(),
@@ -2161,7 +2188,7 @@ fn push_assistant_rows(
             title,
             item.text(),
             item.text_format(),
-            color,
+            heading_style,
             true,
             width,
         );
@@ -2173,21 +2200,21 @@ fn push_formatted_block(
     title: &str,
     body: &str,
     text_format: TextFormat,
-    color: Color,
+    heading_style: Style,
     prominent: bool,
     width: u16,
 ) {
     match text_format {
         TextFormat::Markdown => {
-            push_markdown_block(rows, title, body, color, width, prominent);
+            push_markdown_block(rows, title, body, heading_style, width, prominent);
         }
-        TextFormat::PlainText => push_block(rows, title, body, color, prominent, width),
+        TextFormat::PlainText => push_block(rows, title, body, heading_style, prominent, width),
         TextFormat::Json => {
             let body = serde_json::from_str::<serde_json::Value>(body).map_or_else(
                 |_| body.to_owned(),
                 |value| serde_json::to_string_pretty(&value).unwrap_or_else(|_| body.to_owned()),
             );
-            push_block(rows, title, &body, color, prominent, width);
+            push_block(rows, title, &body, heading_style, prominent, width);
         }
     }
 }
@@ -2196,25 +2223,25 @@ fn push_markdown_block(
     rows: &mut Vec<Line>,
     title: &str,
     body: &str,
-    color: Color,
+    heading_style: Style,
     width: u16,
     prominent: bool,
 ) {
-    push_markdown_block_with_streaming(rows, title, body, color, width, prominent, false);
+    push_markdown_block_with_streaming(rows, title, body, heading_style, width, prominent, false);
 }
 
 fn push_markdown_projection_block(
     rows: &mut Vec<Line>,
     title: &str,
     rendered: &bcode_markdown_render::MarkdownRenderResult,
-    color: Color,
+    heading_style: Style,
     width: u16,
     prominent: bool,
 ) {
     let heading_style = if prominent {
-        Style::new().fg(color).add_modifier(Modifier::BOLD)
+        heading_style.add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(color)
+        heading_style
     };
     push_wrapped_styled_text(rows, Vec::new(), title, width, heading_style, heading_style);
     if rendered.lines.is_empty() {
@@ -2243,15 +2270,15 @@ fn push_markdown_block_with_streaming(
     rows: &mut Vec<Line>,
     title: &str,
     body: &str,
-    color: Color,
+    heading_style: Style,
     width: u16,
     prominent: bool,
     streaming: bool,
 ) {
     let heading_style = if prominent {
-        Style::new().fg(color).add_modifier(Modifier::BOLD)
+        heading_style.add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(color)
+        heading_style
     };
     push_wrapped_styled_text(rows, Vec::new(), title, width, heading_style, heading_style);
 
@@ -2306,7 +2333,7 @@ fn markdown_and_json_layout_work_per_revision_baseline_report() {
                 kind,
                 &format!("revision {revision}\n{body}"),
                 format,
-                Color::Green,
+                Style::new().fg(Color::Green),
                 false,
                 100,
             );
@@ -2330,7 +2357,14 @@ fn markdown_and_json_layout_work_per_revision_baseline_report() {
 #[test]
 fn tui_markdown_message_block_indents_content_and_reserves_width() {
     let mut rows = Vec::new();
-    push_markdown_block(&mut rows, "Bcode", "1234567890", Color::Green, 8, true);
+    push_markdown_block(
+        &mut rows,
+        "Bcode",
+        "1234567890",
+        Style::new().fg(Color::Green),
+        8,
+        true,
+    );
 
     let text = rows
         .iter()
@@ -2354,7 +2388,7 @@ fn tui_markdown_message_block_preserves_table_borders_after_indent() {
         &mut rows,
         "Bcode",
         "| A | B |\n|---|---|\n| 1 | 2 |",
-        Color::Green,
+        Style::new().fg(Color::Green),
         20,
         true,
     );
@@ -2555,7 +2589,14 @@ fn tui_help_markdown_renders_at_normal_and_constrained_widths() {
     let mut snapshot = String::new();
     for width in [80_u16, 24] {
         let mut rows = Vec::new();
-        push_markdown_block(&mut rows, "System", HELP, Color::BrightBlack, width, false);
+        push_markdown_block(
+            &mut rows,
+            "System",
+            HELP,
+            semantic_theme().muted,
+            width,
+            false,
+        );
         let text = rows
             .iter()
             .map(|line| {
@@ -2912,7 +2953,7 @@ fn format_aware_blocks_respect_requested_width() {
             "Title",
             "1234567890 * [value] | more",
             format,
-            Color::Blue,
+            Style::new().fg(Color::Blue),
             true,
             12,
         );
@@ -2926,7 +2967,15 @@ fn format_aware_blocks_distinguish_markdown_plain_text_and_json() {
     let source = "* value";
     let render = |format| {
         let mut rows = Vec::new();
-        push_formatted_block(&mut rows, "You", source, format, Color::Blue, true, 30);
+        push_formatted_block(
+            &mut rows,
+            "You",
+            source,
+            format,
+            Style::new().fg(Color::Blue),
+            true,
+            30,
+        );
         rows.into_iter()
             .map(|line| {
                 line.spans
@@ -2951,7 +3000,7 @@ fn format_aware_json_pretty_prints_valid_values() {
         "Data",
         r#"{"value":[1,2]}"#,
         TextFormat::Json,
-        Color::Blue,
+        Style::new().fg(Color::Blue),
         true,
         30,
     );
@@ -2992,13 +3041,13 @@ fn push_reasoning_rows(
         "Reasoning"
     };
     if let Some(markdown) = markdown {
-        push_markdown_projection_block(rows, title, markdown, Color::BrightBlack, width, false);
+        push_markdown_projection_block(rows, title, markdown, semantic_theme().muted, width, false);
     } else if item.text_format() == TextFormat::Markdown {
         push_markdown_block_with_streaming(
             rows,
             title,
             item.text(),
-            Color::BrightBlack,
+            semantic_theme().muted,
             width,
             false,
             item.streaming(),
@@ -3009,7 +3058,7 @@ fn push_reasoning_rows(
             title,
             item.text(),
             item.text_format(),
-            Color::BrightBlack,
+            semantic_theme().muted,
             false,
             width,
         );
@@ -3507,7 +3556,7 @@ fn push_permission_request_rows(
         rows,
         &format!("Permission required · {tool_name}"),
         &body,
-        Color::Red,
+        semantic_state_theme().error,
         width,
     );
 }
@@ -3522,14 +3571,14 @@ fn push_pending_submission_rows(rows: &mut Vec<Line>, pending: &PendingSubmissio
         &title,
         pending.text(),
         TextFormat::Markdown,
-        Color::Blue,
+        semantic_theme().focused,
         true,
         width,
     );
 }
 
-fn push_detail_block(rows: &mut Vec<Line>, title: &str, body: &str, color: Color, width: u16) {
-    push_block(rows, title, body, color, false, width);
+fn push_detail_block(rows: &mut Vec<Line>, title: &str, body: &str, style: Style, width: u16) {
+    push_block(rows, title, body, style, false, width);
 }
 
 fn push_meta_block(rows: &mut Vec<Line>, text: &str, width: u16) {
@@ -3547,14 +3596,14 @@ fn push_block(
     rows: &mut Vec<Line>,
     title: &str,
     body: &str,
-    color: Color,
+    heading_style: Style,
     prominent: bool,
     width: u16,
 ) {
     let heading_style = if prominent {
-        Style::new().fg(color).add_modifier(Modifier::BOLD)
+        heading_style.add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(color)
+        heading_style
     };
     push_wrapped_styled_text(rows, Vec::new(), title, width, heading_style, heading_style);
     let body_style = if prominent {
@@ -3809,14 +3858,14 @@ impl ChromeLine {
 }
 
 fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
-    let muted = Style::new().fg(Color::BrightBlack);
+    let muted = theme.muted;
     let mut line = ChromeLine::new(" · ", muted).required(
         activity_label(
             app.activity(),
             app.activity_started_at(),
             app.daemon_connection(),
         ),
-        Style::new().fg(theme.accent),
+        theme.info,
         true,
     );
 
@@ -3831,7 +3880,7 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     for contribution in app.plugin_status() {
         line = line.optional(
             contribution.text.clone(),
-            Style::new().fg(theme.accent),
+            theme.info,
             u8::try_from(contribution.priority).unwrap_or(u8::MAX - 1),
             true,
         );
@@ -4057,6 +4106,6 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: 
         .render(inner, frame);
 }
 
-const fn muted_style() -> Style {
-    Style::new().fg(Color::BrightBlack)
+fn muted_style() -> Style {
+    semantic_theme().muted
 }
