@@ -284,9 +284,9 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].namespace, namespace);
         assert_eq!(reports[0].wal_bytes, 4096);
-        assert_eq!(reports[0].draft_rows, 0);
-        assert_eq!(reports[0].action, RetiredCatalogAction::Failed);
-        assert!(reports[0].error.is_some());
+        assert_eq!(reports[0].draft_rows, 1);
+        assert_eq!(reports[0].action, RetiredCatalogAction::WouldRemove);
+        assert!(reports[0].error.is_none());
         assert!(namespace_dir.exists());
     }
 

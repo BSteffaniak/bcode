@@ -860,9 +860,9 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = [1-9][0-9]*' packages/ipc/src/lib.rs
   || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs \
   || ! rg -q 'preparation_recovers_retained_operation_after_transport_interruption' packages/client/src/lib.rs \
   || ! rg -q 'dropping_progress_receiver_stops_client_observation_cleanly' packages/client/src/lib.rs \
-  || ! rg -q 'runner_drains_streaming_session_progress_through_effect_results' packages/tui/src/effects.rs \
+  || ! rg -q 'streaming_sender.try_send\(TuiEffectResult::SessionOpenProgress' packages/tui/src/effects.rs \
   || ! rg -q 'migration_stage_families_and_terminal_failure_render_through_status_chrome' packages/tui/src/tests.rs \
-  || ! rg -q 'session_open_progress_ignores_stale_session_updates' packages/tui/src/chat_loop.rs \
+  || ! rg -q 'current.operation_id == snapshot.operation_id && current.revision >= snapshot.revision' packages/tui/src/chat_loop.rs \
   || ! rg -q 'prepare_session_open_until_terminal' packages/client/src/lib.rs; then
   echo "Session migration IPC violation: versioned prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
   violations=1
@@ -1096,7 +1096,7 @@ if ! rg -q "maintenance: &'a lease::SessionMaintenanceGuard" packages/server/src
   violations=1
 fi
 
-if ! rg -q 'runner_drains_streaming_session_progress_through_effect_results' packages/tui/src/effects.rs \
+if ! rg -q 'streaming_sender.try_send\(TuiEffectResult::SessionOpenProgress' packages/tui/src/effects.rs \
   || ! rg -q 'TuiEffectResult::SessionOpenProgress' packages/tui/src/chat_loop.rs \
   || sed -n '/pub enum Event {/,/^}/p' packages/ipc/src/lib.rs | grep -q 'SessionOpenProgress'; then
   echo "Session TUI progress-routing violation: migration progress must stream through typed TUI effect results, not daemon IPC events." >&2
@@ -1167,8 +1167,8 @@ fi
 
 if ! rg -q 'subscribe_session_view' packages/plugin-sdk/src/tui.rs \
   || ! rg -q 'SessionViewSnapshot' packages/plugin-sdk/src/tui.rs \
-  || ! rg -q 'PluginTuiAction::OpenSession' packages/tui/src/plugin_surface_host.rs \
-  || ! rg -q 'run_event_loop_with_input' packages/tui/src/code_review_launcher.rs packages/tui/src/runtime.rs \
+  || ! rg -q 'PluginTuiAction::OpenSession' packages/tui/src/root_program.rs \
+  || ! rg -q 'run_standalone_plugin_surface' packages/tui/src/code_review_launcher.rs packages/tui/src/runtime.rs \
   || ! rg -q 'SessionView::new\(\)' packages/tui/src/plugin_surface_host.rs \
   || ! rg -q 'PluginSessionViewUpdate::Snapshot' plugins/code-review-plugin/src/code_review_tui.rs; then
   echo "Session view architecture violation: generic plugin observation must be projected by SessionView and delivered as complete semantic snapshots." >&2

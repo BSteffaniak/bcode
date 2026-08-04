@@ -1570,10 +1570,26 @@ impl TuiEffect {
                     .await,
             },
             Self::RenameSession { session_id, name } => TuiEffectResult::SessionRenamed {
-                result: client.rename_session(session_id, name).await,
+                result: execute_session_view_action(
+                    &client,
+                    SessionViewAction::RenameSession { session_id, name },
+                )
+                .await
+                .and_then(|outcome| match outcome {
+                    SessionViewActionOutcome::SessionRenamed { session } => Ok(*session),
+                    _ => Err(ClientError::UnexpectedResponse),
+                }),
             },
             Self::DeleteSession { session_id } => TuiEffectResult::SessionDeleted {
-                result: client.delete_session(session_id).await,
+                result: execute_session_view_action(
+                    &client,
+                    SessionViewAction::DeleteSession { session_id },
+                )
+                .await
+                .and_then(|outcome| match outcome {
+                    SessionViewActionOutcome::SessionDeleted { session } => Ok(*session),
+                    _ => Err(ClientError::UnexpectedResponse),
+                }),
             },
             Self::SearchSessions { request, policy } => TuiEffectResult::SessionsSearched {
                 result: client
