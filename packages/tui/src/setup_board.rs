@@ -8,8 +8,10 @@ use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 use bmux_tui_components::scroll_area::{ScrollArea, ScrollAreaOutcome, ScrollAreaState};
+
+use super::theme::PresentedTheme;
 
 /// Semantic board spot rendered as a clickable board-game location.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +168,7 @@ pub struct SetupBoard<'a> {
     spots: &'a [BoardSpot],
     connections: &'a [BoardConnection],
     policy: SetupBoardPolicy,
+    theme: Option<&'a PresentedTheme>,
 }
 
 impl<'a> SetupBoard<'a> {
@@ -176,7 +179,15 @@ impl<'a> SetupBoard<'a> {
             spots,
             connections,
             policy: SetupBoardPolicy::new(),
+            theme: None,
         }
+    }
+
+    /// Return this board with resolved semantic presentation.
+    #[must_use]
+    pub const fn theme(mut self, theme: &'a PresentedTheme) -> Self {
+        self.theme = Some(theme);
+        self
     }
 
     /// Render this board in `area`.
@@ -235,10 +246,10 @@ impl<'a> SetupBoard<'a> {
         let layout = self.layout();
         let mut surface = BoardSurface::new(layout.width, layout.height);
         for path in &layout.paths {
-            path.render(&mut surface);
+            path.render(&mut surface, path_style(self.theme));
         }
         for spot in &layout.spots {
-            BoardSpotComponent::new(spot).render(&mut surface, state);
+            BoardSpotComponent::new(spot).render(&mut surface, state, self.theme);
         }
         surface.into_lines()
     }
@@ -395,30 +406,20 @@ struct LaidOutBoardPath {
 }
 
 impl LaidOutBoardPath {
-    fn render(self, surface: &mut BoardSurface) {
+    fn render(self, surface: &mut BoardSurface, style: Style) {
         let from = Point::new(
             self.from.x + self.from.width / 2,
             self.from.y + self.from.height - 1,
         );
         let to = Point::new(self.to.x + self.to.width / 2, self.to.y);
         let mid_y = from.y.saturating_add(to.y.saturating_sub(from.y) / 2);
-        surface.draw_vertical(from.x, from.y.saturating_add(1), mid_y, "│", path_style());
-        surface.draw_horizontal(from.x.min(to.x), from.x.max(to.x), mid_y, "─", path_style());
-        surface.draw_vertical(to.x, mid_y, to.y.saturating_sub(1), "│", path_style());
-        surface.put(to.x, to.y.saturating_sub(1), "▼", path_style());
+        surface.draw_vertical(from.x, from.y.saturating_add(1), mid_y, "│", style);
+        surface.draw_horizontal(from.x.min(to.x), from.x.max(to.x), mid_y, "─", style);
+        surface.draw_vertical(to.x, mid_y, to.y.saturating_sub(1), "│", style);
+        surface.put(to.x, to.y.saturating_sub(1), "▼", style);
         if from.x != to.x {
-            surface.put(
-                from.x,
-                mid_y,
-                if to.x > from.x { "╰" } else { "╯" },
-                path_style(),
-            );
-            surface.put(
-                to.x,
-                mid_y,
-                if to.x > from.x { "╮" } else { "╭" },
-                path_style(),
-            );
+            surface.put(from.x, mid_y, if to.x > from.x { "╰" } else { "╯" }, style);
+            surface.put(to.x, mid_y, if to.x > from.x { "╮" } else { "╭" }, style);
         }
     }
 }
@@ -601,10 +602,15 @@ impl<'a> BoardSpotComponent<'a> {
         Self { spot }
     }
 
-    fn render(&self, surface: &mut BoardSurface, state: &SetupBoardState) {
+    fn render(
+        &self,
+        surface: &mut BoardSurface,
+        state: &SetupBoardState,
+        theme: Option<&PresentedTheme>,
+    ) {
         let rect = self.spot.rect;
         let model = self.spot.model;
-        let style = spot_style(model, state);
+        let style = spot_style(model, state, theme);
         surface.draw_box(rect, style);
         surface.write_text(
             rect.x.saturating_add(2),
@@ -756,18 +762,21 @@ impl BoardSurface {
     }
 }
 
-fn spot_style(spot: &BoardSpot, state: &SetupBoardState) -> Style {
+fn spot_style(spot: &BoardSpot, state: &SetupBoardState, theme: Option<&PresentedTheme>) -> Style {
+    let fallback = super::theme::resolve_initial_theme()
+        .presented(super::theme::resolve_initial_theme().accent);
+    let theme = theme.unwrap_or(&fallback);
     let base = match spot.status {
-        SetupSectionStatus::Complete | SetupSectionStatus::Secured => Style::new().fg(Color::Green),
-        SetupSectionStatus::Current => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        SetupSectionStatus::Recommended => Style::new().fg(Color::Yellow),
+        SetupSectionStatus::Complete | SetupSectionStatus::Secured => theme.success,
+        SetupSectionStatus::Current => theme.info.add_modifier(Modifier::BOLD),
+        SetupSectionStatus::Recommended => theme.warning,
         SetupSectionStatus::Blocked | SetupSectionStatus::NeedsAttention => {
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+            theme.error.add_modifier(Modifier::BOLD)
         }
-        SetupSectionStatus::Visited => Style::new().fg(Color::Blue),
+        SetupSectionStatus::Visited => theme.focused,
         SetupSectionStatus::Optional
         | SetupSectionStatus::Skipped
-        | SetupSectionStatus::Unvisited => Style::new().fg(Color::BrightBlack),
+        | SetupSectionStatus::Unvisited => theme.muted,
     };
     let modifier = if state.pressed == Some(spot.id) {
         Some(Modifier::REVERSED)
@@ -779,8 +788,14 @@ fn spot_style(spot: &BoardSpot, state: &SetupBoardState) -> Style {
     modifier.map_or(base, |modifier| base.add_modifier(modifier))
 }
 
-const fn path_style() -> Style {
-    Style::new().fg(Color::BrightBlack)
+fn path_style(theme: Option<&PresentedTheme>) -> Style {
+    theme.map_or_else(
+        || {
+            let initial = super::theme::resolve_initial_theme();
+            initial.presented(initial.accent).muted
+        },
+        |theme| theme.muted,
+    )
 }
 
 const fn status_glyph(status: SetupSectionStatus) -> &'static str {

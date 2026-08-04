@@ -24,6 +24,15 @@ pub fn set_plugin_visual_theme(theme: &super::theme::PresentedTheme) {
     PLUGIN_VISUAL_THEME.with(|state| state.set(Some(plugin_tui_theme(theme))));
 }
 
+fn semantic_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
+    PLUGIN_VISUAL_THEME.with(|state| {
+        state.get().unwrap_or_else(|| {
+            let initial = super::theme::resolve_initial_theme();
+            plugin_tui_theme(&initial.presented(initial.accent))
+        })
+    })
+}
+
 fn markdown_details_open() -> BTreeMap<String, bool> {
     MARKDOWN_DETAILS_OPEN.with(|state| state.borrow().clone())
 }
@@ -150,9 +159,21 @@ pub struct TuiTheme {
     pub muted: Style,
     pub border: Style,
     pub selection: Style,
+    pub info: Style,
 }
 
 impl TuiTheme {
+    pub const fn modal_theme(self) -> bmux_tui_components::modal_frame::ModalTheme {
+        bmux_tui_components::modal_frame::ModalTheme::new(
+            self.text,
+            self.border,
+            self.border,
+            self.text,
+            self.muted,
+            self.selection,
+        )
+    }
+
     #[must_use]
     pub const fn for_app(app: &BmuxApp) -> Self {
         let theme = app.presented_theme();
@@ -162,6 +183,7 @@ impl TuiTheme {
             muted: theme.muted,
             border: theme.border,
             selection: theme.selection,
+            info: theme.info,
         }
     }
 
@@ -183,6 +205,7 @@ impl TuiTheme {
             muted: theme.muted,
             border: theme.border,
             selection: theme.selection,
+            info: theme.info,
         }
     }
 }
@@ -1079,10 +1102,10 @@ fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>)
     if area.is_empty() {
         return;
     }
-    frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
+    frame.fill(area, " ", app.presented_theme().background);
     let title = Line::from_spans(vec![Span::styled(
         " Mermaid source · Alt+Enter closes ",
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        TuiTheme::for_app(app).info.add_modifier(Modifier::BOLD),
     )]);
     frame.write_line(Rect::new(area.x, area.y, area.width, 1), &title);
     for (offset, line) in source
@@ -1101,7 +1124,7 @@ fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>)
             ),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(line, usize::from(area.width)),
-                Style::new().fg(Color::White),
+                TuiTheme::for_app(app).text,
             )]),
         );
     }
@@ -1812,7 +1835,23 @@ fn push_transcript_item_rows(
                 "Stream integrity is degraded; waiting for authoritative resynchronization."
             }
         };
-        push_detail_block(rows, "Stream status", message, Color::Yellow, width);
+        let theme = semantic_theme();
+        push_wrapped_styled_text(
+            rows,
+            Vec::new(),
+            "Stream status",
+            width,
+            theme.border,
+            theme.muted,
+        );
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", theme.muted)],
+            message,
+            width,
+            theme.muted,
+            theme.muted,
+        );
     }
     match item.kind() {
         TranscriptItemKind::UserMessage => {
@@ -3092,22 +3131,16 @@ fn push_tool_block_header(
     is_error: bool,
     width: u16,
 ) {
-    let color = if is_error {
-        Color::Red
+    let theme = semantic_theme();
+    let title_style = if is_error {
+        theme.diff.removed
     } else if streaming {
-        Color::Cyan
+        theme.focused
     } else {
-        Color::Yellow
+        theme.border
     };
     let title = tool_block_title_with_timing(title, timing, streaming);
-    push_wrapped_styled_text(
-        rows,
-        Vec::new(),
-        &title,
-        width,
-        Style::new().fg(color),
-        muted_style(),
-    );
+    push_wrapped_styled_text(rows, Vec::new(), &title, width, title_style, theme.muted);
 }
 
 fn tool_block_title_with_timing(

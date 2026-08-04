@@ -26,14 +26,15 @@ pub fn render_picker(app: &mut WorktreePickerApp, frame: &mut Frame<'_>, theme: 
     let bottom_y = render_picker_status(
         inner,
         app.status(),
-        Style::new().fg(Color::BrightBlack),
+        theme.muted,
         frame,
+        theme,
     );
     let Some(list_area) = picker_list_area(inner, list_y, bottom_y) else {
         return;
     };
     let items = app.list_items();
-    render_picker_list(&items, app.list_state_mut(), list_area, frame);
+    render_picker_list(&items, app.list_state_mut(), list_area, frame, theme);
 }
 
 fn header_line() -> Line {

@@ -2,7 +2,7 @@
 
 use bmux_tui::frame::Frame;
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 
 use super::model_picker::{ModelPickerApp, ModelPickerMode};
 use super::picker_render::{
@@ -42,7 +42,7 @@ pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, them
             ""
         }
     );
-    let bottom_y = render_picker_status(inner, &status, Style::new().fg(Color::BrightBlack), frame);
+    let bottom_y = render_picker_status(inner, &status, theme.muted, frame, theme);
     let Some(list_area) = picker_list_area(inner, list_y, bottom_y) else {
         return;
     };
@@ -51,8 +51,8 @@ pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, them
     }
     frame.write_line_with_fallback_style(
         bmux_tui::geometry::Rect::new(list_area.x, list_area.y, list_area.width, 1),
-        &app.header_line(list_area.width),
-        super::picker_render::picker_base_style(),
+        &app.header_line(list_area.width, theme),
+        super::picker_render::picker_base_style(theme),
     );
     let item_area = bmux_tui::geometry::Rect::new(
         list_area.x,
@@ -60,6 +60,6 @@ pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, them
         list_area.width,
         list_area.height.saturating_sub(1),
     );
-    let items = app.list_items(item_area.width);
-    render_picker_list(&items, app.list_state_mut(), item_area, frame);
+    let items = app.list_items(item_area.width, theme);
+    render_picker_list(&items, app.list_state_mut(), item_area, frame, theme);
 }

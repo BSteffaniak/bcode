@@ -31,5 +31,5 @@ pub fn render_provider_picker(app: &mut ProviderPickerApp, frame: &mut Frame<'_>
         return;
     };
     let items = app.list_items();
-    render_picker_list(&items, app.list_state_mut(), list_area, frame);
+    render_picker_list(&items, app.list_state_mut(), list_area, frame, theme);
 }

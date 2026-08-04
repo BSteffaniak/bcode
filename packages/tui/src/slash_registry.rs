@@ -52,6 +52,7 @@ const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "agent" },
     BuiltinSlashCommand { name: "compact" },
     BuiltinSlashCommand { name: "model" },
+    BuiltinSlashCommand { name: "theme" },
     BuiltinSlashCommand { name: "models" },
     BuiltinSlashCommand { name: "set-model" },
     BuiltinSlashCommand { name: "provider" },
@@ -105,6 +106,22 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     SlashCompletion {
         command: "/compact",
         description: "Compact current session context",
+    },
+    SlashCompletion {
+        command: "/theme",
+        description: "List bundled themes",
+    },
+    SlashCompletion {
+        command: "/theme preview ",
+        description: "Preview bundled theme",
+    },
+    SlashCompletion {
+        command: "/theme apply ",
+        description: "Apply bundled theme for this run",
+    },
+    SlashCompletion {
+        command: "/theme cancel",
+        description: "Cancel theme preview",
     },
     SlashCompletion {
         command: "/model",

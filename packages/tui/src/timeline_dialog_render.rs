@@ -3,16 +3,15 @@
 use bcode_markdown_render::markdown_to_plain_text;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::prelude::{Line, Span};
+use bmux_tui::style::Modifier;
 use bmux_tui::text_width::display_width;
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::render::TuiTheme;
 use super::timeline_dialog::{TimelineDialogState, TimelineEntry};
 
-const MODAL_BG: Color = Color::Black;
 const MIN_DIALOG_WIDTH: u16 = 60;
 const MAX_DIALOG_WIDTH: u16 = 110;
 const MIN_DIALOG_HEIGHT: u16 = 12;
@@ -59,7 +58,7 @@ fn modal_frame(theme: TuiTheme) -> ModalFrame {
             Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
             Insets::all(4),
         ),
-        ModalTheme::dark(theme.accent),
+        theme.modal_theme(),
     )
     .title(" Timeline ")
     .placement(ModalPlacement::Centered)
@@ -74,15 +73,12 @@ fn rows(
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![Span::styled(
         "User messages",
-        Style::new()
-            .fg(theme.accent)
-            .bg(MODAL_BG)
-            .add_modifier(Modifier::BOLD),
+        theme.border.add_modifier(Modifier::BOLD),
     )]));
     if state.entries().is_empty() {
         rows.push(Line::from_spans(vec![Span::styled(
             "No user messages in this session.",
-            Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
+            theme.muted,
         )]));
     } else {
         rows.extend(
@@ -97,7 +93,7 @@ fn rows(
     }
     rows.push(Line::from_spans(vec![Span::styled(
         "↑/↓ select · PgUp/PgDn jump · Enter go · Esc close",
-        Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
+        theme.muted,
     )]));
     rows
 }
@@ -105,25 +101,19 @@ fn rows(
 fn entry_line(entry: &TimelineEntry, selected: bool, width: u16, theme: TuiTheme) -> Line {
     let marker = if selected { "›" } else { " " };
     let base = if selected {
-        Style::new()
-            .fg(Color::White)
-            .bg(Color::Blue)
-            .add_modifier(Modifier::BOLD)
+        theme.selection.add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(Color::White).bg(MODAL_BG)
+        theme.text
     };
     let accent = if selected {
-        Style::new()
-            .fg(theme.accent)
-            .bg(Color::Blue)
-            .add_modifier(Modifier::BOLD)
+        theme.selection.add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(theme.accent).bg(MODAL_BG)
+        theme.border
     };
     let dim = if selected {
-        Style::new().fg(Color::BrightBlack).bg(Color::Blue)
+        theme.selection
     } else {
-        Style::new().fg(Color::BrightBlack).bg(MODAL_BG)
+        theme.muted
     };
     let reserved = TIMESTAMP_WIDTH.saturating_add(4);
     let preview_width = usize::from(width).saturating_sub(reserved).max(8);

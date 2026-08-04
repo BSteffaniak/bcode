@@ -3,13 +3,11 @@
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui::style::Modifier;
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
 
 use super::render::TuiTheme;
 use super::thinking_dialog::ThinkingDialogState;
-
-const MODAL_BG: Color = Color::Black;
 
 const MIN_DIALOG_WIDTH: u16 = 56;
 const MAX_DIALOG_WIDTH: u16 = 96;
@@ -47,7 +45,7 @@ fn modal_frame(theme: TuiTheme) -> ModalFrame {
             Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
             Insets::all(4),
         ),
-        ModalTheme::dark(theme.accent),
+        theme.modal_theme(),
     )
     .title(" Reasoning output settings ")
     .padding(Insets::new(1, 2, 1, 2))
@@ -58,15 +56,15 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![Span::styled(
         "Control requested reasoning effort and provider-visible reasoning summaries.",
-        Style::new().fg(Color::BrightWhite).bg(MODAL_BG),
+        theme.text,
     )]));
     if !state.supported() {
         rows.push(Line::from_spans(vec![Span::styled(
             "This model does not advertise reasoning support. Add a model metadata override to enable it.",
-            Style::new().fg(Color::Yellow).bg(MODAL_BG),
+            theme.selection,
         )]));
     }
-    rows.push(modal_blank_line());
+    rows.push(modal_blank_line(theme));
     rows.push(setting_row(
         state.focused_row() == 0,
         "Show reasoning output",
@@ -109,46 +107,28 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
         )),
         theme,
     ));
-    rows.push(modal_blank_line());
+    rows.push(modal_blank_line(theme));
     rows.push(Line::from_spans(vec![
-        Span::styled(
-            "Enter",
-            Style::new()
-                .fg(Color::Green)
-                .bg(MODAL_BG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" apply   ", Style::new().bg(MODAL_BG)),
-        Span::styled(
-            "Esc",
-            Style::new()
-                .fg(Color::Yellow)
-                .bg(MODAL_BG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" cancel   ", Style::new().bg(MODAL_BG)),
+        Span::styled("Enter", theme.selection.add_modifier(Modifier::BOLD)),
+        Span::styled(" apply   ", theme.text),
+        Span::styled("Esc", theme.selection.add_modifier(Modifier::BOLD)),
+        Span::styled(" cancel   ", theme.text),
         Span::styled(
             "↑/↓",
-            Style::new()
-                .fg(theme.accent)
-                .bg(MODAL_BG)
-                .add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" move   ", Style::new().bg(MODAL_BG)),
+        Span::styled(" move   ", theme.text),
         Span::styled(
             "Space",
-            Style::new()
-                .fg(theme.accent)
-                .bg(MODAL_BG)
-                .add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" change", Style::new().bg(MODAL_BG)),
+        Span::styled(" change", theme.text),
     ]));
     rows
 }
 
-fn modal_blank_line() -> Line {
-    Line::from_spans(vec![Span::styled("", Style::new().bg(MODAL_BG))])
+fn modal_blank_line(theme: TuiTheme) -> Line {
+    Line::from_spans(vec![Span::styled("", theme.text)])
 }
 
 fn setting_row(
@@ -160,28 +140,19 @@ fn setting_row(
 ) -> Line {
     let marker = if focused { "›" } else { " " };
     let marker_style = if focused {
-        Style::new()
-            .fg(theme.accent)
-            .bg(MODAL_BG)
-            .add_modifier(Modifier::BOLD)
+        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(Color::BrightBlack).bg(MODAL_BG)
+        theme.muted
     };
     let mut spans = vec![
         Span::styled(marker, marker_style),
-        Span::styled(" ", Style::new().bg(MODAL_BG)),
-        Span::styled(
-            format!("{label}: "),
-            Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
-        ),
-        Span::styled(value.to_owned(), Style::new().fg(theme.accent).bg(MODAL_BG)),
+        Span::styled(" ", theme.text),
+        Span::styled(format!("{label}: "), theme.muted),
+        Span::styled(value.to_owned(), Style::new().fg(theme.accent)),
     ];
     if let Some(help) = help {
-        spans.push(Span::styled("  ", Style::new().bg(MODAL_BG)));
-        spans.push(Span::styled(
-            help.to_owned(),
-            Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
-        ));
+        spans.push(Span::styled("  ", theme.text));
+        spans.push(Span::styled(help.to_owned(), theme.muted));
     }
     Line::from_spans(spans)
 }

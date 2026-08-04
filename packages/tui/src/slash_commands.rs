@@ -41,6 +41,14 @@ pub enum SlashCommandOutcome {
     PickSession,
     /// Open model picker.
     PickModel,
+    /// Preview a bundled theme without persistence.
+    PreviewTheme { theme_id: String },
+    /// Apply a bundled theme to the in-memory configuration.
+    ApplyTheme { theme_id: String },
+    /// Restore the configured theme after preview.
+    CancelThemePreview,
+    /// List bundled themes.
+    ListThemes,
     /// Open worktree create dialog.
     OpenWorktreeCreateDialog,
     /// Open fork session wizard.
@@ -803,6 +811,25 @@ async fn execute_builtin(
             };
             Ok(SlashCommandOutcome::CompactContext { session_id })
         }
+        "theme" if parts.len() == 1 || parts.get(1) == Some(&"list") => {
+            Ok(SlashCommandOutcome::ListThemes)
+        }
+        "theme" if parts.get(1) == Some(&"preview") && parts.len() == 3 => {
+            Ok(SlashCommandOutcome::PreviewTheme {
+                theme_id: parts[2].to_owned(),
+            })
+        }
+        "theme" if parts.get(1) == Some(&"apply") && parts.len() == 3 => {
+            Ok(SlashCommandOutcome::ApplyTheme {
+                theme_id: parts[2].to_owned(),
+            })
+        }
+        "theme" if parts.get(1) == Some(&"cancel") && parts.len() == 2 => {
+            Ok(SlashCommandOutcome::CancelThemePreview)
+        }
+        "theme" => Ok(SlashCommandOutcome::Handled(
+            "usage: /theme [list|preview <builtin>|apply <builtin>|cancel]".to_owned(),
+        )),
         "model" | "models" if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
         "model" | "set-model" if parts.len() > 1 => {
             let model_id = parts[1].to_owned();

@@ -24,6 +24,7 @@ pub struct OnboardingProgram {
     shell: onboarding::OnboardingShell,
     health: bcode_settings::SettingsDbHealth,
     readiness: Option<bcode_settings::SetupReadinessReport>,
+    theme: super::theme::PresentedTheme,
     area: Rect,
 }
 
@@ -32,6 +33,7 @@ impl OnboardingProgram {
     pub fn new(
         store: bcode_settings::SettingsStore,
         shell: onboarding::OnboardingShell,
+        theme: &super::theme::PresentedTheme,
         area: Rect,
     ) -> Result<Self, TuiError> {
         let health = store.health();
@@ -41,6 +43,7 @@ impl OnboardingProgram {
             shell,
             health,
             readiness,
+            theme: *theme,
             area,
         })
     }
@@ -170,6 +173,7 @@ impl<W: Write> Presenter<OnboardingProgram> for OnboardingPresenter<'_, '_, W> {
                 frame,
                 &program.health,
                 program.readiness.clone(),
+                &program.theme,
             );
         })?;
         Ok(PresentReport {

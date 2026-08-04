@@ -1,7 +1,7 @@
 //! Theme resolution and presentation state.
 
-mod definition;
-mod discovery;
+pub mod definition;
+pub mod discovery;
 
 use std::num::ParseIntError;
 
@@ -9,6 +9,105 @@ use bcode_config::{TuiAgentAccentPolicy, TuiThemeVariant};
 use bmux_tui::style::{Color, Modifier};
 
 use super::app::BmuxApp;
+
+/// One bounded theme catalog row for selection and diagnostics UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeCatalogEntry {
+    /// Stable theme id.
+    pub id: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Bundled, user, project, or explicit origin label.
+    pub source: String,
+    /// Whether a dark variant patch is available.
+    pub has_dark_variant: bool,
+    /// Whether a light variant patch is available.
+    pub has_light_variant: bool,
+    /// Validation state for this accepted catalog definition.
+    pub validation: String,
+    /// Whether this is the configured base selection.
+    pub selected: bool,
+}
+
+/// One bounded effective catalog plus rejected-candidate diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeCatalogView {
+    /// Selectable, fully validated definitions.
+    pub entries: Vec<ThemeCatalogEntry>,
+    /// Bounded secret-safe rejected candidate summaries.
+    pub diagnostics: Vec<String>,
+}
+
+/// Return the bounded effective theme catalog for an app.
+#[must_use]
+pub fn catalog_view(app: &BmuxApp) -> ThemeCatalogView {
+    let project_root = app
+        .working_directory()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let roots = discovery::default_theme_roots(
+        &bcode_config::default_config_dir(),
+        project_root,
+        &app.tui_config().theme.paths,
+    );
+    let Ok(discovered) = discovery::discover_themes(&roots) else {
+        return ThemeCatalogView {
+            entries: Vec::new(),
+            diagnostics: vec!["bundled theme catalog is invalid".to_owned()],
+        };
+    };
+    let entries = discovered
+        .catalog
+        .definitions()
+        .map(|definition| {
+            let source = discovered.sources.get(definition.id()).map_or_else(
+                || "bundled".to_owned(),
+                |external| match external.kind {
+                    discovery::ThemeSourceKind::User => "user".to_owned(),
+                    discovery::ThemeSourceKind::Project => "project".to_owned(),
+                    discovery::ThemeSourceKind::Explicit => "explicit".to_owned(),
+                },
+            );
+            ThemeCatalogEntry {
+                id: definition.id().to_owned(),
+                display_name: definition.display_name().to_owned(),
+                source,
+                has_dark_variant: definition.has_dark_variant(),
+                has_light_variant: definition.has_light_variant(),
+                validation: "valid".to_owned(),
+                selected: definition.id() == app.tui_config().theme.name,
+            }
+        })
+        .collect();
+    let diagnostics = discovered
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            format!(
+                "{}: {}",
+                bcode_plugin_sdk::path::display_from_current_dir(&diagnostic.path),
+                diagnostic.message
+            )
+        })
+        .collect();
+    ThemeCatalogView {
+        entries,
+        diagnostics,
+    }
+}
+
+/// Return the stable metadata signature of the active theme input roots.
+#[must_use]
+pub fn active_theme_input_signature(app: &BmuxApp) -> u64 {
+    let project_root = app
+        .working_directory()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let roots = discovery::default_theme_roots(
+        &bcode_config::default_config_dir(),
+        project_root,
+        &app.tui_config().theme.paths,
+    );
+    discovery::theme_input_signature(&roots)
+}
 
 /// Fully resolved target theme derived from app state and configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +126,14 @@ pub struct ResolvedTheme {
     pub background: bmux_tui::style::Style,
     /// Selection style.
     pub selection: bmux_tui::style::Style,
+    /// Informational state style.
+    pub info: bmux_tui::style::Style,
+    /// Successful state style.
+    pub success: bmux_tui::style::Style,
+    /// Warning state style.
+    pub warning: bmux_tui::style::Style,
+    /// Error state style.
+    pub error: bmux_tui::style::Style,
     /// Markdown styles derived from semantic theme roles.
     pub markdown: bcode_markdown_render::MarkdownTheme,
     /// Semantic syntax palette for code presentation.
@@ -49,6 +156,10 @@ impl ResolvedTheme {
             focused: self.focused,
             background: self.background,
             selection: self.selection,
+            info: self.info,
+            success: self.success,
+            warning: self.warning,
+            error: self.error,
             markdown: self.markdown,
             syntax: self.syntax,
             source: self.source,
@@ -75,6 +186,14 @@ pub struct PresentedTheme {
     pub background: bmux_tui::style::Style,
     /// Selection style.
     pub selection: bmux_tui::style::Style,
+    /// Informational state style.
+    pub info: bmux_tui::style::Style,
+    /// Successful state style.
+    pub success: bmux_tui::style::Style,
+    /// Warning state style.
+    pub warning: bmux_tui::style::Style,
+    /// Error state style.
+    pub error: bmux_tui::style::Style,
     /// Markdown styles derived from semantic theme roles.
     pub markdown: bcode_markdown_render::MarkdownTheme,
     /// Semantic syntax palette for code presentation.
@@ -102,7 +221,24 @@ pub fn resolve_initial_theme() -> ResolvedTheme {
     let resolved = definition::ThemeCatalog::bundled()
         .and_then(|catalog| catalog.resolve(&definition::ThemeSelection::new("terminal-native")))
         .ok();
-    resolved_theme(resolved.as_ref(), PENDING_AGENT_METADATA_ACCENT)
+    resolved_definition_theme(resolved.as_ref(), PENDING_AGENT_METADATA_ACCENT)
+}
+
+/// Resolve a configured theme for standalone TUI surfaces without app state.
+#[must_use]
+pub fn resolve_configured_theme(
+    config: &bcode_config::TuiConfig,
+    project_root: &std::path::Path,
+) -> PresentedTheme {
+    let resolved = resolve_definition(
+        &config.theme.name,
+        &config.theme.overlays,
+        config.theme.variant,
+        project_root,
+        &config.theme.paths,
+    );
+    let accent = resolved_accent(resolved.as_ref());
+    resolved_definition_theme(resolved.as_ref(), accent).presented(accent)
 }
 
 /// Resolve the target theme from app state.
@@ -121,7 +257,12 @@ pub fn resolve_theme(app: &BmuxApp) -> ResolvedTheme {
         &app.tui_config().theme.paths,
     );
     let configured_theme_accent = resolved_accent(resolved.as_ref());
-    let accent = match app.tui_config().theme.agent_accent {
+    let accent = resolve_app_accent(app, configured_theme_accent);
+    resolved_definition_theme(resolved.as_ref(), accent)
+}
+
+pub(crate) fn resolve_app_accent(app: &BmuxApp, configured_theme_accent: Color) -> Color {
+    match app.tui_config().theme.agent_accent {
         TuiAgentAccentPolicy::ThemeOnly => configured_theme_accent,
         TuiAgentAccentPolicy::AgentWithThemeFallback => app
             .display_agent_accent()
@@ -133,8 +274,21 @@ pub fn resolve_theme(app: &BmuxApp) -> ResolvedTheme {
                     configured_theme_accent
                 }
             }),
-    };
-    resolved_theme(resolved.as_ref(), accent)
+    }
+}
+
+pub(crate) fn resolve_theme_selection(
+    app: &BmuxApp,
+    theme_name: &str,
+) -> Option<definition::ResolvedThemeDefinition> {
+    resolve_definition(
+        theme_name,
+        &app.tui_config().theme.overlays,
+        app.tui_config().theme.variant,
+        app.working_directory()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+        &app.tui_config().theme.paths,
+    )
 }
 
 fn resolve_definition(
@@ -165,10 +319,10 @@ fn resolve_definition(
             discovered.catalog
         })
         .or_else(|_| definition::ThemeCatalog::bundled());
-    let variant = match variant {
-        TuiThemeVariant::Auto | TuiThemeVariant::Dark => definition::ResolvedThemeVariant::Dark,
-        TuiThemeVariant::Light => definition::ResolvedThemeVariant::Light,
-    };
+    let variant = resolve_variant(
+        variant,
+        bmux_tui::capabilities::TerminalCapabilities::detect(),
+    );
     catalog
         .and_then(|catalog| {
             catalog.resolve(
@@ -180,14 +334,33 @@ fn resolve_definition(
         .ok()
 }
 
-fn resolved_accent(theme: Option<&definition::ResolvedThemeDefinition>) -> Color {
+const fn resolve_variant(
+    variant: TuiThemeVariant,
+    capabilities: bmux_tui::capabilities::TerminalCapabilities,
+) -> definition::ResolvedThemeVariant {
+    match variant {
+        TuiThemeVariant::Dark => definition::ResolvedThemeVariant::Dark,
+        TuiThemeVariant::Light => definition::ResolvedThemeVariant::Light,
+        TuiThemeVariant::Auto => match capabilities.background {
+            bmux_tui::capabilities::TerminalBackground::Light => {
+                definition::ResolvedThemeVariant::Light
+            }
+            bmux_tui::capabilities::TerminalBackground::Dark
+            | bmux_tui::capabilities::TerminalBackground::Unknown => {
+                definition::ResolvedThemeVariant::Dark
+            }
+        },
+    }
+}
+
+pub(crate) fn resolved_accent(theme: Option<&definition::ResolvedThemeDefinition>) -> Color {
     theme
         .and_then(|theme| theme.style("border.focused").and_then(|style| style.fg))
         .or_else(|| theme.and_then(|theme| theme.color("accent")))
         .unwrap_or(PENDING_AGENT_METADATA_ACCENT)
 }
 
-fn resolved_theme(
+pub(crate) fn resolved_definition_theme(
     theme: Option<&definition::ResolvedThemeDefinition>,
     accent: Color,
 ) -> ResolvedTheme {
@@ -210,6 +383,10 @@ fn resolved_theme(
     let background = style("surface.base").unwrap_or_else(bmux_tui::style::Style::new);
     let selection = style("selection.active")
         .unwrap_or_else(|| bmux_tui::style::Style::new().add_modifier(Modifier::REVERSED));
+    let info = style("state.info").unwrap_or_else(|| bmux_tui::style::Style::new().fg(accent));
+    let success = style("state.success").unwrap_or(text);
+    let warning = style("state.warning").unwrap_or(text);
+    let error = style("state.error").unwrap_or(text);
     let markdown = markdown_theme(theme, text, muted);
     let syntax = syntax_palette(theme);
     let source = bcode_tui_components::source_viewer::SourceViewerStyle {
@@ -243,6 +420,10 @@ fn resolved_theme(
         focused,
         background,
         selection,
+        info,
+        success,
+        warning,
+        error,
         markdown,
         syntax,
         source,
@@ -385,4 +566,66 @@ fn fallback_agent_accent_color(agent_id: &str) -> Color {
         hash.wrapping_mul(33).wrapping_add(usize::from(byte))
     });
     PALETTE[hash % PALETTE.len()]
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn auto_variant_uses_detected_background_with_dark_unknown_fallback() {
+        use bmux_tui::capabilities::{TerminalBackground, TerminalCapabilities};
+
+        for (background, expected) in [
+            (
+                TerminalBackground::Light,
+                definition::ResolvedThemeVariant::Light,
+            ),
+            (
+                TerminalBackground::Dark,
+                definition::ResolvedThemeVariant::Dark,
+            ),
+            (
+                TerminalBackground::Unknown,
+                definition::ResolvedThemeVariant::Dark,
+            ),
+        ] {
+            assert_eq!(
+                resolve_variant(
+                    TuiThemeVariant::Auto,
+                    TerminalCapabilities {
+                        background,
+                        ..TerminalCapabilities::default()
+                    }
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_variant_ignores_detected_background() {
+        use bmux_tui::capabilities::{TerminalBackground, TerminalCapabilities};
+
+        assert_eq!(
+            resolve_variant(
+                TuiThemeVariant::Dark,
+                TerminalCapabilities {
+                    background: TerminalBackground::Light,
+                    ..TerminalCapabilities::default()
+                }
+            ),
+            definition::ResolvedThemeVariant::Dark
+        );
+        assert_eq!(
+            resolve_variant(
+                TuiThemeVariant::Light,
+                TerminalCapabilities {
+                    background: TerminalBackground::Dark,
+                    ..TerminalCapabilities::default()
+                }
+            ),
+            definition::ResolvedThemeVariant::Light
+        );
+    }
 }

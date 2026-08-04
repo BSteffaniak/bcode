@@ -192,6 +192,7 @@ pub struct ChatLoopState {
     daemon_connection: DaemonConnectionMonitor,
     pub(super) permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
+    theme_picker: Option<super::theme_picker::ThemePickerState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     session_fork_dialog: Option<super::session_fork_dialog::SessionForkDialog>,
     fork_prompt_picker: Option<RootForkPromptPicker>,
@@ -236,6 +237,7 @@ impl ChatLoopState {
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             thinking_dialog: None,
+            theme_picker: None,
             timeline_dialog: None,
             session_fork_dialog: None,
             fork_prompt_picker: None,
@@ -405,6 +407,83 @@ impl ChatLoopState {
 
     pub fn refresh_slash_palette(&mut self, chat: &mut ActiveChat) -> bool {
         update_slash_palette_async(chat, self)
+    }
+
+    pub fn open_theme_picker(&mut self, chat: &mut ActiveChat) {
+        let catalog = super::theme::catalog_view(&chat.app);
+        self.theme_picker = Some(super::theme_picker::ThemePickerState::new(
+            catalog.entries,
+            catalog.diagnostics,
+        ));
+        chat.app.set_status("theme picker opened".to_owned());
+    }
+
+    pub fn close_theme_picker(&mut self) {
+        self.theme_picker = None;
+    }
+
+    pub fn handle_theme_picker_key(&mut self, chat: &mut ActiveChat, stroke: KeyStroke) -> bool {
+        let Some(picker) = self.theme_picker.as_mut() else {
+            return false;
+        };
+        let outcome = picker.handle_key(stroke);
+        self.apply_theme_picker_outcome(chat, outcome);
+        true
+    }
+
+    pub fn handle_theme_picker_mouse(
+        &mut self,
+        chat: &mut ActiveChat,
+        mouse: bmux_tui::event::MouseEvent,
+        frame_area: Rect,
+    ) -> bool {
+        let Some(picker) = self.theme_picker.as_mut() else {
+            return false;
+        };
+        let theme = super::render::TuiTheme::for_app(&chat.app);
+        let Some((row, activate)) =
+            super::theme_picker_render::theme_picker_row(picker, mouse, frame_area, theme)
+        else {
+            return true;
+        };
+        let outcome = if activate {
+            picker.activate_row(row)
+        } else {
+            picker.select_row(row)
+        };
+        self.apply_theme_picker_outcome(chat, outcome);
+        true
+    }
+
+    fn apply_theme_picker_outcome(
+        &mut self,
+        chat: &mut ActiveChat,
+        outcome: super::theme_picker::ThemePickerOutcome,
+    ) {
+        match outcome {
+            super::theme_picker::ThemePickerOutcome::Preview(id) => {
+                if chat.app.preview_theme(&id) {
+                    chat.app.set_status(format!("previewing theme {id}"));
+                }
+            }
+            super::theme_picker::ThemePickerOutcome::Apply(id) => {
+                self.theme_picker = None;
+                if chat.app.preview_theme(&id) {
+                    chat.replace_effect(TuiEffect::PersistThemeSelection {
+                        name: id.clone(),
+                        overlays: chat.app.tui_config().theme.overlays.clone(),
+                        variant: chat.app.tui_config().theme.variant,
+                    });
+                    chat.app.set_status(format!("saving theme {id}…"));
+                }
+            }
+            super::theme_picker::ThemePickerOutcome::Cancel => {
+                self.theme_picker = None;
+                chat.app.cancel_theme_preview();
+                chat.app.set_status("theme preview cancelled".to_owned());
+            }
+            super::theme_picker::ThemePickerOutcome::Ignored => {}
+        }
     }
 
     pub const fn has_command_palette(&self) -> bool {
@@ -1845,6 +1924,18 @@ pub fn apply_effect_result(
         TuiEffectResult::ConfigLoaded { config } => {
             apply_config_result(settings, chat, loop_state, *config);
         }
+        TuiEffectResult::ThemeSelectionPersisted { name, result } => match result {
+            Ok(path) => {
+                chat.app.set_status(format!(
+                    "theme {name} saved to {}; reloading configuration…",
+                    bcode_plugin_sdk::path::display_from_current_dir(&path)
+                ));
+                chat.replace_effect(TuiEffect::LoadConfig);
+            }
+            Err(error) => chat
+                .app
+                .set_status(format!("could not save theme {name}: {error}")),
+        },
         TuiEffectResult::AuthSecurityReconciled { status } => {
             apply_auth_security_result(chat, status);
         }
@@ -2729,6 +2820,58 @@ fn apply_root_slash_command_outcome(
         }
         SlashCommandOutcome::OpenForkSessionWizard => {
             loop_state.open_session_fork_dialog(chat);
+        }
+        SlashCommandOutcome::PreviewTheme { theme_id } => {
+            if chat.app.preview_theme(&theme_id) {
+                chat.app.set_status(format!(
+                    "previewing theme {theme_id}; use /theme apply {theme_id} or /theme cancel"
+                ));
+            } else {
+                chat.app
+                    .set_status(format!("unknown bundled theme: {theme_id}"));
+            }
+        }
+        SlashCommandOutcome::ApplyTheme { theme_id } => {
+            if chat.app.preview_theme(&theme_id) {
+                chat.replace_effect(TuiEffect::PersistThemeSelection {
+                    name: theme_id.clone(),
+                    overlays: chat.app.tui_config().theme.overlays.clone(),
+                    variant: chat.app.tui_config().theme.variant,
+                });
+                chat.app.set_status(format!("saving theme {theme_id}…"));
+            } else {
+                chat.app
+                    .set_status(format!("unknown bundled theme: {theme_id}"));
+            }
+        }
+        SlashCommandOutcome::CancelThemePreview => {
+            chat.app.cancel_theme_preview();
+            chat.app.set_status("theme preview cancelled".to_owned());
+        }
+        SlashCommandOutcome::ListThemes => {
+            let entries = super::theme::catalog_view(&chat.app).entries;
+            let status = if entries.is_empty() {
+                "could not load theme catalog".to_owned()
+            } else {
+                entries
+                    .iter()
+                    .map(|entry| {
+                        let current = if entry.selected { "*" } else { " " };
+                        let variants = match (entry.has_dark_variant, entry.has_light_variant) {
+                            (true, true) => "dark,light",
+                            (true, false) => "dark",
+                            (false, true) => "light",
+                            (false, false) => "default",
+                        };
+                        format!(
+                            "{current} {} — {} [{}; {variants}]",
+                            entry.id, entry.display_name, entry.source
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            chat.app.set_status(status);
         }
         SlashCommandOutcome::PickModel => {
             chat.replace_effect(TuiEffect::LoadModelProviders);
@@ -3683,8 +3826,11 @@ pub fn draw_chat_frame<W: Write>(
         if let Some(palette) = &mut loop_state.palette {
             command_palette_render::render_palette(palette, frame, theme);
         }
+        if let Some(picker) = &mut loop_state.theme_picker {
+            super::theme_picker_render::render_theme_picker(picker, frame, theme);
+        }
         if let Some(dialog) = &loop_state.permission_dialog {
-            permission_dialog_render::render_permission_dialog(dialog, frame);
+            permission_dialog_render::render_permission_dialog(dialog, frame, theme);
         }
         if let Some(dialog) = &loop_state.thinking_dialog {
             thinking_dialog_render::render_thinking_dialog(dialog, frame, theme);

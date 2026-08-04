@@ -4,13 +4,11 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::input::TextInput;
 use bmux_tui::prelude::{Line, Span, Style, Widget};
-use bmux_tui::style::{Color, Modifier};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui::style::Modifier;
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
 
 use super::render::TuiTheme;
 use super::session_fork_dialog::{SessionForkDialog, SessionForkDialogFocus};
-
-const MODAL_BG: Color = Color::Black;
 
 /// Render the session fork/clone dialog.
 pub fn render_dialog(dialog: &mut SessionForkDialog, frame: &mut Frame<'_>, theme: TuiTheme) {
@@ -24,18 +22,20 @@ pub fn render_dialog(dialog: &mut SessionForkDialog, frame: &mut Frame<'_>, them
             "Mode",
             dialog.mode().label(),
             dialog.focus() == SessionForkDialogFocus::Mode,
+            theme,
         ),
         &modal,
         content,
         &mut row,
         frame,
     );
-    render_name_field(dialog, &modal, content, &mut row, frame);
+    render_name_field(dialog, &modal, content, &mut row, frame, theme);
     render_line(
         &field_line(
             "Switch after create",
             bool_label(dialog.switch_after_create()),
             dialog.focus() == SessionForkDialogFocus::SwitchAfterCreate,
+            theme,
         ),
         &modal,
         content,
@@ -47,18 +47,16 @@ pub fn render_dialog(dialog: &mut SessionForkDialog, frame: &mut Frame<'_>, them
             "Install returned draft",
             bool_label(dialog.install_draft()),
             dialog.focus() == SessionForkDialogFocus::InstallDraft,
+            theme,
         ),
         &modal,
         content,
         &mut row,
         frame,
     );
-    render_line(&help_line(), &modal, content, &mut row, frame);
+    render_line(&help_line(theme), &modal, content, &mut row, frame);
     render_line(
-        &Line::from_spans(vec![Span::styled(
-            dialog.status().to_owned(),
-            Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
-        )]),
+        &Line::from_spans(vec![Span::styled(dialog.status().to_owned(), theme.muted)]),
         &modal,
         content,
         &mut row,
@@ -69,7 +67,7 @@ pub fn render_dialog(dialog: &mut SessionForkDialog, frame: &mut Frame<'_>, them
 fn modal_frame(theme: TuiTheme) -> ModalFrame {
     ModalFrame::new(
         ModalSizing::new(Size::new(62, 12), Size::new(84, 14), Insets::all(4)),
-        ModalTheme::dark(theme.accent),
+        theme.modal_theme(),
     )
     .title(" Fork / clone session ")
     .padding(Insets::new(1, 2, 1, 2))
@@ -82,6 +80,7 @@ fn render_name_field(
     content: Rect,
     row: &mut u16,
     frame: &mut Frame<'_>,
+    theme: TuiTheme,
 ) {
     if *row >= content.bottom() {
         return;
@@ -93,7 +92,7 @@ fn render_name_field(
         line_area,
         &Line::from_spans(vec![Span::styled(
             label,
-            Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),
+            Style::new().add_modifier(Modifier::BOLD),
         )]),
         frame,
     );
@@ -106,12 +105,8 @@ fn render_name_field(
     dialog.set_name_content_area(input_area);
     let focused = dialog.focus() == SessionForkDialogFocus::Name;
     TextInput::new(dialog.name().buffer())
-        .style(if focused {
-            Style::new().fg(Color::Yellow).bg(MODAL_BG)
-        } else {
-            Style::new().fg(Color::White).bg(MODAL_BG)
-        })
-        .selection_style(Style::new().fg(Color::Black).bg(Color::Yellow))
+        .style(if focused { theme.selection } else { theme.text })
+        .selection_style(theme.selection)
         .vertical_scroll(dialog.name().vertical_scroll())
         .cursor_visible(focused)
         .render(input_area, frame);
@@ -132,40 +127,24 @@ fn render_line(
     *row = row.saturating_add(1);
 }
 
-fn field_line(label: &str, value: &str, focused: bool) -> Line {
-    let style = if focused {
-        Style::new().fg(Color::Yellow).bg(MODAL_BG)
-    } else {
-        Style::new().fg(Color::White).bg(MODAL_BG)
-    };
+fn field_line(label: &str, value: &str, focused: bool, theme: TuiTheme) -> Line {
+    let style = if focused { theme.selection } else { theme.text };
     Line::from_spans(vec![
         Span::styled(format!("{label}: "), style.add_modifier(Modifier::BOLD)),
         Span::styled(value.to_owned(), style),
     ])
 }
 
-fn help_line() -> Line {
+fn help_line(theme: TuiTheme) -> Line {
     Line::from_spans(vec![
-        Span::styled(
-            "Enter",
-            Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),
-        ),
-        Span::styled(" create  ", Style::new().bg(MODAL_BG)),
-        Span::styled(
-            "Tab",
-            Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),
-        ),
-        Span::styled(" field  ", Style::new().bg(MODAL_BG)),
-        Span::styled(
-            "←/→",
-            Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),
-        ),
-        Span::styled(" value  ", Style::new().bg(MODAL_BG)),
-        Span::styled(
-            "Esc",
-            Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),
-        ),
-        Span::styled(" cancel", Style::new().bg(MODAL_BG)),
+        Span::styled("Enter", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(" create  ", theme.text),
+        Span::styled("Tab", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(" field  ", theme.text),
+        Span::styled("←/→", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(" value  ", theme.text),
+        Span::styled("Esc", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(" cancel", theme.text),
     ])
 }
 

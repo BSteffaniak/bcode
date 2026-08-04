@@ -86,14 +86,48 @@ pub enum ResolvedThemeVariant {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThemeDefinition {
     source_name: String,
+    source: String,
     raw: RawTheme,
 }
 
 impl ThemeDefinition {
+    /// Return the original bounded TOML source.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
     /// Return the stable theme id.
     #[must_use]
     pub fn id(&self) -> &str {
         &self.raw.id
+    }
+
+    /// Return the human-readable display name, falling back to the stable id.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.raw
+            .display_name
+            .as_deref()
+            .unwrap_or_else(|| self.id())
+    }
+
+    /// Return the diagnostic source name.
+    #[must_use]
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    /// Return whether this definition provides a dark variant patch.
+    #[must_use]
+    pub const fn has_dark_variant(&self) -> bool {
+        self.raw.variants.dark.is_some()
+    }
+
+    /// Return whether this definition provides a light variant patch.
+    #[must_use]
+    pub const fn has_light_variant(&self) -> bool {
+        self.raw.variants.light.is_some()
     }
 }
 
@@ -116,7 +150,11 @@ pub fn parse_theme_definition(
         message: error.to_string(),
     })?;
     validate_raw_theme(&source_name, &raw)?;
-    Ok(ThemeDefinition { source_name, raw })
+    Ok(ThemeDefinition {
+        source_name,
+        source: source.to_owned(),
+        raw,
+    })
 }
 
 /// Requested base theme, overlays, and resolved terminal variant.
@@ -204,6 +242,33 @@ impl ThemeCatalog {
             include_str!("../../themes/high-contrast.toml"),
         )?);
         Ok(catalog)
+    }
+
+    /// Iterate definitions in stable id order.
+    pub fn definitions(&self) -> impl Iterator<Item = &ThemeDefinition> {
+        self.definitions.values()
+    }
+
+    /// Return one definition by stable id.
+    #[must_use]
+    pub fn definition(&self, id: &str) -> Option<&ThemeDefinition> {
+        self.definitions.get(id)
+    }
+
+    /// Return a bundled definition's original TOML source.
+    #[must_use]
+    pub fn bundled_source(id: &str) -> Option<&'static str> {
+        match id {
+            "terminal-native" => Some(include_str!("../../themes/terminal-native.toml")),
+            "terminal-native-structured" => {
+                Some(include_str!("../../themes/terminal-native-structured.toml"))
+            }
+            "bcode-dark" => Some(include_str!("../../themes/bcode-dark.toml")),
+            "bcode-light" => Some(include_str!("../../themes/bcode-light.toml")),
+            "monochrome" => Some(include_str!("../../themes/monochrome.toml")),
+            "high-contrast" => Some(include_str!("../../themes/high-contrast.toml")),
+            _ => None,
+        }
     }
 
     /// Insert or replace one definition by stable id.

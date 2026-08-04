@@ -4,14 +4,15 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 use bmux_tui::text_width::{display_width, wrap_text_with_continuation};
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowStyles};
 use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails, LabeledDetailsStyles};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
 
 use super::permission_dialog::PermissionDialogState;
 use super::permission_present::{PermissionDetail, permission_presentation};
+use super::render::TuiTheme;
 
 const MIN_DIALOG_WIDTH: u16 = 48;
 const MAX_DIALOG_WIDTH: u16 = 100;
@@ -19,8 +20,12 @@ const MIN_DIALOG_HEIGHT: u16 = 12;
 const MAX_DIALOG_HEIGHT: u16 = 24;
 
 /// Render a permission approval dialog.
-pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame<'_>) {
-    let modal = modal_frame();
+pub fn render_permission_dialog(
+    state: &PermissionDialogState,
+    frame: &mut Frame<'_>,
+    theme: TuiTheme,
+) {
+    let modal = modal_frame(theme);
     let area = modal.panel_area(frame.area());
     let permission = state.permission();
     let presentation = permission_presentation(&permission.tool_name, &permission.arguments_json);
@@ -35,6 +40,7 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
         details: &presentation.details,
         raw_details: presentation.raw_details.as_deref(),
         width: area.width.saturating_sub(4),
+        theme,
     });
 
     modal.render(frame.area(), frame);
@@ -57,24 +63,24 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
         );
     }
 
-    render_actions(state, content, frame);
+    render_actions(state, content, frame, theme);
 }
 
 /// Return the permission dialog panel area for a terminal area.
 #[must_use]
 #[cfg(test)]
-pub fn dialog_area(area: Rect) -> Rect {
-    modal_frame().panel_area(area)
+pub fn dialog_area(area: Rect, theme: TuiTheme) -> Rect {
+    modal_frame(theme).panel_area(area)
 }
 
-fn modal_frame() -> ModalFrame {
+fn modal_frame(theme: TuiTheme) -> ModalFrame {
     ModalFrame::new(
         ModalSizing::new(
             Size::new(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT),
             Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
             Insets::all(4),
         ),
-        ModalTheme::dark(Color::Yellow),
+        theme.modal_theme(),
     )
     .title(" Permission requested ")
     .padding(Insets::new(1, 2, 1, 2))
@@ -107,16 +113,17 @@ struct PermissionRowsInput<'a> {
     details: &'a [PermissionDetail],
     raw_details: Option<&'a str>,
     width: u16,
+    theme: TuiTheme,
 }
 
 fn permission_rows(input: &PermissionRowsInput<'_>) -> Vec<Line> {
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![Span::styled(
         "Review this tool request before it runs.",
-        Style::new().fg(Color::BrightWhite),
+        input.theme.text,
     )]));
     rows.push(Line::default());
-    push_metadata_row(&mut rows, "tool", input.tool_name, input.width);
+    push_metadata_row(&mut rows, "tool", input.tool_name, input.width, input.theme);
     if let Some(batch) = input.batch {
         push_metadata_row(
             &mut rows,
@@ -127,21 +134,22 @@ fn permission_rows(input: &PermissionRowsInput<'_>) -> Vec<Line> {
                 batch.call_count
             ),
             input.width,
+            input.theme,
         );
     }
-    push_metadata_row(&mut rows, "agent", input.agent_id, input.width);
-    push_metadata_row(&mut rows, "risk", input.risk, input.width);
+    push_metadata_row(&mut rows, "agent", input.agent_id, input.width, input.theme);
+    push_metadata_row(&mut rows, "risk", input.risk, input.width, input.theme);
     if let Some(source) = input
         .policy_source
         .filter(|source| !source.trim().is_empty())
     {
-        push_metadata_row(&mut rows, "policy", source, input.width);
+        push_metadata_row(&mut rows, "policy", source, input.width, input.theme);
     }
     if let Some(reason) = input
         .policy_reason
         .filter(|reason| !reason.trim().is_empty())
     {
-        push_metadata_row(&mut rows, "reason", reason, input.width);
+        push_metadata_row(&mut rows, "reason", reason, input.width, input.theme);
     }
     rows.push(Line::default());
 
@@ -153,9 +161,9 @@ fn permission_rows(input: &PermissionRowsInput<'_>) -> Vec<Line> {
     rows.extend(
         LabeledDetails::new(&detail_items)
             .styles(LabeledDetailsStyles {
-                label: muted_style().add_modifier(Modifier::BOLD),
-                value: Style::new().fg(Color::BrightWhite),
-                continuation: muted_style(),
+                label: input.theme.muted.add_modifier(Modifier::BOLD),
+                value: input.theme.text,
+                continuation: input.theme.muted,
             })
             .lines(input.width),
     );
@@ -164,15 +172,15 @@ fn permission_rows(input: &PermissionRowsInput<'_>) -> Vec<Line> {
         rows.push(Line::default());
         rows.push(Line::from_spans(vec![Span::styled(
             "raw details",
-            muted_style().add_modifier(Modifier::BOLD),
+            input.theme.muted.add_modifier(Modifier::BOLD),
         )]));
         for line in raw_details.lines().take(8) {
             push_wrapped_rows(
                 &mut rows,
-                &[Span::styled("  ", muted_style())],
+                &[Span::styled("  ", input.theme.muted)],
                 line,
                 input.width,
-                muted_style(),
+                input.theme.muted,
             );
         }
     }
@@ -183,24 +191,24 @@ fn permission_rows(input: &PermissionRowsInput<'_>) -> Vec<Line> {
             "tab/←/→ choose · enter {} · esc deny",
             input.state.focused_label()
         ),
-        muted_style(),
+        input.theme.muted,
     )]));
     rows
 }
 
-fn push_metadata_row(rows: &mut Vec<Line>, label: &str, value: &str, width: u16) {
+fn push_metadata_row(rows: &mut Vec<Line>, label: &str, value: &str, width: u16, theme: TuiTheme) {
     push_wrapped_rows(
         rows,
         &[
             Span::styled(
                 format_label(label),
-                muted_style().add_modifier(Modifier::BOLD),
+                theme.muted.add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" ", muted_style()),
+            Span::styled(" ", theme.muted),
         ],
         value,
         width,
-        Style::new().fg(Color::BrightWhite),
+        theme.text,
     );
 }
 
@@ -219,14 +227,19 @@ fn push_wrapped_rows(rows: &mut Vec<Line>, prefix: &[Span], text: &str, width: u
             rows.push(Line::from_spans(spans));
         } else {
             rows.push(Line::from_spans(vec![
-                Span::styled("  ", muted_style()),
+                Span::styled("  ", style),
                 Span::styled(chunk, style),
             ]));
         }
     }
 }
 
-fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Frame<'_>) {
+fn render_actions(
+    state: &PermissionDialogState,
+    content: Rect,
+    frame: &mut Frame<'_>,
+    theme: TuiTheme,
+) {
     let dialog = Rect::new(
         content.x.saturating_sub(3),
         content.y.saturating_sub(2),
@@ -250,8 +263,8 @@ fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Fram
     ActionRow::new(&buttons)
         .focused(focused)
         .spacing(2)
-        .styles(action_styles())
-        .render_with_fallback_style(row_area, frame, ModalTheme::dark(Color::Yellow).text);
+        .styles(action_styles(theme))
+        .render_with_fallback_style(row_area, frame, theme.modal_theme().text);
     for (index, area) in areas.into_iter().enumerate() {
         frame.push_hit(
             HitRegion::new(format!("permission-action:{index}"), area)
@@ -290,30 +303,18 @@ fn action_buttons(has_batch: bool, can_remember_policy: bool) -> Vec<ActionButto
     }
 }
 
-const fn action_styles() -> ActionRowStyles {
+const fn action_styles(theme: TuiTheme) -> ActionRowStyles {
     ActionRowStyles {
-        normal: Style::new().fg(Color::BrightWhite),
-        focused: Style::new()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        hovered: Style::new()
-            .fg(Color::BrightWhite)
-            .add_modifier(Modifier::UNDERLINE),
-        pressed: Style::new()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        disabled: Style::new().fg(Color::BrightBlack),
+        normal: theme.text,
+        focused: theme.selection.add_modifier(Modifier::BOLD),
+        hovered: theme.text.add_modifier(Modifier::UNDERLINE),
+        pressed: theme.selection.add_modifier(Modifier::BOLD),
+        disabled: theme.muted,
     }
 }
 
 fn format_label(label: &str) -> String {
     format!("{label:>5}:")
-}
-
-const fn muted_style() -> Style {
-    Style::new().fg(Color::BrightBlack)
 }
 
 #[cfg(test)]
@@ -327,10 +328,14 @@ mod tests {
 
     use super::{dialog_area, render_permission_dialog};
     use crate::permission_dialog::PermissionDialogState;
+    use crate::render::TuiTheme;
 
     #[test]
     fn dialog_area_scales_beyond_old_tiny_modal() {
-        let area = dialog_area(bmux_tui::geometry::Rect::new(0, 0, 140, 50));
+        let area = dialog_area(
+            bmux_tui::geometry::Rect::new(0, 0, 140, 50),
+            TuiTheme::for_agent("test", None, false),
+        );
 
         assert!(area.width > 76);
         assert!(area.height > 14);
@@ -360,7 +365,7 @@ mod tests {
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 120, 35));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
 
-        render_permission_dialog(&state, &mut frame);
+        render_permission_dialog(&state, &mut frame, TuiTheme::for_agent("test", None, false));
 
         let action_hits = frame
             .hits()
@@ -405,7 +410,7 @@ mod tests {
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
 
-        render_permission_dialog(&state, &mut frame);
+        render_permission_dialog(&state, &mut frame, TuiTheme::for_agent("test", None, false));
         let rendered = (0..30)
             .filter_map(|row| frame.buffer().row_symbols(row))
             .collect::<Vec<_>>()
@@ -439,7 +444,7 @@ mod tests {
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
 
-        render_permission_dialog(&state, &mut frame);
+        render_permission_dialog(&state, &mut frame, TuiTheme::for_agent("test", None, false));
         let rendered = (0..30)
             .filter_map(|row| frame.buffer().row_symbols(row))
             .collect::<Vec<_>>()

@@ -6,8 +6,8 @@ use bcode_model::{
     ModelInfo, ModelPricingInfo, ModelTokenPrice, ModelVisibility, ModelVisibilitySource,
 };
 use bmux_tui::list::{ListItem, ListState};
-use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::prelude::{Line, Span};
+use bmux_tui::style::Modifier;
 use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
@@ -93,26 +93,26 @@ impl ModelPickerApp {
 
     /// Return an aligned header line for the visible model columns.
     #[must_use]
-    pub fn header_line(&self, width: u16) -> Line {
+    pub fn header_line(&self, width: u16, theme: super::render::TuiTheme) -> Line {
         let rows = self.visible_rows();
         let widths = ModelPickerColumnWidths::from_rows(&rows, usable_list_width(width));
         Line::from_spans(vec![Span::styled(
             format_header(&widths, self.sort_key, self.sort_direction),
-            Style::new()
-                .fg(Color::BrightBlack)
-                .add_modifier(Modifier::BOLD),
+            theme.muted.add_modifier(Modifier::BOLD),
         )])
     }
 
     /// Return visible list items.
     #[must_use]
-    pub fn list_items(&self, width: u16) -> Vec<ListItem> {
+    pub fn list_items(&self, width: u16, theme: super::render::TuiTheme) -> Vec<ListItem> {
         if self.list.indices().is_empty() {
-            return vec![empty_item("No matching models.")];
+            return vec![empty_item("No matching models.", theme)];
         }
         let rows = self.visible_rows();
         let widths = ModelPickerColumnWidths::from_rows(&rows, usable_list_width(width));
-        rows.iter().map(|row| model_item(row, &widths)).collect()
+        rows.iter()
+            .map(|row| model_item(row, &widths, theme))
+            .collect()
     }
 
     /// Return current interaction mode.
@@ -397,47 +397,42 @@ fn usable_list_width(width: u16) -> usize {
     usize::from(width).saturating_sub(LIST_HIGHLIGHT_WIDTH)
 }
 
-fn model_item(row: &ModelPickerRow, widths: &ModelPickerColumnWidths) -> ListItem {
+fn model_item(
+    row: &ModelPickerRow,
+    widths: &ModelPickerColumnWidths,
+    theme: super::render::TuiTheme,
+) -> ListItem {
     ListItem::new(Line::from_spans(vec![
-        Span::styled(row.marker, Style::new().fg(Color::BrightBlack)),
+        Span::styled(row.marker, theme.muted),
         Span::raw(CELL_GAP),
         Span::styled(
             pad_right(
                 &truncate_ascii(&row.model_id, widths.model_id),
                 widths.model_id,
             ),
-            Style::new().add_modifier(Modifier::BOLD),
+            theme.text.add_modifier(Modifier::BOLD),
         ),
         Span::raw(CELL_GAP),
-        Span::styled(
-            pad_left(&row.context, widths.context),
-            Style::new().fg(Color::Cyan),
-        ),
+        Span::styled(pad_left(&row.context, widths.context), theme.border),
         Span::raw(CELL_GAP),
-        Span::styled(
-            pad_left(&row.max_output, widths.max_output),
-            Style::new().fg(Color::Cyan),
-        ),
+        Span::styled(pad_left(&row.max_output, widths.max_output), theme.border),
         Span::raw(CELL_GAP),
         Span::styled(
             pad_right(&row.input_price, widths.input_price),
-            Style::new().fg(Color::Cyan),
+            theme.border,
         ),
         Span::raw(CELL_GAP),
         Span::styled(
             pad_right(&row.cached_price, widths.cached_price),
-            Style::new().fg(Color::Cyan),
+            theme.border,
         ),
         Span::raw(CELL_GAP),
         Span::styled(
             pad_right(&row.output_price, widths.output_price),
-            Style::new().fg(Color::Cyan),
+            theme.border,
         ),
         Span::raw(CELL_GAP),
-        Span::styled(
-            pad_right(&row.state, widths.state),
-            Style::new().fg(Color::Yellow),
-        ),
+        Span::styled(pad_right(&row.state, widths.state), theme.muted),
     ]))
 }
 
@@ -763,10 +758,10 @@ fn model_matches(model: &ModelInfo, query: &str) -> bool {
             .is_some_and(|summary| summary.to_ascii_lowercase().contains(query))
 }
 
-fn empty_item(message: &str) -> ListItem {
+fn empty_item(message: &str, theme: super::render::TuiTheme) -> ListItem {
     ListItem::new(Line::from_spans(vec![Span::styled(
         message.to_owned(),
-        Style::new().fg(Color::BrightBlack),
+        theme.muted,
     )]))
 }
 

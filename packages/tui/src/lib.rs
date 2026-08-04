@@ -88,7 +88,9 @@ pub(crate) mod temporal;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod text_input_flow;
-pub(crate) mod theme;
+pub mod theme;
+mod theme_picker;
+pub(crate) mod theme_picker_render;
 mod thinking_dialog;
 pub(crate) mod thinking_dialog_render;
 pub(crate) mod thinking_flow;
@@ -251,7 +253,7 @@ pub async fn run_onboarding() -> Result<(), TuiError> {
             })?,
             helpers::terminal_area()?,
         );
-        run_onboarding_runtime(&mut terminal, store, shell).await
+        run_onboarding_runtime(&mut terminal, store, shell, &config.tui).await
     };
     let _writer = guard.leave()?;
     result
@@ -261,9 +263,11 @@ async fn run_onboarding_runtime<W: io::Write>(
     terminal: &mut Terminal<&mut W>,
     store: bcode_settings::SettingsStore,
     shell: onboarding::OnboardingShell,
+    tui_config: &bcode_config::TuiConfig,
 ) -> Result<(), TuiError> {
     let area = terminal.area();
-    let program = onboarding_program::OnboardingProgram::new(store, shell, area)?;
+    let theme = theme::resolve_configured_theme(tui_config, std::path::Path::new("."));
+    let program = onboarding_program::OnboardingProgram::new(store, shell, &theme, area)?;
     let presenter = onboarding_program::OnboardingPresenter::new(terminal);
     let (runtime, handle) = bmux_tui_runtime::Runtime::new(
         program,

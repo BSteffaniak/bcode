@@ -2,7 +2,7 @@
 
 use bmux_tui::frame::Frame;
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 
 use super::picker_render::{
     picker_list_area, render_picker_chrome, render_picker_list, render_picker_status,
@@ -24,7 +24,7 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>, theme: T
         return;
     };
 
-    let bottom_y = render_picker_status(inner, app.status(), status_style(app.mode()), frame);
+    let bottom_y = render_picker_status(inner, app.status(), theme.muted, frame, theme);
     if let Some((session, warnings)) = app.last_import()
         && !warnings.is_empty()
     {
@@ -38,10 +38,7 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>, theme: T
                     inner.width.saturating_sub(2),
                     1,
                 ),
-                &Line::from_spans(vec![Span::styled(
-                    warning_text,
-                    Style::new().fg(Color::Yellow),
-                )]),
+                &Line::from_spans(vec![Span::styled(warning_text, theme.muted)]),
                 Style::new(),
             );
         }
@@ -50,7 +47,7 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>, theme: T
         return;
     };
     let items = app.list_items();
-    render_picker_list(&items, app.list_state_mut(), list_area, frame);
+    render_picker_list(&items, app.list_state_mut(), list_area, frame, theme);
 }
 
 const fn input_placeholder(mode: SessionPickerMode) -> &'static str {
@@ -106,13 +103,4 @@ fn format_import_warnings(
         "Imported [{source}] with {} warnings: {details}{suffix}. Esc dismisses.",
         warnings.len()
     )
-}
-
-const fn status_style(mode: SessionPickerMode) -> Style {
-    match mode {
-        SessionPickerMode::DeleteConfirm => Style::new().fg(Color::Red),
-        SessionPickerMode::Filter
-        | SessionPickerMode::Rename
-        | SessionPickerMode::TranscriptSearch => Style::new().fg(Color::BrightBlack),
-    }
 }

@@ -604,10 +604,13 @@ impl OnboardingShell {
         &self,
         area: bmux_tui::geometry::Rect,
         frame: &mut bmux_tui::frame::Frame<'_>,
+        theme: &super::theme::PresentedTheme,
     ) {
         let spots = self.board_spots();
         let connections = onboarding_board_connections();
-        SetupBoard::new(&spots, &connections).render(area, &self.board_state, frame);
+        SetupBoard::new(&spots, &connections)
+            .theme(theme)
+            .render(area, &self.board_state, frame);
     }
 
     /// Handle board map input.

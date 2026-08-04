@@ -334,6 +334,7 @@ pub struct BmuxApp {
     target_theme: ResolvedTheme,
     presented_theme: PresentedTheme,
     theme_transition: ThemeTransitionState,
+    theme_preview_id: Option<String>,
     thinking_label: String,
     reasoning_support: ReasoningSupport,
     reasoning_display_mode: bcode_config::TuiThinkingMode,
@@ -539,6 +540,7 @@ impl BmuxApp {
             target_theme: initial_theme,
             presented_theme: initial_theme.into(),
             theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
+            theme_preview_id: None,
             thinking_label: "reasoning output shown · unsupported".to_owned(),
             reasoning_support: ReasoningSupport::Unsupported,
             reasoning_display_mode: bcode_config::TuiThinkingMode::All,
@@ -1193,11 +1195,86 @@ impl BmuxApp {
         let markdown_changed = self.tui_config.markdown != config.markdown;
         self.apply_thinking_config(config.thinking);
         self.tui_config = config;
+        self.theme_preview_id = None;
         if markdown_changed {
             self.markdown_presentation_revision =
                 self.markdown_presentation_revision.saturating_add(1);
         }
         self.sync_theme_target(Instant::now());
+    }
+
+    /// Refresh the active configured or preview theme atomically from current inputs.
+    ///
+    /// Returns the active selection id when it resolved. The existing target
+    /// remains untouched when discovery or resolution is invalid, providing
+    /// the runtime's last-valid-theme guarantee.
+    pub fn reload_theme_if_valid(&mut self) -> Option<&str> {
+        let theme_id = self
+            .theme_preview_id
+            .as_deref()
+            .unwrap_or(&self.tui_config.theme.name)
+            .to_owned();
+        let resolved = super::theme::resolve_theme_selection(self, &theme_id)?;
+        let configured_theme_accent = super::theme::resolved_accent(Some(&resolved));
+        let accent = super::theme::resolve_app_accent(self, configured_theme_accent);
+        let target = super::theme::resolved_definition_theme(Some(&resolved), accent);
+        if target == self.target_theme {
+            return Some(
+                self.theme_preview_id
+                    .as_deref()
+                    .unwrap_or(&self.tui_config.theme.name),
+            );
+        }
+        self.target_theme = target;
+        self.theme_transition
+            .set_target(target.accent, &self.tui_config.theme, Instant::now());
+        self.update_theme_animation(Instant::now());
+        Some(
+            self.theme_preview_id
+                .as_deref()
+                .unwrap_or(&self.tui_config.theme.name),
+        )
+    }
+
+    /// Preview one discovered theme for this app without mutating durable configuration.
+    ///
+    /// Returns `false` when the id is unknown or cannot resolve through the
+    /// bounded bundled/user/project/explicit catalog.
+    pub fn preview_theme(&mut self, theme_id: &str) -> bool {
+        let Some(resolved) = super::theme::resolve_theme_selection(self, theme_id) else {
+            return false;
+        };
+        let accent = resolved
+            .style("border.focused")
+            .and_then(|style| style.fg)
+            .or_else(|| resolved.color("accent"))
+            .unwrap_or(super::theme::PENDING_AGENT_METADATA_ACCENT);
+        let target = super::theme::resolved_definition_theme(Some(&resolved), accent);
+        self.theme_preview_id = Some(theme_id.to_owned());
+        self.target_theme = target;
+        self.theme_transition
+            .set_target(target.accent, &self.tui_config.theme, Instant::now());
+        self.update_theme_animation(Instant::now());
+        true
+    }
+
+    /// Restore the configured theme after a non-persistent preview.
+    pub fn cancel_theme_preview(&mut self) {
+        self.theme_preview_id = None;
+        self.sync_theme_target(Instant::now());
+    }
+
+    /// Apply one discovered theme to the in-memory configuration.
+    ///
+    /// Durable config persistence remains owned by the normal config/settings path.
+    pub fn apply_theme(&mut self, theme_id: &str) -> bool {
+        if !self.preview_theme(theme_id) {
+            return false;
+        }
+        theme_id.clone_into(&mut self.tui_config.theme.name);
+        self.theme_preview_id = None;
+        self.sync_theme_target(Instant::now());
+        true
     }
 
     /// Apply renderer-neutral presentation configuration.
@@ -4506,6 +4583,159 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 mod tests {
     use super::*;
     use crate::transcript::TranscriptItemKind;
+
+    #[test]
+    fn invalidated_preview_can_restore_configured_theme() {
+        let temp = tempfile::tempdir().expect("theme root");
+        let path = temp.path().join("preview.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\nid = \"preview\"\n[palette]\naccent = \"#112233\"\n",
+        )
+        .expect("preview theme");
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let mut config = app.tui_config().clone();
+        config.theme.paths = vec![temp.path().to_path_buf()];
+        app.apply_tui_config(config);
+        let configured = app.presented_theme();
+
+        assert!(app.preview_theme("preview"));
+        assert_ne!(app.presented_theme(), configured);
+        std::fs::remove_file(path).expect("preview disappears");
+        assert!(app.reload_theme_if_valid().is_none());
+
+        app.cancel_theme_preview();
+        assert_eq!(app.presented_theme().fingerprint, configured.fingerprint);
+    }
+
+    #[test]
+    fn theme_reload_retains_last_valid_then_applies_next_valid_revision() {
+        let temp = tempfile::tempdir().expect("theme root");
+        let path = temp.path().join("live.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\nid = \"live\"\n[palette]\naccent = \"#112233\"\n[styles.\"text.primary\"]\nfg = \"#112233\"\n",
+        )
+        .expect("initial theme");
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let mut config = app.tui_config().clone();
+        config.theme.name = "live".to_owned();
+        config.theme.paths = vec![temp.path().to_path_buf()];
+        app.apply_tui_config(config);
+        let valid = app.presented_theme();
+
+        std::fs::write(&path, "not = [valid").expect("invalid transient edit");
+        assert!(app.reload_theme_if_valid().is_none());
+        assert_eq!(app.presented_theme(), valid);
+
+        std::fs::write(
+            &path,
+            "schema_version = 1\nid = \"live\"\n[palette]\naccent = \"#445566\"\n[styles.\"text.primary\"]\nfg = \"#445566\"\n",
+        )
+        .expect("next valid theme");
+        assert_eq!(app.reload_theme_if_valid(), Some("live"));
+        assert_ne!(app.presented_theme().fingerprint, valid.fingerprint);
+    }
+
+    #[test]
+    fn catalog_view_preserves_rejected_candidate_diagnostics() {
+        let temp = tempfile::tempdir().expect("theme root");
+        std::fs::write(temp.path().join("broken.toml"), "not = [valid").expect("broken theme");
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let mut config = app.tui_config().clone();
+        config.theme.paths = vec![temp.path().to_path_buf()];
+        app.apply_tui_config(config);
+
+        let catalog = crate::theme::catalog_view(&app);
+
+        assert!(!catalog.entries.is_empty());
+        assert_eq!(catalog.diagnostics.len(), 1);
+        assert!(catalog.diagnostics[0].contains("broken.toml"));
+    }
+
+    #[test]
+    fn theme_catalog_entries_include_external_origin_and_current_selection() {
+        let temp = tempfile::tempdir().expect("theme root");
+        std::fs::write(
+            temp.path().join("custom.toml"),
+            "schema_version = 1\nid = \"custom\"\ndisplay_name = \"Custom\"\n[palette]\naccent = \"#112233\"\n",
+        )
+        .expect("external theme");
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let mut config = app.tui_config().clone();
+        config.theme.name = "custom".to_owned();
+        config.theme.paths = vec![temp.path().to_path_buf()];
+        app.apply_tui_config(config);
+
+        let entries = crate::theme::catalog_view(&app).entries;
+        let custom = entries
+            .iter()
+            .find(|entry| entry.id == "custom")
+            .expect("custom catalog entry");
+
+        assert_eq!(custom.source, "explicit");
+        assert!(custom.selected);
+        assert_eq!(custom.display_name, "Custom");
+    }
+
+    #[test]
+    fn theme_preview_apply_and_cancel_are_in_memory_transitions() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let configured = app.tui_config().theme.name.clone();
+        let initial = app.presented_theme();
+
+        assert!(app.preview_theme("bcode-dark"));
+        assert_eq!(app.tui_config().theme.name, configured);
+        assert_ne!(app.presented_theme(), initial);
+
+        app.cancel_theme_preview();
+        assert_eq!(app.presented_theme(), initial);
+        assert_eq!(app.tui_config().theme.name, configured);
+
+        assert!(app.apply_theme("bcode-light"));
+        assert_eq!(app.tui_config().theme.name, "bcode-light");
+        assert!(!app.preview_theme("does-not-exist"));
+    }
+
+    #[test]
+    fn stream_and_tool_header_rendering_use_active_semantic_theme() {
+        let source = include_str!("render.rs");
+        let stream_start = source.find("if let Some(integrity)").expect("stream block");
+        let stream_end = source[stream_start..]
+            .find("match item.kind()")
+            .map(|offset| stream_start + offset)
+            .expect("stream block end");
+        let tool_start = source
+            .find("fn push_tool_block_header")
+            .expect("tool header");
+        let tool_end = source[tool_start..]
+            .find("fn tool_block_title_with_timing")
+            .map(|offset| tool_start + offset)
+            .expect("tool header end");
+
+        for block in [
+            &source[stream_start..stream_end],
+            &source[tool_start..tool_end],
+        ] {
+            assert!(block.contains("semantic_theme()"));
+            assert!(!block.contains("Color::"));
+        }
+    }
+
+    #[test]
+    fn picker_render_paths_do_not_reintroduce_fixed_palette_colors() {
+        for source in [
+            include_str!("picker_render.rs"),
+            include_str!("model_picker_render.rs"),
+            include_str!("provider_picker_render.rs"),
+            include_str!("session_picker_render.rs"),
+            include_str!("skill_picker_render.rs"),
+            include_str!("worktree_picker_render.rs"),
+        ] {
+            assert!(!source.contains("Color::"));
+            assert!(!source.contains("PICKER_BG"));
+        }
+    }
 
     #[test]
     fn active_interaction_layout_marks_only_previous_and_next_entries_dirty() {

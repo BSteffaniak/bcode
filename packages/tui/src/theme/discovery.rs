@@ -1,6 +1,8 @@
 //! Bounded external theme discovery.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use super::definition::{MAX_THEME_FILE_BYTES, ThemeCatalog, ThemeError, parse_theme_definition};
@@ -11,7 +13,7 @@ pub const MAX_DISCOVERED_THEME_FILES: usize = 256;
 pub const MAX_DISCOVERED_THEME_BYTES: usize = 4 * 1024 * 1024;
 
 /// Origin and precedence class for a discovered theme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ThemeSourceKind {
     /// User configuration directory.
     User,
@@ -50,13 +52,22 @@ pub struct ThemeDiscoveryDiagnostic {
     pub message: String,
 }
 
+/// Accepted origin for one external theme definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeExternalSource {
+    /// Canonical accepted source path.
+    pub path: PathBuf,
+    /// Discovery precedence class that accepted the source.
+    pub kind: ThemeSourceKind,
+}
+
 /// Result of one deterministic theme discovery pass.
 #[derive(Debug, Clone)]
 pub struct DiscoveredThemes {
     /// Bundled and valid external definitions in final precedence order.
     pub catalog: ThemeCatalog,
-    /// Accepted external source path keyed by final stable theme id.
-    pub sources: BTreeMap<String, PathBuf>,
+    /// Accepted external source keyed by final stable theme id.
+    pub sources: BTreeMap<String, ThemeExternalSource>,
     /// Invalid or unsafe candidates that were skipped.
     pub diagnostics: Vec<ThemeDiscoveryDiagnostic>,
 }
@@ -85,6 +96,51 @@ pub fn default_theme_roots(
             .map(|path| ThemeDiscoveryRoot::new(path, ThemeSourceKind::Explicit)),
     );
     roots
+}
+
+/// Stable bounded signature of the current authorized theme inputs.
+///
+/// Missing roots are represented explicitly. Directory roots are shallow and
+/// include only direct `.toml` candidates, matching discovery semantics. This
+/// routine performs only the same bounded, confined reads as discovery and
+/// never parses or mutates theme files.
+#[must_use]
+pub fn theme_input_signature(roots: &[ThemeDiscoveryRoot]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut candidates = Vec::new();
+    let mut diagnostics = Vec::new();
+    for root in roots {
+        root.kind.hash(&mut hasher);
+        root.path.hash(&mut hasher);
+        root.path.exists().hash(&mut hasher);
+        collect_root_candidates(root, &mut candidates, &mut diagnostics);
+    }
+    candidates.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    candidates.truncate(MAX_DISCOVERED_THEME_FILES);
+    let mut aggregate_bytes = 0_usize;
+    for candidate in candidates {
+        candidate.kind.hash(&mut hasher);
+        candidate.path.hash(&mut hasher);
+        let Ok(bytes) = std::fs::read(&candidate.path) else {
+            continue;
+        };
+        if bytes.len() > MAX_THEME_FILE_BYTES
+            || aggregate_bytes.saturating_add(bytes.len()) > MAX_DISCOVERED_THEME_BYTES
+        {
+            continue;
+        }
+        aggregate_bytes = aggregate_bytes.saturating_add(bytes.len());
+        bytes.hash(&mut hasher);
+    }
+    for diagnostic in diagnostics {
+        diagnostic.path.hash(&mut hasher);
+        diagnostic.message.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Discover valid theme definitions from confined roots.
@@ -171,7 +227,13 @@ pub fn discover_themes(roots: &[ThemeDiscoveryRoot]) -> Result<DiscoveredThemes,
             Ok(definition) => {
                 let id = definition.id().to_owned();
                 catalog.insert(definition);
-                sources.insert(id, candidate.path);
+                sources.insert(
+                    id,
+                    ThemeExternalSource {
+                        path: candidate.path,
+                        kind: candidate.kind,
+                    },
+                );
             }
             Err(error) => push_diagnostic(&mut diagnostics, &candidate.path, error.to_string()),
         }
@@ -294,6 +356,26 @@ mod tests {
     }
 
     #[test]
+    fn theme_input_signature_changes_for_file_revision_and_disappearance() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("live.toml");
+        fs::write(&path, theme("live", "#112233")).expect("theme");
+        let roots = [ThemeDiscoveryRoot::new(
+            temp.path(),
+            ThemeSourceKind::Explicit,
+        )];
+        let initial = super::theme_input_signature(&roots);
+
+        fs::write(&path, theme("live", "#445566")).expect("revision");
+        let revised = super::theme_input_signature(&roots);
+        fs::remove_file(path).expect("remove theme");
+        let missing = super::theme_input_signature(&roots);
+
+        assert_ne!(initial, revised);
+        assert_ne!(revised, missing);
+    }
+
+    #[test]
     fn default_roots_have_expected_precedence() {
         let roots = default_theme_roots(
             std::path::Path::new("/user/bcode"),
@@ -334,9 +416,11 @@ mod tests {
         assert_eq!(discovered.diagnostics.len(), 1);
         assert!(
             discovered.sources["same"]
+                .path
                 .parent()
                 .is_some_and(|parent| parent.ends_with("project"))
         );
+        assert_eq!(discovered.sources["same"].kind, ThemeSourceKind::Project);
     }
 
     #[cfg(unix)]

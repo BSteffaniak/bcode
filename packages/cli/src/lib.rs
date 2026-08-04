@@ -113,6 +113,10 @@ pub enum CliError {
     PluginCliComposition(#[from] plugin_cli::CompositionError),
     #[error("plugin CLI command failed: {0}")]
     PluginCli(String),
+    #[error("theme command failed: {0}")]
+    Theme(String),
+    #[error("theme filesystem error: {0}")]
+    ThemeIo(std::io::Error),
     #[error("{0}")]
     AuthPrimeFailed(String),
 }
@@ -287,6 +291,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             allow_non_loopback,
         } => handle_web_command(bind, port, allow_non_loopback).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
+        Commands::Theme { command } => handle_theme_command(command)?,
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Auth { command } => handle_auth_command(command).await?,
         Commands::Login { command } => handle_login_command(command).await?,
@@ -294,6 +299,69 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
         Commands::Workflow { command } => handle_workflow_command(Box::new(command)).await?,
         command => Box::pin(handle_session_io_command(command)).await?,
+    }
+    Ok(())
+}
+
+fn handle_theme_command(command: ThemeCommand) -> Result<(), CliError> {
+    use bcode_tui::theme::definition::{ThemeCatalog, ThemeSelection, parse_theme_definition};
+
+    match command {
+        ThemeCommand::List => {
+            let catalog =
+                ThemeCatalog::bundled().map_err(|error| CliError::Theme(error.to_string()))?;
+            for definition in catalog.definitions() {
+                let variants = match (
+                    definition.has_dark_variant(),
+                    definition.has_light_variant(),
+                ) {
+                    (true, true) => "dark,light",
+                    (true, false) => "dark",
+                    (false, true) => "light",
+                    (false, false) => "-",
+                };
+                println!(
+                    "{}\t{}\tbundled\t{}",
+                    definition.id(),
+                    definition.display_name(),
+                    variants
+                );
+            }
+        }
+        ThemeCommand::Validate { path } => {
+            let source = std::fs::read_to_string(&path).map_err(CliError::ThemeIo)?;
+            let definition = parse_theme_definition(path.display().to_string(), &source)
+                .map_err(|error| CliError::Theme(error.to_string()))?;
+            let id = definition.id().to_owned();
+            let mut catalog =
+                ThemeCatalog::bundled().map_err(|error| CliError::Theme(error.to_string()))?;
+            catalog.insert(definition);
+            let resolved = catalog
+                .resolve(&ThemeSelection::new(&id))
+                .map_err(|error| CliError::Theme(error.to_string()))?;
+            println!("valid\t{id}\t{}", resolved.fingerprint);
+        }
+        ThemeCommand::Copy {
+            builtin,
+            path,
+            force,
+        } => {
+            let source = ThemeCatalog::bundled_source(&builtin)
+                .ok_or_else(|| CliError::Theme(format!("unknown bundled theme {builtin:?}")))?;
+            if path.exists() && !force {
+                return Err(CliError::Theme(format!(
+                    "destination already exists: {} (use --force to replace)",
+                    path.display()
+                )));
+            }
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).map_err(CliError::ThemeIo)?;
+            }
+            std::fs::write(&path, source).map_err(CliError::ThemeIo)?;
+            println!("{}", path.display());
+        }
     }
     Ok(())
 }
@@ -1250,6 +1318,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Server { .. }
         | Commands::Session { .. }
         | Commands::Plugin { .. }
+        | Commands::Theme { .. }
         | Commands::Model { .. }
         | Commands::Auth { .. }
         | Commands::Login { .. }
@@ -1495,6 +1564,10 @@ enum Commands {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    Theme {
+        #[command(subcommand)]
+        command: ThemeCommand,
+    },
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -1541,6 +1614,27 @@ impl Default for Commands {
     fn default() -> Self {
         Self::Tui { session_id: None }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum ThemeCommand {
+    /// List bundled themes in stable id order.
+    List,
+    /// Validate one theme file using the runtime parser and resolver.
+    Validate {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+    /// Copy one bundled theme definition to an editable file.
+    Copy {
+        #[arg(value_name = "BUILTIN")]
+        builtin: String,
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// Replace an existing destination file.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -11987,6 +12081,67 @@ mod session_diagnosis_tests {
         assert_eq!(
             session_diagnosis_classification(Ok(&current), "projection stale", None, false),
             SessionDiagnosisClassification::RepairRequired
+        );
+    }
+}
+
+#[cfg(test)]
+mod theme_command_tests {
+    use super::*;
+
+    #[test]
+    fn theme_subcommands_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["bcode", "theme", "list"])
+                .expect("theme list parses")
+                .command,
+            Some(Commands::Theme {
+                command: ThemeCommand::List
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["bcode", "theme", "validate", "theme.toml"])
+                .expect("theme validate parses")
+                .command,
+            Some(Commands::Theme {
+                command: ThemeCommand::Validate { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "bcode",
+                "theme",
+                "copy",
+                "terminal-native",
+                "theme.toml",
+                "--force"
+            ])
+            .expect("theme copy parses")
+            .command,
+            Some(Commands::Theme {
+                command: ThemeCommand::Copy { force: true, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn theme_validate_and_copy_use_runtime_definitions() {
+        let root = tempfile::tempdir().expect("theme tempdir");
+        let copied = root.path().join("nested/theme.toml");
+        handle_theme_command(ThemeCommand::Copy {
+            builtin: "terminal-native".to_owned(),
+            path: copied.clone(),
+            force: false,
+        })
+        .expect("copy bundled theme");
+        handle_theme_command(ThemeCommand::Validate {
+            path: copied.clone(),
+        })
+        .expect("validate copied theme");
+        assert_eq!(
+            std::fs::read_to_string(copied).expect("copied theme"),
+            bcode_tui::theme::definition::ThemeCatalog::bundled_source("terminal-native")
+                .expect("bundled source")
         );
     }
 }

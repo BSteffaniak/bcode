@@ -3,8 +3,8 @@
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
-use bmux_tui::prelude::{Line, Span, Style, Widget};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::prelude::{Line, Span, Widget};
+use bmux_tui::style::Modifier;
 
 use super::render::TuiTheme;
 use super::slash_palette::{SlashItem, SlashPalette};
@@ -26,11 +26,12 @@ pub fn render_palette(
         return;
     };
 
-    frame.fill(area, " ", Style::new());
+    frame.fill(area, " ", theme.text);
     let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(theme.accent)))
+        .border(Border::single().style(theme.border))
         .title(" Slash Commands  tab/enter accept · ↑/↓ select · esc hide ")
-        .padding(Insets::new(0, 1, 0, 1));
+        .padding(Insets::new(0, 1, 0, 1))
+        .background(theme.text);
     panel.render(area, frame);
 
     let inner = panel.inner_area(area);
@@ -107,17 +108,11 @@ pub const fn composer_panel_area(content_area: Rect) -> Rect {
 
 fn slash_item_line(item: &SlashItem, selected: bool, width: u16, theme: TuiTheme) -> Line {
     let base = if selected {
-        Style::new()
-            .fg(Color::White)
-            .bg(Color::Rgb(38, 52, 64))
-            .add_modifier(Modifier::BOLD)
+        theme.selection.add_modifier(Modifier::BOLD)
     } else {
-        Style::new()
+        theme.text
     };
-    let badge_style = Style::new()
-        .fg(Color::Black)
-        .bg(theme.accent)
-        .add_modifier(Modifier::BOLD);
+    let badge_style = theme.border.add_modifier(Modifier::BOLD);
     let available = usize::from(width.saturating_sub(15));
     Line::from_spans(vec![
         Span::styled(if selected { "› " } else { "  " }, base),
@@ -130,7 +125,7 @@ fn slash_item_line(item: &SlashItem, selected: bool, width: u16, theme: TuiTheme
         Span::styled("  ", base),
         Span::styled(
             truncate_end(item.description(), available.saturating_sub(30)),
-            base.fg(Color::BrightBlack),
+            if selected { base } else { theme.muted },
         ),
     ])
 }

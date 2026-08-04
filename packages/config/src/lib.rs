@@ -4307,6 +4307,33 @@ pub fn set_bedrock_model_profile(
     })
 }
 
+/// Persist a TUI theme selection in the writable user configuration layer.
+///
+/// The selected base, ordered overlays, and variant are written together so a
+/// renderer never observes a partially updated durable selection.
+///
+/// # Errors
+///
+/// Returns an error when the writable config cannot be read, updated, or
+/// written, or when the selected base or an overlay id is empty.
+pub fn set_tui_theme_selection(
+    name: &str,
+    overlays: &[String],
+    variant: TuiThemeVariant,
+) -> Result<PathBuf, ConfigError> {
+    if name.trim().is_empty() || overlays.iter().any(|overlay| overlay.trim().is_empty()) {
+        return Err(ConfigError::Composition {
+            message: "theme names and overlay ids must not be empty".to_owned(),
+        });
+    }
+    update_writable_config(|config| {
+        name.clone_into(&mut config.tui.theme.name);
+        overlays.clone_into(&mut config.tui.theme.overlays);
+        config.tui.theme.variant = variant;
+        Ok(())
+    })
+}
+
 fn update_writable_config(
     update: impl FnOnce(&mut BcodeConfig) -> Result<(), ConfigError>,
 ) -> Result<PathBuf, ConfigError> {
@@ -6682,17 +6709,17 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BcodeConfig, CompactionBackend, CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot,
-        ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc, InvariantGuidanceMode,
-        InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc, TuiAccentTransitionCurve,
-        TuiAgentAccentPolicy, TuiInteractionOffscreenFocus, TuiInteractionPlacement,
-        TuiMouseConfig, TuiRenderConfig, TuiThemeVariant, TuiVisualAdapterConfig,
-        default_config_paths_from, default_permissions_state_path, load_config_from_paths,
-        load_config_from_paths_with_overrides, load_permissions_state_from,
+        BCODE_CONFIG_ENV, BcodeConfig, CompactionBackend, CompactionMode, ConfigDocSchema,
+        ConfigEnvironmentSnapshot, ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc,
+        InvariantGuidanceMode, InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc,
+        TuiAccentTransitionCurve, TuiAgentAccentPolicy, TuiInteractionOffscreenFocus,
+        TuiInteractionPlacement, TuiMouseConfig, TuiRenderConfig, TuiThemeVariant,
+        TuiVisualAdapterConfig, default_config_paths_from, default_permissions_state_path,
+        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
         register_runtime_auth_subscription, set_openai_compatible_sshenv_auth_method,
-        upsert_agent_permission_rule, validate_config,
+        set_tui_theme_selection, upsert_agent_permission_rule, validate_config,
     };
     use bcode_agent_policy_models::Action;
     use bcode_plugin::{PluginSelection, PluginSelectionMode};
@@ -7159,6 +7186,32 @@ enabled = false
             .expect("overridden config should load");
 
         assert_eq!(config.client.request_timeout_secs, 60);
+    }
+
+    #[test]
+    fn tui_theme_selection_write_is_atomic_and_round_trips() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("bcode.toml");
+        let previous = std::env::var_os(BCODE_CONFIG_ENV);
+        // SAFETY: tests that mutate process configuration are serialized by ENV_LOCK.
+        unsafe { std::env::set_var(BCODE_CONFIG_ENV, &path) };
+
+        let written = set_tui_theme_selection(
+            "bcode-light",
+            &["terminal-native-structured".to_owned()],
+            TuiThemeVariant::Light,
+        )
+        .expect("theme selection should write");
+        let loaded = super::read_config(&written).expect("written config should load");
+
+        assert_eq!(loaded.tui.theme.name, "bcode-light");
+        assert_eq!(
+            loaded.tui.theme.overlays,
+            vec!["terminal-native-structured"]
+        );
+        assert_eq!(loaded.tui.theme.variant, TuiThemeVariant::Light);
+        restore_env(BCODE_CONFIG_ENV, previous);
     }
 
     #[test]

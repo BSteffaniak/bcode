@@ -15,7 +15,9 @@ paths = []
 agent_accent = "agent_with_theme_fallback"
 ```
 
-`variant` accepts `auto`, `dark`, or `light`. `paths` may add explicitly authorized theme files or directories. Bcode canonicalizes discovered paths, confines candidates to authorized roots, and bounds candidate count and bytes.
+`auto` uses BMUX-owned bounded terminal capability detection. A trustworthy `COLORFGBG` background index selects the light or dark branch; missing or malformed hints conservatively select dark. Explicit `dark` and `light` always override detection. BMUX also classifies color depth from `NO_COLOR`, `COLORTERM`, and `TERM`; this capability does not change execution semantics or replace terminal-default colors.
+
+`paths` may add explicitly authorized theme files or directories. Bcode canonicalizes discovered paths, confines candidates to authorized roots, and bounds candidate count and bytes.
 
 ## Discovery precedence
 
@@ -84,6 +86,4 @@ A definition may omit roles. Resolution inherits from parent themes and then use
 
 ## Reload and errors
 
-Normal configuration reload resolves a complete theme atomically through the app's existing configuration lifecycle. Presentation fingerprints participate in Markdown, transcript, syntax, source, diff, and plugin visual cache identity. Invalid definitions fail resolution rather than partially changing the active presentation.
-
-External-file watch/debounce UX and interactive preview/apply/cancel remain implementation work; changing a configured theme currently follows the normal configuration reload path.
+External theme roots are polled through a bounded, confined content signature. Valid revisions replace the complete resolved presentation atomically. Invalid or transient revisions retain the last valid configured theme; invalid/disappearing previews close and restore the configured selection. Interactive preview, cancel, and durable apply are available from the theme picker and `/theme` commands.

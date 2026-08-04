@@ -215,6 +215,7 @@ pub struct BcodeRuntimeModel {
     plugin_surface_result: Option<(String, Option<serde_json::Value>)>,
     /// Whether the root program should terminate after its dirty state is committed.
     pub exit_requested: bool,
+    theme_input_signature: u64,
 }
 
 enum RootTimer {
@@ -224,6 +225,7 @@ enum RootTimer {
     DraftSave,
     InteractiveSurfaceRetry,
     TelemetryFlush,
+    ThemeReload,
 }
 
 impl RootTimer {
@@ -235,6 +237,7 @@ impl RootTimer {
             Self::DraftSave => "bcode.draft_save",
             Self::InteractiveSurfaceRetry => "bcode.interactive_surface_retry",
             Self::TelemetryFlush => "bcode.telemetry_flush",
+            Self::ThemeReload => "bcode.theme_reload",
         })
     }
 }
@@ -246,6 +249,7 @@ impl BcodeRuntimeModel {
             settings.launch_working_directory().to_path_buf(),
             chat.app.composer().text().to_owned(),
         );
+        let theme_input_signature = super::theme::active_theme_input_signature(&chat.app);
         Self {
             chat,
             loop_state,
@@ -263,6 +267,7 @@ impl BcodeRuntimeModel {
             exit_after_plugin_surface: false,
             plugin_surface_result: None,
             exit_requested: false,
+            theme_input_signature,
         }
     }
 
@@ -885,6 +890,12 @@ impl BcodeRuntimeModel {
                     }
                     super::chat_loop::ThinkingDialogRootOutcome::Unhandled => {}
                 }
+                if self
+                    .loop_state
+                    .handle_theme_picker_key(&mut self.chat, stroke)
+                {
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if self.loop_state.has_command_palette() {
                     if let Some(action) = self.loop_state.handle_command_palette_key(stroke) {
                         self.apply_root_command_action(action);
@@ -950,6 +961,13 @@ impl BcodeRuntimeModel {
                 }
             }
             Event::Mouse(mouse) => {
+                if self.loop_state.handle_theme_picker_mouse(
+                    &mut self.chat,
+                    mouse,
+                    self.committed_area,
+                ) {
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if self.loop_state.has_command_palette() {
                     if let Some(action) = self
                         .loop_state
@@ -1178,6 +1196,7 @@ impl BcodeRuntimeModel {
                         self.chat.app.set_status("No active session".to_owned());
                     }
                 }
+                "theme.select" => self.loop_state.open_theme_picker(&mut self.chat),
                 "help" => {
                     self.chat.push_presentation_note(
                         "bcode.host",
@@ -1351,6 +1370,10 @@ impl BcodeRuntimeModel {
                 RootTimer::TelemetryFlush,
                 self.loop_state.next_telemetry_flush_at(),
             ),
+            (
+                RootTimer::ThemeReload,
+                Some(now + std::time::Duration::from_millis(750)),
+            ),
         ];
         for (timer, deadline) in deadlines {
             if let Some(deadline) = deadline {
@@ -1399,6 +1422,23 @@ impl BcodeRuntimeModel {
                 }
                 self.loop_state.flush_telemetry_if_due(now);
                 super::invalidation::UiInvalidation::None
+            }
+            "bcode.theme_reload" => {
+                let signature = super::theme::active_theme_input_signature(&self.chat.app);
+                if signature == self.theme_input_signature {
+                    return super::invalidation::UiInvalidation::None;
+                }
+                self.theme_input_signature = signature;
+                if let Some(id) = self.chat.app.reload_theme_if_valid().map(str::to_owned) {
+                    self.chat.app.set_status(format!("theme {id} reloaded"));
+                } else {
+                    self.chat.app.cancel_theme_preview();
+                    self.loop_state.close_theme_picker();
+                    self.chat
+                        .app
+                        .set_status("preview invalidated; restored configured theme".to_owned());
+                }
+                super::invalidation::UiInvalidation::Full
             }
             _ => super::invalidation::UiInvalidation::None,
         }

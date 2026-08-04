@@ -311,6 +311,12 @@ pub fn bundled_host_palette_commands() -> Vec<CommandContribution> {
             "Copy the full current conversation into a new session",
             "session",
         ),
+        CommandContribution::host_palette(
+            "theme.select",
+            "Theme: Select",
+            "List themes and show preview/apply commands",
+            "theme",
+        ),
         CommandContribution::host_palette("help", "Help", "Show TUI help", "help"),
         CommandContribution::host_palette(
             "session.rename",
@@ -357,6 +363,17 @@ pub enum CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_palette_exposes_theme_selection_route() {
+        assert!(bundled_host_palette_commands().iter().any(|contribution| {
+            contribution.id == "theme.select"
+                && contribution.action
+                    == CommandAction::Host {
+                        route: "theme.select".to_owned(),
+                    }
+        }));
+    }
 
     #[test]
     fn append_text_defaults_legacy_payloads_to_plain_text() {
