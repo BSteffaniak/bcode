@@ -438,74 +438,24 @@ async fn stream_bedrock_turn_inner(
             }
             Err(error) => {
                 let error = bedrock_sdk_error(&error);
-                if prompt_cache_rejected(&error) && request_for_model.prompt_cache.mode.is_enabled()
+                match handle_bedrock_turn_error(
+                    error,
+                    request,
+                    request_for_model,
+                    model_id,
+                    &selection,
+                    turn,
+                    &client,
+                    &discovery,
+                    name_map.clone(),
+                )
+                .await
                 {
-                    turn.push(ProviderTurnEvent::Warning {
-                        message: format!(
-                            "Bedrock model {model_id} rejected prompt cache points; retrying without explicit cache points"
-                        ),
-                    });
-                    mark_prompt_cache_unsupported(
-                        &discovery,
-                        selection.cache_key.as_ref(),
-                        model_id,
-                        &error.message,
-                    );
-                    return retry_bedrock_without_prompt_cache(
-                        &client,
-                        request,
-                        model_id,
-                        turn,
-                        name_map.clone(),
-                    )
-                    .await;
-                }
-                if !selection.explicit
-                    && streaming_tool_use_unsupported(&error)
-                    && selection.model_ids.last() != Some(model_id)
-                {
-                    mark_streaming_tool_unsupported(
-                        &discovery,
-                        selection.cache_key.as_ref(),
-                        model_id,
-                        &error.message,
-                    );
-                    turn.push(ProviderTurnEvent::Warning {
-                        message: format!(
-                            "Bedrock model {model_id} does not support streaming tool use; retrying another discovered model"
-                        ),
-                    });
-                    last_error = Some(error);
-                    continue;
-                }
-                if model_unusable_via_converse(&error) {
-                    // These models are served through the Anthropic Messages API surface and are
-                    // not usable through Converse. Prune them from future discovery so they stop
-                    // appearing in the picker, and surface a clear reason.
-                    mark_streaming_tool_unsupported(
-                        &discovery,
-                        selection.cache_key.as_ref(),
-                        model_id,
-                        &error.message,
-                    );
-                    if !selection.explicit && selection.model_ids.last() != Some(model_id) {
-                        turn.push(ProviderTurnEvent::Warning {
-                            message: format!(
-                                "Bedrock model {model_id} is not available through the Converse API; retrying another discovered model"
-                            ),
-                        });
+                    TurnAttempt::Completed(outcome) => return outcome,
+                    TurnAttempt::TryNextModel(error) => {
                         last_error = Some(error);
-                        continue;
                     }
-                    return Err(provider_error(
-                        "bedrock_model_requires_messages_api",
-                        ProviderErrorCategory::UnsupportedFeature,
-                        format!(
-                            "Bedrock model {model_id} is only served through the Anthropic Messages API and cannot be used by the Converse adapter; select a Converse-compatible Claude model"
-                        ),
-                    ));
                 }
-                return Err(error);
             }
         }
     }
@@ -522,6 +472,90 @@ async fn stream_bedrock_turn_inner(
             "set BCODE_BEDROCK_MODEL or configure an accessible streaming Bedrock model",
         ))
     }))
+}
+
+/// Outcome of a single per-model Converse attempt.
+enum TurnAttempt {
+    /// The attempt reached a terminal result (success or a fatal error) for the whole turn.
+    Completed(Result<StreamOutcome, ProviderError>),
+    /// The model was structurally incompatible; try the next discovered model.
+    TryNextModel(ProviderError),
+}
+
+/// Classify and react to a Converse send error for one model.
+///
+/// Handles prompt-cache rejection (retry without cache points), streaming-tool incompatibility,
+/// and Messages-API-only models (data-retention `ValidationException`). Incompatible models are
+/// pruned from future discovery. Returns whether the turn is finished or should try another model.
+#[allow(clippy::too_many_arguments)]
+async fn handle_bedrock_turn_error(
+    error: ProviderError,
+    request: &ModelTurnRequest,
+    request_for_model: &ModelTurnRequest,
+    model_id: &str,
+    selection: &ModelSelection,
+    turn: &TurnState,
+    client: &Client,
+    discovery: &Arc<Mutex<DiscoveryCache>>,
+    name_map: BTreeMap<String, String>,
+) -> TurnAttempt {
+    if prompt_cache_rejected(&error) && request_for_model.prompt_cache.mode.is_enabled() {
+        turn.push(ProviderTurnEvent::Warning {
+            message: format!(
+                "Bedrock model {model_id} rejected prompt cache points; retrying without explicit cache points"
+            ),
+        });
+        mark_prompt_cache_unsupported(
+            discovery,
+            selection.cache_key.as_ref(),
+            model_id,
+            &error.message,
+        );
+        return TurnAttempt::Completed(
+            retry_bedrock_without_prompt_cache(client, request, model_id, turn, name_map).await,
+        );
+    }
+    let is_last = selection.model_ids.last().map(String::as_str) == Some(model_id);
+    if !selection.explicit && streaming_tool_use_unsupported(&error) && !is_last {
+        mark_streaming_tool_unsupported(
+            discovery,
+            selection.cache_key.as_ref(),
+            model_id,
+            &error.message,
+        );
+        turn.push(ProviderTurnEvent::Warning {
+            message: format!(
+                "Bedrock model {model_id} does not support streaming tool use; retrying another discovered model"
+            ),
+        });
+        return TurnAttempt::TryNextModel(error);
+    }
+    if model_unusable_via_converse(&error) {
+        // These models are served through the Anthropic Messages API surface and are not usable
+        // through Converse. Prune them from future discovery so they stop appearing in the picker.
+        mark_streaming_tool_unsupported(
+            discovery,
+            selection.cache_key.as_ref(),
+            model_id,
+            &error.message,
+        );
+        if !selection.explicit && !is_last {
+            turn.push(ProviderTurnEvent::Warning {
+                message: format!(
+                    "Bedrock model {model_id} is not available through the Converse API; retrying another discovered model"
+                ),
+            });
+            return TurnAttempt::TryNextModel(error);
+        }
+        return TurnAttempt::Completed(Err(provider_error(
+            "bedrock_model_requires_messages_api",
+            ProviderErrorCategory::UnsupportedFeature,
+            format!(
+                "Bedrock model {model_id} is only served through the Anthropic Messages API and cannot be used by the Converse adapter; select a Converse-compatible Claude model"
+            ),
+        )));
+    }
+    TurnAttempt::Completed(Err(error))
 }
 
 async fn retry_bedrock_without_prompt_cache(
@@ -1648,25 +1682,17 @@ impl BedrockProviderPlugin {
                 },
             };
         }
-        let discovered = self
-            .runtime
-            .as_ref()
-            .map_err(|error| {
-                provider_error(
-                    "runtime_unavailable",
-                    ProviderErrorCategory::ProviderInternal,
-                    error.clone(),
-                )
-            })
-            .and_then(|runtime| get_or_refresh_discovery_sync(runtime, &self.discovery, &settings))
-            .unwrap_or_else(|error| {
+        let discovered = match self.runtime.as_ref() {
+            Ok(runtime) => discovery_for_picker_nonblocking(runtime, &self.discovery, &settings),
+            Err(error) => {
                 tracing::warn!(
                     target: "bcode_bedrock::discovery",
-                    error = %error.message,
-                    "Bedrock model discovery failed"
+                    error = %error,
+                    "Bedrock model discovery runtime unavailable"
                 );
                 ModelDiscovery::default()
-            });
+            }
+        };
         let mut models = discovered.models;
         apply_default_model_to_list(&mut models, settings.default_model.as_deref());
         ModelList {
@@ -2007,6 +2033,68 @@ fn get_or_refresh_discovery_sync(
                 error.to_string(),
             )
         })?
+}
+
+/// Return the discovered model list for the interactive picker without blocking on AWS.
+///
+/// The model picker is an interactive, bounded path, so it must not block on paginated Bedrock
+/// API calls. This returns whatever is cached immediately (even if stale) and spawns a background
+/// refresh when the cache is missing or expired. The first open before any cache is warmed
+/// returns an empty live list (the host still enriches from the bundled catalog); subsequent opens
+/// return the full discovered list once the background refresh completes.
+fn discovery_for_picker_nonblocking(
+    runtime: &ProviderRuntime,
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    settings: &Settings,
+) -> ModelDiscovery {
+    let cache = Arc::clone(cache);
+    let settings = settings.clone();
+    let key = runtime.block_on({
+        let settings = settings.clone();
+        async move { discovery_cache_key(&settings).await }
+    });
+    if let Ok(key) = key {
+        if let Some(discovery) = cached_discovery(&cache, &key) {
+            return discovery;
+        }
+        if let Some(stale) = stale_cached_discovery(&cache, &key) {
+            spawn_discovery_refresh(runtime, cache, settings, key);
+            return stale;
+        }
+        spawn_discovery_refresh(runtime, cache, settings, key);
+    }
+    ModelDiscovery::default()
+}
+
+fn spawn_discovery_refresh(
+    runtime: &ProviderRuntime,
+    cache: Arc<Mutex<DiscoveryCache>>,
+    settings: Settings,
+    key: DiscoveryCacheKey,
+) {
+    runtime.spawn(async move {
+        match discover_models(&settings).await {
+            Ok(discovery) => store_discovery(&cache, key, discovery),
+            Err(error) => tracing::debug!(
+                target: "bcode_bedrock::discovery",
+                error = %error.message,
+                "background Bedrock model discovery refresh failed"
+            ),
+        }
+    });
+}
+
+/// Return a cached discovery ignoring the freshness TTL, applying compatibility filtering.
+fn stale_cached_discovery(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    key: &DiscoveryCacheKey,
+) -> Option<ModelDiscovery> {
+    let cached = cache.lock().ok()?.entries.get(key).cloned()?;
+    Some(filtered_discovery(
+        &cached.discovery,
+        &cached.unsupported_streaming_tool_models,
+        &cached.unsupported_prompt_cache_models,
+    ))
 }
 
 async fn get_or_refresh_discovery(
@@ -4211,6 +4299,30 @@ mod tests {
                 .unwrap()
                 .is_default
         );
+    }
+
+    #[test]
+    fn model_unusable_via_converse_detects_data_retention_error() {
+        let error = provider_error(
+            "bedrock_request_failed",
+            ProviderErrorCategory::InvalidRequest,
+            "The model returned the following errors: data retention mode 'default' is not available for this model",
+        );
+        assert!(model_unusable_via_converse(&error));
+
+        let unrelated = provider_error(
+            "bedrock_request_failed",
+            ProviderErrorCategory::InvalidRequest,
+            "some other validation problem",
+        );
+        assert!(!model_unusable_via_converse(&unrelated));
+
+        let wrong_category = provider_error(
+            "bedrock_request_failed",
+            ProviderErrorCategory::RateLimit,
+            "data retention mode 'default' is not available for this model",
+        );
+        assert!(!model_unusable_via_converse(&wrong_category));
     }
 
     #[test]
