@@ -217,6 +217,16 @@ pub struct ModelCatalogEntry {
     /// Reasoning-specific metadata.
     #[serde(default)]
     pub reasoning: Option<CatalogReasoning>,
+    /// Provider API surface required to invoke this model.
+    ///
+    /// Some providers serve newer models only through a surface an integration cannot drive. When
+    /// a model requires an unsupported surface, discovery marks it unsupported rather than
+    /// offering it and failing at request time.
+    #[serde(default)]
+    pub api_surface: Option<CatalogApiSurface>,
+    /// Provider-native extended-thinking control shape, when reasoning is supported.
+    #[serde(default)]
+    pub thinking_mode: Option<CatalogThinkingMode>,
     /// Compatibility targets this model is objectively known to support.
     ///
     /// Deprecated for newly-authored catalog data. Use [`Self::deployments`] when operational
@@ -393,6 +403,28 @@ pub struct CatalogCapabilities {
     /// Supports native provider web search.
     #[serde(default)]
     pub native_web_search: bool,
+}
+
+/// Provider API surface required to invoke a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogApiSurface {
+    /// Amazon Bedrock `Converse` / `ConverseStream` API.
+    Converse,
+    /// Amazon Bedrock `InvokeModel` API.
+    InvokeModel,
+    /// Anthropic Messages API surface (`/anthropic/v1/messages`, "bedrock-mantle").
+    Messages,
+}
+
+/// Provider-native extended-thinking control shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogThinkingMode {
+    /// Explicit token budget (`thinking.type = "enabled"`, `budget_tokens = N`).
+    Budget,
+    /// Adaptive thinking (`thinking.type = "adaptive"`); budget is not accepted.
+    Adaptive,
 }
 
 /// Reasoning-specific metadata.

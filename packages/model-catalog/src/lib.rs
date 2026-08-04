@@ -817,6 +817,7 @@ fn enrich_from_entry_for_target(
             reason: "model is marked unsupported by Bcode catalog".to_string(),
         };
     }
+    apply_api_surface_visibility(&mut model, entry);
     model
 }
 
@@ -921,7 +922,21 @@ fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelIn
             reason: "model is marked unsupported by Bcode catalog".to_string(),
         };
     }
+    apply_api_surface_visibility(&mut model, entry);
     model
+}
+
+/// Mark a model unsupported when its catalog `api_surface` cannot be driven by Bcode.
+///
+/// The Bedrock provider adapter uses the Converse API, so models served only through the
+/// Anthropic Messages surface are surfaced as unsupported (visible with a reason) rather than
+/// offered and failing at request time. This is applied last so the surface reason wins.
+fn apply_api_surface_visibility(model: &mut ModelInfo, entry: &ModelCatalogEntry) {
+    if entry.api_surface == Some(bcode_model_catalog_models::CatalogApiSurface::Messages) {
+        model.visibility = bcode_model::ModelVisibility::Unsupported {
+            reason: "served only through the Anthropic Messages API; not usable by the Bedrock Converse adapter".to_string(),
+        };
+    }
 }
 
 fn model_info_from_catalog_entry(entry: &ModelCatalogEntry) -> ModelInfo {
@@ -955,6 +970,7 @@ fn model_info_from_catalog_entry(entry: &ModelCatalogEntry) -> ModelInfo {
             reason: "model is marked unsupported by Bcode catalog".to_string(),
         };
     }
+    apply_api_surface_visibility(&mut model, entry);
     model
 }
 
@@ -1403,6 +1419,8 @@ fn live_model_entry(
         pricing: None,
         capabilities: live_model.capabilities.clone(),
         reasoning: live_model.reasoning.clone(),
+        api_surface: None,
+        thinking_mode: None,
         supported_by: target.cloned().into_iter().collect(),
         deployments: target
             .cloned()
@@ -1893,6 +1911,72 @@ status = "stable"
 
         assert_eq!(enriched.context_window, Some(200_000));
         assert!(enriched.reasoning.is_none());
+    }
+
+    #[test]
+    fn bedrock_messages_api_only_models_are_unsupported() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+
+        for model_id in [
+            "global.anthropic.claude-fable-5",
+            "us.anthropic.claude-opus-4-7-20260416-v1:0",
+            "us.anthropic.claude-sonnet-5-20260101-v1:0",
+            "anthropic.claude-mythos-5",
+        ] {
+            let discovered = bcode_model::ModelInfo {
+                model_id: model_id.to_string(),
+                display_name: model_id.to_string(),
+                is_default: false,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: std::collections::BTreeSet::new(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
+                reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
+                pricing: None,
+                visibility: bcode_model::ModelVisibility::Visible,
+            };
+            let enriched = catalog.enrich_model("bedrock", discovered);
+            assert!(
+                matches!(
+                    enriched.visibility,
+                    bcode_model::ModelVisibility::Unsupported { .. }
+                ),
+                "{model_id} must be unsupported (Messages-API only)"
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_converse_models_remain_visible() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        for model_id in [
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-opus-4-1-20250805-v1:0",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        ] {
+            let discovered = bcode_model::ModelInfo {
+                model_id: model_id.to_string(),
+                display_name: model_id.to_string(),
+                is_default: false,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: std::collections::BTreeSet::new(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
+                reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
+                pricing: None,
+                visibility: bcode_model::ModelVisibility::Visible,
+            };
+            let enriched = catalog.enrich_model("bedrock", discovered);
+            assert_eq!(
+                enriched.visibility,
+                bcode_model::ModelVisibility::Visible,
+                "{model_id} must remain visible (Converse-compatible)"
+            );
+        }
     }
 
     #[test]
