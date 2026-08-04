@@ -10,6 +10,41 @@ that contract is created, but neither owns workflow semantics.
 This architecture extends the existing workflow domain. It does not introduce another workflow
 engine, scheduler, canonical store, or frontend-specific definition format.
 
+## Source-controlled JSON and TOML
+
+Editable source files are serialization adapters for the same canonical
+`WorkflowAuthoringDocument`; they do not define a second graph, compiler, store, or execution path.
+`bcode_workflow::decode_workflow_authoring_source` is the portable SDK decoder, and the high-level
+`bcode::workflow` facade re-exports it with `WorkflowSourceFormat` and
+`WorkflowAuthoringDocument`. Decoding is deterministic, bounded by the authoring-document limit, and
+runs normal semantic validation before returning.
+
+Format selection is explicit or inferred only from a `.json`, `.workflow.json`, `.toml`, or
+`.workflow.toml` file name. Callers never try one parser and silently fall back to another. JSON and
+TOML sources that describe the same document must produce identical canonical source digest,
+executable digest, requirements, effects, and compilation preview. The paired fixtures under
+`fixtures/workflows/` mechanically enforce that property.
+
+TOML cannot natively represent JSON `null`. Within JSON-valued schema, configuration, predicate,
+transform, and presentation fields, an exact table containing only `$bcode_null = true` represents
+one JSON null. Any table combining `$bcode_null` with another field, or assigning a value other than
+`true`, fails closed. The marker is consumed by the format adapter and never enters canonical
+workflow state. Normal omitted optional Rust fields remain ordinary TOML omission and do not require
+the marker.
+
+The CLI reads and bounds the local file, resolves its format, decodes it through the workflow-owned
+adapter, and sends only the typed document through existing public application requests. Supported
+operations are:
+
+* `workflow author-check --source <path>` for daemon-authoritative validation and compilation preview;
+* `workflow author-create --source <path> --draft <id>` for a new logical workflow and initial draft;
+* `workflow author-update --source <path> --workflow <id> --draft <id> --generation <n>` for an optimistic generation-checked replacement.
+
+An explicit `--source-format json|toml` overrides extension inference. The local path is not sent to
+the daemon, persisted, or used as an authorization fact. Source changes never publish, activate,
+start, or overwrite a draft implicitly. Existing author-publish, activation/start, inspection, and
+portable export-bundle import remain separate application operations.
+
 ## Ownership and package boundary
 
 `bcode_workflow` owns the portable authoring document, authoring identities, validation diagnostics,

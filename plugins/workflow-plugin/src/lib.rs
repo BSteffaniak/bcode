@@ -940,6 +940,13 @@ pub(crate) async fn execute_command(
             let source_format: bcode_workflow::WorkflowSourceFormat =
                 serde_json::from_str(&required_arg(&request, "source_format")?)
                     .map_err(|error| error.to_string())?;
+            let workflow_id = document.workflow_id.clone();
+            let source_digest_sha256 = document
+                .source_digest_sha256()
+                .map_err(|error| error.to_string())?;
+            let executable_source_digest_sha256 = document
+                .executable_source_digest_sha256()
+                .map_err(|error| error.to_string())?;
             let validation = client
                 .validate_workflow_authoring(document.clone())
                 .await
@@ -951,6 +958,14 @@ pub(crate) async fn execute_command(
             options.insert(
                 "source_format".to_string(),
                 serde_json::to_value(source_format).map_err(|error| error.to_string())?,
+            );
+            options.insert(
+                "source_identity".to_string(),
+                serde_json::json!({
+                    "workflow_id": workflow_id,
+                    "source_digest_sha256": source_digest_sha256,
+                    "executable_source_digest_sha256": executable_source_digest_sha256,
+                }),
             );
             options.insert(
                 "validation".to_string(),
@@ -967,6 +982,9 @@ pub(crate) async fn execute_command(
             }
         }
         "workflow.author-create" => {
+            let source_format: bcode_workflow::WorkflowSourceFormat =
+                serde_json::from_str(&required_arg(&request, "source_format")?)
+                    .map_err(|error| error.to_string())?;
             let document: bcode_workflow::WorkflowAuthoringDocument =
                 serde_json::from_str(&required_arg(&request, "source_document")?)
                     .map_err(|error| error.to_string())?;
@@ -979,6 +997,10 @@ pub(crate) async fn execute_command(
                 .await
                 .map_err(|error| error.to_string())?;
             options.insert(
+                "source_format".to_string(),
+                serde_json::to_value(source_format).map_err(|error| error.to_string())?,
+            );
+            options.insert(
                 "workflow".to_string(),
                 serde_json::to_value(&created.0).map_err(|error| error.to_string())?,
             );
@@ -989,6 +1011,9 @@ pub(crate) async fn execute_command(
             "workflow draft created from source".to_string()
         }
         "workflow.author-update" => {
+            let source_format: bcode_workflow::WorkflowSourceFormat =
+                serde_json::from_str(&required_arg(&request, "source_format")?)
+                    .map_err(|error| error.to_string())?;
             let document: bcode_workflow::WorkflowAuthoringDocument =
                 serde_json::from_str(&required_arg(&request, "source_document")?)
                     .map_err(|error| error.to_string())?;
@@ -1006,6 +1031,10 @@ pub(crate) async fn execute_command(
                 })
                 .await
                 .map_err(|error| error.to_string())?;
+            options.insert(
+                "source_format".to_string(),
+                serde_json::to_value(source_format).map_err(|error| error.to_string())?,
+            );
             options.insert(
                 "draft_update".to_string(),
                 serde_json::to_value(&updated).map_err(|error| error.to_string())?,

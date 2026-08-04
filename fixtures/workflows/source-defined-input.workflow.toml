@@ -1,0 +1,94 @@
+schema_version = 1
+workflow_id = "example/source-defined-input"
+
+[metadata]
+title = "Source-defined input"
+description = "A portable workflow authored equivalently in JSON and TOML."
+
+[metadata.labels]
+example = "source-defined"
+
+[configuration_schema]
+type_name = "bcode.example.source-configuration/v1"
+
+[configuration_schema.schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[configuration_defaults]
+
+[definition]
+schema_version = 1
+name = "Source-defined input"
+entries = ["await_input"]
+exits = ["await_input"]
+edges = []
+
+[definition.input]
+type_name = "bcode.example.source-value/v1"
+
+[definition.input.schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+required = ["message"]
+
+[definition.input.schema.properties.message]
+type = "string"
+
+[definition.output]
+type_name = "bcode.example.source-value/v1"
+
+[definition.output.schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+required = ["message"]
+
+[definition.output.schema.properties.message]
+type = "string"
+
+[definition.nodes.await_input]
+id = "await_input"
+name = "Await input"
+kind = "input"
+
+[definition.nodes.await_input.input]
+type_name = "bcode.example.source-value/v1"
+
+[definition.nodes.await_input.input.schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+required = ["message"]
+
+[definition.nodes.await_input.input.schema.properties.message]
+type = "string"
+
+[definition.nodes.await_input.output]
+type_name = "bcode.example.source-value/v1"
+
+[definition.nodes.await_input.output.schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+required = ["message"]
+
+[definition.nodes.await_input.output.schema.properties.message]
+type = "string"
+
+[definition.nodes.await_input.configuration]
+gate_version = 1
+
+[requirements]
+
+[run_limits]
+node_execution_cap = 8
+concurrency_cap = 1
+cycle_cap = 1
+retry_cap = 1
+
+[producer]
+kind = "human"
+producer_id = "source-fixture"

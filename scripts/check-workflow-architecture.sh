@@ -238,9 +238,48 @@ fi
 
 if ! rg -q 'FieldsEqual' packages/workflow/src/lib.rs \
   || ! rg -q 'NumericCompare' packages/workflow/src/lib.rs \
+  || ! rg -q 'WorkflowValueSelectorSegment' packages/workflow/src/lib.rs \
+  || ! rg -q 'SelectedInput' packages/workflow/src/lib.rs \
+  || ! rg -q 'MAX_VALUE_SELECTOR_SEGMENTS' packages/workflow/src/lib.rs \
   || ! rg -q 'MAX_PREDICATE_DEPTH' packages/workflow/src/lib.rs \
   || ! rg -q 'WORKFLOW_PREDICATE_MIN_VERSION' packages/workflow/src/lib.rs; then
-  echo "Workflow predicate violation: bounded versioned compositional predicates were removed." >&2
+  echo "Workflow predicate violation: bounded versioned compositional predicates and generic selectors were removed." >&2
+  violations=1
+fi
+
+if rg -n 'shell|command-plan|exit_code' packages/workflow/src/lib.rs \
+  | rg 'WorkflowValueSelector|SelectedEquals|SelectedValuesEqual|SelectedNumericCompare|SelectedInput' \
+  >/tmp/bcode-workflow-selector-violations 2>/dev/null; then
+  echo "Workflow selector ownership violation: generic selectors must not encode shell-specific behavior." >&2
+  cat /tmp/bcode-workflow-selector-violations >&2
+  violations=1
+fi
+rm -f /tmp/bcode-workflow-selector-violations
+
+if ! rg -q 'pub enum WorkflowSourceFormat' packages/workflow/src/lib.rs \
+  || ! rg -q 'pub fn decode_workflow_authoring_source' packages/workflow/src/lib.rs \
+  || ! rg -q 'checked_in_workflow_sources_have_identical_compiled_semantics' packages/workflow/src/lib.rs \
+  || ! rg -q 'decode_workflow_authoring_source' packages/bcode/src/workflow.rs \
+  || ! rg -q 'decode_workflow_authoring_source' plugins/workflow-plugin/src/cli.rs \
+  || rg -q 'std::fs|tokio::fs|bcode_workflow_store|rusqlite' packages/workflow/src/lib.rs; then
+  echo "Workflow source-format violation: one workflow-owned decoder must serve SDK and frontend adapters." >&2
+  violations=1
+fi
+
+if [[ ! -f fixtures/workflows/source-defined-input.workflow.json ]] \
+  || [[ ! -f fixtures/workflows/source-defined-input.workflow.toml ]] \
+  || ! rg -q 'Source-controlled JSON and TOML' docs/runtime-workflow-authoring.md \
+  || ! rg -q '\$bcode_null' docs/runtime-workflow-authoring.md; then
+  echo "Workflow source-format documentation violation: paired fixtures and TOML null semantics must remain documented." >&2
+  violations=1
+fi
+
+if [[ $(rg -c '^\[\[services\.workflow_blocks\]\]' plugins/shell-plugin/bcode-plugin.toml) -lt 2 ]] \
+  || ! rg -q 'block_version[[:space:]]*=[[:space:]]*2' plugins/shell-plugin/bcode-plugin.toml \
+  || ! rg -q 'bcode\.shell\.command-plan/v2' plugins/shell-plugin/bcode-plugin.toml \
+  || ! rg -q 'exit_accepted' plugins/shell-plugin/bcode-plugin.toml \
+  || ! rg -q 'pub enum ProcessTermination' packages/tool-runtime/src/lib.rs; then
+  echo "Shell workflow contract violation: exact v1/v2 blocks or normalized termination semantics were removed." >&2
   violations=1
 fi
 

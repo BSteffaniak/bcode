@@ -192,16 +192,33 @@ receipt, asks a read-only planning agent for a replacement, shows exact instruct
 changes, waits for operator acceptance, and persists the accepted plan as a run decision. That exact
 decision is reused for the rest of its declared scope.
 
+## Generic structured result selection
+
+Workflow predicates and transforms share one versioned `WorkflowValueSelector`. A selector is an
+ordered bounded list of explicit object-field and zero-based array-index segments; an empty list
+selects the complete value. This avoids ambiguous numeric dotted paths and lets workflows route over
+plugin-produced lists without knowing which plugin produced them. Existing dotted object-path
+predicate and transform variants remain valid for compatibility.
+
+Selected equality, selected-value equality, selected numeric comparison, and selected transform
+input are generic workflow semantics. They have no shell, Git, plugin, renderer, filesystem, or
+network behavior. Missing fields, invalid indices, incompatible value categories, excessive depth,
+excessive segments, and unknown future selector versions fail closed with source-addressed errors.
+
 ## Shell plans
 
-Shell command-plan version 1 remains accepted unchanged. A new version adds bounded, unique accepted
-exit codes to each command; the default is `[0]`. An exited code outside that set is typed command
-failure. `continue_on_unaccepted_exit` controls later command execution. Spawn failure, timeout,
-signal termination, cancellation, and unaccepted exit remain distinct.
+Shell command-plan block version 1 remains available unchanged. Exact block version 2 adds bounded,
+unique accepted exit codes to each command; omission defaults to `[0]`. The shell owner sorts and
+normalizes the set before classification and plan-receipt hashing, so explicit `[0]` and its default
+have one identity. An exited code outside the set is typed command failure.
+`continue_on_unaccepted_exit` controls later command execution. Spawn failure, timeout, signal
+termination, cancellation, and unaccepted ordinary exit remain distinct.
 
-Results include actual and accepted exit codes, terminal status, duration, bounded stdout/stderr
-previews, truncation flags, and artifact references. Shell plans remain exact argv arrays and never
-become implicit shell strings.
+Version-2 results include actual exit code, normalized accepted codes, explicit `exit_accepted`,
+terminal status, signal when available, duration, bounded stdout/stderr previews, truncation flags,
+and artifact references. Generic process execution owns normalized exited/signaled/unknown
+termination; the shell plugin maps that result into its own contract. Shell plans remain exact argv
+arrays and never become implicit shell strings.
 
 ## Repository snapshot and verification authority
 

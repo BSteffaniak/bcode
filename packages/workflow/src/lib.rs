@@ -9896,6 +9896,33 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_workflow_sources_have_identical_compiled_semantics() {
+        let json = include_str!("../../../fixtures/workflows/source-defined-input.workflow.json");
+        let toml = include_str!("../../../fixtures/workflows/source-defined-input.workflow.toml");
+        let from_json = decode_workflow_authoring_source(json, WorkflowSourceFormat::Json)
+            .expect("checked-in JSON workflow");
+        let from_toml = decode_workflow_authoring_source(toml, WorkflowSourceFormat::Toml)
+            .expect("checked-in TOML workflow");
+        assert_eq!(from_json, from_toml);
+        assert_eq!(
+            from_json.source_digest_sha256().expect("JSON digest"),
+            from_toml.source_digest_sha256().expect("TOML digest")
+        );
+        assert_eq!(
+            from_json
+                .executable_source_digest_sha256()
+                .expect("JSON executable digest"),
+            from_toml
+                .executable_source_digest_sha256()
+                .expect("TOML executable digest")
+        );
+        assert_eq!(
+            from_json.compilation_preview(&authoring_catalog(), None),
+            from_toml.compilation_preview(&authoring_catalog(), None)
+        );
+    }
+
+    #[test]
     #[allow(clippy::items_after_statements)]
     fn workflow_authoring_sources_decode_json_and_toml_to_identical_semantics() {
         let document = authored_document();
@@ -9994,6 +10021,48 @@ mod tests {
             )
             .is_err()
         );
+        let json_duplicate = r#"{"schema_version":1,"schema_version":1}"#;
+        assert!(
+            decode_workflow_authoring_source(json_duplicate, WorkflowSourceFormat::Json).is_err()
+        );
+        let toml_duplicate = "schema_version = 1\nschema_version = 1\n";
+        assert!(
+            decode_workflow_authoring_source(toml_duplicate, WorkflowSourceFormat::Toml).is_err()
+        );
+        let invalid_null_marker = r#"
+            schema_version = 1
+            workflow_id = "invalid"
+            [metadata]
+            title = "Invalid"
+            [configuration_defaults]
+            "$bcode_null" = false
+        "#;
+        assert!(
+            decode_workflow_authoring_source(invalid_null_marker, WorkflowSourceFormat::Toml)
+                .expect_err("invalid reserved null marker")
+                .to_string()
+                .contains("reserved TOML null marker")
+        );
+        let mixed_null_marker = r#"
+            schema_version = 1
+            workflow_id = "invalid"
+            [metadata]
+            title = "Invalid"
+            [configuration_defaults]
+            "$bcode_null" = true
+            other = true
+        "#;
+        assert!(
+            decode_workflow_authoring_source(mixed_null_marker, WorkflowSourceFormat::Toml)
+                .expect_err("mixed reserved null marker")
+                .to_string()
+                .contains("reserved TOML null marker")
+        );
+        let mut nested = String::from("value = ");
+        nested.push_str(&"[".repeat(MAX_WORKFLOW_AUTHORING_JSON_DEPTH + 2));
+        nested.push('1');
+        nested.push_str(&"]".repeat(MAX_WORKFLOW_AUTHORING_JSON_DEPTH + 2));
+        assert!(decode_workflow_authoring_source(&nested, WorkflowSourceFormat::Toml).is_err());
         assert!(WorkflowSourceFormat::from_file_name("workflow.yaml").is_err());
     }
 

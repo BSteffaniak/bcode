@@ -11,12 +11,13 @@ pub use bcode_workflow::{
     AbortTaskOnDrop, AgentExecutionTarget, ArtifactReference, EdgeDefinition, EdgeKind, Field,
     NodeDefinition, NodeKind, NodeRunState, ParallelFailurePolicy, Predicate, PredicateExpression,
     ResourceAccess, ResourceClaim, RetryPolicy, Step, StepContext, ValueSchema, Workflow,
-    WorkflowApprovalResolver, WorkflowBuilder, WorkflowCancellation, WorkflowDefinition,
-    WorkflowDefinitionIdentity, WorkflowError, WorkflowEvent, WorkflowEventReceiver,
-    WorkflowEventSender, WorkflowGrantScope, WorkflowOutcome, WorkflowPlan, WorkflowPolicyGrant,
-    WorkflowPolicyPreflight, WorkflowPolicyRequest, WorkflowRunObserver, WorkflowRunSnapshot,
-    WorkflowSpec, WorkflowToolCapability, authorize_workflow_policy, fan_out, field, parallel,
-    parallel_named, parallel_named_with_policy, preflight_workflow_policy, workflow_event_channel,
+    WorkflowApprovalResolver, WorkflowAuthoringDocument, WorkflowBuilder, WorkflowCancellation,
+    WorkflowDefinition, WorkflowDefinitionIdentity, WorkflowError, WorkflowEvent,
+    WorkflowEventReceiver, WorkflowEventSender, WorkflowGrantScope, WorkflowOutcome, WorkflowPlan,
+    WorkflowPolicyGrant, WorkflowPolicyPreflight, WorkflowPolicyRequest, WorkflowRunObserver,
+    WorkflowRunSnapshot, WorkflowSourceFormat, WorkflowSpec, WorkflowToolCapability,
+    authorize_workflow_policy, decode_workflow_authoring_source, fan_out, field, parallel,
+    parallel_named_with_policy, preflight_workflow_policy, workflow_event_channel,
 };
 use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
@@ -368,4 +369,23 @@ where
     P: ModelProviderInvoker + 'static,
 {
     AgentStep::new(name, provider)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        WorkflowAuthoringDocument, WorkflowSourceFormat, decode_workflow_authoring_source,
+    };
+
+    #[test]
+    fn sdk_facade_decodes_checked_in_workflow_sources() {
+        let json = include_str!("../../../fixtures/workflows/source-defined-input.workflow.json");
+        let toml = include_str!("../../../fixtures/workflows/source-defined-input.workflow.toml");
+        let json_document: WorkflowAuthoringDocument =
+            decode_workflow_authoring_source(json, WorkflowSourceFormat::Json)
+                .expect("SDK JSON source");
+        let toml_document = decode_workflow_authoring_source(toml, WorkflowSourceFormat::Toml)
+            .expect("SDK TOML source");
+        assert_eq!(json_document, toml_document);
+    }
 }
