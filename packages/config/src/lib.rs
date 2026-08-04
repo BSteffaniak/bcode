@@ -3724,6 +3724,7 @@ fn reasoning_capabilities_from_config(
         || reasoning.visible_summary_supported.is_some()
         || reasoning.raw_reasoning_supported.is_some())
     .then(|| bcode_model::ModelReasoningInfo {
+        control: None,
         effort_values: reasoning.effort_values.clone(),
         default_effort: reasoning.default_effort.clone(),
         visible_summary_supported: reasoning.visible_summary_supported.unwrap_or_default(),

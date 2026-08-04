@@ -104,15 +104,50 @@ effort_values = ["low", "medium", "high"]
 default_effort = "medium"
 raw_reasoning_supported = true
 
-# Messages-API-only Anthropic models ("bedrock-mantle", Opus 4.7 and later). These are served
-# through the Anthropic Messages API (`/anthropic/v1/messages`) and cannot be driven by the
-# Converse adapter, so they are marked with `api_surface = "messages"` and discovery hides them
-# from the picker rather than offering them and failing at request time. Longest-match aliases
-# ensure these version-specific globs win over the broad Converse family entries above.
+# Claude Opus 5 is Converse-usable but only supports adaptive thinking: `thinking.type = "enabled"`
+# with `budget_tokens` is rejected with a ValidationException. `thinking_mode = "adaptive"` tells
+# the provider adapter to send `thinking.type = "adaptive"` plus `output_config.effort`. Opus 5 is
+# also one of the few models accepting the `xhigh` and `max` effort levels.
+[models."anthropic.claude-opus-5"]
+model_id = "anthropic.claude-opus-5"
+display_name = "Claude Opus 5"
+aliases = ["*claude-opus-5*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "converse"
+thinking_mode = "adaptive"
+
+[models."anthropic.claude-opus-5".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+prompt_cache = true
+reasoning = true
+
+[models."anthropic.claude-opus-5".reasoning]
+effort_values = ["low", "medium", "high", "xhigh", "max"]
+default_effort = "high"
+raw_reasoning_supported = true
+
+# Messages-API-only Anthropic models ("bedrock-mantle"). These are served through the Anthropic
+# Messages API (`/anthropic/v1/messages`) and cannot be driven by the Converse adapter, so they
+# are marked with `api_surface = "messages"` and discovery hides them from the picker rather than
+# offering them and failing at request time. Longest-match aliases ensure these version-specific
+# globs win over the broad Converse family entries above.
+#
+# Do not add a model here merely because it requires adaptive thinking. Adaptive thinking is
+# supported over Converse via `additionalModelRequestFields`; that is expressed by
+# `thinking_mode = "adaptive"` on a Converse entry.
 [models."anthropic.claude-opus-4-7"]
 model_id = "anthropic.claude-opus-4-7"
 display_name = "Claude Opus 4.7"
-aliases = ["*claude-opus-4-7*", "*claude-opus-4-8*", "*claude-opus-5*"]
+aliases = ["*claude-opus-4-7*", "*claude-opus-4-8*"]
 status = "stable"
 bcode_support = "unsupported"
 family = "claude"

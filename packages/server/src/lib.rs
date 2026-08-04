@@ -1062,6 +1062,7 @@ fn merge_reasoning_override(
         }
         (Some(base), None) => Some(base),
         (None, Some(override_)) => Some(bcode_model::ModelReasoningInfo {
+            control: None,
             effort_values: override_.effort_values.unwrap_or_default(),
             default_effort: override_.default_effort,
             visible_summary_supported: override_.visible_summary_supported.unwrap_or_default(),
@@ -11935,6 +11936,7 @@ fn reasoning_capabilities_from_config(
         || reasoning.visible_summary_supported.is_some()
         || reasoning.raw_reasoning_supported.is_some())
     .then(|| bcode_model::ModelReasoningInfo {
+        control: None,
         effort_values: reasoning.effort_values.clone(),
         default_effort: reasoning.default_effort.clone(),
         visible_summary_supported: reasoning.visible_summary_supported.unwrap_or_default(),
@@ -22555,6 +22557,7 @@ async fn build_model_turn_request(
             p.reasoning_effort = Some(*level);
         }
         if let Some(reasoning) = reasoning_capabilities.as_ref() {
+            p.reasoning_control = reasoning.control;
             if let Some(effort) = supported_reasoning_value(
                 selection.reasoning_effort.as_deref(),
                 &reasoning.effort_values,

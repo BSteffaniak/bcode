@@ -1157,9 +1157,28 @@ pub enum ModelReasoningCapabilitySource {
     GenericFallback,
 }
 
+/// Normalized shape a model uses to control reasoning/thinking work.
+///
+/// Providers express extended thinking in different ways. This is the provider-neutral semantic
+/// the rest of Bcode carries so provider adapters can emit the correct native request shape
+/// without reimplementing model identity matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningControl {
+    /// Reasoning depth is requested as an explicit token budget.
+    Budget,
+    /// The model allocates reasoning depth itself, guided by a named effort level.
+    Adaptive,
+}
+
 /// Per-model reasoning/thinking controls exposed by a provider.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelReasoningInfo {
+    /// Normalized reasoning-control shape, when known.
+    ///
+    /// `None` means the control shape was not declared; providers keep their historical default.
+    #[serde(default)]
+    pub control: Option<ReasoningControl>,
     /// Provider-native effort values accepted by the model.
     #[serde(default)]
     pub effort_values: Vec<String>,
@@ -2252,6 +2271,12 @@ pub struct ModelParameters {
     pub stop_sequences: Vec<String>,
     #[serde(default)]
     pub reasoning_budget_tokens: Option<u32>,
+    /// Normalized reasoning-control shape resolved for the selected model.
+    ///
+    /// Providers use this to choose the native thinking request shape instead of inferring it
+    /// from model identity.
+    #[serde(default)]
+    pub reasoning_control: Option<ReasoningControl>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]

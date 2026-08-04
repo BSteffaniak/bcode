@@ -7190,6 +7190,7 @@ fn reasoning_info_from_metadata(
 ) -> Option<bcode_model::ModelReasoningInfo> {
     let reasoning = metadata.get("reasoning")?.as_object()?;
     Some(bcode_model::ModelReasoningInfo {
+        control: None,
         effort_values: string_array_field(reasoning, "effort_values"),
         default_effort: string_field(reasoning, "default_effort"),
         visible_summary_supported: bool_field(reasoning, "visible_summary_supported"),

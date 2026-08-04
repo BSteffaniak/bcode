@@ -805,6 +805,7 @@ fn enrich_from_entry_for_target(
             deployment
                 .and_then(|deployment| deployment.reasoning.as_ref())
                 .or(entry.reasoning.as_ref()),
+            entry.thinking_mode,
         );
     }
     if entry.status == CatalogModelStatus::Deprecated {
@@ -866,7 +867,7 @@ fn enrich_from_defaults(mut model: ModelInfo, defaults: &ModelCatalogDefaults) -
         model.cache = cache_info_from_catalog(&defaults.capabilities);
     }
     if model.reasoning.is_none() {
-        model.reasoning = reasoning_from_catalog_parts(defaults.reasoning.as_ref());
+        model.reasoning = reasoning_from_catalog_parts(defaults.reasoning.as_ref(), None);
     }
     model
 }
@@ -1088,14 +1089,31 @@ fn pricing_from_catalog(
 }
 
 fn reasoning_from_catalog(entry: &ModelCatalogEntry) -> Option<ModelReasoningInfo> {
-    reasoning_from_catalog_parts(entry.reasoning.as_ref())
+    reasoning_from_catalog_parts(entry.reasoning.as_ref(), entry.thinking_mode)
+}
+
+/// Map the catalog thinking-control shape onto the normalized model semantic.
+const fn reasoning_control_from_catalog(
+    thinking_mode: Option<bcode_model_catalog_models::CatalogThinkingMode>,
+) -> Option<bcode_model::ReasoningControl> {
+    match thinking_mode {
+        Some(bcode_model_catalog_models::CatalogThinkingMode::Budget) => {
+            Some(bcode_model::ReasoningControl::Budget)
+        }
+        Some(bcode_model_catalog_models::CatalogThinkingMode::Adaptive) => {
+            Some(bcode_model::ReasoningControl::Adaptive)
+        }
+        None => None,
+    }
 }
 
 fn reasoning_from_catalog_parts(
     reasoning: Option<&bcode_model_catalog_models::CatalogReasoning>,
+    thinking_mode: Option<bcode_model_catalog_models::CatalogThinkingMode>,
 ) -> Option<ModelReasoningInfo> {
     let reasoning = reasoning?;
     Some(ModelReasoningInfo {
+        control: reasoning_control_from_catalog(thinking_mode),
         effort_values: reasoning.effort_values.iter().cloned().collect(),
         default_effort: reasoning.default_effort.clone(),
         visible_summary_supported: !reasoning.summary_values.is_empty(),
@@ -1977,6 +1995,73 @@ status = "stable"
                 "{model_id} must remain visible (Converse-compatible)"
             );
         }
+    }
+
+    #[test]
+    fn bedrock_opus_5_is_converse_usable_with_adaptive_reasoning() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let discovered = bcode_model::ModelInfo {
+            model_id: "global.anthropic.claude-opus-5".to_string(),
+            display_name: "global.anthropic.claude-opus-5".to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        };
+        let enriched = catalog.enrich_model("bedrock", discovered);
+        assert_eq!(
+            enriched.visibility,
+            bcode_model::ModelVisibility::Visible,
+            "Opus 5 is reachable through Converse"
+        );
+        let reasoning = enriched
+            .reasoning
+            .expect("Opus 5 must advertise selectable thinking levels");
+        assert_eq!(
+            reasoning.control,
+            Some(bcode_model::ReasoningControl::Adaptive),
+            "Opus 5 rejects explicit thinking budgets"
+        );
+        assert!(
+            reasoning.effort_values.iter().any(|value| value == "xhigh")
+                && reasoning.effort_values.iter().any(|value| value == "max"),
+            "Opus 5 accepts the extended effort levels: {:?}",
+            reasoning.effort_values
+        );
+        assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn bedrock_budget_thinking_models_declare_budget_control() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let discovered = bcode_model::ModelInfo {
+            model_id: "us.anthropic.claude-opus-4-1-20250805-v1:0".to_string(),
+            display_name: "opus 4.1".to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        };
+        let reasoning = catalog
+            .enrich_model("bedrock", discovered)
+            .reasoning
+            .expect("Opus 4.1 advertises reasoning");
+        assert_eq!(
+            reasoning.control,
+            Some(bcode_model::ReasoningControl::Budget)
+        );
     }
 
     #[test]

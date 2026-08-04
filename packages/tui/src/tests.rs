@@ -6939,6 +6939,7 @@ fn thinking_label_uses_effective_values() {
         compatibility_key: None,
         max_output_tokens: None,
         reasoning: Some(bcode_model::ModelReasoningInfo {
+            control: None,
             effort_values: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
             default_effort: Some("medium".to_owned()),
             visible_summary_supported: true,
@@ -6982,6 +6983,7 @@ fn thinking_dialog_cycles_supported_values_in_semantic_order() {
         compatibility_key: None,
         max_output_tokens: None,
         reasoning: Some(bcode_model::ModelReasoningInfo {
+            control: None,
             effort_values: vec!["high".to_owned(), "low".to_owned(), "medium".to_owned()],
             default_effort: Some("low".to_owned()),
             visible_summary_supported: true,
@@ -7036,6 +7038,7 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
         compatibility_key: None,
         max_output_tokens: None,
         reasoning: Some(bcode_model::ModelReasoningInfo {
+            control: None,
             effort_values: vec!["low".to_owned(), "medium".to_owned()],
             default_effort: Some("low".to_owned()),
             visible_summary_supported: true,

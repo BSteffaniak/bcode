@@ -1043,9 +1043,18 @@ fn resolve_reasoning_budget_tokens(params: &bcode_model::ModelParameters) -> Opt
 /// Build the Bedrock `additionalModelRequestFields` document that enables Anthropic extended
 /// thinking, or `None` when reasoning was not requested.
 ///
-/// The Converse API forwards these fields to the model verbatim; Anthropic models accept
-/// `{"thinking": {"type": "enabled", "budget_tokens": N}}`.
+/// The Converse API forwards these fields to the model verbatim. The shape depends on the
+/// normalized reasoning control resolved by the host:
+///
+/// * [`ReasoningControl::Budget`] (and unspecified, the historical default) sends
+///   `{"thinking": {"type": "enabled", "budget_tokens": N}}`.
+/// * [`ReasoningControl::Adaptive`] sends `{"thinking": {"type": "adaptive"}}` plus a sibling
+///   `{"output_config": {"effort": "..."}}` object. Newer Claude models reject the budget shape,
+///   and `effort` must not be nested inside `thinking`.
 fn bedrock_thinking_fields(params: &bcode_model::ModelParameters) -> Option<Document> {
+    if params.reasoning_control == Some(bcode_model::ReasoningControl::Adaptive) {
+        return Some(bedrock_adaptive_thinking_fields(params));
+    }
     let budget = resolve_reasoning_budget_tokens(params)?;
     let mut thinking = HashMap::new();
     thinking.insert("type".to_string(), Document::String("enabled".to_string()));
@@ -1056,6 +1065,47 @@ fn bedrock_thinking_fields(params: &bcode_model::ModelParameters) -> Option<Docu
     let mut fields = HashMap::new();
     fields.insert("thinking".to_string(), Document::Object(thinking));
     Some(Document::Object(fields))
+}
+
+/// Build adaptive-thinking request fields for models that reject explicit thinking budgets.
+///
+/// Adaptive thinking is requested whenever the model uses it, even without a named effort, so the
+/// model still allocates its own reasoning depth. A budget is never emitted; if only a budget was
+/// requested it is dropped rather than translated, because the model chooses its own depth.
+fn bedrock_adaptive_thinking_fields(params: &bcode_model::ModelParameters) -> Document {
+    let mut thinking = HashMap::new();
+    thinking.insert("type".to_string(), Document::String("adaptive".to_string()));
+    let mut fields = HashMap::new();
+    fields.insert("thinking".to_string(), Document::Object(thinking));
+    if let Some(effort) = adaptive_reasoning_effort(params) {
+        let mut output_config = HashMap::new();
+        output_config.insert("effort".to_string(), Document::String(effort));
+        fields.insert("output_config".to_string(), Document::Object(output_config));
+    }
+    Document::Object(fields)
+}
+
+/// Resolve the adaptive `output_config.effort` value requested for this turn.
+///
+/// Prefers the provider-native effort value advertised by the model catalog, falling back to the
+/// portable [`bcode_model::ReasoningEffort`] level. Budget-token requests carry no effort name.
+fn adaptive_reasoning_effort(params: &bcode_model::ModelParameters) -> Option<String> {
+    if let Some(effort) = params
+        .reasoning_effort_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+    {
+        return Some(effort.to_owned());
+    }
+    params.reasoning_effort.map(|effort| {
+        match effort {
+            bcode_model::ReasoningEffort::Low => "low",
+            bcode_model::ReasoningEffort::Medium => "medium",
+            bcode_model::ReasoningEffort::High => "high",
+        }
+        .to_owned()
+    })
 }
 
 fn system_blocks(request: &ModelTurnRequest) -> Vec<SystemContentBlock> {
@@ -4088,6 +4138,83 @@ mod tests {
                 REASONING_EFFORT_HIGH_BUDGET
             ))))
         );
+    }
+
+    #[test]
+    fn bedrock_adaptive_thinking_sends_effort_in_output_config() {
+        let params = bcode_model::ModelParameters {
+            reasoning_control: Some(bcode_model::ReasoningControl::Adaptive),
+            reasoning_effort_value: Some("xhigh".to_string()),
+            ..Default::default()
+        };
+        let Some(Document::Object(root)) = bedrock_thinking_fields(&params) else {
+            panic!("adaptive thinking fields must be an object");
+        };
+        let Some(Document::Object(thinking)) = root.get("thinking") else {
+            panic!("thinking key must be an object");
+        };
+        assert_eq!(
+            thinking.get("type"),
+            Some(&Document::String("adaptive".to_string()))
+        );
+        assert!(
+            !thinking.contains_key("budget_tokens"),
+            "adaptive thinking must never send a token budget"
+        );
+        assert!(
+            !thinking.contains_key("effort"),
+            "effort nested inside thinking is rejected by Bedrock"
+        );
+        let Some(Document::Object(output_config)) = root.get("output_config") else {
+            panic!("output_config must be a sibling object");
+        };
+        assert_eq!(
+            output_config.get("effort"),
+            Some(&Document::String("xhigh".to_string()))
+        );
+    }
+
+    #[test]
+    fn bedrock_adaptive_thinking_ignores_budget_only_requests() {
+        let params = bcode_model::ModelParameters {
+            reasoning_control: Some(bcode_model::ReasoningControl::Adaptive),
+            reasoning_budget_tokens: Some(8_192),
+            ..Default::default()
+        };
+        let Some(Document::Object(root)) = bedrock_thinking_fields(&params) else {
+            panic!("adaptive models still request adaptive thinking");
+        };
+        let Some(Document::Object(thinking)) = root.get("thinking") else {
+            panic!("thinking key must be an object");
+        };
+        assert_eq!(
+            thinking.get("type"),
+            Some(&Document::String("adaptive".to_string()))
+        );
+        assert!(
+            !root.contains_key("output_config"),
+            "a token budget carries no adaptive effort name"
+        );
+    }
+
+    #[test]
+    fn bedrock_budget_control_keeps_enabled_thinking_shape() {
+        let params = bcode_model::ModelParameters {
+            reasoning_control: Some(bcode_model::ReasoningControl::Budget),
+            reasoning_effort_value: Some("high".to_string()),
+            ..Default::default()
+        };
+        let Some(Document::Object(root)) = bedrock_thinking_fields(&params) else {
+            panic!("budget thinking fields must be an object");
+        };
+        let Some(Document::Object(thinking)) = root.get("thinking") else {
+            panic!("thinking key must be an object");
+        };
+        assert_eq!(
+            thinking.get("type"),
+            Some(&Document::String("enabled".to_string()))
+        );
+        assert!(!root.contains_key("output_config"));
     }
 
     #[test]
