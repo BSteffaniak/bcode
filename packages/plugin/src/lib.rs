@@ -2954,6 +2954,7 @@ impl PluginRegistry {
         validate_tool_presentation_declarations(manifests.values())
             .expect("loaded plugin tool presentation contracts must be valid");
         let mut template_identities = BTreeSet::new();
+        let mut block_identities = BTreeSet::new();
         for manifest in manifests.values() {
             for template in &manifest.workflow_templates {
                 template
@@ -2978,6 +2979,14 @@ impl PluginRegistry {
                     assert_eq!(
                         block.plugin_id, manifest.id,
                         "plugin workflow block owner must match manifest"
+                    );
+                    assert!(
+                        block_identities.insert((
+                            block.plugin_id.clone(),
+                            block.block_id.clone(),
+                            block.block_version,
+                        )),
+                        "plugin workflow block identity/version must be unique"
                     );
                     block
                         .validate()
@@ -5273,16 +5282,35 @@ mod tests {
             .iter()
             .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
             .expect("workflow block service");
-        assert_eq!(service.workflow_blocks.len(), 1);
-        let block = &service.workflow_blocks[0];
-        block.validate().expect("valid workflow block");
-        assert_eq!(block.block_id, "shell.command-plan");
-        assert_eq!(block.plugin_id, manifest.id);
-        assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::Mutating);
-        assert!(block.authorization.explicit_grant_required);
+        let blocks = &service.workflow_blocks;
+        assert_eq!(blocks.len(), 2);
+        for block in blocks {
+            block.validate().expect("valid workflow block");
+            assert_eq!(block.block_id, "shell.command-plan");
+            assert_eq!(block.plugin_id, manifest.id);
+            assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::Mutating);
+            assert!(block.authorization.explicit_grant_required);
+            assert_eq!(
+                block.reconciliation,
+                bcode_workflow::WorkflowBlockReconciliation::RepairRequired
+            );
+        }
         assert_eq!(
-            block.reconciliation,
-            bcode_workflow::WorkflowBlockReconciliation::RepairRequired
+            blocks
+                .iter()
+                .map(|block| block.block_version)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2])
+        );
+        assert_eq!(blocks[0].input.type_name, "bcode.shell.command-plan/v1");
+        assert_eq!(blocks[1].input.type_name, "bcode.shell.command-plan/v2");
+        assert_eq!(
+            blocks[0].output.type_name,
+            "bcode.shell.command-plan-result/v1"
+        );
+        assert_eq!(
+            blocks[1].output.type_name,
+            "bcode.shell.command-plan-result/v2"
         );
     }
 

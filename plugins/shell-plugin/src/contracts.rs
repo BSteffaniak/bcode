@@ -87,6 +87,7 @@ pub struct ShellWorkflowCommandPlan {
 #[serde(rename_all = "snake_case")]
 pub enum ShellWorkflowCommandStatus {
     Exited,
+    Signaled,
     SpawnFailed,
     TimedOut,
     Cancelled,
@@ -102,6 +103,10 @@ pub struct ShellWorkflowCommandResult {
     pub exit_code: Option<i32>,
     /// Exact accepted exit codes used to classify this command.
     pub accepted_exit_codes: Vec<i32>,
+    /// Whether an ordinary exited code was contained in `accepted_exit_codes`.
+    /// Version-1 results omit this field for exact compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_accepted: Option<bool>,
     pub signal: Option<i32>,
     pub duration_ms: u64,
     pub stdout_preview: String,
@@ -275,6 +280,7 @@ mod tests {
                 status: ShellWorkflowCommandStatus::Exited,
                 exit_code: Some(1),
                 accepted_exit_codes: vec![0],
+                exit_accepted: Some(false),
                 signal: None,
                 duration_ms: 12,
                 stdout_preview: String::new(),

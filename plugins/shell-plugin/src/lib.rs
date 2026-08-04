@@ -376,16 +376,18 @@ fn execute_workflow_command_plan(
         if context.cancellation.is_cancelled() {
             commands.push(cancelled_workflow_command_result(
                 index,
+                plan.version,
                 command_accepted_exit_codes(plan.version, command),
             ));
             break;
         }
         let (result, command_artifacts) =
             execute_workflow_command(context, invocation, plan, command, index, &cwd)?;
-        let accepted = command_accepted_exit_codes(plan.version, command);
-        let accepted_exit = result
-            .exit_code
-            .is_some_and(|exit_code| accepted.contains(&exit_code));
+        let accepted_exit = result.exit_accepted.unwrap_or_else(|| {
+            result
+                .exit_code
+                .is_some_and(|code| result.accepted_exit_codes.contains(&code))
+        });
         let continue_on_unaccepted = if plan.version == contracts::SHELL_COMMAND_PLAN_VERSION_1 {
             command.continue_on_nonzero
         } else {
@@ -401,15 +403,14 @@ fn execute_workflow_command_plan(
     }
     let _ = progress.finish();
     let passed = commands.len() == plan.commands.len()
-        && commands
-            .iter()
-            .zip(&plan.commands)
-            .all(|(result, command)| {
-                result.status == ShellWorkflowCommandStatus::Exited
-                    && result.exit_code.is_some_and(|exit_code| {
-                        command_accepted_exit_codes(plan.version, command).contains(&exit_code)
-                    })
-            });
+        && commands.iter().all(|result| {
+            result.status == ShellWorkflowCommandStatus::Exited
+                && result.exit_accepted.unwrap_or_else(|| {
+                    result
+                        .exit_code
+                        .is_some_and(|code| result.accepted_exit_codes.contains(&code))
+                })
+        });
     Ok(ShellWorkflowCommandPlanResult {
         version: plan.version,
         plan_sha256: canonical_command_plan_sha256(plan)?,
@@ -541,6 +542,7 @@ fn execute_workflow_command(
                     status: ShellWorkflowCommandStatus::SpawnFailed,
                     exit_code: None,
                     accepted_exit_codes,
+                    exit_accepted: None,
                     signal: None,
                     duration_ms: elapsed_millis(started),
                     stdout_preview: String::new(),
@@ -582,19 +584,33 @@ fn execute_workflow_command(
             outcome.stderr.bytes,
         )?);
     }
+    let (status, exit_code, signal) = if outcome.cancelled {
+        (ShellWorkflowCommandStatus::Cancelled, None, None)
+    } else if outcome.timed_out {
+        (ShellWorkflowCommandStatus::TimedOut, None, None)
+    } else {
+        match outcome.termination {
+            bcode_tool_runtime::ProcessTermination::Exited { code } => {
+                (ShellWorkflowCommandStatus::Exited, Some(code), None)
+            }
+            bcode_tool_runtime::ProcessTermination::Signaled { signal } => {
+                (ShellWorkflowCommandStatus::Signaled, None, Some(signal))
+            }
+            bcode_tool_runtime::ProcessTermination::Unknown => {
+                (ShellWorkflowCommandStatus::Signaled, None, None)
+            }
+        }
+    };
+    let exit_accepted = exit_code.is_some_and(|code| accepted_exit_codes.contains(&code));
     Ok((
         ShellWorkflowCommandResult {
             index: u32::try_from(index).map_err(|error| error.to_string())?,
-            status: if outcome.cancelled {
-                ShellWorkflowCommandStatus::Cancelled
-            } else if outcome.timed_out {
-                ShellWorkflowCommandStatus::TimedOut
-            } else {
-                ShellWorkflowCommandStatus::Exited
-            },
-            exit_code: outcome.exit_code,
+            status,
+            exit_code,
             accepted_exit_codes,
-            signal: None,
+            exit_accepted: (plan.version != contracts::SHELL_COMMAND_PLAN_VERSION_1)
+                .then_some(exit_accepted),
+            signal,
             duration_ms: outcome.duration_ms,
             stdout_preview,
             stderr_preview,
@@ -655,6 +671,7 @@ fn write_workflow_output_artifact(
 
 fn cancelled_workflow_command_result(
     index: usize,
+    plan_version: u32,
     accepted_exit_codes: Vec<i32>,
 ) -> ShellWorkflowCommandResult {
     ShellWorkflowCommandResult {
@@ -662,6 +679,7 @@ fn cancelled_workflow_command_result(
         status: ShellWorkflowCommandStatus::Cancelled,
         exit_code: None,
         accepted_exit_codes,
+        exit_accepted: (plan_version != contracts::SHELL_COMMAND_PLAN_VERSION_1).then_some(false),
         signal: None,
         duration_ms: 0,
         stdout_preview: String::new(),
@@ -2345,6 +2363,7 @@ mod tests {
         assert_eq!(result.version, contracts::SHELL_COMMAND_PLAN_VERSION);
         assert_eq!(result.commands[0].exit_code, Some(7));
         assert_eq!(result.commands[0].accepted_exit_codes, vec![0, 7]);
+        assert_eq!(result.commands[0].exit_accepted, Some(true));
 
         plan.commands = vec![
             command("exit 8", Some(vec![7]), true),
@@ -2362,6 +2381,7 @@ mod tests {
         assert!(!continued.passed);
         assert_eq!(continued.commands.len(), 2);
         assert_eq!(continued.commands[0].accepted_exit_codes, vec![7]);
+        assert_eq!(continued.commands[0].exit_accepted, Some(false));
     }
 
     #[cfg(unix)]
@@ -2439,6 +2459,44 @@ mod tests {
         .expect("success");
         assert!(success.passed);
         assert_eq!(success.commands.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_command_plan_reports_signal_termination() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (invocation, mut plan) = workflow_command_plan(
+            workspace.path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "kill -TERM $$".to_string(),
+                ],
+                timeout_ms: 1_000,
+                continue_on_nonzero: false,
+                accepted_exit_codes: None,
+                continue_on_unaccepted_exit: false,
+            }],
+        );
+        plan.version = contracts::SHELL_COMMAND_PLAN_VERSION;
+        let result = execute_workflow_command_plan(
+            &workflow_context(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            &invocation,
+            &plan,
+        )
+        .expect("signaled result");
+        assert!(!result.passed);
+        assert_eq!(
+            result.commands[0].status,
+            ShellWorkflowCommandStatus::Signaled
+        );
+        assert_eq!(result.commands[0].exit_code, None);
+        assert_eq!(result.commands[0].signal, Some(15));
+        assert_eq!(result.commands[0].exit_accepted, Some(false));
     }
 
     #[cfg(unix)]
@@ -2640,6 +2698,7 @@ mod tests {
                 status: ShellWorkflowCommandStatus::Exited,
                 exit_code: Some(7),
                 accepted_exit_codes: vec![0],
+                exit_accepted: Some(false),
                 signal: None,
                 duration_ms: 1,
                 stdout_preview: String::new(),

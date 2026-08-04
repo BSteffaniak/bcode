@@ -50,11 +50,22 @@ pub struct ProcessCapturedOutput {
     pub truncated: bool,
 }
 
+/// Normalized terminal process outcome owned by the managed process boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessTermination {
+    /// The process exited normally with an exact code.
+    Exited { code: i32 },
+    /// The process was terminated by a platform signal.
+    Signaled { signal: i32 },
+    /// The platform returned neither a normal exit code nor a supported signal identity.
+    Unknown,
+}
+
 /// Managed process execution result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessExecutionResult {
     pub id: ToolExecutionId,
-    pub exit_code: Option<i32>,
+    pub termination: ProcessTermination,
     pub timed_out: bool,
     pub cancelled: bool,
     pub duration_ms: u64,
@@ -355,7 +366,7 @@ async fn run_process_inner(
     };
     Ok(ProcessExecutionResult {
         id,
-        exit_code: status.code(),
+        termination: normalize_process_termination(status),
         timed_out,
         cancelled,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -368,6 +379,20 @@ async fn run_process_inner(
             truncated: stderr_truncated,
         },
     })
+}
+
+fn normalize_process_termination(status: std::process::ExitStatus) -> ProcessTermination {
+    if let Some(code) = status.code() {
+        return ProcessTermination::Exited { code };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return ProcessTermination::Signaled { signal };
+        }
+    }
+    ProcessTermination::Unknown
 }
 
 async fn wait_for_process(
@@ -714,6 +739,46 @@ mod tests {
             !marker.exists(),
             "cancelled descendant escaped the Windows Job Object"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_termination_distinguishes_exit_and_signal() {
+        let runtime = ToolExecutionRuntime::new(1);
+        let exited = runtime
+            .run_process(ProcessExecutionRequest {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "exit 7".to_string()],
+                cwd: None,
+                timeout: Some(Duration::from_secs(1)),
+                max_output_bytes: 1024,
+                inherit_environment: true,
+                environment: BTreeMap::new(),
+            })
+            .await
+            .expect("normal exit");
+        assert_eq!(exited.termination, ProcessTermination::Exited { code: 7 });
+        assert!(!exited.timed_out);
+        assert!(!exited.cancelled);
+
+        let signaled = runtime
+            .run_process(ProcessExecutionRequest {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "kill -TERM $$".to_string()],
+                cwd: None,
+                timeout: Some(Duration::from_secs(1)),
+                max_output_bytes: 1024,
+                inherit_environment: true,
+                environment: BTreeMap::new(),
+            })
+            .await
+            .expect("signal termination");
+        assert_eq!(
+            signaled.termination,
+            ProcessTermination::Signaled { signal: SIGTERM }
+        );
+        assert!(!signaled.timed_out);
+        assert!(!signaled.cancelled);
     }
 
     #[tokio::test]

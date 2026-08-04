@@ -45,7 +45,7 @@ pub const WORKFLOW_PRODUCTION_CAPABILITY_VERSION: u32 = 1;
 pub const WORKFLOW_REQUIREMENT_AVAILABILITY_VERSION: u32 = 1;
 
 /// Stable deterministic predicate contract version.
-pub const WORKFLOW_PREDICATE_VERSION: u32 = 2;
+pub const WORKFLOW_PREDICATE_VERSION: u32 = 3;
 /// Earliest deterministic predicate contract version retained for compatibility.
 pub const WORKFLOW_PREDICATE_MIN_VERSION: u32 = 1;
 
@@ -54,6 +54,12 @@ const MAX_PREDICATE_OPERATIONS: usize = 256;
 const MAX_PREDICATE_PATH_BYTES: usize = 512;
 const MAX_PREDICATE_PATH_SEGMENT_BYTES: usize = 256;
 const MAX_PREDICATE_VALUE_BYTES: usize = 65_536;
+/// Stable typed structured-value selector contract version.
+pub const WORKFLOW_VALUE_SELECTOR_VERSION: u32 = 1;
+const MAX_VALUE_SELECTOR_SEGMENTS: usize = 64;
+const MAX_VALUE_SELECTOR_FIELD_BYTES: usize = 256;
+const MAX_VALUE_SELECTOR_INDEX: usize = 1_000_000;
+const WORKFLOW_TOML_NULL_MARKER: &str = "$bcode_null";
 
 /// Stable plugin workflow-block interface version.
 pub const WORKFLOW_BLOCK_INTERFACE_VERSION: u32 = 1;
@@ -1341,7 +1347,9 @@ impl<T> WorkflowFanOutResult<T> {
 }
 
 /// Stable durable transform contract version.
-pub const WORKFLOW_TRANSFORM_VERSION: u32 = 1;
+pub const WORKFLOW_TRANSFORM_VERSION: u32 = 2;
+/// Earliest declarative transform contract version retained for compatibility.
+pub const WORKFLOW_TRANSFORM_MIN_VERSION: u32 = 1;
 
 /// Durable transform source containing the output that selected the successor edge.
 pub const WORKFLOW_TRANSFORM_SOURCE_CURRENT: &str = "current";
@@ -3613,6 +3621,134 @@ pub fn workflow_authoring_semantic_diff(
         before_effects: before_compiled.effects,
         after_effects: after_compiled.effects,
     })
+}
+
+/// Portable source encoding for one [`WorkflowAuthoringDocument`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSourceFormat {
+    /// JavaScript Object Notation.
+    Json,
+    /// TOML 1.x document syntax.
+    Toml,
+}
+
+impl WorkflowSourceFormat {
+    /// Infer one exact supported format from a source-file name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file name does not end in `.json`, `.workflow.json`, `.toml`, or
+    /// `.workflow.toml`. The function never guesses by trying multiple parsers.
+    pub fn from_file_name(file_name: &str) -> Result<Self, WorkflowError> {
+        let normalized = file_name.to_ascii_lowercase();
+        if normalized.ends_with(".workflow.json") || normalized.ends_with(".json") {
+            return Ok(Self::Json);
+        }
+        if normalized.ends_with(".workflow.toml") || normalized.ends_with(".toml") {
+            return Ok(Self::Toml);
+        }
+        Err(authoring_error(
+            "source.format",
+            "workflow source format requires an explicit format or a .json/.toml file name",
+        ))
+    }
+}
+
+/// Decode and semantically validate one bounded authored-workflow source document.
+///
+/// JSON and TOML are adapters into the same [`WorkflowAuthoringDocument`]. No format-specific
+/// value is retained after decoding.
+///
+/// # Errors
+///
+/// Returns a source-addressed error when the input exceeds the authoring document bound, contains
+/// malformed syntax, uses unknown fields or unsupported versions, or fails workflow validation.
+pub fn decode_workflow_authoring_source(
+    source: &str,
+    format: WorkflowSourceFormat,
+) -> Result<WorkflowAuthoringDocument, WorkflowError> {
+    if source.len() > MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
+        return Err(authoring_error(
+            "source",
+            format!("workflow source exceeds {MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES} bytes"),
+        ));
+    }
+    let document: WorkflowAuthoringDocument = match format {
+        WorkflowSourceFormat::Json => serde_json::from_str(source).map_err(|error| {
+            authoring_error(
+                "source.json",
+                format!(
+                    "invalid JSON workflow source at line {}, column {}: {error}",
+                    error.line(),
+                    error.column()
+                ),
+            )
+        })?,
+        WorkflowSourceFormat::Toml => {
+            let mut value: serde_json::Value = toml::from_str(source).map_err(|error| {
+                let location = error.span().map_or_else(String::new, |span| {
+                    format!(" at byte range {}..{}", span.start, span.end)
+                });
+                authoring_error(
+                    "source.toml",
+                    format!("invalid TOML workflow source{location}: {error}"),
+                )
+            })?;
+            decode_workflow_toml_null_markers(&mut value, 0)?;
+            serde_json::from_value(value).map_err(|error| {
+                authoring_error(
+                    "source.toml",
+                    format!("invalid TOML workflow document: {error}"),
+                )
+            })?
+        }
+    };
+    document.validate()?;
+    Ok(document)
+}
+
+fn decode_workflow_toml_null_markers(
+    value: &mut serde_json::Value,
+    depth: usize,
+) -> Result<(), WorkflowError> {
+    if depth > MAX_WORKFLOW_AUTHORING_JSON_DEPTH {
+        return Err(authoring_error(
+            "source.toml",
+            format!("TOML value depth exceeds {MAX_WORKFLOW_AUTHORING_JSON_DEPTH}"),
+        ));
+    }
+    match value {
+        serde_json::Value::Object(fields) => {
+            if fields.len() == 1
+                && fields.get(WORKFLOW_TOML_NULL_MARKER) == Some(&serde_json::json!(true))
+            {
+                *value = serde_json::Value::Null;
+                return Ok(());
+            }
+            if fields.contains_key(WORKFLOW_TOML_NULL_MARKER) {
+                return Err(authoring_error(
+                    "source.toml",
+                    format!(
+                        "reserved TOML null marker '{WORKFLOW_TOML_NULL_MARKER}' must be the only field and equal true"
+                    ),
+                ));
+            }
+            for value in fields.values_mut() {
+                decode_workflow_toml_null_markers(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for value in items {
+                decode_workflow_toml_null_markers(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+    Ok(())
 }
 
 /// Portable source contract for one runtime-authored workflow.
@@ -6288,6 +6424,108 @@ pub enum PredicateNumericComparison {
     GreaterThanOrEqual,
 }
 
+/// One explicit segment in a bounded structured-value selector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowValueSelectorSegment {
+    /// Select one exact object field.
+    Field { name: String },
+    /// Select one exact array member by zero-based index.
+    Index { index: usize },
+}
+
+/// Versioned, bounded selector shared by generic predicates and transforms.
+///
+/// An empty segment list selects the complete input value. Field and index segments are explicit,
+/// so numeric object keys are never confused with array indices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowValueSelector {
+    /// Selector contract version.
+    pub version: u32,
+    /// Ordered traversal from the input root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<WorkflowValueSelectorSegment>,
+}
+
+impl WorkflowValueSelector {
+    /// Validate this selector's version and durable bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, excessive segments, empty/oversized fields, or
+    /// indices above the durable bound.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_VALUE_SELECTOR_VERSION {
+            return Err(WorkflowError::Build {
+                path: "selector.version".to_string(),
+                message: format!(
+                    "unsupported workflow value selector version {}; expected {}",
+                    self.version, WORKFLOW_VALUE_SELECTOR_VERSION
+                ),
+            });
+        }
+        if self.segments.len() > MAX_VALUE_SELECTOR_SEGMENTS {
+            return Err(WorkflowError::Build {
+                path: "selector.segments".to_string(),
+                message: format!("value selector exceeds {MAX_VALUE_SELECTOR_SEGMENTS} segments"),
+            });
+        }
+        for (position, segment) in self.segments.iter().enumerate() {
+            match segment {
+                WorkflowValueSelectorSegment::Field { name }
+                    if name.is_empty() || name.len() > MAX_VALUE_SELECTOR_FIELD_BYTES =>
+                {
+                    return Err(WorkflowError::Build {
+                        path: format!("selector.segments.{position}"),
+                        message: format!(
+                            "selector field must contain 1..={MAX_VALUE_SELECTOR_FIELD_BYTES} bytes"
+                        ),
+                    });
+                }
+                WorkflowValueSelectorSegment::Index { index }
+                    if *index > MAX_VALUE_SELECTOR_INDEX =>
+                {
+                    return Err(WorkflowError::Build {
+                        path: format!("selector.segments.{position}"),
+                        message: format!(
+                            "selector index exceeds durable maximum {MAX_VALUE_SELECTOR_INDEX}"
+                        ),
+                    });
+                }
+                WorkflowValueSelectorSegment::Field { .. }
+                | WorkflowValueSelectorSegment::Index { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn select<'a>(
+        &self,
+        value: &'a serde_json::Value,
+    ) -> Result<&'a serde_json::Value, WorkflowError> {
+        self.validate()?;
+        let mut selected = value;
+        for (position, segment) in self.segments.iter().enumerate() {
+            selected = match segment {
+                WorkflowValueSelectorSegment::Field { name } => {
+                    selected.get(name).ok_or_else(|| WorkflowError::Build {
+                        path: format!("selector.segments.{position}"),
+                        message: format!("selected object field '{name}' was not present"),
+                    })?
+                }
+                WorkflowValueSelectorSegment::Index { index } => {
+                    selected.get(*index).ok_or_else(|| WorkflowError::Build {
+                        path: format!("selector.segments.{position}"),
+                        message: format!("selected array index {index} was not present"),
+                    })?
+                }
+            };
+        }
+        Ok(selected)
+    }
+}
+
 /// Serializable deterministic predicate over a structured workflow value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -6342,6 +6580,35 @@ pub enum PredicateExpression {
         /// Ordering relation that must hold.
         comparison: PredicateNumericComparison,
     },
+    /// Compare a value selected with explicit field/index segments to one constant.
+    SelectedEquals {
+        /// Predicate contract version. This operation requires version 3.
+        version: u32,
+        /// Explicit structured-value selector.
+        selector: WorkflowValueSelector,
+        /// Expected JSON value.
+        value: serde_json::Value,
+    },
+    /// Compare two values selected from the same input with explicit field/index segments.
+    SelectedValuesEqual {
+        /// Predicate contract version. This operation requires version 3.
+        version: u32,
+        /// Left structured-value selector.
+        left_selector: WorkflowValueSelector,
+        /// Right structured-value selector.
+        right_selector: WorkflowValueSelector,
+    },
+    /// Compare two selected numeric values using an exact ordering operation.
+    SelectedNumericCompare {
+        /// Predicate contract version. This operation requires version 3.
+        version: u32,
+        /// Left structured-value selector.
+        left_selector: WorkflowValueSelector,
+        /// Right structured-value selector.
+        right_selector: WorkflowValueSelector,
+        /// Ordering relation that must hold.
+        comparison: PredicateNumericComparison,
+    },
 }
 
 impl PredicateExpression {
@@ -6362,7 +6629,10 @@ impl PredicateExpression {
             | Self::All { version, .. }
             | Self::Any { version, .. }
             | Self::Not { version, .. }
-            | Self::NumericCompare { version, .. } => *version,
+            | Self::NumericCompare { version, .. }
+            | Self::SelectedEquals { version, .. }
+            | Self::SelectedValuesEqual { version, .. }
+            | Self::SelectedNumericCompare { version, .. } => *version,
         }
     }
 
@@ -6433,41 +6703,87 @@ impl PredicateExpression {
                 left_path,
                 right_path,
                 comparison,
+            } => evaluate_numeric_predicate_values(
+                predicate_value_at_path(value, left_path)?,
+                predicate_value_at_path(value, right_path)?,
+                comparison,
+                left_path,
+                right_path,
+            ),
+            Self::SelectedEquals {
+                version: _,
+                selector,
+                value: expected,
             } => {
-                let left_value = predicate_value_at_path(value, left_path)?;
-                let right_value = predicate_value_at_path(value, right_path)?;
-                let serde_json::Value::Number(left) = left_value else {
-                    return Err(WorkflowError::Build {
-                        path: left_path.clone(),
-                        message: format!(
-                            "numeric predicate expected number, found {}",
-                            predicate_value_kind(left_value)
-                        ),
-                    });
-                };
-                let serde_json::Value::Number(right) = right_value else {
-                    return Err(WorkflowError::Build {
-                        path: right_path.clone(),
-                        message: format!(
-                            "numeric predicate expected number, found {}",
-                            predicate_value_kind(right_value)
-                        ),
-                    });
-                };
-                let ordering =
-                    compare_json_numbers(left, right).ok_or_else(|| WorkflowError::Build {
-                        path: format!("{left_path},{right_path}"),
-                        message: "numeric predicate values cannot be compared exactly".to_string(),
-                    })?;
-                Ok(match comparison {
-                    PredicateNumericComparison::LessThan => ordering.is_lt(),
-                    PredicateNumericComparison::LessThanOrEqual => !ordering.is_gt(),
-                    PredicateNumericComparison::GreaterThan => ordering.is_gt(),
-                    PredicateNumericComparison::GreaterThanOrEqual => !ordering.is_lt(),
-                })
+                let actual = selector.select(value)?;
+                if !predicate_values_compatible(actual, expected) {
+                    return Err(predicate_type_mismatch("selector", actual, expected));
+                }
+                Ok(actual == expected)
             }
+            Self::SelectedValuesEqual {
+                version: _,
+                left_selector,
+                right_selector,
+            } => {
+                let left = left_selector.select(value)?;
+                let right = right_selector.select(value)?;
+                if !predicate_values_compatible(left, right) {
+                    return Err(predicate_type_mismatch("selector", left, right));
+                }
+                Ok(left == right)
+            }
+            Self::SelectedNumericCompare {
+                version: _,
+                left_selector,
+                right_selector,
+                comparison,
+            } => evaluate_numeric_predicate_values(
+                left_selector.select(value)?,
+                right_selector.select(value)?,
+                comparison,
+                "left_selector",
+                "right_selector",
+            ),
         }
     }
+}
+
+fn evaluate_numeric_predicate_values(
+    left_value: &serde_json::Value,
+    right_value: &serde_json::Value,
+    comparison: &PredicateNumericComparison,
+    left_path: &str,
+    right_path: &str,
+) -> Result<bool, WorkflowError> {
+    let serde_json::Value::Number(left) = left_value else {
+        return Err(WorkflowError::Build {
+            path: left_path.to_string(),
+            message: format!(
+                "numeric predicate expected number, found {}",
+                predicate_value_kind(left_value)
+            ),
+        });
+    };
+    let serde_json::Value::Number(right) = right_value else {
+        return Err(WorkflowError::Build {
+            path: right_path.to_string(),
+            message: format!(
+                "numeric predicate expected number, found {}",
+                predicate_value_kind(right_value)
+            ),
+        });
+    };
+    let ordering = compare_json_numbers(left, right).ok_or_else(|| WorkflowError::Build {
+        path: format!("{left_path},{right_path}"),
+        message: "numeric predicate values cannot be compared exactly".to_string(),
+    })?;
+    Ok(match comparison {
+        PredicateNumericComparison::LessThan => ordering.is_lt(),
+        PredicateNumericComparison::LessThanOrEqual => !ordering.is_gt(),
+        PredicateNumericComparison::GreaterThan => ordering.is_gt(),
+        PredicateNumericComparison::GreaterThanOrEqual => !ordering.is_lt(),
+    })
 }
 
 fn predicate_value_at_path<'a>(
@@ -6631,6 +6947,13 @@ pub enum WorkflowTransformExpression {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         path: String,
     },
+    /// Select a named input using explicit field/index segments.
+    SelectedInput {
+        /// Stable input source name.
+        source: String,
+        /// Explicit structured-value selector. This operation requires transform version 2.
+        selector: WorkflowValueSelector,
+    },
     /// Embed one bounded JSON constant.
     Constant { value: serde_json::Value },
     /// Construct an object from explicit deterministic field expressions.
@@ -6708,12 +7031,12 @@ impl WorkflowTransform {
     ///
     /// Returns an error for unsupported versions, invalid output schemas, or expression bounds.
     pub fn validate(&self) -> Result<(), WorkflowError> {
-        if self.version != WORKFLOW_TRANSFORM_VERSION {
+        if !(WORKFLOW_TRANSFORM_MIN_VERSION..=WORKFLOW_TRANSFORM_VERSION).contains(&self.version) {
             return Err(WorkflowError::Build {
                 path: "transform.version".to_string(),
                 message: format!(
-                    "unsupported workflow transform version {}; expected {}",
-                    self.version, WORKFLOW_TRANSFORM_VERSION
+                    "unsupported workflow transform version {}; expected {} through {}",
+                    self.version, WORKFLOW_TRANSFORM_MIN_VERSION, WORKFLOW_TRANSFORM_VERSION
                 ),
             });
         }
@@ -6722,11 +7045,12 @@ impl WorkflowTransform {
             message: format!("invalid transform output schema: {error}"),
         })?;
         let mut operations = 0_usize;
-        validate_transform_expression(&self.expression, 0, &mut operations)
+        validate_transform_expression(self.version, &self.expression, 0, &mut operations)
     }
 }
 
 fn validate_transform_expression(
+    version: u32,
     expression: &WorkflowTransformExpression,
     depth: usize,
     operations: &mut usize,
@@ -6740,6 +7064,21 @@ fn validate_transform_expression(
                     message: "transform input source/path exceeds bounds".to_string(),
                 });
             }
+        }
+        WorkflowTransformExpression::SelectedInput { source, selector } => {
+            if version < 2 {
+                return Err(WorkflowError::Build {
+                    path: "transform.selected_input".to_string(),
+                    message: "selected input requires transform version 2".to_string(),
+                });
+            }
+            if source.trim().is_empty() || source.len() > 256 {
+                return Err(WorkflowError::Build {
+                    path: "transform.selected_input".to_string(),
+                    message: "transform input source exceeds bounds".to_string(),
+                });
+            }
+            selector.validate()?;
         }
         WorkflowTransformExpression::Constant { value } => {
             ensure_transform_value_bound("transform.constant", value)?;
@@ -6756,7 +7095,7 @@ fn validate_transform_expression(
                 });
             }
             for value in fields.values() {
-                validate_transform_expression(value, depth + 1, operations)?;
+                validate_transform_expression(version, value, depth + 1, operations)?;
             }
         }
         WorkflowTransformExpression::Array { items }
@@ -6768,15 +7107,15 @@ fn validate_transform_expression(
                 });
             }
             for value in items {
-                validate_transform_expression(value, depth + 1, operations)?;
+                validate_transform_expression(version, value, depth + 1, operations)?;
             }
         }
         WorkflowTransformExpression::Increment { value, .. } => {
-            validate_transform_expression(value, depth + 1, operations)?;
+            validate_transform_expression(version, value, depth + 1, operations)?;
         }
         WorkflowTransformExpression::Default { value, default } => {
-            validate_transform_expression(value, depth + 1, operations)?;
-            validate_transform_expression(default, depth + 1, operations)?;
+            validate_transform_expression(version, value, depth + 1, operations)?;
+            validate_transform_expression(version, default, depth + 1, operations)?;
         }
     }
     Ok(())
@@ -6827,6 +7166,15 @@ fn evaluate_transform_expression(
                     path: path.clone(),
                     message: "transform input field was not present".to_string(),
                 })
+        }
+        WorkflowTransformExpression::SelectedInput { source, selector } => {
+            let source = inputs
+                .get(source.as_str())
+                .ok_or_else(|| WorkflowError::Build {
+                    path: source.clone(),
+                    message: "transform references an unknown named input".to_string(),
+                })?;
+            selector.select(source).cloned()
         }
         WorkflowTransformExpression::Constant { value } => Ok(value.clone()),
         WorkflowTransformExpression::Object { fields } => fields
@@ -7090,7 +7438,9 @@ impl WorkflowDefinition {
                         ),
                     });
                 }
-                if capabilities.transform_version != Some(transform.version) {
+                if capabilities.transform_version.is_none_or(|supported| {
+                    !(WORKFLOW_TRANSFORM_MIN_VERSION..=supported).contains(&transform.version)
+                }) {
                     diagnostics.push(WorkflowCapabilityDiagnostic {
                         code: "unsupported_transform_version".to_string(),
                         node_id: Some(edge.from.clone()),
@@ -9075,6 +9425,40 @@ fn validate_predicate_expression_inner(
             validate_predicate_path(left_path)?;
             validate_predicate_path(right_path)?;
         }
+        PredicateExpression::SelectedEquals {
+            selector, value, ..
+        } => {
+            if version < 3 {
+                return Err(predicate_operation_requires_version_three(expression));
+            }
+            selector.validate()?;
+            let encoded = serde_json::to_vec(value).map_err(|error| WorkflowError::Build {
+                path: "selector".to_string(),
+                message: format!("predicate value cannot be serialized: {error}"),
+            })?;
+            if encoded.len() > MAX_PREDICATE_VALUE_BYTES {
+                return Err(WorkflowError::Build {
+                    path: "selector".to_string(),
+                    message: format!("predicate value exceeds {MAX_PREDICATE_VALUE_BYTES} bytes"),
+                });
+            }
+        }
+        PredicateExpression::SelectedValuesEqual {
+            left_selector,
+            right_selector,
+            ..
+        }
+        | PredicateExpression::SelectedNumericCompare {
+            left_selector,
+            right_selector,
+            ..
+        } => {
+            if version < 3 {
+                return Err(predicate_operation_requires_version_three(expression));
+            }
+            left_selector.validate()?;
+            right_selector.validate()?;
+        }
         PredicateExpression::All { predicates, .. }
         | PredicateExpression::Any { predicates, .. } => {
             if version < 2 {
@@ -9119,6 +9503,16 @@ fn predicate_operation_requires_version_two(expression: &PredicateExpression) ->
         path: "predicate".to_string(),
         message: format!(
             "predicate operation requires version 2, found {}",
+            expression.version()
+        ),
+    }
+}
+
+fn predicate_operation_requires_version_three(expression: &PredicateExpression) -> WorkflowError {
+    WorkflowError::Build {
+        path: "predicate".to_string(),
+        message: format!(
+            "predicate operation requires version 3, found {}",
             expression.version()
         ),
     }
@@ -9492,6 +9886,107 @@ mod tests {
                 )]),
             }),
         }
+    }
+
+    #[test]
+    fn workflow_authoring_sources_decode_json_and_toml_to_identical_semantics() {
+        let document = authored_document();
+        let json = serde_json::to_string_pretty(&document).expect("JSON source");
+        fn encode_toml_nulls(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for value in fields.values_mut() {
+                        encode_toml_nulls(value);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for value in items {
+                        encode_toml_nulls(value);
+                    }
+                }
+                serde_json::Value::Null => {
+                    *value = serde_json::json!({WORKFLOW_TOML_NULL_MARKER: true});
+                }
+                serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::String(_) => {}
+            }
+        }
+        let mut toml_value = serde_json::to_value(&document).expect("TOML value");
+        encode_toml_nulls(&mut toml_value);
+        let toml = toml::to_string_pretty(&toml_value).expect("TOML source");
+        let from_json = decode_workflow_authoring_source(&json, WorkflowSourceFormat::Json)
+            .expect("decode JSON source");
+        let from_toml = decode_workflow_authoring_source(&toml, WorkflowSourceFormat::Toml)
+            .expect("decode TOML source");
+        assert_eq!(from_json, document);
+        assert_eq!(from_toml, document);
+        assert_eq!(
+            from_json.source_digest_sha256().expect("JSON digest"),
+            from_toml.source_digest_sha256().expect("TOML digest")
+        );
+        assert_eq!(
+            from_json
+                .executable_source_digest_sha256()
+                .expect("JSON executable digest"),
+            from_toml
+                .executable_source_digest_sha256()
+                .expect("TOML executable digest")
+        );
+        assert_eq!(
+            from_json.compilation_preview(&authoring_catalog(), None),
+            from_toml.compilation_preview(&authoring_catalog(), None)
+        );
+        assert_eq!(
+            WorkflowSourceFormat::from_file_name("check.workflow.json").expect("JSON extension"),
+            WorkflowSourceFormat::Json
+        );
+        assert_eq!(
+            WorkflowSourceFormat::from_file_name("check.workflow.toml").expect("TOML extension"),
+            WorkflowSourceFormat::Toml
+        );
+    }
+
+    #[test]
+    fn workflow_authoring_sources_fail_closed_for_syntax_versions_fields_and_bounds() {
+        assert!(
+            decode_workflow_authoring_source("{", WorkflowSourceFormat::Json)
+                .expect_err("malformed JSON")
+                .to_string()
+                .contains("line 1")
+        );
+        assert!(
+            decode_workflow_authoring_source("workflow_id = [", WorkflowSourceFormat::Toml)
+                .expect_err("malformed TOML")
+                .to_string()
+                .contains("byte range")
+        );
+        let mut future = serde_json::to_value(authored_document()).expect("document value");
+        future["schema_version"] = serde_json::json!(WORKFLOW_AUTHORING_DOCUMENT_VERSION + 1);
+        assert!(
+            decode_workflow_authoring_source(
+                &serde_json::to_string(&future).expect("future source"),
+                WorkflowSourceFormat::Json,
+            )
+            .is_err()
+        );
+        future["schema_version"] = serde_json::json!(WORKFLOW_AUTHORING_DOCUMENT_VERSION);
+        future["unknown"] = serde_json::json!(true);
+        assert!(
+            decode_workflow_authoring_source(
+                &serde_json::to_string(&future).expect("unknown source"),
+                WorkflowSourceFormat::Json,
+            )
+            .is_err()
+        );
+        assert!(
+            decode_workflow_authoring_source(
+                &" ".repeat(MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES + 1),
+                WorkflowSourceFormat::Json,
+            )
+            .is_err()
+        );
+        assert!(WorkflowSourceFormat::from_file_name("workflow.yaml").is_err());
     }
 
     #[test]
@@ -11221,6 +11716,165 @@ mod tests {
     }
 
     #[test]
+    fn typed_value_selectors_support_objects_arrays_and_whole_values() {
+        let input = serde_json::json!({
+            "commands": [
+                {"status": "exited", "exit_code": 7},
+                {"status": "exited", "exit_code": 0}
+            ],
+            "expected": 7
+        });
+        let command_exit = WorkflowValueSelector {
+            version: WORKFLOW_VALUE_SELECTOR_VERSION,
+            segments: vec![
+                WorkflowValueSelectorSegment::Field {
+                    name: "commands".to_string(),
+                },
+                WorkflowValueSelectorSegment::Index { index: 0 },
+                WorkflowValueSelectorSegment::Field {
+                    name: "exit_code".to_string(),
+                },
+            ],
+        };
+        let expected = WorkflowValueSelector {
+            version: WORKFLOW_VALUE_SELECTOR_VERSION,
+            segments: vec![WorkflowValueSelectorSegment::Field {
+                name: "expected".to_string(),
+            }],
+        };
+        assert!(
+            PredicateExpression::SelectedEquals {
+                version: WORKFLOW_PREDICATE_VERSION,
+                selector: command_exit.clone(),
+                value: serde_json::json!(7),
+            }
+            .evaluate_value(&input)
+            .expect("selected equality")
+        );
+        assert!(
+            PredicateExpression::SelectedValuesEqual {
+                version: WORKFLOW_PREDICATE_VERSION,
+                left_selector: command_exit.clone(),
+                right_selector: expected.clone(),
+            }
+            .evaluate_value(&input)
+            .expect("selected values equality")
+        );
+        assert!(
+            PredicateExpression::SelectedNumericCompare {
+                version: WORKFLOW_PREDICATE_VERSION,
+                left_selector: command_exit.clone(),
+                right_selector: WorkflowValueSelector {
+                    version: WORKFLOW_VALUE_SELECTOR_VERSION,
+                    segments: vec![
+                        WorkflowValueSelectorSegment::Field {
+                            name: "commands".to_string(),
+                        },
+                        WorkflowValueSelectorSegment::Index { index: 1 },
+                        WorkflowValueSelectorSegment::Field {
+                            name: "exit_code".to_string(),
+                        },
+                    ],
+                },
+                comparison: PredicateNumericComparison::GreaterThan,
+            }
+            .evaluate_value(&input)
+            .expect("selected numeric comparison")
+        );
+
+        let transform = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::SelectedInput {
+                source: WORKFLOW_TRANSFORM_SOURCE_CURRENT.to_string(),
+                selector: command_exit,
+            },
+            output: ValueSchema {
+                type_name: "exit-code/v1".to_string(),
+                schema: serde_json::json!({"type": "integer"}),
+            },
+        };
+        assert_eq!(
+            transform
+                .evaluate(&[WorkflowTransformInput {
+                    name: WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &input,
+                }])
+                .expect("selected transform"),
+            serde_json::json!(7)
+        );
+        let whole = WorkflowValueSelector {
+            version: WORKFLOW_VALUE_SELECTOR_VERSION,
+            segments: Vec::new(),
+        };
+        assert_eq!(whole.select(&input).expect("whole value"), &input);
+        let version_one = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_MIN_VERSION,
+            expression: WorkflowTransformExpression::SelectedInput {
+                source: WORKFLOW_TRANSFORM_SOURCE_CURRENT.to_string(),
+                selector: whole,
+            },
+            output: ValueSchema {
+                type_name: "object/v1".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            },
+        };
+        assert!(version_one.validate().is_err());
+    }
+
+    #[test]
+    fn typed_value_selectors_reject_missing_invalid_and_unbounded_segments() {
+        let input = serde_json::json!({"commands": []});
+        let missing = WorkflowValueSelector {
+            version: WORKFLOW_VALUE_SELECTOR_VERSION,
+            segments: vec![
+                WorkflowValueSelectorSegment::Field {
+                    name: "commands".to_string(),
+                },
+                WorkflowValueSelectorSegment::Index { index: 0 },
+            ],
+        };
+        assert!(missing.select(&input).is_err());
+        assert!(
+            WorkflowValueSelector {
+                version: WORKFLOW_VALUE_SELECTOR_VERSION + 1,
+                segments: Vec::new(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            WorkflowValueSelector {
+                version: WORKFLOW_VALUE_SELECTOR_VERSION,
+                segments: vec![WorkflowValueSelectorSegment::Field {
+                    name: String::new(),
+                }],
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            WorkflowValueSelector {
+                version: WORKFLOW_VALUE_SELECTOR_VERSION,
+                segments: vec![WorkflowValueSelectorSegment::Index {
+                    index: MAX_VALUE_SELECTOR_INDEX + 1,
+                }],
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            WorkflowValueSelector {
+                version: WORKFLOW_VALUE_SELECTOR_VERSION,
+                segments: (0..=MAX_VALUE_SELECTOR_SEGMENTS)
+                    .map(|index| WorkflowValueSelectorSegment::Index { index })
+                    .collect(),
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn declarative_transforms_cover_projection_construction_merge_defaults_and_bounds() {
         let state = serde_json::json!({
@@ -11402,7 +12056,7 @@ mod tests {
                 .is_err()
         );
         let unsupported = WorkflowTransform {
-            version: 2,
+            version: WORKFLOW_TRANSFORM_VERSION + 1,
             expression: unknown.expression.clone(),
             output: unknown.output,
         };
