@@ -310,13 +310,20 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
                 || command.argv.len() > 256
                 || command.timeout_ms == 0
                 || command.timeout_ms > 300_000
-                || command
-                    .accepted_exit_codes
-                    .as_ref()
-                    .is_some_and(|codes| codes.is_empty() || codes.len() > 64)
+                || command.accepted_exit_codes.as_ref().is_some_and(|codes| {
+                    codes.is_empty()
+                        || codes.len() > 64
+                        || codes
+                            .iter()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len()
+                            != codes.len()
+                })
                 || plan.version == contracts::SHELL_COMMAND_PLAN_VERSION_1
                     && (command.accepted_exit_codes.is_some()
                         || command.continue_on_unaccepted_exit)
+                || plan.version == contracts::SHELL_COMMAND_PLAN_VERSION
+                    && command.continue_on_nonzero
         })
         || plan.environment.set.len() > 128
         || plan.output.preview_bytes > 65_536
@@ -336,8 +343,26 @@ const SHELL_WORKFLOW_ARTIFACT_CONTENT_TYPE: &str = "application/octet-stream";
 const SHELL_WORKFLOW_STDOUT_SCHEMA: &str = "bcode.shell.command-plan.stdout";
 const SHELL_WORKFLOW_STDERR_SCHEMA: &str = "bcode.shell.command-plan.stderr";
 
+fn normalized_command_plan(plan: &ShellWorkflowCommandPlan) -> ShellWorkflowCommandPlan {
+    let mut normalized = plan.clone();
+    if normalized.version == contracts::SHELL_COMMAND_PLAN_VERSION {
+        for command in &mut normalized.commands {
+            let mut codes = command
+                .accepted_exit_codes
+                .take()
+                .unwrap_or_else(|| vec![0]);
+            codes.sort_unstable();
+            codes.dedup();
+            command.accepted_exit_codes = Some(codes);
+            command.continue_on_nonzero = false;
+        }
+    }
+    normalized
+}
+
 fn canonical_command_plan_sha256(plan: &ShellWorkflowCommandPlan) -> Result<String, String> {
-    let normalized = serde_json::to_vec(plan)
+    let normalized = normalized_command_plan(plan);
+    let normalized = serde_json::to_vec(&normalized)
         .map_err(|error| format!("failed to encode canonical shell command plan: {error}"))?;
     Ok(format!("{:x}", Sha256::digest(normalized)))
 }
@@ -2674,6 +2699,15 @@ mod tests {
         let first = canonical_command_plan_sha256(&plan).expect("digest");
         assert_eq!(first, canonical_command_plan_sha256(&plan).expect("digest"));
         assert_eq!(first.len(), 64);
+        let mut explicit_default = plan.clone();
+        explicit_default.version = contracts::SHELL_COMMAND_PLAN_VERSION;
+        explicit_default.commands[0].accepted_exit_codes = Some(vec![0]);
+        let mut implicit_default = explicit_default.clone();
+        implicit_default.commands[0].accepted_exit_codes = None;
+        assert_eq!(
+            canonical_command_plan_sha256(&explicit_default).expect("explicit default"),
+            canonical_command_plan_sha256(&implicit_default).expect("implicit default")
+        );
         let mut changed = plan;
         changed.commands[0].timeout_ms = 2_000;
         assert_ne!(

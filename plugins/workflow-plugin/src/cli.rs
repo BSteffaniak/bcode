@@ -21,6 +21,12 @@ struct WorkflowCli {
     /// Exact positive definition version.
     #[arg(long)]
     version: Option<u32>,
+    /// Path to an editable JSON or TOML `WorkflowAuthoringDocument` source file.
+    #[arg(long)]
+    source: Option<PathBuf>,
+    /// Explicit source format (`json` or `toml`); otherwise inferred from the file name.
+    #[arg(long)]
+    source_format: Option<String>,
     /// Path to a compiled workflow definition JSON document for registration.
     #[arg(long)]
     definition: Option<PathBuf>,
@@ -108,6 +114,35 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
                 _ => "definition_version",
             };
             args.insert(key.to_string(), version.to_string());
+        }
+        if let Some(path) = cli.source {
+            let source = std::fs::read_to_string(&path)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+            let format = match cli.source_format.as_deref() {
+                Some("json") => bcode_workflow::WorkflowSourceFormat::Json,
+                Some("toml") => bcode_workflow::WorkflowSourceFormat::Toml,
+                Some(format) => {
+                    return Err(format!("unsupported workflow source format '{format}'"));
+                }
+                None => bcode_workflow::WorkflowSourceFormat::from_file_name(
+                    path.file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .ok_or_else(|| {
+                            "workflow source file name is not valid UTF-8".to_string()
+                        })?,
+                )
+                .map_err(|error| error.to_string())?,
+            };
+            let document = bcode_workflow::decode_workflow_authoring_source(&source, format)
+                .map_err(|error| error.to_string())?;
+            args.insert(
+                "source_document".to_string(),
+                serde_json::to_string(&document).map_err(|error| error.to_string())?,
+            );
+            args.insert(
+                "source_format".to_string(),
+                serde_json::to_string(&format).map_err(|error| error.to_string())?,
+            );
         }
         if let Some(path) = cli.definition {
             let definition = std::fs::read_to_string(&path)

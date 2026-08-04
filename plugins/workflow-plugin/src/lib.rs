@@ -324,6 +324,21 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Start a validated workflow template",
         ),
         (
+            "workflow.author-check",
+            "Workflow: Check Source",
+            "Validate and compile-preview one authored workflow source",
+        ),
+        (
+            "workflow.author-create",
+            "Workflow: Create From Source",
+            "Create one durable workflow draft from authored source",
+        ),
+        (
+            "workflow.author-update",
+            "Workflow: Update From Source",
+            "Replace one exact durable draft generation from authored source",
+        ),
+        (
             "workflow.author-publish",
             "Workflow: Publish Authored Draft",
             "Publish one exact authored draft generation",
@@ -917,6 +932,85 @@ pub(crate) async fn execute_command(
                 .map_err(|error| error.to_string())?;
             options.insert("runs".to_string(), serde_json::json!([started.run]));
             "workflow template started".to_string()
+        }
+        "workflow.author-check" => {
+            let document: bcode_workflow::WorkflowAuthoringDocument =
+                serde_json::from_str(&required_arg(&request, "source_document")?)
+                    .map_err(|error| error.to_string())?;
+            let source_format: bcode_workflow::WorkflowSourceFormat =
+                serde_json::from_str(&required_arg(&request, "source_format")?)
+                    .map_err(|error| error.to_string())?;
+            let validation = client
+                .validate_workflow_authoring(document.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            let preview = client
+                .preview_workflow_compilation(document, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "source_format".to_string(),
+                serde_json::to_value(source_format).map_err(|error| error.to_string())?,
+            );
+            options.insert(
+                "validation".to_string(),
+                serde_json::to_value(&validation).map_err(|error| error.to_string())?,
+            );
+            options.insert(
+                "compilation_preview".to_string(),
+                serde_json::to_value(&preview).map_err(|error| error.to_string())?,
+            );
+            if validation.valid && preview.compiled.is_some() {
+                "workflow source is valid and available".to_string()
+            } else {
+                "workflow source has validation or availability diagnostics".to_string()
+            }
+        }
+        "workflow.author-create" => {
+            let document: bcode_workflow::WorkflowAuthoringDocument =
+                serde_json::from_str(&required_arg(&request, "source_document")?)
+                    .map_err(|error| error.to_string())?;
+            let draft_id = required_arg(&request, "draft_id")?;
+            let created = client
+                .create_authored_workflow(bcode_ipc::CreateAuthoredWorkflowRequest {
+                    document,
+                    draft_id,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "workflow".to_string(),
+                serde_json::to_value(&created.0).map_err(|error| error.to_string())?,
+            );
+            options.insert(
+                "draft".to_string(),
+                serde_json::to_value(&created.1).map_err(|error| error.to_string())?,
+            );
+            "workflow draft created from source".to_string()
+        }
+        "workflow.author-update" => {
+            let document: bcode_workflow::WorkflowAuthoringDocument =
+                serde_json::from_str(&required_arg(&request, "source_document")?)
+                    .map_err(|error| error.to_string())?;
+            let workflow_id = required_arg(&request, "workflow_id")?;
+            let draft_id = required_arg(&request, "draft_id")?;
+            let expected_generation = parse_arg::<u64>(&request, "expected_generation")?;
+            let producer = document.producer.clone();
+            let updated = client
+                .update_workflow_draft(bcode_ipc::UpdateWorkflowDraftRequest {
+                    workflow_id,
+                    draft_id,
+                    expected_generation,
+                    document,
+                    producer,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "draft_update".to_string(),
+                serde_json::to_value(&updated).map_err(|error| error.to_string())?,
+            );
+            "workflow draft update resolved".to_string()
         }
         "workflow.author-publish" => {
             let workflow_id = required_arg(&request, "workflow_id")?;

@@ -3642,10 +3642,16 @@ impl WorkflowSourceFormat {
     /// `.workflow.toml`. The function never guesses by trying multiple parsers.
     pub fn from_file_name(file_name: &str) -> Result<Self, WorkflowError> {
         let normalized = file_name.to_ascii_lowercase();
-        if normalized.ends_with(".workflow.json") || normalized.ends_with(".json") {
+        if normalized
+            .strip_suffix(".json")
+            .is_some_and(|stem| !stem.is_empty())
+        {
             return Ok(Self::Json);
         }
-        if normalized.ends_with(".workflow.toml") || normalized.ends_with(".toml") {
+        if normalized
+            .strip_suffix(".toml")
+            .is_some_and(|stem| !stem.is_empty())
+        {
             return Ok(Self::Toml);
         }
         Err(authoring_error(
@@ -6706,7 +6712,7 @@ impl PredicateExpression {
             } => evaluate_numeric_predicate_values(
                 predicate_value_at_path(value, left_path)?,
                 predicate_value_at_path(value, right_path)?,
-                comparison,
+                *comparison,
                 left_path,
                 right_path,
             ),
@@ -6741,7 +6747,7 @@ impl PredicateExpression {
             } => evaluate_numeric_predicate_values(
                 left_selector.select(value)?,
                 right_selector.select(value)?,
-                comparison,
+                *comparison,
                 "left_selector",
                 "right_selector",
             ),
@@ -6752,7 +6758,7 @@ impl PredicateExpression {
 fn evaluate_numeric_predicate_values(
     left_value: &serde_json::Value,
     right_value: &serde_json::Value,
-    comparison: &PredicateNumericComparison,
+    comparison: PredicateNumericComparison,
     left_path: &str,
     right_path: &str,
 ) -> Result<bool, WorkflowError> {
@@ -9366,6 +9372,7 @@ fn validate_predicate_expression(expression: &PredicateExpression) -> Result<(),
     validate_predicate_expression_inner(expression, 1, &mut operations)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_predicate_expression_inner(
     expression: &PredicateExpression,
     depth: usize,
@@ -9889,6 +9896,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::items_after_statements)]
     fn workflow_authoring_sources_decode_json_and_toml_to_identical_semantics() {
         let document = authored_document();
         let json = serde_json::to_string_pretty(&document).expect("JSON source");
@@ -11716,6 +11724,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn typed_value_selectors_support_objects_arrays_and_whole_values() {
         let input = serde_json::json!({
             "commands": [
@@ -11755,7 +11764,7 @@ mod tests {
             PredicateExpression::SelectedValuesEqual {
                 version: WORKFLOW_PREDICATE_VERSION,
                 left_selector: command_exit.clone(),
-                right_selector: expected.clone(),
+                right_selector: expected,
             }
             .evaluate_value(&input)
             .expect("selected values equality")
