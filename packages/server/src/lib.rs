@@ -5679,6 +5679,17 @@ async fn handle_create_session(
     name: Option<String>,
     working_directory: PathBuf,
 ) -> Result<(), ServerError> {
+    if !working_directory.is_absolute() {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "session_working_directory_must_be_absolute",
+                "session working directory must be absolute",
+            )),
+        )
+        .await;
+    }
     let session = state
         .sessions
         .create_session(name, working_directory)
@@ -5788,6 +5799,17 @@ async fn handle_change_session_working_directory(
     session_id: SessionId,
     working_directory: PathBuf,
 ) -> Result<(), ServerError> {
+    if !working_directory.is_absolute() {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "session_working_directory_must_be_absolute",
+                "session working directory must be absolute",
+            )),
+        )
+        .await;
+    }
     if state.session_has_active_turn(session_id).await {
         return send_response(
             writer,

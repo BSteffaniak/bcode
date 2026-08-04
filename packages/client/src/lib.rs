@@ -1197,6 +1197,8 @@ impl BcodeClient {
         name: Option<String>,
         working_directory: std::path::PathBuf,
     ) -> Result<SessionSummary, ClientError> {
+        let working_directory =
+            resolve_path_from(Some(working_directory), &current_working_directory());
         match self
             .send_request(Request::CreateSession {
                 name,
@@ -1392,10 +1394,12 @@ impl BcodeClient {
         session_id: SessionId,
         working_directory: impl Into<std::path::PathBuf>,
     ) -> Result<SessionSummary, ClientError> {
+        let working_directory =
+            resolve_path_from(Some(working_directory.into()), &current_working_directory());
         match self
             .send_request(Request::ChangeSessionWorkingDirectory {
                 session_id,
-                working_directory: working_directory.into(),
+                working_directory,
             })
             .await?
         {

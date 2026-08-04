@@ -328,7 +328,10 @@ impl BcodeRuntimeModel {
                 return super::invalidation::UiInvalidation::Structural;
             }
             super::ralph_launcher::RalphHomeAction::Start => {
-                self.loop_state.open_ralph_start_dialog(&mut self.chat);
+                self.loop_state.open_ralph_start_dialog(
+                    self.settings.launch_working_directory(),
+                    &mut self.chat,
+                );
                 return super::invalidation::UiInvalidation::Structural;
             }
         };
@@ -1001,13 +1004,13 @@ impl BcodeRuntimeModel {
         skill_id: bcode_skill_models::SkillId,
         arguments: String,
     ) {
-        match super::skill_flow::start_skill_action(&mut self.chat, action, skill_id, arguments) {
-            Ok(()) => {}
-            Err(error) => self
-                .chat
-                .app
-                .set_status(format!("Skill action unavailable: {error}")),
-        }
+        super::skill_flow::start_skill_action(
+            self.settings.launch_working_directory(),
+            &mut self.chat,
+            action,
+            skill_id,
+            arguments,
+        );
     }
 
     fn apply_root_timeline_jump(&mut self, entry: &super::timeline_dialog::TimelineEntry) {

@@ -537,13 +537,17 @@ impl ChatLoopState {
         true
     }
 
-    pub fn open_ralph_start_dialog(&mut self, chat: &mut ActiveChat) {
+    pub fn open_ralph_start_dialog(
+        &mut self,
+        launch_working_directory: &std::path::Path,
+        chat: &mut ActiveChat,
+    ) {
         let default_name = chat
             .app
             .session_title()
             .map_or_else(|| "new-ralph-loop".to_owned(), ToString::to_string);
         let repo_root = chat.app.working_directory().map_or_else(
-            || std::path::PathBuf::from("."),
+            || launch_working_directory.to_path_buf(),
             std::path::Path::to_path_buf,
         );
         let validation_commands = bcode_ralph::default_validation_commands(&repo_root);
@@ -1951,7 +1955,9 @@ pub fn apply_effect_result(
             loop_state.apply_session_search_result(result);
         }
         TuiEffectResult::SlashCommandExecuted { message, result } => match result {
-            Ok(outcome) => apply_root_slash_command_outcome(chat, loop_state, &message, outcome),
+            Ok(outcome) => {
+                apply_root_slash_command_outcome(settings, chat, loop_state, &message, outcome);
+            }
             Err(error) => {
                 chat.app.restore_pending_submission(&message);
                 report_nonfatal_client_error(chat, "Slash command failed", &error);
@@ -2127,11 +2133,10 @@ pub fn apply_effect_result(
                                 surface_kind,
                                 instance_id,
                                 options,
-                                working_directory: chat
-                                    .app
-                                    .working_directory()
-                                    .unwrap_or_else(|| std::path::Path::new("."))
-                                    .to_path_buf(),
+                                working_directory: chat.app.working_directory().map_or_else(
+                                    || settings.launch_working_directory().to_path_buf(),
+                                    std::path::Path::to_path_buf,
+                                ),
                                 session_id: chat.session_id,
                             });
                             chat.app.set_status("opening plugin surface…".to_owned());
@@ -2523,6 +2528,7 @@ fn apply_slash_palette_result(
 
 #[allow(clippy::too_many_lines)]
 fn apply_root_slash_command_outcome(
+    settings: &TuiRuntimeSettings,
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     message: &str,
@@ -2620,11 +2626,10 @@ fn apply_root_slash_command_outcome(
                 plugin_id,
                 command_id,
             } => {
-                let working_directory = chat
-                    .app
-                    .working_directory()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .to_path_buf();
+                let working_directory = chat.app.working_directory().map_or_else(
+                    || settings.launch_working_directory().to_path_buf(),
+                    std::path::Path::to_path_buf,
+                );
                 chat.start_effect(TuiEffect::InvokePluginCommand {
                     plugin_id,
                     command_id,
@@ -2687,11 +2692,10 @@ fn apply_root_slash_command_outcome(
             chat.start_effect(TuiEffect::SkillAction {
                 request: Box::new(super::effects::SkillActionRequest {
                     session_id: chat.session_id,
-                    launch_working_directory: chat
-                        .app
-                        .working_directory()
-                        .unwrap_or_else(|| std::path::Path::new("."))
-                        .to_path_buf(),
+                    launch_working_directory: chat.app.working_directory().map_or_else(
+                        || settings.launch_working_directory().to_path_buf(),
+                        std::path::Path::to_path_buf,
+                    ),
                     skill_id,
                     action: super::effects::SkillActionKind::Invoke,
                     arguments,
@@ -2735,28 +2739,36 @@ fn apply_root_slash_command_outcome(
             chat.app.set_status("loading skills…".to_owned());
         }
         SlashCommandOutcome::ShowRalphStatus => {
-            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::ShowStatus);
+            start_root_ralph_action(
+                settings,
+                chat,
+                super::ralph_flow::RalphRootAction::ShowStatus,
+            );
         }
         SlashCommandOutcome::RunRalphLoop => {
-            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::Run);
+            start_root_ralph_action(settings, chat, super::ralph_flow::RalphRootAction::Run);
         }
         SlashCommandOutcome::ApproveRalphRun => {
-            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::Approve);
+            start_root_ralph_action(settings, chat, super::ralph_flow::RalphRootAction::Approve);
         }
         SlashCommandOutcome::StopRalphLoop => {
-            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::Stop);
+            start_root_ralph_action(settings, chat, super::ralph_flow::RalphRootAction::Stop);
         }
         SlashCommandOutcome::ListRalphRuns => {
-            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::ListRuns);
+            start_root_ralph_action(settings, chat, super::ralph_flow::RalphRootAction::ListRuns);
         }
         SlashCommandOutcome::ListRalphIterations => {
-            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::ListIterations);
+            start_root_ralph_action(
+                settings,
+                chat,
+                super::ralph_flow::RalphRootAction::ListIterations,
+            );
         }
         SlashCommandOutcome::ResumeRalphRun => {
-            start_root_ralph_action(chat, super::ralph_flow::RalphRootAction::Resume);
+            start_root_ralph_action(settings, chat, super::ralph_flow::RalphRootAction::Resume);
         }
         SlashCommandOutcome::OpenRalphStartDialog => {
-            loop_state.open_ralph_start_dialog(chat);
+            loop_state.open_ralph_start_dialog(settings.launch_working_directory(), chat);
         }
         SlashCommandOutcome::PickSession => {
             loop_state.open_session_picker(chat);
@@ -2768,7 +2780,7 @@ fn apply_root_slash_command_outcome(
                 instance_id: "ralph-home".to_owned(),
                 options: serde_json::Value::Null,
                 working_directory: chat.app.working_directory().map_or_else(
-                    || std::path::PathBuf::from("."),
+                    || settings.launch_working_directory().to_path_buf(),
                     std::path::Path::to_path_buf,
                 ),
                 session_id: chat.session_id,
@@ -2782,16 +2794,15 @@ fn apply_root_slash_command_outcome(
     }
 }
 
-fn start_root_ralph_action(chat: &mut ActiveChat, action: super::ralph_flow::RalphRootAction) {
+fn start_root_ralph_action(
+    settings: &TuiRuntimeSettings,
+    chat: &mut ActiveChat,
+    action: super::ralph_flow::RalphRootAction,
+) {
     let repo_root = chat.app.working_directory().map_or_else(
-        || std::env::current_dir().ok(),
-        |path| Some(path.to_path_buf()),
+        || settings.launch_working_directory().to_path_buf(),
+        std::path::Path::to_path_buf,
     );
-    let Some(repo_root) = repo_root else {
-        chat.app
-            .set_status("Ralph repository root unavailable".to_owned());
-        return;
-    };
     chat.replace_effect(TuiEffect::RalphAction { repo_root, action });
     chat.app.set_status("running Ralph action…".to_owned());
 }

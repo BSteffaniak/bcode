@@ -7,7 +7,7 @@ use bcode_skill_models::SkillId;
 use super::effects::{SkillActionKind, SkillActionRequest, TuiEffect};
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::session_flow::ActiveChat;
-use super::{TuiError, skill_picker, text_input_flow};
+use super::{skill_picker, text_input_flow};
 
 pub fn handle_skill_picker_key(
     picker: &mut skill_picker::SkillPickerApp,
@@ -187,11 +187,12 @@ pub fn format_skill_manifest_markdown(manifest: &bcode_skill_models::SkillManife
 }
 
 pub fn start_skill_action(
+    launch_working_directory: &std::path::Path,
     chat: &mut ActiveChat,
     action: SkillActionKind,
     skill_id: SkillId,
     arguments: String,
-) -> Result<(), TuiError> {
+) {
     let session_id = chat.app.session_id();
     let agent_id = if action == SkillActionKind::Invoke {
         if session_id.is_some() {
@@ -216,7 +217,7 @@ pub fn start_skill_action(
     chat.start_effect(TuiEffect::SkillAction {
         request: Box::new(SkillActionRequest {
             session_id,
-            launch_working_directory: std::env::current_dir()?,
+            launch_working_directory: launch_working_directory.to_path_buf(),
             skill_id,
             action,
             arguments,
@@ -241,7 +242,6 @@ pub fn start_skill_action(
         SkillActionKind::Invoke => "invoking skill…",
     };
     chat.app.set_status(label.to_owned());
-    Ok(())
 }
 
 fn truncate_markdown_for_display(value: &str, max_chars: usize) -> String {

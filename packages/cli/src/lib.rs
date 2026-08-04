@@ -275,7 +275,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
                 },
                 secure_import_env,
             )
-            .await?
+            .await?;
         }
         Commands::ArtifactId => println!("{}", bcode_ipc::ArtifactId::current()),
         Commands::Server { command } => handle_server_command(command).await?,
@@ -981,11 +981,13 @@ async fn handle_web_command(
     let port = requested_port.unwrap_or(0);
     let access_token = random_web_access_token()?;
     let config = bcode_config::load_config()?;
-    let state = bcode_hyperchad::HyperChadAppState::with_streaming_presentation_policy(
-        BcodeClient::default_endpoint(),
-        access_token.clone(),
-        config.presentation.streaming.policy(),
-    );
+    let state =
+        bcode_hyperchad::HyperChadAppState::with_streaming_presentation_policy_in_working_directory(
+            BcodeClient::default_endpoint(),
+            access_token.clone(),
+            bcode_ipc::current_working_directory(),
+            config.presentation.streaming.policy(),
+        );
     let builder = bcode_hyperchad::init(&state).await?;
     let launch_token = access_token;
     let builder = builder

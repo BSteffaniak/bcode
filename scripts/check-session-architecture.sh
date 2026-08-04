@@ -3,6 +3,14 @@ set -euo pipefail
 
 violations=0
 
+if rg -n 'launch_working_directory: std::env::current_dir\(\)|unwrap_or_else\(\|\| std::path::Path::new\("\."\)\)' \
+  packages/tui/src/skill_flow.rs packages/tui/src/chat_loop.rs >/tmp/bcode-tui-daemon-relative-cwd.txt \
+  || ! grep -F 'session_working_directory_must_be_absolute' packages/server/src/lib.rs >/dev/null; then
+  echo "Session working-directory violation: frontend launch paths must remain explicit and daemon session paths must reject relative values." >&2
+  cat /tmp/bcode-tui-daemon-relative-cwd.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
 if ! rg -q 'GlobalSessionDb::open_existing_turso_in_root' packages/session/src/store.rs \
   || rg -n 'GlobalSessionDb::(?:open_turso_in_root|initialize_turso_in_root)' packages/session/src/store.rs >/tmp/bcode-session-catalog-read-open-mode.txt; then
   echo "Session catalog read violation: normal store loading must use the non-initializing existing-catalog open mode." >&2

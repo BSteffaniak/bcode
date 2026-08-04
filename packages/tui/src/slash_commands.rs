@@ -476,14 +476,26 @@ fn goal_command(parts: &[&str]) -> SlashCommandOutcome {
     ralph_command(&ralph_parts)
 }
 
-fn cwd_command(session_id: SessionId, parts: &[&str]) -> SlashCommandOutcome {
+fn resolve_working_directory_path(base: &std::path::Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+fn cwd_command(
+    session_id: SessionId,
+    working_directory: &std::path::Path,
+    parts: &[&str],
+) -> SlashCommandOutcome {
     if parts.len() <= 1 {
         return SlashCommandOutcome::Handled("usage: /cwd <path>".to_owned());
     }
-    let working_directory = parts.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+    let requested_path = parts.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
     SlashCommandOutcome::AttachWorktree {
         session_id,
-        path: PathBuf::from(working_directory),
+        path: resolve_working_directory_path(working_directory, PathBuf::from(requested_path)),
     }
 }
 
@@ -547,7 +559,7 @@ async fn worktree_command(
             let path = parts.iter().skip(2).copied().collect::<Vec<_>>().join(" ");
             Ok(SlashCommandOutcome::AttachWorktree {
                 session_id,
-                path: PathBuf::from(path),
+                path: resolve_working_directory_path(working_directory, PathBuf::from(path)),
             })
         }
         Some(_) => Ok(SlashCommandOutcome::Handled(
@@ -862,7 +874,7 @@ async fn execute_builtin(
                     "cwd requires an active session".to_owned(),
                 ));
             };
-            Ok(cwd_command(session_id, parts))
+            Ok(cwd_command(session_id, context.working_directory, parts))
         }
         "worktree" | "worktrees" => {
             worktree_command(client, session_id, context.working_directory, parts).await
@@ -1159,6 +1171,27 @@ mod tests {
         assert_eq!(
             goal_command(&["/goal", "status"]),
             SlashCommandOutcome::ShowRalphStatus
+        );
+    }
+
+    #[test]
+    fn relative_session_paths_resolve_against_the_active_working_directory() {
+        let session_id = SessionId::new();
+        let base = std::path::Path::new("/workspace/project");
+
+        assert_eq!(
+            cwd_command(session_id, base, &["/cwd", "../worktree"]),
+            SlashCommandOutcome::AttachWorktree {
+                session_id,
+                path: base.join("../worktree"),
+            }
+        );
+        assert_eq!(
+            cwd_command(session_id, base, &["/cwd", "/tmp/absolute"]),
+            SlashCommandOutcome::AttachWorktree {
+                session_id,
+                path: std::path::PathBuf::from("/tmp/absolute"),
+            }
         );
     }
 

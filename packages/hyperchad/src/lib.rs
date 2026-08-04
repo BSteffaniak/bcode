@@ -45,6 +45,7 @@ const WATCH_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_mil
 pub struct HyperChadAppState {
     client: BcodeClient,
     access_token: Arc<str>,
+    launch_working_directory: Arc<std::path::PathBuf>,
     watched_sessions: Arc<Mutex<BTreeSet<SessionId>>>,
     history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
     interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
@@ -60,6 +61,7 @@ impl std::fmt::Debug for HyperChadAppState {
             .debug_struct("HyperChadAppState")
             .field("client", &self.client)
             .field("access_token", &"[REDACTED]")
+            .field("launch_working_directory", &self.launch_working_directory)
             .field("watched_sessions", &self.watched_sessions)
             .field("history_windows", &self.history_windows)
             .field("interaction_controllers", &self.interaction_controllers)
@@ -313,9 +315,26 @@ impl HyperChadAppState {
     /// Create `HyperChad` application state from a daemon client and access capability.
     #[must_use]
     pub fn new(client: BcodeClient, access_token: impl Into<Arc<str>>) -> Self {
-        Self::with_presentation_policies(
+        Self::with_presentation_policies_in_working_directory(
             client,
             access_token,
+            bcode_ipc::current_working_directory(),
+            ReasoningPresentationPolicy::All,
+            StreamingPresentationPolicy::default(),
+        )
+    }
+
+    /// Create `HyperChad` application state for an explicit launch working directory.
+    #[must_use]
+    pub fn new_in_working_directory(
+        client: BcodeClient,
+        access_token: impl Into<Arc<str>>,
+        launch_working_directory: std::path::PathBuf,
+    ) -> Self {
+        Self::with_presentation_policies_in_working_directory(
+            client,
+            access_token,
+            launch_working_directory,
             ReasoningPresentationPolicy::All,
             StreamingPresentationPolicy::default(),
         )
@@ -328,9 +347,26 @@ impl HyperChadAppState {
         access_token: impl Into<Arc<str>>,
         streaming_presentation_policy: StreamingPresentationPolicy,
     ) -> Self {
-        Self::with_presentation_policies(
+        Self::with_streaming_presentation_policy_in_working_directory(
             client,
             access_token,
+            bcode_ipc::current_working_directory(),
+            streaming_presentation_policy,
+        )
+    }
+
+    /// Create `HyperChad` state with an explicit launch directory and live text policy.
+    #[must_use]
+    pub fn with_streaming_presentation_policy_in_working_directory(
+        client: BcodeClient,
+        access_token: impl Into<Arc<str>>,
+        launch_working_directory: std::path::PathBuf,
+        streaming_presentation_policy: StreamingPresentationPolicy,
+    ) -> Self {
+        Self::with_presentation_policies_in_working_directory(
+            client,
+            access_token,
+            launch_working_directory,
             ReasoningPresentationPolicy::All,
             streaming_presentation_policy,
         )
@@ -344,10 +380,32 @@ impl HyperChadAppState {
         reasoning_presentation_policy: ReasoningPresentationPolicy,
         streaming_presentation_policy: StreamingPresentationPolicy,
     ) -> Self {
+        Self::with_presentation_policies_in_working_directory(
+            client,
+            access_token,
+            bcode_ipc::current_working_directory(),
+            reasoning_presentation_policy,
+            streaming_presentation_policy,
+        )
+    }
+
+    /// Create `HyperChad` state with explicit launch and renderer presentation policies.
+    #[must_use]
+    pub fn with_presentation_policies_in_working_directory(
+        client: BcodeClient,
+        access_token: impl Into<Arc<str>>,
+        launch_working_directory: std::path::PathBuf,
+        reasoning_presentation_policy: ReasoningPresentationPolicy,
+        streaming_presentation_policy: StreamingPresentationPolicy,
+    ) -> Self {
         let client = client.with_interaction_adapters(local_interaction_adapters());
+        let launch_working_directory = launch_working_directory
+            .canonicalize()
+            .unwrap_or(launch_working_directory);
         Self {
             client,
             access_token: access_token.into(),
+            launch_working_directory: Arc::new(launch_working_directory),
             watched_sessions: Arc::new(Mutex::new(BTreeSet::new())),
             history_windows: Arc::new(Mutex::new(BTreeMap::new())),
             interaction_controllers: Arc::new(Mutex::new(LocalInteractionControllers::default())),
@@ -1020,18 +1078,9 @@ impl HyperChadAppState {
                 .render_session_or_initial(session_id, "prompt cannot be empty")
                 .await;
         }
-        let launch_working_directory = if session_id.is_none() {
-            match std::env::current_dir() {
-                Ok(working_directory) => Some(working_directory),
-                Err(_) => {
-                    return error_page(
-                        "Bcode could not determine the working directory for a new session.",
-                    );
-                }
-            }
-        } else {
-            None
-        };
+        let launch_working_directory = session_id
+            .is_none()
+            .then(|| self.launch_working_directory.as_ref().clone());
         let action = SessionViewAction::SubmitMessage {
             session_id,
             launch_working_directory,
@@ -3494,6 +3543,21 @@ mod tests {
             build_app_with_runtime(builder).expect("HTML/Actix application runtime should build");
         drop(app);
         drop(runtime);
+    }
+
+    #[test]
+    fn hyperchad_state_retains_explicit_launch_working_directory() {
+        let launch_working_directory = std::path::PathBuf::from("/tmp/hyperchad-workspace");
+        let state = HyperChadAppState::new_in_working_directory(
+            BcodeClient::default_endpoint(),
+            "scope-token",
+            launch_working_directory.clone(),
+        );
+
+        assert_eq!(
+            state.launch_working_directory.as_ref(),
+            &launch_working_directory
+        );
     }
 
     #[test]
