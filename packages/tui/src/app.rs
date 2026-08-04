@@ -80,16 +80,22 @@ struct TranscriptScrollAnimation {
     target_top_row: usize,
     started_at: Instant,
     duration: Duration,
+    next_frame_at: Instant,
 }
 
 impl TranscriptScrollAnimation {
-    const fn new(start_top_row: usize, target_top_row: usize, started_at: Instant) -> Self {
+    fn new(start_top_row: usize, target_top_row: usize, started_at: Instant) -> Self {
         Self {
             start_top_row,
             target_top_row,
             started_at,
             duration: TRANSCRIPT_SCROLL_ANIMATION_DURATION,
+            next_frame_at: started_at + TRANSCRIPT_SCROLL_ANIMATION_FRAME,
         }
+    }
+
+    fn advance_frame(&mut self, now: Instant) {
+        self.next_frame_at = now + TRANSCRIPT_SCROLL_ANIMATION_FRAME;
     }
 
     fn top_row_at(self, now: Instant) -> usize {
@@ -122,6 +128,7 @@ struct ThemeTransitionState {
     started_at: Instant,
     duration: Duration,
     curve: TuiAccentTransitionCurve,
+    next_frame_at: Option<Instant>,
 }
 
 impl ThemeTransitionState {
@@ -133,6 +140,7 @@ impl ThemeTransitionState {
             started_at: now,
             duration: Duration::ZERO,
             curve: TuiAccentTransitionCurve::EaseOut,
+            next_frame_at: None,
         }
     }
 
@@ -149,6 +157,7 @@ impl ThemeTransitionState {
             self.started_at = now;
             self.duration = Duration::ZERO;
             self.curve = config.accent_transition_curve;
+            self.next_frame_at = None;
             return;
         }
         self.source_accent = self.accent_at(now);
@@ -157,6 +166,7 @@ impl ThemeTransitionState {
         self.started_at = now;
         self.duration = Duration::from_millis(duration_ms);
         self.curve = config.accent_transition_curve;
+        self.next_frame_at = Some(now + THEME_TRANSITION_FRAME);
     }
 
     fn accent_at(&self, now: Instant) -> Color {
@@ -183,6 +193,11 @@ impl ThemeTransitionState {
 
     fn update(&mut self, now: Instant) -> Color {
         self.displayed_accent = self.accent_at(now);
+        if self.is_active(now) {
+            self.next_frame_at = Some(now + THEME_TRANSITION_FRAME);
+        } else {
+            self.next_frame_at = None;
+        }
         self.displayed_accent
     }
 
@@ -196,6 +211,7 @@ impl ThemeTransitionState {
         self.displayed_accent = self.target_accent;
         self.source_accent = self.target_accent;
         self.duration = Duration::ZERO;
+        self.next_frame_at = None;
     }
 }
 
@@ -369,6 +385,7 @@ pub struct BmuxApp {
     latest_hidden_activity_at: Option<Instant>,
     latest_hidden_activity_burst: u8,
     latest_bar_animation_started_at: Instant,
+    latest_bar_next_frame_at: Option<Instant>,
     submitted_user_message_following: SubmittedUserMessageFollowing,
     assistant_scroll_anchor: AssistantScrollAnchorState,
     pending_assistant_stream_anchor: bool,
@@ -576,6 +593,7 @@ impl BmuxApp {
             latest_hidden_activity_at: None,
             latest_hidden_activity_burst: 0,
             latest_bar_animation_started_at: now,
+            latest_bar_next_frame_at: None,
             submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
             assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
             pending_assistant_stream_anchor: false,
@@ -2735,6 +2753,10 @@ impl BmuxApp {
             )
             .max(1);
         self.latest_hidden_activity_at = Some(now);
+        if self.latest_bar_next_frame_at.is_none_or(|at| at <= now) {
+            self.latest_bar_next_frame_at =
+                Some(now + latest_bar_active_frame_duration(self.latest_hidden_activity_burst));
+        }
         let velocity_rows_per_second = u128::try_from(changed_rows)
             .unwrap_or(u128::MAX)
             .saturating_mul(1_000)
@@ -3301,22 +3323,25 @@ impl BmuxApp {
         now_system: SystemTime,
     ) -> Vec<InvalidationRequest> {
         let mut requests = vec![self.cursor.invalidation_request()];
-        if self.transcript_scroll_animation.is_some() {
+        if let Some(animation) = self.transcript_scroll_animation {
             requests.push(InvalidationRequest::new(
                 InvalidationKey::new(TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY),
-                now + TRANSCRIPT_SCROLL_ANIMATION_FRAME,
+                animation.next_frame_at,
             ));
         }
-        if self.newer_transcript_content_below() && self.latest_bar_active(now) {
+        if self.newer_transcript_content_below()
+            && self.latest_bar_active(now)
+            && let Some(next_frame_at) = self.latest_bar_next_frame_at
+        {
             requests.push(InvalidationRequest::new(
                 InvalidationKey::new(LATEST_BAR_ANIMATION_INVALIDATION_KEY),
-                self.next_latest_bar_invalidation(now),
+                next_frame_at,
             ));
         }
-        if self.theme_transition_active(now) {
+        if let Some(next_frame_at) = self.theme_transition.next_frame_at {
             requests.push(InvalidationRequest::new(
                 InvalidationKey::new(THEME_TRANSITION_INVALIDATION_KEY),
-                now + THEME_TRANSITION_FRAME,
+                next_frame_at,
             ));
         }
         requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
@@ -3339,6 +3364,9 @@ impl BmuxApp {
                     invalidation
                 }
             } else if is_latest_bar_animation_invalidation(key) {
+                self.latest_bar_next_frame_at = self.latest_bar_active(now).then(|| {
+                    now + latest_bar_active_frame_duration(self.latest_hidden_activity_burst)
+                });
                 invalidation.merge(UiInvalidation::Paint)
             } else if is_theme_transition_invalidation(key) {
                 self.update_theme_animation(now);
@@ -3362,13 +3390,8 @@ impl BmuxApp {
             .is_some_and(|at| now.saturating_duration_since(at) < LATEST_BAR_ACTIVE_WINDOW)
     }
 
-    fn next_latest_bar_invalidation(&self, now: Instant) -> Instant {
-        debug_assert!(self.latest_bar_active(now));
-        now + latest_bar_active_frame_duration(self.latest_hidden_activity_burst)
-    }
-
     fn handle_transcript_scroll_animation(&mut self, now: Instant) -> bool {
-        let Some(animation) = self.transcript_scroll_animation else {
+        let Some(mut animation) = self.transcript_scroll_animation else {
             return false;
         };
         if animation.finished(now) {
@@ -3385,6 +3408,9 @@ impl BmuxApp {
                 TranscriptScrollMode::AnchoredToEntry { .. }
                 | TranscriptScrollMode::ManualDetached => {}
             }
+        } else {
+            animation.advance_frame(now);
+            self.transcript_scroll_animation = Some(animation);
         }
         true
     }
@@ -4583,6 +4609,74 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 mod tests {
     use super::*;
     use crate::transcript::TranscriptItemKind;
+
+    fn invalidation_deadline(app: &BmuxApp, key: &str, now: Instant) -> Option<Instant> {
+        app.invalidation_requests(now, SystemTime::UNIX_EPOCH)
+            .into_iter()
+            .find(|request| request.key.as_str() == key)
+            .map(|request| request.at)
+    }
+
+    #[test]
+    fn theme_transition_deadline_is_stable_until_the_frame_is_handled() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let immediate = TuiConfig {
+            theme: TuiThemeConfig {
+                accent_transition: bcode_config::TuiAccentTransitionMode::Immediate,
+                ..TuiThemeConfig::default()
+            },
+            ..TuiConfig::default()
+        };
+        app.apply_tui_config(immediate);
+        app.set_current_agent("plan", Some("#6b7280".to_owned()));
+        app.apply_tui_config(TuiConfig {
+            theme: TuiThemeConfig {
+                accent_transition: bcode_config::TuiAccentTransitionMode::Transition,
+                accent_transition_ms: 100,
+                ..TuiThemeConfig::default()
+            },
+            ..TuiConfig::default()
+        });
+        app.set_current_agent("build", Some("#22d3ee".to_owned()));
+
+        let queried_at = Instant::now();
+        let first_deadline =
+            invalidation_deadline(&app, THEME_TRANSITION_INVALIDATION_KEY, queried_at)
+                .expect("transition should request a frame");
+        assert_eq!(
+            invalidation_deadline(
+                &app,
+                THEME_TRANSITION_INVALIDATION_KEY,
+                queried_at + Duration::from_millis(10),
+            ),
+            Some(first_deadline),
+            "unrelated scheduling passes must not postpone the pending frame"
+        );
+
+        app.handle_invalidations(
+            &[InvalidationKey::new(THEME_TRANSITION_INVALIDATION_KEY)],
+            first_deadline,
+        );
+        let next_deadline =
+            invalidation_deadline(&app, THEME_TRANSITION_INVALIDATION_KEY, first_deadline)
+                .expect("active transition should request its next frame");
+        assert!(next_deadline > first_deadline);
+
+        app.handle_invalidations(
+            &[InvalidationKey::new(THEME_TRANSITION_INVALIDATION_KEY)],
+            queried_at + Duration::from_millis(200),
+        );
+        assert_eq!(app.display_agent_id(), "build");
+        assert_eq!(app.presented_theme().accent, Color::Rgb(34, 211, 238));
+        assert_eq!(
+            invalidation_deadline(
+                &app,
+                THEME_TRANSITION_INVALIDATION_KEY,
+                queried_at + Duration::from_millis(200),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn invalidated_preview_can_restore_configured_theme() {

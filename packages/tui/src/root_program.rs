@@ -3,7 +3,7 @@
 //! These types establish the application boundary before orchestration migrates from the existing
 //! chat loop. BMUX treats messages and model state as opaque application data.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use bmux_tui::event::Event;
@@ -216,6 +216,8 @@ pub struct BcodeRuntimeModel {
     /// Whether the root program should terminate after its dirty state is committed.
     pub exit_requested: bool,
     theme_input_signature: u64,
+    theme_reload_at: Instant,
+    scheduled_deadlines: BTreeMap<bmux_tui_runtime::TimerId, Instant>,
 }
 
 enum RootTimer {
@@ -250,6 +252,7 @@ impl BcodeRuntimeModel {
             chat.app.composer().text().to_owned(),
         );
         let theme_input_signature = super::theme::active_theme_input_signature(&chat.app);
+        let theme_reload_at = Instant::now() + Duration::from_millis(750);
         Self {
             chat,
             loop_state,
@@ -268,6 +271,8 @@ impl BcodeRuntimeModel {
             plugin_surface_result: None,
             exit_requested: false,
             theme_input_signature,
+            theme_reload_at,
+            scheduled_deadlines: BTreeMap::new(),
         }
     }
 
@@ -1339,7 +1344,7 @@ impl BcodeRuntimeModel {
         commands
     }
 
-    fn schedule_deadlines(&self) {
+    fn schedule_deadlines(&mut self) {
         let Some(handle) = &self.runtime_handle else {
             return;
         };
@@ -1370,16 +1375,20 @@ impl BcodeRuntimeModel {
                 RootTimer::TelemetryFlush,
                 self.loop_state.next_telemetry_flush_at(),
             ),
-            (
-                RootTimer::ThemeReload,
-                Some(now + std::time::Duration::from_millis(750)),
-            ),
+            (RootTimer::ThemeReload, Some(self.theme_reload_at)),
         ];
         for (timer, deadline) in deadlines {
-            if let Some(deadline) = deadline {
-                handle.schedule_timer(timer.id(), deadline);
-            } else {
-                let _cancelled = handle.cancel_timer(&timer.id());
+            let id = timer.id();
+            match deadline {
+                Some(deadline) if self.scheduled_deadlines.get(&id) != Some(&deadline) => {
+                    handle.schedule_timer(id.clone(), deadline);
+                    self.scheduled_deadlines.insert(id, deadline);
+                }
+                Some(_) => {}
+                None => {
+                    let _cancelled = handle.cancel_timer(&id);
+                    self.scheduled_deadlines.remove(&id);
+                }
             }
         }
     }
@@ -1388,6 +1397,7 @@ impl BcodeRuntimeModel {
         &mut self,
         timer: &bmux_tui_runtime::TimerId,
     ) -> super::invalidation::UiInvalidation {
+        self.scheduled_deadlines.remove(timer);
         let now = Instant::now();
         match timer.as_str() {
             "bcode.invalidations" => {
@@ -1424,6 +1434,7 @@ impl BcodeRuntimeModel {
                 super::invalidation::UiInvalidation::None
             }
             "bcode.theme_reload" => {
+                self.theme_reload_at = now + Duration::from_millis(750);
                 let signature = super::theme::active_theme_input_signature(&self.chat.app);
                 if signature == self.theme_input_signature {
                     return super::invalidation::UiInvalidation::None;

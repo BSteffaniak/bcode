@@ -1539,6 +1539,7 @@ fn configured_agent_accent_overrides_fallback_color() {
 #[test]
 fn invalid_configured_agent_accent_falls_back_to_agent_color() {
     let mut fallback_app = BmuxApp::new_with_history(None, &[], &[], false);
+    disable_theme_transition(&mut fallback_app);
     fallback_app.set_agent_metadata_hydrated(true);
     fallback_app.set_current_agent_id("quiet-plan");
     let mut fallback_buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
@@ -1549,6 +1550,7 @@ fn invalid_configured_agent_accent_falls_back_to_agent_color() {
         .and_then(|cell| cell.style.fg);
 
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    disable_theme_transition(&mut app);
     app.set_agent_metadata_hydrated(true);
     app.set_current_agent("quiet-plan", Some("not-a-color".to_owned()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
