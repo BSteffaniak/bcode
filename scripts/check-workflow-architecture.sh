@@ -260,7 +260,9 @@ if ! rg -q 'pub enum WorkflowSourceFormat' packages/workflow/src/lib.rs \
   || ! rg -q 'pub fn decode_workflow_authoring_source' packages/workflow/src/lib.rs \
   || ! rg -q 'checked_in_workflow_sources_have_identical_compiled_semantics' packages/workflow/src/lib.rs \
   || ! rg -q 'decode_workflow_authoring_source' packages/bcode/src/workflow.rs \
+  || ! rg -q 'decode_workflow_authoring_source' packages/cli/src/lib.rs \
   || ! rg -q 'decode_workflow_authoring_source' plugins/workflow-plugin/src/cli.rs \
+  || ! rg -q 'name = "workflow-ui"' plugins/workflow-plugin/src/cli.rs \
   || rg -q 'std::fs|tokio::fs|bcode_workflow_store|rusqlite' packages/workflow/src/lib.rs; then
   echo "Workflow source-format violation: one workflow-owned decoder must serve SDK and frontend adapters." >&2
   violations=1
@@ -268,6 +270,7 @@ fi
 
 if [[ ! -f fixtures/workflows/source-defined-input.workflow.json ]] \
   || [[ ! -f fixtures/workflows/source-defined-input.workflow.toml ]] \
+  || [[ ! -f fixtures/workflows/shell-v2-exit-routing.workflow.json ]] \
   || ! rg -q 'Source-controlled JSON and TOML' docs/runtime-workflow-authoring.md \
   || ! rg -q '\$bcode_null' docs/runtime-workflow-authoring.md; then
   echo "Workflow source-format documentation violation: paired fixtures and TOML null semantics must remain documented." >&2

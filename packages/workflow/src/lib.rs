@@ -10,7 +10,10 @@
 //! ordinary typed steps instead of scheduler-specific branches.
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -3681,16 +3684,37 @@ pub fn decode_workflow_authoring_source(
         ));
     }
     let document: WorkflowAuthoringDocument = match format {
-        WorkflowSourceFormat::Json => serde_json::from_str(source).map_err(|error| {
-            authoring_error(
-                "source.json",
-                format!(
-                    "invalid JSON workflow source at line {}, column {}: {error}",
-                    error.line(),
-                    error.column()
-                ),
-            )
-        })?,
+        WorkflowSourceFormat::Json => {
+            let mut deserializer = serde_json::Deserializer::from_str(source);
+            let value = DuplicateRejectingJsonValue::deserialize(&mut deserializer)
+                .map_err(|error| {
+                    authoring_error(
+                        "source.json",
+                        format!(
+                            "invalid JSON workflow source at line {}, column {}: {error}",
+                            error.line(),
+                            error.column()
+                        ),
+                    )
+                })?
+                .0;
+            deserializer.end().map_err(|error| {
+                authoring_error(
+                    "source.json",
+                    format!(
+                        "invalid JSON workflow source at line {}, column {}: {error}",
+                        error.line(),
+                        error.column()
+                    ),
+                )
+            })?;
+            serde_json::from_value(value).map_err(|error| {
+                authoring_error(
+                    "source.json",
+                    format!("invalid JSON workflow document: {error}"),
+                )
+            })?
+        }
         WorkflowSourceFormat::Toml => {
             let mut value: serde_json::Value = toml::from_str(source).map_err(|error| {
                 let location = error.span().map_or_else(String::new, |span| {
@@ -3712,6 +3736,98 @@ pub fn decode_workflow_authoring_source(
     };
     document.validate()?;
     Ok(document)
+}
+
+struct DuplicateRejectingJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for DuplicateRejectingJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateRejectingJsonVisitor)
+    }
+}
+
+struct DuplicateRejectingJsonVisitor;
+
+impl<'de> Visitor<'de> for DuplicateRejectingJsonVisitor {
+    type Value = DuplicateRejectingJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(value.into()))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value).map_or_else(
+            || Err(E::custom("non-finite JSON number")),
+            |number| Ok(DuplicateRejectingJsonValue(number.into())),
+        )
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(value.into()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(value.into()))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        DuplicateRejectingJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<DuplicateRejectingJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(DuplicateRejectingJsonValue(values.into()))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some((key, value)) = map.next_entry::<String, DuplicateRejectingJsonValue>()? {
+            if values.insert(key.clone(), value.0).is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON object key '{key}'"
+                )));
+            }
+        }
+        Ok(DuplicateRejectingJsonValue(values.into()))
+    }
 }
 
 fn decode_workflow_toml_null_markers(
@@ -9896,6 +10012,81 @@ mod tests {
     }
 
     #[test]
+    fn shell_v2_source_example_compiles_and_routes_only_on_generic_typed_data() {
+        let source =
+            include_str!("../../../fixtures/workflows/shell-v2-exit-routing.workflow.json");
+        let document = decode_workflow_authoring_source(source, WorkflowSourceFormat::Json)
+            .expect("shell v2 source example");
+        let block: WorkflowBlockDefinition =
+            serde_json::from_value(document.definition.nodes["run_shell"].configuration.clone())
+                .expect("exact shell block");
+        assert_eq!(block.plugin_id, "bcode.shell");
+        assert_eq!(block.block_id, "shell.command-plan");
+        assert_eq!(block.block_version, 2);
+        let mut catalog = WorkflowAuthoringCatalogSnapshot {
+            version: WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: WorkflowAuthoringCapabilitySummary::from(
+                &WorkflowProductionCapabilities::current(),
+            ),
+            plugins: BTreeSet::from(["bcode.shell".to_string()]),
+            blocks: BTreeMap::from([(workflow_block_catalog_key(&block), block.clone())]),
+            node_configuration_schemas: workflow_node_configuration_schemas(),
+            workflow_definitions: BTreeMap::new(),
+            agent_profiles: BTreeSet::new(),
+            skills: BTreeSet::new(),
+        };
+        catalog.validate().expect("shell example catalog");
+        let preview = document.compilation_preview(&catalog, None);
+        assert!(
+            preview.is_compiled(),
+            "{:?}",
+            preview.validation.diagnostics
+        );
+        let compiled = preview.compiled.expect("compiled shell source");
+        assert_eq!(
+            compiled.input_defaults["commands"][0]["accepted_exit_codes"],
+            serde_json::json!([0, 7])
+        );
+        assert!(
+            compiled
+                .requirements
+                .blocks
+                .contains("bcode.shell/shell.command-plan@2")
+        );
+        assert_eq!(
+            compiled.effects.block_effects,
+            BTreeSet::from([WorkflowBlockEffect::Mutating])
+        );
+        let predicate = document.definition.nodes["route_exit"]
+            .configuration
+            .get("predicate")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<PredicateExpression>(value).ok())
+            .expect("generic route predicate");
+        assert!(
+            predicate
+                .evaluate_value(&serde_json::json!({
+                    "commands": [{"exit_accepted": true}]
+                }))
+                .expect("accepted route")
+        );
+        assert!(
+            !predicate
+                .evaluate_value(&serde_json::json!({
+                    "commands": [{"exit_accepted": false}]
+                }))
+                .expect("unaccepted route")
+        );
+        catalog.blocks.clear();
+        assert!(
+            document
+                .compilation_preview(&catalog, None)
+                .compiled
+                .is_none()
+        );
+    }
+
+    #[test]
     fn checked_in_workflow_sources_have_identical_compiled_semantics() {
         let json = include_str!("../../../fixtures/workflows/source-defined-input.workflow.json");
         let toml = include_str!("../../../fixtures/workflows/source-defined-input.workflow.toml");
@@ -10024,6 +10215,13 @@ mod tests {
         let json_duplicate = r#"{"schema_version":1,"schema_version":1}"#;
         assert!(
             decode_workflow_authoring_source(json_duplicate, WorkflowSourceFormat::Json).is_err()
+        );
+        let nested_json_duplicate = r#"{"outer":{"value":1,"value":2}}"#;
+        assert!(
+            decode_workflow_authoring_source(nested_json_duplicate, WorkflowSourceFormat::Json)
+                .expect_err("nested duplicate JSON key")
+                .to_string()
+                .contains("duplicate JSON object key")
         );
         let toml_duplicate = "schema_version = 1\nschema_version = 1\n";
         assert!(

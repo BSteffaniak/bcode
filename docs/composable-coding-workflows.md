@@ -220,6 +220,17 @@ and artifact references. Generic process execution owns normalized exited/signal
 termination; the shell plugin maps that result into its own contract. Shell plans remain exact argv
 arrays and never become implicit shell strings.
 
+The checked-in `fixtures/workflows/shell-v2-exit-routing.workflow.json` example selects exact
+`bcode.shell/shell.command-plan@2`, invokes `sh` explicitly in argv, accepts exit codes `0` and `7`,
+and routes on `commands[0].exit_accepted` using the generic typed selector. Changing the accepted
+set or command plan changes the exact mutating operation identity and therefore requires matching
+review/authorization. Disabling `bcode.shell` leaves unrelated authoring operational but makes this
+example’s exact block unavailable during compilation preview and start admission.
+
+The example’s terminal input gates make both accepted and unaccepted route results inspectable
+without adding shell semantics to the runtime. Spawn failure, signal, timeout, and cancellation are
+not ordinary exits and therefore never satisfy `exit_accepted`.
+
 ## Repository snapshot and verification authority
 
 `workspace_snapshot` continues to identify the immutable workspace location for workflow and grant

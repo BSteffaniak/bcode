@@ -89,9 +89,9 @@ start_server "${workdir}/before.log"
 first_pid="${server_pid}"
 session_id="$(cd "${workdir}/repo" && "${bcode}" session create flagship-release-proof)"
 
-"${bcode}" workflow template-describe --owner bcode.workflow --template implementation-batch --version 1 --session "${session_id}" >"${workdir}/batch.json"
-"${bcode}" workflow template-describe --owner bcode.workflow --template delivery-tranche --version 1 --session "${session_id}" >"${workdir}/tranche.json"
-"${bcode}" workflow template-describe --owner bcode.workflow --template progress-driven-delivery --version 1 --session "${session_id}" >"${workdir}/parent.json"
+"${bcode}" workflow-ui template-describe --owner bcode.workflow --template implementation-batch --version 1 --session "${session_id}" >"${workdir}/batch.json"
+"${bcode}" workflow-ui template-describe --owner bcode.workflow --template delivery-tranche --version 1 --session "${session_id}" >"${workdir}/tranche.json"
+"${bcode}" workflow-ui template-describe --owner bcode.workflow --template progress-driven-delivery --version 1 --session "${session_id}" >"${workdir}/parent.json"
 
 python3 - "${root}/plugins/workflow-plugin/templates/progress-driven-delivery.workflow.json" "${workdir}/configuration.json" <<'PY'
 import json
@@ -196,16 +196,16 @@ continued_parent_input="$(cat "${workdir}/exhausted-parent-configuration.json.co
 
 # Prove exact portable export/import before registering the standalone wait fixture so that the
 # authoring catalog contains only content-addressed definitions.
-"${bcode}" workflow template-instantiate --owner bcode.workflow --template implementation-batch --version 1 --workflow acceptance-source --draft source-draft --session "${session_id}" >"${workdir}/acceptance-created.json"
-"${bcode}" workflow author-publish --workflow acceptance-source --draft source-draft --generation 1 --session "${session_id}" >"${workdir}/acceptance-published.json"
-"${bcode}" workflow author-export --workflow acceptance-source --revision 1 --session "${session_id}" >"${workdir}/exported-workflow-response.json"
+"${bcode}" workflow-ui template-instantiate --owner bcode.workflow --template implementation-batch --version 1 --workflow acceptance-source --draft source-draft --session "${session_id}" >"${workdir}/acceptance-created.json"
+"${bcode}" workflow-ui author-publish --workflow acceptance-source --draft source-draft --generation 1 --session "${session_id}" >"${workdir}/acceptance-published.json"
+"${bcode}" workflow-ui author-export --workflow acceptance-source --revision 1 --session "${session_id}" >"${workdir}/exported-workflow-response.json"
 python3 - "${workdir}/exported-workflow-response.json" "${workdir}/exported-workflow.json" <<'PY'
 import json, pathlib, sys
 value=json.loads(pathlib.Path(sys.argv[1]).read_text().split("\n",1)[1])
 pathlib.Path(sys.argv[2]).write_text(json.dumps(value[0]["options"]["export_bundle"]))
 PY
 bundle="$(cat "${workdir}/exported-workflow.json")"
-"${bcode}" workflow author-import --bundle "${bundle}" --target-workflow acceptance-imported --draft imported-draft --session "${session_id}" >"${workdir}/imported-workflow.json"
+"${bcode}" workflow-ui author-import --bundle "${bundle}" --target-workflow acceptance-imported --draft imported-draft --session "${session_id}" >"${workdir}/imported-workflow.json"
 
 # Use one release CLI process to prove deterministic public input-wait resolution and restart.
 cat >"${workdir}/wait.workflow.json" <<'JSON'
@@ -229,16 +229,16 @@ cat >"${workdir}/wait.workflow.json" <<'JSON'
   "edges": []
 }
 JSON
-wait_registration="$("${bcode}" workflow register --id proof/flagship-release-input-wait --version 1 --definition "${workdir}/wait.workflow.json" --session "${session_id}")"
+wait_registration="$("${bcode}" workflow-ui register --id proof/flagship-release-input-wait --version 1 --definition "${workdir}/wait.workflow.json" --session "${session_id}")"
 wait_definition_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read().split("\n",1)[1])[0]["options"]["definitions"][0]["definition_id"])' <<<"${wait_registration}")"
-"${bcode}" workflow run --id "${wait_definition_id}" --version 1 --session "${session_id}" --input '{}' >"${workdir}/wait-started.json"
+"${bcode}" workflow-ui run --id "${wait_definition_id}" --version 1 --session "${session_id}" --input '{}' >"${workdir}/wait-started.json"
 wait_run_id="$(python3 - "${workdir}/wait-started.json" <<'PY'
 import json, pathlib, sys
 value=json.loads(pathlib.Path(sys.argv[1]).read_text().split("\n",1)[1])
 print(value[0]["options"]["run"]["run_id"])
 PY
 )"
-"${bcode}" workflow inspect --id "${wait_run_id}" --session "${session_id}" >"${workdir}/wait-before.txt"
+"${bcode}" workflow-ui inspect --id "${wait_run_id}" --session "${session_id}" >"${workdir}/wait-before.txt"
 wait_activation="$(python3 - "${workdir}/wait-before.txt" <<'PY'
 import json, pathlib, sys
 value=json.loads(pathlib.Path(sys.argv[1]).read_text().split("\n",1)[1])
@@ -250,7 +250,7 @@ wait_for_flagship_approval() {
     local output="$1"
     local descendant_output="${workdir}/approval-before.txt"
     for _ in {1..300}; do
-        if ! "${bcode}" workflow inspect --id flagship-root --session "${session_id}" >"${output}"; then
+        if ! "${bcode}" workflow-ui inspect --id flagship-root --session "${session_id}" >"${output}"; then
             sleep 0.1
             continue
         fi
@@ -260,7 +260,7 @@ wait_for_flagship_approval() {
         fi
         while IFS= read -r descendant_run_id; do
             [[ -n "${descendant_run_id}" ]] || continue
-            if "${bcode}" workflow inspect --id "${descendant_run_id}" --session "${session_id}" >"${descendant_output}" \
+            if "${bcode}" workflow-ui inspect --id "${descendant_run_id}" --session "${session_id}" >"${descendant_output}" \
                 && python3 - "${descendant_output}" <<'PY'
 import json
 import pathlib
@@ -294,7 +294,7 @@ resolve_flagship_approvals_until_settled() {
     local root_output="${workdir}/run-settled.txt"
     local descendant_output="${workdir}/approval-current.txt"
     for _ in {1..600}; do
-        "${bcode}" workflow inspect --id flagship-root --session "${session_id}" >"${root_output}"
+        "${bcode}" workflow-ui inspect --id flagship-root --session "${session_id}" >"${root_output}"
         local root_status
         root_status="$(python3 - "${root_output}" <<'PY'
 import json, pathlib, sys
@@ -305,7 +305,7 @@ PY
         local resolved=0
         while IFS= read -r descendant_run_id; do
             [[ -n "${descendant_run_id}" ]] || continue
-            if ! "${bcode}" workflow inspect --id "${descendant_run_id}" --session "${session_id}" >"${descendant_output}" \
+            if ! "${bcode}" workflow-ui inspect --id "${descendant_run_id}" --session "${session_id}" >"${descendant_output}" \
                 || [[ ! -s "${descendant_output}" ]]; then
                 continue
             fi
@@ -321,7 +321,7 @@ PY
             if [[ -n "${approval_details}" ]]; then
                 local approval_run_id approval_id
                 read -r approval_run_id approval_id <<<"${approval_details}"
-                "${bcode}" workflow approve-mutation --id "${approval_run_id}" --approval "${approval_id}" --session "${session_id}" >>"${workdir}/subsequent-approvals.jsonl"
+                "${bcode}" workflow-ui approve-mutation --id "${approval_run_id}" --approval "${approval_id}" --session "${session_id}" >>"${workdir}/subsequent-approvals.jsonl"
                 resolved=1
                 break
             fi
@@ -349,7 +349,7 @@ PY
 # workflow-product fields or move product behavior into the provider.
 (
     cd "${workdir}/repo"
-    "${bcode}" workflow template-start --owner bcode.workflow --template progress-driven-delivery --version 1 --session "${session_id}" --run flagship-root --input "${configuration}" >"${workdir}/started.json"
+    "${bcode}" workflow-ui template-start --owner bcode.workflow --template progress-driven-delivery --version 1 --session "${session_id}" --run flagship-root --input "${configuration}" >"${workdir}/started.json"
 )
 wait_for_flagship_approval "${workdir}/run-before.txt"
 
@@ -359,10 +359,10 @@ server_pid=""
 start_server "${workdir}/after.log"
 second_pid="${server_pid}"
 
-"${bcode}" workflow template-describe --owner bcode.workflow --template implementation-batch --version 1 --session "${session_id}" >"${workdir}/batch-after.json"
-"${bcode}" workflow template-describe --owner bcode.workflow --template delivery-tranche --version 1 --session "${session_id}" >"${workdir}/tranche-after.json"
-"${bcode}" workflow template-describe --owner bcode.workflow --template progress-driven-delivery --version 1 --session "${session_id}" >"${workdir}/parent-after.json"
-"${bcode}" workflow inspect --id flagship-root --session "${session_id}" >"${workdir}/run-after.txt"
+"${bcode}" workflow-ui template-describe --owner bcode.workflow --template implementation-batch --version 1 --session "${session_id}" >"${workdir}/batch-after.json"
+"${bcode}" workflow-ui template-describe --owner bcode.workflow --template delivery-tranche --version 1 --session "${session_id}" >"${workdir}/tranche-after.json"
+"${bcode}" workflow-ui template-describe --owner bcode.workflow --template progress-driven-delivery --version 1 --session "${session_id}" >"${workdir}/parent-after.json"
+"${bcode}" workflow-ui inspect --id flagship-root --session "${session_id}" >"${workdir}/run-after.txt"
 approval_details="$(python3 - "${workdir}/approval-before.txt" <<'PY'
 import json, pathlib, sys
 value=json.loads(pathlib.Path(sys.argv[1]).read_text().split("\n",1)[1])
@@ -371,14 +371,14 @@ print(approval["run_id"], approval["approval_id"])
 PY
 )"
 read -r approval_run_id approval_id <<<"${approval_details}"
-"${bcode}" workflow approve-mutation --id "${approval_run_id}" --approval "${approval_id}" --session "${session_id}" >"${workdir}/approval-resolved.json"
-"${bcode}" workflow inspect --id "${approval_run_id}" --session "${session_id}" >"${workdir}/approval-approved.txt"
+"${bcode}" workflow-ui approve-mutation --id "${approval_run_id}" --approval "${approval_id}" --session "${session_id}" >"${workdir}/approval-resolved.json"
+"${bcode}" workflow-ui inspect --id "${approval_run_id}" --session "${session_id}" >"${workdir}/approval-approved.txt"
 resolve_flagship_approvals_until_settled
-"${bcode}" workflow inspect --id flagship-root --session "${session_id}" >"${workdir}/run-approved.txt"
+"${bcode}" workflow-ui inspect --id flagship-root --session "${session_id}" >"${workdir}/run-approved.txt"
 : >"${workdir}/children-approved.jsonl"
 while IFS= read -r descendant_run_id; do
     [[ -n "${descendant_run_id}" ]] || continue
-    "${bcode}" workflow inspect --id "${descendant_run_id}" --session "${session_id}" \
+    "${bcode}" workflow-ui inspect --id "${descendant_run_id}" --session "${session_id}" \
         >"${workdir}/child-approved-current.json"
     python3 - "${workdir}/child-approved-current.json" <<'PY' \
         >>"${workdir}/children-approved.jsonl"
@@ -394,21 +394,21 @@ for descendant in value[0]["options"].get("descendant_runs", []):
 PY
 )
 test -f "${workdir}/repo/flagship-formatted.txt"
-"${bcode}" workflow inspect --id "${wait_run_id}" --session "${session_id}" >"${workdir}/wait-after.txt"
-"${bcode}" workflow provide-input --id "${wait_run_id}" --node operator_wait --activation "${wait_activation}" --input '{}' --session "${session_id}" >"${workdir}/wait-resolved.json"
-"${bcode}" workflow inspect --id "${wait_run_id}" --session "${session_id}" >"${workdir}/wait-completed.txt"
+"${bcode}" workflow-ui inspect --id "${wait_run_id}" --session "${session_id}" >"${workdir}/wait-after.txt"
+"${bcode}" workflow-ui provide-input --id "${wait_run_id}" --node operator_wait --activation "${wait_activation}" --input '{}' --session "${session_id}" >"${workdir}/wait-resolved.json"
+"${bcode}" workflow-ui inspect --id "${wait_run_id}" --session "${session_id}" >"${workdir}/wait-completed.txt"
 
 # Start the standalone exact implementation batch with semantic completion held false. The
 # runtime, not the provider fixture, owns and emits the 20-iteration exhausted result.
 (
     cd "${workdir}/repo"
-    "${bcode}" workflow template-start --owner bcode.workflow --template implementation-batch --version 1 --session "${session_id}" --run flagship-exhausted-batch --input "${exhausted_configuration}" >"${workdir}/exhausted-started.json"
+    "${bcode}" workflow-ui template-start --owner bcode.workflow --template implementation-batch --version 1 --session "${session_id}" --run flagship-exhausted-batch --input "${exhausted_configuration}" >"${workdir}/exhausted-started.json"
 )
 resolve_run_approvals_until_settled() {
     local run_id="$1"
     local output="$2"
     for _ in {1..2400}; do
-        "${bcode}" workflow inspect --id "${run_id}" --session "${session_id}" >"${output}"
+        "${bcode}" workflow-ui inspect --id "${run_id}" --session "${session_id}" >"${output}"
         local status approval_details
         status="$(python3 - "${output}" <<'PY'
 import json, pathlib, sys
@@ -430,7 +430,7 @@ PY
         if [[ -n "${approval_details}" ]]; then
             local approval_run_id approval_id
             read -r approval_run_id approval_id <<<"${approval_details}"
-            "${bcode}" workflow approve-mutation --id "${approval_run_id}" --approval "${approval_id}" --session "${session_id}" >>"${workdir}/exhausted-approvals.jsonl"
+            "${bcode}" workflow-ui approve-mutation --id "${approval_run_id}" --approval "${approval_id}" --session "${session_id}" >>"${workdir}/exhausted-approvals.jsonl"
         else
             sleep 0.1
         fi
@@ -446,7 +446,7 @@ resolve_run_approvals_until_settled flagship-exhausted-batch "${workdir}/exhaust
 # child admission, and the operator gate remain workflow/runtime behavior.
 (
     cd "${workdir}/repo"
-    "${bcode}" workflow template-start --owner bcode.workflow \
+    "${bcode}" workflow-ui template-start --owner bcode.workflow \
         --template progress-driven-delivery --version 1 --session "${session_id}" \
         --run flagship-five-batches --input "${exhausted_parent_configuration}" \
         >"${workdir}/five-batches-started.json"
@@ -455,7 +455,7 @@ wait_for_composed_operator_gate() {
     local output="${workdir}/five-batches-waiting.txt"
     local descendants="${workdir}/five-batches-descendants.txt"
     for _ in {1..12000}; do
-        "${bcode}" workflow inspect --id flagship-five-batches --session "${session_id}" \
+        "${bcode}" workflow-ui inspect --id flagship-five-batches --session "${session_id}" \
             >"${output}"
         local status operator_activation approval_details
         status="$(python3 - "${output}" <<'PY'
@@ -491,7 +491,7 @@ PY
         local resolved=0
         while IFS= read -r descendant_run_id; do
             [[ -n "${descendant_run_id}" ]] || continue
-            "${bcode}" workflow inspect --id "${descendant_run_id}" --session "${session_id}" \
+            "${bcode}" workflow-ui inspect --id "${descendant_run_id}" --session "${session_id}" \
                 >"${workdir}/five-batches-descendant-current.txt"
             approval_details="$(python3 - "${workdir}/five-batches-descendant-current.txt" <<'PY'
 import json, pathlib, sys
@@ -504,7 +504,7 @@ PY
             if [[ -n "${approval_details}" ]]; then
                 local approval_run_id approval_id
                 read -r approval_run_id approval_id <<<"${approval_details}"
-                "${bcode}" workflow approve-mutation --id "${approval_run_id}" \
+                "${bcode}" workflow-ui approve-mutation --id "${approval_run_id}" \
                     --approval "${approval_id}" --session "${session_id}" \
                     >>"${workdir}/five-batches-approvals.jsonl"
                 resolved=1
@@ -521,11 +521,11 @@ PY
 }
 wait_for_composed_operator_gate
 operator_activation="$(cat "${workdir}/five-batches-operator-activation.txt")"
-"${bcode}" workflow provide-input --id flagship-five-batches --node operator_continuation \
+"${bcode}" workflow-ui provide-input --id flagship-five-batches --node operator_continuation \
     --activation "${operator_activation}" --input "${continued_parent_input}" \
     --session "${session_id}" >"${workdir}/five-batches-continued.json"
 for _ in {1..1200}; do
-    "${bcode}" workflow inspect --id flagship-five-batches --session "${session_id}" \
+    "${bcode}" workflow-ui inspect --id flagship-five-batches --session "${session_id}" \
         >"${workdir}/second-tranche.txt"
     second_tranche_count="$(python3 - "${workdir}/second-tranche.txt" <<'PY'
 import json, pathlib, sys
@@ -550,7 +550,7 @@ resolve_run_and_descendant_approvals_until_settled() {
     local descendants="${workdir}/later-batch-descendants.txt"
     local descendant_output="${workdir}/later-batch-descendant-current.txt"
     for _ in {1..2400}; do
-        "${bcode}" workflow inspect --id "${root_run_id}" --session "${session_id}" >"${output}"
+        "${bcode}" workflow-ui inspect --id "${root_run_id}" --session "${session_id}" >"${output}"
         local status
         status="$(python3 - "${output}" <<'PY'
 import json, pathlib, sys
@@ -570,7 +570,7 @@ PY
         local resolved=0
         while IFS= read -r descendant_run_id; do
             [[ -n "${descendant_run_id}" ]] || continue
-            "${bcode}" workflow inspect --id "${descendant_run_id}" --session "${session_id}" \
+            "${bcode}" workflow-ui inspect --id "${descendant_run_id}" --session "${session_id}" \
                 >"${descendant_output}"
             local approval_details
             approval_details="$(python3 - "${descendant_output}" <<'PY'
@@ -584,7 +584,7 @@ PY
             if [[ -n "${approval_details}" ]]; then
                 local approval_run_id approval_id
                 read -r approval_run_id approval_id <<<"${approval_details}"
-                "${bcode}" workflow approve-mutation --id "${approval_run_id}" \
+                "${bcode}" workflow-ui approve-mutation --id "${approval_run_id}" \
                     --approval "${approval_id}" --session "${session_id}" \
                     >>"${workdir}/later-batch-approvals.jsonl"
                 resolved=1

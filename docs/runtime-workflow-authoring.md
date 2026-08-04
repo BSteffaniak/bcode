@@ -32,6 +32,10 @@ one JSON null. Any table combining `$bcode_null` with another field, or assignin
 workflow state. Normal omitted optional Rust fields remain ordinary TOML omission and do not require
 the marker.
 
+The plugin-contributed template/status/TUI convenience namespace is `workflow-ui`; it is deliberately
+separate from the core `workflow author|start|cancel-computation` application namespace so enabling
+the bundled workflow plugin cannot replace portable authored-workflow operations.
+
 The CLI reads and bounds the local file, resolves its format, decodes it through the workflow-owned
 adapter, and sends only the typed document through existing public application requests. Supported
 operations are:

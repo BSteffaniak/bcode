@@ -3884,6 +3884,43 @@ mod tests {
     }
 
     #[test]
+    fn source_created_draft_is_consumed_by_the_existing_editor_contract() {
+        let document = bcode_workflow::decode_workflow_authoring_source(
+            include_str!("../../../fixtures/workflows/source-defined-input.workflow.toml"),
+            bcode_workflow::WorkflowSourceFormat::Toml,
+        )
+        .expect("source document");
+        let options = serde_json::json!({
+            "draft": {
+                "identity": {
+                    "workflow_id": document.workflow_id,
+                    "draft_id": "draft-1"
+                },
+                "generation": 1,
+                "document": document,
+                "producer": {
+                    "kind": "cli",
+                    "producer_id": "workflow-source"
+                }
+            }
+        });
+        let surface = WorkflowAuthorSurface::new(&options);
+        assert_eq!(
+            surface.workflow_id.as_deref(),
+            Some("example/source-defined-input")
+        );
+        assert_eq!(surface.draft_id.as_deref(), Some("draft-1"));
+        assert_eq!(surface.generation, Some(1));
+        assert_eq!(
+            surface
+                .document
+                .as_ref()
+                .map(|document| document.workflow_id.as_str()),
+            Some("example/source-defined-input")
+        );
+    }
+
+    #[test]
     fn terminal_rendering_covers_viewport_mouse_diagnostics_and_revision_diff() {
         let mut current = document();
         current.metadata.title = "Edited workflow".to_string();

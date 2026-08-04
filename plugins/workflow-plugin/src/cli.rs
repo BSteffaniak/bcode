@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "workflow",
-    about = "Discover, register, run, and inspect durable workflows"
+    name = "workflow-ui",
+    about = "Discover templates and operate durable workflow runtime/UI surfaces"
 )]
 struct WorkflowCli {
     /// Workflow action: list, register, run, status, pause, resume, cancel, inspect,
@@ -80,6 +80,34 @@ struct WorkflowCli {
     session: Option<String>,
 }
 
+fn load_workflow_source(
+    path: &std::path::Path,
+    explicit_format: Option<&str>,
+) -> Result<
+    (
+        bcode_workflow::WorkflowAuthoringDocument,
+        bcode_workflow::WorkflowSourceFormat,
+    ),
+    String,
+> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let format = match explicit_format {
+        Some("json") => bcode_workflow::WorkflowSourceFormat::Json,
+        Some("toml") => bcode_workflow::WorkflowSourceFormat::Toml,
+        Some(format) => return Err(format!("unsupported workflow source format '{format}'")),
+        None => bcode_workflow::WorkflowSourceFormat::from_file_name(
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| "workflow source file name is not valid UTF-8".to_string())?,
+        )
+        .map_err(|error| error.to_string())?,
+    };
+    let document = bcode_workflow::decode_workflow_authoring_source(&source, format)
+        .map_err(|error| error.to_string())?;
+    Ok((document, format))
+}
+
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
         requires_daemon: true,
@@ -88,6 +116,7 @@ pub fn registration() -> StaticCliRegistration {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = WorkflowCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
@@ -116,25 +145,7 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             args.insert(key.to_string(), version.to_string());
         }
         if let Some(path) = cli.source {
-            let source = std::fs::read_to_string(&path)
-                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-            let format = match cli.source_format.as_deref() {
-                Some("json") => bcode_workflow::WorkflowSourceFormat::Json,
-                Some("toml") => bcode_workflow::WorkflowSourceFormat::Toml,
-                Some(format) => {
-                    return Err(format!("unsupported workflow source format '{format}'"));
-                }
-                None => bcode_workflow::WorkflowSourceFormat::from_file_name(
-                    path.file_name()
-                        .and_then(std::ffi::OsStr::to_str)
-                        .ok_or_else(|| {
-                            "workflow source file name is not valid UTF-8".to_string()
-                        })?,
-                )
-                .map_err(|error| error.to_string())?,
-            };
-            let document = bcode_workflow::decode_workflow_authoring_source(&source, format)
-                .map_err(|error| error.to_string())?;
+            let (document, format) = load_workflow_source(&path, cli.source_format.as_deref())?;
             args.insert(
                 "source_document".to_string(),
                 serde_json::to_string(&document).map_err(|error| error.to_string())?,
@@ -214,4 +225,25 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         );
         Ok(StaticCliOutcome::default())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_loader_infers_and_overrides_formats_without_retaining_paths() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let json = root.join("fixtures/workflows/source-defined-input.workflow.json");
+        let toml = root.join("fixtures/workflows/source-defined-input.workflow.toml");
+        let (json_document, json_format) = load_workflow_source(&json, None).expect("JSON source");
+        let (toml_document, toml_format) =
+            load_workflow_source(&toml, Some("toml")).expect("explicit TOML source");
+        assert_eq!(json_format, bcode_workflow::WorkflowSourceFormat::Json);
+        assert_eq!(toml_format, bcode_workflow::WorkflowSourceFormat::Toml);
+        assert_eq!(json_document, toml_document);
+        let encoded = serde_json::to_string(&json_document).expect("portable document");
+        assert!(!encoded.contains("fixtures/workflows"));
+        assert!(load_workflow_source(&json, Some("yaml")).is_err());
+    }
 }

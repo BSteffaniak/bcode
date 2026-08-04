@@ -9,7 +9,7 @@ for required in \
   'WorkflowSpec<LoopWorkflowIteration>' \
   'AgentExecutionTarget::SharedParentSequential' \
   'PluginWorkflowStartRequest::typed' \
-  'host\.start_workflow\(request\.clone\(\)\)\.await' \
+  'host\.start_workflow\(request\.clone\(\)\)' \
   'associated_workflow_run' \
   'control_associated_workflow_run' \
   'fn legacy_state_exists_at' \
