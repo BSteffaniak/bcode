@@ -213,18 +213,18 @@ bmux_codec = { default-features = false, features = [
     "typed-stable",
     "compression-lz4",
     "compression-zstd",
-], git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_image = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_ipc = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_keyboard = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_plugin = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_plugin_schema = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_plugin_sdk = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_terminal_grid = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_tui = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_tui_components = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
-bmux_tui_runtime = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "1de06662a2919473f61e29efc6a8bd6bed4b6d94" }
+], git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_image = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_ipc = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_keyboard = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_plugin = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_plugin_schema = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_plugin_sdk = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_terminal_grid = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_tui = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_tui_components = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_tui_runtime = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 
 # External dependencies
 arboard = { version = "3.6.1", default-features = false, features = [
