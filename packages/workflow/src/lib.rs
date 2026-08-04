@@ -2918,7 +2918,8 @@ pub struct WorkflowAuthoringActionDescriptor {
     /// Exact target workflow block catalog identity.
     pub target_block: String,
     /// Deterministic payload adaptation expressed in the generic transform contract.
-    pub input_adapter: WorkflowTransform,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_adapter: Option<WorkflowTransform>,
 }
 
 impl WorkflowAuthoringActionDescriptor {
@@ -2948,14 +2949,21 @@ impl WorkflowAuthoringActionDescriptor {
         validate_authoring_id("catalog.authoring_actions.action_key", &self.action_key)?;
         validate_authoring_id("catalog.authoring_actions.plugin_id", &self.plugin_id)?;
         validate_runtime_value_schema("catalog.authoring_actions.input", &self.input)?;
-        self.input_adapter.validate()?;
+        if let Some(adapter) = &self.input_adapter {
+            adapter.validate()?;
+        }
         let block = blocks.get(&self.target_block).ok_or_else(|| {
             authoring_error(
                 "catalog.authoring_actions.target_block",
                 format!("target block '{}' is unavailable", self.target_block),
             )
         })?;
-        if block.plugin_id != self.plugin_id || self.input_adapter.output != block.input {
+        if block.plugin_id != self.plugin_id
+            || self
+                .input_adapter
+                .as_ref()
+                .is_some_and(|adapter| adapter.output != block.input)
+        {
             return Err(authoring_error(
                 "catalog.authoring_actions.target_block",
                 "action owner and adapter output must match the exact target block",
@@ -4334,12 +4342,14 @@ fn lower_workflow_source_action(
             descriptor
                 .input
                 .validate_value(&format!("steps[{index}].{action_key}"), payload)?;
-            let input = descriptor
-                .input_adapter
-                .evaluate(&[WorkflowTransformInput {
+            let input = if let Some(adapter) = &descriptor.input_adapter {
+                adapter.evaluate(&[WorkflowTransformInput {
                     name: WORKFLOW_TRANSFORM_SOURCE_CURRENT,
                     value: payload,
-                }])?;
+                }])?
+            } else {
+                payload.clone()
+            };
             let block = catalog
                 .blocks
                 .get(&descriptor.target_block)
@@ -4669,6 +4679,11 @@ impl WorkflowAuthoringDocument {
                 value,
             )?;
         }
+        materialize_plugin_input_defaults(
+            &mut definition,
+            &plugin_input_defaults,
+            &mut input_defaults,
+        )?;
         let definition = normalize_authored_definition(definition)?;
         if input_defaults == serde_json::json!({}) {
             input_defaults = serde_json::Value::Null;
@@ -5054,6 +5069,59 @@ fn authoring_value_at_path<'a>(
             )
         })
     })
+}
+
+fn materialize_plugin_input_defaults(
+    definition: &mut WorkflowDefinition,
+    plugin_input_defaults: &BTreeMap<String, serde_json::Value>,
+    workflow_input: &mut serde_json::Value,
+) -> Result<(), WorkflowError> {
+    if plugin_input_defaults.is_empty() {
+        return Ok(());
+    }
+    if definition.entries.len() != 1 {
+        return Err(authoring_error(
+            "plugin_input_defaults",
+            "plugin input defaults require exactly one workflow entry",
+        ));
+    }
+    for (node_id, defaults) in plugin_input_defaults {
+        let node = definition.nodes.get_mut(node_id).ok_or_else(|| {
+            authoring_error(
+                format!("plugin_input_defaults.{node_id}"),
+                "plugin input defaults reference an unknown node",
+            )
+        })?;
+        if definition.entries.first() == Some(node_id) {
+            *workflow_input = defaults.clone();
+        }
+        for edge in definition
+            .edges
+            .iter_mut()
+            .filter(|edge| edge.to == *node_id)
+        {
+            edge.transform = Some(WorkflowTransform {
+                version: WORKFLOW_TRANSFORM_VERSION,
+                expression: WorkflowTransformExpression::Constant {
+                    value: defaults.clone(),
+                },
+                output: node.input.clone(),
+            });
+        }
+    }
+    let entry = definition
+        .entries
+        .first()
+        .and_then(|node_id| definition.nodes.get(node_id))
+        .ok_or_else(|| authoring_error("definition.entries", "workflow entry node is missing"))?;
+    definition.input = entry.input.clone();
+    let exit = definition
+        .exits
+        .first()
+        .and_then(|node_id| definition.nodes.get(node_id))
+        .ok_or_else(|| authoring_error("definition.exits", "workflow exit node is missing"))?;
+    definition.output = exit.output.clone();
+    Ok(())
 }
 
 fn set_authoring_json_path(
@@ -10756,14 +10824,14 @@ mod tests {
             plugin_id: "bcode.example".to_string(),
             input: block.input.clone(),
             target_block: key.clone(),
-            input_adapter: WorkflowTransform {
+            input_adapter: Some(WorkflowTransform {
                 version: WORKFLOW_TRANSFORM_VERSION,
                 expression: WorkflowTransformExpression::Input {
                     source: WORKFLOW_TRANSFORM_SOURCE_CURRENT.to_string(),
                     path: String::new(),
                 },
                 output: block.input.clone(),
-            },
+            }),
         };
         let mut catalog = authoring_catalog();
         catalog.plugins.insert("bcode.example".to_string());
@@ -10794,6 +10862,84 @@ steps:
             first.document.plugin_input_defaults["final"],
             serde_json::json!("second")
         );
+    }
+
+    #[test]
+    fn checked_in_concise_sources_lower_identically() {
+        let block = WorkflowBlockDefinition {
+            block_id: "shell.script".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.shell".to_string(),
+            operation: "shell.script".to_string(),
+            input: ValueSchema {
+                type_name: "bcode.shell.script/v1".to_string(),
+                schema: serde_json::json!({
+                    "oneOf": [
+                        {"type": "string", "minLength": 1},
+                        {"type": "object"}
+                    ]
+                }),
+            },
+            output: ValueSchema {
+                type_name: "bcode.shell.command-plan-result/v2".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            },
+            effect: WorkflowBlockEffect::Mutating,
+            resources: vec![ResourceClaim::write("repository")],
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::Mutating,
+                explicit_grant_required: true,
+            },
+            timeout_ms: 300_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::RepairRequired,
+        };
+        let action = WorkflowAuthoringActionDescriptor {
+            version: WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION,
+            action_key: "run".to_string(),
+            action_version: 1,
+            plugin_id: "bcode.shell".to_string(),
+            input: block.input.clone(),
+            target_block: workflow_block_catalog_key(&block),
+            input_adapter: None,
+        };
+        let mut catalog = authoring_catalog();
+        catalog.plugins.insert("bcode.shell".to_string());
+        catalog
+            .blocks
+            .insert(workflow_block_catalog_key(&block), block);
+        catalog
+            .authoring_actions
+            .insert(action.catalog_key(), action);
+        let lowered = [
+            lower_workflow_authoring_source(
+                include_str!("../../../fixtures/workflows/concise-run.workflow.json"),
+                WorkflowSourceFormat::Json,
+                &catalog,
+            )
+            .expect("concise JSON"),
+            lower_workflow_authoring_source(
+                include_str!("../../../fixtures/workflows/concise-run.workflow.yaml"),
+                WorkflowSourceFormat::Yaml,
+                &catalog,
+            )
+            .expect("concise YAML"),
+            lower_workflow_authoring_source(
+                include_str!("../../../fixtures/workflows/concise-run.workflow.toml"),
+                WorkflowSourceFormat::Toml,
+                &catalog,
+            )
+            .expect("concise TOML"),
+        ];
+        assert_eq!(lowered[0], lowered[1]);
+        assert_eq!(lowered[1], lowered[2]);
+        let preview = lowered[0].document.compilation_preview(&catalog, None);
+        let compiled = preview.compiled.expect("compiled concise workflow");
+        assert_eq!(
+            compiled.input_defaults,
+            serde_json::json!("printf 'first\\n'")
+        );
+        assert!(compiled.definition.edges[0].transform.is_some());
     }
 
     #[test]

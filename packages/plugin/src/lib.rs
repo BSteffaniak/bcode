@@ -5320,10 +5320,13 @@ mod tests {
             .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
             .expect("workflow block service");
         let blocks = &service.workflow_blocks;
-        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.len(), 3);
         for block in blocks {
             block.validate().expect("valid workflow block");
-            assert_eq!(block.block_id, "shell.command-plan");
+            assert!(matches!(
+                block.block_id.as_str(),
+                "shell.command-plan" | "shell.script"
+            ));
             assert_eq!(block.plugin_id, manifest.id);
             assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::Mutating);
             assert!(block.authorization.explicit_grant_required);
@@ -5335,19 +5338,27 @@ mod tests {
         assert_eq!(
             blocks
                 .iter()
+                .filter(|block| block.block_id == "shell.command-plan")
                 .map(|block| block.block_version)
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([1, 2])
         );
-        assert_eq!(blocks[0].input.type_name, "bcode.shell.command-plan/v1");
-        assert_eq!(blocks[1].input.type_name, "bcode.shell.command-plan/v2");
+        assert_eq!(blocks[0].input.type_name, "bcode.shell.script/v1");
+        assert_eq!(blocks[1].input.type_name, "bcode.shell.command-plan/v1");
+        assert_eq!(blocks[2].input.type_name, "bcode.shell.command-plan/v2");
         assert_eq!(
-            blocks[0].output.type_name,
+            blocks[1].output.type_name,
             "bcode.shell.command-plan-result/v1"
         );
         assert_eq!(
-            blocks[1].output.type_name,
+            blocks[2].output.type_name,
             "bcode.shell.command-plan-result/v2"
+        );
+        assert_eq!(service.workflow_authoring_actions.len(), 1);
+        assert_eq!(service.workflow_authoring_actions[0].catalog_key(), "run@1");
+        assert_eq!(
+            service.workflow_authoring_actions[0].target_block,
+            "bcode.shell/shell.script@1"
         );
     }
 

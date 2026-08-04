@@ -271,7 +271,10 @@ fn shell_tool_definition() -> ToolDefinition {
 }
 
 fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResponse {
-    if context.request.operation != "shell.command-plan" {
+    if !matches!(
+        context.request.operation.as_str(),
+        "shell.command-plan" | "shell.script"
+    ) {
         return ServiceResponse::error(
             "unsupported_operation",
             "unsupported shell workflow block operation",
@@ -287,9 +290,37 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
         Ok(invocation) => invocation,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
-    let plan = match invocation.typed_input::<ShellWorkflowCommandPlan>() {
-        Ok(plan) => plan,
-        Err(error) => return ServiceResponse::error("invalid_request", error),
+    let plan = if context.request.operation == "shell.script" {
+        let request = if let Some(script) = invocation.input.as_str() {
+            contracts::ShellWorkflowScriptRequest {
+                version: contracts::SHELL_SCRIPT_VERSION,
+                script: script.to_string(),
+                shell: None,
+                cwd: std::path::PathBuf::from("."),
+                environment: std::collections::BTreeMap::new(),
+                timeout_ms: 300_000,
+                accepted_exit_codes: vec![0],
+                continue_on_unaccepted_exit: false,
+                output: contracts::ShellWorkflowOutputPolicy {
+                    preview_bytes: 8_192,
+                    artifact_spill: true,
+                },
+            }
+        } else {
+            match invocation.typed_input::<contracts::ShellWorkflowScriptRequest>() {
+                Ok(request) => request,
+                Err(error) => return ServiceResponse::error("invalid_request", error),
+            }
+        };
+        match shell_script_command_plan(request) {
+            Ok(plan) => plan,
+            Err(error) => return ServiceResponse::error("invalid_request", error),
+        }
+    } else {
+        match invocation.typed_input::<ShellWorkflowCommandPlan>() {
+            Ok(plan) => plan,
+            Err(error) => return ServiceResponse::error("invalid_request", error),
+        }
     };
     if !matches!(
         plan.version,
@@ -337,6 +368,51 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
         Ok(result) => json_response(&result),
         Err(error) => ServiceResponse::error("command_plan_failed", error),
     }
+}
+
+fn shell_script_command_plan(
+    request: contracts::ShellWorkflowScriptRequest,
+) -> Result<ShellWorkflowCommandPlan, String> {
+    if request.version != contracts::SHELL_SCRIPT_VERSION
+        || request.script.is_empty()
+        || request.script.len() > 65_536
+        || request.timeout_ms == 0
+        || request.timeout_ms > 300_000
+        || request.accepted_exit_codes.is_empty()
+        || request.accepted_exit_codes.len() > 64
+    {
+        return Err(
+            "shell script request exceeds version, script, timeout, or exit-code bounds"
+                .to_string(),
+        );
+    }
+    let mut shell = request.shell.unwrap_or_else(|| {
+        if cfg!(windows) {
+            vec!["cmd".to_string(), "/C".to_string()]
+        } else {
+            vec!["sh".to_string(), "-c".to_string()]
+        }
+    });
+    if shell.is_empty() || shell.len() > 32 || shell.iter().any(|part| part.contains('\0')) {
+        return Err("shell interpreter argv is invalid".to_string());
+    }
+    shell.push(request.script);
+    Ok(ShellWorkflowCommandPlan {
+        version: contracts::SHELL_COMMAND_PLAN_VERSION,
+        cwd: request.cwd,
+        commands: vec![contracts::ShellWorkflowCommand {
+            argv: shell,
+            timeout_ms: request.timeout_ms,
+            continue_on_nonzero: false,
+            accepted_exit_codes: Some(request.accepted_exit_codes),
+            continue_on_unaccepted_exit: request.continue_on_unaccepted_exit,
+        }],
+        environment: contracts::ShellWorkflowEnvironment {
+            inherit: true,
+            set: request.environment,
+        },
+        output: request.output,
+    })
 }
 
 const SHELL_WORKFLOW_ARTIFACT_CONTENT_TYPE: &str = "application/octet-stream";
@@ -2265,6 +2341,7 @@ bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn workflow_command_plan(
         workspace: &Path,
@@ -2321,6 +2398,52 @@ mod tests {
         cancellation: bcode_plugin_sdk::ServiceCancellation,
     ) -> NativeServiceContext {
         workflow_context_with_bridge(invocation, cancellation, ServiceBridge::default())
+    }
+
+    #[test]
+    fn shell_script_request_defaults_and_advanced_fields_are_plugin_owned() {
+        let scalar = contracts::ShellWorkflowScriptRequest {
+            version: contracts::SHELL_SCRIPT_VERSION,
+            script: "printf scalar".to_string(),
+            shell: None,
+            cwd: PathBuf::from("."),
+            environment: BTreeMap::new(),
+            timeout_ms: 300_000,
+            accepted_exit_codes: vec![0],
+            continue_on_unaccepted_exit: false,
+            output: contracts::ShellWorkflowOutputPolicy {
+                preview_bytes: 8_192,
+                artifact_spill: true,
+            },
+        };
+        let scalar_plan = shell_script_command_plan(scalar).expect("scalar plan");
+        assert_eq!(scalar_plan.commands[0].accepted_exit_codes, Some(vec![0]));
+        assert_eq!(
+            scalar_plan.commands[0].argv.last().map(String::as_str),
+            Some("printf scalar")
+        );
+
+        let advanced: contracts::ShellWorkflowScriptRequest = serde_json::from_value(json!({
+            "script": "exit 7",
+            "shell": ["bash", "-c"],
+            "cwd": "subdir",
+            "environment": {"MODE": "ci"},
+            "timeout_ms": 120_000,
+            "accepted_exit_codes": [0, 7],
+            "continue_on_unaccepted_exit": true,
+            "output": {"preview_bytes": 4096, "artifact_spill": false}
+        }))
+        .expect("advanced request");
+        let advanced_plan = shell_script_command_plan(advanced).expect("advanced plan");
+        assert_eq!(advanced_plan.cwd, PathBuf::from("subdir"));
+        assert_eq!(advanced_plan.environment.set["MODE"], "ci");
+        assert_eq!(advanced_plan.commands[0].argv, ["bash", "-c", "exit 7"]);
+        assert_eq!(
+            advanced_plan.commands[0].accepted_exit_codes,
+            Some(vec![0, 7])
+        );
+        assert!(advanced_plan.commands[0].continue_on_unaccepted_exit);
+        assert_eq!(advanced_plan.output.preview_bytes, 4096);
     }
 
     #[test]

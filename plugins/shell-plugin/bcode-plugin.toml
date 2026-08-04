@@ -12,7 +12,7 @@ name         = "Shell Workflow Blocks"
 action_key     = "run"
 action_version = 1
 plugin_id      = "bcode.shell"
-target_block   = "bcode.shell/shell.command-plan@2"
+target_block   = "bcode.shell/shell.script@1"
 version        = 1
 
 [services.workflow_authoring_actions.input]
@@ -20,100 +20,40 @@ schema = { oneOf = [
     { type = "string", minLength = 1, maxLength = 65536 },
     { type = "object", additionalProperties = false, required = [
         "script",
-    ], properties = { script = { type = "string", minLength = 1, maxLength = 65536 }, shell = { type = "array", minItems = 1, maxItems = 32, items = { type = "string", maxLength = 4096 } }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, environment = { type = "object", maxProperties = 128, additionalProperties = { type = "string", maxLength = 65536 } }, timeout_ms = { type = "integer", minimum = 1, maximum = 300000 }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 64, uniqueItems = true, items = { type = "integer" } }, continue_on_unaccepted_exit = { type = "boolean" }, output = { type = "object", additionalProperties = false, properties = { preview_bytes = { type = "integer", minimum = 0, maximum = 65536 }, artifact_spill = { type = "boolean" } } } } },
+    ], properties = { version = { const = 1 }, script = { type = "string", minLength = 1, maxLength = 65536 }, shell = { type = "array", minItems = 1, maxItems = 32, items = { type = "string", maxLength = 4096 } }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, environment = { type = "object", maxProperties = 128, additionalProperties = { type = "string", maxLength = 65536 } }, timeout_ms = { type = "integer", minimum = 1, maximum = 300000 }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 64, uniqueItems = true, items = { type = "integer" } }, continue_on_unaccepted_exit = { type = "boolean" }, output = { type = "object", additionalProperties = false, properties = { preview_bytes = { type = "integer", minimum = 0, maximum = 65536 }, artifact_spill = { type = "boolean" } } } } },
 ] }
-type_name = "bcode.shell.run-source/v1"
+type_name = "bcode.shell.script/v1"
 
-[services.workflow_authoring_actions.input_adapter]
-version = 2
+[[services.workflow_blocks]]
+block_id               = "shell.script"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "shell.script"
+plugin_id              = "bcode.shell"
+reconciliation         = "repair_required"
+timeout_ms             = 300000
 
-[services.workflow_authoring_actions.input_adapter.expression]
-operation = "object"
+[services.workflow_blocks.input]
+schema = { oneOf = [
+    { type = "string", minLength = 1, maxLength = 65536 },
+    { type = "object", additionalProperties = false, required = [
+        "script",
+    ], properties = { version = { const = 1 }, script = { type = "string", minLength = 1, maxLength = 65536 }, shell = { type = "array", minItems = 1, maxItems = 32, items = { type = "string", maxLength = 4096 } }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, environment = { type = "object", maxProperties = 128, additionalProperties = { type = "string", maxLength = 65536 } }, timeout_ms = { type = "integer", minimum = 1, maximum = 300000 }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 64, uniqueItems = true, items = { type = "integer" } }, continue_on_unaccepted_exit = { type = "boolean" }, output = { type = "object", additionalProperties = false, properties = { preview_bytes = { type = "integer", minimum = 0, maximum = 65536 }, artifact_spill = { type = "boolean" } } } } },
+] }
+type_name = "bcode.shell.script/v1"
 
-[services.workflow_authoring_actions.input_adapter.expression.fields.version]
-operation = "constant"
-value     = 2
+[services.workflow_blocks.output]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan-result/v2"
 
-[services.workflow_authoring_actions.input_adapter.expression.fields.cwd]
-operation = "constant"
-value     = "."
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
 
-[services.workflow_authoring_actions.input_adapter.expression.fields.commands]
-operation = "array"
-
-[[services.workflow_authoring_actions.input_adapter.expression.fields.commands.items]]
-operation = "object"
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.commands.items.fields.argv]
-operation = "array"
-
-[[services.workflow_authoring_actions.input_adapter.expression.fields.commands.items.fields.argv.items]]
-operation = "constant"
-value     = "sh"
-
-[[services.workflow_authoring_actions.input_adapter.expression.fields.commands.items.fields.argv.items]]
-operation = "constant"
-value     = "-c"
-
-[[services.workflow_authoring_actions.input_adapter.expression.fields.commands.items.fields.argv.items]]
-operation = "input"
-source    = "current"
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.commands.items.fields.timeout_ms]
-operation = "constant"
-value     = 300000
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.commands.items.fields.accepted_exit_codes]
-operation = "array"
-
-[[services.workflow_authoring_actions.input_adapter.expression.fields.commands.items.fields.accepted_exit_codes.items]]
-operation = "constant"
-value     = 0
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.commands.items.fields.continue_on_unaccepted_exit]
-operation = "constant"
-value     = false
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.environment]
-operation = "object"
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.environment.fields.inherit]
-operation = "constant"
-value     = true
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.environment.fields.set]
-fields    = {}
-operation = "object"
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.output]
-operation = "object"
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.output.fields.preview_bytes]
-operation = "constant"
-value     = 8192
-
-[services.workflow_authoring_actions.input_adapter.expression.fields.output.fields.artifact_spill]
-operation = "constant"
-value     = true
-
-[services.workflow_authoring_actions.input_adapter.output]
-schema = { type = "object", additionalProperties = false, required = [
-    "version",
-    "cwd",
-    "commands",
-    "environment",
-    "output",
-], properties = { version = { const = 2 }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, commands = { type = "array", minItems = 1, maxItems = 64, items = { type = "object", additionalProperties = false, required = [
-    "argv",
-    "timeout_ms",
-], properties = { argv = { type = "array", minItems = 1, maxItems = 256, items = { type = "string", maxLength = 65536 } }, timeout_ms = { type = "integer", minimum = 1, maximum = 300000 }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 64, uniqueItems = true, items = { type = "integer" } }, continue_on_unaccepted_exit = { type = "boolean" } } } }, environment = { type = "object", additionalProperties = false, required = [
-    "inherit",
-    "set",
-], properties = { inherit = { type = "boolean" }, set = { type = "object", maxProperties = 128, additionalProperties = { type = "string", maxLength = 65536 } } } }, output = { type = "object", additionalProperties = false, required = [
-    "preview_bytes",
-    "artifact_spill",
-], properties = { preview_bytes = { type = "integer", minimum = 0, maximum = 65536 }, artifact_spill = { type = "boolean" } } } } }
-type_name = "bcode.shell.command-plan/v2"
+[[services.workflow_blocks.resources]]
+access   = "write"
+resource = "repository"
 
 [[services.workflow_blocks]]
 block_id      = "shell.command-plan"

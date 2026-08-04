@@ -34,6 +34,55 @@ pub const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-record
 pub const SHELL_COMMAND_PLAN_VERSION_1: u32 = 1;
 /// Current typed command-plan workflow block contract version.
 pub const SHELL_COMMAND_PLAN_VERSION: u32 = 2;
+/// Current typed script workflow block contract version.
+pub const SHELL_SCRIPT_VERSION: u32 = 1;
+
+/// Shell-plugin-owned script request. Interpreter selection and script adaptation never enter the
+/// generic workflow domain.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellWorkflowScriptRequest {
+    #[serde(default = "default_script_version")]
+    pub version: u32,
+    pub script: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<Vec<String>>,
+    #[serde(default = "default_workflow_cwd")]
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_shell_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_accepted_exit_codes")]
+    pub accepted_exit_codes: Vec<i32>,
+    #[serde(default)]
+    pub continue_on_unaccepted_exit: bool,
+    #[serde(default = "default_workflow_output")]
+    pub output: ShellWorkflowOutputPolicy,
+}
+
+const fn default_script_version() -> u32 {
+    SHELL_SCRIPT_VERSION
+}
+
+fn default_workflow_cwd() -> PathBuf {
+    PathBuf::from(".")
+}
+
+const fn default_shell_timeout() -> u64 {
+    300_000
+}
+
+fn default_accepted_exit_codes() -> Vec<i32> {
+    vec![0]
+}
+
+const fn default_workflow_output() -> ShellWorkflowOutputPolicy {
+    ShellWorkflowOutputPolicy {
+        preview_bytes: 8_192,
+        artifact_spill: true,
+    }
+}
 
 /// One argv-mode command. No implicit shell-string parsing is performed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
