@@ -478,6 +478,33 @@ async fn stream_bedrock_turn_inner(
                     last_error = Some(error);
                     continue;
                 }
+                if model_unusable_via_converse(&error) {
+                    // These models are served through the Anthropic Messages API surface and are
+                    // not usable through Converse. Prune them from future discovery so they stop
+                    // appearing in the picker, and surface a clear reason.
+                    mark_streaming_tool_unsupported(
+                        &discovery,
+                        selection.cache_key.as_ref(),
+                        model_id,
+                        &error.message,
+                    );
+                    if !selection.explicit && selection.model_ids.last() != Some(model_id) {
+                        turn.push(ProviderTurnEvent::Warning {
+                            message: format!(
+                                "Bedrock model {model_id} is not available through the Converse API; retrying another discovered model"
+                            ),
+                        });
+                        last_error = Some(error);
+                        continue;
+                    }
+                    return Err(provider_error(
+                        "bedrock_model_requires_messages_api",
+                        ProviderErrorCategory::UnsupportedFeature,
+                        format!(
+                            "Bedrock model {model_id} is only served through the Anthropic Messages API and cannot be used by the Converse adapter; select a Converse-compatible Claude model"
+                        ),
+                    ));
+                }
                 return Err(error);
             }
         }
@@ -2121,6 +2148,20 @@ fn streaming_tool_use_unsupported(error: &ProviderError) -> bool {
         && error
             .message
             .contains("doesn't support tool use in streaming mode")
+}
+
+/// Detect models that cannot be driven through the Converse API by this adapter.
+///
+/// The newest Anthropic models (for example the `global.` inference tier) are served through the
+/// Bedrock Anthropic Messages API and reject Converse requests with a data-retention
+/// `ValidationException`. Treat these as structurally unusable so they are pruned from discovery
+/// like other adapter-incompatible models.
+fn model_unusable_via_converse(error: &ProviderError) -> bool {
+    error.category == ProviderErrorCategory::InvalidRequest
+        && error
+            .message
+            .to_ascii_lowercase()
+            .contains("data retention mode")
 }
 
 fn prompt_cache_rejected(error: &ProviderError) -> bool {
