@@ -13,36 +13,19 @@ text_output = true
 tool_use = true
 structured_outputs = true
 
-[models."anthropic.claude-3-5-sonnet-20241022-v2:0"]
-model_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
-display_name = "Claude 3.5 Sonnet v2"
-status = "stable"
-bcode_support = "supported"
-context_window = 200000
-max_output_tokens = 64000
+# Amazon Bedrock exposes a large, fast-moving set of Anthropic models (and per-region
+# inference-profile IDs such as `us.`/`eu.`/`apac.` prefixes). Membership is driven by the
+# live Bedrock provider plugin (`ListFoundationModels` + `ListInferenceProfiles`); the entries
+# below are family/tier alias globs that enrich whatever the plugin discovers with correct
+# Claude family metadata. Do not maintain an exhaustive pinned model list here: new Claude
+# generations should be picked up by live discovery and enriched by the longest-matching glob.
+#
+# Alias matching (see `find_provider_model`) prefers the longest `*needle*` substring match, so
+# the broad `*claude*` fallback applies only when no tier-specific entry matches.
 
-[models."anthropic.claude-3-5-sonnet-20241022-v2:0".pricing]
-currency = "USD"
-unit = "per_million_tokens"
-input_micros = 3000000
-cached_input_micros = 300000
-cache_write_input_micros = 3750000
-output_micros = 15000000
-
-[models."anthropic.claude-3-5-sonnet-20241022-v2:0".capabilities]
-text_input = true
-image_input = true
-text_output = true
-tool_use = true
-parallel_tool_calls = true
-structured_outputs = true
-prompt_cache = true
-
-[models."anthropic.claude-3-5-sonnet-20241022-v2:0".source]
-pricing = "manual"
-metadata = "manual"
-last_verified_at = "2026-06-20T00:00:00Z"
-
+# Broad Claude family fallback. Claude 3 / 3.5 generations do not support extended thinking, so
+# the fallback intentionally omits a reasoning block; tier globs below add reasoning where the
+# generation supports it.
 [models."anthropic.claude"]
 model_id = "anthropic.claude"
 display_name = "Claude"
@@ -62,17 +45,22 @@ parallel_tool_calls = true
 structured_outputs = true
 prompt_cache = true
 
-[models."anthropic.claude-opus-4"]
-model_id = "anthropic.claude-opus-4"
-display_name = "Claude Opus 4"
-aliases = ["*claude-opus-4*"]
+# Modern reasoning-capable Claude generations (3.7 and 4.x/5.x lines) support extended thinking
+# on Bedrock. Reasoning effort is expressed via a thinking token budget rather than named effort
+# levels, so `effort_values` are Bcode-portable names mapped by the provider adapter and
+# `raw_reasoning_supported` reflects Bedrock streaming reasoning content blocks.
+
+[models."anthropic.claude-3-7-sonnet"]
+model_id = "anthropic.claude-3-7-sonnet"
+display_name = "Claude 3.7 Sonnet"
+aliases = ["*claude-3-7-sonnet*", "*claude-3-7*"]
 status = "stable"
 bcode_support = "supported"
 family = "claude"
 context_window = 200000
 max_output_tokens = 64000
 
-[models."anthropic.claude-opus-4".capabilities]
+[models."anthropic.claude-3-7-sonnet".capabilities]
 text_input = true
 image_input = true
 text_output = true
@@ -80,11 +68,42 @@ tool_use = true
 parallel_tool_calls = true
 structured_outputs = true
 prompt_cache = true
+reasoning = true
+
+[models."anthropic.claude-3-7-sonnet".reasoning]
+effort_values = ["low", "medium", "high"]
+default_effort = "medium"
+raw_reasoning_supported = true
+
+[models."anthropic.claude-opus"]
+model_id = "anthropic.claude-opus"
+display_name = "Claude Opus"
+aliases = ["*claude-opus-4*", "*claude-opus-5*", "*claude-opus*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 200000
+max_output_tokens = 64000
+
+[models."anthropic.claude-opus".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+prompt_cache = true
+reasoning = true
+
+[models."anthropic.claude-opus".reasoning]
+effort_values = ["low", "medium", "high"]
+default_effort = "medium"
+raw_reasoning_supported = true
 
 [models."anthropic.claude-sonnet-4"]
 model_id = "anthropic.claude-sonnet-4"
 display_name = "Claude Sonnet 4"
-aliases = ["*claude-sonnet-4*"]
+aliases = ["*claude-sonnet-4*", "*claude-sonnet-5*", "*claude-sonnet*"]
 status = "stable"
 bcode_support = "supported"
 family = "claude"
@@ -99,11 +118,17 @@ tool_use = true
 parallel_tool_calls = true
 structured_outputs = true
 prompt_cache = true
+reasoning = true
+
+[models."anthropic.claude-sonnet-4".reasoning]
+effort_values = ["low", "medium", "high"]
+default_effort = "medium"
+raw_reasoning_supported = true
 
 [models."anthropic.claude-haiku-4"]
 model_id = "anthropic.claude-haiku-4"
 display_name = "Claude Haiku 4"
-aliases = ["*claude-haiku-4*"]
+aliases = ["*claude-haiku-4*", "*claude-haiku-5*", "*claude-haiku*"]
 status = "stable"
 bcode_support = "supported"
 family = "claude"
@@ -118,6 +143,12 @@ tool_use = true
 parallel_tool_calls = true
 structured_outputs = true
 prompt_cache = true
+reasoning = true
+
+[models."anthropic.claude-haiku-4".reasoning]
+effort_values = ["low", "medium", "high"]
+default_effort = "medium"
+raw_reasoning_supported = true
 
 [models."anthropic.claude-3-7"]
 model_id = "anthropic.claude-3-7"
@@ -137,6 +168,12 @@ tool_use = true
 parallel_tool_calls = true
 structured_outputs = true
 prompt_cache = true
+reasoning = true
+
+[models."anthropic.claude-3-7".reasoning]
+effort_values = ["low", "medium", "high"]
+default_effort = "medium"
+raw_reasoning_supported = true
 
 [models."anthropic.claude-3-haiku"]
 model_id = "anthropic.claude-3-haiku"

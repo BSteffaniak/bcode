@@ -5151,6 +5151,81 @@ mod tests {
     }
 
     #[test]
+    fn session_model_list_with_populated_feature_support_round_trips() {
+        // Guards against the TypedStable codec regression where enum-keyed `BTreeMap`s in
+        // `ModelFeatureSupport` failed to decode ("unexpected type tag: expected String, got
+        // U32"). Every enum-keyed map is populated so all variant-identifier decode paths run.
+        use bcode_model::{
+            CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
+            ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
+        };
+
+        let supported = || CapabilitySupport::Supported {
+            source: CapabilitySource::BundledCatalog,
+        };
+        let unsupported = || CapabilitySupport::Unsupported {
+            source: CapabilitySource::Probe,
+            reason: "not available".to_string(),
+        };
+
+        let feature_support = ModelFeatureSupport {
+            parameters: [
+                (ModelParameterKey::Temperature, supported()),
+                (ModelParameterKey::ReasoningEffort, unsupported()),
+            ]
+            .into_iter()
+            .collect(),
+            structured_output: [
+                (StructuredOutputMode::JsonSchema, supported()),
+                (StructuredOutputMode::StrictJsonSchema, unsupported()),
+            ]
+            .into_iter()
+            .collect(),
+            tool_choice: [
+                (ToolChoiceMode::Auto, supported()),
+                (ToolChoiceMode::Parallel, supported()),
+            ]
+            .into_iter()
+            .collect(),
+            prompt_cache: std::iter::once((PromptCacheFeature::ConversationPrefix, supported()))
+                .collect(),
+            media_input: std::iter::once((MediaInputFeature::UserImage, supported())).collect(),
+        };
+
+        let response = Response::Ok(ResponsePayload::SessionModelList {
+            provider_plugin_id: Some("bcode.bedrock".to_string()),
+            models: bcode_model::ModelList {
+                models: vec![bcode_model::ModelInfo {
+                    model_id: "anthropic.claude".to_string(),
+                    display_name: "Claude".to_string(),
+                    is_default: true,
+                    context_window: Some(200_000),
+                    max_output_tokens: Some(64_000),
+                    capabilities: BTreeSet::new(),
+                    feature_support,
+                    reasoning: None,
+                    cache: bcode_model::ModelCacheInfo::default(),
+                    metadata_source: None,
+                    pricing: None,
+                    visibility: bcode_model::ModelVisibility::Visible,
+                }],
+                catalog: bcode_model::ModelCatalogHints {
+                    policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
+                        provider_id: "bedrock".to_string(),
+                        target: None,
+                        authority: bcode_model::ModelListAuthority::Partial,
+                    },
+                },
+            },
+        });
+
+        let encoded = encode_response(&response).expect("response should encode");
+        let decoded = decode_response(&encoded).expect("response should decode");
+
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
     fn response_envelope_uses_current_protocol_version() {
         let envelope = response_envelope(7, &Response::Ok(ResponsePayload::MessageSent))
             .expect("response envelope should encode");

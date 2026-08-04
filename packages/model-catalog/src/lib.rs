@@ -1837,6 +1837,65 @@ status = "stable"
     }
 
     #[test]
+    fn bedrock_live_inference_profile_enriches_to_reasoning_family() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+
+        // A live-discovered cross-region inference-profile ID (as returned by
+        // `ListInferenceProfiles`) must enrich from the tier-specific Claude Sonnet glob, not
+        // just the broad `*claude*` fallback, and gain reasoning metadata + a 200k window.
+        let discovered = bcode_model::ModelInfo {
+            model_id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+            display_name: "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        };
+
+        let enriched = catalog.enrich_model("bedrock", discovered);
+
+        assert_eq!(enriched.context_window, Some(200_000));
+        let reasoning = enriched
+            .reasoning
+            .expect("modern Claude tier should carry reasoning metadata");
+        assert!(reasoning.effort_values.contains(&"medium".to_string()));
+        assert!(reasoning.raw_reasoning_supported);
+    }
+
+    #[test]
+    fn bedrock_legacy_claude_3_has_no_reasoning() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+
+        // Claude 3 Haiku does not support extended thinking; it should match the broad
+        // `*claude*` fallback (no reasoning) rather than a modern reasoning tier.
+        let discovered = bcode_model::ModelInfo {
+            model_id: "anthropic.claude-3-haiku-20240307-v1:0".to_string(),
+            display_name: "anthropic.claude-3-haiku-20240307-v1:0".to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        };
+
+        let enriched = catalog.enrich_model("bedrock", discovered);
+
+        assert_eq!(enriched.context_window, Some(200_000));
+        assert!(enriched.reasoning.is_none());
+    }
+
+    #[test]
     fn overlay_marks_remote_models_and_remote_values_take_precedence() {
         let mut local = load_embedded_catalog().expect("embedded catalog should load");
         let mut remote = CatalogDocument::empty("remote", "2026-01-01T00:00:00Z");

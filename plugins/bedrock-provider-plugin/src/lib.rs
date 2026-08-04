@@ -288,15 +288,11 @@ fn validate_bedrock_request(request: &ModelTurnRequest) -> Result<(), ProviderEr
             "Bedrock Converse does not provide provider-native JSON Schema enforcement",
         ));
     }
-    if request.parameters.reasoning_budget_tokens.is_some()
-        || request.parameters.reasoning_effort.is_some()
-        || request.parameters.reasoning_effort_value.is_some()
-        || request.parameters.reasoning_summary.is_some()
-    {
+    if request.parameters.reasoning_summary.is_some() {
         return Err(provider_error(
-            "bedrock_reasoning_controls_unsupported",
+            "bedrock_reasoning_summary_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
-            "Bedrock reasoning controls are not supported by this provider adapter",
+            "Bedrock Anthropic extended thinking does not support provider-visible reasoning summaries",
         ));
     }
     if request.tool_call_policy.parallel == Some(true) {
@@ -433,6 +429,9 @@ async fn stream_bedrock_turn_inner(
         if let Some(inference_config) = bedrock_request.inference_config {
             builder = builder.inference_config(inference_config);
         }
+        if let Some(additional_fields) = bedrock_request.additional_model_request_fields {
+            builder = builder.additional_model_request_fields(additional_fields);
+        }
         match builder.send().await {
             Ok(response) => {
                 return read_bedrock_stream(response.stream, turn, name_map.clone()).await;
@@ -520,6 +519,9 @@ async fn retry_bedrock_without_prompt_cache(
     }
     if let Some(inference_config) = bedrock_request.inference_config {
         retry_builder = retry_builder.inference_config(inference_config);
+    }
+    if let Some(additional_fields) = bedrock_request.additional_model_request_fields {
+        retry_builder = retry_builder.additional_model_request_fields(additional_fields);
     }
     match retry_builder.send().await {
         Ok(response) => read_bedrock_stream(response.stream, turn, name_map).await,
@@ -884,6 +886,7 @@ struct BedrockConverseRequest {
     system: Vec<SystemContentBlock>,
     tool_config: Option<ToolConfiguration>,
     inference_config: Option<InferenceConfiguration>,
+    additional_model_request_fields: Option<Document>,
 }
 
 fn bedrock_request_projection(request: &ModelTurnRequest) -> ProviderRequestProjection {
@@ -940,7 +943,58 @@ fn build_converse_request(
         system: system_blocks(request),
         tool_config: model_tools_to_bedrock_tool_config(request)?,
         inference_config: model_parameters_to_inference_config(request),
+        additional_model_request_fields: bedrock_thinking_fields(&request.parameters),
     })
+}
+
+/// Default Anthropic extended-thinking token budgets per Bcode reasoning-effort level.
+const REASONING_EFFORT_LOW_BUDGET: u32 = 1_024;
+const REASONING_EFFORT_MEDIUM_BUDGET: u32 = 4_096;
+const REASONING_EFFORT_HIGH_BUDGET: u32 = 16_384;
+
+/// Resolve the Anthropic extended-thinking token budget requested for this turn.
+///
+/// Prefers an explicit `reasoning_budget_tokens`, otherwise maps a named
+/// `reasoning_effort`/`reasoning_effort_value` onto a portable default budget. Returns `None`
+/// when the request does not ask for reasoning.
+fn resolve_reasoning_budget_tokens(params: &bcode_model::ModelParameters) -> Option<u32> {
+    if let Some(budget) = params.reasoning_budget_tokens
+        && budget > 0
+    {
+        return Some(budget);
+    }
+    let effort = params.reasoning_effort.map(|effort| match effort {
+        bcode_model::ReasoningEffort::Low => REASONING_EFFORT_LOW_BUDGET,
+        bcode_model::ReasoningEffort::Medium => REASONING_EFFORT_MEDIUM_BUDGET,
+        bcode_model::ReasoningEffort::High => REASONING_EFFORT_HIGH_BUDGET,
+    });
+    if let Some(budget) = effort {
+        return Some(budget);
+    }
+    match params.reasoning_effort_value.as_deref() {
+        Some("low" | "minimal") => Some(REASONING_EFFORT_LOW_BUDGET),
+        Some("medium") => Some(REASONING_EFFORT_MEDIUM_BUDGET),
+        Some("high" | "xhigh" | "max") => Some(REASONING_EFFORT_HIGH_BUDGET),
+        _ => None,
+    }
+}
+
+/// Build the Bedrock `additionalModelRequestFields` document that enables Anthropic extended
+/// thinking, or `None` when reasoning was not requested.
+///
+/// The Converse API forwards these fields to the model verbatim; Anthropic models accept
+/// `{"thinking": {"type": "enabled", "budget_tokens": N}}`.
+fn bedrock_thinking_fields(params: &bcode_model::ModelParameters) -> Option<Document> {
+    let budget = resolve_reasoning_budget_tokens(params)?;
+    let mut thinking = HashMap::new();
+    thinking.insert("type".to_string(), Document::String("enabled".to_string()));
+    thinking.insert(
+        "budget_tokens".to_string(),
+        Document::Number(Number::PosInt(u64::from(budget))),
+    );
+    let mut fields = HashMap::new();
+    fields.insert("thinking".to_string(), Document::Object(thinking));
+    Some(Document::Object(fields))
 }
 
 fn system_blocks(request: &ModelTurnRequest) -> Vec<SystemContentBlock> {
@@ -1445,24 +1499,18 @@ fn bedrock_feature_support() -> bcode_model::ModelFeatureSupport {
             ModelParameterKey::MaxOutputTokens,
             ModelParameterKey::TopP,
             ModelParameterKey::StopSequences,
+            ModelParameterKey::ReasoningBudgetTokens,
+            ModelParameterKey::ReasoningEffort,
+            ModelParameterKey::ReasoningEffortValue,
         ]
         .into_iter()
         .map(|key| (key, supported()))
-        .chain(
-            [
-                ModelParameterKey::ReasoningBudgetTokens,
-                ModelParameterKey::ReasoningEffort,
-                ModelParameterKey::ReasoningEffortValue,
-                ModelParameterKey::ReasoningSummary,
-            ]
-            .into_iter()
-            .map(|key| {
-                (
-                    key,
-                    unsupported("Bedrock Converse reasoning controls are not mapped"),
-                )
-            }),
-        )
+        .chain(std::iter::once((
+            ModelParameterKey::ReasoningSummary,
+            unsupported(
+                "Bedrock Anthropic extended thinking has no provider-visible reasoning summary",
+            ),
+        )))
         .collect(),
         structured_output: [
             StructuredOutputMode::JsonSchema,
@@ -3804,6 +3852,21 @@ mod tests {
             provider.structured_output(StructuredOutputMode::StrictJsonSchema),
             CapabilitySupport::Unsupported { .. }
         ));
+        assert!(
+            provider
+                .parameter(ModelParameterKey::ReasoningBudgetTokens)
+                .is_guaranteed(),
+            "Bedrock now maps extended thinking to a reasoning budget"
+        );
+        assert!(
+            provider
+                .parameter(ModelParameterKey::ReasoningEffort)
+                .is_guaranteed()
+        );
+        assert!(matches!(
+            provider.parameter(ModelParameterKey::ReasoningSummary),
+            CapabilitySupport::Unsupported { .. }
+        ));
         assert!(matches!(
             provider.negotiate(
                 &ModelFeatureSupport::default(),
@@ -3828,13 +3891,63 @@ mod tests {
 
         request.structured_output = None;
         request.parameters.reasoning_effort = Some(bcode_model::ReasoningEffort::High);
-        let error = validate_bedrock_request(&request).expect_err("reasoning control must fail");
-        assert_eq!(error.code, "bedrock_reasoning_controls_unsupported");
+        validate_bedrock_request(&request)
+            .expect("reasoning effort is now mapped to extended thinking");
+
+        request.parameters = bcode_model::ModelParameters::default();
+        request.parameters.reasoning_summary = Some("detailed".to_string());
+        let error = validate_bedrock_request(&request).expect_err("reasoning summary must fail");
+        assert_eq!(error.code, "bedrock_reasoning_summary_unsupported");
 
         request.parameters = bcode_model::ModelParameters::default();
         request.tool_call_policy.parallel = Some(true);
         let error = validate_bedrock_request(&request).expect_err("parallel policy must fail");
         assert_eq!(error.code, "bedrock_parallel_tool_policy_unsupported");
+    }
+
+    #[test]
+    fn bedrock_thinking_fields_from_reasoning_effort() {
+        let params = bcode_model::ModelParameters::default();
+        assert!(bedrock_thinking_fields(&params).is_none());
+
+        let params = bcode_model::ModelParameters {
+            reasoning_effort: Some(bcode_model::ReasoningEffort::High),
+            ..Default::default()
+        };
+        let fields = bedrock_thinking_fields(&params).expect("thinking fields");
+        let Document::Object(root) = fields else {
+            panic!("thinking fields must be an object");
+        };
+        let Some(Document::Object(thinking)) = root.get("thinking") else {
+            panic!("thinking key must be an object");
+        };
+        assert_eq!(
+            thinking.get("type"),
+            Some(&Document::String("enabled".to_string()))
+        );
+        assert_eq!(
+            thinking.get("budget_tokens"),
+            Some(&Document::Number(Number::PosInt(u64::from(
+                REASONING_EFFORT_HIGH_BUDGET
+            ))))
+        );
+    }
+
+    #[test]
+    fn bedrock_thinking_budget_prefers_explicit_tokens() {
+        let mut params = bcode_model::ModelParameters {
+            reasoning_effort: Some(bcode_model::ReasoningEffort::Low),
+            reasoning_budget_tokens: Some(8_192),
+            ..Default::default()
+        };
+        assert_eq!(resolve_reasoning_budget_tokens(&params), Some(8_192));
+
+        params.reasoning_budget_tokens = Some(0);
+        assert_eq!(
+            resolve_reasoning_budget_tokens(&params),
+            Some(REASONING_EFFORT_LOW_BUDGET),
+            "a zero explicit budget falls back to the effort mapping"
+        );
     }
 
     #[test]
