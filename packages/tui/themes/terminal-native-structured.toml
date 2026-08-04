@@ -30,6 +30,18 @@ bg = "$muted_background"
 [styles."tool.timed_out.container"]
 bg = "$warning_background"
 
+[containers."transcript.user"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "content"
+
+[containers."transcript.assistant"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "content"
+
 [containers."tool.requested"]
 border    = "left"
 layout    = "panel"
@@ -55,7 +67,7 @@ padding_x = 1
 width     = "full"
 
 [containers."tool.failed"]
-border    = "left"
+border    = "all"
 layout    = "panel"
 padding_x = 1
 width     = "full"

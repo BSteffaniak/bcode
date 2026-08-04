@@ -9,6 +9,70 @@ use bmux_tui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 use thiserror::Error;
 
+/// Semantic style roles every version-1 theme must resolve through definition or inheritance.
+pub const REQUIRED_SEMANTIC_STYLE_ROLES: &[&str] = &[
+    "canvas",
+    "text.primary",
+    "text.muted",
+    "border.default",
+    "border.focused",
+    "state.info",
+    "state.success",
+    "state.warning",
+    "state.error",
+    "selection.active",
+    "markdown.text",
+    "markdown.heading",
+    "markdown.link",
+    "markdown.inline_code",
+    "markdown.code_block_text",
+    "markdown.code_block_border",
+    "markdown.blockquote_bar",
+    "markdown.alert_note",
+    "markdown.alert_tip",
+    "markdown.alert_important",
+    "markdown.alert_warning",
+    "markdown.alert_caution",
+    "markdown.list_marker",
+    "markdown.task_checked",
+    "markdown.task_unchecked",
+    "markdown.table_border",
+    "markdown.horizontal_rule",
+    "syntax.text",
+    "syntax.comment",
+    "syntax.keyword",
+    "syntax.function",
+    "syntax.variable",
+    "syntax.string",
+    "syntax.number",
+    "syntax.type",
+    "syntax.operator",
+    "syntax.punctuation",
+    "transcript.user.label",
+    "transcript.assistant.label",
+    "transcript.reasoning.label",
+    "tool.requested.title",
+    "tool.running.title",
+    "tool.waiting.title",
+    "tool.succeeded.title",
+    "tool.failed.title",
+    "tool.cancelled.title",
+    "tool.timed_out.title",
+];
+
+/// Semantic container roles every version-1 theme must resolve through definition or inheritance.
+pub const REQUIRED_CONTAINER_ROLES: &[&str] = &[
+    "transcript.user",
+    "transcript.assistant",
+    "tool.requested",
+    "tool.running",
+    "tool.waiting",
+    "tool.succeeded",
+    "tool.failed",
+    "tool.cancelled",
+    "tool.timed_out",
+];
+
 /// Theme definition schema version supported by this build.
 pub const THEME_SCHEMA_VERSION: u32 = 1;
 /// Maximum accepted UTF-8 bytes in one theme file.
@@ -925,8 +989,9 @@ mod tests {
     use bmux_tui::style::{Color, Modifier};
 
     use super::{
-        ContainerBorder, ContainerLayout, ContainerWidth, ResolvedThemeVariant, ThemeCatalog,
-        ThemeError, ThemeSelection, parse_theme_definition,
+        ContainerBorder, ContainerLayout, ContainerWidth, REQUIRED_CONTAINER_ROLES,
+        REQUIRED_SEMANTIC_STYLE_ROLES, ResolvedThemeVariant, ThemeCatalog, ThemeError,
+        ThemeSelection, parse_theme_definition,
     };
 
     const BASE: &str = r##"
@@ -1070,6 +1135,83 @@ indicator = "exit-code"
             palette.resolve(&ThemeSelection::new("palette")),
             Err(ThemeError::ColorReferenceCycle { .. })
         ));
+    }
+
+    #[test]
+    fn bundled_catalog_resolves_every_required_role_and_recipe() {
+        let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
+        for definition in catalog.definitions() {
+            let id = definition.id();
+            let resolved = catalog
+                .resolve(&ThemeSelection::new(id))
+                .unwrap_or_else(|error| panic!("bundled theme {id:?} resolves: {error}"));
+            let missing_styles = REQUIRED_SEMANTIC_STYLE_ROLES
+                .iter()
+                .copied()
+                .filter(|role| !resolved.styles.contains_key(*role))
+                .collect::<Vec<_>>();
+            let missing_containers = REQUIRED_CONTAINER_ROLES
+                .iter()
+                .copied()
+                .filter(|role| !resolved.containers.contains_key(*role))
+                .collect::<Vec<_>>();
+            assert!(
+                missing_styles.is_empty(),
+                "bundled theme {id:?} is missing semantic styles: {missing_styles:?}"
+            );
+            assert!(
+                missing_containers.is_empty(),
+                "bundled theme {id:?} is missing container recipes: {missing_containers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_catalog_exercises_supported_container_recipe_families() {
+        let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
+        let resolved = catalog
+            .definitions()
+            .map(|definition| {
+                catalog
+                    .resolve(&ThemeSelection::new(definition.id()))
+                    .expect("bundled theme resolves")
+            })
+            .collect::<Vec<_>>();
+        for layout in [
+            ContainerLayout::Plain,
+            ContainerLayout::LeftBar,
+            ContainerLayout::Panel,
+        ] {
+            assert!(
+                resolved.iter().any(|theme| theme
+                    .containers
+                    .values()
+                    .any(|recipe| recipe.layout == layout)),
+                "bundled catalog does not exercise {layout:?}"
+            );
+        }
+        for width in [ContainerWidth::Content, ContainerWidth::Full] {
+            assert!(
+                resolved.iter().any(|theme| theme
+                    .containers
+                    .values()
+                    .any(|recipe| recipe.width == width)),
+                "bundled catalog does not exercise {width:?}"
+            );
+        }
+        for border in [
+            ContainerBorder::None,
+            ContainerBorder::Left,
+            ContainerBorder::All,
+        ] {
+            assert!(
+                resolved.iter().any(|theme| theme
+                    .containers
+                    .values()
+                    .any(|recipe| recipe.border == border)),
+                "bundled catalog does not exercise {border:?}"
+            );
+        }
     }
 
     #[test]
