@@ -2,9 +2,7 @@
 
 use crate::source_viewer::pad_card_spans;
 #[cfg(feature = "syntax")]
-use bcode_syntax_render::SyntaxHighlighter;
-#[cfg(feature = "syntax")]
-use bcode_syntax_render::SyntaxStyle;
+use bcode_syntax_render::{SyntaxHighlighter, SyntaxPalette, SyntaxStyle};
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -111,6 +109,27 @@ pub fn diff_from_text_at_lines(
     old_start_line: u32,
     new_start_line: u32,
 ) -> DiffDocument {
+    diff_from_text_at_lines_with_palette(
+        label,
+        old_text,
+        new_text,
+        old_start_line,
+        new_start_line,
+        #[cfg(feature = "syntax")]
+        None,
+    )
+}
+
+/// Build a line-offset diff document with an optional semantic syntax palette.
+#[must_use]
+pub fn diff_from_text_at_lines_with_palette(
+    label: &str,
+    old_text: &str,
+    new_text: &str,
+    old_start_line: u32,
+    new_start_line: u32,
+    #[cfg(feature = "syntax")] syntax_palette: Option<SyntaxPalette>,
+) -> DiffDocument {
     let old_offset = old_start_line.saturating_sub(1);
     let new_offset = new_start_line.saturating_sub(1);
     let mut lines = diff_lines_from_text(label, old_text, new_text);
@@ -126,6 +145,9 @@ pub fn diff_from_text_at_lines(
         }
     }
     apply_intraline_changed_ranges(&mut lines);
+    #[cfg(feature = "syntax")]
+    apply_syntax_highlighting(label, &mut lines, syntax_palette);
+    #[cfg(not(feature = "syntax"))]
     apply_syntax_highlighting(label, &mut lines);
     let (added, removed) = count_changed_diff_lines(&lines);
     DiffDocument {
@@ -397,8 +419,8 @@ fn range_from_graphemes(
 }
 
 #[cfg(feature = "syntax")]
-fn apply_syntax_highlighting(label: &str, lines: &mut [DiffLine]) {
-    let highlighter = SyntaxHighlighter::new();
+fn apply_syntax_highlighting(label: &str, lines: &mut [DiffLine], palette: Option<SyntaxPalette>) {
+    let highlighter = palette.map_or_else(SyntaxHighlighter::new, SyntaxHighlighter::with_palette);
     if !highlighter.can_highlight(label) {
         return;
     }
@@ -648,6 +670,9 @@ pub struct DiffViewerInput<'a> {
     pub argument_bytes: Option<usize>,
     /// Whether input text was truncated before diffing.
     pub truncated: bool,
+    /// Optional semantic syntax palette.
+    #[cfg(feature = "syntax")]
+    pub syntax_palette: Option<SyntaxPalette>,
     /// Layout policy for this rendering.
     pub layout: DiffViewerLayout,
 }
@@ -655,12 +680,14 @@ pub struct DiffViewerInput<'a> {
 /// Render diff viewer rows.
 #[must_use]
 pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
-    let mut diff = diff_from_text_at_lines(
+    let mut diff = diff_from_text_at_lines_with_palette(
         input.label,
         input.old_text,
         input.new_text,
         input.old_start_line,
         input.new_start_line,
+        #[cfg(feature = "syntax")]
+        input.syntax_palette,
     );
     if !input.line_numbers_known {
         for line in &mut diff.lines {
@@ -1409,6 +1436,8 @@ mod tests {
     ) -> Vec<Line> {
         diff_viewer_rows(
             DiffViewerInput {
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
                 label,
                 old_text,
                 new_text,
@@ -1838,6 +1867,48 @@ mod tests {
             assert_eq!(width, first_width);
             assert!(width <= usize::from(available_width));
         }
+    }
+
+    #[test]
+    #[cfg(feature = "syntax")]
+    fn diff_viewer_accepts_semantic_syntax_palette() {
+        use bcode_syntax_render::{SyntaxColor, SyntaxPalette};
+
+        let color = SyntaxColor::rgb(11, 12, 13);
+        let palette = SyntaxPalette {
+            text: color,
+            comment: color,
+            keyword: color,
+            function: color,
+            variable: color,
+            string: color,
+            number: color,
+            type_name: color,
+            operator: color,
+            punctuation: color,
+        };
+        let rows = diff_viewer_rows(
+            DiffViewerInput {
+                syntax_palette: Some(palette),
+                label: "file.rs",
+                old_text: "fn old() {}",
+                new_text: "fn new() {}",
+                old_start_line: 1,
+                new_start_line: 1,
+                line_numbers_known: true,
+                title: "Edit",
+                subtitle: None,
+                argument_bytes: None,
+                truncated: false,
+                layout: DiffViewerLayout::Unified,
+            },
+            80,
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| { span.style.fg == Some(Color::Rgb(11, 12, 13)) })
+        );
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub fn file_change_rows(
 
     diff_viewer_rows(
         DiffViewerInput {
+            syntax_palette: None,
             label: &context.display_path(path).to_string(),
             old_text,
             new_text,
