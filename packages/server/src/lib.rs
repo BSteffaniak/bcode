@@ -27380,6 +27380,52 @@ fn session_events_to_model_messages_for_target_with_limits(
     )
 }
 
+#[derive(Debug)]
+struct PendingModelToolCall {
+    call: bcode_model::ToolCall,
+    output_position: Option<bcode_session_models::TurnOutputPosition>,
+}
+
+#[derive(Debug, Default)]
+struct PendingModelToolExchange {
+    calls: Vec<PendingModelToolCall>,
+    results: BTreeMap<String, ContentBlock>,
+}
+
+impl PendingModelToolExchange {
+    fn push_call(
+        &mut self,
+        call: bcode_model::ToolCall,
+        output_position: Option<bcode_session_models::TurnOutputPosition>,
+    ) {
+        self.calls.push(PendingModelToolCall {
+            call,
+            output_position,
+        });
+        self.calls.sort_by_key(|pending| pending.output_position);
+    }
+
+    fn contains_call(&self, call_id: &str) -> bool {
+        self.calls.iter().any(|pending| pending.call.id == call_id)
+    }
+
+    fn record_result(&mut self, call_id: String, result: ContentBlock) {
+        self.results.insert(call_id, result);
+    }
+
+    fn has_result(&self, call_id: &str) -> bool {
+        self.results.contains_key(call_id)
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.calls.is_empty()
+            && self
+                .calls
+                .iter()
+                .all(|pending| self.results.contains_key(&pending.call.id))
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn session_events_to_sanitized_model_messages(
     events: &[&bcode_session_models::SessionEvent],
@@ -27393,7 +27439,7 @@ fn session_events_to_sanitized_model_messages(
 ) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
-    let mut pending_tool_call_ids = Vec::<String>::new();
+    let mut pending_tool_exchange = PendingModelToolExchange::default();
 
     for event in events {
         match &event.kind {
@@ -27402,54 +27448,48 @@ fn session_events_to_sanitized_model_messages(
                 tool_name,
                 arguments_json,
                 ..
+            } => {
+                append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
+                append_model_tool_call(
+                    &mut messages,
+                    &mut seen_tool_call_ids,
+                    &mut pending_tool_exchange,
+                    tool_call_id,
+                    tool_name,
+                    arguments_json,
+                    None,
+                    fallback_tool_argument_chars,
+                );
             }
-            | SessionEventKind::PositionedToolCallRequested {
+            SessionEventKind::PositionedToolCallRequested {
+                output_position,
                 tool_call_id,
                 tool_name,
                 arguments_json,
                 ..
             } => {
-                if seen_tool_call_ids.contains(tool_call_id) {
-                    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
-                    messages.push(plain_context_message(format!(
-                        "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {tool_call_id}; tool: {tool_name}; arguments: {}",
-                        truncate_text(arguments_json, fallback_tool_argument_chars),
-                    )));
-                    continue;
-                }
-                let Ok(arguments) = serde_json::from_str(arguments_json) else {
-                    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
-                    messages.push(plain_context_message(format!(
-                        "Historical assistant tool call omitted from structured tool protocol because its arguments were malformed or truncated. Call id: {tool_call_id}; tool: {tool_name}; raw arguments: {}",
-                        truncate_text(arguments_json, fallback_tool_argument_chars),
-                    )));
-                    continue;
-                };
-                messages.push(ModelMessage {
-                    role: MessageRole::Assistant,
-                    content: vec![ContentBlock::ToolCall {
-                        call: bcode_model::ToolCall {
-                            id: tool_call_id.clone(),
-                            name: tool_name.clone(),
-                            arguments,
-                        },
-                    }],
-                });
-                seen_tool_call_ids.insert(tool_call_id.clone());
-                pending_tool_call_ids.push(tool_call_id.clone());
+                append_model_tool_call(
+                    &mut messages,
+                    &mut seen_tool_call_ids,
+                    &mut pending_tool_exchange,
+                    tool_call_id,
+                    tool_name,
+                    arguments_json,
+                    Some(*output_position),
+                    fallback_tool_argument_chars,
+                );
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
                 let tool_call_id = &record.invocation_id;
                 let result = &record.model_output;
                 let is_error = record.is_error;
-                if let Some(index) = pending_tool_call_ids
-                    .iter()
-                    .position(|pending| pending == tool_call_id)
-                {
-                    pending_tool_call_ids.remove(index);
-                    messages.push(ModelMessage {
-                        role: MessageRole::Tool,
-                        content: vec![ContentBlock::ToolResult {
+                if pending_tool_exchange.contains_call(tool_call_id) {
+                    if pending_tool_exchange.has_result(tool_call_id) {
+                        continue;
+                    }
+                    pending_tool_exchange.record_result(
+                        tool_call_id.clone(),
+                        ContentBlock::ToolResult {
                             result: bcode_model::ToolResult {
                                 call_id: tool_call_id.clone(),
                                 output: project_tool_result_for_model_context(
@@ -27460,10 +27500,13 @@ fn session_events_to_sanitized_model_messages(
                                 is_error,
                                 content: tool_result_content_from_output(result),
                             },
-                        }],
-                    });
+                        },
+                    );
+                    if pending_tool_exchange.is_complete() {
+                        append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
+                    }
                 } else {
-                    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
+                    append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
                     messages.push(plain_context_message(format!(
                         "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {tool_call_id}; error={is_error}; result: {}",
                         project_tool_result_for_model_context(
@@ -27475,7 +27518,7 @@ fn session_events_to_sanitized_model_messages(
                 }
             }
             SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
-                append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
+                append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
                 let compatible = provider_plugin_id == Some(snapshot.provider_plugin_id.as_str())
                     && model_id == Some(snapshot.model_id.as_str())
                     && snapshot.auth_profile.as_deref() == auth_profile
@@ -27501,35 +27544,104 @@ fn session_events_to_sanitized_model_messages(
                     });
                 }
             }
+            SessionEventKind::ModelTurnStarted { .. } => {
+                append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
+            }
             _ => {
-                append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
                 if let Some(message) = non_tool_session_event_to_model_message(event) {
+                    append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
                     messages.push(message);
                 }
             }
         }
     }
 
-    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
+    append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
     messages
 }
 
-fn append_missing_tool_results(
+#[allow(clippy::too_many_arguments)]
+fn append_model_tool_call(
     messages: &mut Vec<ModelMessage>,
-    pending_tool_call_ids: &mut Vec<String>,
+    seen_tool_call_ids: &mut BTreeSet<String>,
+    pending: &mut PendingModelToolExchange,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments_json: &str,
+    output_position: Option<bcode_session_models::TurnOutputPosition>,
+    fallback_tool_argument_chars: usize,
 ) {
-    messages.extend(pending_tool_call_ids.drain(..).map(|call_id| ModelMessage {
+    if seen_tool_call_ids.contains(tool_call_id) {
+        append_pending_tool_exchange(messages, pending);
+        messages.push(plain_context_message(format!(
+            "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {tool_call_id}; tool: {tool_name}; arguments: {}",
+            truncate_text(arguments_json, fallback_tool_argument_chars),
+        )));
+        return;
+    }
+    let Ok(arguments) = serde_json::from_str(arguments_json) else {
+        append_pending_tool_exchange(messages, pending);
+        messages.push(plain_context_message(format!(
+            "Historical assistant tool call omitted from structured tool protocol because its arguments were malformed or truncated. Call id: {tool_call_id}; tool: {tool_name}; raw arguments: {}",
+            truncate_text(arguments_json, fallback_tool_argument_chars),
+        )));
+        return;
+    };
+    seen_tool_call_ids.insert(tool_call_id.to_owned());
+    pending.push_call(
+        bcode_model::ToolCall {
+            id: tool_call_id.to_owned(),
+            name: tool_name.to_owned(),
+            arguments,
+        },
+        output_position,
+    );
+}
+
+fn append_pending_tool_exchange(
+    messages: &mut Vec<ModelMessage>,
+    pending: &mut PendingModelToolExchange,
+) {
+    if pending.calls.is_empty() {
+        pending.results.clear();
+        return;
+    }
+    let calls = std::mem::take(&mut pending.calls);
+    messages.push(ModelMessage {
+        role: MessageRole::Assistant,
+        content: calls
+            .iter()
+            .map(|pending| ContentBlock::ToolCall {
+                call: pending.call.clone(),
+            })
+            .collect(),
+    });
+    messages.push(ModelMessage {
         role: MessageRole::Tool,
-        content: vec![ContentBlock::ToolResult {
-            result: bcode_model::ToolResult {
-                call_id,
-                output: "tool invocation was interrupted before Bcode could persist a result"
-                    .to_string(),
-                is_error: true,
-                content: Vec::new(),
-            },
-        }],
-    }));
+        content: calls
+            .into_iter()
+            .map(|pending_call| {
+                let call_id = pending_call.call.id;
+                pending
+                    .results
+                    .remove(&call_id)
+                    .unwrap_or_else(|| interrupted_tool_result(call_id))
+            })
+            .collect(),
+    });
+    pending.results.clear();
+}
+
+fn interrupted_tool_result(call_id: String) -> ContentBlock {
+    ContentBlock::ToolResult {
+        result: bcode_model::ToolResult {
+            call_id,
+            output: "tool invocation was interrupted before Bcode could persist a result"
+                .to_string(),
+            is_error: true,
+            content: Vec::new(),
+        },
+    }
 }
 
 fn plain_context_message(text: String) -> ModelMessage {
@@ -44053,6 +44165,187 @@ library = "test"
             messages[2].content.as_slice(),
             [ContentBlock::Text { text }] if text == "done"
         ));
+    }
+
+    #[test]
+    fn positioned_parallel_tool_round_preserves_provider_order() {
+        let session_id = SessionId::new();
+        let turn_id = "turn-1".to_owned();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id: turn_id.clone(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(1),
+                    tool_call_id: "call-2".to_owned(),
+                    tool_name: "filesystem.read".to_owned(),
+                    arguments_json: r#"{"path":"two"}"#.to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    working_directory: None,
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: turn_id.clone(),
+                    outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                    message: None,
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id,
+                    output_position: bcode_session_models::TurnOutputPosition::new(0),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.read".to_owned(),
+                    arguments_json: r#"{"path":"one"}"#.to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    working_directory: None,
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-2".to_owned(),
+                        model_output: "two".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
+            session_event(
+                session_id,
+                5,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "one".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages(&history);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        let call_ids = messages[0]
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                ContentBlock::ToolCall { call } => Some(call.id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let result_ids = messages[1]
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                ContentBlock::ToolResult { result } => Some(result.call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids, ["call-1", "call-2"]);
+        assert_eq!(result_ids, ["call-1", "call-2"]);
+    }
+
+    #[test]
+    fn positioned_parallel_tool_round_ignores_duplicate_result() {
+        let session_id = SessionId::new();
+        let turn_id = "turn-1".to_owned();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id: turn_id.clone(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(0),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.read".to_owned(),
+                    arguments_json: r#"{"path":"one"}"#.to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    working_directory: None,
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id,
+                    output_position: bcode_session_models::TurnOutputPosition::new(1),
+                    tool_call_id: "call-2".to_owned(),
+                    tool_name: "filesystem.read".to_owned(),
+                    arguments_json: r#"{"path":"two"}"#.to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    working_directory: None,
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "one".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "duplicate".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
+            session_event(
+                session_id,
+                5,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-2".to_owned(),
+                        model_output: "two".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages(&history);
+        let structured_results = messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|content| matches!(content, ContentBlock::ToolResult { .. }))
+            .count();
+
+        assert_eq!(structured_results, 2);
+        assert!(!messages.iter().any(|message| {
+            matches!(
+                message.content.as_slice(),
+                [ContentBlock::Text { text }] if text.contains("duplicate")
+            )
+        }));
     }
 
     #[test]
