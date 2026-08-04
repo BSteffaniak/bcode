@@ -29,11 +29,13 @@ impl ReviewViewDocument {
         file_index: usize,
         file: &ReviewFile,
         syntax_highlighting: bool,
+        syntax_palette: Option<bcode_syntax_render::SyntaxPalette>,
         cached_file: Option<&CachedReviewFile>,
         context_load_states: &BTreeMap<DiffContextKey, DiffContextLoadState>,
     ) -> Self {
         let display = ReviewDisplayBuilder::new()
             .syntax_highlighting(syntax_highlighting)
+            .syntax_palette(syntax_palette)
             .build_file(file);
         let hunk_start_rows = hunk_start_rows(file);
         let display_by_source = display
@@ -1272,7 +1274,8 @@ mod tests {
         };
 
         let start = Instant::now();
-        let document = ReviewViewDocument::build_diff_file(0, &file, false, None, &BTreeMap::new());
+        let document =
+            ReviewViewDocument::build_diff_file(0, &file, false, None, None, &BTreeMap::new());
         let elapsed = start.elapsed();
 
         assert_eq!(document.hunk_targets().len(), 500);
@@ -1287,7 +1290,8 @@ mod tests {
     fn diff_file_document_maps_visual_rows_to_semantic_targets() {
         let file = test_file();
 
-        let document = ReviewViewDocument::build_diff_file(7, &file, true, None, &BTreeMap::new());
+        let document =
+            ReviewViewDocument::build_diff_file(7, &file, true, None, None, &BTreeMap::new());
 
         assert_eq!(document.rows.len(), 2);
         assert_eq!(
@@ -1332,17 +1336,18 @@ mod tests {
             severity: ReviewThreadSeverity::Info,
         };
 
-        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeMap::new())
-            .with_inline_draft_threads(
-                7,
-                std::iter::once((anchor.clone(), vec![comment])),
-                std::iter::empty::<(ReviewThreadAnchor, Vec<ReviewSuggestedComment>)>(),
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                true,
-            );
+        let document =
+            ReviewViewDocument::build_diff_file(7, &file, false, None, None, &BTreeMap::new())
+                .with_inline_draft_threads(
+                    7,
+                    std::iter::once((anchor.clone(), vec![comment])),
+                    std::iter::empty::<(ReviewThreadAnchor, Vec<ReviewSuggestedComment>)>(),
+                    &BTreeMap::new(),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    true,
+                );
 
         assert_eq!(document.rows.len(), 10);
         assert_eq!(document.rows[1].source_row, Some(1));
@@ -1386,17 +1391,18 @@ mod tests {
             severity: ReviewThreadSeverity::Info,
         };
 
-        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeMap::new())
-            .with_inline_draft_threads(
-                7,
-                std::iter::once((anchor, vec![comment])),
-                std::iter::empty::<(ReviewThreadAnchor, Vec<ReviewSuggestedComment>)>(),
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                true,
-            );
+        let document =
+            ReviewViewDocument::build_diff_file(7, &file, false, None, None, &BTreeMap::new())
+                .with_inline_draft_threads(
+                    7,
+                    std::iter::once((anchor, vec![comment])),
+                    std::iter::empty::<(ReviewThreadAnchor, Vec<ReviewSuggestedComment>)>(),
+                    &BTreeMap::new(),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    true,
+                );
 
         assert!(matches!(
             document.rows[3].block,
@@ -1472,6 +1478,7 @@ mod tests {
             7,
             &file,
             true,
+            None,
             Some(&cached_file),
             &context_states,
         );
@@ -1522,6 +1529,7 @@ mod tests {
             7,
             &file,
             false,
+            None,
             Some(&cached_file),
             &BTreeMap::new(),
         );
@@ -1559,6 +1567,7 @@ mod tests {
             7,
             &file,
             false,
+            None,
             Some(&cached_file),
             &context_states,
         );
@@ -1598,6 +1607,7 @@ mod tests {
             7,
             &file,
             false,
+            None,
             Some(&cached_file),
             &context_states,
         );

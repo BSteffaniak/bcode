@@ -1,6 +1,8 @@
 //! Native TUI rendering for filesystem file-change previews.
 
-use bcode_tui_components::diff_viewer::{DiffViewerInput, DiffViewerLayout, diff_viewer_rows};
+use bcode_tui_components::diff_viewer::{
+    DiffViewerInput, DiffViewerLayout, DiffViewerStyle, diff_viewer_rows_with_style,
+};
 use bmux_tui::prelude::Line;
 
 /// Filesystem file-change TUI visual adapter.
@@ -74,9 +76,24 @@ pub fn file_change_rows(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    diff_viewer_rows(
+    let theme = context.theme();
+    let syntax_palette = theme.map(|theme| syntax_palette(theme.syntax));
+    let diff_style = theme.map_or_else(DiffViewerStyle::default, |theme| DiffViewerStyle {
+        text: theme.diff.text,
+        muted: theme.diff.muted,
+        title: theme.diff.title,
+        label: theme.diff.label,
+        added: theme.diff.added,
+        removed: theme.diff.removed,
+        hunk: theme.diff.hunk,
+        added_row: theme.diff.added_row,
+        removed_row: theme.diff.removed_row,
+        added_emphasis: theme.diff.added_emphasis,
+        removed_emphasis: theme.diff.removed_emphasis,
+    });
+    diff_viewer_rows_with_style(
         DiffViewerInput {
-            syntax_palette: None,
+            syntax_palette,
             label: &context.display_path(path).to_string(),
             old_text,
             new_text,
@@ -98,7 +115,28 @@ pub fn file_change_rows(
             },
         },
         width,
+        diff_style,
     )
+}
+
+fn syntax_palette(
+    theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
+) -> bcode_syntax_render::SyntaxPalette {
+    let color = |color: bcode_plugin_sdk::tui::PluginTuiSyntaxColor| {
+        bcode_syntax_render::SyntaxColor::rgb(color.r, color.g, color.b)
+    };
+    bcode_syntax_render::SyntaxPalette {
+        text: color(theme.text),
+        comment: color(theme.comment),
+        keyword: color(theme.keyword),
+        function: color(theme.function),
+        variable: color(theme.variable),
+        string: color(theme.string),
+        number: color(theme.number),
+        type_name: color(theme.type_name),
+        operator: color(theme.operator),
+        punctuation: color(theme.punctuation),
+    }
 }
 
 #[cfg(test)]

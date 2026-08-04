@@ -31,6 +31,10 @@ pub struct ResolvedTheme {
     pub markdown: bcode_markdown_render::MarkdownTheme,
     /// Semantic syntax palette for code presentation.
     pub syntax: bcode_syntax_render::SyntaxPalette,
+    /// Semantic source-card presentation.
+    pub source: bcode_tui_components::source_viewer::SourceViewerStyle,
+    /// Semantic diff presentation.
+    pub diff: bcode_tui_components::diff_viewer::DiffViewerStyle,
     /// Stable resolved presentation fingerprint.
     pub fingerprint: u64,
 }
@@ -47,6 +51,8 @@ impl ResolvedTheme {
             selection: self.selection,
             markdown: self.markdown,
             syntax: self.syntax,
+            source: self.source,
+            diff: self.diff,
             fingerprint: self.fingerprint,
         }
     }
@@ -73,6 +79,10 @@ pub struct PresentedTheme {
     pub markdown: bcode_markdown_render::MarkdownTheme,
     /// Semantic syntax palette for code presentation.
     pub syntax: bcode_syntax_render::SyntaxPalette,
+    /// Semantic source-card presentation.
+    pub source: bcode_tui_components::source_viewer::SourceViewerStyle,
+    /// Semantic diff presentation.
+    pub diff: bcode_tui_components::diff_viewer::DiffViewerStyle,
     /// Stable resolved presentation fingerprint.
     pub fingerprint: u64,
 }
@@ -202,6 +212,29 @@ fn resolved_theme(
         .unwrap_or_else(|| bmux_tui::style::Style::new().add_modifier(Modifier::REVERSED));
     let markdown = markdown_theme(theme, text, muted);
     let syntax = syntax_palette(theme);
+    let source = bcode_tui_components::source_viewer::SourceViewerStyle {
+        source: style("source.text").unwrap_or(text),
+        border: style("source.border").unwrap_or(border),
+        gutter: style("source.gutter").unwrap_or(muted),
+        truncated: style("source.truncated").unwrap_or(muted),
+    };
+    let diff = bcode_tui_components::diff_viewer::DiffViewerStyle {
+        text: style("diff.text").unwrap_or(text),
+        muted: style("diff.muted").unwrap_or(muted),
+        title: style("diff.title").unwrap_or(focused),
+        label: style("diff.label").unwrap_or_else(|| text.add_modifier(Modifier::BOLD)),
+        added: style("diff.added")
+            .unwrap_or_else(|| bmux_tui::style::Style::new().fg(Color::Green)),
+        removed: style("diff.removed")
+            .unwrap_or_else(|| bmux_tui::style::Style::new().fg(Color::Red)),
+        hunk: style("diff.hunk").unwrap_or(focused),
+        added_row: style("diff.added_row").unwrap_or_else(bmux_tui::style::Style::new),
+        removed_row: style("diff.removed_row").unwrap_or_else(bmux_tui::style::Style::new),
+        added_emphasis: style("diff.added_emphasis")
+            .unwrap_or_else(|| bmux_tui::style::Style::new().add_modifier(Modifier::UNDERLINE)),
+        removed_emphasis: style("diff.removed_emphasis")
+            .unwrap_or_else(|| bmux_tui::style::Style::new().add_modifier(Modifier::UNDERLINE)),
+    };
     ResolvedTheme {
         accent,
         text,
@@ -212,6 +245,8 @@ fn resolved_theme(
         selection,
         markdown,
         syntax,
+        source,
+        diff,
         fingerprint: theme.map_or(0, |theme| theme.fingerprint),
     }
 }

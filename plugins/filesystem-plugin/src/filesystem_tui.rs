@@ -2,7 +2,9 @@
 
 use crate::file_change_tui::file_change_rows;
 use bcode_tui_components::source_preview::{SourcePreviewOptions, source_preview_lines};
-use bcode_tui_components::source_viewer::{SourceViewerInput, source_viewer_rows};
+use bcode_tui_components::source_viewer::{
+    SourceViewerInput, SourceViewerStyle, source_viewer_rows_with_style,
+};
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use devicons::{FileIcon, Theme, icon_for_file};
 use serde_json::Value;
@@ -289,9 +291,10 @@ fn read_rows(
     if let Some(contents) = text(payload, "contents").or_else(|| text(payload, "preview")) {
         rows.push(Line::raw(""));
         let numbered = !kind.contains("artifact");
-        rows.extend(source_viewer_rows(
+        let theme = context.theme();
+        rows.extend(source_viewer_rows_with_style(
             SourceViewerInput {
-                syntax_palette: None,
+                syntax_palette: theme.map(|theme| syntax_palette(theme.syntax)),
                 label: text(payload, "path").unwrap_or_default(),
                 contents,
                 start_line: payload
@@ -304,6 +307,12 @@ fn read_rows(
                 line_numbers: numbered,
             },
             width,
+            theme.map_or_else(SourceViewerStyle::default, |theme| SourceViewerStyle {
+                source: theme.source.source,
+                border: theme.source.border,
+                gutter: theme.source.gutter,
+                truncated: theme.source.truncated,
+            }),
         ));
     }
     rows
@@ -462,13 +471,22 @@ fn grep_rows(
         let line_number = number(value, "line_number").unwrap_or_default();
         if let Some(line) = text(value, "line") {
             let prefix = format!("  {line_number:>line_number_width$} │ ");
-            rows.extend(preview_lines_with_options(
-                line,
-                &SourcePreviewOptions::new(path, width)
-                    .max_lines(1)
-                    .line_prefix(&prefix, muted())
-                    .truncated_message("    … preview truncated", muted()),
-            ));
+            let theme = context.theme();
+            let mut options = SourcePreviewOptions::new(path, width)
+                .max_lines(1)
+                .line_prefix(
+                    &prefix,
+                    theme.map_or_else(muted, |theme| theme.source.gutter),
+                )
+                .source_style(theme.map_or_else(Style::new, |theme| theme.source.source))
+                .truncated_message(
+                    "    … preview truncated",
+                    theme.map_or_else(muted, |theme| theme.source.truncated),
+                );
+            if let Some(theme) = theme {
+                options = options.syntax_palette(syntax_palette(theme.syntax));
+            }
+            rows.extend(preview_lines_with_options(line, &options));
         }
     }
     if values.len() > 25 {
@@ -642,6 +660,26 @@ fn dimensions(payload: &Value) -> Option<String> {
     let width = payload.get("width").and_then(Value::as_u64)?;
     let height = payload.get("height").and_then(Value::as_u64)?;
     Some(format!("{width}×{height}"))
+}
+
+fn syntax_palette(
+    theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
+) -> bcode_syntax_render::SyntaxPalette {
+    let color = |color: bcode_plugin_sdk::tui::PluginTuiSyntaxColor| {
+        bcode_syntax_render::SyntaxColor::rgb(color.r, color.g, color.b)
+    };
+    bcode_syntax_render::SyntaxPalette {
+        text: color(theme.text),
+        comment: color(theme.comment),
+        keyword: color(theme.keyword),
+        function: color(theme.function),
+        variable: color(theme.variable),
+        string: color(theme.string),
+        number: color(theme.number),
+        type_name: color(theme.type_name),
+        operator: color(theme.operator),
+        punctuation: color(theme.punctuation),
+    }
 }
 
 const fn accent() -> Style {

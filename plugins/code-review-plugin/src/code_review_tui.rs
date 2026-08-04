@@ -97,6 +97,26 @@ const MAX_LINKED_SESSION_EVENTS_SCANNED: usize = 2_048;
 const MAX_LINKED_SESSION_BYTES: usize = 512 * 1024;
 const FILE_SIDEBAR_WIDTH: u16 = 34;
 
+fn syntax_palette(
+    theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
+) -> bcode_syntax_render::SyntaxPalette {
+    let color = |color: bcode_plugin_sdk::tui::PluginTuiSyntaxColor| {
+        bcode_syntax_render::SyntaxColor::rgb(color.r, color.g, color.b)
+    };
+    bcode_syntax_render::SyntaxPalette {
+        text: color(theme.text),
+        comment: color(theme.comment),
+        keyword: color(theme.keyword),
+        function: color(theme.function),
+        variable: color(theme.variable),
+        string: color(theme.string),
+        number: color(theme.number),
+        type_name: color(theme.type_name),
+        operator: color(theme.operator),
+        punctuation: color(theme.punctuation),
+    }
+}
+
 const fn linked_session_projection_request() -> ProjectionWindowRequest {
     ProjectionWindowRequest {
         projection: SessionProjectionKind::Transcript,
@@ -176,6 +196,7 @@ pub struct CodeReviewSurface {
     repo_path: PathBuf,
     review_target: ReviewOpenTarget,
     app: ReviewApp,
+    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
     file_store: AsyncValueStore<String, CachedReviewFile>,
     agent_streams: ReviewAgentStreamStore,
 }
@@ -206,6 +227,7 @@ impl CodeReviewSurface {
             repo_path,
             review_target,
             app,
+            theme: None,
             file_store: AsyncValueStore::new(),
             agent_streams: ReviewAgentStreamStore::default(),
         };
@@ -384,7 +406,18 @@ impl PluginTuiSurface for CodeReviewSurface {
     }
 
     fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
-        crate::code_review_tui_render::render(&mut self.app, frame);
+        crate::code_review_tui_render::render(&mut self.app, frame, self.theme);
+    }
+
+    fn render_with_theme(
+        &mut self,
+        _area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        self.theme = theme;
+        self.app.set_tui_theme(theme);
+        crate::code_review_tui_render::render(&mut self.app, frame, self.theme);
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -5401,6 +5434,7 @@ struct ReviewViewDocumentCacheKey {
     expanded_contexts: Vec<(DiffContextKey, DiffContextLoadState)>,
     show_resolved_threads: bool,
     agent_state_revision: u64,
+    theme_fingerprint: u64,
 }
 
 /// Stateful review app model.
@@ -5550,6 +5584,8 @@ pub struct ReviewApp {
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
     mouse_regions: Vec<ReviewMouseRegion>,
+    syntax_palette: Option<bcode_syntax_render::SyntaxPalette>,
+    theme_fingerprint: u64,
     view_document_cache: Arc<RwLock<Option<ReviewViewDocumentCache>>>,
 }
 
@@ -5634,10 +5670,25 @@ impl ReviewApp {
             last_file_area: None,
             last_diff_area: None,
             mouse_regions: Vec::new(),
+            syntax_palette: None,
+            theme_fingerprint: 0,
             view_document_cache: Arc::new(RwLock::new(None)),
         };
         app.restore_presentation_state();
         app
+    }
+
+    /// Update renderer-owned syntax presentation and invalidate derived display rows when changed.
+    pub fn set_tui_theme(&mut self, theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) {
+        let fingerprint = theme.map_or(0, |theme| theme.fingerprint);
+        if self.theme_fingerprint == fingerprint {
+            return;
+        }
+        self.syntax_palette = theme.map(|theme| syntax_palette(theme.syntax));
+        self.theme_fingerprint = fingerprint;
+        if let Ok(mut cache) = self.view_document_cache.write() {
+            *cache = None;
+        }
     }
 
     /// Switch directly to build mode.
@@ -12297,6 +12348,7 @@ impl ReviewApp {
                     self.selected_file,
                     file,
                     true,
+                    self.syntax_palette,
                     cached_file,
                     &self.diff_context_load_states,
                 )
@@ -12474,6 +12526,7 @@ impl ReviewApp {
                 .collect(),
             show_resolved_threads: self.show_resolved_threads,
             agent_state_revision: self.agent_state_revision,
+            theme_fingerprint: self.theme_fingerprint,
         })
     }
 }

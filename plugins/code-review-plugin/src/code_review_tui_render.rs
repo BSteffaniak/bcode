@@ -28,8 +28,32 @@ use crate::code_review_tui_view::{
 };
 use bcode_code_review_models::ReviewSource;
 
+fn syntax_palette(
+    theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
+) -> bcode_syntax_render::SyntaxPalette {
+    let color = |color: bcode_plugin_sdk::tui::PluginTuiSyntaxColor| {
+        bcode_syntax_render::SyntaxColor::rgb(color.r, color.g, color.b)
+    };
+    bcode_syntax_render::SyntaxPalette {
+        text: color(theme.text),
+        comment: color(theme.comment),
+        keyword: color(theme.keyword),
+        function: color(theme.function),
+        variable: color(theme.variable),
+        string: color(theme.string),
+        number: color(theme.number),
+        type_name: color(theme.type_name),
+        operator: color(theme.operator),
+        punctuation: color(theme.punctuation),
+    }
+}
+
 /// Render one full-screen code review frame.
-pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
+pub fn render(
+    app: &mut ReviewApp,
+    frame: &mut Frame<'_>,
+    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+) {
     let area = frame.area();
     if area.is_empty() {
         return;
@@ -39,7 +63,7 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
     app.clear_mouse_regions();
     render_chrome(app, area, frame);
     let diff_area = render_body(app, area, frame);
-    render_main_content(app, diff_area, frame);
+    render_main_content(app, diff_area, frame, theme);
     render_overlays(app, area, frame);
 }
 
@@ -177,12 +201,17 @@ fn render_sidebar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
-fn render_main_content(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_main_content(
+    app: &mut ReviewApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+) {
     app.set_diff_area(area);
     if app.ux_mode == crate::code_review_tui::ReviewUxMode::Build {
         render_build_workspace(app, area, frame);
     } else {
-        render_diff(app, area, frame);
+        render_diff(app, area, frame, theme);
     }
 }
 
@@ -1538,7 +1567,12 @@ fn source_status_label(included: bool, surface_count: usize, diagnostic_count: u
     format!("{surface_count} surface(s)")
 }
 
-fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_diff(
+    app: &ReviewApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+) {
     if area.is_empty() {
         return;
     }
@@ -1566,7 +1600,7 @@ fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         render_empty(area, "No textual changes", frame);
         return;
     }
-    render_view_document(app, &document, area, frame);
+    render_view_document(app, &document, area, frame, theme);
 }
 
 fn render_view_document(
@@ -1574,8 +1608,11 @@ fn render_view_document(
     document: &ReviewViewDocument,
     area: Rect,
     frame: &mut Frame<'_>,
+    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
 ) {
-    let syntax_highlighter = SyntaxHighlighter::new();
+    let syntax_highlighter = theme.map_or_else(SyntaxHighlighter::new, |theme| {
+        SyntaxHighlighter::with_palette(syntax_palette(theme.syntax))
+    });
     let syntax_hint = app
         .selected_file_path()
         .or_else(|| {
@@ -1599,7 +1636,7 @@ fn render_view_document(
         let mut rendered = render_view_row(
             app,
             view_row,
-            syntax_highlighter,
+            &syntax_highlighter,
             can_highlight,
             &syntax_hint,
             area.width,
@@ -1695,7 +1732,7 @@ fn render_inline_thread_header(
 fn render_view_row(
     app: &ReviewApp,
     view_row: &ReviewViewRow,
-    syntax_highlighter: SyntaxHighlighter,
+    syntax_highlighter: &SyntaxHighlighter,
     can_highlight: bool,
     syntax_hint: &str,
     width: u16,
@@ -2131,7 +2168,7 @@ fn render_source_view_row(
 fn render_expanded_context_file_line(
     line_number: Option<u32>,
     content: &str,
-    syntax_highlighter: SyntaxHighlighter,
+    syntax_highlighter: &SyntaxHighlighter,
     can_highlight: bool,
     syntax_hint: &str,
 ) -> RenderedRow {
@@ -2166,7 +2203,7 @@ fn render_file_view_row(
     view_row: &ReviewViewRow,
     line_number: Option<u32>,
     content: &str,
-    syntax_highlighter: SyntaxHighlighter,
+    syntax_highlighter: &SyntaxHighlighter,
     can_highlight: bool,
     syntax_hint: &str,
 ) -> RenderedRow {
@@ -2249,7 +2286,7 @@ fn render_materialized_file_surface(app: &ReviewApp, area: Rect, frame: &mut Fra
         render_empty(area, "No file content", frame);
         return;
     }
-    render_view_document(app, &document, area, frame);
+    render_view_document(app, &document, area, frame, None);
 }
 
 #[must_use]
@@ -2291,7 +2328,7 @@ fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         render_empty(area, "No file content", frame);
         return;
     }
-    render_view_document(app, &document, area, frame);
+    render_view_document(app, &document, area, frame, None);
 }
 
 fn file_viewer_row_style(app: &ReviewApp, index: usize) -> Style {
@@ -2307,7 +2344,7 @@ fn file_viewer_row_style(app: &ReviewApp, index: usize) -> Style {
 }
 
 fn highlighted_source_spans(
-    syntax_highlighter: SyntaxHighlighter,
+    syntax_highlighter: &SyntaxHighlighter,
     can_highlight: bool,
     syntax_hint: &str,
     content: &str,
@@ -3629,7 +3666,7 @@ mod tests {
     fn render_app_text(app: &mut ReviewApp, width: u16, height: u16) -> String {
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
         let mut frame = Frame::new(&mut buffer);
-        render(app, &mut frame);
+        render(app, &mut frame, None);
         (0..buffer.area().height)
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<Vec<_>>()
@@ -3896,7 +3933,7 @@ mod tests {
         let rendered = render_expanded_context_file_line(
             Some(2),
             "pub fn expanded() {}",
-            SyntaxHighlighter::new(),
+            &SyntaxHighlighter::new(),
             true,
             "src/lib.rs",
         );

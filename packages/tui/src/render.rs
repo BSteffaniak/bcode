@@ -11,11 +11,17 @@ thread_local! {
         side_by_side_breakpoint: 120,
     }) };
     static MARKDOWN_DETAILS_OPEN: RefCell<BTreeMap<String, bool>> = const { RefCell::new(BTreeMap::new()) };
+    static PLUGIN_VISUAL_THEME: Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const { Cell::new(None) };
 }
 
 /// Synchronize layout-affecting Markdown presentation state for row generation.
 pub fn set_markdown_details_open(details_open: &BTreeMap<String, bool>) {
     MARKDOWN_DETAILS_OPEN.with(|state| details_open.clone_into(&mut state.borrow_mut()));
+}
+
+/// Synchronize renderer-owned plugin visual presentation for row generation.
+pub fn set_plugin_visual_theme(theme: &super::theme::PresentedTheme) {
+    PLUGIN_VISUAL_THEME.with(|state| state.set(Some(plugin_tui_theme(theme))));
 }
 
 fn markdown_details_open() -> BTreeMap<String, bool> {
@@ -35,12 +41,66 @@ fn plugin_visual_context(
             TuiDiffViewerLayout::Unified => PluginTuiDiffLayout::Unified,
             TuiDiffViewerLayout::SideBySide => PluginTuiDiffLayout::SideBySide,
         };
-        PluginTuiVisualRenderContext::new(
+        let context = PluginTuiVisualRenderContext::new(
             width,
             diff_layout,
             working_directory.map(std::path::Path::to_path_buf),
-        )
+        );
+        PLUGIN_VISUAL_THEME.with(|theme| {
+            if let Some(theme) = theme.get() {
+                context.with_theme(theme)
+            } else {
+                context
+            }
+        })
     })
+}
+
+/// Build renderer-owned plugin presentation from the active app theme.
+#[must_use]
+pub fn plugin_theme_for_app(app: &BmuxApp) -> bcode_plugin_sdk::tui::PluginTuiTheme {
+    plugin_tui_theme(&app.presented_theme())
+}
+
+fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::tui::PluginTuiTheme {
+    let syntax_color = |color: bcode_syntax_render::SyntaxColor| {
+        bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(color.r, color.g, color.b)
+    };
+    let syntax = theme.syntax;
+    bcode_plugin_sdk::tui::PluginTuiTheme {
+        source: bcode_plugin_sdk::tui::PluginTuiSourceTheme {
+            source: theme.source.source,
+            border: theme.source.border,
+            gutter: theme.source.gutter,
+            truncated: theme.source.truncated,
+        },
+        diff: bcode_plugin_sdk::tui::PluginTuiDiffTheme {
+            text: theme.diff.text,
+            muted: theme.diff.muted,
+            title: theme.diff.title,
+            label: theme.diff.label,
+            added: theme.diff.added,
+            removed: theme.diff.removed,
+            hunk: theme.diff.hunk,
+            added_row: theme.diff.added_row,
+            removed_row: theme.diff.removed_row,
+            added_emphasis: theme.diff.added_emphasis,
+            removed_emphasis: theme.diff.removed_emphasis,
+        },
+        syntax: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme {
+            text: syntax_color(syntax.text),
+            comment: syntax_color(syntax.comment),
+            keyword: syntax_color(syntax.keyword),
+            function: syntax_color(syntax.function),
+            variable: syntax_color(syntax.variable),
+            string: syntax_color(syntax.string),
+            number: syntax_color(syntax.number),
+            type_name: syntax_color(syntax.type_name),
+            operator: syntax_color(syntax.operator),
+            punctuation: syntax_color(syntax.punctuation),
+        },
+        fingerprint: theme.fingerprint,
+    }
 }
 
 use std::time::{Duration, Instant};

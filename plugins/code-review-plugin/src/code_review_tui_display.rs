@@ -8,6 +8,7 @@ use crate::code_review_tui::{ReviewFile, ReviewLine, ReviewLineKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReviewDisplayBuilder {
     syntax_highlighting: bool,
+    syntax_palette: Option<bcode_syntax_render::SyntaxPalette>,
 }
 
 impl Default for ReviewDisplayBuilder {
@@ -22,6 +23,7 @@ impl ReviewDisplayBuilder {
     pub const fn new() -> Self {
         Self {
             syntax_highlighting: true,
+            syntax_palette: None,
         }
     }
 
@@ -32,11 +34,23 @@ impl ReviewDisplayBuilder {
         self
     }
 
+    /// Set an optional semantic syntax palette.
+    #[must_use]
+    pub const fn syntax_palette(
+        mut self,
+        palette: Option<bcode_syntax_render::SyntaxPalette>,
+    ) -> Self {
+        self.syntax_palette = palette;
+        self
+    }
+
     /// Build display rows for a review file.
     #[must_use]
     pub fn build_file(self, file: &ReviewFile) -> ReviewDisplayFile {
         let mut rows = Vec::new();
-        let syntax_highlighter = SyntaxHighlighter::new();
+        let syntax_highlighter = self
+            .syntax_palette
+            .map_or_else(SyntaxHighlighter::new, SyntaxHighlighter::with_palette);
         let syntax_hint = file.display_path();
         let can_highlight =
             self.syntax_highlighting && syntax_highlighter.can_highlight(syntax_hint);
@@ -74,7 +88,11 @@ impl ReviewDisplayBuilder {
                 .map(|line| line.content.as_str())
                 .collect::<Vec<_>>();
             let highlighted = if can_highlight {
-                highlighted_code_segments_for_lines(syntax_hint, &contents)
+                highlighted_code_segments_for_lines_with_highlighter(
+                    &syntax_highlighter,
+                    syntax_hint,
+                    &contents,
+                )
             } else {
                 contents
                     .iter()
@@ -188,7 +206,18 @@ pub fn highlighted_code_segments_for_lines(
     syntax_hint: &str,
     lines: &[&str],
 ) -> Vec<Vec<ReviewDisplaySegment>> {
-    let syntax_highlighter = SyntaxHighlighter::new();
+    highlighted_code_segments_for_lines_with_highlighter(
+        &SyntaxHighlighter::new(),
+        syntax_hint,
+        lines,
+    )
+}
+
+fn highlighted_code_segments_for_lines_with_highlighter(
+    syntax_highlighter: &SyntaxHighlighter,
+    syntax_hint: &str,
+    lines: &[&str],
+) -> Vec<Vec<ReviewDisplaySegment>> {
     if !syntax_highlighter.can_highlight(syntax_hint) {
         return lines.iter().map(|line| plain_code_segments(line)).collect();
     }
@@ -256,6 +285,54 @@ mod tests {
     use crate::code_review_tui::{
         ReviewFile, ReviewFileStatus, ReviewHunk, ReviewLine, ReviewLineKind,
     };
+
+    #[test]
+    fn applies_caller_supplied_syntax_palette() {
+        let custom = bcode_syntax_render::SyntaxColor::rgb(12, 34, 56);
+        let palette = bcode_syntax_render::SyntaxPalette {
+            text: custom,
+            comment: custom,
+            keyword: custom,
+            function: custom,
+            variable: custom,
+            string: custom,
+            number: custom,
+            type_name: custom,
+            operator: custom,
+            punctuation: custom,
+        };
+        let file = ReviewFile {
+            old_path: Some("src/lib.rs".to_string()),
+            new_path: Some("src/lib.rs".to_string()),
+            status: ReviewFileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            hunks: vec![ReviewHunk {
+                old_start: 1,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                heading: None,
+                lines: vec![ReviewLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn demo() {}".to_string(),
+                }],
+            }],
+            is_binary: false,
+        };
+
+        let display = ReviewDisplayBuilder::new()
+            .syntax_palette(Some(palette))
+            .build_file(&file);
+        assert!(display.rows[1].segments.iter().all(|segment| {
+            segment.roles.iter().any(|role| {
+                matches!(role, ReviewDisplayTextRole::Syntax(style)
+                    if (style.foreground_r, style.foreground_g, style.foreground_b) == (12, 34, 56))
+            })
+        }));
+    }
 
     #[test]
     fn builds_semantic_rows_for_unified_diff() {

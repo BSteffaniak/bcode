@@ -83,6 +83,7 @@ fn transcript_item_rows(
 
 fn sync_layout(app: &mut BmuxApp, width: u16) {
     render::set_markdown_details_open(app.markdown_details_open());
+    render::set_plugin_visual_theme(&app.presented_theme());
     let started = Instant::now();
     let elapsed_dirty_visuals =
         app.drain_elapsed_dirty_visuals_bounded(MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC);

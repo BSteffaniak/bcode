@@ -3712,7 +3712,11 @@ pub fn draw_chat_frame<W: Write>(
         }
         if let Some(surface) = &mut loop_state.plugin_surface {
             let area = frame.area();
-            surface.surface.render(area, frame);
+            surface.surface.render_with_theme(
+                area,
+                frame,
+                Some(render::plugin_theme_for_app(&chat.app)),
+            );
         }
         if let Some(dialog) = &mut loop_state.session_fork_dialog {
             super::session_fork_dialog_render::render_dialog(dialog, frame, theme);

@@ -17,7 +17,7 @@ use bmux_text_edit::{TextEditCommand, TextMotion};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::prelude::Line;
+use bmux_tui::prelude::{Line, Style};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
 
@@ -829,12 +829,88 @@ pub enum PluginTuiDiffLayout {
     SideBySide,
 }
 
+/// Portable RGB color used by terminal syntax presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginTuiSyntaxColor {
+    /// Red channel.
+    pub r: u8,
+    /// Green channel.
+    pub g: u8,
+    /// Blue channel.
+    pub b: u8,
+}
+
+impl PluginTuiSyntaxColor {
+    /// Construct an RGB syntax color.
+    #[must_use]
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+}
+
+/// Semantic syntax palette supplied by the TUI host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginTuiSyntaxTheme {
+    pub text: PluginTuiSyntaxColor,
+    pub comment: PluginTuiSyntaxColor,
+    pub keyword: PluginTuiSyntaxColor,
+    pub function: PluginTuiSyntaxColor,
+    pub variable: PluginTuiSyntaxColor,
+    pub string: PluginTuiSyntaxColor,
+    pub number: PluginTuiSyntaxColor,
+    pub type_name: PluginTuiSyntaxColor,
+    pub operator: PluginTuiSyntaxColor,
+    pub punctuation: PluginTuiSyntaxColor,
+}
+
+/// Semantic styles for source-code cards supplied by the TUI host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginTuiSourceTheme {
+    pub source: Style,
+    pub border: Style,
+    pub gutter: Style,
+    pub truncated: Style,
+}
+
+/// Semantic styles for diff presentation supplied by the TUI host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginTuiDiffTheme {
+    pub text: Style,
+    pub muted: Style,
+    pub title: Style,
+    pub label: Style,
+    pub added: Style,
+    pub removed: Style,
+    pub hunk: Style,
+    pub added_row: Style,
+    pub removed_row: Style,
+    pub added_emphasis: Style,
+    pub removed_emphasis: Style,
+}
+
+/// Renderer-owned semantic presentation passed to native TUI plugin adapters.
+///
+/// This context contains presentation only. It must not affect plugin routing,
+/// authorization, dispatch, or persisted outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginTuiTheme {
+    /// Source-code card presentation.
+    pub source: PluginTuiSourceTheme,
+    /// Diff presentation.
+    pub diff: PluginTuiDiffTheme,
+    /// Syntax presentation.
+    pub syntax: PluginTuiSyntaxTheme,
+    /// Stable identity of the resolved presentation.
+    pub fingerprint: u64,
+}
+
 /// Host-owned presentation context for visual adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginTuiVisualRenderContext {
     width: u16,
     diff_layout: PluginTuiDiffLayout,
     working_directory: Option<PathBuf>,
+    theme: Option<PluginTuiTheme>,
 }
 
 impl PluginTuiVisualRenderContext {
@@ -849,7 +925,21 @@ impl PluginTuiVisualRenderContext {
             width,
             diff_layout,
             working_directory,
+            theme: None,
         }
+    }
+
+    /// Attach renderer-owned semantic presentation to the context.
+    #[must_use]
+    pub const fn with_theme(mut self, theme: PluginTuiTheme) -> Self {
+        self.theme = Some(theme);
+        self
+    }
+
+    /// Return the renderer-owned semantic presentation, when supplied.
+    #[must_use]
+    pub const fn theme(&self) -> Option<PluginTuiTheme> {
+        self.theme
     }
 
     /// Return the width assigned to the visual.
@@ -997,6 +1087,18 @@ pub trait PluginTuiSurface: Send {
 
     /// Render this surface inside the host-assigned area.
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>);
+
+    /// Render this surface with optional renderer-owned semantic presentation.
+    ///
+    /// The default preserves compatibility for surfaces that do not consume themes.
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        _theme: Option<PluginTuiTheme>,
+    ) {
+        self.render(area, frame);
+    }
 
     /// Handle routed terminal input.
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction;
