@@ -14,18 +14,48 @@ use bcode_code_review_models::{
     ReviewSourceKind, ReviewWorkspace, ReviewWorkspaceListItem, UpdateReviewWorkspaceRequest,
     UpdateReviewWorkspaceResponse,
 };
-use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
+use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 use bmux_tui::terminal::Terminal;
 use tokio::sync::mpsc;
 
 use crate::terminal_events::TuiInput;
 use crate::tui_host_types::{TuiError, helpers};
+
+#[derive(Debug, Clone, Copy)]
+struct ReviewHomeTheme {
+    canvas: Style,
+    text: Style,
+    muted: Style,
+    focused: Style,
+    selection: Style,
+}
+
+impl ReviewHomeTheme {
+    fn resolve(theme: Option<PluginTuiTheme>) -> Self {
+        theme.map_or_else(
+            || Self {
+                canvas: Style::new(),
+                text: Style::new(),
+                muted: Style::new().add_modifier(Modifier::DIM),
+                focused: Style::new().add_modifier(Modifier::BOLD),
+                selection: Style::new().add_modifier(Modifier::REVERSED),
+            },
+            |theme| Self {
+                canvas: theme.canvas,
+                text: theme.text,
+                muted: theme.muted,
+                focused: theme.focused,
+                selection: theme.selection,
+            },
+        )
+    }
+}
 
 /// Review home outcome.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -730,7 +760,16 @@ impl PluginTuiSurface for ReviewHomeSurface {
     }
 
     fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
-        render(&self.app, frame);
+        render(&self.app, frame, ReviewHomeTheme::resolve(None));
+    }
+
+    fn render_with_theme(
+        &mut self,
+        _area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<PluginTuiTheme>,
+    ) {
+        render(&self.app, frame, ReviewHomeTheme::resolve(theme));
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -778,7 +817,7 @@ pub async fn run<W: Write>(
             needs_redraw = true;
         }
         if needs_redraw {
-            terminal.draw(|frame| render(&app, frame))?;
+            terminal.draw(|frame| render(&app, frame, ReviewHomeTheme::resolve(None)))?;
             needs_redraw = false;
         }
         let Some(event) = input.recv().await? else {
@@ -1540,32 +1579,29 @@ async fn create_workspace_with_sources(
     Ok(response.workspace)
 }
 
-fn render(app: &ReviewHomeApp, frame: &mut Frame<'_>) {
+fn render(app: &ReviewHomeApp, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
     let area = frame.area();
-    frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
-    render_header(app, area, frame);
+    frame.fill(area, " ", theme.canvas);
+    render_header(app, area, frame, theme);
     let body = Rect::new(
         area.x,
         area.y.saturating_add(2),
         area.width,
         area.height.saturating_sub(4),
     );
-    render_workspaces(app, body, frame);
-    render_footer(app, area, frame);
+    render_workspaces(app, body, frame, theme);
+    render_footer(app, area, frame, theme);
     if app.help_visible {
-        render_help(area, frame);
+        render_help(area, frame, theme);
     }
 }
 
-fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
     frame.write_line(
         Rect::new(area.x, area.y, area.width, 1),
         &Line::from_spans(vec![Span::styled(
             format!(" Bcode Reviews  {} ", review_home_summary_label(app)),
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            theme.focused.add_modifier(Modifier::BOLD),
         )]),
     );
     let filter_label = active_filter_label(app);
@@ -1575,7 +1611,7 @@ fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
             format!(
                 " {filter_label}  enter open   c latest   n new   u/s/w/l/v presets   S setup   F drafts   / search   ? help "
             ),
-            Style::new().fg(Color::BrightBlack).bg(Color::Black),
+            theme.muted,
         )]),
     );
 }
@@ -1664,7 +1700,12 @@ const fn review_home_help_lines() -> &'static [&'static str] {
     ]
 }
 
-fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_workspaces(
+    app: &ReviewHomeApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: ReviewHomeTheme,
+) {
     if app.details_visible && area.width >= 80 {
         let details_width = (area.width / 3).clamp(28, 48);
         let list_width = area.width.saturating_sub(details_width).saturating_sub(1);
@@ -1675,14 +1716,19 @@ fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
             details_width,
             area.height,
         );
-        render_workspace_list(app, list_area, frame);
-        render_workspace_details(app, details_area, frame);
+        render_workspace_list(app, list_area, frame, theme);
+        render_workspace_details(app, details_area, frame, theme);
     } else {
-        render_workspace_list(app, area, frame);
+        render_workspace_list(app, area, frame, theme);
     }
 }
 
-fn render_empty_review_home(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_empty_review_home(
+    app: &ReviewHomeApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: ReviewHomeTheme,
+) {
     let lines = [
         "No review workspaces yet.",
         "",
@@ -1696,12 +1742,9 @@ fn render_empty_review_home(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
     ];
     for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
         let style = if row == 0 {
-            Style::new()
-                .fg(Color::Cyan)
-                .bg(Color::Black)
-                .add_modifier(Modifier::BOLD)
+            theme.focused.add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(Color::White).bg(Color::Black)
+            theme.text
         };
         frame.write_line(
             Rect::new(
@@ -1722,19 +1765,21 @@ fn render_empty_review_home(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
         if y < area.bottom() {
             frame.write_line(
                 Rect::new(area.x, y, area.width, 1),
-                &Line::from_spans(vec![Span::styled(
-                    format!(" {message}"),
-                    Style::new().fg(Color::Yellow).bg(Color::Black),
-                )]),
+                &Line::from_spans(vec![Span::styled(format!(" {message}"), theme.focused)]),
             );
         }
     }
 }
 
-fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_workspace_list(
+    app: &ReviewHomeApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: ReviewHomeTheme,
+) {
     let visible = app.visible_indices();
     if app.workspace_items.is_empty() {
-        render_empty_review_home(app, area, frame);
+        render_empty_review_home(app, area, frame, theme);
         return;
     }
     if visible.is_empty() {
@@ -1746,7 +1791,7 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
                 } else {
                     " No matching review workspaces."
                 },
-                Style::new().fg(Color::White).bg(Color::Black),
+                theme.text,
             )]),
         );
         return;
@@ -1765,11 +1810,11 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         let workspace = &item.workspace;
         let selected = first_visible_row.saturating_add(row) == app.selected;
         let style = if selected {
-            Style::new().fg(Color::Black).bg(Color::Yellow)
+            theme.selection
         } else if workspace.archived_at_ms.is_some() {
-            Style::new().fg(Color::BrightBlack).bg(Color::Black)
+            theme.muted
         } else {
-            Style::new().fg(Color::White).bg(Color::Black)
+            theme.text
         };
         let status = workspace_health_label(item);
         let text = format!("{status:8}  {}", workspace_row_text(item));
@@ -1786,14 +1831,16 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
     }
 }
 
-fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_workspace_details(
+    app: &ReviewHomeApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: ReviewHomeTheme,
+) {
     let Some(index) = app.selected_workspace_index() else {
         frame.write_line(
             Rect::new(area.x, area.y, area.width, 1),
-            &Line::from_spans(vec![Span::styled(
-                " No review selected",
-                Style::new().fg(Color::BrightBlack),
-            )]),
+            &Line::from_spans(vec![Span::styled(" No review selected", theme.muted)]),
         );
         return;
     };
@@ -1874,9 +1921,9 @@ fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
             &Line::from_spans(vec![Span::styled(
                 line.clone(),
                 if row == 0 {
-                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    theme.focused.add_modifier(Modifier::BOLD)
                 } else {
-                    Style::new().fg(Color::BrightBlack)
+                    theme.muted
                 },
             )]),
         );
@@ -2142,7 +2189,7 @@ fn relative_time_label(timestamp_ms: u64) -> String {
     }
 }
 
-fn render_help(area: Rect, frame: &mut Frame<'_>) {
+fn render_help(area: Rect, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
     let lines = review_home_help_lines();
     let width = area.width.min(72);
     let height = area.height.min(
@@ -2158,11 +2205,7 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
         .y
         .saturating_add(area.height.saturating_sub(height) / 2);
     let popup = Rect::new(x, y, width, height);
-    frame.fill(
-        popup,
-        " ",
-        Style::new().fg(Color::White).bg(Color::BrightBlack),
-    );
+    frame.fill(popup, " ", theme.canvas.patch(theme.text));
     for (index, text) in lines.iter().enumerate() {
         let y = popup
             .y
@@ -2180,13 +2223,13 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
             ),
             &Line::from_spans(vec![Span::styled(
                 text.to_string(),
-                Style::new().fg(Color::White).bg(Color::BrightBlack),
+                theme.canvas.patch(theme.text),
             )]),
         );
     }
 }
 
-fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
     let text = app.new_review_buffer.as_ref().map_or_else(
         || {
             app.rename_buffer.as_ref().map_or_else(
@@ -2224,7 +2267,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
         Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
             text.as_str(),
-            Style::new().fg(Color::White).bg(Color::BrightBlack),
+            theme.canvas.patch(theme.text),
         )]),
     );
 }

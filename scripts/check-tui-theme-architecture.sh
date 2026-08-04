@@ -89,6 +89,11 @@ if rg -n 'Color::|frame\.fill\(area, " ", Style::new\(\)' \
   fail "workflow authoring surface must consume renderer-owned semantic themes"
 fi
 
+if rg -n 'Color::|frame\.fill\(area, " ", Style::new\(\)' \
+  plugins/code-review-plugin/src/code_review_home.rs; then
+  fail "code-review home must consume renderer-owned semantic themes"
+fi
+
 if rg -n 'SyntaxHighlighter::new\(\)' \
   plugins/filesystem-plugin/src \
   --glob '*.rs'; then
