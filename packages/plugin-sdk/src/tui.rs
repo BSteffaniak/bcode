@@ -894,6 +894,18 @@ pub struct PluginTuiDiffTheme {
 /// authorization, dispatch, or persisted outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginTuiTheme {
+    /// Base canvas style.
+    pub canvas: Style,
+    /// Primary text style.
+    pub text: Style,
+    /// Secondary text style.
+    pub muted: Style,
+    /// Default border/separator style.
+    pub border: Style,
+    /// Focused control/accent style.
+    pub focused: Style,
+    /// Active selection style.
+    pub selection: Style,
     /// Source-code card presentation.
     pub source: PluginTuiSourceTheme,
     /// Diff presentation.

@@ -48,6 +48,42 @@ fn syntax_palette(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReviewTheme {
+    canvas: Style,
+    muted: Style,
+    focused: Style,
+    selection: Style,
+}
+
+impl Default for ReviewTheme {
+    fn default() -> Self {
+        Self {
+            canvas: Style::new(),
+            muted: Style::new().fg(Color::BrightBlack),
+            focused: Style::new().fg(Color::Cyan),
+            selection: Style::new().add_modifier(Modifier::REVERSED),
+        }
+    }
+}
+
+impl ReviewTheme {
+    const fn control(self, active: bool) -> Style {
+        if active { self.selection } else { self.focused }
+    }
+}
+
+impl From<bcode_plugin_sdk::tui::PluginTuiTheme> for ReviewTheme {
+    fn from(theme: bcode_plugin_sdk::tui::PluginTuiTheme) -> Self {
+        Self {
+            canvas: theme.canvas,
+            muted: theme.muted,
+            focused: theme.focused,
+            selection: theme.selection,
+        }
+    }
+}
+
 /// Render one full-screen code review frame.
 pub fn render(
     app: &mut ReviewApp,
@@ -59,23 +95,29 @@ pub fn render(
         return;
     }
 
-    frame.fill(area, " ", Style::new().bg(Color::Black));
+    let review_theme = theme.map_or_else(ReviewTheme::default, ReviewTheme::from);
+    frame.fill(area, " ", review_theme.canvas);
     app.clear_mouse_regions();
-    render_chrome(app, area, frame);
-    let diff_area = render_body(app, area, frame);
-    render_main_content(app, diff_area, frame, theme);
+    render_chrome(app, area, frame, review_theme);
+    let diff_area = render_body(app, area, frame, review_theme);
+    render_main_content(app, diff_area, frame, theme, review_theme);
     render_overlays(app, area, frame);
 }
 
-fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
     let header = Rect::new(area.x, area.y, area.width, 1);
-    render_header(app, header, frame);
+    render_header(app, header, frame, theme);
 
     let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
-    render_footer(app, footer, frame);
+    render_footer(app, footer, frame, theme);
 }
 
-fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_header_actions(
+    app: &mut ReviewApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: ReviewTheme,
+) {
     if area.width == 0 {
         return;
     }
@@ -87,7 +129,7 @@ fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "Files",
         ReviewMouseAction::SidebarMode(ReviewSidebarMode::Included),
-        app.sidebar_mode == ReviewSidebarMode::Included,
+        theme.control(app.sidebar_mode == ReviewSidebarMode::Included),
     );
     x = render_header_button(
         app,
@@ -96,7 +138,7 @@ fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "Repo",
         ReviewMouseAction::SidebarMode(ReviewSidebarMode::Repository),
-        app.sidebar_mode == ReviewSidebarMode::Repository,
+        theme.control(app.sidebar_mode == ReviewSidebarMode::Repository),
     );
     x = render_header_button(
         app,
@@ -105,7 +147,7 @@ fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "Threads",
         ReviewMouseAction::SidebarMode(ReviewSidebarMode::Threads),
-        app.sidebar_mode == ReviewSidebarMode::Threads,
+        theme.control(app.sidebar_mode == ReviewSidebarMode::Threads),
     );
     x = render_header_button(
         app,
@@ -114,7 +156,7 @@ fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "General",
         ReviewMouseAction::SidebarMode(ReviewSidebarMode::General),
-        app.sidebar_mode == ReviewSidebarMode::General,
+        theme.control(app.sidebar_mode == ReviewSidebarMode::General),
     );
     x = render_header_button(
         app,
@@ -123,7 +165,7 @@ fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "Summary",
         ReviewMouseAction::SidebarMode(ReviewSidebarMode::Summary),
-        app.sidebar_mode == ReviewSidebarMode::Summary,
+        theme.control(app.sidebar_mode == ReviewSidebarMode::Summary),
     );
     x = render_header_button(
         app,
@@ -132,7 +174,7 @@ fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "Attention",
         ReviewMouseAction::SidebarMode(ReviewSidebarMode::NeedsAttention),
-        app.sidebar_mode == ReviewSidebarMode::NeedsAttention,
+        theme.control(app.sidebar_mode == ReviewSidebarMode::NeedsAttention),
     );
     x = render_header_button(
         app,
@@ -141,7 +183,7 @@ fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "File note",
         ReviewMouseAction::FileComment,
-        false,
+        theme.control(false),
     );
     let _ = render_header_button(
         app,
@@ -150,11 +192,11 @@ fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "+Review note",
         ReviewMouseAction::NewReviewComment,
-        false,
+        theme.control(false),
     );
 }
 
-fn render_body(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) -> Rect {
+fn render_body(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) -> Rect {
     let body = Rect::new(
         area.x,
         area.y.saturating_add(1),
@@ -169,7 +211,7 @@ fn render_body(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) -> Rect {
 
     let file_area = Rect::new(body.x, body.y, sidebar_width, body.height);
     app.set_file_area(Some(file_area));
-    render_sidebar(app, file_area, frame);
+    render_sidebar(app, file_area, frame, theme);
     let separator = Rect::new(file_area.right(), body.y, 1, body.height);
     render_separator(separator, frame);
     Rect::new(
@@ -180,8 +222,8 @@ fn render_body(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) -> Rect {
     )
 }
 
-fn render_sidebar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
-    render_header_actions(app, area, frame);
+fn render_sidebar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+    render_header_actions(app, area, frame, theme);
     let content = Rect::new(
         area.x,
         area.y.saturating_add(1),
@@ -206,12 +248,13 @@ fn render_main_content(
     area: Rect,
     frame: &mut Frame<'_>,
     theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    review_theme: ReviewTheme,
 ) {
     app.set_diff_area(area);
     if app.ux_mode == crate::code_review_tui::ReviewUxMode::Build {
         render_build_workspace(app, area, frame);
     } else {
-        render_diff(app, area, frame, theme);
+        render_diff(app, area, frame, theme, review_theme);
     }
 }
 
@@ -240,16 +283,11 @@ fn render_header_button(
     y: u16,
     label: &'static str,
     action: ReviewMouseAction,
-    active: bool,
+    style: Style,
 ) -> u16 {
     let text = format!("[{label}]");
     let width = u16::try_from(text.chars().count().saturating_add(1)).unwrap_or(u16::MAX);
     let rect = Rect::new(x, y, width.saturating_sub(1), 1);
-    let style = if active {
-        Style::new().fg(Color::Black).bg(Color::White)
-    } else {
-        Style::new().fg(Color::Cyan).bg(Color::Black)
-    };
     frame.write_line_with_fallback_style(
         rect,
         &Line::from_spans(vec![Span::styled(text, style)]),
@@ -259,7 +297,7 @@ fn render_header_button(
     x.saturating_add(width)
 }
 
-fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
     if area.is_empty() {
         return;
     }
@@ -349,12 +387,9 @@ fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         area,
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(&text, usize::from(area.width)),
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            theme.focused.add_modifier(Modifier::BOLD),
         )]),
-        Style::new().fg(Color::Black).bg(Color::Cyan),
+        theme.focused,
     );
     register_header_thread_regions(app, area, &text);
 }
@@ -463,7 +498,7 @@ fn header_thread_label(app: &ReviewApp) -> String {
     }
 }
 
-fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
     if area.is_empty() {
         return;
     }
@@ -531,9 +566,9 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         area,
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(&text, usize::from(area.width)),
-            Style::new().fg(Color::White).bg(Color::BrightBlack),
+            theme.muted,
         )]),
-        Style::new().fg(Color::White).bg(Color::BrightBlack),
+        theme.muted,
     );
 }
 
@@ -1148,7 +1183,15 @@ fn render_thread_detail(
     let mut x = area.x;
     let action_y = area.y.saturating_add(2);
     for (label, action) in actions {
-        x = render_header_button(app, frame, x, action_y, label, action, false);
+        x = render_header_button(
+            app,
+            frame,
+            x,
+            action_y,
+            label,
+            action,
+            ReviewTheme::default().control(false),
+        );
     }
     let body = thread.latest_body.lines().next().unwrap_or_default();
     let mut detail_lines = Vec::new();
@@ -1211,7 +1254,7 @@ fn render_thread_toolbar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "All",
         ReviewMouseAction::ThreadFilter(ReviewThreadFilter::All),
-        app.thread_filter == ReviewThreadFilter::All,
+        ReviewTheme::default().control(app.thread_filter == ReviewThreadFilter::All),
     );
     x = render_header_button(
         app,
@@ -1220,7 +1263,7 @@ fn render_thread_toolbar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "Open",
         ReviewMouseAction::ThreadFilter(ReviewThreadFilter::Open),
-        app.thread_filter == ReviewThreadFilter::Open,
+        ReviewTheme::default().control(app.thread_filter == ReviewThreadFilter::Open),
     );
     x = render_header_button(
         app,
@@ -1229,7 +1272,7 @@ fn render_thread_toolbar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "Resolved",
         ReviewMouseAction::ThreadFilter(ReviewThreadFilter::Resolved),
-        app.thread_filter == ReviewThreadFilter::Resolved,
+        ReviewTheme::default().control(app.thread_filter == ReviewThreadFilter::Resolved),
     );
     let _ = render_header_button(
         app,
@@ -1238,7 +1281,7 @@ fn render_thread_toolbar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         area.y,
         "+Review",
         ReviewMouseAction::NewReviewComment,
-        false,
+        ReviewTheme::default().control(false),
     );
 }
 
@@ -1572,6 +1615,7 @@ fn render_diff(
     area: Rect,
     frame: &mut Frame<'_>,
     theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    review_theme: ReviewTheme,
 ) {
     if area.is_empty() {
         return;
@@ -1600,7 +1644,7 @@ fn render_diff(
         render_empty(area, "No textual changes", frame);
         return;
     }
-    render_view_document(app, &document, area, frame, theme);
+    render_view_document(app, &document, area, frame, theme, review_theme);
 }
 
 fn render_view_document(
@@ -1609,6 +1653,7 @@ fn render_view_document(
     area: Rect,
     frame: &mut Frame<'_>,
     theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    review_theme: ReviewTheme,
 ) {
     let syntax_highlighter = theme.map_or_else(SyntaxHighlighter::new, |theme| {
         SyntaxHighlighter::with_palette(syntax_palette(theme.syntax))
@@ -1640,6 +1685,7 @@ fn render_view_document(
             can_highlight,
             &syntax_hint,
             area.width,
+            review_theme,
         );
         if app.is_view_target_selected(&view_row.target) {
             rendered.line = selected_line(&rendered.line);
@@ -1736,6 +1782,7 @@ fn render_view_row(
     can_highlight: bool,
     syntax_hint: &str,
     width: u16,
+    _theme: ReviewTheme,
 ) -> RenderedRow {
     match &view_row.block {
         ReviewViewBlock::OmittedContext { .. }
@@ -2286,7 +2333,7 @@ fn render_materialized_file_surface(app: &ReviewApp, area: Rect, frame: &mut Fra
         render_empty(area, "No file content", frame);
         return;
     }
-    render_view_document(app, &document, area, frame, None);
+    render_view_document(app, &document, area, frame, None, ReviewTheme::default());
 }
 
 #[must_use]
@@ -2328,7 +2375,7 @@ fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         render_empty(area, "No file content", frame);
         return;
     }
-    render_view_document(app, &document, area, frame, None);
+    render_view_document(app, &document, area, frame, None, ReviewTheme::default());
 }
 
 fn file_viewer_row_style(app: &ReviewApp, index: usize) -> Style {
@@ -3663,14 +3710,73 @@ mod tests {
 
     use super::*;
 
-    fn render_app_text(app: &mut ReviewApp, width: u16, height: u16) -> String {
+    fn render_app_text_with_theme(
+        app: &mut ReviewApp,
+        width: u16,
+        height: u16,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) -> String {
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
         let mut frame = Frame::new(&mut buffer);
-        render(app, &mut frame, None);
+        render(app, &mut frame, theme);
         (0..buffer.area().height)
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn render_app_text(app: &mut ReviewApp, width: u16, height: u16) -> String {
+        render_app_text_with_theme(app, width, height, None)
+    }
+
+    #[test]
+    fn terminal_native_theme_does_not_force_black_canvas() {
+        let mut app = crate::code_review_tui::tests::sample_app();
+        let default_style = Style::new();
+        let syntax_color = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(12, 34, 56);
+        let theme = bcode_plugin_sdk::tui::PluginTuiTheme {
+            canvas: default_style,
+            text: default_style,
+            muted: default_style,
+            border: default_style,
+            focused: default_style,
+            selection: default_style.add_modifier(Modifier::REVERSED),
+            source: bcode_plugin_sdk::tui::PluginTuiSourceTheme {
+                source: default_style,
+                border: default_style,
+                gutter: default_style,
+                truncated: default_style,
+            },
+            diff: bcode_plugin_sdk::tui::PluginTuiDiffTheme {
+                text: default_style,
+                muted: default_style,
+                title: default_style,
+                label: default_style,
+                added: default_style,
+                removed: default_style,
+                hunk: default_style,
+                added_row: default_style,
+                removed_row: default_style,
+                added_emphasis: default_style,
+                removed_emphasis: default_style,
+            },
+            syntax: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme {
+                text: syntax_color,
+                comment: syntax_color,
+                keyword: syntax_color,
+                function: syntax_color,
+                variable: syntax_color,
+                string: syntax_color,
+                number: syntax_color,
+                type_name: syntax_color,
+                operator: syntax_color,
+                punctuation: syntax_color,
+            },
+            fingerprint: 7,
+        };
+
+        let rendered = render_app_text_with_theme(&mut app, 100, 24, Some(theme));
+        assert!(rendered.contains("bcode review"));
     }
 
     #[test]

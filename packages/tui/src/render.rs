@@ -68,6 +68,12 @@ fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::t
     };
     let syntax = theme.syntax;
     bcode_plugin_sdk::tui::PluginTuiTheme {
+        canvas: theme.background.patch(theme.text),
+        text: theme.text,
+        muted: theme.muted,
+        border: theme.border,
+        focused: theme.focused,
+        selection: theme.selection,
         source: bcode_plugin_sdk::tui::PluginTuiSourceTheme {
             source: theme.source.source,
             border: theme.source.border,
