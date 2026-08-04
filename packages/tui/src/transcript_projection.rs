@@ -170,6 +170,7 @@ struct TranscriptLayoutInput<'a> {
     active_interaction_layout: Option<(&'a str, u16)>,
     markdown_presentation_revision: u64,
     pending_submissions_projection_revision: u64,
+    theme_fingerprint: u64,
     has_older_history: bool,
     loading_older_history: bool,
 }
@@ -187,6 +188,7 @@ impl<'a> TranscriptLayoutInput<'a> {
             active_interaction_layout: app.active_interaction_layout(),
             markdown_presentation_revision: app.markdown_presentation_revision(),
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
+            theme_fingerprint: app.presented_theme().fingerprint,
             has_older_history: app.has_older_history(),
             loading_older_history: app.loading_older_history(),
         }
@@ -217,9 +219,10 @@ impl<'a> TranscriptLayoutInput<'a> {
             |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
         );
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};diff:{:?};history:{}:{};presentation:{presentation};transcript-rev:{};markdown-presentation-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
+            "width:{};diff:{:?};theme:{};history:{}:{};presentation:{presentation};transcript-rev:{};markdown-presentation-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
             self.width,
             self.diff_viewer_config,
+            self.theme_fingerprint,
             self.has_older_history,
             self.loading_older_history,
             self.transcript_projection_revision,
@@ -251,6 +254,7 @@ pub fn test_layout_signature(
         active_interaction_layout: None,
         markdown_presentation_revision: 0,
         pending_submissions_projection_revision: 0,
+        theme_fingerprint: 0,
         has_older_history: false,
         loading_older_history: false,
     };
@@ -272,7 +276,8 @@ fn transcript_item_signature(
             .map_or(0, |host| host.visual_revision(invocation_id))
     });
     TranscriptLayoutSignature::new(format!(
-        "{};presentation-generation:{presentation_generation};visual-rev:{visual_revision}",
-        base.as_str()
+        "{};theme:{};presentation-generation:{presentation_generation};visual-rev:{visual_revision}",
+        base.as_str(),
+        input.theme_fingerprint
     ))
 }

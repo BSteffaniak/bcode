@@ -1,5 +1,28 @@
 # TUI rendering configuration
 
+## Theme ownership
+
+Terminal presentation is derived from the active versioned theme definition described in
+[`tui-themes.md`](tui-themes.md). Bcode owns coding-agent semantic roles and resolves them into
+renderer styles; BMUX owns terminal primitives and generic component style structures. Portable
+frontend/session contracts do not contain terminal colors, viewport data, or theme selection.
+
+`terminal-native` preserves `Color::Default`: absence of an explicit fill means the terminal's
+background, not black. Opaque themes opt into backgrounds through semantic canvas, surface,
+container, source, and diff roles. Raw terminal/program output keeps its own ANSI colors and is not
+reinterpreted as application chrome.
+
+Configuration startup and reload continue through `runtime.rs` and the app's existing config
+application path. The app stores only fully resolved presentation. Markdown options include the
+resolved Markdown and syntax palettes, transcript layout fingerprints include the resolved theme
+fingerprint, and native plugin visual contexts carry renderer-owned source/diff/syntax presentation
+plus that fingerprint. Theme changes therefore invalidate retained styled rows without replaying or
+mutating canonical session history.
+
+The mechanical boundary is checked by `scripts/check-tui-theme-architecture.sh`. Its exceptions are
+narrow: declarative theme definitions/resolution, raw ANSI conversion, compatibility defaults, and
+focused tests may contain concrete colors; migrated application chrome must consume semantic styles.
+
 ## BMUX runtime ownership
 
 Bcode's normal terminal entry point in `packages/tui/src/runtime.rs` constructs one

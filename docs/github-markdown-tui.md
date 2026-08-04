@@ -17,6 +17,24 @@ The terminal renderer supports the CommonMark and GitHub-oriented syntax used by
 
 Renderer-owned options are included in a versioned layout signature so width, theme, trusted document context, Mermaid bounds, streaming state, and semantic contributions invalidate retained rows correctly.
 
+## Resolved Markdown and syntax themes
+
+Markdown does not select a fixed global color scheme. The active TUI theme resolves semantic roles
+for ordinary text, headings, links, inline code, fenced code, block quotes, alerts, list/task markers,
+tables, and thematic breaks. `terminal-native` leaves base text/background on terminal defaults;
+opaque themes may style those roles explicitly.
+
+Fenced code uses the same resolved semantic syntax palette as source previews, diffs, and
+renderer-aware plugin visuals. The palette covers text, comments, keywords, functions, variables,
+strings, numbers, types, operators, and punctuation while preserving parser-derived font modifiers.
+Raw terminal output remains distinct and keeps its program-provided ANSI presentation.
+
+`MarkdownRenderOptions` owns both the resolved `MarkdownTheme` and `SyntaxPalette`. They participate
+in option equality/hash and retained Markdown cache identity. Transcript layout additionally includes
+the resolved theme fingerprint. A theme change therefore rebuilds affected styled rows and converges
+to the same terminal output as a fresh render without changing semantic Markdown contributions,
+requesting session replay, or persisting presentation data.
+
 ## Progressive rendering and exact convergence
 
 The renderer keeps append-aware state only for semantically closed plain-paragraph prefixes whose
