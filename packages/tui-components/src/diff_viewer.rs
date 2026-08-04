@@ -551,9 +551,17 @@ mod diff_tests {
             },
             80,
             DiffViewerStyle {
+                text: custom,
                 muted: custom,
                 title: custom,
                 label: custom,
+                added: custom,
+                removed: custom,
+                hunk: custom,
+                added_row: custom,
+                removed_row: custom,
+                added_emphasis: custom,
+                removed_emphasis: custom,
             },
         );
 
@@ -569,6 +577,9 @@ mod diff_tests {
                 .iter()
                 .all(|span| span.style.fg == Some(Color::Magenta))
         );
+        assert!(rows.iter().skip(4).flat_map(|row| &row.spans).all(|span| {
+            span.style.fg == Some(Color::Magenta) && span.style.bg == Some(Color::Blue)
+        }));
     }
 
     #[test]
@@ -688,25 +699,81 @@ impl DiffViewerLayout {
     }
 }
 
-/// Semantic styles used by diff viewer summary chrome.
+/// Semantic styles used by diff viewer chrome and states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffViewerStyle {
-    /// Secondary text and card-border style.
+    /// Base text style for unchanged content.
+    pub text: Style,
+    /// Secondary text, border, gutter, and omission style.
     pub muted: Style,
     /// Preview title style.
     pub title: Style,
     /// Changed-path label style.
     pub label: Style,
+    /// Added-line marker and text style.
+    pub added: Style,
+    /// Removed-line marker and text style.
+    pub removed: Style,
+    /// Hunk-header marker and text style.
+    pub hunk: Style,
+    /// Added-line container style.
+    pub added_row: Style,
+    /// Removed-line container style.
+    pub removed_row: Style,
+    /// Added intraline-emphasis style.
+    pub added_emphasis: Style,
+    /// Removed intraline-emphasis style.
+    pub removed_emphasis: Style,
 }
 
 impl Default for DiffViewerStyle {
     fn default() -> Self {
         Self {
+            text: Style::new(),
             muted: Style::new().fg(Color::BrightBlack),
             title: Style::new().fg(Color::Cyan),
             label: Style::new()
                 .fg(Color::BrightWhite)
                 .add_modifier(Modifier::BOLD),
+            added: Style::new().fg(Color::BrightGreen),
+            removed: Style::new().fg(Color::BrightRed),
+            hunk: Style::new().fg(Color::BrightCyan),
+            added_row: Style::new().bg(Color::Rgb(0, 24, 16)),
+            removed_row: Style::new().bg(Color::Rgb(32, 10, 10)),
+            added_emphasis: Style::new().bg(Color::Rgb(0, 42, 26)),
+            removed_emphasis: Style::new().bg(Color::Rgb(50, 14, 14)),
+        }
+    }
+}
+
+impl DiffViewerStyle {
+    const fn row(self, kind: DiffLineKind) -> Style {
+        match kind {
+            DiffLineKind::Added => self.added_row,
+            DiffLineKind::Removed => self.removed_row,
+            DiffLineKind::Context | DiffLineKind::HunkHeader | DiffLineKind::FileHeader => {
+                self.text
+            }
+        }
+    }
+
+    const fn emphasis(self, kind: DiffLineKind) -> Style {
+        match kind {
+            DiffLineKind::Added => self.added_emphasis,
+            DiffLineKind::Removed => self.removed_emphasis,
+            DiffLineKind::Context | DiffLineKind::HunkHeader | DiffLineKind::FileHeader => {
+                self.text
+            }
+        }
+    }
+
+    const fn line(self, kind: DiffLineKind) -> (&'static str, Style, Style) {
+        match kind {
+            DiffLineKind::Added => ("+", self.added, self.added),
+            DiffLineKind::Removed => ("-", self.removed, self.removed),
+            DiffLineKind::HunkHeader => ("·", self.hunk, self.hunk),
+            DiffLineKind::FileHeader => ("·", self.muted, self.muted),
+            DiffLineKind::Context => (" ", self.muted, self.text),
         }
     }
 }
@@ -865,18 +932,18 @@ fn render_preview_rows(
     preview: &[PreviewRow<'_>],
     layout: DiffViewerLayout,
     card_width: u16,
-    _style: DiffViewerStyle,
+    style: DiffViewerStyle,
 ) -> Vec<Line> {
     if layout == DiffViewerLayout::SideBySide {
-        return render_side_by_side_preview(preview, card_width);
+        return render_side_by_side_preview_with_style(preview, card_width, style);
     }
     let mut rows = Vec::new();
     let mut rendered_rows = 0_usize;
     for row in preview {
         let rendered = match row {
-            PreviewRow::Line(line) => render_diff_line(line, card_width),
+            PreviewRow::Line(line) => render_diff_line_with_style(line, card_width, style),
             PreviewRow::Hidden { count, .. } => {
-                vec![hidden_row(*count, card_width)]
+                vec![hidden_row_with_style(*count, card_width, style)]
             }
         };
         let remaining = MAX_INLINE_DIFF_RENDER_ROWS.saturating_sub(rendered_rows);
@@ -887,7 +954,7 @@ fn render_preview_rows(
         rows.extend(rendered.into_iter().take(take));
         rendered_rows = rendered_rows.saturating_add(take);
         if take == remaining {
-            rows.push(hidden_row(1, card_width));
+            rows.push(hidden_row_with_style(1, card_width, style));
             break;
         }
     }
@@ -997,7 +1064,16 @@ fn side_by_side_column_widths(preview: &[PreviewRow<'_>], width: u16) -> (usize,
     (old_width, cells_width.saturating_sub(old_width))
 }
 
+#[cfg(test)]
 fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Line> {
+    render_side_by_side_preview_with_style(preview, width, DiffViewerStyle::default())
+}
+
+fn render_side_by_side_preview_with_style(
+    preview: &[PreviewRow<'_>],
+    width: u16,
+    style: DiffViewerStyle,
+) -> Vec<Line> {
     let mut rows = Vec::new();
     let (left_width, right_width) = side_by_side_column_widths(preview, width);
     let mut index = 0;
@@ -1008,13 +1084,14 @@ fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Li
                 old_count,
                 new_count,
             } => {
-                rows.push(split_hidden_row(
+                rows.push(split_hidden_row_with_style(
                     count,
                     old_count,
                     new_count,
                     width,
                     left_width,
                     right_width,
+                    style,
                 ));
                 index += 1;
             }
@@ -1038,19 +1115,32 @@ fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Li
                     let new = (offset < added_count)
                         .then(|| preview.get(added_start + offset).and_then(preview_line))
                         .flatten();
-                    rows.extend(render_split_row(old, new, left_width, right_width));
+                    rows.extend(render_split_row_with_style(
+                        old,
+                        new,
+                        left_width,
+                        right_width,
+                        style,
+                    ));
                 }
             }
             PreviewRow::Line(line) if line.kind == DiffLineKind::Added => {
-                rows.extend(render_split_row(None, Some(line), left_width, right_width));
+                rows.extend(render_split_row_with_style(
+                    None,
+                    Some(line),
+                    left_width,
+                    right_width,
+                    style,
+                ));
                 index += 1;
             }
             PreviewRow::Line(line) => {
-                rows.extend(render_split_row(
+                rows.extend(render_split_row_with_style(
                     Some(line),
                     Some(line),
                     left_width,
                     right_width,
+                    style,
                 ));
                 index += 1;
             }
@@ -1059,6 +1149,7 @@ fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Li
     rows
 }
 
+#[cfg(test)]
 fn split_hidden_row(
     count: usize,
     old_count: usize,
@@ -1066,6 +1157,26 @@ fn split_hidden_row(
     width: u16,
     old_width: usize,
     new_width: usize,
+) -> Line {
+    split_hidden_row_with_style(
+        count,
+        old_count,
+        new_count,
+        width,
+        old_width,
+        new_width,
+        DiffViewerStyle::default(),
+    )
+}
+
+fn split_hidden_row_with_style(
+    count: usize,
+    old_count: usize,
+    new_count: usize,
+    width: u16,
+    old_width: usize,
+    new_width: usize,
+    style: DiffViewerStyle,
 ) -> Line {
     let text = format!("⋯ {count} rows omitted ⋯");
     if old_count > 0 && new_count > 0 {
@@ -1077,33 +1188,35 @@ fn split_hidden_row(
             .saturating_sub(text_width)
             .saturating_sub(left_padding);
         return Line::from_spans(vec![
-            Span::styled("  ", muted_style()),
-            Span::styled("│", muted_style()),
-            Span::styled(" ".repeat(left_padding), muted_style()),
-            Span::styled(clipped, muted_style()),
-            Span::styled(" ".repeat(right_padding), muted_style()),
-            Span::styled("│", muted_style()),
+            Span::styled("  ", style.muted),
+            Span::styled("│", style.muted),
+            Span::styled(" ".repeat(left_padding), style.muted),
+            Span::styled(clipped, style.muted),
+            Span::styled(" ".repeat(right_padding), style.muted),
+            Span::styled("│", style.muted),
         ]);
     }
 
     let mut spans = vec![
-        Span::styled("  ", muted_style()),
-        Span::styled("│", muted_style()),
+        Span::styled("  ", style.muted),
+        Span::styled("│", style.muted),
     ];
     spans.extend(centered_hidden_cell(
         (old_count > 0).then_some(text.as_str()),
         old_width,
+        style.muted,
     ));
-    spans.push(Span::styled("│", muted_style()));
+    spans.push(Span::styled("│", style.muted));
     spans.extend(centered_hidden_cell(
         (new_count > 0).then_some(text.as_str()),
         new_width,
+        style.muted,
     ));
-    spans.push(Span::styled("│", muted_style()));
+    spans.push(Span::styled("│", style.muted));
     Line::from_spans(spans)
 }
 
-fn centered_hidden_cell(text: Option<&str>, width: usize) -> Vec<Span> {
+fn centered_hidden_cell(text: Option<&str>, width: usize, style: Style) -> Vec<Span> {
     let clipped = truncate_to_display_width(text.unwrap_or_default(), width);
     let text_width = UnicodeWidthStr::width(clipped.as_str());
     let left_padding = width.saturating_sub(text_width) / 2;
@@ -1111,9 +1224,9 @@ fn centered_hidden_cell(text: Option<&str>, width: usize) -> Vec<Span> {
         .saturating_sub(text_width)
         .saturating_sub(left_padding);
     vec![
-        Span::styled(" ".repeat(left_padding), muted_style()),
-        Span::styled(clipped, muted_style()),
-        Span::styled(" ".repeat(right_padding), muted_style()),
+        Span::styled(" ".repeat(left_padding), style),
+        Span::styled(clipped, style),
+        Span::styled(" ".repeat(right_padding), style),
     ]
 }
 
@@ -1124,40 +1237,57 @@ const fn preview_line<'a>(row: &'a PreviewRow<'a>) -> Option<&'a DiffLine> {
     }
 }
 
-fn render_split_row(
+fn render_split_row_with_style(
     old: Option<&DiffLine>,
     new: Option<&DiffLine>,
     old_width: usize,
     new_width: usize,
+    style: DiffViewerStyle,
 ) -> Vec<Line> {
-    let old_chunks = split_cell_chunks(old, old_width);
-    let new_chunks = split_cell_chunks(new, new_width);
+    let old_chunks = split_cell_chunks_with_style(old, old_width, style);
+    let new_chunks = split_cell_chunks_with_style(new, new_width, style);
     let height = old_chunks.len().max(new_chunks.len());
     (0..height)
         .map(|row| {
             let mut spans = vec![
-                Span::styled("  ", muted_style()),
-                Span::styled("│", muted_style()),
+                Span::styled("  ", style.muted),
+                Span::styled("│", style.muted),
             ];
-            spans.extend(split_cell_row(old, old_chunks.get(row), row, old_width));
-            spans.push(Span::styled("│", muted_style()));
-            spans.extend(split_cell_row(new, new_chunks.get(row), row, new_width));
-            spans.push(Span::styled("│", muted_style()));
+            spans.extend(split_cell_row_with_style(
+                old,
+                old_chunks.get(row),
+                row,
+                old_width,
+                style,
+            ));
+            spans.push(Span::styled("│", style.muted));
+            spans.extend(split_cell_row_with_style(
+                new,
+                new_chunks.get(row),
+                row,
+                new_width,
+                style,
+            ));
+            spans.push(Span::styled("│", style.muted));
             Line::from_spans(spans)
         })
         .collect()
 }
 
-fn split_cell_chunks(line: Option<&DiffLine>, width: usize) -> Vec<Vec<Span>> {
+fn split_cell_chunks_with_style(
+    line: Option<&DiffLine>,
+    width: usize,
+    style: DiffViewerStyle,
+) -> Vec<Vec<Span>> {
     let Some(line) = line else {
         return vec![Vec::new()];
     };
     let body_width = width.saturating_sub(9).max(1);
-    let (_, _, body_style) = line_styles(line.kind);
+    let (_, _, body_style) = style.line(line.kind);
     let chunks = wrap_spans(
-        content_spans(line, row_style(line.kind).patch(body_style)),
+        content_spans(line, style.row(line.kind).patch(body_style)),
         &line.changed_ranges,
-        emphasis_style(line.kind),
+        style.emphasis(line.kind),
         body_width,
     );
     if chunks.is_empty() {
@@ -1167,18 +1297,19 @@ fn split_cell_chunks(line: Option<&DiffLine>, width: usize) -> Vec<Vec<Span>> {
     }
 }
 
-fn split_cell_row(
+fn split_cell_row_with_style(
     line: Option<&DiffLine>,
     chunk: Option<&Vec<Span>>,
     row: usize,
     width: usize,
+    style: DiffViewerStyle,
 ) -> Vec<Span> {
     let Some(line) = line else {
-        return vec![Span::styled(" ".repeat(width), Style::new())];
+        return vec![Span::styled(" ".repeat(width), style.text)];
     };
-    let (sign, sign_style, body_style) = line_styles(line.kind);
-    let background = row_style(line.kind);
-    let gutter_style = background.patch(muted_style());
+    let (sign, sign_style, body_style) = style.line(line.kind);
+    let background = style.row(line.kind);
+    let gutter_style = background.patch(style.muted);
     let number = if row == 0 {
         (if matches!(line.kind, DiffLineKind::Removed) {
             line.old_line
@@ -1206,11 +1337,16 @@ fn split_cell_row(
     spans
 }
 
+#[cfg(test)]
 fn render_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
-    let (sign, sign_style, body_style) = line_styles(line.kind);
-    let row_style = row_style(line.kind);
-    let emphasis_style = emphasis_style(line.kind);
-    let gutter_style = row_style.patch(muted_style());
+    render_diff_line_with_style(line, width, DiffViewerStyle::default())
+}
+
+fn render_diff_line_with_style(line: &DiffLine, width: u16, style: DiffViewerStyle) -> Vec<Line> {
+    let (sign, sign_style, body_style) = style.line(line.kind);
+    let row_style = style.row(line.kind);
+    let emphasis_style = style.emphasis(line.kind);
+    let gutter_style = row_style.patch(style.muted);
     let body_width = usize::from(width)
         .saturating_sub(INLINE_DIFF_BODY_CHROME_WIDTH)
         .max(1);
@@ -1232,10 +1368,10 @@ fn render_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
         .into_iter()
         .enumerate()
         .map(|(index, chunk)| {
-            let mut spans = vec![Span::styled("  ", muted_style())];
+            let mut spans = vec![Span::styled("  ", style.muted)];
             let mut card_spans = if index == 0 {
                 vec![
-                    Span::styled("│ ", muted_style()),
+                    Span::styled("│ ", style.muted),
                     Span::styled("  ", gutter_style),
                     Span::styled(
                         sign,
@@ -1245,7 +1381,7 @@ fn render_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
                     Span::styled(" │ ", gutter_style),
                 ]
             } else {
-                continuation_prefix(gutter_style)
+                continuation_prefix(gutter_style, style.muted)
             };
             card_spans.extend(chunk);
             pad_card_spans(
@@ -1253,16 +1389,16 @@ fn render_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
                 usize::from(width).saturating_sub(2),
                 row_style,
             );
-            card_spans.push(Span::styled(" │", muted_style()));
+            card_spans.push(Span::styled(" │", style.muted));
             spans.extend(card_spans);
             Line::from_spans(spans)
         })
         .collect()
 }
 
-fn continuation_prefix(gutter_style: Style) -> Vec<Span> {
+fn continuation_prefix(gutter_style: Style, border_style: Style) -> Vec<Span> {
     vec![
-        Span::styled("│ ", muted_style()),
+        Span::styled("│ ", border_style),
         Span::styled("  ", gutter_style),
         Span::styled(" ", gutter_style),
         Span::styled("    ", gutter_style),
@@ -1366,7 +1502,12 @@ fn card_border(left: char, fill: char, right: char, width: u16, style: Style) ->
     ])
 }
 
+#[cfg(test)]
 fn hidden_row(count: usize, width: u16) -> Line {
+    hidden_row_with_style(count, width, DiffViewerStyle::default())
+}
+
+fn hidden_row_with_style(count: usize, width: u16, style: DiffViewerStyle) -> Line {
     let text = hidden_text(count);
     let inner_width = usize::from(width.saturating_sub(4));
     let clipped = truncate_to_display_width(&text, inner_width);
@@ -1375,15 +1516,15 @@ fn hidden_row(count: usize, width: u16) -> Line {
     let left_padding = padding / 2;
     let right_padding = padding.saturating_sub(left_padding);
     let mut spans = vec![
-        Span::styled("  ", muted_style()),
-        Span::styled("│ ", muted_style()),
-        Span::styled(" ".repeat(left_padding), muted_style()),
-        Span::styled(clipped, muted_style()),
+        Span::styled("  ", style.muted),
+        Span::styled("│ ", style.muted),
+        Span::styled(" ".repeat(left_padding), style.muted),
+        Span::styled(clipped, style.muted),
     ];
     if right_padding > 0 {
-        spans.push(Span::styled(" ".repeat(right_padding), muted_style()));
+        spans.push(Span::styled(" ".repeat(right_padding), style.muted));
     }
-    spans.push(Span::styled(" │", muted_style()));
+    spans.push(Span::styled(" │", style.muted));
     Line::from_spans(spans)
 }
 
@@ -1413,10 +1554,6 @@ const fn mode_label(old_text_is_empty: bool) -> &'static str {
     }
 }
 
-const fn muted_style() -> Style {
-    Style::new().fg(Color::BrightBlack)
-}
-
 fn line_number(line: &DiffLine) -> String {
     line.new_line
         .or(line.old_line)
@@ -1441,44 +1578,6 @@ fn line_count_label(count: u32) -> String {
         "1 line".to_owned()
     } else {
         format!("{count} lines")
-    }
-}
-
-const fn row_style(kind: DiffLineKind) -> Style {
-    match kind {
-        DiffLineKind::Added => Style::new().bg(Color::Rgb(0, 24, 16)),
-        DiffLineKind::Removed => Style::new().bg(Color::Rgb(32, 10, 10)),
-        DiffLineKind::Context | DiffLineKind::HunkHeader | DiffLineKind::FileHeader => Style::new(),
-    }
-}
-
-const fn emphasis_style(kind: DiffLineKind) -> Style {
-    match kind {
-        DiffLineKind::Added => Style::new().bg(Color::Rgb(0, 42, 26)),
-        DiffLineKind::Removed => Style::new().bg(Color::Rgb(50, 14, 14)),
-        DiffLineKind::Context | DiffLineKind::HunkHeader | DiffLineKind::FileHeader => Style::new(),
-    }
-}
-
-const fn line_styles(kind: DiffLineKind) -> (&'static str, Style, Style) {
-    match kind {
-        DiffLineKind::Added => (
-            "+",
-            Style::new().fg(Color::BrightGreen),
-            Style::new().fg(Color::BrightGreen),
-        ),
-        DiffLineKind::Removed => (
-            "-",
-            Style::new().fg(Color::BrightRed),
-            Style::new().fg(Color::BrightRed),
-        ),
-        DiffLineKind::HunkHeader => (
-            "·",
-            Style::new().fg(Color::BrightCyan),
-            Style::new().fg(Color::BrightCyan),
-        ),
-        DiffLineKind::FileHeader => ("·", muted_style(), muted_style()),
-        DiffLineKind::Context => (" ", muted_style(), Style::new()),
     }
 }
 
