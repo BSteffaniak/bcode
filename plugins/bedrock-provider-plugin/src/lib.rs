@@ -1603,7 +1603,10 @@ fn capabilities() -> ProviderCapabilities {
 impl BedrockProviderPlugin {
     fn models(&self, request: &ModelListRequest) -> ModelList {
         let settings = Settings::resolve_from_context(&request.provider_context);
-        if settings.model_ids_are_explicit || settings.default_model.is_some() {
+        // Only an explicit models *list* (BCODE_BEDROCK_MODELS / config `models`) pins membership.
+        // A merely-selected or configured single model must not collapse the picker to one entry;
+        // it is surfaced as the default within the full discovered list below.
+        if settings.model_ids_are_explicit {
             return ModelList {
                 models: model_infos_from_ids(
                     &settings.model_ids,
@@ -1637,8 +1640,10 @@ impl BedrockProviderPlugin {
                 );
                 ModelDiscovery::default()
             });
+        let mut models = discovered.models;
+        apply_default_model_to_list(&mut models, settings.default_model.as_deref());
         ModelList {
-            models: discovered.models,
+            models,
             catalog: ModelCatalogHints {
                 policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
                     provider_id: "bedrock".to_string(),
@@ -1772,6 +1777,27 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect::<Vec<_>>()
+}
+
+/// Mark the selected/configured model as the default within a discovered model list.
+///
+/// The full discovered list is preserved. When `default_model` is set but discovery did not
+/// surface it (for example a pinned version ID that is not an ACTIVE inference profile, or a
+/// failed discovery), it is prepended so it stays selectable rather than replacing the list. When
+/// `default_model` is `None`, the list's existing default (chosen by discovery) is left untouched.
+fn apply_default_model_to_list(models: &mut Vec<ModelInfo>, default_model: Option<&str>) {
+    let Some(default_model) = default_model.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if !models.iter().any(|model| model.model_id == default_model) {
+        models.insert(
+            0,
+            model_infos_from_ids(&[default_model.to_string()], Some(default_model)).remove(0),
+        );
+    }
+    for model in models.iter_mut() {
+        model.is_default = model.model_id == default_model;
+    }
 }
 
 fn bedrock_model_cache_info() -> bcode_model::ModelCacheInfo {
@@ -1922,7 +1948,9 @@ fn warm_discovery_cache(
     cache: Arc<Mutex<DiscoveryCache>>,
     settings: Settings,
 ) {
-    if settings.model_ids_are_explicit || settings.default_model.is_some() {
+    // Discovery still drives the picker list when a single model is selected/configured, so only
+    // an explicit pinned models list skips warming.
+    if settings.model_ids_are_explicit {
         return;
     }
     runtime.spawn(async move {
@@ -4078,6 +4106,70 @@ mod tests {
         settings.model_ids = vec!["model-b".to_string(), "model-a".to_string()];
         let metadata = diagnostics_metadata(&settings);
         assert_eq!(metadata.get("default_model"), Some(&"model-b".to_string()));
+    }
+
+    #[test]
+    fn apply_default_model_preserves_full_discovered_list() {
+        // A selected/configured model must mark the default without collapsing the picker to a
+        // single entry (regression: only the configured model was shown).
+        let mut models = model_infos_from_ids(
+            &[
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+                "us.anthropic.claude-opus-4-8-20250101-v1:0".to_string(),
+                "us.anthropic.claude-haiku-4-5-20250101-v1:0".to_string(),
+            ],
+            None,
+        );
+
+        apply_default_model_to_list(
+            &mut models,
+            Some("us.anthropic.claude-opus-4-8-20250101-v1:0"),
+        );
+
+        assert_eq!(models.len(), 3, "the full list must be preserved");
+        let default = models
+            .iter()
+            .filter(|model| model.is_default)
+            .collect::<Vec<_>>();
+        assert_eq!(default.len(), 1);
+        assert_eq!(
+            default[0].model_id,
+            "us.anthropic.claude-opus-4-8-20250101-v1:0"
+        );
+    }
+
+    #[test]
+    fn apply_default_model_adds_missing_pinned_model() {
+        let mut models = model_infos_from_ids(
+            &["us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string()],
+            None,
+        );
+
+        apply_default_model_to_list(
+            &mut models,
+            Some("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+        );
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models[0].model_id,
+            "anthropic.claude-3-5-sonnet-20241022-v2:0"
+        );
+        assert!(models[0].is_default);
+    }
+
+    #[test]
+    fn apply_default_model_none_leaves_list_untouched() {
+        let mut models = model_infos_from_ids(&["a".to_string(), "b".to_string()], Some("b"));
+        apply_default_model_to_list(&mut models, None);
+        assert_eq!(models.len(), 2);
+        assert!(
+            models
+                .iter()
+                .find(|m| m.model_id == "b")
+                .unwrap()
+                .is_default
+        );
     }
 
     #[test]
