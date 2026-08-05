@@ -29,6 +29,8 @@ const MAX_SNAPSHOT_PATHS: usize = 10_000;
 const MAX_SNAPSHOT_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SYMLINK_TARGET_BYTES: usize = 16 * 1024;
+const GIT_REMOTE_OBSERVATION_VERSION: u32 = 1;
+const GIT_PUSH_VERSION: u32 = 1;
 
 /// Git access plugin.
 #[derive(Default)]
@@ -483,6 +485,111 @@ pub struct PrepareResponse {
     pub changed_paths: Vec<PreparedChangedPath>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitRemoteObservationRequest {
+    pub version: u32,
+    pub remote: String,
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRemoteRelationship {
+    UpToDate,
+    LocalAhead,
+    RemoteAhead,
+    Diverged,
+    UnbornLocal,
+    MissingRemote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitRemoteObservation {
+    pub version: u32,
+    pub repository_identity_sha256: String,
+    pub remote: String,
+    pub reference: String,
+    pub local_object_id: Option<String>,
+    pub observed_remote_object_id: Option<String>,
+    pub merge_base_object_id: Option<String>,
+    pub relationship: GitRemoteRelationship,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitPushRequest {
+    pub version: u32,
+    pub remote: String,
+    pub reference: String,
+    pub expected_repository_identity_sha256: String,
+    pub expected_local_object_id: String,
+    pub observed_remote_object_id: Option<String>,
+    pub dispatch_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitPushOutcome {
+    Pushed,
+    RemoteAdvanced,
+    Rejected,
+    Cancelled,
+    Failed,
+    RepairRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitPushStatusRequest {
+    pub version: u32,
+    pub remote: String,
+    pub reference: String,
+    pub expected_repository_identity_sha256: String,
+    pub expected_local_object_id: String,
+    pub observed_remote_object_id: Option<String>,
+    pub dispatch_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitPushStatusOutcome {
+    Accepted,
+    NotAccepted,
+    RemoteAdvanced,
+    DivergedOrAmbiguous,
+    Unverifiable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitPushStatusResult {
+    pub version: u32,
+    pub dispatch_id: String,
+    pub outcome: GitPushStatusOutcome,
+    pub expected_local_object_id: String,
+    pub observed_remote_object_id: Option<String>,
+    pub current_remote_object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitPushResult {
+    pub version: u32,
+    pub dispatch_id: String,
+    pub outcome: GitPushOutcome,
+    pub expected_local_object_id: String,
+    pub observed_remote_object_id: Option<String>,
+    pub final_remote_object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
 fn zero_sha256() -> String {
     "0".repeat(64)
 }
@@ -490,6 +597,15 @@ fn zero_sha256() -> String {
 fn invoke_workflow_block(context: &NativeServiceContext) -> ServiceResponse {
     if context.request.operation == "git.repository-snapshot" {
         return repository_snapshot_workflow(context);
+    }
+    if context.request.operation == "git.remote-observe" {
+        return remote_observation_workflow(context);
+    }
+    if context.request.operation == "git.push" {
+        return push_workflow(context);
+    }
+    if context.request.operation == "git.push-status" {
+        return push_status_workflow(context);
     }
     if context.request.operation == "git.verification-receipt" {
         return verification_receipt_workflow(context);
@@ -597,6 +713,442 @@ fn commit_status(request: &CommitStatusRequest) -> Result<CommitStatusResponse, 
         actual_commit_paths,
         guidance,
     })
+}
+
+fn push_status_workflow(context: &NativeServiceContext) -> ServiceResponse {
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return invalid_request(&error),
+    };
+    let request = match invocation.typed_input::<GitPushStatusRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
+    };
+    match reconcile_git_push(&invocation.workspace_root, &request) {
+        Ok(result) => json_response(&result),
+        Err(error) => ServiceResponse::error("push_status_failed", error.to_string()),
+    }
+}
+
+fn reconcile_git_push(
+    workspace_root: &Path,
+    request: &GitPushStatusRequest,
+) -> Result<GitPushStatusResult, GitError> {
+    if request.version != GIT_PUSH_VERSION {
+        return Err(GitError::InvalidRequest(format!(
+            "unsupported push status version {}; expected {GIT_PUSH_VERSION}",
+            request.version
+        )));
+    }
+    validate_remote_name(&request.remote)?;
+    validate_remote_reference(&request.reference)?;
+    validate_object_id(&request.expected_local_object_id)?;
+    if let Some(observed) = &request.observed_remote_object_id {
+        validate_object_id(observed)?;
+    }
+    if request.dispatch_id.is_empty() || request.dispatch_id.len() > 256 {
+        return Err(GitError::InvalidRequest(
+            "push status dispatch identity must contain 1..=256 bytes".to_string(),
+        ));
+    }
+    let repository_root = PathBuf::from(git_stdout(
+        workspace_root,
+        ["rev-parse", "--show-toplevel"],
+    )?)
+    .canonicalize()?;
+    let git_common_dir = PathBuf::from(git_stdout(
+        &repository_root,
+        ["rev-parse", "--git-common-dir"],
+    )?);
+    let git_common_dir = if git_common_dir.is_absolute() {
+        git_common_dir
+    } else {
+        repository_root.join(git_common_dir)
+    }
+    .canonicalize()?;
+    if sha256_hex(git_common_dir.as_os_str().as_encoded_bytes())
+        != request.expected_repository_identity_sha256
+    {
+        return Err(GitError::InvalidRequest(
+            "push status repository identity no longer matches".to_string(),
+        ));
+    }
+    let current_remote =
+        observe_exact_remote_ref(&repository_root, &request.remote, &request.reference)?;
+    let outcome = if current_remote.as_deref() == Some(request.expected_local_object_id.as_str()) {
+        GitPushStatusOutcome::Accepted
+    } else if current_remote == request.observed_remote_object_id {
+        GitPushStatusOutcome::NotAccepted
+    } else if current_remote.is_none() {
+        GitPushStatusOutcome::Unverifiable
+    } else {
+        let remote = current_remote.as_deref().ok_or_else(|| {
+            GitError::InvalidRequest("current remote unexpectedly absent".to_string())
+        })?;
+        let local_contains_remote =
+            git_is_ancestor(&repository_root, remote, &request.expected_local_object_id)?;
+        let remote_contains_local =
+            git_is_ancestor(&repository_root, &request.expected_local_object_id, remote)?;
+        if remote_contains_local && !local_contains_remote {
+            GitPushStatusOutcome::RemoteAdvanced
+        } else {
+            GitPushStatusOutcome::DivergedOrAmbiguous
+        }
+    };
+    Ok(GitPushStatusResult {
+        version: GIT_PUSH_VERSION,
+        dispatch_id: request.dispatch_id.clone(),
+        outcome,
+        expected_local_object_id: request.expected_local_object_id.clone(),
+        observed_remote_object_id: request.observed_remote_object_id.clone(),
+        current_remote_object_id: current_remote,
+        diagnostics: Vec::new(),
+    })
+}
+
+fn git_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::CloneFailed {
+            status: output.status.to_string(),
+            stderr: normalize_git_diagnostic(&output.stderr),
+        }),
+    }
+}
+
+fn push_workflow(context: &NativeServiceContext) -> ServiceResponse {
+    if context.cancellation.is_cancelled() {
+        return json_response(&GitPushResult {
+            version: GIT_PUSH_VERSION,
+            dispatch_id: "cancelled-before-decode".to_string(),
+            outcome: GitPushOutcome::Cancelled,
+            expected_local_object_id: String::new(),
+            observed_remote_object_id: None,
+            final_remote_object_id: None,
+            diagnostics: Vec::new(),
+        });
+    }
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return invalid_request(&error),
+    };
+    let request = match invocation.typed_input::<GitPushRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
+    };
+    match push_git_reference(&invocation.workspace_root, &request) {
+        Ok(result) => json_response(&result),
+        Err(error) => ServiceResponse::error("push_failed", error.to_string()),
+    }
+}
+
+fn push_git_reference(
+    workspace_root: &Path,
+    request: &GitPushRequest,
+) -> Result<GitPushResult, GitError> {
+    if request.version != GIT_PUSH_VERSION {
+        return Err(GitError::InvalidRequest(format!(
+            "unsupported push version {}; expected {GIT_PUSH_VERSION}",
+            request.version
+        )));
+    }
+    validate_remote_name(&request.remote)?;
+    validate_remote_reference(&request.reference)?;
+    validate_object_id(&request.expected_local_object_id)?;
+    if let Some(observed) = &request.observed_remote_object_id {
+        validate_object_id(observed)?;
+    }
+    if request.dispatch_id.is_empty() || request.dispatch_id.len() > 256 {
+        return Err(GitError::InvalidRequest(
+            "push dispatch identity must contain 1..=256 bytes".to_string(),
+        ));
+    }
+    let repository_root = PathBuf::from(git_stdout(
+        workspace_root,
+        ["rev-parse", "--show-toplevel"],
+    )?)
+    .canonicalize()?;
+    let actual_local = git_stdout(&repository_root, ["rev-parse", &request.reference])?;
+    if actual_local != request.expected_local_object_id {
+        return Err(GitError::InvalidRequest(
+            "push local ref no longer matches the expected object identity".to_string(),
+        ));
+    }
+    let git_common_dir = PathBuf::from(git_stdout(
+        &repository_root,
+        ["rev-parse", "--git-common-dir"],
+    )?);
+    let git_common_dir = if git_common_dir.is_absolute() {
+        git_common_dir
+    } else {
+        repository_root.join(git_common_dir)
+    }
+    .canonicalize()?;
+    let actual_repository_identity = sha256_hex(git_common_dir.as_os_str().as_encoded_bytes());
+    if actual_repository_identity != request.expected_repository_identity_sha256 {
+        return Err(GitError::InvalidRequest(
+            "push repository identity no longer matches".to_string(),
+        ));
+    }
+    let before = observe_exact_remote_ref(&repository_root, &request.remote, &request.reference)?;
+    if before != request.observed_remote_object_id {
+        return Ok(GitPushResult {
+            version: GIT_PUSH_VERSION,
+            dispatch_id: request.dispatch_id.clone(),
+            outcome: GitPushOutcome::RemoteAdvanced,
+            expected_local_object_id: request.expected_local_object_id.clone(),
+            observed_remote_object_id: request.observed_remote_object_id.clone(),
+            final_remote_object_id: before,
+            diagnostics: Vec::new(),
+        });
+    }
+    let refspec = format!("{}:{}", request.expected_local_object_id, request.reference);
+    let output = Command::new("git")
+        .current_dir(&repository_root)
+        .args(["push", "--porcelain", &request.remote, &refspec])
+        .output()?;
+    let final_remote =
+        observe_exact_remote_ref(&repository_root, &request.remote, &request.reference)?;
+    let outcome = if final_remote.as_deref() == Some(request.expected_local_object_id.as_str()) {
+        GitPushOutcome::Pushed
+    } else if !output.status.success() && final_remote != request.observed_remote_object_id {
+        GitPushOutcome::RemoteAdvanced
+    } else if !output.status.success() && final_remote == request.observed_remote_object_id {
+        GitPushOutcome::Rejected
+    } else {
+        GitPushOutcome::RepairRequired
+    };
+    Ok(GitPushResult {
+        version: GIT_PUSH_VERSION,
+        dispatch_id: request.dispatch_id.clone(),
+        outcome,
+        expected_local_object_id: request.expected_local_object_id.clone(),
+        observed_remote_object_id: request.observed_remote_object_id.clone(),
+        final_remote_object_id: final_remote,
+        diagnostics: if output.status.success() {
+            Vec::new()
+        } else {
+            vec![normalize_git_diagnostic(&output.stderr)]
+        },
+    })
+}
+
+fn observe_exact_remote_ref(
+    repository_root: &Path,
+    remote: &str,
+    reference: &str,
+) -> Result<Option<String>, GitError> {
+    let output = Command::new("git")
+        .current_dir(repository_root)
+        .args(["ls-remote", "--refs", remote, reference])
+        .output()?;
+    if !output.status.success() {
+        return Err(GitError::CloneFailed {
+            status: format!("ls-remote: {}", output.status),
+            stderr: normalize_git_diagnostic(&output.stderr),
+        });
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let matches = text
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, found)| *found == reference)
+        .map(|(object_id, _)| object_id.to_string())
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        return Err(GitError::InvalidRequest(
+            "remote returned ambiguous exact-ref matches".to_string(),
+        ));
+    }
+    let object_id = matches.into_iter().next();
+    if let Some(value) = &object_id {
+        validate_object_id(value)?;
+    }
+    Ok(object_id)
+}
+
+fn remote_observation_workflow(context: &NativeServiceContext) -> ServiceResponse {
+    if context.cancellation.is_cancelled() {
+        return ServiceResponse::error("cancelled", "Git remote observation cancelled");
+    }
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return invalid_request(&error),
+    };
+    let request = match invocation.typed_input::<GitRemoteObservationRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
+    };
+    match observe_git_remote(&invocation.workspace_root, &request) {
+        Ok(observation) => json_response(&observation),
+        Err(error) => ServiceResponse::error("remote_observation_failed", error.to_string()),
+    }
+}
+
+fn observe_git_remote(
+    workspace_root: &Path,
+    request: &GitRemoteObservationRequest,
+) -> Result<GitRemoteObservation, GitError> {
+    if request.version != GIT_REMOTE_OBSERVATION_VERSION {
+        return Err(GitError::InvalidRequest(format!(
+            "unsupported remote observation version {}; expected {GIT_REMOTE_OBSERVATION_VERSION}",
+            request.version
+        )));
+    }
+    validate_remote_name(&request.remote)?;
+    validate_remote_reference(&request.reference)?;
+    let repository_root = PathBuf::from(git_stdout(
+        workspace_root,
+        ["rev-parse", "--show-toplevel"],
+    )?);
+    let repository_root = repository_root.canonicalize()?;
+    let git_common_dir = PathBuf::from(git_stdout(
+        &repository_root,
+        ["rev-parse", "--git-common-dir"],
+    )?);
+    let git_common_dir = if git_common_dir.is_absolute() {
+        git_common_dir
+    } else {
+        repository_root.join(git_common_dir)
+    }
+    .canonicalize()?;
+    let repository_identity_sha256 = sha256_hex(git_common_dir.as_os_str().as_encoded_bytes());
+    let local_object_id = git_optional_stdout(
+        &repository_root,
+        ["rev-parse", "--verify", &request.reference],
+    )?;
+    if let Some(local) = &local_object_id {
+        validate_object_id(local)?;
+    }
+    let remote_output = Command::new("git")
+        .current_dir(&repository_root)
+        .args(["ls-remote", "--refs", &request.remote, &request.reference])
+        .output()?;
+    if !remote_output.status.success() {
+        return Err(GitError::CloneFailed {
+            status: format!("ls-remote: {}", remote_output.status),
+            stderr: normalize_git_diagnostic(&remote_output.stderr),
+        });
+    }
+    let remote_text = String::from_utf8_lossy(&remote_output.stdout);
+    let matches = remote_text
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, reference)| *reference == request.reference)
+        .map(|(object_id, _)| object_id.to_string())
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        return Err(GitError::InvalidRequest(
+            "remote observation returned ambiguous exact-ref matches".to_string(),
+        ));
+    }
+    let observed_remote_object_id = matches.into_iter().next();
+    if let Some(remote) = &observed_remote_object_id {
+        validate_object_id(remote)?;
+    }
+    let (relationship, merge_base_object_id) = match (
+        local_object_id.as_deref(),
+        observed_remote_object_id.as_deref(),
+    ) {
+        (None | Some(_), None) => (GitRemoteRelationship::MissingRemote, None),
+        (None, Some(_)) => (GitRemoteRelationship::UnbornLocal, None),
+        (Some(local), Some(remote)) if local == remote => {
+            (GitRemoteRelationship::UpToDate, Some(local.to_string()))
+        }
+        (Some(local), Some(remote)) => {
+            let merge_base = git_optional_stdout(&repository_root, ["merge-base", local, remote])?;
+            match merge_base.as_deref() {
+                Some(base) if base == remote => (GitRemoteRelationship::LocalAhead, merge_base),
+                Some(base) if base == local => (GitRemoteRelationship::RemoteAhead, merge_base),
+                _ => (GitRemoteRelationship::Diverged, merge_base),
+            }
+        }
+    };
+    Ok(GitRemoteObservation {
+        version: GIT_REMOTE_OBSERVATION_VERSION,
+        repository_identity_sha256,
+        remote: request.remote.clone(),
+        reference: request.reference.clone(),
+        local_object_id,
+        observed_remote_object_id,
+        merge_base_object_id,
+        relationship,
+        diagnostics: Vec::new(),
+    })
+}
+
+fn validate_remote_name(remote: &str) -> Result<(), GitError> {
+    if remote.is_empty()
+        || remote.len() > 256
+        || remote.starts_with('-')
+        || !remote
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(GitError::InvalidRequest(
+            "remote must be a bounded safe configured remote name".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_reference(reference: &str) -> Result<(), GitError> {
+    if reference.len() < 6
+        || reference.len() > 1024
+        || !reference.starts_with("refs/")
+        || reference.contains("..")
+        || reference.contains("@{")
+        || reference.ends_with('/')
+        || reference.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || byte.is_ascii_whitespace()
+                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+    {
+        return Err(GitError::InvalidRequest(
+            "reference must be one exact safe fully-qualified ref".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn git_optional_stdout<const N: usize>(
+    repo: &Path,
+    args: [&str; N],
+) -> Result<Option<String>, GitError> {
+    let output = Command::new("git").current_dir(repo).args(args).output()?;
+    if output.status.success() {
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    } else if output.status.code() == Some(1) {
+        Ok(None)
+    } else {
+        Err(GitError::CloneFailed {
+            status: output.status.to_string(),
+            stderr: normalize_git_diagnostic(&output.stderr),
+        })
+    }
+}
+
+fn normalize_git_diagnostic(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr);
+    let first_line = message.lines().next().unwrap_or("Git operation failed");
+    first_line.chars().take(512).collect()
 }
 
 fn repository_snapshot_workflow(context: &NativeServiceContext) -> ServiceResponse {
@@ -1906,6 +2458,15 @@ bcode_plugin_sdk::export_plugin!(GitPlugin, include_str!("../bcode-plugin.toml")
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_observation_validates_exact_remote_and_ref_facts() {
+        assert!(validate_remote_name("origin").is_ok());
+        assert!(validate_remote_name("https://example.com/repo").is_err());
+        assert!(validate_remote_reference("refs/heads/main").is_ok());
+        assert!(validate_remote_reference("main").is_err());
+        assert!(validate_remote_reference("refs/heads/../main").is_err());
+    }
 
     fn init_repository() -> tempfile::TempDir {
         let directory = tempfile::tempdir().expect("repo");

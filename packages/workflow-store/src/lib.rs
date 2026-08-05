@@ -8,9 +8,10 @@ use bcode_workflow::{
     WORKFLOW_COMPILATION_PREVIEW_VERSION, WorkflowAuthoringDocument, WorkflowAuthoringListCursor,
     WorkflowBlockDefinition, WorkflowCompilationPreview, WorkflowDefinition,
     WorkflowDefinitionIdentity, WorkflowNodeDataflowPolicy, WorkflowPackageApplyRequest,
-    WorkflowPackageMutationMemberResult, WorkflowPackageMutationOutcome,
-    WorkflowPackageMutationResult, WorkflowProducerProvenance, WorkflowRevisionListCursor,
-    WorkflowRunLimitPolicy, prepare_workflow_node_dataflow, validate_persistable_authoring_value,
+    WorkflowPackageLock, WorkflowPackageMutationMemberResult, WorkflowPackageMutationOutcome,
+    WorkflowPackageMutationResult, WorkflowPackagePublishRequest, WorkflowProducerProvenance,
+    WorkflowRevisionListCursor, WorkflowRunLimitPolicy, prepare_workflow_node_dataflow,
+    validate_persistable_authoring_value,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -1743,6 +1744,199 @@ impl WorkflowStore {
             outcome: WorkflowPackageMutationOutcome::Applied,
             members: results,
             lock: Some(request.plan.lock.clone()),
+            diagnostics: Vec::new(),
+        };
+        result
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        Ok(result)
+    }
+
+    /// Atomically publish every exact package draft generation without activating members.
+    ///
+    /// All lock, draft, compiled-definition, and generation facts are checked inside one database
+    /// transaction. Any mismatch or persistence failure rolls back every member publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed package facts, missing/stale drafts, lock drift, archived
+    /// workflows, invalid documents, unsupported compilation, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn publish_workflow_package(
+        &mut self,
+        request: &WorkflowPackagePublishRequest,
+        published_at_ms: u64,
+    ) -> Result<WorkflowPackageMutationResult, WorkflowStoreError> {
+        request
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let expected = request
+            .expected_generations
+            .iter()
+            .map(|fact| (fact.member_id.as_str(), fact.expected_generation))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let locked = request
+            .expected_lock
+            .members
+            .iter()
+            .map(|member| (member.member_id.as_str(), member))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let transaction = self.connection.transaction()?;
+        let mut results = Vec::with_capacity(locked.len());
+        let mut published_lock_members = Vec::with_capacity(locked.len());
+        for (member_id, lock) in locked {
+            let expected_generation = expected[member_id];
+            let draft = transaction
+                .query_row(
+                    "SELECT workflow_id, draft_id, base_revision, generation, checksum_sha256, document_json, producer_json, created_at_ms, updated_at_ms \
+                     FROM workflow_drafts WHERE workflow_id = ?1 AND draft_id = 'package'",
+                    [&lock.definition_identity.kind],
+                    decode_workflow_draft,
+                )
+                .optional()?
+                .map(validate_stored_workflow_draft)
+                .transpose()?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(format!(
+                        "package member draft is missing: {member_id}"
+                    ))
+                })?;
+            if draft.generation != expected_generation {
+                return Err(WorkflowStoreError::AuthoringConflict {
+                    entity_id: member_id.to_string(),
+                    expected: expected_generation,
+                    current: draft.generation,
+                });
+            }
+            let source_digest = draft
+                .document
+                .source_digest_sha256()
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            let executable_digest = draft
+                .document
+                .executable_source_digest_sha256()
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            let identity = WorkflowDefinitionIdentity::for_definition(
+                draft.workflow_id.clone(),
+                &draft.document.definition,
+            )
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            if source_digest != lock.source_digest_sha256
+                || executable_digest != lock.executable_digest_sha256
+                || identity != lock.definition_identity
+            {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "package lock drift for member '{member_id}'"
+                )));
+            }
+            let workflow = transaction
+                .query_row(
+                    "SELECT workflow_id, title, description, archived, active_revision, created_at_ms, updated_at_ms \
+                     FROM authored_workflows WHERE workflow_id = ?1",
+                    [&draft.workflow_id],
+                    decode_authored_workflow,
+                )
+                .optional()?
+                .map(validate_stored_authored_workflow)
+                .transpose()?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(format!(
+                        "authored workflow not found: {}",
+                        draft.workflow_id
+                    ))
+                })?;
+            if workflow.archived {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "archived package member cannot publish: {member_id}"
+                )));
+            }
+            let revision = transaction.query_row(
+                "SELECT COALESCE(MAX(revision), 0) + 1 FROM workflow_revisions WHERE workflow_id = ?1",
+                [&draft.workflow_id],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let definition_json = bounded_json("compiled definition", &draft.document.definition)?;
+            let stored_definition = StoredWorkflowDefinition {
+                definition_id: identity.definition_id.clone(),
+                version: identity.definition_version,
+                checksum_sha256: sha256_hex(definition_json.as_bytes()),
+                definition_json,
+            };
+            persist_definition_transaction(&transaction, &stored_definition)?;
+            transaction.execute(
+                "INSERT INTO workflow_revisions \
+                 (workflow_id, revision, source_checksum_sha256, executable_source_checksum_sha256, definition_id, definition_version, document_json, producer_json, published_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    draft.workflow_id,
+                    revision,
+                    draft.checksum_sha256,
+                    executable_digest,
+                    stored_definition.definition_id,
+                    stored_definition.version,
+                    bounded_json("published document", &draft.document)?,
+                    bounded_json("published producer", &draft.producer)?,
+                    published_at_ms
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE authored_workflows SET updated_at_ms = ?2 WHERE workflow_id = ?1",
+                (&draft.workflow_id, published_at_ms),
+            )?;
+            transaction.execute(
+                "INSERT INTO workflow_authoring_events \
+                 (workflow_id, event_type, payload_json, created_at_ms) VALUES (?1, 'revision_published', ?2, ?3)",
+                (
+                    &draft.workflow_id,
+                    bounded_json(
+                        "package publication event",
+                        &serde_json::json!({
+                            "revision": revision,
+                            "definition_id": identity.definition_id,
+                            "definition_version": identity.definition_version,
+                            "activated": false,
+                            "package_id": request.package_id,
+                            "member_id": member_id,
+                        }),
+                    )?,
+                    published_at_ms,
+                ),
+            )?;
+            transaction.execute(
+                "DELETE FROM workflow_drafts WHERE workflow_id = ?1 AND draft_id = 'package' AND generation = ?2",
+                (&draft.workflow_id, expected_generation),
+            )?;
+            let revision_identity = bcode_workflow::WorkflowRevisionIdentity {
+                workflow_id: draft.workflow_id.clone(),
+                revision,
+            };
+            results.push(WorkflowPackageMutationMemberResult {
+                member_id: member_id.to_string(),
+                generation: expected_generation,
+                revision: Some(revision_identity.clone()),
+                definition_identity: lock.definition_identity.clone(),
+            });
+            let mut published = lock.clone();
+            published.published_revision = Some(revision_identity);
+            published_lock_members.push(published);
+        }
+        results.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+        published_lock_members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+        transaction.commit()?;
+        let result = WorkflowPackageMutationResult {
+            version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+            package_id: request.package_id.clone(),
+            outcome: WorkflowPackageMutationOutcome::Published,
+            members: results,
+            lock: Some(WorkflowPackageLock {
+                version: request.expected_lock.version,
+                package_id: request.expected_lock.package_id.clone(),
+                package_source_digest_sha256: request
+                    .expected_lock
+                    .package_source_digest_sha256
+                    .clone(),
+                members: published_lock_members,
+            }),
             diagnostics: Vec::new(),
         };
         result
@@ -11414,17 +11608,24 @@ mod tests {
                 &document.definition,
             )
             .expect("identity");
+            let source_map = bcode_workflow::WorkflowSourceMap {
+                version: bcode_workflow::WORKFLOW_SOURCE_MAP_VERSION,
+                entries: Vec::new(),
+            };
             bcode_workflow::WorkflowPackagePlannedMember {
                 member_id: member_id.to_string(),
+                member_source_map: bcode_workflow::WorkflowPackageMemberSourceMap {
+                    version: bcode_workflow::WORKFLOW_PACKAGE_MEMBER_SOURCE_MAP_VERSION,
+                    member_id: member_id.to_string(),
+                    source_name: format!("{member_id}.json"),
+                    source_map: source_map.clone(),
+                },
                 lowering: bcode_workflow::WorkflowSourceLoweringResult {
                     version: bcode_workflow::WORKFLOW_SOURCE_LOWERING_VERSION,
                     profile: bcode_workflow::WorkflowSourceProfile::Canonical,
                     validation: document.validation_report(),
                     document,
-                    source_map: bcode_workflow::WorkflowSourceMap {
-                        version: bcode_workflow::WORKFLOW_SOURCE_MAP_VERSION,
-                        entries: Vec::new(),
-                    },
+                    source_map,
                 },
                 definition_identity: identity,
                 dependency_closure: Vec::new(),
@@ -11492,6 +11693,87 @@ mod tests {
             1
         );
         assert!(catalog.version > 0);
+    }
+
+    #[test]
+    fn package_publish_is_atomic_and_generates_authoritative_lock() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let (workflow, mut draft, _) = authored_store_fixture();
+        draft.draft_id = "package".to_string();
+        let identity = WorkflowDefinitionIdentity::for_definition(
+            draft.document.workflow_id.clone(),
+            &draft.document.definition,
+        )
+        .expect("identity");
+        let source_digest = draft
+            .document
+            .source_digest_sha256()
+            .expect("source digest");
+        let executable_digest = draft
+            .document
+            .executable_source_digest_sha256()
+            .expect("executable digest");
+        store.create_authored_workflow(&workflow).expect("workflow");
+        store.create_workflow_draft(&draft).expect("draft");
+        let lock = WorkflowPackageLock {
+            version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
+            package_id: "example/package".to_string(),
+            package_source_digest_sha256: "a".repeat(64),
+            members: vec![bcode_workflow::WorkflowPackageLockedMember {
+                member_id: "main".to_string(),
+                source_digest_sha256: source_digest,
+                executable_digest_sha256: executable_digest,
+                definition_identity: identity.clone(),
+                published_revision: None,
+                dependency_closure: Vec::new(),
+            }],
+        };
+        let request = WorkflowPackagePublishRequest {
+            version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+            package_id: lock.package_id.clone(),
+            expected_lock: lock,
+            expected_generations: vec![bcode_workflow::WorkflowPackageExpectedGeneration {
+                member_id: "main".to_string(),
+                expected_generation: 1,
+            }],
+        };
+        let published = store
+            .publish_workflow_package(&request, 20)
+            .expect("publish package");
+        assert_eq!(published.outcome, WorkflowPackageMutationOutcome::Published);
+        assert_eq!(published.members.len(), 1);
+        assert_eq!(
+            published.members[0]
+                .revision
+                .as_ref()
+                .expect("revision")
+                .revision,
+            1
+        );
+        assert!(
+            published.lock.as_ref().expect("lock").members[0]
+                .published_revision
+                .is_some()
+        );
+        assert!(
+            store
+                .workflow_draft(&workflow.workflow_id, "package")
+                .expect("draft read")
+                .is_none()
+        );
+
+        let mut stale = request;
+        stale.expected_generations[0].expected_generation = 2;
+        assert!(store.publish_workflow_package(&stale, 21).is_err());
+        assert_eq!(
+            store
+                .workflow_revision(&workflow.workflow_id, 1)
+                .expect("revision read")
+                .expect("revision")
+                .definition_identity,
+            identity
+        );
     }
 
     #[allow(clippy::too_many_lines)]

@@ -34,7 +34,7 @@ use bcode_session_models::{
 use bcode_worktree_models::WorktreeCreateRequest;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -370,6 +370,12 @@ fn handle_theme_command(command: ThemeCommand) -> Result<(), CliError> {
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     match *command {
+        WorkflowCommand::Author { command } => {
+            handle_workflow_author_command(&client, command).await?;
+        }
+        WorkflowCommand::Package { command } => {
+            handle_workflow_package_command(&client, command).await?;
+        }
         WorkflowCommand::CancelComputation { operation_id } => {
             print_json(&client.cancel_workflow_computation(operation_id).await?)?;
         }
@@ -417,9 +423,6 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
                     })
                     .await?,
             )?;
-        }
-        WorkflowCommand::Author { command } => {
-            handle_workflow_author_command(&client, command).await?;
         }
     }
     Ok(())
@@ -972,6 +975,284 @@ async fn handle_workflow_preset_command(
         )?,
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliWorkflowPackageManifest {
+    version: u32,
+    package_id: String,
+    exports: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    external_dependencies: std::collections::BTreeMap<String, bcode_workflow::WorkflowCallTarget>,
+    members: Vec<CliWorkflowPackageMember>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliWorkflowPackageMember {
+    member_id: String,
+    source_name: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+async fn handle_workflow_package_command(
+    client: &BcodeClient,
+    command: WorkflowPackageCommand,
+) -> Result<(), CliError> {
+    if let WorkflowPackageCommand::Publish {
+        lock,
+        expected_generations,
+    } = command
+    {
+        let expected_lock: bcode_workflow::WorkflowPackageLock =
+            serde_json::from_value(read_bounded_json(&lock)?)?;
+        let request = bcode_workflow::WorkflowPackagePublishRequest {
+            version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+            package_id: expected_lock.package_id.clone(),
+            expected_lock,
+            expected_generations: parse_package_expected_generations(&expected_generations)?,
+        };
+        request
+            .validate()
+            .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+        print_json(
+            &client
+                .publish_workflow_package(bcode_ipc::PublishWorkflowPackageRequest {
+                    request,
+                    published_at_ms: current_unix_time_ms()?,
+                })
+                .await?,
+        )?;
+        return Ok(());
+    }
+    let (manifest_path, operation_id, timeout_ms, operation) = match command {
+        WorkflowPackageCommand::Validate {
+            manifest,
+            operation_id,
+            timeout_ms,
+        } => (
+            manifest,
+            operation_id,
+            timeout_ms,
+            PackageCliOperation::Validate,
+        ),
+        WorkflowPackageCommand::Preview {
+            manifest,
+            operation_id,
+            timeout_ms,
+        } => (
+            manifest,
+            operation_id,
+            timeout_ms,
+            PackageCliOperation::Preview,
+        ),
+        WorkflowPackageCommand::Apply {
+            manifest,
+            expected_generations,
+            operation_id,
+            timeout_ms,
+        } => (
+            manifest,
+            operation_id,
+            timeout_ms,
+            PackageCliOperation::Apply(parse_package_expected_generations(&expected_generations)?),
+        ),
+        WorkflowPackageCommand::Publish { .. } => unreachable!("handled above"),
+    };
+    let manifest = read_workflow_package_manifest(&manifest_path)?;
+    let result = client
+        .validate_workflow_package(bcode_ipc::WorkflowPackageComputationRequest {
+            manifest,
+            control: workflow_computation_control(operation_id.clone(), timeout_ms),
+        })
+        .await?;
+    match operation {
+        PackageCliOperation::Validate => print_json(&result)?,
+        PackageCliOperation::Preview => {
+            print_json(
+                &client
+                    .preview_workflow_package(bcode_ipc::WorkflowPackagePreviewRequest {
+                        plan: result.plan,
+                        configurations: std::collections::BTreeMap::new(),
+                        control: workflow_computation_control(operation_id, timeout_ms),
+                    })
+                    .await?,
+            )?;
+        }
+        PackageCliOperation::Apply(expected_generations) => {
+            print_json(
+                &client
+                    .apply_workflow_package(bcode_ipc::ApplyWorkflowPackageRequest {
+                        request: bcode_workflow::WorkflowPackageApplyRequest {
+                            version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+                            plan: result.plan,
+                            expected_generations,
+                        },
+                        applied_at_ms: current_unix_time_ms()?,
+                    })
+                    .await?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum PackageCliOperation {
+    Validate,
+    Preview,
+    Apply(Vec<bcode_workflow::WorkflowPackageExpectedGeneration>),
+}
+
+fn current_unix_time_ms() -> Result<u64, CliError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            CliError::InvalidArguments(format!("system clock precedes Unix epoch: {error}"))
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| CliError::InvalidArguments("current timestamp exceeds u64".to_string()))
+}
+
+fn parse_package_expected_generations(
+    facts: &[String],
+) -> Result<Vec<bcode_workflow::WorkflowPackageExpectedGeneration>, CliError> {
+    let mut parsed = facts
+        .iter()
+        .map(|fact| {
+            let (member_id, generation) = fact.split_once('=').ok_or_else(|| {
+                CliError::InvalidArguments(format!(
+                    "expected generation '{fact}' must use MEMBER_ID=GENERATION"
+                ))
+            })?;
+            let expected_generation = generation.parse::<u64>().map_err(|error| {
+                CliError::InvalidArguments(format!(
+                    "expected generation '{fact}' is invalid: {error}"
+                ))
+            })?;
+            if member_id.is_empty() || expected_generation == 0 {
+                return Err(CliError::InvalidArguments(format!(
+                    "expected generation '{fact}' requires a member and nonzero generation"
+                )));
+            }
+            Ok(bcode_workflow::WorkflowPackageExpectedGeneration {
+                member_id: member_id.to_string(),
+                expected_generation,
+            })
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    parsed.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+    if parsed
+        .windows(2)
+        .any(|pair| pair[0].member_id == pair[1].member_id)
+    {
+        return Err(CliError::InvalidArguments(
+            "expected generations must be unique by member".to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn read_workflow_package_manifest(
+    path: &Path,
+) -> Result<bcode_workflow::WorkflowPackageManifest, CliError> {
+    if path == Path::new("-") {
+        return Err(CliError::InvalidArguments(
+            "workflow package manifests must be local files so member paths can be confined"
+                .to_string(),
+        ));
+    }
+    let manifest_path = fs::canonicalize(path)?;
+    let package_root = manifest_path.parent().ok_or_else(|| {
+        CliError::InvalidArguments("workflow package manifest has no parent directory".to_string())
+    })?;
+    let manifest_source = fs::read_to_string(&manifest_path)?;
+    if manifest_source.len() > bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES {
+        return Err(CliError::InvalidArguments(
+            "workflow package manifest exceeds the package byte bound".to_string(),
+        ));
+    }
+    let file_name = manifest_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            CliError::InvalidArguments("workflow package manifest name is not UTF-8".to_string())
+        })?;
+    let decoded: CliWorkflowPackageManifest =
+        match bcode_workflow::WorkflowSourceFormat::from_file_name(file_name)
+            .map_err(|error| CliError::InvalidArguments(error.to_string()))?
+        {
+            bcode_workflow::WorkflowSourceFormat::Json => serde_json::from_str(&manifest_source)?,
+            bcode_workflow::WorkflowSourceFormat::Yaml => yaml_serde::from_str(&manifest_source)
+                .map_err(|error| {
+                    CliError::InvalidArguments(format!(
+                        "invalid workflow package YAML manifest: {error}"
+                    ))
+                })?,
+            bcode_workflow::WorkflowSourceFormat::Toml => toml::from_str(&manifest_source)
+                .map_err(|error| {
+                    CliError::InvalidArguments(format!(
+                        "invalid workflow package TOML manifest: {error}"
+                    ))
+                })?,
+        };
+    let mut manifest = bcode_workflow::WorkflowPackageManifest {
+        version: decoded.version,
+        package_id: decoded.package_id,
+        exports: decoded.exports,
+        external_dependencies: decoded.external_dependencies,
+        members: decoded
+            .members
+            .into_iter()
+            .map(|member| bcode_workflow::WorkflowPackageMember {
+                member_id: member.member_id,
+                source_name: member.source_name,
+                format: bcode_workflow::WorkflowSourceFormat::Json,
+                source: String::new(),
+                dependencies: member.dependencies,
+            })
+            .collect(),
+    };
+    let mut total_bytes = 0_usize;
+    for member in &mut manifest.members {
+        let relative = Path::new(&member.source_name);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(CliError::InvalidArguments(format!(
+                "workflow package member path '{}' is not confined",
+                member.source_name
+            )));
+        }
+        let member_path = fs::canonicalize(package_root.join(relative))?;
+        if !member_path.starts_with(package_root) || !member_path.is_file() {
+            return Err(CliError::InvalidArguments(format!(
+                "workflow package member '{}' escapes the package root or is not a file",
+                member.source_name
+            )));
+        }
+        let source = fs::read_to_string(&member_path)?;
+        total_bytes = total_bytes.checked_add(source.len()).ok_or_else(|| {
+            CliError::InvalidArguments("workflow package byte count overflow".to_string())
+        })?;
+        if total_bytes > bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES {
+            return Err(CliError::InvalidArguments(
+                "workflow package sources exceed the package byte bound".to_string(),
+            ));
+        }
+        member.format = bcode_workflow::WorkflowSourceFormat::from_file_name(&member.source_name)
+            .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+        member.source = source;
+    }
+    manifest
+        .validate()
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    Ok(manifest)
 }
 
 struct WorkflowSourceFile {
@@ -1787,6 +2068,11 @@ enum WorkflowCommand {
         #[command(subcommand)]
         command: Box<WorkflowAuthorCommand>,
     },
+    /// Source-controlled workflow package operations.
+    Package {
+        #[command(subcommand)]
+        command: WorkflowPackageCommand,
+    },
     /// Start one immutable authored-workflow revision.
     Start {
         #[command(subcommand)]
@@ -1804,6 +2090,48 @@ enum WorkflowCommand {
     CancelComputation {
         #[arg(long)]
         operation_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowPackageCommand {
+    /// Validate and deterministically plan a bounded package manifest.
+    Validate {
+        #[arg(value_name = "MANIFEST")]
+        manifest: PathBuf,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+    /// Validate, plan, and compile-preview every package member without mutation.
+    Preview {
+        #[arg(value_name = "MANIFEST")]
+        manifest: PathBuf,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+    /// Validate, plan, and atomically apply all package members as canonical package drafts.
+    Apply {
+        #[arg(value_name = "MANIFEST")]
+        manifest: PathBuf,
+        /// Exact `MEMBER_ID=GENERATION` facts for every existing member; omitted members are create-only.
+        #[arg(long = "expected-generation", value_name = "MEMBER_ID=GENERATION")]
+        expected_generations: Vec<String>,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+    /// Atomically publish exact package draft generations from an applied lock candidate.
+    Publish {
+        #[arg(long, value_name = "LOCK_JSON")]
+        lock: PathBuf,
+        /// One exact `MEMBER_ID=GENERATION` fact for every locked member.
+        #[arg(long = "expected-generation", value_name = "MEMBER_ID=GENERATION")]
+        expected_generations: Vec<String>,
     },
 }
 
@@ -13148,6 +13476,53 @@ mod workflow_source_tests {
         assert!(loaded.source.contains("run: printf 'first\\n'"));
         assert!(!loaded.source.contains("fixtures/workflows"));
         assert!(read_workflow_source_file(&yaml, Some("xml")).is_err());
+    }
+
+    #[test]
+    fn primary_cli_confines_and_loads_package_member_sources() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let member = temp.path().join("member.workflow.yaml");
+        std::fs::write(
+            &member,
+            "workflow_source_version: 2\nworkflow_id: example/member\ntitle: Member\nsteps:\n  - id: input\n    input:\n      schema:\n        type_name: value/v1\n        schema:\n          type: string\n",
+        )
+        .expect("member");
+        let manifest = temp.path().join("workflow-package.yaml");
+        std::fs::write(
+            &manifest,
+            "version: 1\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n",
+        )
+        .expect("manifest");
+        let loaded = read_workflow_package_manifest(&manifest).expect("package");
+        assert_eq!(loaded.members.len(), 1);
+        assert_eq!(loaded.members[0].source_name, "member.workflow.yaml");
+        assert_eq!(
+            loaded.members[0].format,
+            bcode_workflow::WorkflowSourceFormat::Yaml
+        );
+        assert!(loaded.members[0].source.contains("workflow_source_version"));
+
+        std::fs::write(
+            &manifest,
+            "version: 1\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: ../outside.yaml\n",
+        )
+        .expect("escaping manifest");
+        assert!(read_workflow_package_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn primary_cli_parses_exact_package_generations() {
+        let facts =
+            parse_package_expected_generations(&["parent=4".to_string(), "child=2".to_string()])
+                .expect("generation facts");
+        assert_eq!(facts[0].member_id, "child");
+        assert_eq!(facts[0].expected_generation, 2);
+        assert_eq!(facts[1].member_id, "parent");
+        assert!(parse_package_expected_generations(&["child=0".to_string()]).is_err());
+        assert!(
+            parse_package_expected_generations(&["child=1".to_string(), "child=2".to_string(),])
+                .is_err()
+        );
     }
 
     #[test]

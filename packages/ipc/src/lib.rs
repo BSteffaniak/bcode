@@ -479,6 +479,8 @@ pub enum Request {
     WorkflowAuthoringCatalog,
     /// Atomically apply one previously validated package plan as canonical package drafts.
     ApplyWorkflowPackage(ApplyWorkflowPackageRequest),
+    /// Atomically publish every exact package draft generation.
+    PublishWorkflowPackage(PublishWorkflowPackageRequest),
     /// Validate and plan one bounded workflow package through the daemon-owned catalog.
     ValidateWorkflowPackage(WorkflowPackageComputationRequest),
     /// Compile-preview one complete package plan through the daemon-owned catalog.
@@ -1537,6 +1539,14 @@ pub struct ApplyWorkflowPackageRequest {
     pub applied_at_ms: u64,
 }
 
+/// Atomic package publication request through the daemon-owned workflow store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishWorkflowPackageRequest {
+    pub request: bcode_workflow::WorkflowPackagePublishRequest,
+    pub published_at_ms: u64,
+}
+
 /// One bounded portable package validation/planning request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2545,6 +2555,9 @@ pub enum ResponsePayload {
         catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot,
     },
     WorkflowPackageApplied {
+        result: Box<bcode_workflow::WorkflowPackageMutationResult>,
+    },
+    WorkflowPackagePublished {
         result: Box<bcode_workflow::WorkflowPackageMutationResult>,
     },
     WorkflowPackageValidated {
@@ -4503,6 +4516,26 @@ mod tests {
         assert_eq!(
             decode_request(&encoded).expect("decode package apply"),
             apply
+        );
+
+        let publish = Request::PublishWorkflowPackage(PublishWorkflowPackageRequest {
+            request: bcode_workflow::WorkflowPackagePublishRequest {
+                version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+                package_id: "example/package".to_string(),
+                expected_lock: bcode_workflow::WorkflowPackageLock {
+                    version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
+                    package_id: "example/package".to_string(),
+                    package_source_digest_sha256: "a".repeat(64),
+                    members: Vec::new(),
+                },
+                expected_generations: Vec::new(),
+            },
+            published_at_ms: 11,
+        });
+        let encoded = encode_request(&publish).expect("encode package publish");
+        assert_eq!(
+            decode_request(&encoded).expect("decode package publish"),
+            publish
         );
     }
 

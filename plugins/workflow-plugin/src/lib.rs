@@ -334,6 +334,11 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Validate and compile-preview one authored workflow source",
         ),
         (
+            "workflow.package-check",
+            "Workflow: Check Package",
+            "Validate and compile-preview one bounded workflow package",
+        ),
+        (
             "workflow.author-create",
             "Workflow: Create From Source",
             "Create one durable workflow draft from authored source",
@@ -988,6 +993,35 @@ pub(crate) async fn execute_command(
                 serde_json::to_value(preview).map_err(|error| error.to_string())?,
             );
             "workflow authoring source validated".to_string()
+        }
+        "workflow.package-check" => {
+            let manifest: bcode_workflow::WorkflowPackageManifest =
+                serde_json::from_str(&required_arg(&request, "package_manifest")?)
+                    .map_err(|error| error.to_string())?;
+            let validation = client
+                .validate_workflow_package(bcode_ipc::WorkflowPackageComputationRequest {
+                    manifest,
+                    control: bcode_ipc::WorkflowComputationControl::default(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            let preview = client
+                .preview_workflow_package(bcode_ipc::WorkflowPackagePreviewRequest {
+                    plan: validation.plan.clone(),
+                    configurations: BTreeMap::new(),
+                    control: bcode_ipc::WorkflowComputationControl::default(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "package_validation".to_string(),
+                serde_json::to_value(validation).map_err(|error| error.to_string())?,
+            );
+            options.insert(
+                "package_preview".to_string(),
+                serde_json::to_value(preview).map_err(|error| error.to_string())?,
+            );
+            "workflow package validated".to_string()
         }
         "workflow.author-create" => {
             let source_format: bcode_workflow::WorkflowSourceFormat =

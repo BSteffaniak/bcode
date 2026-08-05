@@ -58,6 +58,184 @@ access   = "read"
 resource = "repository"
 
 [[services.workflow_blocks]]
+block_id               = "git.remote-observe"
+block_version          = 1
+cancellation_supported = true
+effect                 = "network"
+operation              = "git.remote-observe"
+plugin_id              = "bcode.git"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 30000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "remote",
+    "reference",
+], properties = { version = { const = 1 }, remote = { type = "string", minLength = 1, maxLength = 256, pattern = "^[A-Za-z0-9._-]+$" }, reference = { type = "string", minLength = 6, maxLength = 1024, pattern = "^refs/" } } }
+type_name = "bcode.git.remote-observation-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "repository_identity_sha256",
+    "remote",
+    "reference",
+    "relationship",
+    "diagnostics",
+], properties = { version = { const = 1 }, repository_identity_sha256 = { type = "string" }, remote = { type = "string" }, reference = { type = "string" }, local_object_id = { type = [
+    "string",
+    "null",
+] }, observed_remote_object_id = { type = [
+    "string",
+    "null",
+] }, merge_base_object_id = { type = [
+    "string",
+    "null",
+] }, relationship = { type = "string", enum = [
+    "up_to_date",
+    "local_ahead",
+    "remote_ahead",
+    "diverged",
+    "unborn_local",
+    "missing_remote",
+] }, diagnostics = { type = "array", maxItems = 32, items = { type = "string", maxLength = 512 } } } }
+type_name = "bcode.git.remote-observation/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "network"
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "repository"
+
+[[services.workflow_blocks]]
+block_id               = "git.push"
+block_version          = 1
+cancellation_supported = true
+effect                 = "network"
+operation              = "git.push"
+plugin_id              = "bcode.git"
+reconciliation         = "repair_required"
+timeout_ms             = 120000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "remote",
+    "reference",
+    "expected_repository_identity_sha256",
+    "expected_local_object_id",
+    "dispatch_id",
+], properties = { version = { const = 1 }, remote = { type = "string", minLength = 1, maxLength = 256 }, reference = { type = "string", minLength = 6, maxLength = 1024 }, expected_repository_identity_sha256 = { type = "string" }, expected_local_object_id = { type = "string" }, observed_remote_object_id = { type = [
+    "string",
+    "null",
+] }, dispatch_id = { type = "string", minLength = 1, maxLength = 256 } } }
+type_name = "bcode.git.push-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "dispatch_id",
+    "outcome",
+    "expected_local_object_id",
+    "diagnostics",
+], properties = { version = { const = 1 }, dispatch_id = { type = "string" }, outcome = { type = "string", enum = [
+    "pushed",
+    "remote_advanced",
+    "rejected",
+    "cancelled",
+    "failed",
+    "repair_required",
+] }, expected_local_object_id = { type = "string" }, observed_remote_object_id = { type = [
+    "string",
+    "null",
+] }, final_remote_object_id = { type = [
+    "string",
+    "null",
+] }, diagnostics = { type = "array", maxItems = 32, items = { type = "string", maxLength = 512 } } } }
+type_name = "bcode.git.push-result/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[[services.workflow_blocks.resources]]
+access   = "write"
+resource = "network"
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "repository"
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "git-ref"
+
+[[services.workflow_blocks]]
+block_id               = "git.push-status"
+block_version          = 1
+cancellation_supported = true
+effect                 = "network"
+operation              = "git.push-status"
+plugin_id              = "bcode.git"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 30000
+
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "remote",
+    "reference",
+    "expected_repository_identity_sha256",
+    "expected_local_object_id",
+    "dispatch_id",
+], properties = { version = { const = 1 }, remote = { type = "string", minLength = 1, maxLength = 256 }, reference = { type = "string", minLength = 6, maxLength = 1024 }, expected_repository_identity_sha256 = { type = "string" }, expected_local_object_id = { type = "string" }, observed_remote_object_id = { type = [
+    "string",
+    "null",
+] }, dispatch_id = { type = "string", minLength = 1, maxLength = 256 } } }
+type_name = "bcode.git.push-status-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "dispatch_id",
+    "outcome",
+    "expected_local_object_id",
+    "diagnostics",
+], properties = { version = { const = 1 }, dispatch_id = { type = "string" }, outcome = { type = "string", enum = [
+    "accepted",
+    "not_accepted",
+    "remote_advanced",
+    "diverged_or_ambiguous",
+    "unverifiable",
+] }, expected_local_object_id = { type = "string" }, observed_remote_object_id = { type = [
+    "string",
+    "null",
+] }, current_remote_object_id = { type = [
+    "string",
+    "null",
+] }, diagnostics = { type = "array", maxItems = 32, items = { type = "string", maxLength = 512 } } } }
+type_name = "bcode.git.push-status-result/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "network"
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "repository"
+
+[[services.workflow_blocks]]
 block_id               = "git.verification-receipt"
 block_version          = 1
 cancellation_supported = true

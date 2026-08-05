@@ -3934,6 +3934,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::GetWorkflowPreset { .. } => "get_workflow_preset",
         Request::WorkflowAuthoringCatalog => "workflow_authoring_catalog",
         Request::ApplyWorkflowPackage(_) => "apply_workflow_package",
+        Request::PublishWorkflowPackage(_) => "publish_workflow_package",
         Request::ValidateWorkflowPackage(_) => "validate_workflow_package",
         Request::PreviewWorkflowPackage(_) => "preview_workflow_package",
         Request::ValidateWorkflowSource(_) => "validate_workflow_source",
@@ -4763,6 +4764,21 @@ async fn handle_request_inner(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::WorkflowPackageApplied {
+                    result: Box::new(result),
+                }),
+            )
+            .await
+        }
+        Request::PublishWorkflowPackage(request) => {
+            let result = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .publish_workflow_package(&request.request, request.published_at_ms)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPackagePublished {
                     result: Box::new(result),
                 }),
             )

@@ -24,6 +24,9 @@ struct WorkflowCli {
     /// Path to an editable JSON, YAML, or TOML `WorkflowAuthoringDocument` source file.
     #[arg(long)]
     source: Option<PathBuf>,
+    /// Path to a bounded package manifest JSON payload for `package-check`.
+    #[arg(long)]
+    package_manifest: Option<PathBuf>,
     /// Explicit source format (`json`, `yaml`, or `toml`); otherwise inferred from the file name.
     #[arg(long)]
     source_format: Option<String>,
@@ -187,6 +190,20 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             let definition = std::fs::read_to_string(&path)
                 .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
             args.insert("definition".to_string(), definition);
+        }
+        if let Some(path) = cli.package_manifest {
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            if bytes.len() > bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES {
+                return Err("workflow package manifest exceeds the package byte bound".to_string());
+            }
+            let source = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+            let manifest: bcode_workflow::WorkflowPackageManifest =
+                serde_json::from_str(source).map_err(|error| error.to_string())?;
+            manifest.validate().map_err(|error| error.to_string())?;
+            args.insert(
+                "package_manifest".to_string(),
+                serde_json::to_string(&manifest).map_err(|error| error.to_string())?,
+            );
         }
         if let Some(input) = cli.input {
             let key = match cli.action.as_str() {

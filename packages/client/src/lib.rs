@@ -2937,6 +2937,25 @@ impl BcodeClient {
         }
     }
 
+    /// Atomically publish every exact package draft generation through the daemon-owned store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, package facts drift, optimistic
+    /// generations conflict, or the complete transaction cannot commit.
+    pub async fn publish_workflow_package(
+        &self,
+        request: bcode_ipc::PublishWorkflowPackageRequest,
+    ) -> Result<bcode_workflow::WorkflowPackageMutationResult, ClientError> {
+        match self
+            .send_request(Request::PublishWorkflowPackage(request))
+            .await?
+        {
+            ResponsePayload::WorkflowPackagePublished { result } => Ok(*result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Validate and plan one bounded workflow package through the daemon-owned catalog.
     ///
     /// # Errors
