@@ -274,6 +274,39 @@ impl ModelCatalogResolver {
         self.diagnostics.read().await.clone()
     }
 
+    /// Resolve the catalog-known API surface for one model.
+    ///
+    /// This is a bounded single-entry lookup used when a live provider model list cannot confirm
+    /// the selected model, so transport routing does not silently fall back to a provider default.
+    pub async fn model_api_surface(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<bcode_model::ModelApiSurface> {
+        self.catalog
+            .read()
+            .await
+            .model(provider_id, model_id)
+            .and_then(|entry| model_api_surface_from_catalog(entry.api_surface))
+    }
+
+    /// Resolve catalog-known reasoning capabilities for one model.
+    ///
+    /// This is a bounded single-entry lookup used when a live provider model list cannot confirm
+    /// the selected model. It lets callers recover provider-native reasoning semantics, such as an
+    /// adaptive-only thinking control, without depending on discovery having completed.
+    pub async fn model_reasoning(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<bcode_model::ModelReasoningInfo> {
+        self.catalog
+            .read()
+            .await
+            .model(provider_id, model_id)
+            .and_then(reasoning_from_catalog)
+    }
+
     pub async fn resolve_view(
         &self,
         list: bcode_model::ModelList,
@@ -2076,6 +2109,44 @@ status = "stable"
             reasoning.effort_values
         );
         assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn bedrock_global_prefixed_opus_5_resolves_messages_surface_and_adaptive_control() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let discovered = bcode_model::ModelInfo {
+            model_id: "global.anthropic.claude-opus-5".to_string(),
+            display_name: "opus 5".to_string(),
+            is_default: true,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            api_surface: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        };
+        // Mirrors the provider's `EnrichOnly { target: None }` hint, which routes through the
+        // non-target enrichment path used for explicitly configured models.
+        let merged =
+            catalog.merge_provider_models_for_target("bedrock", vec![discovered], false, None);
+        let enriched = merged.first().expect("model should survive enrichment");
+        assert_eq!(
+            enriched.api_surface,
+            Some(bcode_model::ModelApiSurface::Messages),
+            "Opus 5 must route to the Messages adapter, not Converse"
+        );
+        let reasoning = enriched
+            .reasoning
+            .as_ref()
+            .expect("global-prefixed Opus 5 must advertise reasoning");
+        assert_eq!(
+            reasoning.control,
+            Some(bcode_model::ReasoningControl::Adaptive)
+        );
     }
 
     #[test]

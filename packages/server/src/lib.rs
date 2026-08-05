@@ -22551,25 +22551,7 @@ async fn build_model_turn_request(
     )
     .await;
     let parameters_timer = state.metrics.timer();
-    let parameters = {
-        let mut p = ModelParameters::default();
-        if let Some(level) = &selection.thinking_level {
-            p.reasoning_effort = Some(*level);
-        }
-        if let Some(reasoning) = reasoning_capabilities.as_ref() {
-            p.reasoning_control = reasoning.control;
-            if let Some(effort) = supported_reasoning_value(
-                selection.reasoning_effort.as_deref(),
-                &reasoning.effort_values,
-            ) {
-                p.reasoning_effort_value = Some(effort.to_owned());
-            }
-            if let Some(summary) = requested_reasoning_summary(selection, reasoning) {
-                p.reasoning_summary = Some(summary.to_owned());
-            }
-        }
-        p
-    };
+    let parameters = resolve_model_reasoning_parameters(selection, reasoning_capabilities.as_ref());
     state.metrics.record_histogram_with_labels(
         "model.request_build.parameters_duration_ms",
         parameters_timer.elapsed_ms(),
@@ -23046,6 +23028,34 @@ fn requested_reasoning_summary<'a>(
     supported_reasoning_value(requested, &reasoning.summary_values)
 }
 
+/// Resolve the reasoning-bearing model parameters for one turn.
+///
+/// The provider-native control shape is independent of the requested effort value: a model that
+/// only accepts adaptive thinking must advertise that control even when the requested effort is
+/// unsupported or absent, otherwise the provider falls back to a request shape the model rejects.
+fn resolve_model_reasoning_parameters(
+    selection: &SessionModelSelection,
+    reasoning_capabilities: Option<&bcode_model::ModelReasoningInfo>,
+) -> ModelParameters {
+    let mut parameters = ModelParameters::default();
+    if let Some(level) = &selection.thinking_level {
+        parameters.reasoning_effort = Some(*level);
+    }
+    if let Some(reasoning) = reasoning_capabilities {
+        parameters.reasoning_control = reasoning.control;
+        if let Some(effort) = supported_reasoning_value(
+            selection.reasoning_effort.as_deref(),
+            &reasoning.effort_values,
+        ) {
+            parameters.reasoning_effort_value = Some(effort.to_owned());
+        }
+        if let Some(summary) = requested_reasoning_summary(selection, reasoning) {
+            parameters.reasoning_summary = Some(summary.to_owned());
+        }
+    }
+    parameters
+}
+
 fn supported_reasoning_value<'a>(
     requested: Option<&'a str>,
     supported: &[String],
@@ -23132,11 +23142,31 @@ async fn resolve_model_api_surface(
     )
     .await
     .ok()?;
-    models
+    if let Some(api_surface) = models
         .models
-        .into_iter()
+        .iter()
         .find(|model| model.model_id == model_id)
         .and_then(|model| model.api_surface)
+    {
+        return Some(api_surface);
+    }
+    // The live list may not yet contain the selected model while background discovery runs.
+    // Routing must still use the catalog-known transport rather than the provider default.
+    let catalog_provider_id = catalog_provider_id_for_policy(&models.catalog.policy)?;
+    state
+        .model_catalog
+        .model_api_surface(&catalog_provider_id, model_id)
+        .await
+}
+
+/// Return the catalog provider identity a provider's catalog policy maps its models to.
+fn catalog_provider_id_for_policy(policy: &bcode_model::ModelCatalogPolicy) -> Option<String> {
+    match policy {
+        bcode_model::ModelCatalogPolicy::Unmapped => None,
+        bcode_model::ModelCatalogPolicy::EnrichOnly { provider_id, .. }
+        | bcode_model::ModelCatalogPolicy::ExpandSupported { provider_id, .. }
+        | bcode_model::ModelCatalogPolicy::ExpandAll { provider_id } => Some(provider_id.clone()),
+    }
 }
 
 async fn resolve_model_reasoning_info(
@@ -23153,9 +23183,52 @@ async fn resolve_model_reasoning_info(
     )
     .await
     .or_else(|| state.selected_reasoning_capabilities.clone());
+    // A live provider list may not yet contain the selected model, for example while background
+    // discovery is still running. Provider-native reasoning semantics must not be lost in that
+    // window, so fall back to the catalog entry the provider maps this model to.
+    let provider_reasoning = match provider_reasoning {
+        Some(reasoning) => Some(reasoning),
+        None => {
+            catalog_model_reasoning_info(
+                state,
+                provider_plugin_id,
+                selected_model_id,
+                provider_context,
+            )
+            .await
+        }
+    };
     let override_ =
         selected_model_id.and_then(|model_id| model_reasoning_override(provider_context, model_id));
     merge_reasoning_override(provider_reasoning, override_)
+}
+
+/// Resolve catalog-known reasoning capabilities for the selected model.
+///
+/// The catalog provider identity comes from the provider's own catalog policy rather than a
+/// host-side mapping, so providers keep ownership of how their models are catalogued.
+async fn catalog_model_reasoning_info(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+    provider_context: &bcode_model::ProviderRequestContext,
+) -> Option<bcode_model::ModelReasoningInfo> {
+    let model_id = selected_model_id?;
+    let models = provider_models(
+        state,
+        provider_plugin_id.map(ToOwned::to_owned),
+        bcode_model::ModelListRequest {
+            provider_context: provider_context.clone(),
+            selected_model_id: Some(model_id.to_owned()),
+        },
+    )
+    .await
+    .ok()?;
+    let catalog_provider_id = catalog_provider_id_for_policy(&models.catalog.policy)?;
+    state
+        .model_catalog
+        .model_reasoning(&catalog_provider_id, model_id)
+        .await
 }
 
 async fn resolve_model_reasoning_info_from_provider(
@@ -61847,6 +61920,132 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 schema: execution.structured_output.expect("request").schema,
                 strict: true,
             })
+        );
+    }
+
+    #[test]
+    fn adaptive_control_survives_every_requested_effort_value() {
+        // Mirrors Bedrock Claude Opus 5: adaptive-only thinking, advertising a fixed effort set.
+        let reasoning = bcode_model::ModelReasoningInfo {
+            control: Some(bcode_model::ReasoningControl::Adaptive),
+            effort_values: ["low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            default_effort: Some("high".to_owned()),
+            source: bcode_model::ModelReasoningCapabilitySource::KnownModelTable,
+            ..bcode_model::ModelReasoningInfo::default()
+        };
+
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let selection = SessionModelSelection {
+                reasoning_effort: Some(effort.to_owned()),
+                ..SessionModelSelection::default()
+            };
+            let parameters = resolve_model_reasoning_parameters(&selection, Some(&reasoning));
+            assert_eq!(
+                parameters.reasoning_control,
+                Some(bcode_model::ReasoningControl::Adaptive),
+                "effort '{effort}' must preserve the adaptive control shape"
+            );
+            assert_eq!(
+                parameters.reasoning_effort_value.as_deref(),
+                Some(effort),
+                "effort '{effort}' must reach the provider as a native effort name"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_control_survives_unsupported_and_absent_effort_values() {
+        let reasoning = bcode_model::ModelReasoningInfo {
+            control: Some(bcode_model::ReasoningControl::Adaptive),
+            effort_values: vec!["high".to_owned()],
+            source: bcode_model::ModelReasoningCapabilitySource::KnownModelTable,
+            ..bcode_model::ModelReasoningInfo::default()
+        };
+
+        // An effort the model does not advertise must not silently downgrade the control shape to
+        // the budget form, which adaptive-only models reject.
+        let unsupported = SessionModelSelection {
+            reasoning_effort: Some("minimal".to_owned()),
+            ..SessionModelSelection::default()
+        };
+        let parameters = resolve_model_reasoning_parameters(&unsupported, Some(&reasoning));
+        assert_eq!(
+            parameters.reasoning_control,
+            Some(bcode_model::ReasoningControl::Adaptive)
+        );
+        assert_eq!(parameters.reasoning_effort_value, None);
+
+        let absent = SessionModelSelection::default();
+        let parameters = resolve_model_reasoning_parameters(&absent, Some(&reasoning));
+        assert_eq!(
+            parameters.reasoning_control,
+            Some(bcode_model::ReasoningControl::Adaptive)
+        );
+    }
+
+    #[test]
+    fn missing_reasoning_capabilities_leave_control_unset() {
+        let selection = SessionModelSelection {
+            reasoning_effort: Some("low".to_owned()),
+            ..SessionModelSelection::default()
+        };
+        let parameters = resolve_model_reasoning_parameters(&selection, None);
+        assert_eq!(parameters.reasoning_control, None);
+        assert_eq!(parameters.reasoning_effort_value, None);
+    }
+
+    #[tokio::test]
+    async fn adaptive_model_absent_from_provider_list_still_resolves_adaptive_control() {
+        // Bedrock discovery is non-blocking: on a cold cache the provider returns an empty/partial
+        // model list and refreshes in the background. The selected model can therefore be missing
+        // from the live list even though the bundled catalog knows it requires adaptive thinking.
+        // Resolution must not silently fall back to the budget request shape in that window,
+        // because adaptive-only models reject `thinking.type = "enabled"`.
+        let catalog = bcode_model_catalog::ModelCatalogResolver::embedded();
+
+        // `select_model_info` returns `None` when the live provider list does not contain the
+        // selected model, which is what drives provider-sourced capabilities to `None`.
+        assert!(
+            select_model_info(&[], Some("global.anthropic.claude-opus-5")).is_none(),
+            "an empty provider list cannot confirm the selected model"
+        );
+
+        let reasoning = catalog
+            .model_reasoning("bedrock", "global.anthropic.claude-opus-5")
+            .await
+            .expect("catalog must supply Opus 5 reasoning without provider discovery");
+        assert_eq!(
+            reasoning.control,
+            Some(bcode_model::ReasoningControl::Adaptive),
+            "catalog must describe Opus 5 as adaptive-only"
+        );
+
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.bedrock".to_string()),
+            requested_model_id: Some("global.anthropic.claude-opus-5".to_string()),
+            model_id: Some("global.anthropic.claude-opus-5".to_string()),
+            reasoning_effort: Some("low".to_owned()),
+            ..SessionModelSelection::default()
+        };
+        let parameters = resolve_model_reasoning_parameters(&selection, Some(&reasoning));
+        assert_eq!(
+            parameters.reasoning_control,
+            Some(bcode_model::ReasoningControl::Adaptive),
+            "an unconfirmed model must not lose its catalog-known adaptive control shape"
+        );
+        assert_eq!(parameters.reasoning_effort_value.as_deref(), Some("low"));
+
+        // The transport shares the same discovery dependency: Opus 5 must route to the Messages
+        // surface even when the live provider list cannot confirm it.
+        assert_eq!(
+            catalog
+                .model_api_surface("bedrock", "global.anthropic.claude-opus-5")
+                .await,
+            Some(bcode_model::ModelApiSurface::Messages),
+            "an unconfirmed model must not lose its catalog-known transport"
         );
     }
 
