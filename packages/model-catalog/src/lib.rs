@@ -1126,13 +1126,24 @@ const fn reasoning_control_from_catalog(
     }
 }
 
+/// Build normalized reasoning info from the catalog's reasoning table and thinking mode.
+///
+/// A declared `thinking_mode` is sufficient on its own: it determines the provider-native request
+/// shape, so it must survive even when a model omits the optional `[reasoning]` effort table.
+/// Dropping it here would silently downgrade an adaptive-only model to the budget request shape,
+/// which such models reject.
 fn reasoning_from_catalog_parts(
     reasoning: Option<&bcode_model_catalog_models::CatalogReasoning>,
     thinking_mode: Option<bcode_model_catalog_models::CatalogThinkingMode>,
 ) -> Option<ModelReasoningInfo> {
-    let reasoning = reasoning?;
+    let control = reasoning_control_from_catalog(thinking_mode);
+    if reasoning.is_none() && control.is_none() {
+        return None;
+    }
+    let default_reasoning = bcode_model_catalog_models::CatalogReasoning::default();
+    let reasoning = reasoning.unwrap_or(&default_reasoning);
     Some(ModelReasoningInfo {
-        control: reasoning_control_from_catalog(thinking_mode),
+        control,
         effort_values: reasoning.effort_values.iter().cloned().collect(),
         default_effort: reasoning.default_effort.clone(),
         visible_summary_supported: !reasoning.summary_values.is_empty(),
@@ -2065,6 +2076,53 @@ status = "stable"
             reasoning.effort_values
         );
         assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn bedrock_adaptive_models_without_reasoning_table_keep_adaptive_control() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        // These catalog entries declare `thinking_mode = "adaptive"` but intentionally omit the
+        // optional `[reasoning]` effort table. The thinking mode must still survive enrichment,
+        // otherwise the provider falls back to `thinking.type = "enabled"` with a budget, which
+        // these models reject with a ValidationException.
+        for model_id in [
+            "us.anthropic.claude-sonnet-5-20250101-v1:0",
+            "us.anthropic.claude-haiku-5-20250101-v1:0",
+            "us.anthropic.claude-opus-4-7-20250101-v1:0",
+        ] {
+            let discovered = bcode_model::ModelInfo {
+                model_id: model_id.to_string(),
+                display_name: model_id.to_string(),
+                is_default: false,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: std::collections::BTreeSet::new(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
+                reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
+                pricing: None,
+                api_surface: None,
+                visibility: bcode_model::ModelVisibility::Visible,
+            };
+            let reasoning = catalog
+                .enrich_model("bedrock", discovered)
+                .reasoning
+                .unwrap_or_else(|| {
+                    panic!("{model_id} declares an adaptive thinking mode and must advertise it")
+                });
+            assert_eq!(
+                reasoning.control,
+                Some(bcode_model::ReasoningControl::Adaptive),
+                "{model_id} must request adaptive thinking"
+            );
+        }
+    }
+
+    #[test]
+    fn models_without_reasoning_or_thinking_mode_advertise_no_reasoning() {
+        // Absent both signals, reasoning must stay `None` so non-reasoning models are unaffected.
+        assert!(reasoning_from_catalog_parts(None, None).is_none());
     }
 
     #[test]
