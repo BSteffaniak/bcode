@@ -1959,6 +1959,7 @@ status = "stable"
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
 
         for model_id in [
+            "global.anthropic.claude-opus-5",
             "global.anthropic.claude-fable-5",
             "us.anthropic.claude-opus-4-7-20260416-v1:0",
             "us.anthropic.claude-sonnet-5-20260101-v1:0",
@@ -2026,7 +2027,7 @@ status = "stable"
     }
 
     #[test]
-    fn bedrock_opus_5_is_converse_usable_with_adaptive_reasoning() {
+    fn bedrock_opus_5_uses_messages_with_adaptive_reasoning() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let discovered = bcode_model::ModelInfo {
             model_id: "global.anthropic.claude-opus-5".to_string(),
@@ -2045,9 +2046,9 @@ status = "stable"
         };
         let enriched = catalog.enrich_model("bedrock", discovered);
         assert_eq!(
-            enriched.visibility,
-            bcode_model::ModelVisibility::Visible,
-            "Opus 5 is reachable through Converse"
+            enriched.api_surface,
+            Some(bcode_model::ModelApiSurface::Messages),
+            "Opus 5 must route through the Anthropic Messages adapter"
         );
         let reasoning = enriched
             .reasoning

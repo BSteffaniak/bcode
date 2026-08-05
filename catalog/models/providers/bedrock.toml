@@ -117,7 +117,7 @@ bcode_support = "supported"
 family = "claude"
 context_window = 1000000
 max_output_tokens = 128000
-api_surface = "converse"
+api_surface = "messages"
 thinking_mode = "adaptive"
 
 [models."anthropic.claude-opus-5".capabilities]
