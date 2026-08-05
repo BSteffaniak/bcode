@@ -487,21 +487,10 @@ async fn stream_bedrock_messages_turn(
 ) -> Result<StreamOutcome, ProviderError> {
     let mut last_error = None;
     for model_id in &selection.model_ids {
-        let body = build_anthropic_messages_request(request)?;
-        let result = client
-            .invoke_model_with_response_stream()
-            .model_id(model_id)
-            .content_type("application/json")
-            .accept("application/json")
-            .body(Blob::new(body))
-            .send()
-            .await;
-        match result {
-            Ok(response) => {
-                return read_anthropic_messages_stream(response.body, turn, name_map.clone()).await;
-            }
+        match stream_bedrock_messages_model(request, client, model_id, turn, name_map.clone()).await
+        {
+            Ok(outcome) => return Ok(outcome),
             Err(error) => {
-                let error = bedrock_messages_sdk_error(&error);
                 let is_last = selection.model_ids.last().map(String::as_str) == Some(model_id);
                 if selection.explicit || is_last {
                     return Err(error);
@@ -519,6 +508,26 @@ async fn stream_bedrock_messages_turn(
     }))
 }
 
+async fn stream_bedrock_messages_model(
+    request: &ModelTurnRequest,
+    client: &Client,
+    model_id: &str,
+    turn: &TurnState,
+    name_map: BTreeMap<String, String>,
+) -> Result<StreamOutcome, ProviderError> {
+    let body = build_anthropic_messages_request(request)?;
+    let response = client
+        .invoke_model_with_response_stream()
+        .model_id(model_id)
+        .content_type("application/json")
+        .accept("application/json")
+        .body(Blob::new(body))
+        .send()
+        .await
+        .map_err(|error| bedrock_messages_sdk_error(&error))?;
+    read_anthropic_messages_stream(response.body, turn, name_map).await
+}
+
 /// Outcome of a single per-model Converse attempt.
 enum TurnAttempt {
     /// The attempt reached a terminal result (success or a fatal error) for the whole turn.
@@ -529,9 +538,8 @@ enum TurnAttempt {
 
 /// Classify and react to a Converse send error for one model.
 ///
-/// Handles prompt-cache rejection (retry without cache points), streaming-tool incompatibility,
-/// and Messages-API-only models (data-retention `ValidationException`). Incompatible models are
-/// pruned from future discovery. Returns whether the turn is finished or should try another model.
+/// Handles prompt-cache rejection, streaming-tool incompatibility, and rerouting models rejected
+/// by Converse through the Anthropic Messages adapter.
 #[allow(clippy::too_many_arguments)]
 async fn handle_bedrock_turn_error(
     error: ProviderError,
@@ -576,29 +584,14 @@ async fn handle_bedrock_turn_error(
         return TurnAttempt::TryNextModel(error);
     }
     if model_unusable_via_converse(&error) {
-        // These models are served through the Anthropic Messages API surface and are not usable
-        // through Converse. Prune them from future discovery so they stop appearing in the picker.
-        mark_streaming_tool_unsupported(
-            discovery,
-            selection.cache_key.as_ref(),
-            model_id,
-            &error.message,
-        );
-        if !selection.explicit && !is_last {
-            turn.push(ProviderTurnEvent::Warning {
-                message: format!(
-                    "Bedrock model {model_id} is not available through the Converse API; retrying another discovered model"
-                ),
-            });
-            return TurnAttempt::TryNextModel(error);
-        }
-        return TurnAttempt::Completed(Err(provider_error(
-            "bedrock_model_requires_messages_api",
-            ProviderErrorCategory::UnsupportedFeature,
-            format!(
-                "Bedrock model {model_id} is only served through the Anthropic Messages API and cannot be used by the Converse adapter; select a Converse-compatible Claude model"
+        turn.push(ProviderTurnEvent::Warning {
+            message: format!(
+                "Bedrock model {model_id} requires the Anthropic Messages API; retrying through InvokeModelWithResponseStream"
             ),
-        )));
+        });
+        return TurnAttempt::Completed(
+            stream_bedrock_messages_model(request, client, model_id, turn, name_map).await,
+        );
     }
     TurnAttempt::Completed(Err(error))
 }

@@ -22580,7 +22580,7 @@ async fn build_model_turn_request(
     provider_context.api_surface = resolve_model_api_surface(
         state,
         provider_plugin_id,
-        selected_model_id,
+        &model_id,
         &selection.provider_context,
     )
     .await;
@@ -23119,16 +23119,15 @@ async fn resolve_parallel_tool_call_capabilities(
 async fn resolve_model_api_surface(
     state: &ServerState,
     provider_plugin_id: Option<&str>,
-    selected_model_id: Option<&str>,
+    model_id: &str,
     provider_context: &bcode_model::ProviderRequestContext,
 ) -> Option<bcode_model::ModelApiSurface> {
-    let selected_model_id = selected_model_id?;
     let models = resolved_provider_models(
         state,
         provider_plugin_id.map(ToOwned::to_owned),
         bcode_model::ModelListRequest {
             provider_context: provider_context.clone(),
-            selected_model_id: Some(selected_model_id.to_owned()),
+            selected_model_id: Some(model_id.to_owned()),
         },
     )
     .await
@@ -23136,7 +23135,7 @@ async fn resolve_model_api_surface(
     models
         .models
         .into_iter()
-        .find(|model| model.model_id == selected_model_id)
+        .find(|model| model.model_id == model_id)
         .and_then(|model| model.api_surface)
 }
 
