@@ -478,7 +478,9 @@ impl SessionManager {
         session_id: SessionId,
         kind: SessionEventKind,
     ) -> Result<SessionEvent, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
+        // Appends are reached from deep async chains such as IPC request dispatch. Boxing the
+        // session-loading tail keeps this path's stack frame bounded regardless of caller depth.
+        Box::pin(self.ensure_session_loaded(session_id)).await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let event = handle.append_event(kind, activity_timestamp_ms).await?;

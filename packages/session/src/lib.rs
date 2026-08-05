@@ -886,11 +886,16 @@ impl SessionManager {
             )
         };
         if refreshed_summary {
-            self.refresh_summary_session(session_id, store, &handle)
-                .await?;
+            // Session loading sits at the bottom of a deep async chain (IPC dispatch through
+            // session mutation). Each `async fn` inlines its callee's future into its own state,
+            // so the database-opening tail is boxed to keep the combined stack frame bounded.
+            Box::pin(self.refresh_summary_session(session_id, store, &handle)).await?;
         } else if !snapshot.owned {
-            let db =
-                db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+            let db = Box::pin(db::SessionDb::open_existing_turso_in_root(
+                session_id,
+                &store.root_path(),
+            ))
+            .await?;
             db.validate_write_readiness().await?;
         }
         record_ensure_loaded_duration(

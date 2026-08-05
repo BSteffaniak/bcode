@@ -4064,7 +4064,10 @@ async fn handle_request(
     result
 }
 
-#[allow(clippy::too_many_lines, clippy::large_stack_frames)]
+/// Dispatch client, session-lifecycle, history, search, and attach requests.
+///
+/// Later request domains are handled by boxed sub-dispatchers so this frame stays bounded.
+#[allow(clippy::too_many_lines)]
 async fn handle_request_inner(
     request: Request,
     request_id: u64,
@@ -4260,6 +4263,34 @@ async fn handle_request_inner(
         Request::SessionInspection { session_id, query } => {
             handle_session_inspection(request_id, client_id, state, writer, session_id, query).await
         }
+        request => {
+            Box::pin(handle_session_search_attach_request(
+                request,
+                request_id,
+                client_id,
+                state,
+                writer,
+                attached_session,
+            ))
+            .await
+        }
+    }
+}
+
+/// Dispatch session search, open/attach, import, and catalog-refresh requests.
+///
+/// Split out of [`handle_request_inner`] so neither dispatcher has to reserve stack for every
+/// request arm's locals at once.
+#[allow(clippy::too_many_lines)]
+async fn handle_session_search_attach_request(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    attached_session: &mut Option<SessionId>,
+) -> Result<(), ServerError> {
+    match request {
         Request::SessionSearch {
             request,
             policy,
@@ -4446,6 +4477,29 @@ async fn handle_request_inner(
             )
             .await
         }
+        request => {
+            Box::pin(handle_turn_workflow_model_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+    }
+}
+
+/// Dispatch turn, workflow, runtime-work, and model-selection requests.
+///
+/// Split out of [`handle_request_inner`] so one `async fn` frame does not have to hold the locals
+/// of every request arm at once. Each sub-dispatcher is awaited through a boxed future so the
+/// combined stack frame stays bounded regardless of how deep the IPC call chain runs.
+#[allow(clippy::too_many_lines)]
+async fn handle_turn_workflow_model_request(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
         Request::SendUserMessage { session_id, text } => {
             handle_user_message(
                 request_id,
@@ -4560,6 +4614,27 @@ async fn handle_request_inner(
         Request::ApplyWorkflowSource(request) => {
             handle_apply_workflow_source(request_id, client_id, state, writer, request).await
         }
+        request => {
+            Box::pin(handle_workflow_mutation_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+    }
+}
+
+/// Dispatch workflow creation, draft, revision, and preset mutation requests.
+///
+/// Split out of [`handle_turn_workflow_model_request`] to keep each dispatcher frame bounded.
+#[allow(clippy::too_many_lines)]
+async fn handle_workflow_mutation_request(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
         Request::CreateAuthoredWorkflow(request) => {
             handle_create_authored_workflow(request_id, client_id, state, writer, request).await
         }
@@ -4640,6 +4715,28 @@ async fn handle_request_inner(
         Request::StartWorkflowPackageExport(request) => {
             handle_start_workflow_package_export(request_id, client_id, state, writer, request).await
         }
+        request => {
+            Box::pin(handle_workflow_authoring_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+    }
+}
+
+/// Dispatch workflow authoring, revision, preset, template, and run-control requests.
+///
+/// Split out of [`handle_turn_workflow_model_request`] to keep each dispatcher's stack frame
+/// bounded; workflow authoring arms carry large request and page payloads.
+#[allow(clippy::too_many_lines)]
+async fn handle_workflow_authoring_request(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
         Request::ListAuthoredWorkflows { cursor, limit } => {
             let workflows = state
                 .workflow_store
@@ -4807,6 +4904,28 @@ async fn handle_request_inner(
             )
             .await
         }
+        request => {
+            Box::pin(handle_workflow_validation_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+    }
+}
+
+/// Dispatch workflow authoring-catalog, validation, and compilation-preview requests.
+///
+/// These arms carry large authoring documents and compilation reports, so they are dispatched
+/// through their own boxed future rather than reserving that space in a shared frame.
+#[allow(clippy::too_many_lines)]
+async fn handle_workflow_validation_request(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
         Request::WorkflowAuthoringCatalog => {
             handle_workflow_authoring_catalog(request_id, state, writer).await
         }
@@ -5268,7 +5387,12 @@ async fn handle_request_inner(
                 }
             }
         }
-        request => handle_remaining_request(request, request_id, client_id, state, writer).await,
+        request => {
+            Box::pin(handle_remaining_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
     }
 }
 
@@ -49674,115 +49798,154 @@ library = "test"
         server.abort();
     }
 
+    /// Stack budget libtest gives each test thread by default.
+    ///
+    /// Tokio gives worker threads the same default, so an IPC flow that cannot fit here is also
+    /// close to the limit inside the daemon.
+    #[cfg(unix)]
+    const DEFAULT_TEST_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_resolution_crosses_real_ipc_and_persists_resolution() {
+        run_permission_resolution_ipc_flow().await;
+    }
+
+    /// Pin the permission IPC flow to an explicitly sized default stack.
+    ///
+    /// `#[tokio::test]` inherits libtest's thread stack, which an external `RUST_MIN_STACK` can
+    /// enlarge and thereby hide a stack-usage regression. Running the same flow on a thread with
+    /// an explicit stack size keeps the requirement deterministic.
     #[cfg(unix)]
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn permission_resolution_crosses_real_ipc_and_persists_resolution() {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_stack_size(8 * 1024 * 1024)
-            .enable_all()
-            .build()
-            .expect("permission IPC runtime")
-            .block_on(async {
-                let workspace = tempfile::tempdir().expect("permission IPC workspace");
-                let sessions = SessionManager::persistent(workspace.path().join("sessions"))
-                    .expect("persistent session manager");
-                let session = sessions
-                    .create_session(
-                        Some("permission IPC".to_owned()),
-                        workspace.path().to_path_buf(),
-                    )
-                    .await
-                    .expect("session");
-                let session_id = session.id;
-                sessions
-                    .append_permission_requested(
-                        session_id,
-                        SessionEventKind::PermissionRequested {
-                            permission_id: "permission-ipc".to_owned(),
-                            tool_call_id: "call-ipc".to_owned(),
-                            producer_plugin_id: Some("test.plugin".to_owned()),
-                            tool_name: "test.tool".to_owned(),
-                            arguments_json: "{}".to_owned(),
-                            batch: None,
-                            policy_source: None,
-                            policy_reason: None,
-                        },
-                    )
-                    .await
-                    .expect("permission requested event");
-                let state = Arc::new(test_server_state(sessions));
-                let pending = PendingPermission {
-                    summary: PermissionSummary {
-                        permission_id: "permission-ipc".to_owned(),
-                        session_id,
-                        tool_call_id: "call-ipc".to_owned(),
-                        tool_name: "test.tool".to_owned(),
-                        arguments_json: "{}".to_owned(),
-                        batch: None,
-                        agent_id: "build".to_owned(),
-                        policy_source: None,
-                        policy_reason: None,
-                        can_remember_policy: false,
-                    },
-                    decision: Arc::new(Mutex::new(None)),
-                    notify: Arc::new(Notify::new()),
-                    skill_decision_key: None,
-                };
-                state
-                    .pending_permissions
-                    .lock()
-                    .await
-                    .insert("permission-ipc".to_owned(), pending);
+    fn permission_resolution_ipc_flow_fits_the_default_thread_stack() {
+        std::thread::Builder::new()
+            .stack_size(DEFAULT_TEST_THREAD_STACK_BYTES)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("current-thread runtime")
+                    .block_on(run_permission_resolution_ipc_flow());
+            })
+            .expect("spawn pinned-stack thread")
+            .join()
+            .expect("permission IPC flow fits the default thread stack");
+    }
 
-                let socket_dir = tempfile::tempdir().expect("IPC socket directory");
-                let endpoint =
-                    bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
-                let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
-                let server_state = Arc::clone(&state);
-                let server = tokio::spawn(async move {
-                    loop {
-                        let stream = listener.accept().await.expect("client connection");
-                        let state = Arc::clone(&server_state);
-                        tokio::spawn(async move {
-                            handle_client(stream, state).await.expect("handle client");
-                        });
-                    }
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    async fn run_permission_resolution_ipc_flow() {
+        let workspace = tempfile::tempdir().expect("permission IPC workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent session manager");
+        let session = sessions
+            .create_session(
+                Some("permission IPC".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session");
+        let session_id = session.id;
+        sessions
+            .append_permission_requested(
+                session_id,
+                SessionEventKind::PermissionRequested {
+                    permission_id: "permission-ipc".to_owned(),
+                    tool_call_id: "call-ipc".to_owned(),
+                    producer_plugin_id: Some("test.plugin".to_owned()),
+                    tool_name: "test.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    batch: None,
+                    policy_source: None,
+                    policy_reason: None,
+                },
+            )
+            .await
+            .expect("permission requested event");
+        let state = Arc::new(test_server_state(sessions));
+        // Production permission work is nested inside an active turn, which retains a queued
+        // ownership guard for the session (see the ownership activity matrix in
+        // docs/session-persistence-architecture.md). Without a guard and with no attached client
+        // the actor is quiescent, so it releases its database and lease after every append and
+        // must reacquire them on the next one. Hold the documented carrier so this test exercises
+        // the real permission lifecycle instead of an unowned state the daemon never enters.
+        let _ownership = state
+            .sessions
+            .acquire_session_ownership(
+                session_id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .expect("queued command ownership guard");
+        let pending = PendingPermission {
+            summary: PermissionSummary {
+                permission_id: "permission-ipc".to_owned(),
+                session_id,
+                tool_call_id: "call-ipc".to_owned(),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                batch: None,
+                agent_id: "build".to_owned(),
+                policy_source: None,
+                policy_reason: None,
+                can_remember_policy: false,
+            },
+            decision: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+            skill_decision_key: None,
+        };
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .insert("permission-ipc".to_owned(), pending);
+
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
                 });
-                let client = bcode_client::BcodeClient::new(endpoint);
-                let permissions = client.list_permissions().await.expect("list permissions");
-                assert_eq!(permissions.len(), 1);
-                assert_eq!(permissions[0].permission_id, "permission-ipc");
-                assert!(
-                    client
-                        .resolve_permission("permission-ipc".to_owned(), true)
-                        .await
-                        .expect("resolve permission")
-                );
-                assert!(
-                    client
-                        .list_permissions()
-                        .await
-                        .expect("list resolved")
-                        .is_empty()
-                );
-                let history = state
-                    .sessions
-                    .session_history(session_id)
-                    .await
-                    .expect("permission history");
-                let snapshot = bcode_session_view::build_session_view_snapshot(&history);
-                assert!(snapshot.permissions.is_empty());
-                assert!(snapshot.transcript.items.iter().any(|item| matches!(
-                    &item.kind,
-                    bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
-                        if permission.permission_id == "permission-ipc"
-                            && permission.resolved
-                            && permission.approved == Some(true)
-                )));
-                server.abort();
-            });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let permissions = client.list_permissions().await.expect("list permissions");
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(permissions[0].permission_id, "permission-ipc");
+        assert!(
+            client
+                .resolve_permission("permission-ipc".to_owned(), true)
+                .await
+                .expect("resolve permission")
+        );
+        assert!(
+            client
+                .list_permissions()
+                .await
+                .expect("list resolved")
+                .is_empty()
+        );
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("permission history");
+        let snapshot = bcode_session_view::build_session_view_snapshot(&history);
+        assert!(snapshot.permissions.is_empty());
+        assert!(snapshot.transcript.items.iter().any(|item| matches!(
+            &item.kind,
+            bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
+                if permission.permission_id == "permission-ipc"
+                    && permission.resolved
+                    && permission.approved == Some(true)
+        )));
+        server.abort();
     }
 
     #[cfg(unix)]
