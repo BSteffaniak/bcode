@@ -60,6 +60,7 @@ Invalid files are diagnosed and are never partially applied. Theme files are dat
 * `bcode-dark` and `bcode-light` provide first-party opaque palettes.
 * `monochrome` emphasizes glyphs and modifiers rather than color distinctions.
 * `high-contrast` provides strong focus, selection, warning, error, and success distinctions.
+* `nord` adapts the Nord palette under its MIT license; source, copyright, and license text are recorded in `packages/tui/themes/attribution/nord.md`.
 
 ## Authoring format
 

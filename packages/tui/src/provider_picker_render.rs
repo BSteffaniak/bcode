@@ -30,6 +30,6 @@ pub fn render_provider_picker(app: &mut ProviderPickerApp, frame: &mut Frame<'_>
     let Some(list_area) = picker_list_area(inner, list_y, inner.bottom()) else {
         return;
     };
-    let items = app.list_items();
+    let items = app.list_items(theme.muted);
     render_picker_list(&items, app.list_state_mut(), list_area, frame, theme);
 }

@@ -4,7 +4,7 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{SessionId, SessionSummary};
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
@@ -192,10 +192,10 @@ impl SessionPickerApp {
 
     /// Return visible list items.
     #[must_use]
-    pub fn list_items(&self) -> Vec<ListItem> {
+    pub fn list_items(&self, muted: Style) -> Vec<ListItem> {
         if self.mode == SessionPickerMode::TranscriptSearch {
             if self.search_results.is_empty() {
-                return vec![empty_item("No transcript matches")];
+                return vec![empty_item("No transcript matches", muted)];
             }
             return self
                 .search_results
@@ -206,17 +206,17 @@ impl SessionPickerApp {
                         .iter()
                         .find(|session| session.id == result.hit.locator.session_id)
                         .map(SessionSummary::display_title);
-                    search_result_item(result, title)
+                    search_result_item(result, title, muted)
                 })
                 .collect();
         }
         if self.list.indices().is_empty() {
-            return vec![empty_item(&self.empty_message)];
+            return vec![empty_item(&self.empty_message, muted)];
         }
         self.list
             .indices()
             .iter()
-            .map(|index| session_item(&self.sessions[*index]))
+            .map(|index| session_item(&self.sessions[*index], muted))
             .collect()
     }
 
@@ -317,6 +317,7 @@ impl SessionPickerApp {
 fn search_result_item(
     result: &bcode_session_search::HydratedSessionSearchHit,
     canonical_title: Option<&str>,
+    muted: Style,
 ) -> ListItem {
     let preview = result.hit.preview.as_deref().unwrap_or("<no preview>");
     let timestamp = result
@@ -342,7 +343,7 @@ fn search_result_item(
                 "{} rank {}{degraded}",
                 result.hit.provider_id, result.hit.provider_rank
             ),
-            Style::new().fg(Color::BrightBlack),
+            muted,
         ),
         Span::raw("  "),
         Span::raw(preview),
@@ -354,7 +355,7 @@ fn search_result_item(
     ]))
 }
 
-fn session_item(session: &SessionSummary) -> ListItem {
+fn session_item(session: &SessionSummary, muted: Style) -> ListItem {
     let name = session.display_title();
     let display_name = session.import.as_ref().map_or_else(
         || fork_display_name(session, name),
@@ -371,9 +372,9 @@ fn session_item(session: &SessionSummary) -> ListItem {
     ListItem::new(Line::from_spans(vec![
         Span::styled(display_name, Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(id, Style::new().fg(Color::BrightBlack)),
+        Span::styled(id, muted),
         Span::raw("  "),
-        Span::styled(cwd, Style::new().fg(Color::BrightBlack)),
+        Span::styled(cwd, muted),
     ]))
 }
 
@@ -429,10 +430,10 @@ fn fork_matches_query(fork: &bcode_session_models::SessionForkSummary, query: &s
             .is_some_and(|title| title.to_ascii_lowercase().contains(query))
 }
 
-fn empty_item(message: &str) -> ListItem {
+fn empty_item(message: &str, muted: Style) -> ListItem {
     ListItem::new(Line::from_spans(vec![Span::styled(
         message.to_owned(),
-        Style::new().fg(Color::BrightBlack),
+        muted,
     )]))
 }
 
@@ -515,7 +516,7 @@ mod tests {
         app.set_search_results(&response, vec![first.clone(), second]);
 
         assert_eq!(app.mode(), SessionPickerMode::TranscriptSearch);
-        let items = app.list_items();
+        let items = app.list_items(Style::new());
         assert_eq!(items.len(), 2);
         let first_text = items[0]
             .line()

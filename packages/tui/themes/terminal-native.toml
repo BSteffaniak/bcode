@@ -137,6 +137,32 @@ modifiers = ["bold"]
 fg        = "$muted"
 modifiers = ["italic"]
 
+[styles."transcript.system.label"]
+fg = "$muted"
+
+[styles."transcript.meta"]
+fg = "$muted"
+
+[styles."transcript.skill.label"]
+fg = "$accent"
+
+[styles."transcript.skill_error.label"]
+fg = "$error"
+
+[styles."transcript.pending.label"]
+fg        = "$accent"
+modifiers = ["bold"]
+
+[styles."transcript.stream_status.label"]
+fg        = "$warning"
+modifiers = ["bold"]
+
+[styles."transcript.detail.label"]
+fg = "$muted"
+
+[styles."transcript.detail.body"]
+fg = "$muted"
+
 [styles."tool.requested.title"]
 fg = "$muted"
 
@@ -158,6 +184,23 @@ fg = "$muted"
 [styles."tool.timed_out.title"]
 fg        = "$warning"
 modifiers = ["bold"]
+
+[styles."tool.metadata"]
+fg = "$muted"
+
+[styles."tool.label"]
+fg        = "$muted"
+modifiers = ["bold"]
+
+[styles."tool.argument"]
+fg = "$text"
+
+[styles."tool.output"]
+fg = "$text"
+
+[styles."tool.truncation"]
+fg        = "$muted"
+modifiers = ["italic"]
 
 [containers."transcript.user"]
 layout = "plain"

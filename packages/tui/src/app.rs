@@ -4811,7 +4811,7 @@ mod tests {
             &source[stream_start..stream_end],
             &source[tool_start..tool_end],
         ] {
-            assert!(block.contains("semantic_theme()"));
+            assert!(block.contains("semantic_state_theme()"));
             assert!(!block.contains("Color::"));
         }
     }

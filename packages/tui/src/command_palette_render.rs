@@ -12,7 +12,7 @@ use super::render::TuiTheme;
 /// Render a command palette overlay.
 pub fn render_palette(palette: &mut BmuxCommandPalette, frame: &mut Frame<'_>, theme: TuiTheme) {
     let area = palette_area(frame.area());
-    let items = palette.cloned_items();
+    let items = palette.cloned_items(theme.muted);
     let widget = CommandPalette::new(&items)
         .panel(
             Panel::new()

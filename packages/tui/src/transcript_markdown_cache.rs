@@ -208,6 +208,57 @@ mod tests {
     }
 
     #[test]
+    fn theme_and_syntax_palette_changes_replace_projection_exactly_once() {
+        use bcode_syntax_render::{SyntaxColor, SyntaxPalette};
+        use bmux_tui::style::{Color, Style};
+
+        let cache = TranscriptMarkdownCache::default();
+        let item = TranscriptItem::with_format(
+            "Bcode",
+            "# Heading\n\n```rust\nfn main() {}\n```".to_owned(),
+            TextFormat::Markdown,
+        );
+        let document_id = format!("transcript:{}", item.id().get());
+        let base = MarkdownRenderOptions::new(80).with_document_id(document_id);
+        let first = cache.project(&item, base.clone());
+
+        let mut themed = base.clone();
+        themed.theme.heading = Style::new().fg(Color::Magenta);
+        let themed_result = cache.project(&item, themed.clone());
+        let themed_repeat = cache.project(&item, themed);
+        assert!(!Arc::ptr_eq(&first, &themed_result));
+        assert!(Arc::ptr_eq(&themed_result, &themed_repeat));
+
+        let color = |value| SyntaxColor::rgb(value, value, value);
+        let palette = SyntaxPalette {
+            text: color(1),
+            comment: color(2),
+            keyword: color(3),
+            function: color(4),
+            variable: color(5),
+            string: color(6),
+            number: color(7),
+            type_name: color(8),
+            operator: color(9),
+            punctuation: color(10),
+        };
+        let palette_options = base.with_syntax_palette(palette);
+        let palette_result = cache.project(&item, palette_options.clone());
+        let palette_repeat = cache.project(&item, palette_options);
+        assert!(!Arc::ptr_eq(&themed_result, &palette_result));
+        assert!(Arc::ptr_eq(&palette_result, &palette_repeat));
+        assert_eq!(cache.render_count(), 3);
+        assert_eq!(
+            cache
+                .entries
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn layout_affecting_option_change_replaces_projection_once() {
         let cache = TranscriptMarkdownCache::default();
         let item = TranscriptItem::with_format(

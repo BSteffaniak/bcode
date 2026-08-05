@@ -46,7 +46,7 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>, theme: T
     let Some(list_area) = picker_list_area(inner, list_y, bottom_y) else {
         return;
     };
-    let items = app.list_items();
+    let items = app.list_items(theme.muted);
     render_picker_list(&items, app.list_state_mut(), list_area, frame, theme);
 }
 

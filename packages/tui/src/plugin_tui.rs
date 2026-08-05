@@ -83,6 +83,7 @@ struct DynamicVisualKey {
     schema_version: u32,
     payload_revision: u64,
     width: u16,
+    theme_fingerprint: u64,
 }
 
 #[derive(Debug)]
@@ -644,6 +645,7 @@ impl PluginTuiPresentation {
                 schema_version,
                 payload_revision,
                 width: context.width(),
+                theme_fingerprint: context.theme().map_or(0, |theme| theme.fingerprint),
             };
             let response = {
                 let dynamic = self.dynamic_visuals.lock().ok()?;
@@ -653,7 +655,7 @@ impl PluginTuiPresentation {
                 return Some(RoutedTuiVisual {
                     render_mode: serialized_render_mode(&response, route.render_mode),
                     route,
-                    rows: serialized_visual_rows(&response),
+                    rows: serialized_visual_rows(&response, context.theme()),
                     header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader {
                         title: response.title,
                         timeout_ms: response.timeout_ms,
@@ -676,6 +678,7 @@ impl PluginTuiPresentation {
                         width: context.width(),
                         diff_layout: format!("{:?}", context.diff_layout()),
                         working_directory: context.working_directory().map(ToOwned::to_owned),
+                        theme_fingerprint: context.theme().map_or(0, |theme| theme.fingerprint),
                     },
                 },
             });
@@ -907,8 +910,11 @@ fn serialized_render_mode(
 
 fn serialized_visual_rows(
     response: &bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse,
+    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
 ) -> Vec<bmux_tui::prelude::Line> {
-    use bcode_plugin_sdk::tui_visual::{SerializedTuiColor, SerializedTuiModifier};
+    use bcode_plugin_sdk::tui_visual::{
+        SerializedTuiColor, SerializedTuiModifier, SerializedTuiStyleRole,
+    };
     use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
     response
         .rows
@@ -936,7 +942,23 @@ fn serialized_visual_rows(
                             SerializedTuiColor::LightMagenta => Color::BrightMagenta,
                             SerializedTuiColor::LightCyan => Color::BrightCyan,
                         };
-                        let mut style = Style::new().fg(color);
+                        let compatibility_style = Style::new().fg(color);
+                        let role_style = span.role.and_then(|role| {
+                            theme.map(|theme| match role {
+                                SerializedTuiStyleRole::Text => theme.text,
+                                SerializedTuiStyleRole::Muted => theme.muted,
+                                SerializedTuiStyleRole::Accent | SerializedTuiStyleRole::Info => {
+                                    theme.focused
+                                }
+                                SerializedTuiStyleRole::Success
+                                | SerializedTuiStyleRole::DiffAdded => theme.diff.added,
+                                SerializedTuiStyleRole::Warning
+                                | SerializedTuiStyleRole::DiffHunk => theme.diff.hunk,
+                                SerializedTuiStyleRole::Error
+                                | SerializedTuiStyleRole::DiffRemoved => theme.diff.removed,
+                            })
+                        });
+                        let mut style = role_style.unwrap_or(compatibility_style);
                         for modifier in &span.modifiers {
                             style = style.add_modifier(match modifier {
                                 SerializedTuiModifier::Bold => Modifier::BOLD,
@@ -1224,6 +1246,9 @@ library = "libdynamic_visual_test.dylib"
                                                 "dynamic:{}:artifact-{artifact_revision}",
                                                 request.adapter_id
                                             ),
+                                            role: Some(
+                                                bcode_plugin_sdk::tui_visual::SerializedTuiStyleRole::Success,
+                                            ),
                                             foreground:
                                                 bcode_plugin_sdk::tui_visual::SerializedTuiColor::Green,
                                             modifiers: vec![
@@ -1303,6 +1328,139 @@ library = "libdynamic_visual_test.dylib"
                     .collect(),
             },
             test_tui_extensions(),
+        )
+    }
+
+    fn test_plugin_theme(fingerprint: u64) -> bcode_plugin_sdk::tui::PluginTuiTheme {
+        use bmux_tui::prelude::{Color, Modifier, Style};
+
+        let style = Style::new();
+        let added = Style::new().fg(Color::Green);
+        let removed = Style::new().fg(Color::Red);
+        let hunk = Style::new().fg(Color::Yellow);
+        let syntax = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(1, 2, 3);
+        bcode_plugin_sdk::tui::PluginTuiTheme {
+            canvas: style,
+            text: style.fg(Color::White),
+            muted: style.fg(Color::BrightBlack),
+            border: style,
+            focused: style.fg(Color::Cyan),
+            selection: style.add_modifier(Modifier::REVERSED),
+            source: bcode_plugin_sdk::tui::PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: bcode_plugin_sdk::tui::PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added,
+                removed,
+                hunk,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme {
+                text: syntax,
+                comment: syntax,
+                keyword: syntax,
+                function: syntax,
+                variable: syntax,
+                string: syntax,
+                number: syntax,
+                type_name: syntax,
+                operator: syntax,
+                punctuation: syntax,
+            },
+            fingerprint,
+        }
+    }
+
+    #[test]
+    fn serialized_semantic_role_precedes_legacy_color_with_readable_fallback() {
+        use bcode_plugin_sdk::tui_visual::{
+            RenderTuiVisualResponse, SerializedTuiColor, SerializedTuiRow, SerializedTuiSpan,
+            SerializedTuiStyleRole,
+        };
+        use bmux_tui::prelude::{Color, Style};
+
+        let response = RenderTuiVisualResponse {
+            version: 2,
+            render_mode: "inline".to_owned(),
+            title: None,
+            timeout_ms: None,
+            rows: vec![SerializedTuiRow {
+                spans: vec![SerializedTuiSpan {
+                    text: "status".to_owned(),
+                    role: Some(SerializedTuiStyleRole::Success),
+                    foreground: SerializedTuiColor::Red,
+                    modifiers: Vec::new(),
+                }],
+            }],
+        };
+        let themed = serialized_visual_rows(&response, Some(test_plugin_theme(7)));
+        assert_eq!(themed[0].spans[0].style.fg, Some(Color::Green));
+
+        let fallback = serialized_visual_rows(&response, None);
+        assert_eq!(fallback[0].spans[0].style, Style::new().fg(Color::Red));
+    }
+
+    #[test]
+    fn serialized_visual_cache_key_includes_theme_identity() {
+        let presentation = dynamic_test_presentation("success", &[]);
+        let key = |theme_fingerprint| DynamicVisualKey {
+            plugin_id: "test.dynamic-visual".to_owned(),
+            adapter_id: "success".to_owned(),
+            invocation_id: "call-theme".to_owned(),
+            schema: "bcode.shell.run".to_owned(),
+            schema_version: 1,
+            payload_revision: 0,
+            width: 80,
+            theme_fingerprint,
+        };
+        assert_ne!(key(1), key(2));
+        let context = |fingerprint| {
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            )
+            .with_theme(test_plugin_theme(fingerprint))
+        };
+
+        let first = dynamic_test_visual_with_context(&presentation, "call-theme", &context(1));
+        if first.is_none() {
+            wait_for_dynamic_completion(&presentation);
+        }
+        assert!(
+            dynamic_test_visual_with_context(&presentation, "call-theme", &context(1)).is_some()
+        );
+        let changed = dynamic_test_visual_with_context(&presentation, "call-theme", &context(2));
+        if let Some(visual) = changed {
+            assert_eq!(visual.route.plugin_id, "bcode.shell");
+        }
+    }
+
+    fn dynamic_test_visual_with_context(
+        presentation: &PluginTuiPresentation,
+        invocation_id: &str,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Option<RoutedTuiVisual> {
+        presentation.routed_visual(
+            invocation_id,
+            0,
+            "bcode.shell.run",
+            1,
+            None,
+            &serde_json::json!({
+                "arguments": {"command": "printf hello", "cwd": "/tmp/project"}
+            }),
+            context,
         )
     }
 

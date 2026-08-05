@@ -34,12 +34,14 @@ bg = "$warning_background"
 border    = "left"
 layout    = "left_bar"
 padding_x = 1
+padding_y = 1
 width     = "content"
 
 [containers."transcript.assistant"]
 border    = "left"
 layout    = "left_bar"
 padding_x = 1
+padding_y = 1
 width     = "content"
 
 [containers."tool.requested"]
@@ -70,6 +72,7 @@ width     = "full"
 border    = "all"
 layout    = "panel"
 padding_x = 1
+padding_y = 1
 width     = "full"
 
 [containers."tool.cancelled"]

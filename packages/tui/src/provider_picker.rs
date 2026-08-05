@@ -3,7 +3,7 @@
 use bcode_ipc::PluginServiceSummary;
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
@@ -40,14 +40,14 @@ impl ProviderPickerApp {
 
     /// Return visible list items.
     #[must_use]
-    pub fn list_items(&self) -> Vec<ListItem> {
+    pub fn list_items(&self, muted: Style) -> Vec<ListItem> {
         if self.list.indices().is_empty() {
-            return vec![empty_item("No matching providers.")];
+            return vec![empty_item("No matching providers.", muted)];
         }
         self.list
             .indices()
             .iter()
-            .map(|index| provider_item(&self.providers[*index]))
+            .map(|index| provider_item(&self.providers[*index], muted))
             .collect()
     }
 
@@ -86,18 +86,15 @@ impl ProviderPickerApp {
     }
 }
 
-fn provider_item(provider: &PluginServiceSummary) -> ListItem {
+fn provider_item(provider: &PluginServiceSummary, muted: Style) -> ListItem {
     let label = provider.name.as_deref().unwrap_or(&provider.plugin_id);
     let description = provider.description.as_deref().unwrap_or("model provider");
     ListItem::new(Line::from_spans(vec![
         Span::styled(label.to_owned(), Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(
-            provider.plugin_id.clone(),
-            Style::new().fg(Color::BrightBlack),
-        ),
+        Span::styled(provider.plugin_id.clone(), muted),
         Span::raw("  "),
-        Span::styled(description.to_owned(), Style::new().fg(Color::BrightBlack)),
+        Span::styled(description.to_owned(), muted),
     ]))
 }
 
@@ -114,9 +111,9 @@ fn provider_matches(provider: &PluginServiceSummary, query: &str) -> bool {
             .is_some_and(|description| description.to_ascii_lowercase().contains(query))
 }
 
-fn empty_item(message: &str) -> ListItem {
+fn empty_item(message: &str, muted: Style) -> ListItem {
     ListItem::new(Line::from_spans(vec![Span::styled(
         message.to_owned(),
-        Style::new().fg(Color::BrightBlack),
+        muted,
     )]))
 }

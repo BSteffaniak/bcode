@@ -44,6 +44,185 @@ fn semantic_state_theme() -> super::theme::PresentedTheme {
     })
 }
 
+fn apply_container_recipe(
+    rows: &mut Vec<Line>,
+    start: usize,
+    presentation: super::theme::ContainerPresentation,
+    width: u16,
+) {
+    use super::theme::definition::{ContainerBorder, ContainerLayout, ContainerWidth};
+
+    if matches!(presentation.recipe.layout, ContainerLayout::Plain) || start >= rows.len() {
+        return;
+    }
+
+    let available_width = usize::from(width.max(1));
+    let left_border_width =
+        usize::from(!matches!(presentation.recipe.border, ContainerBorder::None));
+    let right_border_width =
+        usize::from(matches!(presentation.recipe.border, ContainerBorder::All));
+    let horizontal_padding = usize::from(presentation.recipe.padding_x);
+    let natural_width = rows[start..]
+        .iter()
+        .map(|line| spans_width(&line.spans))
+        .max()
+        .unwrap_or_default()
+        .saturating_add(horizontal_padding.saturating_mul(2))
+        .saturating_add(left_border_width)
+        .saturating_add(right_border_width)
+        .max(1);
+    let container_width = match presentation.recipe.width {
+        ContainerWidth::Full => available_width,
+        ContainerWidth::Content => natural_width.min(available_width),
+    };
+    let interior_width = container_width
+        .saturating_sub(left_border_width)
+        .saturating_sub(right_border_width);
+    let left_padding_width = horizontal_padding.min(interior_width);
+    let content_width = interior_width
+        .saturating_sub(left_padding_width)
+        .saturating_sub(horizontal_padding.min(interior_width - left_padding_width));
+
+    let mut container_rows = Vec::new();
+    if matches!(presentation.recipe.border, ContainerBorder::All) {
+        container_rows.push(container_border_line(
+            container_width,
+            '┌',
+            '─',
+            '┐',
+            presentation.style,
+        ));
+    }
+    let vertical_padding = usize::from(presentation.recipe.padding_y);
+    for _ in 0..vertical_padding {
+        container_rows.push(container_content_line(
+            &Line::new(),
+            content_width,
+            left_padding_width,
+            interior_width,
+            presentation,
+        ));
+    }
+    for line in rows.drain(start..) {
+        let wrapped = if content_width == 0 {
+            vec![Line::new()]
+        } else {
+            line.wrap_character(content_width)
+        };
+        for line in wrapped {
+            container_rows.push(container_content_line(
+                &line,
+                content_width,
+                left_padding_width,
+                interior_width,
+                presentation,
+            ));
+        }
+    }
+    for _ in 0..vertical_padding {
+        container_rows.push(container_content_line(
+            &Line::new(),
+            content_width,
+            left_padding_width,
+            interior_width,
+            presentation,
+        ));
+    }
+    if matches!(presentation.recipe.border, ContainerBorder::All) {
+        container_rows.push(container_border_line(
+            container_width,
+            '└',
+            '─',
+            '┘',
+            presentation.style,
+        ));
+    }
+    rows.extend(container_rows);
+}
+
+fn container_content_line(
+    line: &Line,
+    content_width: usize,
+    left_padding_width: usize,
+    interior_width: usize,
+    presentation: super::theme::ContainerPresentation,
+) -> Line {
+    use super::theme::definition::ContainerBorder;
+
+    let mut spans = Vec::new();
+    if !matches!(presentation.recipe.border, ContainerBorder::None) {
+        spans.push(Span::styled("│", presentation.style));
+    }
+    spans.push(Span::styled(
+        " ".repeat(left_padding_width),
+        presentation.style,
+    ));
+    let line = line
+        .with_fallback_style(presentation.style)
+        .truncate(content_width);
+    let used_width = spans_width(&line.spans);
+    spans.extend(line.spans);
+    spans.push(Span::styled(
+        " ".repeat(
+            interior_width
+                .saturating_sub(left_padding_width)
+                .saturating_sub(used_width),
+        ),
+        presentation.style,
+    ));
+    if matches!(presentation.recipe.border, ContainerBorder::All) {
+        spans.push(Span::styled("│", presentation.style));
+    }
+    Line::from_spans(spans)
+}
+
+fn container_border_line(width: usize, left: char, fill: char, right: char, style: Style) -> Line {
+    let text = match width {
+        0 => String::new(),
+        1 => left.to_string(),
+        _ => format!("{left}{}{right}", fill.to_string().repeat(width - 2)),
+    };
+    Line::from_spans(vec![Span::styled(text, style)])
+}
+
+fn tool_container_presentation(
+    item: &TranscriptItem,
+) -> Option<super::theme::ContainerPresentation> {
+    use bcode_session_view_models::ToolInvocationViewStatus;
+
+    let theme = semantic_state_theme();
+    match item.kind() {
+        TranscriptItemKind::ToolRequest { status, timing, .. } => {
+            if timing.timed_out == Some(true) {
+                Some(theme.containers.tool_timed_out)
+            } else {
+                Some(match status {
+                    Some(ToolInvocationViewStatus::Running) => theme.containers.tool_running,
+                    Some(ToolInvocationViewStatus::Waiting) => theme.containers.tool_waiting,
+                    Some(ToolInvocationViewStatus::Finished) => theme.containers.tool_succeeded,
+                    Some(ToolInvocationViewStatus::Failed) => theme.containers.tool_failed,
+                    Some(ToolInvocationViewStatus::Cancelled) => theme.containers.tool_cancelled,
+                    Some(ToolInvocationViewStatus::Requested) | None => {
+                        theme.containers.tool_requested
+                    }
+                })
+            }
+        }
+        TranscriptItemKind::ToolResult {
+            is_error, timing, ..
+        } => {
+            if timing.timed_out == Some(true) {
+                Some(theme.containers.tool_timed_out)
+            } else if *is_error {
+                Some(theme.containers.tool_failed)
+            } else {
+                Some(theme.containers.tool_succeeded)
+            }
+        }
+        _ => None,
+    }
+}
+
 fn markdown_details_open() -> BTreeMap<String, bool> {
     MARKDOWN_DETAILS_OPEN.with(|state| state.borrow().clone())
 }
@@ -212,6 +391,29 @@ impl TuiTheme {
                 configured_accent,
                 agent_metadata_hydrated,
             ),
+            text: theme.text,
+            muted: theme.muted,
+            border: theme.border,
+            selection: theme.selection,
+            info: theme.info,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_theme_id(theme_id: &str) -> Self {
+        let catalog =
+            super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+        let resolved = catalog
+            .resolve(&super::theme::definition::ThemeSelection::new(theme_id))
+            .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+        let theme = super::theme::resolved_definition_theme(
+            Some(&resolved),
+            super::theme::PENDING_AGENT_METADATA_ACCENT,
+        )
+        .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+        Self {
+            accent: theme.accent,
             text: theme.text,
             muted: theme.muted,
             border: theme.border,
@@ -841,7 +1043,7 @@ fn active_latest_bar_line(
     spans.push(Span::styled(
         text,
         latest_bar_background_style()
-            .fg(latest_bar_active_text_color(burst))
+            .patch(latest_bar_active_text_style())
             .add_modifier(Modifier::BOLD),
     ));
     push_latest_bar_glow_rail(
@@ -868,13 +1070,13 @@ fn stale_latest_bar_line(width: u16, key_label: &str) -> Line {
         Span::styled(" ".repeat(left_width), latest_bar_background_style()),
         Span::styled(
             text,
-            latest_bar_background_style().fg(Color::Rgb(130, 154, 166)),
+            latest_bar_background_style().patch(semantic_state_theme().muted),
         ),
         Span::styled(" ".repeat(right_width), latest_bar_background_style()),
         Span::styled(
             "▾",
             latest_bar_background_style()
-                .fg(Color::Rgb(105, 210, 230))
+                .patch(semantic_state_theme().info)
                 .add_modifier(Modifier::BOLD),
         ),
     ])
@@ -942,7 +1144,12 @@ fn push_latest_bar_glow_rail(
             spans.push(Span::styled(" ", latest_bar_background_style()));
             continue;
         }
-        let mut style = latest_bar_background_style().fg(latest_bar_glow_color(distance, burst));
+        let role_style = if distance == 0 {
+            semantic_state_theme().info
+        } else {
+            semantic_state_theme().focused
+        };
+        let mut style = latest_bar_background_style().patch(role_style);
         if distance == 0 || (intensity >= 3 && distance <= 1) || (intensity >= 7 && distance <= 2) {
             style = style.add_modifier(Modifier::BOLD);
         }
@@ -950,33 +1157,12 @@ fn push_latest_bar_glow_rail(
     }
 }
 
-const fn latest_bar_active_text_color(burst: u8) -> Color {
-    if burst >= 6 {
-        Color::Rgb(230, 255, 250)
-    } else if burst >= 3 {
-        Color::Rgb(210, 245, 250)
-    } else {
-        Color::White
-    }
+fn latest_bar_active_text_style() -> Style {
+    semantic_state_theme().text
 }
 
-const fn latest_bar_glow_color(distance: usize, burst: u8) -> Color {
-    match (burst >= 6, burst >= 3, distance) {
-        (true, _, 0) => Color::Rgb(255, 255, 255),
-        (true, _, 1) => Color::Rgb(0, 255, 255),
-        (true, _, 2) => Color::Rgb(0, 190, 235),
-        (true, _, _) => Color::Rgb(18, 92, 128),
-        (_, true, 0) => Color::Rgb(235, 255, 255),
-        (_, true, 1 | 2) => Color::Rgb(55, 235, 255),
-        (_, true, _) => Color::Rgb(32, 125, 160),
-        (_, _, 0) => Color::Rgb(190, 245, 245),
-        (_, _, 1 | 2) => Color::Rgb(75, 190, 215),
-        (_, _, _) => Color::Rgb(40, 100, 125),
-    }
-}
-
-const fn latest_bar_background_style() -> Style {
-    Style::new().bg(Color::Rgb(12, 24, 32))
+fn latest_bar_background_style() -> Style {
+    semantic_state_theme().background
 }
 
 fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
@@ -1837,6 +2023,7 @@ fn push_transcript_item_rows(
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
     markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
 ) {
+    let item_start = rows.len();
     if let Some(integrity) = item.stream_integrity() {
         let message = match integrity {
             TranscriptStreamIntegrity::Incomplete => {
@@ -1846,22 +2033,22 @@ fn push_transcript_item_rows(
                 "Stream integrity is degraded; waiting for authoritative resynchronization."
             }
         };
-        let theme = semantic_theme();
+        let theme = semantic_state_theme();
         push_wrapped_styled_text(
             rows,
             Vec::new(),
             "Stream status",
             width,
-            theme.border,
-            theme.muted,
+            theme.transcript.stream_status_label,
+            theme.transcript.meta,
         );
         push_wrapped_styled_text(
             rows,
-            vec![Span::styled("  ", theme.muted)],
+            vec![Span::styled("  ", theme.transcript.meta)],
             message,
             width,
-            theme.muted,
-            theme.muted,
+            theme.transcript.meta,
+            theme.transcript.meta,
         );
     }
     match item.kind() {
@@ -1871,7 +2058,7 @@ fn push_transcript_item_rows(
                     rows,
                     &item.display_role(),
                     markdown,
-                    semantic_theme().focused,
+                    semantic_state_theme().transcript.user_label,
                     width,
                     true,
                 );
@@ -1881,7 +2068,7 @@ fn push_transcript_item_rows(
                     &item.display_role(),
                     item.text(),
                     item.text_format(),
-                    semantic_theme().focused,
+                    semantic_state_theme().transcript.user_label,
                     true,
                     width,
                 );
@@ -1984,7 +2171,7 @@ fn push_transcript_item_rows(
                     rows,
                     &item.display_role(),
                     markdown,
-                    semantic_theme().muted,
+                    semantic_state_theme().transcript.system_label,
                     width,
                     false,
                 );
@@ -1994,7 +2181,7 @@ fn push_transcript_item_rows(
                     &item.display_role(),
                     item.text(),
                     item.text_format(),
-                    semantic_theme().muted,
+                    semantic_state_theme().transcript.system_label,
                     false,
                     width,
                 );
@@ -2004,14 +2191,20 @@ fn push_transcript_item_rows(
             push_meta_block(rows, item.text(), width);
         }
         TranscriptItemKind::Skill => {
-            push_detail_block(rows, "Skill", item.text(), semantic_theme().focused, width);
+            push_detail_block(
+                rows,
+                "Skill",
+                item.text(),
+                semantic_state_theme().transcript.skill_label,
+                width,
+            );
         }
         TranscriptItemKind::SkillError => {
             push_detail_block(
                 rows,
                 "Skill error",
                 item.text(),
-                semantic_state_theme().error,
+                semantic_state_theme().transcript.skill_error_label,
                 width,
             );
         }
@@ -2101,7 +2294,7 @@ fn push_transcript_item_rows(
                                 .as_deref()
                                 .unwrap_or("Tool contribution"),
                             timing,
-                            item.streaming(),
+                            invocation.as_deref().map(|invocation| invocation.status),
                             invocation
                                 .as_deref()
                                 .and_then(|invocation| invocation.is_error)
@@ -2116,7 +2309,7 @@ fn push_transcript_item_rows(
                             rows,
                             "Tool contribution",
                             item.tool_timing(),
-                            item.streaming(),
+                            None,
                             false,
                             width,
                         );
@@ -2147,10 +2340,19 @@ fn push_transcript_item_rows(
                 rows,
                 &item.display_role(),
                 item.text(),
-                semantic_theme().muted,
+                semantic_state_theme().transcript.detail_label,
                 width,
             );
         }
+    }
+    let theme = semantic_state_theme();
+    let presentation = match item.kind() {
+        TranscriptItemKind::UserMessage => Some(theme.containers.user),
+        TranscriptItemKind::AssistantMessage => Some(theme.containers.assistant),
+        _ => tool_container_presentation(item),
+    };
+    if let Some(presentation) = presentation {
+        apply_container_recipe(rows, item_start, presentation, width);
     }
 }
 
@@ -2166,9 +2368,9 @@ fn push_assistant_rows(
         "Bcode"
     };
     let heading_style = if item.streaming() {
-        semantic_state_theme().info
+        semantic_state_theme().transcript.tool_running_title
     } else {
-        semantic_state_theme().success
+        semantic_state_theme().transcript.assistant_label
     };
     if let Some(markdown) = markdown {
         push_markdown_projection_block(rows, title, markdown, heading_style, width, true);
@@ -2298,6 +2500,8 @@ fn push_markdown_block_with_streaming(
         for line in render_markdown_lines(
             body,
             MarkdownRenderOptions::new(width.saturating_sub(2).max(1))
+                .with_theme(semantic_state_theme().markdown)
+                .with_syntax_palette(semantic_state_theme().syntax)
                 .with_streaming(streaming)
                 .with_details_open(markdown_details_open()),
         ) {
@@ -2422,6 +2626,668 @@ fn visible_rows_snapshot(rows: &[Line]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+#[test]
+fn structured_transcript_recipe_changes_chrome_without_changing_body_text() {
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let native = catalog
+        .resolve(&super::theme::definition::ThemeSelection::new(
+            "terminal-native",
+        ))
+        .expect("native resolves");
+    let structured = catalog
+        .resolve(&super::theme::definition::ThemeSelection::new(
+            "terminal-native-structured",
+        ))
+        .expect("structured resolves");
+    let native = super::theme::resolved_definition_theme(
+        Some(&native),
+        super::theme::PENDING_AGENT_METADATA_ACCENT,
+    )
+    .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+    let structured = super::theme::resolved_definition_theme(
+        Some(&structured),
+        super::theme::PENDING_AGENT_METADATA_ACCENT,
+    )
+    .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+    let item = TranscriptItem::with_format(
+        "You",
+        "same semantic body".to_owned(),
+        TextFormat::PlainText,
+    );
+
+    set_plugin_visual_theme(&native);
+    let native_rows =
+        transcript_item_rows_from_item(&item, 40, None, TuiDiffViewerConfig::default());
+    set_plugin_visual_theme(&structured);
+    let structured_rows =
+        transcript_item_rows_from_item(&item, 40, None, TuiDiffViewerConfig::default());
+
+    let text = |rows: &[Line]| {
+        rows.iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_str())
+            .collect::<String>()
+    };
+    assert!(text(&native_rows).contains("same semantic body"));
+    assert!(text(&structured_rows).contains("same semantic body"));
+    assert!(!text(&native_rows).contains('│'));
+    assert!(text(&structured_rows).contains('│'));
+}
+
+#[cfg(test)]
+fn semantic_state_snapshot(theme_id: &str, rows: &[Line]) -> String {
+    let lines = rows
+        .iter()
+        .map(|line| {
+            let spans = line
+                .spans
+                .iter()
+                .filter(|span| !span.content.is_empty())
+                .map(|span| format!("{:?}:{:?}", span.content, span.style))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!("[{spans}]")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("== {theme_id} ==\n{lines}")
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_lines)] // Explicit transcript/tool fixture matrix.
+fn semantic_state_matrix_items() -> Vec<TranscriptItem> {
+    use bcode_session_view_models::ToolInvocationViewStatus;
+
+    let mut items = vec![
+        TranscriptItem::with_format("You", "user body".to_owned(), TextFormat::PlainText),
+        TranscriptItem::with_format(
+            "Bcode",
+            "assistant **body**".to_owned(),
+            TextFormat::Markdown,
+        ),
+        TranscriptItem::with_kind(
+            "Reasoning",
+            "reasoning body".to_owned(),
+            false,
+            TranscriptItemKind::ReasoningMessage,
+        ),
+        TranscriptItem::with_kind(
+            "System",
+            "system body".to_owned(),
+            false,
+            TranscriptItemKind::System,
+        ),
+        TranscriptItem::with_kind(
+            "Meta",
+            "metadata body".to_owned(),
+            false,
+            TranscriptItemKind::Meta,
+        ),
+        TranscriptItem::with_kind(
+            "Skill",
+            "skill body".to_owned(),
+            false,
+            TranscriptItemKind::Skill,
+        ),
+        TranscriptItem::with_kind(
+            "Skill error",
+            "skill failure".to_owned(),
+            false,
+            TranscriptItemKind::SkillError,
+        ),
+        TranscriptItem::with_kind(
+            "Detail",
+            "detail body".to_owned(),
+            false,
+            TranscriptItemKind::Generic,
+        ),
+        super::transcript::permission_request_item(
+            "permission-1",
+            "call-permission",
+            "example.permission",
+            r#"{"path":"src/lib.rs"}"#,
+            Some("policy"),
+            Some("side effect requires approval"),
+        ),
+    ];
+    items.extend(
+        [
+            (ToolInvocationViewStatus::Requested, ToolTiming::default()),
+            (ToolInvocationViewStatus::Running, ToolTiming::default()),
+            (ToolInvocationViewStatus::Waiting, ToolTiming::default()),
+            (ToolInvocationViewStatus::Finished, ToolTiming::default()),
+            (ToolInvocationViewStatus::Failed, ToolTiming::default()),
+            (ToolInvocationViewStatus::Cancelled, ToolTiming::default()),
+            (
+                ToolInvocationViewStatus::Failed,
+                ToolTiming {
+                    timed_out: Some(true),
+                    ..ToolTiming::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(status, timing)| {
+            TranscriptItem::with_kind(
+                "Tool",
+                "{}".to_owned(),
+                false,
+                TranscriptItemKind::ToolRequest {
+                    tool_call_id: format!("call-{}", tool_status_label(status)),
+                    producer_plugin_id: None,
+                    tool_name: "example".to_owned(),
+                    working_directory: None,
+                    active: matches!(
+                        status,
+                        ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                    ),
+                    status: Some(status),
+                    timing,
+                },
+            )
+        }),
+    );
+    items.push(super::transcript::tool_result_item(
+        "call-result",
+        Some("example"),
+        Some(r#"{"path":"src/lib.rs"}"#),
+        "first output row\nsecond output row",
+        false,
+    ));
+    items.push(super::transcript::tool_result_item(
+        "call-error",
+        Some("example"),
+        None,
+        "failure output",
+        true,
+    ));
+    items
+}
+
+#[cfg(test)]
+#[test]
+fn transcript_and_tool_state_matrix_snapshots_cross_theme_styles() {
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let mut snapshot = String::new();
+    for theme_id in [
+        "terminal-native",
+        "terminal-native-structured",
+        "bcode-dark",
+        "bcode-light",
+        "monochrome",
+        "high-contrast",
+    ] {
+        let resolved = catalog
+            .resolve(&super::theme::definition::ThemeSelection::new(theme_id))
+            .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+        let theme = super::theme::resolved_definition_theme(
+            Some(&resolved),
+            super::theme::PENDING_AGENT_METADATA_ACCENT,
+        )
+        .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+        set_plugin_visual_theme(&theme);
+        let rows = semantic_state_matrix_items()
+            .iter()
+            .flat_map(|item| {
+                transcript_item_rows_from_item(item, 44, None, TuiDiffViewerConfig::default())
+            })
+            .collect::<Vec<_>>();
+        if !snapshot.is_empty() {
+            snapshot.push('\n');
+        }
+        snapshot.push_str(&semantic_state_snapshot(theme_id, &rows));
+    }
+    insta::assert_snapshot!("transcript_tool_state_matrix_cross_theme", snapshot);
+}
+
+#[cfg(test)]
+#[test]
+#[allow(clippy::too_many_lines)] // One explicit cross-theme semantic state matrix.
+fn transcript_and_tool_state_matrix_is_bounded_across_bundled_themes() {
+    use bcode_session_view_models::ToolInvocationViewStatus;
+
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let width = 32;
+    for theme_id in [
+        "terminal-native",
+        "terminal-native-structured",
+        "bcode-dark",
+        "bcode-light",
+        "monochrome",
+        "high-contrast",
+    ] {
+        let resolved = catalog
+            .resolve(&super::theme::definition::ThemeSelection::new(theme_id))
+            .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+        let theme = super::theme::resolved_definition_theme(
+            Some(&resolved),
+            super::theme::PENDING_AGENT_METADATA_ACCENT,
+        )
+        .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+        set_plugin_visual_theme(&theme);
+
+        let messages = [
+            TranscriptItem::with_format("You", "user body".to_owned(), TextFormat::PlainText),
+            TranscriptItem::with_format("Bcode", "assistant body".to_owned(), TextFormat::Markdown),
+            TranscriptItem::with_kind(
+                "Reasoning",
+                "reasoning body".to_owned(),
+                false,
+                TranscriptItemKind::ReasoningMessage,
+            ),
+            TranscriptItem::with_kind(
+                "System",
+                "system body".to_owned(),
+                false,
+                TranscriptItemKind::System,
+            ),
+            TranscriptItem::with_kind(
+                "Meta",
+                "metadata body".to_owned(),
+                false,
+                TranscriptItemKind::Meta,
+            ),
+            TranscriptItem::with_kind(
+                "Skill",
+                "skill body".to_owned(),
+                false,
+                TranscriptItemKind::Skill,
+            ),
+            TranscriptItem::with_kind(
+                "Skill error",
+                "skill failure".to_owned(),
+                false,
+                TranscriptItemKind::SkillError,
+            ),
+            TranscriptItem::with_kind(
+                "Detail",
+                "detail body".to_owned(),
+                false,
+                TranscriptItemKind::Generic,
+            ),
+        ];
+        for item in &messages {
+            let rows =
+                transcript_item_rows_from_item(item, width, None, TuiDiffViewerConfig::default());
+            assert!(!rows.is_empty(), "{theme_id} omitted {:?}", item.kind());
+            assert!(
+                rows.iter()
+                    .all(|line| spans_width(&line.spans) <= usize::from(width)),
+                "{theme_id} overflowed {:?}",
+                item.kind()
+            );
+        }
+
+        for (status, timing) in [
+            (ToolInvocationViewStatus::Requested, ToolTiming::default()),
+            (ToolInvocationViewStatus::Running, ToolTiming::default()),
+            (ToolInvocationViewStatus::Waiting, ToolTiming::default()),
+            (ToolInvocationViewStatus::Finished, ToolTiming::default()),
+            (ToolInvocationViewStatus::Failed, ToolTiming::default()),
+            (ToolInvocationViewStatus::Cancelled, ToolTiming::default()),
+            (
+                ToolInvocationViewStatus::Failed,
+                ToolTiming {
+                    timed_out: Some(true),
+                    ..ToolTiming::default()
+                },
+            ),
+        ] {
+            let item = TranscriptItem::with_kind(
+                "Tool",
+                "{}".to_owned(),
+                false,
+                TranscriptItemKind::ToolRequest {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: None,
+                    tool_name: "example".to_owned(),
+                    working_directory: None,
+                    active: matches!(
+                        status,
+                        ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                    ),
+                    status: Some(status),
+                    timing,
+                },
+            );
+            let rows =
+                transcript_item_rows_from_item(&item, width, None, TuiDiffViewerConfig::default());
+            let visible = rows
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(visible.contains(tool_status_label(status)));
+            assert!(
+                rows.iter()
+                    .all(|line| spans_width(&line.spans) <= usize::from(width))
+            );
+            if timing.timed_out == Some(true) {
+                assert!(
+                    visible.contains("tim") && visible.contains("out"),
+                    "{theme_id} omitted timeout cue: {visible}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn monochrome_tool_states_retain_explicit_text_and_modifier_cues() {
+    use bcode_session_view_models::ToolInvocationViewStatus;
+
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let resolved = catalog
+        .resolve(&super::theme::definition::ThemeSelection::new("monochrome"))
+        .expect("monochrome resolves");
+    let theme = super::theme::resolved_definition_theme(
+        Some(&resolved),
+        super::theme::PENDING_AGENT_METADATA_ACCENT,
+    )
+    .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+    set_plugin_visual_theme(&theme);
+
+    for (status, timing) in [
+        (ToolInvocationViewStatus::Requested, ToolTiming::default()),
+        (ToolInvocationViewStatus::Running, ToolTiming::default()),
+        (ToolInvocationViewStatus::Waiting, ToolTiming::default()),
+        (ToolInvocationViewStatus::Finished, ToolTiming::default()),
+        (ToolInvocationViewStatus::Failed, ToolTiming::default()),
+        (ToolInvocationViewStatus::Cancelled, ToolTiming::default()),
+        (
+            ToolInvocationViewStatus::Failed,
+            ToolTiming {
+                timed_out: Some(true),
+                ..ToolTiming::default()
+            },
+        ),
+    ] {
+        let item = TranscriptItem::with_kind(
+            "Tool",
+            "{}".to_owned(),
+            false,
+            TranscriptItemKind::ToolRequest {
+                tool_call_id: "call-monochrome".to_owned(),
+                producer_plugin_id: None,
+                tool_name: "example".to_owned(),
+                working_directory: None,
+                active: matches!(
+                    status,
+                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                ),
+                status: Some(status),
+                timing,
+            },
+        );
+        let rows = transcript_item_rows_from_item(&item, 44, None, TuiDiffViewerConfig::default());
+        let visible = rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        let status_style_has_modifier = rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| {
+                span.content.contains(tool_status_label(status))
+                    || (timing.timed_out == Some(true)
+                        && span.content.to_ascii_lowercase().contains("timed out"))
+            })
+            .any(|span| !span.style.modifiers.is_empty());
+
+        if timing.timed_out == Some(true) {
+            assert!(visible.to_ascii_lowercase().contains("timed out"));
+        } else {
+            assert!(visible.contains(tool_status_label(status)));
+        }
+        assert!(
+            status_style_has_modifier,
+            "monochrome {status:?} lacks a non-color modifier cue: {rows:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+#[allow(clippy::too_many_lines)] // One explicit rich-content cross-theme regression matrix.
+fn rich_content_matrix_is_bounded_and_semantic_across_themes() {
+    use bcode_markdown_render::MarkdownRenderOptions;
+    use bcode_tui_components::diff_viewer::{
+        DiffViewerInput, DiffViewerLayout, diff_viewer_rows_with_style,
+    };
+    use bcode_tui_components::source_preview::{SourcePreviewOptions, source_preview_lines};
+    use bcode_tui_components::terminal_viewer::{
+        TerminalViewerInput, TerminalViewerSizing, terminal_viewer_rows,
+    };
+
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let code = (0..96)
+        .map(|line| format!("let value_{line} = {line};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let markdown = format!(
+        "# Streaming\n\n> [!WARNING]\n> themed alert\n\n| Name | Value |\n|:--|--:|\n| alpha | one |\n| beta | two |\n\n<details><summary>More</summary>detail body</details>\n\n```rust\n{code}"
+    );
+    let mut markdown_signatures = Vec::new();
+
+    for theme_id in ["terminal-native", "bcode-dark", "bcode-light"] {
+        let resolved = catalog
+            .resolve(&super::theme::definition::ThemeSelection::new(theme_id))
+            .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+        let theme = super::theme::resolved_definition_theme(
+            Some(&resolved),
+            super::theme::PENDING_AGENT_METADATA_ACCENT,
+        )
+        .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+
+        for width in [18, 80] {
+            let rendered = render_markdown(
+                &markdown,
+                &MarkdownRenderOptions::new(width)
+                    .with_theme(theme.markdown)
+                    .with_syntax_palette(theme.syntax)
+                    .with_streaming(true)
+                    .with_document_id(format!("rich-{theme_id}-{width}")),
+            );
+            assert!(!rendered.lines.is_empty());
+            assert!(
+                rendered
+                    .lines
+                    .iter()
+                    .all(|line| spans_width(&line.spans) <= usize::from(width)),
+                "{theme_id} Markdown overflow at width {width}"
+            );
+            let visible = rendered
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(visible.contains("Streaming"));
+            assert!(visible.contains("WARNING"));
+            assert!(visible.contains("More"));
+            markdown_signatures.push((theme_id, width, rendered.layout_signature));
+        }
+
+        for layout in [DiffViewerLayout::Unified, DiffViewerLayout::SideBySide] {
+            let rows = diff_viewer_rows_with_style(
+                DiffViewerInput {
+                    label: "src/lib.rs",
+                    old_text: "fn old() {\n    let value = 1;\n}\n",
+                    new_text: "fn new() {\n    let value = 2;\n}\n",
+                    old_start_line: 1,
+                    new_start_line: 1,
+                    line_numbers_known: true,
+                    title: "Updated",
+                    subtitle: Some("semantic diff"),
+                    argument_bytes: Some(128),
+                    truncated: false,
+                    syntax_palette: Some(theme.syntax),
+                    layout,
+                },
+                72,
+                theme.diff,
+            );
+            let visible = rows
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(visible.contains('+') && visible.contains('-'));
+            assert!(rows.iter().all(|line| spans_width(&line.spans) <= 72));
+        }
+
+        let source = source_preview_lines(
+            "fn one() {}\nfn two() {}\nfn three() {}",
+            &SourcePreviewOptions::new("rust", 24)
+                .syntax_palette(theme.syntax)
+                .max_lines(2)
+                .line_prefix("  │ ", theme.source.gutter)
+                .source_style(theme.source.source)
+                .truncated_message("  … preview truncated", theme.source.truncated),
+        );
+        assert!(source.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("preview truncated"))
+        }));
+        assert!(source.iter().all(|line| spans_width(&line.spans) <= 24));
+    }
+
+    assert_ne!(markdown_signatures[2].2, markdown_signatures[4].2);
+
+    let raw = terminal_viewer_rows(
+        TerminalViewerInput {
+            output: "\u{1b}[31mRED\u{1b}[0m plain",
+            columns: 20,
+            rows: 4,
+            exit_code: Some(0),
+            timed_out: Some(false),
+            elapsed: None,
+            show_status: false,
+            output_truncated: false,
+            output_bytes: None,
+            retained_output_bytes: None,
+            sizing: TerminalViewerSizing::Compact,
+        },
+        24,
+    );
+    assert!(
+        raw.iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| { span.content.contains("RED") && span.style.fg == Some(Color::Red) })
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn full_width_panel_fills_exactly_and_all_border_closes() {
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let structured = catalog
+        .resolve(&super::theme::definition::ThemeSelection::new(
+            "terminal-native-structured",
+        ))
+        .expect("structured resolves");
+    let structured = super::theme::resolved_definition_theme(
+        Some(&structured),
+        super::theme::PENDING_AGENT_METADATA_ACCENT,
+    )
+    .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+    set_plugin_visual_theme(&structured);
+
+    let mut failed = super::transcript::tool_result_item(
+        "call-1",
+        Some("example"),
+        Some(r#"{"path":"very/long/path"}"#),
+        "failure output",
+        true,
+    );
+    failed.set_tool_timed_out(Some(false));
+    let rows = transcript_item_rows_from_item(&failed, 24, None, TuiDiffViewerConfig::default());
+
+    assert!(rows.len() >= 5);
+    assert_eq!(
+        visible_rows_snapshot(&rows[..1]),
+        "00 │ ┌──────────────────────┐"
+    );
+    assert_eq!(
+        visible_rows_snapshot(&rows[rows.len() - 1..]),
+        "00 │ └──────────────────────┘"
+    );
+    assert!(
+        rows.iter()
+            .all(|line| spans_width(&line.spans) == usize::from(24_u16))
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn structured_tool_recipes_cover_normalized_state_matrix() {
+    use bcode_session_view_models::ToolInvocationViewStatus;
+
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let structured = catalog
+        .resolve(&super::theme::definition::ThemeSelection::new(
+            "terminal-native-structured",
+        ))
+        .expect("structured resolves");
+    let structured = super::theme::resolved_definition_theme(
+        Some(&structured),
+        super::theme::PENDING_AGENT_METADATA_ACCENT,
+    )
+    .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+    set_plugin_visual_theme(&structured);
+
+    for (status, timing) in [
+        (ToolInvocationViewStatus::Requested, ToolTiming::default()),
+        (ToolInvocationViewStatus::Running, ToolTiming::default()),
+        (ToolInvocationViewStatus::Waiting, ToolTiming::default()),
+        (ToolInvocationViewStatus::Finished, ToolTiming::default()),
+        (ToolInvocationViewStatus::Failed, ToolTiming::default()),
+        (ToolInvocationViewStatus::Cancelled, ToolTiming::default()),
+        (
+            ToolInvocationViewStatus::Failed,
+            ToolTiming {
+                timed_out: Some(true),
+                ..ToolTiming::default()
+            },
+        ),
+    ] {
+        let item = TranscriptItem::with_kind(
+            "Tool",
+            "{}".to_owned(),
+            false,
+            TranscriptItemKind::ToolRequest {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: None,
+                tool_name: "example".to_owned(),
+                working_directory: None,
+                active: matches!(
+                    status,
+                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                ),
+                status: Some(status),
+                timing,
+            },
+        );
+        let rows = transcript_item_rows_from_item(&item, 40, None, TuiDiffViewerConfig::default());
+        assert!(
+            rows.iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.content.contains('│')),
+            "structured tool state {status:?} did not render container chrome"
+        );
+        assert!(rows.iter().all(|line| spans_width(&line.spans) <= 40));
+    }
 }
 
 #[cfg(test)]
@@ -3040,14 +3906,15 @@ fn push_reasoning_rows(
     } else {
         "Reasoning"
     };
+    let style = semantic_state_theme().transcript.reasoning_label;
     if let Some(markdown) = markdown {
-        push_markdown_projection_block(rows, title, markdown, semantic_theme().muted, width, false);
+        push_markdown_projection_block(rows, title, markdown, style, width, false);
     } else if item.text_format() == TextFormat::Markdown {
         push_markdown_block_with_streaming(
             rows,
             title,
             item.text(),
-            semantic_theme().muted,
+            style,
             width,
             false,
             item.streaming(),
@@ -3058,7 +3925,7 @@ fn push_reasoning_rows(
             title,
             item.text(),
             item.text_format(),
-            semantic_theme().muted,
+            style,
             false,
             width,
         );
@@ -3087,14 +3954,11 @@ fn push_tool_request_rows(
             )
         },
     );
-    push_tool_block_header(
-        rows,
-        &title,
-        item.tool_timing(),
-        item.tool_is_active(),
-        false,
-        width,
-    );
+    let status = context.status.or_else(|| {
+        item.tool_is_active()
+            .then_some(bcode_session_view_models::ToolInvocationViewStatus::Running)
+    });
+    push_tool_block_header(rows, &title, item.tool_timing(), status, false, width);
     rows.push(Line::default());
 }
 
@@ -3172,24 +4036,60 @@ fn push_canonical_plugin_visual_rows(
     false
 }
 
+fn tool_title_style(
+    status: Option<bcode_session_view_models::ToolInvocationViewStatus>,
+    timing: Option<ToolTiming>,
+    is_error: bool,
+) -> Style {
+    use bcode_session_view_models::ToolInvocationViewStatus;
+
+    let theme = semantic_state_theme();
+    if timing.is_some_and(|timing| timing.timed_out == Some(true)) {
+        theme.transcript.tool_timed_out_title
+    } else if is_error || matches!(status, Some(ToolInvocationViewStatus::Failed)) {
+        theme.transcript.tool_failed_title
+    } else {
+        match status {
+            Some(ToolInvocationViewStatus::Running) => theme.transcript.tool_running_title,
+            Some(ToolInvocationViewStatus::Waiting) => theme.transcript.tool_waiting_title,
+            Some(ToolInvocationViewStatus::Finished) => theme.transcript.tool_succeeded_title,
+            Some(ToolInvocationViewStatus::Cancelled) => theme.transcript.tool_cancelled_title,
+            Some(ToolInvocationViewStatus::Requested | ToolInvocationViewStatus::Failed) | None => {
+                theme.transcript.tool_requested_title
+            }
+        }
+    }
+}
+
 fn push_tool_block_header(
     rows: &mut Vec<Line>,
     title: &str,
     timing: Option<ToolTiming>,
-    streaming: bool,
+    status: Option<bcode_session_view_models::ToolInvocationViewStatus>,
     is_error: bool,
     width: u16,
 ) {
-    let theme = semantic_theme();
-    let title_style = if is_error {
-        theme.diff.removed
-    } else if streaming {
-        theme.focused
-    } else {
-        theme.border
-    };
-    let title = tool_block_title_with_timing(title, timing, streaming);
-    push_wrapped_styled_text(rows, Vec::new(), &title, width, title_style, theme.muted);
+    let theme = semantic_state_theme();
+    let title_style = tool_title_style(status, timing, is_error);
+    let title = tool_block_title_with_timing(
+        title,
+        timing,
+        matches!(
+            status,
+            Some(
+                bcode_session_view_models::ToolInvocationViewStatus::Running
+                    | bcode_session_view_models::ToolInvocationViewStatus::Waiting
+            )
+        ),
+    );
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        &title,
+        width,
+        title_style,
+        theme.transcript.tool_metadata,
+    );
 }
 
 fn tool_block_title_with_timing(
@@ -3258,11 +4158,7 @@ fn push_tool_invocation_fallback_rows(
         rows,
         &title,
         item.tool_timing(),
-        matches!(
-            invocation.status,
-            bcode_session_view_models::ToolInvocationViewStatus::Running
-                | bcode_session_view_models::ToolInvocationViewStatus::Waiting
-        ),
+        Some(invocation.status),
         is_error,
         width,
     );
@@ -3370,7 +4266,11 @@ fn push_tool_result_rows(
                             .or(artifact.title.as_deref())
                             .unwrap_or("Tool result"),
                         timing,
-                        item.streaming(),
+                        Some(if context.is_error {
+                            bcode_session_view_models::ToolInvocationViewStatus::Failed
+                        } else {
+                            bcode_session_view_models::ToolInvocationViewStatus::Finished
+                        }),
                         context.is_error,
                         width,
                     );
@@ -3387,7 +4287,11 @@ fn push_tool_result_rows(
                         rows,
                         &title,
                         item.tool_timing(),
-                        item.streaming(),
+                        Some(if context.is_error {
+                            bcode_session_view_models::ToolInvocationViewStatus::Failed
+                        } else {
+                            bcode_session_view_models::ToolInvocationViewStatus::Finished
+                        }),
                         context.is_error,
                         width,
                     );
@@ -3407,7 +4311,11 @@ fn push_tool_result_rows(
         rows,
         &title,
         item.tool_timing(),
-        item.streaming(),
+        Some(if context.is_error {
+            bcode_session_view_models::ToolInvocationViewStatus::Failed
+        } else {
+            bcode_session_view_models::ToolInvocationViewStatus::Finished
+        }),
         context.is_error,
         width,
     );
@@ -3433,13 +4341,14 @@ fn push_tool_result_rows(
         return;
     }
     if context.has_file_preview && !context.result.trim().is_empty() {
+        let theme = semantic_state_theme();
         push_wrapped_styled_text(
             rows,
-            vec![Span::styled("  ", muted_style())],
+            vec![Span::styled("  ", theme.transcript.tool_metadata)],
             &format!("confirmation: {}", context.result.trim()),
             width,
-            muted_style(),
-            muted_style(),
+            theme.transcript.tool_output,
+            theme.transcript.tool_metadata,
         );
     } else {
         push_labeled_text_preview(
@@ -3451,13 +4360,14 @@ fn push_tool_result_rows(
         );
     }
     if context.is_error {
+        let theme = semantic_state_theme();
         push_wrapped_styled_text(
             rows,
-            vec![Span::styled("  ", muted_style())],
+            vec![Span::styled("  ", theme.transcript.tool_metadata)],
             "tool failed",
             width,
-            muted_style(),
-            muted_style(),
+            theme.transcript.tool_failed_title,
+            theme.transcript.tool_metadata,
         );
     }
     rows.push(Line::default());
@@ -3500,27 +4410,40 @@ fn push_labeled_text_preview(
     if text.is_empty() {
         return;
     }
+    let theme = semantic_state_theme();
     push_wrapped_styled_text(
         rows,
-        vec![Span::styled("  ", muted_style())],
+        vec![Span::styled("  ", theme.transcript.tool_metadata)],
         label,
         width,
-        muted_style().add_modifier(Modifier::BOLD),
-        muted_style(),
+        theme.transcript.tool_label,
+        theme.transcript.tool_metadata,
     );
-    let lines = text.lines().map(Line::raw).collect::<Vec<_>>();
+    let body_style = if matches!(label, "output" | "result") {
+        theme.transcript.tool_output
+    } else {
+        theme.transcript.tool_argument
+    };
+    let lines = text
+        .lines()
+        .map(|line| Line::from_spans(vec![Span::styled(line, body_style)]))
+        .collect::<Vec<_>>();
     let total = lines.len();
     for line in preview_lines(&lines, max_rows) {
-        rows.push(prefix_line(line.clone(), "    ", muted_style()));
+        rows.push(prefix_line(
+            line.clone(),
+            "    ",
+            theme.transcript.tool_metadata,
+        ));
     }
     if total > max_rows {
         push_wrapped_styled_text(
             rows,
-            vec![Span::styled("    ", muted_style())],
+            vec![Span::styled("    ", theme.transcript.tool_metadata)],
             &format!("… {} {label} rows hidden …", total - max_rows),
             width,
-            muted_style(),
-            muted_style(),
+            theme.transcript.tool_truncation,
+            theme.transcript.tool_truncation,
         );
     }
 }
@@ -3571,24 +4494,31 @@ fn push_pending_submission_rows(rows: &mut Vec<Line>, pending: &PendingSubmissio
         &title,
         pending.text(),
         TextFormat::Markdown,
-        semantic_theme().focused,
+        semantic_state_theme().transcript.pending_label,
         true,
         width,
     );
 }
 
 fn push_detail_block(rows: &mut Vec<Line>, title: &str, body: &str, style: Style, width: u16) {
-    push_block(rows, title, body, style, false, width);
+    push_block_with_body_style(
+        rows,
+        title,
+        body,
+        style,
+        semantic_state_theme().transcript.detail_body,
+        width,
+    );
 }
 
 fn push_meta_block(rows: &mut Vec<Line>, text: &str, width: u16) {
     push_wrapped_styled_text(
         rows,
-        vec![Span::styled("· ", muted_style())],
+        vec![Span::styled("· ", semantic_state_theme().transcript.meta)],
         text,
         width,
-        muted_style(),
-        muted_style(),
+        semantic_state_theme().transcript.meta,
+        semantic_state_theme().transcript.meta,
     );
 }
 
@@ -3605,26 +4535,38 @@ fn push_block(
     } else {
         heading_style
     };
-    push_wrapped_styled_text(rows, Vec::new(), title, width, heading_style, heading_style);
     let body_style = if prominent {
         Style::new()
     } else {
         muted_style()
     };
+    push_block_with_body_style(rows, title, body, heading_style, body_style, width);
+}
+
+fn push_block_with_body_style(
+    rows: &mut Vec<Line>,
+    title: &str,
+    body: &str,
+    heading_style: Style,
+    body_style: Style,
+    width: u16,
+) {
+    let continuation_style = semantic_state_theme().transcript.detail_body;
+    push_wrapped_styled_text(rows, Vec::new(), title, width, heading_style, heading_style);
     if body.is_empty() {
         rows.push(Line::from_spans(vec![
-            Span::styled("  ", muted_style()),
+            Span::styled("  ", continuation_style),
             Span::styled("·", body_style),
         ]));
     } else {
         for line in body.lines() {
             push_wrapped_styled_text(
                 rows,
-                vec![Span::styled("  ", muted_style())],
+                vec![Span::styled("  ", continuation_style)],
                 line,
                 width,
                 body_style,
-                muted_style(),
+                continuation_style,
             );
         }
     }

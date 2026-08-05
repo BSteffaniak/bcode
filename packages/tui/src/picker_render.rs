@@ -104,3 +104,40 @@ pub fn render_picker_list(
         .render(area, frame, &mut render_state);
     *state = render_state;
 }
+
+#[cfg(test)]
+mod tests {
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::frame::Frame;
+    use bmux_tui::geometry::{Point, Rect};
+
+    use super::render_picker_panel;
+    use crate::render::TuiTheme;
+
+    #[test]
+    fn picker_panel_chrome_tracks_terminal_native_dark_and_light_themes() {
+        let mut observed = Vec::new();
+        for theme_id in ["terminal-native", "bcode-dark", "bcode-light"] {
+            let theme = TuiTheme::for_theme_id(theme_id);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 8));
+            let mut frame = Frame::new(&mut buffer);
+            let inner = render_picker_panel(" Picker ", frame.area(), &mut frame, theme);
+            assert_eq!(inner, Rect::new(2, 2, 20, 4));
+            assert_eq!(
+                frame.buffer().get(Point::new(0, 0)).expect("border").style,
+                theme.border,
+                "{theme_id} border"
+            );
+            assert_eq!(
+                frame.buffer().get(Point::new(1, 1)).expect("body").style,
+                theme.text,
+                "{theme_id} body"
+            );
+            observed.push((theme_id, theme.text, theme.border));
+        }
+
+        assert!(observed[0].1.bg.is_none());
+        assert_ne!(observed[1].1, observed[2].1);
+        assert_ne!(observed[1].2, observed[2].2);
+    }
+}

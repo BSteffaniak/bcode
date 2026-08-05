@@ -118,7 +118,11 @@ impl Default for SyntaxHighlighter {
 }
 
 impl SyntaxHighlighter {
-    /// Create a syntax highlighter using the bundled default syntax theme.
+    /// Create a syntax highlighter using a neutral bundled classification theme.
+    ///
+    /// Application presentation should use [`Self::with_palette`]. This
+    /// compatibility constructor is retained for standalone callers that have
+    /// not supplied semantic syntax colors.
     #[must_use]
     pub const fn new() -> Self {
         Self { palette: None }
@@ -153,7 +157,7 @@ impl SyntaxHighlighter {
         let Some(syntax) = syntax_for(path_or_language) else {
             return plain_syntax_spans(line);
         };
-        let mut highlighter = HighlightLines::new(syntax, default_theme());
+        let mut highlighter = HighlightLines::new(syntax, classification_theme());
         highlight_line_tokens_with(&mut highlighter, line).map_or_else(
             || plain_syntax_spans_with_palette(line, self.palette),
             |spans| remap_spans(spans, self.palette),
@@ -182,7 +186,7 @@ impl SyntaxHighlighter {
                 .map(|line| plain_syntax_spans_with_palette(line, self.palette))
                 .collect();
         };
-        let mut highlighter = HighlightLines::new(syntax, default_theme());
+        let mut highlighter = HighlightLines::new(syntax, classification_theme());
         lines
             .iter()
             .map(|line| {
@@ -199,15 +203,10 @@ fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
-fn default_theme() -> &'static Theme {
+fn classification_theme() -> &'static Theme {
     DEFAULT_THEME.get_or_init(|| {
         let themes = ThemeSet::load_defaults();
-        themes
-            .themes
-            .get("base16-ocean.dark")
-            .or_else(|| themes.themes.values().next())
-            .cloned()
-            .unwrap_or_default()
+        themes.themes.values().next().cloned().unwrap_or_default()
     })
 }
 

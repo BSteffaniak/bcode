@@ -378,6 +378,45 @@ mod tests {
     }
 
     #[test]
+    fn terminal_content_colors_remain_content_owned() {
+        let rows = terminal_viewer_rows(
+            TerminalViewerInput {
+                output: "\u{1b}[38;2;12;34;56mRGB\u{1b}[0m \u{1b}[31mANSI\u{1b}[0m plain\n",
+                columns: 80,
+                rows: 24,
+                exit_code: Some(0),
+                timed_out: Some(false),
+                elapsed: None,
+                output_truncated: false,
+                output_bytes: None,
+                retained_output_bytes: None,
+                show_status: true,
+                sizing: TerminalViewerSizing::Compact,
+            },
+            100,
+        );
+        let output_spans = rows
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| matches!(span.content.as_str(), "RGB" | "ANSI" | "plain"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            output_spans
+                .iter()
+                .any(|span| span.content == "RGB" && span.style.fg == Some(Color::Rgb(12, 34, 56)))
+        );
+        assert!(
+            output_spans
+                .iter()
+                .any(|span| span.content == "ANSI" && span.style.fg == Some(Color::Red))
+        );
+        let rendered = rendered_text(&rows);
+        assert!(rendered.contains("plain"));
+        assert_eq!(rows[0].spans[0].style, muted_style());
+    }
+
+    #[test]
     fn terminal_viewer_interprets_carriage_return() {
         let rows = terminal_viewer_rows(
             TerminalViewerInput {

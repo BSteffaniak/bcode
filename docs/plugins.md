@@ -64,6 +64,15 @@ Cross-boundary requests and responses use Bcode-owned serializable contracts. Pr
 
 The [`hello-plugin`](../examples/hello-plugin) example is a native dynamic library with a manifest, service, event subscriptions, authentication contribution, and serialized TUI visual adapter. It is primarily a smoke-test fixture, but it demonstrates the complete loading boundary.
 
+## Serialized visual presentation roles
+
+Serialized TUI visual responses are versioned independently from tool/artifact schemas. Contract version 1 remains readable and supports concrete terminal foreground colors. Contract version 2 adds renderer-neutral `role` values for text, muted, accent, info, success, warning, error, and diff states.
+
+When both `role` and `foreground` are present, the active renderer theme resolves the semantic role and takes precedence. The concrete color remains a compatibility fallback when no renderer theme is available. Unknown future response versions fail closed and fall through to the normal native or generic presentation path rather than being guessed. A response declaring semantic roles with version 1 is rejected.
+
+The host includes the resolved theme fingerprint in serialized visual context and dynamic cache identity. This metadata may invalidate derived presentation only; plugins must not use it for routing, authorization, dispatch, or persisted outcomes.
+
+
 ```sh
 cargo build -p bcode_hello_plugin
 ```

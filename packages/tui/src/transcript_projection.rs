@@ -261,6 +261,51 @@ pub fn test_layout_signature(
     transcript_item_signature(item, &input)
 }
 
+#[cfg(test)]
+#[must_use]
+pub fn test_layout_signature_with_theme(
+    item: &TranscriptItem,
+    width: u16,
+    theme_fingerprint: u64,
+) -> TranscriptLayoutSignature {
+    let transcript = [item.clone()];
+    let pending = [];
+    let input = TranscriptLayoutInput {
+        width,
+        transcript: TranscriptItems::new(&transcript, &[]),
+        plugin_host: None,
+        diff_viewer_config: TuiDiffViewerConfig::default(),
+        pending: &pending,
+        elapsed_layout_revision: 0,
+        transcript_projection_revision: 0,
+        active_interaction_layout: None,
+        markdown_presentation_revision: 0,
+        pending_submissions_projection_revision: 0,
+        theme_fingerprint,
+        has_older_history: false,
+        loading_older_history: false,
+    };
+    transcript_item_signature(item, &input)
+}
+
+#[cfg(test)]
+#[test]
+fn theme_fingerprint_changes_versioned_transcript_layout_signature_exactly() {
+    let item = TranscriptItem::with_format(
+        "Bcode",
+        "# themed markdown".to_owned(),
+        bcode_session_view_models::TextFormat::Markdown,
+    );
+    let first = test_layout_signature_with_theme(&item, 80, 11);
+    let repeated = test_layout_signature_with_theme(&item, 80, 11);
+    let changed = test_layout_signature_with_theme(&item, 80, 12);
+
+    assert_eq!(first, repeated);
+    assert_ne!(first, changed);
+    assert!(first.as_str().contains("theme:11"));
+    assert!(changed.as_str().contains("theme:12"));
+}
+
 fn transcript_item_signature(
     item: &TranscriptItem,
     input: &TranscriptLayoutInput<'_>,

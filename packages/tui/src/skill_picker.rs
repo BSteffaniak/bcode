@@ -3,7 +3,7 @@
 use bcode_skill_models::{SkillId, SkillSummary};
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
@@ -90,14 +90,14 @@ impl SkillPickerApp {
 
     /// Return visible list items.
     #[must_use]
-    pub fn list_items(&self) -> Vec<ListItem> {
+    pub fn list_items(&self, muted: Style) -> Vec<ListItem> {
         if self.list.indices().is_empty() {
-            return vec![empty_item("No matching skills.")];
+            return vec![empty_item("No matching skills.", muted)];
         }
         self.list
             .indices()
             .iter()
-            .map(|index| skill_item(&self.skills[*index]))
+            .map(|index| skill_item(&self.skills[*index], muted))
             .collect()
     }
 
@@ -141,7 +141,7 @@ impl SkillPickerApp {
     }
 }
 
-fn skill_item(skill: &SkillSummary) -> ListItem {
+fn skill_item(skill: &SkillSummary, muted: Style) -> ListItem {
     let description = skill.description.as_deref().unwrap_or("no description");
     ListItem::new(Line::from_spans(vec![
         Span::styled(
@@ -149,7 +149,7 @@ fn skill_item(skill: &SkillSummary) -> ListItem {
             Style::new().add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(description.to_owned(), Style::new().fg(Color::BrightBlack)),
+        Span::styled(description.to_owned(), muted),
     ]))
 }
 
@@ -163,9 +163,9 @@ fn skill_matches(skill: &SkillSummary, query: &str) -> bool {
             .is_some_and(|description| description.to_ascii_lowercase().contains(query))
 }
 
-fn empty_item(message: &str) -> ListItem {
+fn empty_item(message: &str, muted: Style) -> ListItem {
     ListItem::new(Line::from_spans(vec![Span::styled(
         message.to_owned(),
-        Style::new().fg(Color::BrightBlack),
+        muted,
     )]))
 }

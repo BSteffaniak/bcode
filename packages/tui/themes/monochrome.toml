@@ -21,6 +21,9 @@ modifiers = ["bold", "underline"]
 [styles."state.error"]
 modifiers = ["bold", "reversed"]
 
+[styles."tool.requested.title"]
+modifiers = ["dim"]
+
 [styles."tool.running.title"]
 modifiers = ["italic"]
 

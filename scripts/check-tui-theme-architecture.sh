@@ -9,7 +9,8 @@ for theme in \
   packages/tui/themes/bcode-dark.toml \
   packages/tui/themes/bcode-light.toml \
   packages/tui/themes/monochrome.toml \
-  packages/tui/themes/high-contrast.toml; do
+  packages/tui/themes/high-contrast.toml \
+  packages/tui/themes/nord.toml; do
   [[ -f "$theme" ]] || fail "missing required bundled theme: $theme"
 done
 

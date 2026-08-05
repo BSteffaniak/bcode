@@ -39,6 +39,7 @@ fn render_shell_visual(context: &NativeServiceContext) -> Option<ServiceResponse
             rows: vec![bcode_plugin_sdk::tui_visual::SerializedTuiRow {
                 spans: vec![bcode_plugin_sdk::tui_visual::SerializedTuiSpan {
                     text: format!("hello dynamic {}", request.invocation_id),
+                    role: Some(bcode_plugin_sdk::tui_visual::SerializedTuiStyleRole::Accent),
                     foreground: bcode_plugin_sdk::tui_visual::SerializedTuiColor::LightCyan,
                     modifiers: vec![bcode_plugin_sdk::tui_visual::SerializedTuiModifier::Bold],
                 }],

@@ -305,6 +305,10 @@ impl ThemeCatalog {
             "builtin:high-contrast",
             include_str!("../../themes/high-contrast.toml"),
         )?);
+        catalog.insert(parse_theme_definition(
+            "builtin:nord",
+            include_str!("../../themes/nord.toml"),
+        )?);
         Ok(catalog)
     }
 
@@ -331,6 +335,7 @@ impl ThemeCatalog {
             "bcode-light" => Some(include_str!("../../themes/bcode-light.toml")),
             "monochrome" => Some(include_str!("../../themes/monochrome.toml")),
             "high-contrast" => Some(include_str!("../../themes/high-contrast.toml")),
+            "nord" => Some(include_str!("../../themes/nord.toml")),
             _ => None,
         }
     }
@@ -1217,7 +1222,7 @@ indicator = "exit-code"
     #[test]
     fn bundled_themes_use_the_runtime_loader() {
         let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
-        assert_eq!(catalog.definitions.len(), 6);
+        assert_eq!(catalog.definitions.len(), 7);
         let native_definition = catalog
             .definitions
             .get("terminal-native")

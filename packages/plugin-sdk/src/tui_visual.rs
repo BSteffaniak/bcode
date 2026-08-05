@@ -13,8 +13,10 @@ pub const TUI_VISUAL_ADAPTER_INTERFACE_ID: &str = "bcode.tui-visual-adapter/v1";
 pub const OP_RENDER_TUI_VISUAL: &str = "render";
 /// Deliver one bounded artifact chunk through a serialized TUI extension.
 pub const OP_DELIVER_TUI_VISUAL_ARTIFACT: &str = "artifact_chunk";
+/// Earliest serialized TUI visual extension contract version accepted by this SDK.
+pub const MIN_TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 1;
 /// Current serialized TUI visual extension contract version.
-pub const TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 1;
+pub const TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 2;
 /// Maximum rows accepted from one serialized visual response.
 pub const MAX_SERIALIZED_TUI_VISUAL_ROWS: usize = 256;
 /// Maximum spans accepted across one serialized visual response.
@@ -56,10 +58,30 @@ pub enum SerializedTuiModifier {
     Underlined,
 }
 
+/// Stable renderer-neutral semantic style role exposed by contract version 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SerializedTuiStyleRole {
+    Text,
+    Muted,
+    Accent,
+    Info,
+    Success,
+    Warning,
+    Error,
+    DiffAdded,
+    DiffRemoved,
+    DiffHunk,
+}
+
 /// One bounded styled text span returned by a serialized extension.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializedTuiSpan {
     pub text: String,
+    /// Optional semantic role. When present, renderer-owned role presentation
+    /// takes precedence over the compatibility foreground color.
+    #[serde(default)]
+    pub role: Option<SerializedTuiStyleRole>,
     #[serde(default)]
     pub foreground: SerializedTuiColor,
     #[serde(default)]
@@ -78,6 +100,10 @@ pub struct SerializedTuiVisualContext {
     pub width: u16,
     pub diff_layout: String,
     pub working_directory: Option<PathBuf>,
+    /// Stable renderer-owned presentation identity. Plugins may use this only
+    /// to invalidate derived presentation, never for execution semantics.
+    #[serde(default)]
+    pub theme_fingerprint: u64,
 }
 
 /// Request to render one exact manifest adapter through a dynamic plugin service.
@@ -113,11 +139,22 @@ impl RenderTuiVisualResponse {
     /// Returns an error for unsupported versions, invalid render modes, or excessive rows, spans,
     /// or text bytes.
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != TUI_VISUAL_ADAPTER_CONTRACT_VERSION {
+        if !(MIN_TUI_VISUAL_ADAPTER_CONTRACT_VERSION..=TUI_VISUAL_ADAPTER_CONTRACT_VERSION)
+            .contains(&self.version)
+        {
             return Err(format!(
                 "unsupported TUI visual response version {}",
                 self.version
             ));
+        }
+        if self.version < 2
+            && self
+                .rows
+                .iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.role.is_some())
+        {
+            return Err("semantic TUI visual roles require response version 2".to_owned());
         }
         if !matches!(
             self.render_mode.as_str(),
@@ -141,6 +178,58 @@ impl RenderTuiVisualResponse {
             return Err("serialized TUI visual content limit exceeded".to_owned());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_one_concrete_color_response_remains_compatible() {
+        let response = RenderTuiVisualResponse {
+            version: 1,
+            render_mode: "inline".to_owned(),
+            title: None,
+            timeout_ms: None,
+            rows: vec![SerializedTuiRow {
+                spans: vec![SerializedTuiSpan {
+                    text: "legacy".to_owned(),
+                    role: None,
+                    foreground: SerializedTuiColor::Green,
+                    modifiers: vec![SerializedTuiModifier::Bold],
+                }],
+            }],
+        };
+
+        assert!(response.validate().is_ok());
+        assert_eq!(
+            response.rows[0].spans[0].foreground,
+            SerializedTuiColor::Green
+        );
+    }
+
+    #[test]
+    fn semantic_roles_require_version_two_and_future_versions_fail_closed() {
+        let semantic = RenderTuiVisualResponse {
+            version: 1,
+            render_mode: "inline".to_owned(),
+            title: None,
+            timeout_ms: None,
+            rows: vec![SerializedTuiRow {
+                spans: vec![SerializedTuiSpan {
+                    text: "semantic".to_owned(),
+                    role: Some(SerializedTuiStyleRole::Warning),
+                    foreground: SerializedTuiColor::Red,
+                    modifiers: Vec::new(),
+                }],
+            }],
+        };
+        assert!(semantic.validate().is_err());
+
+        let mut future = semantic;
+        future.version = TUI_VISUAL_ADAPTER_CONTRACT_VERSION + 1;
+        assert!(future.validate().is_err());
     }
 }
 

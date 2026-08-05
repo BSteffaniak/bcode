@@ -109,6 +109,89 @@ pub fn active_theme_input_signature(app: &BmuxApp) -> u64 {
     discovery::theme_input_signature(&roots)
 }
 
+/// One resolved renderer-owned container recipe and its presentation style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerPresentation {
+    /// Bounded layout recipe.
+    pub recipe: definition::ContainerRecipe,
+    /// Container background/border style.
+    pub style: bmux_tui::style::Style,
+}
+
+/// Resolved bounded transcript/container recipes used only by the TUI renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptContainerTheme {
+    /// User message recipe.
+    pub user: ContainerPresentation,
+    /// Assistant message recipe.
+    pub assistant: ContainerPresentation,
+    /// Requested tool recipe.
+    pub tool_requested: ContainerPresentation,
+    /// Running tool recipe.
+    pub tool_running: ContainerPresentation,
+    /// Waiting tool recipe.
+    pub tool_waiting: ContainerPresentation,
+    /// Successful tool recipe.
+    pub tool_succeeded: ContainerPresentation,
+    /// Failed tool recipe.
+    pub tool_failed: ContainerPresentation,
+    /// Cancelled tool recipe.
+    pub tool_cancelled: ContainerPresentation,
+    /// Timed-out tool recipe.
+    pub tool_timed_out: ContainerPresentation,
+}
+
+/// Resolved semantic transcript and generic tool content styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptStyleTheme {
+    /// User message label.
+    pub user_label: bmux_tui::style::Style,
+    /// Assistant message label.
+    pub assistant_label: bmux_tui::style::Style,
+    /// Reasoning label.
+    pub reasoning_label: bmux_tui::style::Style,
+    /// System message label.
+    pub system_label: bmux_tui::style::Style,
+    /// Metadata text.
+    pub meta: bmux_tui::style::Style,
+    /// Skill label.
+    pub skill_label: bmux_tui::style::Style,
+    /// Skill error label.
+    pub skill_error_label: bmux_tui::style::Style,
+    /// Pending-submission label.
+    pub pending_label: bmux_tui::style::Style,
+    /// Stream-integrity label.
+    pub stream_status_label: bmux_tui::style::Style,
+    /// Generic detail label.
+    pub detail_label: bmux_tui::style::Style,
+    /// Generic detail body.
+    pub detail_body: bmux_tui::style::Style,
+    /// Tool title for requested state.
+    pub tool_requested_title: bmux_tui::style::Style,
+    /// Tool title for running state.
+    pub tool_running_title: bmux_tui::style::Style,
+    /// Tool title for waiting state.
+    pub tool_waiting_title: bmux_tui::style::Style,
+    /// Tool title for successful state.
+    pub tool_succeeded_title: bmux_tui::style::Style,
+    /// Tool title for failed state.
+    pub tool_failed_title: bmux_tui::style::Style,
+    /// Tool title for cancelled state.
+    pub tool_cancelled_title: bmux_tui::style::Style,
+    /// Tool title for timed-out state.
+    pub tool_timed_out_title: bmux_tui::style::Style,
+    /// Tool metadata such as timing.
+    pub tool_metadata: bmux_tui::style::Style,
+    /// Tool field label.
+    pub tool_label: bmux_tui::style::Style,
+    /// Tool argument value.
+    pub tool_argument: bmux_tui::style::Style,
+    /// Tool output body.
+    pub tool_output: bmux_tui::style::Style,
+    /// Tool truncation notice.
+    pub tool_truncation: bmux_tui::style::Style,
+}
+
 /// Fully resolved target theme derived from app state and configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedTheme {
@@ -142,6 +225,10 @@ pub struct ResolvedTheme {
     pub source: bcode_tui_components::source_viewer::SourceViewerStyle,
     /// Semantic diff presentation.
     pub diff: bcode_tui_components::diff_viewer::DiffViewerStyle,
+    /// Resolved bounded transcript/container recipes.
+    pub containers: TranscriptContainerTheme,
+    /// Resolved semantic transcript and generic tool content styles.
+    pub transcript: TranscriptStyleTheme,
     /// Stable resolved presentation fingerprint.
     pub fingerprint: u64,
 }
@@ -164,6 +251,8 @@ impl ResolvedTheme {
             syntax: self.syntax,
             source: self.source,
             diff: self.diff,
+            containers: self.containers,
+            transcript: self.transcript,
             fingerprint: self.fingerprint,
         }
     }
@@ -202,6 +291,10 @@ pub struct PresentedTheme {
     pub source: bcode_tui_components::source_viewer::SourceViewerStyle,
     /// Semantic diff presentation.
     pub diff: bcode_tui_components::diff_viewer::DiffViewerStyle,
+    /// Resolved bounded transcript/container recipes.
+    pub containers: TranscriptContainerTheme,
+    /// Resolved semantic transcript and generic tool content styles.
+    pub transcript: TranscriptStyleTheme,
     /// Stable resolved presentation fingerprint.
     pub fingerprint: u64,
 }
@@ -360,6 +453,7 @@ pub(crate) fn resolved_accent(theme: Option<&definition::ResolvedThemeDefinition
         .unwrap_or(PENDING_AGENT_METADATA_ACCENT)
 }
 
+#[allow(clippy::too_many_lines)] // Resolves one immutable presentation aggregate from semantic roles.
 pub(crate) fn resolved_definition_theme(
     theme: Option<&definition::ResolvedThemeDefinition>,
     accent: Color,
@@ -412,6 +506,63 @@ pub(crate) fn resolved_definition_theme(
         removed_emphasis: style("diff.removed_emphasis")
             .unwrap_or_else(|| bmux_tui::style::Style::new().add_modifier(Modifier::UNDERLINE)),
     };
+    let default_container = definition::ContainerRecipe {
+        layout: definition::ContainerLayout::Plain,
+        width: definition::ContainerWidth::Content,
+        border: definition::ContainerBorder::None,
+        padding_x: 0,
+        padding_y: 0,
+    };
+    let container = |role: &str| {
+        theme
+            .and_then(|theme| theme.containers.get(role).copied())
+            .unwrap_or(default_container)
+    };
+    let presentation =
+        |role: &str, style_role: &str, fallback: bmux_tui::style::Style| ContainerPresentation {
+            recipe: container(role),
+            style: style(style_role).unwrap_or(fallback),
+        };
+    let containers = TranscriptContainerTheme {
+        user: presentation("transcript.user", "transcript.user.container", text),
+        assistant: presentation(
+            "transcript.assistant",
+            "transcript.assistant.container",
+            text,
+        ),
+        tool_requested: presentation("tool.requested", "tool.requested.container", muted),
+        tool_running: presentation("tool.running", "tool.running.container", info),
+        tool_waiting: presentation("tool.waiting", "tool.waiting.container", warning),
+        tool_succeeded: presentation("tool.succeeded", "tool.succeeded.container", success),
+        tool_failed: presentation("tool.failed", "tool.failed.container", error),
+        tool_cancelled: presentation("tool.cancelled", "tool.cancelled.container", muted),
+        tool_timed_out: presentation("tool.timed_out", "tool.timed_out.container", warning),
+    };
+    let transcript = TranscriptStyleTheme {
+        user_label: style("transcript.user.label").unwrap_or(focused),
+        assistant_label: style("transcript.assistant.label").unwrap_or(success),
+        reasoning_label: style("transcript.reasoning.label").unwrap_or(muted),
+        system_label: style("transcript.system.label").unwrap_or(muted),
+        meta: style("transcript.meta").unwrap_or(muted),
+        skill_label: style("transcript.skill.label").unwrap_or(focused),
+        skill_error_label: style("transcript.skill_error.label").unwrap_or(error),
+        pending_label: style("transcript.pending.label").unwrap_or(focused),
+        stream_status_label: style("transcript.stream_status.label").unwrap_or(warning),
+        detail_label: style("transcript.detail.label").unwrap_or(muted),
+        detail_body: style("transcript.detail.body").unwrap_or(muted),
+        tool_requested_title: style("tool.requested.title").unwrap_or(muted),
+        tool_running_title: style("tool.running.title").unwrap_or(info),
+        tool_waiting_title: style("tool.waiting.title").unwrap_or(warning),
+        tool_succeeded_title: style("tool.succeeded.title").unwrap_or(success),
+        tool_failed_title: style("tool.failed.title").unwrap_or(error),
+        tool_cancelled_title: style("tool.cancelled.title").unwrap_or(muted),
+        tool_timed_out_title: style("tool.timed_out.title").unwrap_or(warning),
+        tool_metadata: style("tool.metadata").unwrap_or(muted),
+        tool_label: style("tool.label").unwrap_or_else(|| muted.add_modifier(Modifier::BOLD)),
+        tool_argument: style("tool.argument").unwrap_or(text),
+        tool_output: style("tool.output").unwrap_or(text),
+        tool_truncation: style("tool.truncation").unwrap_or(muted),
+    };
     ResolvedTheme {
         accent,
         text,
@@ -428,6 +579,8 @@ pub(crate) fn resolved_definition_theme(
         syntax,
         source,
         diff,
+        containers,
+        transcript,
         fingerprint: theme.map_or(0, |theme| theme.fingerprint),
     }
 }
@@ -626,6 +779,51 @@ mod capability_tests {
                 }
             ),
             definition::ResolvedThemeVariant::Light
+        );
+    }
+
+    #[test]
+    fn missing_and_reduced_color_capabilities_keep_terminal_native_usable() {
+        use bmux_tui::capabilities::{
+            TerminalBackground, TerminalCapabilities, TerminalColorDepth,
+        };
+
+        let missing = TerminalCapabilities::detect_with(|_| None);
+        assert_eq!(missing.background, TerminalBackground::Unknown);
+        assert_eq!(missing.color_depth, TerminalColorDepth::Ansi16);
+        assert_eq!(
+            resolve_variant(TuiThemeVariant::Auto, missing),
+            definition::ResolvedThemeVariant::Dark
+        );
+
+        let reduced = TerminalCapabilities::detect_with(|name| match name {
+            "NO_COLOR" => Some(String::new()),
+            "COLORFGBG" => Some("15;0".to_owned()),
+            _ => None,
+        });
+        assert_eq!(reduced.background, TerminalBackground::Dark);
+        assert_eq!(reduced.color_depth, TerminalColorDepth::Monochrome);
+
+        let catalog = definition::ThemeCatalog::bundled().expect("bundled themes parse");
+        let native = catalog
+            .resolve(
+                &definition::ThemeSelection::new("terminal-native")
+                    .variant(resolve_variant(TuiThemeVariant::Auto, reduced)),
+            )
+            .expect("terminal-native resolves with reduced-color capabilities");
+        let presented = resolved_definition_theme(Some(&native), PENDING_AGENT_METADATA_ACCENT)
+            .presented(PENDING_AGENT_METADATA_ACCENT);
+        assert!(
+            presented
+                .text
+                .fg
+                .is_none_or(|color| color == Color::Default)
+        );
+        assert!(
+            presented
+                .background
+                .bg
+                .is_none_or(|color| color == Color::Default)
         );
     }
 }

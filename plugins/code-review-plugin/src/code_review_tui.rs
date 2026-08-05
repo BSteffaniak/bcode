@@ -12593,6 +12593,100 @@ pub(crate) mod tests {
         }
     }
 
+    fn test_plugin_theme(fingerprint: u64, red: u8) -> bcode_plugin_sdk::tui::PluginTuiTheme {
+        let style = bmux_tui::style::Style::new();
+        let syntax_color = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(red, 34, 56);
+        bcode_plugin_sdk::tui::PluginTuiTheme {
+            canvas: style,
+            text: style,
+            muted: style,
+            border: style,
+            focused: style,
+            selection: style.add_modifier(bmux_tui::style::Modifier::REVERSED),
+            source: bcode_plugin_sdk::tui::PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: bcode_plugin_sdk::tui::PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme {
+                text: syntax_color,
+                comment: syntax_color,
+                keyword: syntax_color,
+                function: syntax_color,
+                variable: syntax_color,
+                string: syntax_color,
+                number: syntax_color,
+                type_name: syntax_color,
+                operator: syntax_color,
+                punctuation: syntax_color,
+            },
+            fingerprint,
+        }
+    }
+
+    #[test]
+    fn theme_fingerprint_invalidates_bounded_review_document_cache() {
+        let mut app = sample_app();
+        let first = app
+            .current_review_view_document()
+            .expect("initial document");
+        assert!(
+            app.view_document_cache
+                .read()
+                .expect("cache read")
+                .is_some()
+        );
+
+        app.set_tui_theme(Some(test_plugin_theme(7, 12)));
+        assert!(
+            app.view_document_cache
+                .read()
+                .expect("cache read")
+                .is_none()
+        );
+        let themed = app.current_review_view_document().expect("themed document");
+        assert_eq!(first.rows.len(), themed.rows.len());
+        assert_eq!(
+            app.view_document_cache
+                .read()
+                .expect("cache read")
+                .as_ref()
+                .expect("one cached document")
+                .key
+                .theme_fingerprint,
+            7
+        );
+
+        app.set_tui_theme(Some(test_plugin_theme(7, 99)));
+        assert!(
+            app.view_document_cache
+                .read()
+                .expect("same identity preserves cache")
+                .is_some()
+        );
+        app.set_tui_theme(Some(test_plugin_theme(8, 99)));
+        assert!(
+            app.view_document_cache
+                .read()
+                .expect("changed identity invalidates cache")
+                .is_none()
+        );
+    }
+
     pub fn sample_app() -> ReviewApp {
         ReviewApp::new(ReviewSummary {
             title: "test".to_string(),

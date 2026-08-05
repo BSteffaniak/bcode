@@ -3,7 +3,7 @@
 use bcode_command::{CommandContribution, CommandSurface};
 use bmux_tui::palette::{CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::style::Modifier;
 
 /// Command palette state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +35,11 @@ impl BmuxCommandPalette {
 
     /// Return cloned items for rendering/handling.
     #[must_use]
-    pub fn cloned_items(&self) -> Vec<PaletteItem> {
-        self.contributions.iter().map(palette_item).collect()
+    pub fn cloned_items(&self, muted: Style) -> Vec<PaletteItem> {
+        self.contributions
+            .iter()
+            .map(|contribution| palette_item(contribution, muted))
+            .collect()
     }
 
     /// Return palette state mutably.
@@ -57,12 +60,13 @@ impl Default for BmuxCommandPalette {
     }
 }
 
-fn palette_item(contribution: &CommandContribution) -> PaletteItem {
+fn palette_item(contribution: &CommandContribution, muted: Style) -> PaletteItem {
     raw_item(
         &contribution.id,
         &contribution.title,
         contribution.description.as_deref().unwrap_or_default(),
         &command_search_text(contribution),
+        muted,
     )
 }
 
@@ -79,13 +83,19 @@ fn command_search_text(contribution: &CommandContribution) -> String {
     .join(" ")
 }
 
-fn raw_item(id: &str, title: &str, description: &str, search_text: &str) -> PaletteItem {
+fn raw_item(
+    id: &str,
+    title: &str,
+    description: &str,
+    search_text: &str,
+    muted: Style,
+) -> PaletteItem {
     PaletteItem::new(
         id,
         Line::from_spans(vec![
             Span::styled(title.to_owned(), Style::new().add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(description.to_owned(), Style::new().fg(Color::BrightBlack)),
+            Span::styled(description.to_owned(), muted),
         ]),
     )
     .search_text(search_text)
@@ -126,7 +136,7 @@ mod tests {
         let palette = BmuxCommandPalette::with_command_contributions(
             registry.commands_for_surface(&CommandSurface::Palette),
         );
-        let items = palette.cloned_items();
+        let items = palette.cloned_items(Style::new());
         let index = items
             .iter()
             .position(|item| item.id == "example.dynamic")
@@ -173,7 +183,7 @@ mod tests {
 
         assert!(
             palette
-                .cloned_items()
+                .cloned_items(Style::new())
                 .iter()
                 .all(|item| item.id != "example.hidden")
         );

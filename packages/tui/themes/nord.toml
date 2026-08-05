@@ -1,0 +1,155 @@
+display_name   = "Nord"
+extends        = ["terminal-native-structured"]
+id             = "nord"
+schema_version = 1
+
+# Adapted from the Nord palette by Sven Greb, licensed under MIT.
+# Source and complete license: attribution/nord.md
+[palette]
+accent             = "#88c0d0"
+background         = "#2e3440"
+border             = "#4c566a"
+error              = "#bf616a"
+error_background   = "#3b303b"
+info               = "#81a1c1"
+muted              = "#7b88a1"
+muted_background   = "#3b4252"
+selection          = "#434c5e"
+success            = "#a3be8c"
+success_background = "#35423a"
+text               = "#eceff4"
+warning            = "#ebcb8b"
+warning_background = "#49443c"
+
+[styles.canvas]
+bg = "$background"
+fg = "$text"
+
+[styles."text.primary"]
+fg = "$text"
+
+[styles."text.muted"]
+fg = "$muted"
+
+[styles."border.default"]
+fg = "$border"
+
+[styles."border.focused"]
+fg        = "$accent"
+modifiers = ["bold"]
+
+[styles."selection.active"]
+bg        = "$selection"
+fg        = "$text"
+modifiers = ["bold"]
+
+[styles."state.info"]
+fg = "$info"
+
+[styles."state.success"]
+fg        = "$success"
+modifiers = ["bold"]
+
+[styles."state.warning"]
+fg        = "$warning"
+modifiers = ["bold"]
+
+[styles."state.error"]
+fg        = "$error"
+modifiers = ["bold"]
+
+[styles."source.border"]
+fg = "$border"
+
+[styles."source.gutter"]
+fg = "$muted"
+
+[styles."source.truncated"]
+fg = "$warning"
+
+[styles."diff.text"]
+fg = "$text"
+
+[styles."diff.muted"]
+fg = "$muted"
+
+[styles."diff.title"]
+fg        = "$accent"
+modifiers = ["bold"]
+
+[styles."diff.label"]
+fg        = "$text"
+modifiers = ["bold"]
+
+[styles."diff.added"]
+fg = "$success"
+
+[styles."diff.removed"]
+fg = "$error"
+
+[styles."diff.hunk"]
+fg = "$info"
+
+[styles."diff.added_row"]
+bg = "$success_background"
+
+[styles."diff.removed_row"]
+bg = "$error_background"
+
+[styles."diff.added_emphasis"]
+bg        = "#405044"
+modifiers = ["bold"]
+
+[styles."diff.removed_emphasis"]
+bg        = "#533a42"
+modifiers = ["bold"]
+
+[styles."syntax.text"]
+fg = "$text"
+
+[styles."syntax.comment"]
+fg = "$muted"
+
+[styles."syntax.keyword"]
+fg = "#81a1c1"
+
+[styles."syntax.function"]
+fg = "#88c0d0"
+
+[styles."syntax.variable"]
+fg = "#d8dee9"
+
+[styles."syntax.string"]
+fg = "#a3be8c"
+
+[styles."syntax.number"]
+fg = "#b48ead"
+
+[styles."syntax.type"]
+fg = "#8fbcbb"
+
+[styles."syntax.operator"]
+fg = "#81a1c1"
+
+[styles."syntax.punctuation"]
+fg = "#e5e9f0"
+
+[styles."tool.running.title"]
+fg        = "$info"
+modifiers = ["bold"]
+
+[styles."tool.waiting.title"]
+fg        = "$warning"
+modifiers = ["bold"]
+
+[styles."tool.succeeded.title"]
+fg        = "$success"
+modifiers = ["bold"]
+
+[styles."tool.failed.title"]
+fg        = "$error"
+modifiers = ["bold"]
+
+[styles."tool.timed_out.title"]
+fg        = "$warning"
+modifiers = ["bold", "underline"]

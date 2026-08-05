@@ -499,7 +499,7 @@ impl ChatLoopState {
 
     pub fn handle_command_palette_key(&mut self, stroke: KeyStroke) -> Option<CommandAction> {
         let palette = self.palette.as_mut()?;
-        let items = palette.cloned_items();
+        let items = palette.cloned_items(bmux_tui::prelude::Style::new());
         let widget = bmux_tui::palette::CommandPalette::new(&items);
         match widget.handle_key(palette.state_mut(), 12, stroke) {
             bmux_tui::palette::CommandPaletteKeyOutcome::Ignored
