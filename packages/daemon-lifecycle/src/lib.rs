@@ -14,8 +14,10 @@ use std::io::{Read, Seek as _, Write as _};
 use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
+#[cfg(all(unix, test))]
+use std::os::unix::fs::MetadataExt as _;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -422,10 +424,15 @@ fn process_identity_evidence(record: &DaemonRecord) -> ProcessIdentityEvidence {
     let Some(executable) = process.exe() else {
         return ProcessIdentityEvidence::Unverifiable;
     };
+    // A digest mismatch only proves PID reuse when the pathname is content-addressed, because an
+    // immutable image path can never be rewritten in place. A daemon spawned from a mutable
+    // pathname (such as a `cargo build` output) keeps running its original bytes even after that
+    // path is rebuilt, so a mismatch there is ambiguous rather than positive reuse evidence.
+    let path_is_immutable = executable_path_matches_digest(executable, expected_digest);
     match executable_sha256(executable) {
         Ok(actual_digest) if actual_digest == expected_digest => ProcessIdentityEvidence::Exact,
-        Ok(_) => ProcessIdentityEvidence::MissingOrReused,
-        Err(_) => ProcessIdentityEvidence::Unverifiable,
+        Ok(_) if path_is_immutable => ProcessIdentityEvidence::MissingOrReused,
+        Ok(_) | Err(_) => ProcessIdentityEvidence::Unverifiable,
     }
 }
 
@@ -674,20 +681,22 @@ impl ArtifactBootstrap {
         &self.source_path
     }
 
-    #[cfg(unix)]
-    fn current_source_path(&self) -> Option<PathBuf> {
-        let path_metadata = fs::metadata(&self.source_path).ok()?;
-        let source = self.source.lock().ok()?;
-        let source_metadata = source.metadata().ok()?;
+    /// Report whether the bootstrap source path still resolves to the retained artifact bytes.
+    ///
+    /// Daemons are never spawned from this mutable pathname, so this is diagnostic evidence only.
+    #[cfg(all(unix, test))]
+    fn source_path_still_current(&self) -> bool {
+        let Ok(path_metadata) = fs::metadata(&self.source_path) else {
+            return false;
+        };
+        let Ok(source) = self.source.lock() else {
+            return false;
+        };
+        let Ok(source_metadata) = source.metadata() else {
+            return false;
+        };
         drop(source);
-        (path_metadata.dev() == source_metadata.dev()
-            && path_metadata.ino() == source_metadata.ino())
-        .then(|| self.source_path.clone())
-    }
-
-    #[cfg(not(unix))]
-    const fn current_source_path(&self) -> Option<PathBuf> {
-        None
+        path_metadata.dev() == source_metadata.dev() && path_metadata.ino() == source_metadata.ino()
     }
 
     fn digest(&self) -> Result<String, DaemonLifecycleError> {
@@ -1577,12 +1586,42 @@ mod tests {
             }),
             ProcessIdentityEvidence::MissingOrReused
         );
+        // The test binary runs from a mutable pathname, so a digest mismatch is ambiguous and
+        // must not be reported as positive PID-reuse evidence.
         assert_eq!(
             process_identity_evidence(&DaemonRecord {
                 executable_digest: Some("reused-image".to_owned()),
                 ..record
             }),
-            ProcessIdentityEvidence::MissingOrReused
+            ProcessIdentityEvidence::Unverifiable
+        );
+    }
+
+    #[test]
+    fn rebuilt_mutable_executable_path_is_ambiguous_and_preserves_the_record() {
+        // A rebuilt source path must never be classified as stale while the daemon still answers,
+        // so a live daemon spawned from `target/` keeps serving its own artifact after a rebuild.
+        let current = DaemonRecord {
+            namespace: bcode_ipc::daemon_namespace(),
+            ..record_with_writer_epoch(Some(2))
+        };
+        assert_eq!(
+            classify_daemon_record_evidence(
+                &current,
+                None,
+                true,
+                ProcessIdentityEvidence::Unverifiable,
+            ),
+            DaemonRecordClassification::Unverifiable
+        );
+        assert_eq!(
+            classify_daemon_record_evidence(
+                &current,
+                None,
+                false,
+                ProcessIdentityEvidence::Unverifiable,
+            ),
+            DaemonRecordClassification::Unverifiable
         );
     }
 
@@ -1802,11 +1841,11 @@ mod tests {
         )
         .unwrap();
         let original_digest = bootstrap.digest().unwrap();
-        assert_eq!(bootstrap.current_source_path(), Some(source.clone()));
+        assert!(bootstrap.source_path_still_current());
         let replacement = root.join("replacement");
         fs::write(&replacement, b"replacement bytes").unwrap();
         fs::rename(&replacement, &source).unwrap();
-        assert_eq!(bootstrap.current_source_path(), None);
+        assert!(!bootstrap.source_path_still_current());
         let copied = root.join("copied");
         let copied_digest = bootstrap.copy_to(&copied).unwrap();
 
@@ -2036,13 +2075,15 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                     ),
                 })?
                 .to_owned();
-            let exe = initialize_artifact_bootstrap()?
-                .current_source_path()
-                .unwrap_or(cached_exe);
+            // Always spawn from the immutable content-addressed image. Spawning from the
+            // bootstrap source path would pin the daemon to a mutable pathname (for example
+            // `target/<triple>/release/bcode`), so rebuilding that path would later make the
+            // running daemon's own identity unverifiable even though it keeps serving its
+            // original artifact correctly.
+            let exe = cached_exe;
             tracing::debug!(
                 target: "bcode_daemon_lifecycle::startup",
                 elapsed_ms = spawn_started_at.elapsed().as_millis(),
-                spawn_from_source = exe == initialize_artifact_bootstrap()?.source_path(),
                 "daemon image ready"
             );
             let (endpoint_env_name, endpoint_env_value) =

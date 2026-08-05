@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Durable session-storage writer contract supported by this Bcode build.
@@ -141,6 +141,17 @@ pub enum SessionLeaseError {
     UnverifiableOwnerMetadata {
         /// Owner metadata path that could not be classified.
         path: PathBuf,
+    },
+    /// A session lock could not be acquired within its bounded wait budget.
+    #[error(
+        "timed out after {waited_ms}ms acquiring the session lock at {}",
+        path.display()
+    )]
+    LockWaitTimeout {
+        /// Lock path that stayed contended for the whole wait budget.
+        path: PathBuf,
+        /// Milliseconds spent waiting before giving up.
+        waited_ms: u64,
     },
     /// Current platform does not support Bcode's session access mechanism.
     #[error("session access guards are unsupported on this platform")]
@@ -300,7 +311,8 @@ pub fn active_session_owners(
 ///
 /// # Errors
 ///
-/// Returns an error if the coordinator lock cannot be opened/locked, owner metadata cannot be
+/// Returns an error if the coordinator lock cannot be opened/locked, the lock stays contended for
+/// the bounded wait budget, owner metadata cannot be
 /// read/written, or an incompatible live build is already registered for the session.
 pub fn acquire_session_lease(
     root: &Path,
@@ -312,10 +324,7 @@ pub fn acquire_session_lease(
     }
     let lock_path = session_lock_path(root, session_id);
     let file = open_lock_file(&lock_path)?;
-    lock_file_exclusive(&file).map_err(|source| SessionLeaseError::Io {
-        path: lock_path.clone(),
-        source,
-    })?;
+    lock_file_exclusive_bounded(&file, &lock_path)?;
 
     let access_dir = session_owner_dir(root, session_id);
     fs::create_dir_all(&access_dir).map_err(|source| SessionLeaseError::Io {
@@ -377,17 +386,15 @@ pub fn session_maintenance_is_active(
 ///
 /// # Errors
 ///
-/// Returns an error if locking or owner inspection fails, or if any live owner exists.
+/// Returns an error if locking or owner inspection fails, the coordinator lock stays contended for
+/// the bounded wait budget, or if any live owner exists.
 pub fn acquire_session_maintenance_guard(
     root: &Path,
     session_id: SessionId,
 ) -> Result<SessionMaintenanceGuard, SessionLeaseError> {
     let lock_path = session_lock_path(root, session_id);
     let coordinator = open_lock_file(&lock_path)?;
-    lock_file_exclusive(&coordinator).map_err(|source| SessionLeaseError::Io {
-        path: lock_path,
-        source,
-    })?;
+    lock_file_exclusive_bounded(&coordinator, &lock_path)?;
     let access_dir = session_owner_dir(root, session_id);
     fs::create_dir_all(&access_dir).map_err(|source| SessionLeaseError::Io {
         path: access_dir.clone(),
@@ -479,17 +486,15 @@ fn first_owner(access_dir: &Path) -> Result<Option<SessionLeaseOwner>, SessionLe
 ///
 /// # Errors
 ///
-/// Returns an error if the write lock file cannot be opened or locked.
+/// Returns an error if the write lock file cannot be opened or locked, or if either the
+/// coordinator or write lock stays contended for the bounded wait budget.
 pub fn acquire_session_write_lock(
     root: &Path,
     session_id: SessionId,
 ) -> Result<SessionWriteGuard, SessionLeaseError> {
     let coordinator_path = session_lock_path(root, session_id);
     let coordinator = open_lock_file(&coordinator_path)?;
-    lock_file_shared(&coordinator).map_err(|source| SessionLeaseError::Io {
-        path: coordinator_path,
-        source,
-    })?;
+    lock_file_shared_bounded(&coordinator, &coordinator_path)?;
     acquire_session_write_lock_inner(root, session_id, Some(coordinator))
 }
 
@@ -497,7 +502,8 @@ pub fn acquire_session_write_lock(
 ///
 /// # Errors
 ///
-/// Returns an error if the write lock file cannot be opened or locked.
+/// Returns an error if the write lock file cannot be opened or locked, or if it stays contended for
+/// the bounded wait budget.
 pub fn acquire_maintenance_session_write_lock(
     _maintenance: &SessionMaintenanceGuard,
     root: &Path,
@@ -513,10 +519,7 @@ fn acquire_session_write_lock_inner(
 ) -> Result<SessionWriteGuard, SessionLeaseError> {
     let lock_path = session_write_lock_path(root, session_id);
     let file = open_lock_file(&lock_path)?;
-    lock_file_exclusive(&file).map_err(|source| SessionLeaseError::Io {
-        path: lock_path,
-        source,
-    })?;
+    lock_file_exclusive_bounded(&file, &lock_path)?;
     Ok(SessionWriteGuard { file, coordinator })
 }
 
@@ -524,14 +527,12 @@ fn acquire_session_write_lock_inner(
 ///
 /// # Errors
 ///
-/// Returns an error if the catalog lock file cannot be opened or locked.
+/// Returns an error if the catalog lock file cannot be opened or locked, or if it stays contended
+/// for the bounded wait budget.
 pub fn acquire_catalog_lock(root: &Path) -> Result<CatalogLockGuard, SessionLeaseError> {
     let lock_path = root.join("catalog.lock");
     let file = open_lock_file(&lock_path)?;
-    lock_file_exclusive(&file).map_err(|source| SessionLeaseError::Io {
-        path: lock_path,
-        source,
-    })?;
+    lock_file_exclusive_bounded(&file, &lock_path)?;
     Ok(CatalogLockGuard { file })
 }
 
@@ -774,8 +775,12 @@ const fn process_is_alive(_pid: u32) -> bool {
     true
 }
 
-fn lock_file_shared(file: &File) -> io::Result<()> {
-    file.lock_shared()
+fn try_lock_file_shared(file: &File) -> io::Result<bool> {
+    match file.try_lock_shared() {
+        Ok(()) => Ok(true),
+        Err(fs::TryLockError::WouldBlock) => Ok(false),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 fn try_lock_file_exclusive(file: &File) -> io::Result<bool> {
@@ -790,6 +795,48 @@ fn lock_file_exclusive(file: &File) -> io::Result<()> {
     file.lock()
 }
 
+/// Bounded wait budget for acquiring a contended session lock.
+///
+/// An unbounded blocking `flock` on an async executor thread turns lock contention into a silent
+/// hang with no error and no cancellation point, so every lock wait is bounded and reported.
+const LOCK_WAIT_BUDGET: Duration = Duration::from_secs(10);
+
+const LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Acquire an exclusive file lock, failing with a bounded timeout instead of blocking forever.
+fn lock_file_exclusive_bounded(file: &File, path: &Path) -> Result<(), SessionLeaseError> {
+    lock_file_bounded(file, path, try_lock_file_exclusive)
+}
+
+/// Acquire a shared file lock, failing with a bounded timeout instead of blocking forever.
+fn lock_file_shared_bounded(file: &File, path: &Path) -> Result<(), SessionLeaseError> {
+    lock_file_bounded(file, path, try_lock_file_shared)
+}
+
+fn lock_file_bounded(
+    file: &File,
+    path: &Path,
+    try_lock: fn(&File) -> io::Result<bool>,
+) -> Result<(), SessionLeaseError> {
+    let started_at = Instant::now();
+    loop {
+        if try_lock(file).map_err(|source| SessionLeaseError::Io {
+            path: path.to_path_buf(),
+            source,
+        })? {
+            return Ok(());
+        }
+        let waited = started_at.elapsed();
+        if waited >= LOCK_WAIT_BUDGET {
+            return Err(SessionLeaseError::LockWaitTimeout {
+                path: path.to_path_buf(),
+                waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+        std::thread::sleep(LOCK_WAIT_POLL_INTERVAL.min(LOCK_WAIT_BUDGET.saturating_sub(waited)));
+    }
+}
+
 fn unlock_file(file: &File) -> io::Result<()> {
     file.unlock()
 }
@@ -802,6 +849,36 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contended_lock_wait_times_out_instead_of_blocking_forever() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let lock_path = temp_dir.path().join("contended.lock");
+        let holder = open_lock_file(&lock_path).expect("open holder");
+        lock_file_exclusive(&holder).expect("hold lock");
+
+        let waiter = open_lock_file(&lock_path).expect("open waiter");
+        let started_at = Instant::now();
+        let error = lock_file_exclusive_bounded(&waiter, &lock_path)
+            .expect_err("contended lock must not block forever");
+
+        assert!(
+            matches!(error, SessionLeaseError::LockWaitTimeout { .. }),
+            "expected a bounded wait timeout, got {error:?}"
+        );
+        assert!(started_at.elapsed() >= LOCK_WAIT_BUDGET);
+        let _ = unlock_file(&holder);
+    }
+
+    #[test]
+    fn uncontended_bounded_lock_wait_succeeds() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let lock_path = temp_dir.path().join("free.lock");
+        let file = open_lock_file(&lock_path).expect("open lock");
+
+        lock_file_exclusive_bounded(&file, &lock_path).expect("uncontended lock must succeed");
+        let _ = unlock_file(&file);
+    }
 
     fn context(build: &str, storage_writer_epoch: u32) -> SessionLeaseOwnerContext {
         SessionLeaseOwnerContext {
