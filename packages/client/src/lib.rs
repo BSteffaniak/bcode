@@ -379,6 +379,7 @@ fn current_runtime_context() -> ClientRuntimeContext {
             auth_candidates,
             request: resolved.request,
             env,
+            api_surface: None,
         },
         interaction_adapters: Vec::new(),
         env_keys,

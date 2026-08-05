@@ -137,9 +137,9 @@ raw_reasoning_supported = true
 
 # Messages-API-only Anthropic models ("bedrock-mantle"). These are served through the Anthropic
 # Messages API (`/anthropic/v1/messages`) and cannot be driven by the Converse adapter, so they
-# are marked with `api_surface = "messages"` and discovery hides them from the picker rather than
-# offering them and failing at request time. Longest-match aliases ensure these version-specific
-# globs win over the broad Converse family entries above.
+# are marked with `api_surface = "messages"` and the provider routes them through the
+# `InvokeModelWithResponseStream` Messages adapter instead. Longest-match aliases ensure these
+# version-specific globs win over the broad Converse family entries above.
 #
 # Do not add a model here merely because it requires adaptive thinking. Adaptive thinking is
 # supported over Converse via `additionalModelRequestFields`; that is expressed by
@@ -149,7 +149,7 @@ model_id = "anthropic.claude-opus-4-7"
 display_name = "Claude Opus 4.7"
 aliases = ["*claude-opus-4-7*", "*claude-opus-4-8*"]
 status = "stable"
-bcode_support = "unsupported"
+bcode_support = "supported"
 family = "claude"
 context_window = 1000000
 max_output_tokens = 128000
@@ -168,7 +168,7 @@ model_id = "anthropic.claude-sonnet-5"
 display_name = "Claude Sonnet 5"
 aliases = ["*claude-sonnet-5*"]
 status = "stable"
-bcode_support = "unsupported"
+bcode_support = "supported"
 family = "claude"
 context_window = 1000000
 max_output_tokens = 128000
@@ -187,7 +187,7 @@ model_id = "anthropic.claude-haiku-5"
 display_name = "Claude Haiku 5"
 aliases = ["*claude-haiku-5*"]
 status = "stable"
-bcode_support = "unsupported"
+bcode_support = "supported"
 family = "claude"
 context_window = 200000
 max_output_tokens = 64000
@@ -206,7 +206,7 @@ model_id = "anthropic.claude-fable-5"
 display_name = "Claude Fable 5"
 aliases = ["*claude-fable*"]
 status = "stable"
-bcode_support = "unsupported"
+bcode_support = "supported"
 family = "claude"
 context_window = 1000000
 max_output_tokens = 128000
@@ -225,7 +225,7 @@ model_id = "anthropic.claude-mythos-5"
 display_name = "Claude Mythos 5"
 aliases = ["*claude-mythos*"]
 status = "stable"
-bcode_support = "unsupported"
+bcode_support = "supported"
 family = "claude"
 context_window = 1000000
 max_output_tokens = 128000

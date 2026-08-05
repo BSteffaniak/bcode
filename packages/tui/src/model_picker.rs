@@ -799,6 +799,7 @@ mod tests {
                 output: output.map(price),
                 source: bcode_model::ModelPricingSource::PatternMatch,
             }),
+            api_surface: None,
             visibility: ModelVisibility::Visible,
         }
     }

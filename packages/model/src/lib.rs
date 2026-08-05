@@ -962,8 +962,29 @@ pub struct ModelInfo {
     pub metadata_source: Option<ModelMetadataSource>,
     #[serde(default)]
     pub pricing: Option<ModelPricingInfo>,
+    /// Provider API surface required to invoke this model, when known.
+    ///
+    /// Lets the host route a turn to the correct provider adapter (for example Bedrock Converse
+    /// vs the Anthropic Messages surface) instead of guessing from the model id.
+    #[serde(default)]
+    pub api_surface: Option<ModelApiSurface>,
     #[serde(default, skip)]
     pub visibility: ModelVisibility,
+}
+
+/// Provider API surface a model must be invoked through.
+///
+/// This is the provider-neutral semantic the host carries so a provider adapter can select the
+/// correct native transport without reimplementing model identity matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelApiSurface {
+    /// Amazon Bedrock Converse / `ConverseStream` API.
+    Converse,
+    /// Amazon Bedrock `InvokeModel` API.
+    InvokeModel,
+    /// Anthropic Messages API surface (`/anthropic/v1/messages`).
+    Messages,
 }
 
 /// Model picker/list visibility metadata.
@@ -1805,6 +1826,14 @@ pub struct ProviderRequestContext {
     /// plugin. They must not be persisted to session history or unredacted traces.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Provider API surface the host resolved for the selected model.
+    ///
+    /// Providers that serve models through more than one transport (for example Bedrock Converse
+    /// vs the Anthropic Messages surface) use this to route the turn without reimplementing model
+    /// identity matching. `None` means the host did not resolve a surface; providers keep their
+    /// historical default.
+    #[serde(default)]
+    pub api_surface: Option<ModelApiSurface>,
 }
 
 impl ProviderRequestContext {
@@ -3488,6 +3517,7 @@ mod tests {
                 cache: super::ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: None,
+                api_surface: None,
                 visibility: ModelVisibility::Ignored {
                     source: ModelVisibilitySource::State,
                     rule: "hidden".to_string(),

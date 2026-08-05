@@ -1794,6 +1794,7 @@ fn models(has_context_window: bool, subset_reasoning: bool) -> ModelList {
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: Some(bcode_model::ModelMetadataSource::BundledCatalog),
             pricing: None,
+            api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
         }],
         catalog: bcode_model::ModelCatalogHints::default(),

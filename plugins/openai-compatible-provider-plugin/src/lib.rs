@@ -7040,6 +7040,7 @@ fn model_infos_from_items_without_catalog(
             metadata_source: provider_api_context_window(&model.metadata)
                 .map(|_| ModelMetadataSource::ProviderApi),
             pricing: pricing_from_provider_api(&model.metadata),
+            api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect()
@@ -8566,6 +8567,7 @@ fn append_missing_model_items_from_ids(models: &mut Vec<ModelInfo>, model_ids: &
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: Some(ModelMetadataSource::ProviderLive),
                 pricing: None,
+                api_surface: None,
                 visibility: bcode_model::ModelVisibility::Visible,
             });
         }

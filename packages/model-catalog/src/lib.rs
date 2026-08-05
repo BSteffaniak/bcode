@@ -366,6 +366,7 @@ impl ModelCatalogResolver {
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: None,
+                api_surface: None,
                 visibility: bcode_model::ModelVisibility::Visible,
             });
         }
@@ -839,6 +840,7 @@ fn model_info_from_catalog_entry_for_target(
             cache: ModelCacheInfo::default(),
             metadata_source: None,
             pricing: None,
+            api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
         },
         entry,
@@ -927,16 +929,32 @@ fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelIn
     model
 }
 
-/// Mark a model unsupported when its catalog `api_surface` cannot be driven by Bcode.
+/// Record the provider API surface a model must be invoked through.
 ///
-/// The Bedrock provider adapter uses the Converse API, so models served only through the
-/// Anthropic Messages surface are surfaced as unsupported (visible with a reason) rather than
-/// offered and failing at request time. This is applied last so the surface reason wins.
-fn apply_api_surface_visibility(model: &mut ModelInfo, entry: &ModelCatalogEntry) {
-    if entry.api_surface == Some(bcode_model_catalog_models::CatalogApiSurface::Messages) {
-        model.visibility = bcode_model::ModelVisibility::Unsupported {
-            reason: "served only through the Anthropic Messages API; not usable by the Bedrock Converse adapter".to_string(),
-        };
+/// Bcode now supports both the Bedrock Converse and Anthropic Messages surfaces, so this records
+/// the resolved surface on the model for the host to route the turn to the correct provider
+/// adapter. It no longer hides Messages-only models.
+const fn apply_api_surface_visibility(model: &mut ModelInfo, entry: &ModelCatalogEntry) {
+    if let Some(api_surface) = model_api_surface_from_catalog(entry.api_surface) {
+        model.api_surface = Some(api_surface);
+    }
+}
+
+/// Map the catalog API surface onto the normalized model semantic.
+const fn model_api_surface_from_catalog(
+    api_surface: Option<bcode_model_catalog_models::CatalogApiSurface>,
+) -> Option<bcode_model::ModelApiSurface> {
+    match api_surface {
+        Some(bcode_model_catalog_models::CatalogApiSurface::Converse) => {
+            Some(bcode_model::ModelApiSurface::Converse)
+        }
+        Some(bcode_model_catalog_models::CatalogApiSurface::InvokeModel) => {
+            Some(bcode_model::ModelApiSurface::InvokeModel)
+        }
+        Some(bcode_model_catalog_models::CatalogApiSurface::Messages) => {
+            Some(bcode_model::ModelApiSurface::Messages)
+        }
+        None => None,
     }
 }
 
@@ -964,6 +982,7 @@ fn model_info_from_catalog_entry(entry: &ModelCatalogEntry) -> ModelInfo {
             ModelMetadataSource::BundledCatalog
         }),
         pricing: pricing_from_catalog(entry.pricing.as_ref(), entry_is_remote(entry)),
+        api_surface: None,
         visibility: bcode_model::ModelVisibility::Visible,
     };
     if entry.bcode_support == BcodeSupportStatus::Unsupported {
@@ -1667,6 +1686,7 @@ mod tests {
             cache: ModelCacheInfo::default(),
             metadata_source: None,
             pricing: None,
+            api_surface: None,
             visibility: ModelVisibility::Visible,
         };
 
@@ -1718,6 +1738,7 @@ mod tests {
             cache: ModelCacheInfo::default(),
             metadata_source: None,
             pricing: None,
+            api_surface: None,
             visibility: ModelVisibility::Visible,
         };
 
@@ -1891,6 +1912,7 @@ status = "stable"
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: None,
             pricing: None,
+            api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
         };
 
@@ -1922,6 +1944,7 @@ status = "stable"
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: None,
             pricing: None,
+            api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
         };
 
@@ -1932,7 +1955,7 @@ status = "stable"
     }
 
     #[test]
-    fn bedrock_messages_api_only_models_are_unsupported() {
+    fn bedrock_messages_api_only_models_route_to_messages_surface() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
 
         for model_id in [
@@ -1953,15 +1976,19 @@ status = "stable"
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: None,
+                api_surface: None,
                 visibility: bcode_model::ModelVisibility::Visible,
             };
             let enriched = catalog.enrich_model("bedrock", discovered);
-            assert!(
-                matches!(
-                    enriched.visibility,
-                    bcode_model::ModelVisibility::Unsupported { .. }
-                ),
-                "{model_id} must be unsupported (Messages-API only)"
+            assert_eq!(
+                enriched.visibility,
+                bcode_model::ModelVisibility::Visible,
+                "{model_id} is now supported via the Messages surface"
+            );
+            assert_eq!(
+                enriched.api_surface,
+                Some(bcode_model::ModelApiSurface::Messages),
+                "{model_id} must route to the Messages API surface"
             );
         }
     }
@@ -1986,6 +2013,7 @@ status = "stable"
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: None,
+                api_surface: None,
                 visibility: bcode_model::ModelVisibility::Visible,
             };
             let enriched = catalog.enrich_model("bedrock", discovered);
@@ -2012,6 +2040,7 @@ status = "stable"
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: None,
             pricing: None,
+            api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
         };
         let enriched = catalog.enrich_model("bedrock", discovered);
@@ -2052,6 +2081,7 @@ status = "stable"
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: None,
             pricing: None,
+            api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
         };
         let reasoning = catalog
@@ -2143,6 +2173,7 @@ status = "stable"
                 cache: ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: None,
+                api_surface: None,
                 visibility: ModelVisibility::Visible,
             };
             let explicit = resolver
@@ -2248,6 +2279,7 @@ status = "stable"
             cache: ModelCacheInfo::default(),
             metadata_source: Some(ModelMetadataSource::ProviderLive),
             pricing: None,
+            api_surface: None,
             visibility: ModelVisibility::Visible,
         };
 

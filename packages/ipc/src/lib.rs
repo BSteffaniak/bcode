@@ -5127,6 +5127,7 @@ mod tests {
                         output: Some(bcode_model::ModelTokenPrice::from_micros(10_000_000)),
                         source: bcode_model::ModelPricingSource::PatternMatch,
                     }),
+                    api_surface: None,
                     visibility: bcode_model::ModelVisibility::Visible,
                 }],
                 catalog: bcode_model::ModelCatalogHints {
@@ -5207,6 +5208,7 @@ mod tests {
                     cache: bcode_model::ModelCacheInfo::default(),
                     metadata_source: None,
                     pricing: None,
+                    api_surface: None,
                     visibility: bcode_model::ModelVisibility::Visible,
                 }],
                 catalog: bcode_model::ModelCatalogHints {

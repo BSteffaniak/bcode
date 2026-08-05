@@ -13,11 +13,12 @@ use aws_sdk_bedrock as bedrock;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::operation::RequestId;
 use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+use aws_sdk_bedrockruntime::operation::invoke_model_with_response_stream::InvokeModelWithResponseStreamError;
 use aws_sdk_bedrockruntime::types::{
     AnyToolChoice, AutoToolChoice, CachePointBlock, CachePointType,
     ContentBlock as BedrockContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
     ConverseStreamOutput, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration,
-    Message as BedrockMessage, ReasoningContentBlockDelta, SpecificToolChoice,
+    Message as BedrockMessage, ReasoningContentBlockDelta, ResponseStream, SpecificToolChoice,
     StopReason as BedrockStopReason, SystemContentBlock, Tool, ToolChoice as BedrockToolChoice,
     ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
     ToolSpecification, ToolUseBlock,
@@ -404,6 +405,9 @@ async fn stream_bedrock_turn_inner(
     let client = bedrock_client(&settings).await;
     let selection = resolve_turn_model_selection(request, &settings, turn, &discovery).await?;
     let name_map = bedrock_tool_name_map(&request.tools);
+    if request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Messages) {
+        return stream_bedrock_messages_turn(request, &client, &selection, turn, name_map).await;
+    }
     let mut last_error = None;
     for model_id in &selection.model_ids {
         let mut effective_request;
@@ -471,6 +475,47 @@ async fn stream_bedrock_turn_inner(
             bcode_model::ProviderFailureCapability::ModelDiscovery,
             "set BCODE_BEDROCK_MODEL or configure an accessible streaming Bedrock model",
         ))
+    }))
+}
+
+async fn stream_bedrock_messages_turn(
+    request: &ModelTurnRequest,
+    client: &Client,
+    selection: &ModelSelection,
+    turn: &TurnState,
+    name_map: BTreeMap<String, String>,
+) -> Result<StreamOutcome, ProviderError> {
+    let mut last_error = None;
+    for model_id in &selection.model_ids {
+        let body = build_anthropic_messages_request(request)?;
+        let result = client
+            .invoke_model_with_response_stream()
+            .model_id(model_id)
+            .content_type("application/json")
+            .accept("application/json")
+            .body(Blob::new(body))
+            .send()
+            .await;
+        match result {
+            Ok(response) => {
+                return read_anthropic_messages_stream(response.body, turn, name_map.clone()).await;
+            }
+            Err(error) => {
+                let error = bedrock_messages_sdk_error(&error);
+                let is_last = selection.model_ids.last().map(String::as_str) == Some(model_id);
+                if selection.explicit || is_last {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        provider_error(
+            "bedrock_messages_model_unavailable",
+            ProviderErrorCategory::Config,
+            "no usable Bedrock Messages model was available for the turn",
+        )
     }))
 }
 
@@ -672,6 +717,316 @@ fn client_context_credentials(settings: &Settings) -> Option<Credentials> {
         None,
         "bcode-client-context",
     ))
+}
+
+async fn read_anthropic_messages_stream(
+    mut stream: aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver<
+        ResponseStream,
+        aws_sdk_bedrockruntime::types::error::ResponseStreamError,
+    >,
+    turn: &TurnState,
+    name_map: BTreeMap<String, String>,
+) -> Result<StreamOutcome, ProviderError> {
+    let mut accumulator = AnthropicMessagesAccumulator::new(name_map);
+    loop {
+        if turn.is_cancelled() {
+            return Ok(StreamOutcome::Cancelled);
+        }
+        let cancel_notify = turn.cancel_notify();
+        tokio::select! {
+            event = stream.recv() => {
+                let Some(event) = event.map_err(|error| bedrock_messages_stream_error(&error))? else {
+                    return Ok(accumulator.finish());
+                };
+                if let ResponseStream::Chunk(chunk) = event
+                    && let Some(bytes) = chunk.bytes()
+                {
+                    let event = serde_json::from_slice::<serde_json::Value>(bytes.as_ref()).map_err(|error| {
+                        provider_error(
+                            "bedrock_messages_stream_decode_failed",
+                            ProviderErrorCategory::ProviderInternal,
+                            format!("failed to decode Bedrock Messages stream event: {error}"),
+                        )
+                    })?;
+                    if let Some(outcome) = accumulator.process(&event, turn)? {
+                        return Ok(outcome);
+                    }
+                }
+            }
+            () = cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+        }
+    }
+}
+
+struct AnthropicMessagesAccumulator {
+    tool_calls: BTreeMap<u32, ToolCallAccumulator>,
+    reasoning_blocks: BTreeMap<u32, String>,
+    saw_tool_call: bool,
+    name_map: BTreeMap<String, String>,
+}
+
+impl AnthropicMessagesAccumulator {
+    const fn new(name_map: BTreeMap<String, String>) -> Self {
+        Self {
+            tool_calls: BTreeMap::new(),
+            reasoning_blocks: BTreeMap::new(),
+            saw_tool_call: false,
+            name_map,
+        }
+    }
+
+    fn process(
+        &mut self,
+        event: &serde_json::Value,
+        turn: &TurnState,
+    ) -> Result<Option<StreamOutcome>, ProviderError> {
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("message_start") => Self::emit_usage(
+                event
+                    .get("message")
+                    .and_then(|message| message.get("usage")),
+                turn,
+                true,
+            ),
+            Some("content_block_start") => self.start_content_block(event, turn)?,
+            Some("content_block_delta") => self.content_block_delta(event, turn),
+            Some("content_block_stop") => self.finish_content_block(event, turn)?,
+            Some("message_delta") => Self::emit_usage(event.get("usage"), turn, false),
+            Some("message_stop") => return Ok(Some(self.finish())),
+            Some("error") => {
+                return Err(provider_error(
+                    "bedrock_messages_stream_failed",
+                    ProviderErrorCategory::ProviderInternal,
+                    event
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .map_or_else(
+                            || "Bedrock Messages stream failed".to_string(),
+                            sanitize_provider_diagnostic,
+                        ),
+                ));
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn start_content_block(
+        &mut self,
+        event: &serde_json::Value,
+        turn: &TurnState,
+    ) -> Result<(), ProviderError> {
+        let index = event_index(event)?;
+        let block = event
+            .get("content_block")
+            .unwrap_or(&serde_json::Value::Null);
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("tool_use") => {
+                let id = required_event_string(block, "id")?;
+                let name = required_event_string(block, "name")?;
+                self.saw_tool_call = true;
+                self.tool_calls.insert(
+                    index,
+                    ToolCallAccumulator {
+                        id: Some(id.clone()),
+                        name: Some(name.clone()),
+                        arguments: String::new(),
+                    },
+                );
+                turn.push(ProviderTurnEvent::ToolCallStarted {
+                    call_id: id,
+                    name: original_tool_name(&name, &self.name_map),
+                });
+            }
+            Some("thinking" | "redacted_thinking") => {
+                self.reasoning_blocks.insert(index, String::new());
+                turn.push(ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::Started {
+                        activity_id: format!("bedrock-messages-reasoning-{index}"),
+                        order: index,
+                    },
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn content_block_delta(&mut self, event: &serde_json::Value, turn: &TurnState) {
+        let Some(index) = event
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            return;
+        };
+        let delta = event.get("delta").unwrap_or(&serde_json::Value::Null);
+        match delta.get("type").and_then(serde_json::Value::as_str) {
+            Some("text_delta") => {
+                if let Some(text) = delta
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    turn.push(ProviderTurnEvent::TextDelta {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            Some("input_json_delta") => {
+                if let Some(json) = delta
+                    .get("partial_json")
+                    .and_then(serde_json::Value::as_str)
+                    && let Some(tool) = self.tool_calls.get_mut(&index)
+                {
+                    tool.arguments.push_str(json);
+                    if let Some(call_id) = &tool.id {
+                        turn.push(ProviderTurnEvent::ToolCallDelta {
+                            call_id: call_id.clone(),
+                            delta: json.to_string(),
+                        });
+                    }
+                }
+            }
+            Some("thinking_delta") => {
+                if let Some(text) = delta
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    self.reasoning_blocks
+                        .entry(index)
+                        .or_default()
+                        .push_str(text);
+                    turn.push(ProviderTurnEvent::ReasoningActivity {
+                        event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                            activity_id: format!("bedrock-messages-reasoning-{index}"),
+                            activity_order: index,
+                            part_id: format!("raw-{index}"),
+                            kind: bcode_session_models::ReasoningContentKind::Raw,
+                            role: bcode_session_models::ReasoningContentRole::Detail,
+                            part_order: index,
+                            text: text.to_string(),
+                        },
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_content_block(
+        &mut self,
+        event: &serde_json::Value,
+        turn: &TurnState,
+    ) -> Result<(), ProviderError> {
+        let index = event_index(event)?;
+        if let Some(tool) = self.tool_calls.get(&index) {
+            let id = tool.id.clone().ok_or_else(|| {
+                provider_error(
+                    "missing_tool_call_id",
+                    ProviderErrorCategory::ProviderInternal,
+                    "Bedrock Messages emitted a tool call without an id",
+                )
+            })?;
+            let name = tool.name.clone().ok_or_else(|| {
+                provider_error(
+                    "missing_tool_call_name",
+                    ProviderErrorCategory::ProviderInternal,
+                    "Bedrock Messages emitted a tool call without a name",
+                )
+            })?;
+            let arguments = if tool.arguments.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&tool.arguments).map_err(|error| {
+                    provider_error(
+                        "tool_arguments_decode_failed",
+                        ProviderErrorCategory::ProviderInternal,
+                        format!("failed to decode arguments for tool call {id} ({name}): {error}"),
+                    )
+                })?
+            };
+            turn.push(ProviderTurnEvent::ToolCallFinished {
+                call: ToolCall {
+                    id,
+                    name: original_tool_name(&name, &self.name_map),
+                    arguments,
+                },
+            });
+        }
+        if self.reasoning_blocks.remove(&index).is_some() {
+            turn.push(ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::Finished {
+                    activity_id: format!("bedrock-messages-reasoning-{index}"),
+                    activity_order: index,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                },
+            });
+        }
+        Ok(())
+    }
+
+    fn emit_usage(usage: Option<&serde_json::Value>, turn: &TurnState, exact_input: bool) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let input_tokens = usage.get("input_tokens").and_then(json_u32);
+        let output_tokens = usage.get("output_tokens").and_then(json_u32);
+        let cached_input_tokens = usage.get("cache_read_input_tokens").and_then(json_u32);
+        let cache_write_input_tokens = usage.get("cache_creation_input_tokens").and_then(json_u32);
+        turn.push(ProviderTurnEvent::Usage {
+            usage: TokenUsage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cache_write_input_tokens,
+                ..TokenUsage::default()
+            },
+        });
+        if exact_input && let Some(tokens) = input_tokens {
+            turn.push(ProviderTurnEvent::ExactRequestInputTokens {
+                tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
+            });
+        }
+    }
+
+    const fn finish(&self) -> StreamOutcome {
+        if self.saw_tool_call {
+            StreamOutcome::ToolCall
+        } else {
+            StreamOutcome::Finished
+        }
+    }
+}
+
+fn event_index(event: &serde_json::Value) -> Result<u32, ProviderError> {
+    event.get("index").and_then(json_u32).ok_or_else(|| {
+        provider_error(
+            "bedrock_messages_stream_invalid_event",
+            ProviderErrorCategory::ProviderInternal,
+            "Bedrock Messages stream event omitted a valid content block index",
+        )
+    })
+}
+
+fn required_event_string(value: &serde_json::Value, key: &str) -> Result<String, ProviderError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            provider_error(
+                "bedrock_messages_stream_invalid_event",
+                ProviderErrorCategory::ProviderInternal,
+                format!("Bedrock Messages stream content block omitted {key}"),
+            )
+        })
+}
+
+fn json_u32(value: &serde_json::Value) -> Option<u32> {
+    value.as_u64().and_then(|value| u32::try_from(value).ok())
 }
 
 async fn read_bedrock_stream(
@@ -950,8 +1305,228 @@ struct BedrockConverseRequest {
     additional_model_request_fields: Option<Document>,
 }
 
+fn build_anthropic_messages_request(request: &ModelTurnRequest) -> Result<Vec<u8>, ProviderError> {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "anthropic_version".to_string(),
+        serde_json::json!("bedrock-2023-05-31"),
+    );
+    body.insert(
+        "max_tokens".to_string(),
+        serde_json::json!(request.parameters.max_output_tokens.unwrap_or(4_096)),
+    );
+    if let Some(system) = anthropic_system_content(request) {
+        body.insert("system".to_string(), system);
+    }
+    body.insert(
+        "messages".to_string(),
+        serde_json::Value::Array(
+            request
+                .messages
+                .iter()
+                .filter_map(|message| anthropic_message(message).transpose())
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    );
+    if !request.tools.is_empty() && !matches!(request.tool_call_policy.choice, ToolChoice::None) {
+        body.insert(
+            "tools".to_string(),
+            serde_json::Value::Array(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        serde_json::json!({
+                            "name": bedrock_tool_name(&tool.name),
+                            "description": tool.description,
+                            "input_schema": tool.input_schema,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        body.insert("tool_choice".to_string(), anthropic_tool_choice(request)?);
+    }
+    if request.prompt_cache.cache_tools
+        && let Some(last_tool) = body
+            .get_mut("tools")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|tools| tools.last_mut())
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        last_tool.insert("cache_control".to_string(), anthropic_cache_control());
+    }
+    if let Some(temperature) = request.parameters.temperature {
+        body.insert("temperature".to_string(), serde_json::json!(temperature));
+    }
+    if let Some(top_p) = request.parameters.top_p {
+        body.insert("top_p".to_string(), serde_json::json!(top_p));
+    }
+    if !request.parameters.stop_sequences.is_empty() {
+        body.insert(
+            "stop_sequences".to_string(),
+            serde_json::json!(request.parameters.stop_sequences),
+        );
+    }
+    apply_anthropic_thinking_fields(&mut body, &request.parameters);
+    serde_json::to_vec(&body).map_err(|error| build_error(&error))
+}
+
+fn anthropic_system_content(request: &ModelTurnRequest) -> Option<serde_json::Value> {
+    let mut blocks = Vec::new();
+    if let Some(prompt) = request
+        .system_prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        let mut block = serde_json::json!({"type": "text", "text": prompt});
+        if request.prompt_cache.cache_system_prompt {
+            block
+                .as_object_mut()
+                .expect("text block is an object")
+                .insert("cache_control".to_string(), anthropic_cache_control());
+        }
+        blocks.push(block);
+    }
+    for message in &request.messages {
+        if message.role == MessageRole::System {
+            let text = joined_text_content(message);
+            if !text.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": text}));
+            }
+        }
+    }
+    (!blocks.is_empty()).then_some(serde_json::Value::Array(blocks))
+}
+
+fn anthropic_message(message: &ModelMessage) -> Result<Option<serde_json::Value>, ProviderError> {
+    let role = match message.role {
+        MessageRole::System => return Ok(None),
+        MessageRole::User | MessageRole::Tool => "user",
+        MessageRole::Assistant => "assistant",
+    };
+    let content = anthropic_content_blocks(message)?;
+    Ok((!content.is_empty()).then(|| serde_json::json!({"role": role, "content": content})))
+}
+
+fn anthropic_cache_control() -> serde_json::Value {
+    serde_json::json!({"type": "ephemeral"})
+}
+
+fn anthropic_content_blocks(
+    message: &ModelMessage,
+) -> Result<Vec<serde_json::Value>, ProviderError> {
+    let mut blocks = Vec::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                blocks.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            ContentBlock::Image { image } => {
+                base64::engine::general_purpose::STANDARD.decode(&image.data_base64).map_err(|error| {
+                    provider_error(
+                        "bedrock_invalid_image_data",
+                        ProviderErrorCategory::InvalidRequest,
+                        format!("invalid image data: {error}"),
+                    )
+                })?;
+                blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": image.mime_type, "data": image.data_base64}
+                }));
+            }
+            ContentBlock::ToolCall { call } => blocks.push(serde_json::json!({
+                "type": "tool_use", "id": call.id, "name": bedrock_tool_name(&call.name), "input": call.arguments,
+            })),
+            ContentBlock::ToolResult { result } => {
+                let content = result.content.iter().map(|item| match item {
+                    bcode_model::ToolResultContent::Text { text } => serde_json::json!({"type": "text", "text": text}),
+                    bcode_model::ToolResultContent::Image { image } => serde_json::json!({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": image.mime_type, "data": image.data_base64}
+                    }),
+                    bcode_model::ToolResultContent::ImageRef { image } => serde_json::json!({
+                        "type": "text",
+                        "text": format!("[image reference: {} {}]", image.path, image.mime_type),
+                    }),
+                }).collect::<Vec<_>>();
+                blocks.push(serde_json::json!({
+                    "type": "tool_result", "tool_use_id": result.call_id,
+                    "content": content, "is_error": result.is_error,
+                }));
+            }
+            ContentBlock::CachePoint { .. } => {
+                if let Some(previous) = blocks
+                    .last_mut()
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    previous.insert("cache_control".to_string(), anthropic_cache_control());
+                }
+            }
+            ContentBlock::ProviderExtension { .. } | ContentBlock::Text { .. } => {}
+        }
+    }
+    Ok(blocks)
+}
+
+fn anthropic_tool_choice(request: &ModelTurnRequest) -> Result<serde_json::Value, ProviderError> {
+    match &request.tool_call_policy.choice {
+        ToolChoice::Auto => Ok(serde_json::json!({"type": "auto"})),
+        ToolChoice::Required => Ok(serde_json::json!({"type": "any"})),
+        ToolChoice::Tool { name } => {
+            let tool = request
+                .tools
+                .iter()
+                .find(|tool| tool.name == *name)
+                .ok_or_else(|| {
+                    provider_error(
+                        "unknown_required_tool",
+                        ProviderErrorCategory::InvalidRequest,
+                        format!("required Bedrock tool '{name}' is not registered"),
+                    )
+                })?;
+            Ok(serde_json::json!({"type": "tool", "name": bedrock_tool_name(&tool.name)}))
+        }
+        ToolChoice::None => Ok(serde_json::Value::Null),
+    }
+}
+
+fn apply_anthropic_thinking_fields(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    params: &bcode_model::ModelParameters,
+) {
+    match params.reasoning_control {
+        Some(bcode_model::ReasoningControl::Adaptive) => {
+            body.insert(
+                "thinking".to_string(),
+                serde_json::json!({"type": "adaptive"}),
+            );
+            if let Some(effort) = adaptive_reasoning_effort(params) {
+                body.insert(
+                    "output_config".to_string(),
+                    serde_json::json!({"effort": effort}),
+                );
+            }
+        }
+        Some(bcode_model::ReasoningControl::Budget) | None => {
+            if let Some(budget) = resolve_reasoning_budget_tokens(params) {
+                body.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "enabled", "budget_tokens": budget}),
+                );
+            }
+        }
+    }
+}
+
 fn bedrock_request_projection(request: &ModelTurnRequest) -> ProviderRequestProjection {
-    let emitted_cache_points = bedrock_emitted_cache_point_count(request);
+    let messages_surface =
+        request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Messages);
+    let emitted_cache_points = if messages_surface {
+        0
+    } else {
+        bedrock_emitted_cache_point_count(request)
+    };
     let sent_messages = request
         .messages
         .iter()
@@ -959,7 +1534,14 @@ fn bedrock_request_projection(request: &ModelTurnRequest) -> ProviderRequestProj
         .count();
     ProviderRequestProjection {
         provider: Some("bcode.bedrock".to_string()),
-        api_shape: Some("bedrock_converse".to_string()),
+        api_shape: Some(
+            if messages_surface {
+                "bedrock_anthropic_messages"
+            } else {
+                "bedrock_converse"
+            }
+            .to_string(),
+        ),
         message_count: Some(sent_messages),
         original_message_count: Some(request.messages.len()),
         sent_message_count: Some(sent_messages),
@@ -1877,6 +2459,7 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             cache: bedrock_model_cache_info(),
             metadata_source: None,
             pricing: None,
+            api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect::<Vec<_>>()
@@ -2610,6 +3193,7 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             cache: bedrock_model_cache_info(),
             metadata_source: None,
             pricing: None,
+            api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect();
@@ -2876,6 +3460,74 @@ fn build_error(error: &(impl ToString + ?Sized)) -> ProviderError {
         ProviderErrorCategory::InvalidRequest,
         error.to_string(),
     )
+}
+
+fn bedrock_messages_sdk_error(
+    error_source: &aws_sdk_bedrockruntime::error::SdkError<InvokeModelWithResponseStreamError>,
+) -> ProviderError {
+    let Some(service_error) = error_source.as_service_error() else {
+        let (kind, category) = match error_source {
+            aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => {
+                ("timeout", ProviderErrorCategory::Timeout)
+            }
+            aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(dispatch) => {
+                return bedrock_dispatch_error(
+                    "bedrock_messages_request_failed",
+                    "Bedrock Messages runtime",
+                    dispatch,
+                    bcode_model::ProviderFailureCapability::ModelInvocation,
+                );
+            }
+            aws_sdk_bedrockruntime::error::SdkError::ResponseError(_) => {
+                ("response", ProviderErrorCategory::Network)
+            }
+            aws_sdk_bedrockruntime::error::SdkError::ConstructionFailure(_) => {
+                ("construction", ProviderErrorCategory::Config)
+            }
+            _ => ("unknown", ProviderErrorCategory::ProviderInternal),
+        };
+        return bedrock_runtime_transport_error(kind, category);
+    };
+    let metadata = service_error.meta();
+    let provider_message = metadata.message().map(sanitize_provider_diagnostic);
+    let category = if service_error.is_access_denied_exception() {
+        ProviderErrorCategory::Auth
+    } else if service_error.is_throttling_exception() {
+        ProviderErrorCategory::RateLimit
+    } else if service_error.is_service_unavailable_exception() {
+        ProviderErrorCategory::Overloaded
+    } else if service_error.is_model_timeout_exception() {
+        ProviderErrorCategory::Timeout
+    } else if service_error.is_resource_not_found_exception() {
+        ProviderErrorCategory::ModelNotFound
+    } else if service_error.is_validation_exception() {
+        ProviderErrorCategory::InvalidRequest
+    } else if provider_message
+        .as_deref()
+        .is_some_and(is_context_length_error)
+    {
+        ProviderErrorCategory::ContextLength
+    } else {
+        ProviderErrorCategory::ProviderInternal
+    };
+    let mut normalized = provider_error(
+        "bedrock_messages_request_failed",
+        category,
+        provider_message
+            .as_deref()
+            .unwrap_or("Bedrock Messages request failed"),
+    );
+    normalized.request_id = metadata
+        .request_id()
+        .map(str::to_string)
+        .map(String::into_boxed_str);
+    normalized.provider_message = provider_message.clone().map(String::into_boxed_str);
+    normalized.sources.push(ProviderErrorSource {
+        source: "aws_bedrock_messages".to_string(),
+        code: metadata.code().map(str::to_string),
+        message: provider_message,
+    });
+    normalized
 }
 
 fn bedrock_sdk_error(
@@ -3457,6 +4109,52 @@ fn bedrock_transport_error(kind: &str, category: ProviderErrorCategory) -> Provi
     normalized
 }
 
+fn bedrock_messages_stream_error<R>(
+    error: &aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::types::error::ResponseStreamError,
+        R,
+    >,
+) -> ProviderError {
+    let Some(service_error) = error.as_service_error() else {
+        return provider_error(
+            "bedrock_messages_stream_failed",
+            ProviderErrorCategory::Network,
+            "Bedrock Messages response stream failed",
+        );
+    };
+    let metadata = service_error.meta();
+    let provider_message = metadata.message().map(sanitize_provider_diagnostic);
+    let category = if service_error.is_service_unavailable_exception() {
+        ProviderErrorCategory::Overloaded
+    } else if service_error.is_throttling_exception() {
+        ProviderErrorCategory::RateLimit
+    } else if service_error.is_validation_exception() {
+        ProviderErrorCategory::InvalidRequest
+    } else if service_error.is_model_timeout_exception() {
+        ProviderErrorCategory::Timeout
+    } else {
+        ProviderErrorCategory::ProviderInternal
+    };
+    let mut normalized = provider_error(
+        "bedrock_messages_stream_failed",
+        category,
+        provider_message
+            .as_deref()
+            .unwrap_or("Bedrock Messages response stream failed"),
+    );
+    normalized.request_id = metadata
+        .request_id()
+        .map(str::to_string)
+        .map(String::into_boxed_str);
+    normalized.provider_message = provider_message.clone().map(String::into_boxed_str);
+    normalized.sources.push(ProviderErrorSource {
+        source: "aws_bedrock_messages_stream".to_string(),
+        code: metadata.code().map(str::to_string),
+        message: provider_message,
+    });
+    normalized
+}
+
 fn bedrock_stream_error<R>(
     error: &aws_sdk_bedrockruntime::error::SdkError<
         aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError,
@@ -3568,6 +4266,91 @@ mod tests {
         run_provider_conformance_suite,
     };
     use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
+
+    #[test]
+    fn anthropic_messages_request_serializes_tools_and_adaptive_thinking() {
+        let mut request = test_model_turn_request();
+        request.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "inspect the repository".to_string(),
+            }],
+        }];
+        request.parameters.max_output_tokens = Some(8_192);
+        request.parameters.reasoning_control = Some(bcode_model::ReasoningControl::Adaptive);
+        request.parameters.reasoning_effort_value = Some("high".to_string());
+        request.system_prompt = Some("system instructions".to_string());
+        request.prompt_cache.cache_system_prompt = true;
+        request.prompt_cache.cache_tools = true;
+        request.tools = vec![ToolDefinition {
+            name: "shell.run".to_string(),
+            description: "Run a shell command".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+
+        let value: serde_json::Value = serde_json::from_slice(
+            &build_anthropic_messages_request(&request).expect("request should serialize"),
+        )
+        .expect("request should be JSON");
+
+        assert_eq!(value["anthropic_version"], "bedrock-2023-05-31");
+        assert_eq!(value["max_tokens"], 8_192);
+        assert_eq!(
+            value["messages"][0]["content"][0]["text"],
+            "inspect the repository"
+        );
+        assert_eq!(value["tools"][0]["name"], "shell_run");
+        assert_eq!(value["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(value["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(value["thinking"]["type"], "adaptive");
+        assert_eq!(value["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn anthropic_messages_accumulator_emits_text_tools_and_usage() {
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::from([(
+            "shell_run".to_string(),
+            "shell.run".to_string(),
+        )]));
+        accumulator
+            .process(
+                &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}),
+                &turn,
+            )
+            .expect("text delta should process");
+        accumulator
+            .process(
+                &serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"shell_run","input":{}}}),
+                &turn,
+            )
+            .expect("tool start should process");
+        accumulator
+            .process(
+                &serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}),
+                &turn,
+            )
+            .expect("tool delta should process");
+        accumulator
+            .process(
+                &serde_json::json!({"type":"content_block_stop","index":1}),
+                &turn,
+            )
+            .expect("tool stop should process");
+        accumulator
+            .process(
+                &serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0}}}),
+                &turn,
+            )
+            .expect("usage should process");
+
+        let events = turn.drain();
+        assert!(events.iter().any(
+            |event| matches!(event, ProviderTurnEvent::TextDelta { text } if text == "hello")
+        ));
+        assert!(events.iter().any(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { call } if call.name == "shell.run" && call.arguments["command"] == "pwd")));
+        assert!(events.iter().any(|event| matches!(event, ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 12)));
+    }
 
     #[derive(Debug)]
     struct DeterministicBedrockTurnExecutor;

@@ -147,6 +147,7 @@ pub fn resolve_provider_request_context(
         auth_candidates: Vec::new(),
         request: request.selection.request,
         env: BTreeMap::new(),
+        api_surface: None,
     };
 
     if let Some(auth_profile_name) = request.selection.auth_profile.as_deref()

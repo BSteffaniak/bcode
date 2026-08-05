@@ -1943,6 +1943,7 @@ impl BmuxApp {
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: status.pricing.clone(),
+                api_surface: None,
                 visibility: bcode_model::ModelVisibility::Visible,
             });
         self.token_usage.apply_model_info(model.as_ref());

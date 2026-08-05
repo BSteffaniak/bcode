@@ -22577,6 +22577,13 @@ async fn build_model_turn_request(
     );
     let mut provider_context = selection.provider_context.clone();
     select_host_auth_pool_candidate(state, provider_plugin_id, &mut provider_context).await;
+    provider_context.api_surface = resolve_model_api_surface(
+        state,
+        provider_plugin_id,
+        selected_model_id,
+        &selection.provider_context,
+    )
+    .await;
     let projection_timer = state.metrics.timer();
     let context_format = compaction_policy
         .capabilities
@@ -23107,6 +23114,30 @@ async fn resolve_parallel_tool_call_capabilities(
         model: supported,
         runtime,
     }
+}
+
+async fn resolve_model_api_surface(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+    provider_context: &bcode_model::ProviderRequestContext,
+) -> Option<bcode_model::ModelApiSurface> {
+    let selected_model_id = selected_model_id?;
+    let models = resolved_provider_models(
+        state,
+        provider_plugin_id.map(ToOwned::to_owned),
+        bcode_model::ModelListRequest {
+            provider_context: provider_context.clone(),
+            selected_model_id: Some(selected_model_id.to_owned()),
+        },
+    )
+    .await
+    .ok()?;
+    models
+        .models
+        .into_iter()
+        .find(|model| model.model_id == selected_model_id)
+        .and_then(|model| model.api_surface)
 }
 
 async fn resolve_model_reasoning_info(
@@ -43881,6 +43912,7 @@ library = "test"
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: None,
+                api_surface: None,
                 visibility: bcode_model::ModelVisibility::Visible,
             },
             bcode_model::ModelInfo {
@@ -43895,6 +43927,7 @@ library = "test"
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: None,
+                api_surface: None,
                 visibility: bcode_model::ModelVisibility::Visible,
             },
         ];
