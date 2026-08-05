@@ -6,6 +6,7 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::SessionId;
 use bcode_skill_models::SkillId;
 use bcode_worktree_models::WorktreeListRequest;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 /// Local execution context for backend-agnostic slash commands.
@@ -47,8 +48,10 @@ pub enum SlashCommandOutcome {
     ApplyTheme { theme_id: String },
     /// Restore the configured theme after preview.
     CancelThemePreview,
-    /// List bundled themes.
-    ListThemes,
+    /// Open the interactive theme picker.
+    OpenThemePicker,
+    /// Show the theme catalog as durable transcript content.
+    ShowThemeCatalog,
     /// Open worktree create dialog.
     OpenWorktreeCreateDialog,
     /// Open fork session wizard.
@@ -778,6 +781,51 @@ pub async fn execute_resolved(
     }
 }
 
+fn theme_command(parts: &[&str]) -> SlashCommandOutcome {
+    match parts {
+        [_] => SlashCommandOutcome::OpenThemePicker,
+        [_, "list"] => SlashCommandOutcome::ShowThemeCatalog,
+        [_, "preview", theme_id] => SlashCommandOutcome::PreviewTheme {
+            theme_id: (*theme_id).to_owned(),
+        },
+        [_, "apply", theme_id] => SlashCommandOutcome::ApplyTheme {
+            theme_id: (*theme_id).to_owned(),
+        },
+        [_, "cancel"] => SlashCommandOutcome::CancelThemePreview,
+        _ => SlashCommandOutcome::Handled(
+            "usage: /theme [list|preview <builtin>|apply <builtin>|cancel]".to_owned(),
+        ),
+    }
+}
+
+pub fn format_theme_catalog_markdown(view: &super::theme::ThemeCatalogView) -> String {
+    if view.entries.is_empty() {
+        return "# Themes\n\nNo valid themes are currently available.".to_owned();
+    }
+    let mut output = String::from("# Themes\n\nUse `/theme` to open the interactive picker.\n\n");
+    for entry in &view.entries {
+        let current = if entry.selected { " (current)" } else { "" };
+        let variants = match (entry.has_dark_variant, entry.has_light_variant) {
+            (true, true) => "dark, light",
+            (true, false) => "dark",
+            (false, true) => "light",
+            (false, false) => "default",
+        };
+        let _ = writeln!(
+            output,
+            "* **{}**{current} — {} (`{}`; {variants})",
+            entry.display_name, entry.source, entry.id
+        );
+    }
+    if !view.diagnostics.is_empty() {
+        output.push_str("\n## Rejected definitions\n\n");
+        for diagnostic in &view.diagnostics {
+            let _ = writeln!(output, "* {diagnostic}");
+        }
+    }
+    output
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute_builtin(
     client: &BcodeClient,
@@ -811,25 +859,7 @@ async fn execute_builtin(
             };
             Ok(SlashCommandOutcome::CompactContext { session_id })
         }
-        "theme" if parts.len() == 1 || parts.get(1) == Some(&"list") => {
-            Ok(SlashCommandOutcome::ListThemes)
-        }
-        "theme" if parts.get(1) == Some(&"preview") && parts.len() == 3 => {
-            Ok(SlashCommandOutcome::PreviewTheme {
-                theme_id: parts[2].to_owned(),
-            })
-        }
-        "theme" if parts.get(1) == Some(&"apply") && parts.len() == 3 => {
-            Ok(SlashCommandOutcome::ApplyTheme {
-                theme_id: parts[2].to_owned(),
-            })
-        }
-        "theme" if parts.get(1) == Some(&"cancel") && parts.len() == 2 => {
-            Ok(SlashCommandOutcome::CancelThemePreview)
-        }
-        "theme" => Ok(SlashCommandOutcome::Handled(
-            "usage: /theme [list|preview <builtin>|apply <builtin>|cancel]".to_owned(),
-        )),
+        "theme" => Ok(theme_command(parts)),
         "model" | "models" if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
         "model" | "set-model" if parts.len() > 1 => {
             let model_id = parts[1].to_owned();
@@ -1111,6 +1141,47 @@ mod tests {
         assert!(output.contains("* **ID:** `review`"));
         assert!(output.contains("## Instructions\n\n## Steps"));
         assert!(output.contains("```sh\ncargo test\n```"));
+    }
+
+    #[test]
+    fn bare_theme_opens_picker_and_list_uses_durable_catalog() {
+        assert_eq!(
+            theme_command(&["/theme"]),
+            SlashCommandOutcome::OpenThemePicker
+        );
+        assert_eq!(
+            theme_command(&["/theme", "list"]),
+            SlashCommandOutcome::ShowThemeCatalog
+        );
+        assert_eq!(
+            theme_command(&["/theme", "apply", "bcode-light"]),
+            SlashCommandOutcome::ApplyTheme {
+                theme_id: "bcode-light".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn theme_catalog_markdown_is_durable_and_actionable() {
+        let view = super::super::theme::ThemeCatalogView {
+            entries: vec![super::super::theme::ThemeCatalogEntry {
+                id: "bcode-light".to_owned(),
+                display_name: "Bcode Light".to_owned(),
+                source: "bundled".to_owned(),
+                has_dark_variant: false,
+                has_light_variant: true,
+                validation: "valid".to_owned(),
+                selected: true,
+            }],
+            diagnostics: vec!["broken.toml: invalid color".to_owned()],
+        };
+
+        let markdown = format_theme_catalog_markdown(&view);
+        assert!(markdown.contains("Use `/theme` to open the interactive picker"));
+        assert!(markdown.contains("**Bcode Light** (current)"));
+        assert!(markdown.contains("`bcode-light`; light"));
+        assert!(markdown.contains("Rejected definitions"));
+        assert!(markdown.contains("broken.toml: invalid color"));
     }
 
     #[test]

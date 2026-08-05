@@ -109,7 +109,7 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     },
     SlashCompletion {
         command: "/theme",
-        description: "List bundled themes",
+        description: "Open interactive theme picker",
     },
     SlashCompletion {
         command: "/theme preview ",
@@ -117,7 +117,7 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     },
     SlashCompletion {
         command: "/theme apply ",
-        description: "Apply bundled theme for this run",
+        description: "Persist bundled theme",
     },
     SlashCompletion {
         command: "/theme cancel",

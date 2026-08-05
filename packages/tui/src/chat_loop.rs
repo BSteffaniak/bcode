@@ -2848,30 +2848,17 @@ fn apply_root_slash_command_outcome(
             chat.app.cancel_theme_preview();
             chat.app.set_status("theme preview cancelled".to_owned());
         }
-        SlashCommandOutcome::ListThemes => {
-            let entries = super::theme::catalog_view(&chat.app).entries;
-            let status = if entries.is_empty() {
-                "could not load theme catalog".to_owned()
-            } else {
-                entries
-                    .iter()
-                    .map(|entry| {
-                        let current = if entry.selected { "*" } else { " " };
-                        let variants = match (entry.has_dark_variant, entry.has_light_variant) {
-                            (true, true) => "dark,light",
-                            (true, false) => "dark",
-                            (false, true) => "light",
-                            (false, false) => "default",
-                        };
-                        format!(
-                            "{current} {} — {} [{}; {variants}]",
-                            entry.id, entry.display_name, entry.source
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            chat.app.set_status(status);
+        SlashCommandOutcome::OpenThemePicker => loop_state.open_theme_picker(chat),
+        SlashCommandOutcome::ShowThemeCatalog => {
+            let markdown = super::slash_commands::format_theme_catalog_markdown(
+                &super::theme::catalog_view(&chat.app),
+            );
+            chat.push_presentation_note(
+                "bcode.host",
+                markdown,
+                bcode_command::CommandTextFormat::Markdown,
+            );
+            chat.app.set_status("theme catalog shown".to_owned());
         }
         SlashCommandOutcome::PickModel => {
             chat.replace_effect(TuiEffect::LoadModelProviders);
