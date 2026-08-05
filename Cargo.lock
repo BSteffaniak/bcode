@@ -1402,6 +1402,7 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_session_models",
  "clap",
+ "reqwest",
  "rustls 0.23.42",
  "serde",
  "serde_json",

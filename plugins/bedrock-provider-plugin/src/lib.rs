@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Amazon Bedrock model provider plugin for Bcode.
+//! Amazon Bedrock Runtime and Mantle model provider plugin for Bcode.
 
 #[cfg(feature = "static-bundled")]
 mod cli;
@@ -50,6 +50,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROVIDER_ID: &str = "bcode.bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
+const DEFAULT_MANTLE_ANTHROPIC_BASE_URL_PREFIX: &str = "https://bedrock-mantle.";
+const DEFAULT_MANTLE_ANTHROPIC_BASE_URL_SUFFIX: &str = ".api.aws/anthropic";
 const MODEL_DISCOVERY_TTL: Duration = Duration::from_mins(10);
 const COMPATIBILITY_CACHE_VERSION: u8 = 1;
 const COMPATIBILITY_CACHE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -402,9 +404,13 @@ async fn stream_bedrock_turn_inner(
 ) -> Result<StreamOutcome, ProviderError> {
     validate_bedrock_request(request)?;
     let settings = Settings::resolve(Some(request));
-    let client = bedrock_client(&settings).await;
+    let transport = settings.transport.clone()?;
     let selection = resolve_turn_model_selection(request, &settings, turn, &discovery).await?;
     let name_map = bedrock_tool_name_map(&request.tools);
+    if transport == BedrockTransport::MantleAnthropic {
+        return stream_mantle_anthropic_turn(request, &settings, &selection, turn, name_map).await;
+    }
+    let client = bedrock_client(&settings).await;
     if request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Messages) {
         return stream_bedrock_messages_turn(request, &client, &selection, turn, name_map).await;
     }
@@ -476,6 +482,256 @@ async fn stream_bedrock_turn_inner(
             "set BCODE_BEDROCK_MODEL or configure an accessible streaming Bedrock model",
         ))
     }))
+}
+
+async fn stream_mantle_anthropic_turn(
+    request: &ModelTurnRequest,
+    settings: &Settings,
+    selection: &ModelSelection,
+    turn: &TurnState,
+    name_map: BTreeMap<String, String>,
+) -> Result<StreamOutcome, ProviderError> {
+    let token = client_context_bearer_token(settings).ok_or_else(|| {
+        provider_error(
+            "bedrock_mantle_missing_bearer_token",
+            ProviderErrorCategory::Auth,
+            "Bedrock Mantle requires AWS_BEARER_TOKEN_BEDROCK or a mapped bearer_token credential",
+        )
+    })?;
+    let endpoint = mantle_anthropic_messages_endpoint(settings)?;
+    let client = if settings.force_http1 {
+        reqwest::Client::builder().http1_only().build()
+    } else {
+        reqwest::Client::builder().build()
+    }
+    .map_err(|error| mantle_network_error("client_build_failed", &error))?;
+    let mut request_builder = client
+        .post(endpoint.clone())
+        .header("x-api-key", &token)
+        .header("anthropic-version", "2023-06-01")
+        .header("accept", "text/event-stream")
+        .header("user-agent", "bcode/0.0.1");
+    if settings.mantle_auth_header {
+        request_builder = request_builder.bearer_auth(&token);
+    }
+    let mut last_error = None;
+    for model_id in &selection.model_ids {
+        let response = request_builder
+            .try_clone()
+            .ok_or_else(|| {
+                provider_error(
+                    "bedrock_mantle_request_clone_failed",
+                    ProviderErrorCategory::ProviderInternal,
+                    "failed to prepare Bedrock Mantle request",
+                )
+            })?
+            .json(&build_mantle_anthropic_request(request, model_id)?)
+            .send()
+            .await
+            .map_err(|error| mantle_network_error("request_failed", &error))?;
+        if !response.status().is_success() {
+            let error = mantle_status_error(response).await;
+            let is_last = selection.model_ids.last().map(String::as_str) == Some(model_id);
+            if selection.explicit || is_last {
+                return Err(error);
+            }
+            last_error = Some(error);
+            continue;
+        }
+        return read_mantle_anthropic_stream(response, turn, name_map.clone()).await;
+    }
+    Err(last_error.unwrap_or_else(|| {
+        provider_error(
+            "bedrock_mantle_model_unavailable",
+            ProviderErrorCategory::Config,
+            "no usable Bedrock Mantle Anthropic model was available for the turn",
+        )
+    }))
+}
+
+fn mantle_anthropic_messages_endpoint(settings: &Settings) -> Result<String, ProviderError> {
+    let region = settings.region.as_deref().unwrap_or(DEFAULT_REGION);
+    let base_url = settings.mantle_base_url.clone().unwrap_or_else(|| {
+        format!(
+            "{DEFAULT_MANTLE_ANTHROPIC_BASE_URL_PREFIX}{region}{DEFAULT_MANTLE_ANTHROPIC_BASE_URL_SUFFIX}"
+        )
+    });
+    let mut url = reqwest::Url::parse(base_url.trim()).map_err(|error| {
+        provider_error(
+            "bedrock_mantle_base_url_invalid",
+            ProviderErrorCategory::Config,
+            format!("invalid Bedrock Mantle base URL: {error}"),
+        )
+    })?;
+    if url.scheme() != "https"
+        && !url
+            .host_str()
+            .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost"))
+    {
+        return Err(provider_error(
+            "bedrock_mantle_base_url_insecure",
+            ProviderErrorCategory::Config,
+            "Bedrock Mantle base URL must use HTTPS",
+        ));
+    }
+    let path = format!("{}/v1/messages", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    Ok(url.to_string())
+}
+
+async fn mantle_status_error(response: reqwest::Response) -> ProviderError {
+    let status = response.status();
+    let request_id = response
+        .headers()
+        .get("x-amzn-requestid")
+        .or_else(|| response.headers().get("request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(sanitize_provider_diagnostic)
+        })
+        .unwrap_or_else(|| format!("Bedrock Mantle request failed with HTTP {status}"));
+    let category = match status.as_u16() {
+        401 | 403 => ProviderErrorCategory::Auth,
+        400 | 404 | 409 | 422 => ProviderErrorCategory::InvalidRequest,
+        408 | 425 | 429 | 500..=599 => ProviderErrorCategory::Network,
+        _ => ProviderErrorCategory::ProviderInternal,
+    };
+    let mut error = provider_error("bedrock_mantle_http_error", category, message);
+    error.request_id = request_id.map(String::into_boxed_str);
+    error.retry = retry_hint_from_body(&body).map(Box::new);
+    error
+}
+
+fn mantle_network_error(code: &str, error: &reqwest::Error) -> ProviderError {
+    provider_error(
+        format!("bedrock_mantle_{code}"),
+        ProviderErrorCategory::Network,
+        format!("Bedrock Mantle transport failed: {error}"),
+    )
+}
+
+#[derive(Default)]
+struct MantleSseDecoder {
+    buffer: Vec<u8>,
+    data: Vec<String>,
+}
+
+impl MantleSseDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<serde_json::Value>, ProviderError> {
+        self.buffer.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.buffer.drain(..=position).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = String::from_utf8(line).map_err(|error| {
+                provider_error(
+                    "bedrock_mantle_stream_decode_failed",
+                    ProviderErrorCategory::ProviderInternal,
+                    format!("Bedrock Mantle stream was not valid UTF-8: {error}"),
+                )
+            })?;
+            self.process_line(&line, &mut events)?;
+        }
+        Ok(events)
+    }
+
+    fn finish(&mut self) -> Result<Vec<serde_json::Value>, ProviderError> {
+        let mut events = Vec::new();
+        if !self.buffer.is_empty() {
+            let line = String::from_utf8(std::mem::take(&mut self.buffer)).map_err(|error| {
+                provider_error(
+                    "bedrock_mantle_stream_decode_failed",
+                    ProviderErrorCategory::ProviderInternal,
+                    format!("Bedrock Mantle stream was not valid UTF-8: {error}"),
+                )
+            })?;
+            self.process_line(line.trim_end_matches('\r'), &mut events)?;
+        }
+        self.flush(&mut events)?;
+        Ok(events)
+    }
+
+    fn process_line(
+        &mut self,
+        line: &str,
+        events: &mut Vec<serde_json::Value>,
+    ) -> Result<(), ProviderError> {
+        if line.is_empty() {
+            return self.flush(events);
+        }
+        if line.starts_with(':') {
+            return Ok(());
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            self.data
+                .push(data.strip_prefix(' ').unwrap_or(data).to_string());
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, events: &mut Vec<serde_json::Value>) -> Result<(), ProviderError> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        let data = self.data.join("\n");
+        self.data.clear();
+        if data == "[DONE]" {
+            return Ok(());
+        }
+        events.push(serde_json::from_str(&data).map_err(|error| {
+            provider_error(
+                "bedrock_mantle_stream_decode_failed",
+                ProviderErrorCategory::ProviderInternal,
+                format!("failed to decode Bedrock Mantle SSE event: {error}"),
+            )
+        })?);
+        Ok(())
+    }
+}
+
+async fn read_mantle_anthropic_stream(
+    mut response: reqwest::Response,
+    turn: &TurnState,
+    name_map: BTreeMap<String, String>,
+) -> Result<StreamOutcome, ProviderError> {
+    let mut decoder = MantleSseDecoder::default();
+    let mut accumulator = AnthropicMessagesAccumulator::new(name_map);
+    loop {
+        if turn.is_cancelled() {
+            return Ok(StreamOutcome::Cancelled);
+        }
+        let cancel_notify = turn.cancel_notify();
+        tokio::select! {
+            chunk = response.chunk() => {
+                if let Some(chunk) = chunk.map_err(|error| mantle_network_error("stream_failed", &error))? {
+                    for event in decoder.push(&chunk)? {
+                        if let Some(outcome) = accumulator.process(&event, turn)? {
+                            return Ok(outcome);
+                        }
+                    }
+                } else {
+                    for event in decoder.finish()? {
+                        if let Some(outcome) = accumulator.process(&event, turn)? {
+                            return Ok(outcome);
+                        }
+                    }
+                    return Ok(accumulator.finish());
+                }
+            }
+            () = cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+        }
+    }
 }
 
 async fn stream_bedrock_messages_turn(
@@ -751,6 +1007,27 @@ async fn read_anthropic_messages_stream(
     }
 }
 
+fn anthropic_messages_event_error(event: &serde_json::Value) -> ProviderError {
+    let error_type = event
+        .pointer("/error/type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("stream_error");
+    let message = event
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || "Bedrock Anthropic Messages stream returned an error".to_string(),
+            sanitize_provider_diagnostic,
+        );
+    let category = match error_type {
+        "authentication_error" | "permission_error" => ProviderErrorCategory::Auth,
+        "invalid_request_error" | "not_found_error" => ProviderErrorCategory::InvalidRequest,
+        "rate_limit_error" | "overloaded_error" | "api_error" => ProviderErrorCategory::Network,
+        _ => ProviderErrorCategory::ProviderInternal,
+    };
+    provider_error(format!("bedrock_anthropic_{error_type}"), category, message)
+}
+
 struct AnthropicMessagesAccumulator {
     tool_calls: BTreeMap<u32, ToolCallAccumulator>,
     reasoning_blocks: BTreeMap<u32, String>,
@@ -781,25 +1058,12 @@ impl AnthropicMessagesAccumulator {
                 turn,
                 true,
             ),
+            Some("error") => return Err(anthropic_messages_event_error(event)),
             Some("content_block_start") => self.start_content_block(event, turn)?,
             Some("content_block_delta") => self.content_block_delta(event, turn),
             Some("content_block_stop") => self.finish_content_block(event, turn)?,
             Some("message_delta") => Self::emit_usage(event.get("usage"), turn, false),
             Some("message_stop") => return Ok(Some(self.finish())),
-            Some("error") => {
-                return Err(provider_error(
-                    "bedrock_messages_stream_failed",
-                    ProviderErrorCategory::ProviderInternal,
-                    event
-                        .get("error")
-                        .and_then(|error| error.get("message"))
-                        .and_then(serde_json::Value::as_str)
-                        .map_or_else(
-                            || "Bedrock Messages stream failed".to_string(),
-                            sanitize_provider_diagnostic,
-                        ),
-                ));
-            }
             _ => {}
         }
         Ok(None)
@@ -1298,7 +1562,9 @@ struct BedrockConverseRequest {
     additional_model_request_fields: Option<Document>,
 }
 
-fn build_anthropic_messages_request(request: &ModelTurnRequest) -> Result<Vec<u8>, ProviderError> {
+fn build_anthropic_messages_request_value(
+    request: &ModelTurnRequest,
+) -> Result<serde_json::Map<String, serde_json::Value>, ProviderError> {
     let mut body = serde_json::Map::new();
     body.insert(
         "anthropic_version".to_string(),
@@ -1362,7 +1628,23 @@ fn build_anthropic_messages_request(request: &ModelTurnRequest) -> Result<Vec<u8
         );
     }
     apply_anthropic_thinking_fields(&mut body, &request.parameters);
-    serde_json::to_vec(&body).map_err(|error| build_error(&error))
+    Ok(body)
+}
+
+fn build_anthropic_messages_request(request: &ModelTurnRequest) -> Result<Vec<u8>, ProviderError> {
+    serde_json::to_vec(&build_anthropic_messages_request_value(request)?)
+        .map_err(|error| build_error(&error))
+}
+
+fn build_mantle_anthropic_request(
+    request: &ModelTurnRequest,
+    model_id: &str,
+) -> Result<serde_json::Value, ProviderError> {
+    let mut body = build_anthropic_messages_request_value(request)?;
+    body.remove("anthropic_version");
+    body.insert("model".to_string(), serde_json::json!(model_id));
+    body.insert("stream".to_string(), serde_json::Value::Bool(true));
+    Ok(serde_json::Value::Object(body))
 }
 
 fn anthropic_system_content(request: &ModelTurnRequest) -> Option<serde_json::Value> {
@@ -2004,8 +2286,41 @@ fn model_parameters_to_inference_config(
     Some(builder.build())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BedrockTransport {
+    Runtime,
+    MantleAnthropic,
+}
+
+impl BedrockTransport {
+    fn parse(value: Option<&str>) -> Result<Self, ProviderError> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("bedrock_runtime" | "runtime") => Ok(Self::Runtime),
+            Some("mantle_anthropic" | "mantle") => Ok(Self::MantleAnthropic),
+            Some(value) => Err(provider_error(
+                "bedrock_transport_invalid",
+                ProviderErrorCategory::Config,
+                format!(
+                    "unsupported Bedrock transport '{value}'; expected 'bedrock_runtime' or 'mantle_anthropic'"
+                ),
+            )),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "bedrock_runtime",
+            Self::MantleAnthropic => "mantle_anthropic",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Settings {
+    transport: Result<BedrockTransport, ProviderError>,
+    mantle_base_url: Option<String>,
+    mantle_auth_header: bool,
+    force_http1: bool,
     default_model: Option<String>,
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
@@ -2048,6 +2363,7 @@ impl Settings {
         Self::resolve_context(request.map(|request| &request.provider_context))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn resolve_context(request_context: Option<&ProviderRequestContext>) -> Self {
         let config = bcode_config::load_config().ok();
         let resolved = config
@@ -2127,7 +2443,22 @@ impl Settings {
             model_ids.insert(0, default_model.clone());
         }
         let (region, region_source) = resolve_configured_region(&value, &first_context_env);
+        let transport_value =
+            first_context_env(&["BCODE_BEDROCK_TRANSPORT"]).or_else(|| value(&["transport"]));
+        let transport = BedrockTransport::parse(transport_value.as_deref());
+        let mantle_base_url = first_context_env(&["BCODE_BEDROCK_MANTLE_BASE_URL"])
+            .or_else(|| value(&["mantle_base_url"]));
+        let mantle_auth_header = first_context_env(&["BCODE_BEDROCK_MANTLE_AUTH_HEADER"])
+            .or_else(|| value(&["mantle_auth_header"]))
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"));
+        let force_http1 =
+            first_context_env(&["BCODE_BEDROCK_FORCE_HTTP1", "AWS_BEDROCK_FORCE_HTTP1"])
+                .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"));
         Self {
+            transport,
+            mantle_base_url,
+            mantle_auth_header,
+            force_http1,
             default_model,
             model_ids,
             model_ids_are_explicit: model_ids_value.is_some(),
@@ -2289,9 +2620,29 @@ fn capabilities() -> ProviderCapabilities {
 impl BedrockProviderPlugin {
     fn models(&self, request: &ModelListRequest) -> ModelList {
         let settings = Settings::resolve_from_context(&request.provider_context);
-        // Only an explicit models *list* (BCODE_BEDROCK_MODELS / config `models`) pins membership.
-        // A merely-selected or configured single model must not collapse the picker to one entry;
-        // it is surfaced as the default within the full discovered list below.
+        // Mantle has no Bedrock control-plane discovery API. Its configured model membership is
+        // authoritative and the central catalog enriches those IDs with capabilities and limits.
+        if settings
+            .transport
+            .as_ref()
+            .is_ok_and(|transport| *transport == BedrockTransport::MantleAnthropic)
+        {
+            let model_ids = if settings.model_ids.is_empty() {
+                settings.default_model.iter().cloned().collect::<Vec<_>>()
+            } else {
+                settings.model_ids.clone()
+            };
+            return ModelList {
+                models: model_infos_from_ids(&model_ids, settings.default_model.as_deref()),
+                catalog: ModelCatalogHints {
+                    policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
+                        provider_id: "bedrock".to_string(),
+                        target: None,
+                        authority: bcode_model::ModelListAuthority::Explicit,
+                    },
+                },
+            };
+        }
         if settings.model_ids_are_explicit {
             return ModelList {
                 models: model_infos_from_ids(
@@ -2342,13 +2693,26 @@ impl BedrockProviderPlugin {
 
     fn validate_config(&self, provider_context: &ProviderRequestContext) -> ValidateConfigResponse {
         let settings = Settings::resolve_from_context(provider_context);
-        let mut validation: Result<(), ProviderError> = Ok(());
-        let mut metadata = diagnostics_metadata(&settings);
-        let effective_region = validation.as_ref().ok().and_then(|()| {
-            self.runtime
+        let mut validation = settings.transport.clone().map(|_| ());
+        if validation.is_ok()
+            && settings
+                .transport
                 .as_ref()
-                .ok()
-                .and_then(|runtime| resolved_sdk_region(runtime, &settings))
+                .is_ok_and(|transport| *transport == BedrockTransport::MantleAnthropic)
+        {
+            validation = validate_mantle_settings(&settings);
+        }
+        let mut metadata = diagnostics_metadata(&settings);
+        let transport = settings.transport.as_ref().copied();
+        let effective_region = validation.as_ref().ok().and_then(|()| {
+            (transport == Ok(BedrockTransport::Runtime))
+                .then(|| {
+                    self.runtime
+                        .as_ref()
+                        .ok()
+                        .and_then(|runtime| resolved_sdk_region(runtime, &settings))
+                })
+                .flatten()
         });
         if let Some((region, source)) = &effective_region {
             metadata.insert("effective_region".to_string(), region.clone());
@@ -2358,6 +2722,10 @@ impl BedrockProviderPlugin {
             );
         }
         if validation.is_ok()
+            && settings
+                .transport
+                .as_ref()
+                .is_ok_and(|transport| *transport == BedrockTransport::Runtime)
             && !settings.model_ids_are_explicit
             && settings.default_model.is_none()
         {
@@ -2517,6 +2885,17 @@ async fn resolve_turn_model_selection(
             cache_key: None,
         });
     }
+    if settings
+        .transport
+        .as_ref()
+        .is_ok_and(|transport| *transport == BedrockTransport::MantleAnthropic)
+    {
+        return Err(provider_error(
+            "bedrock_mantle_model_required",
+            ProviderErrorCategory::Config,
+            "Bedrock Mantle requires a configured model",
+        ));
+    }
     let key = discovery_cache_key(settings).await;
     let discovery = if let Some(discovery) = cached_discovery(cache, &key) {
         discovery
@@ -2627,9 +3006,13 @@ fn warm_discovery_cache(
     cache: Arc<Mutex<DiscoveryCache>>,
     settings: Settings,
 ) {
-    // Discovery still drives the picker list when a single model is selected/configured, so only
-    // an explicit pinned models list skips warming.
-    if settings.model_ids_are_explicit {
+    // Mantle has no Bedrock control-plane discovery API; configured model membership is used.
+    if settings.model_ids_are_explicit
+        || settings
+            .transport
+            .as_ref()
+            .is_ok_and(|transport| *transport == BedrockTransport::MantleAnthropic)
+    {
         return;
     }
     runtime.spawn(async move {
@@ -3298,9 +3681,51 @@ fn resolved_sdk_region(
     Some((region, source))
 }
 
+fn validate_mantle_settings(settings: &Settings) -> Result<(), ProviderError> {
+    let model_configured = settings
+        .default_model
+        .as_ref()
+        .is_some_and(|model| !model.trim().is_empty())
+        || settings
+            .model_ids
+            .iter()
+            .any(|model| !model.trim().is_empty());
+    if !model_configured {
+        return Err(provider_error(
+            "bedrock_mantle_model_required",
+            ProviderErrorCategory::Config,
+            "Bedrock Mantle requires a configured model because control-plane discovery is unavailable",
+        ));
+    }
+    if client_context_bearer_token(settings).is_none() {
+        return Err(provider_error(
+            "bedrock_mantle_missing_bearer_token",
+            ProviderErrorCategory::Auth,
+            "Bedrock Mantle requires AWS_BEARER_TOKEN_BEDROCK or a mapped bearer_token credential",
+        ));
+    }
+    mantle_anthropic_messages_endpoint(settings).map(|_| ())
+}
+
 fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert("provider".to_string(), PROVIDER_ID.to_string());
+    metadata.insert(
+        "transport".to_string(),
+        settings
+            .transport
+            .as_ref()
+            .map_or("invalid", |transport| transport.as_str())
+            .to_string(),
+    );
+    metadata.insert("force_http1".to_string(), settings.force_http1.to_string());
+    metadata.insert(
+        "mantle_auth_header".to_string(),
+        settings.mantle_auth_header.to_string(),
+    );
+    if let Some(base_url) = &settings.mantle_base_url {
+        metadata.insert("mantle_base_url".to_string(), base_url.clone());
+    }
     metadata.insert(
         "default_model".to_string(),
         settings
@@ -4259,6 +4684,119 @@ mod tests {
         run_provider_conformance_suite,
     };
     use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
+
+    #[test]
+    fn anthropic_messages_error_event_is_normalized() {
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new());
+        let turn = TurnState::default();
+        let event = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "authentication_error",
+                "message": "invalid API key"
+            }
+        });
+        let error = accumulator
+            .process(&event, &turn)
+            .expect_err("error event must fail the stream");
+        assert_eq!(error.category, ProviderErrorCategory::Auth);
+        assert_eq!(error.code, "bedrock_anthropic_authentication_error");
+    }
+
+    #[test]
+    fn mantle_anthropic_request_uses_direct_messages_shape() {
+        let mut request = test_model_turn_request();
+        request.parameters.reasoning_control = Some(bcode_model::ReasoningControl::Adaptive);
+        request.parameters.reasoning_effort_value = Some("high".to_string());
+
+        let value = build_mantle_anthropic_request(&request, "anthropic.claude-opus-5")
+            .expect("Mantle request should serialize");
+
+        assert_eq!(value["model"], "anthropic.claude-opus-5");
+        assert_eq!(value["stream"], true);
+        assert!(value.get("anthropic_version").is_none());
+        assert_eq!(value["thinking"]["type"], "adaptive");
+        assert_eq!(value["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn mantle_endpoint_defaults_from_region_and_accepts_local_tests() {
+        let settings = test_settings();
+        assert_eq!(
+            mantle_anthropic_messages_endpoint(&settings).expect("default endpoint"),
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages"
+        );
+
+        let mut local = settings;
+        local.mantle_base_url = Some("http://127.0.0.1:8080/anthropic/".to_string());
+        assert_eq!(
+            mantle_anthropic_messages_endpoint(&local).expect("local endpoint"),
+            "http://127.0.0.1:8080/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn mantle_sse_decoder_handles_fragmented_multiline_events() {
+        let mut decoder = MantleSseDecoder::default();
+        assert!(
+            decoder
+                .push(b"event: message_start\r\ndata: {\"type\":")
+                .unwrap()
+                .is_empty()
+        );
+        let events = decoder
+            .push(b"\"message_start\",\r\ndata: \"message\":{}}\r\n\r\n")
+            .expect("fragmented event should decode");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "message_start");
+    }
+
+    #[test]
+    fn mantle_settings_require_model_and_bearer_token() {
+        let mut settings = test_settings();
+        settings.transport = Ok(BedrockTransport::MantleAnthropic);
+        settings.default_model = None;
+        settings.model_ids.clear();
+        assert_eq!(
+            validate_mantle_settings(&settings).unwrap_err().code,
+            "bedrock_mantle_model_required"
+        );
+
+        settings.default_model = Some("anthropic.claude-opus-5".to_string());
+        assert_eq!(
+            validate_mantle_settings(&settings).unwrap_err().code,
+            "bedrock_mantle_missing_bearer_token"
+        );
+        settings
+            .auth_credentials
+            .insert("bearer_token".to_string(), "secret".to_string());
+        validate_mantle_settings(&settings).expect("valid Mantle settings");
+        let diagnostics = diagnostics_metadata(&settings);
+        assert_eq!(
+            diagnostics.get("transport").map(String::as_str),
+            Some("mantle_anthropic")
+        );
+        assert!(!diagnostics.values().any(|value| value.contains("secret")));
+    }
+
+    fn test_settings() -> Settings {
+        Settings {
+            transport: Ok(BedrockTransport::Runtime),
+            mantle_base_url: None,
+            mantle_auth_header: false,
+            force_http1: false,
+            default_model: Some("anthropic.claude-opus-5".to_string()),
+            model_ids: vec!["anthropic.claude-opus-5".to_string()],
+            model_ids_are_explicit: false,
+            region: Some(DEFAULT_REGION.to_string()),
+            region_source: RegionSource::Profile,
+            aws_profile: None,
+            endpoint_url: None,
+            auth_credentials: BTreeMap::new(),
+            env: BTreeMap::new(),
+            config_source: "test".to_string(),
+        }
+    }
 
     #[test]
     fn anthropic_messages_request_serializes_tools_and_adaptive_thinking() {
@@ -5288,6 +5826,10 @@ mod tests {
     #[test]
     fn context_bearer_token_is_resolved_from_auth_credentials() {
         let settings = Settings {
+            transport: Ok(BedrockTransport::Runtime),
+            mantle_base_url: None,
+            mantle_auth_header: false,
+            force_http1: false,
             default_model: None,
             model_ids: Vec::new(),
             model_ids_are_explicit: false,
