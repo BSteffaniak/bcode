@@ -1242,9 +1242,13 @@ impl AnthropicMessagesAccumulator {
                 ..TokenUsage::default()
             },
         });
-        if exact_input && let Some(tokens) = input_tokens {
+        if exact_input && let Some(input_tokens) = input_tokens {
             turn.push(ProviderTurnEvent::ExactRequestInputTokens {
-                tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
+                tokens: bcode_model::ExactRequestInputTokens::new(complete_request_input_tokens(
+                    input_tokens,
+                    cached_input_tokens,
+                    cache_write_input_tokens,
+                )),
             });
         }
     }
@@ -1321,6 +1325,7 @@ struct StreamAccumulator {
     stop_reason: Option<StopReason>,
     reasoning_blocks: BTreeMap<i32, String>,
     name_map: BTreeMap<String, String>,
+    saw_message_stop: bool,
 }
 
 impl StreamAccumulator {
@@ -1331,6 +1336,7 @@ impl StreamAccumulator {
             stop_reason: None,
             reasoning_blocks: BTreeMap::new(),
             name_map,
+            saw_message_stop: false,
         }
     }
 
@@ -1369,25 +1375,36 @@ impl StreamAccumulator {
             },
             ConverseStreamOutput::Metadata(event) => {
                 if let Some(usage) = event.usage() {
-                    let exact_input_tokens = nonnegative_u32(usage.input_tokens());
+                    let input_tokens = nonnegative_u32(usage.input_tokens());
+                    let cache_read_input_tokens =
+                        usage.cache_read_input_tokens().and_then(nonnegative_u32);
+                    let cache_write_input_tokens =
+                        usage.cache_write_input_tokens().and_then(nonnegative_u32);
                     turn.push(ProviderTurnEvent::Usage {
                         usage: TokenUsage {
-                            input_tokens: nonnegative_u32(usage.input_tokens()),
+                            input_tokens,
                             output_tokens: nonnegative_u32(usage.output_tokens()),
-                            cached_input_tokens: usage
-                                .cache_read_input_tokens()
-                                .and_then(nonnegative_i32_to_u32),
-                            cache_write_input_tokens: usage
-                                .cache_write_input_tokens()
-                                .and_then(nonnegative_i32_to_u32),
+                            cached_input_tokens: cache_read_input_tokens,
+                            cache_write_input_tokens,
                             ..TokenUsage::default()
                         },
                     });
-                    if let Some(tokens) = exact_input_tokens {
+                    if let Some(input_tokens) = input_tokens {
                         turn.push(ProviderTurnEvent::ExactRequestInputTokens {
-                            tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
+                            tokens: bcode_model::ExactRequestInputTokens::new(
+                                complete_request_input_tokens(
+                                    input_tokens,
+                                    cache_read_input_tokens,
+                                    cache_write_input_tokens,
+                                ),
+                            ),
                         });
                     }
+                }
+                // `metadata` is the documented final Converse event. Once the message already
+                // stopped, terminate instead of waiting on end-of-stream.
+                if self.saw_message_stop {
+                    return Ok(Some(self.finish_outcome()));
                 }
             }
             ConverseStreamOutput::MessageStop(event) => {
@@ -1395,9 +1412,12 @@ impl StreamAccumulator {
                 self.finish_reasoning(turn);
                 if self.saw_tool_call {
                     self.finish_tool_calls(turn)?;
-                    return Ok(Some(StreamOutcome::ToolCall));
                 }
-                return Ok(Some(StreamOutcome::Finished));
+                // `messageStop` is not the last Converse event: the trailing `metadata` event
+                // carries `usage`, which is the only source of provider-exact request input
+                // tokens. Keep reading so the stream terminates on end-of-stream instead of
+                // discarding usage. `finish_outcome` reproduces the outcome chosen here.
+                self.saw_message_stop = true;
             }
             _ => {}
         }
@@ -3865,11 +3885,24 @@ const fn map_stop_reason(reason: &BedrockStopReason) -> StopReason {
 }
 
 fn nonnegative_u32(value: i32) -> Option<u32> {
-    nonnegative_i32_to_u32(value)
+    u32::try_from(value).ok()
 }
 
-fn nonnegative_i32_to_u32(value: i32) -> Option<u32> {
-    u32::try_from(value).ok()
+/// Combine Bedrock input-token fields into the complete request input context.
+///
+/// Bedrock reports `inputTokens` as *non-cached* input whenever prompt caching participates in a
+/// request, so the complete model-visible request is
+/// `inputTokens + cacheReadInputTokens + cacheWriteInputTokens`. Callers must only supply an
+/// `input_tokens` value the provider actually reported, because a cache-only sum would understate
+/// context occupancy.
+fn complete_request_input_tokens(
+    input_tokens: u32,
+    cache_read_input_tokens: Option<u32>,
+    cache_write_input_tokens: Option<u32>,
+) -> u64 {
+    u64::from(input_tokens)
+        .saturating_add(u64::from(cache_read_input_tokens.unwrap_or_default()))
+        .saturating_add(u64::from(cache_write_input_tokens.unwrap_or_default()))
 }
 
 fn build_error(error: &(impl ToString + ?Sized)) -> ProviderError {
@@ -4881,6 +4914,214 @@ mod tests {
         ));
         assert!(events.iter().any(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { call } if call.name == "shell.run" && call.arguments["command"] == "pwd")));
         assert!(events.iter().any(|event| matches!(event, ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 12)));
+    }
+
+    #[test]
+    fn anthropic_messages_exact_input_tokens_include_cache_reads_and_writes() {
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new());
+
+        accumulator
+            .process(
+                &serde_json::json!({"type":"message_start","message":{"usage":{
+                    "input_tokens": 12,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 80
+                }}}),
+                &turn,
+            )
+            .expect("usage should process");
+
+        let events = turn.drain();
+        // Anthropic reports `input_tokens` as non-cached input, so the complete request context is
+        // 12 + 400 + 80.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 492
+        )));
+        // Billing-shaped usage keeps the provider's own field split.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Usage { usage }
+                if usage.input_tokens == Some(12)
+                    && usage.cached_input_tokens == Some(400)
+                    && usage.cache_write_input_tokens == Some(80)
+        )));
+    }
+
+    #[test]
+    fn anthropic_messages_omits_exact_input_tokens_without_input_count() {
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new());
+
+        accumulator
+            .process(
+                &serde_json::json!({"type":"message_start","message":{"usage":{
+                    "cache_read_input_tokens": 400
+                }}}),
+                &turn,
+            )
+            .expect("usage should process");
+
+        // A cache-only sum would understate context, so fail closed to the local estimate.
+        assert!(
+            !turn
+                .drain()
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ExactRequestInputTokens { .. }))
+        );
+    }
+
+    fn converse_metadata_event(
+        input_tokens: i32,
+        cache_read_input_tokens: Option<i32>,
+        cache_write_input_tokens: Option<i32>,
+    ) -> ConverseStreamOutput {
+        let mut usage = aws_sdk_bedrockruntime::types::TokenUsage::builder()
+            .input_tokens(input_tokens)
+            .output_tokens(7)
+            .total_tokens(input_tokens.saturating_add(7));
+        if let Some(tokens) = cache_read_input_tokens {
+            usage = usage.cache_read_input_tokens(tokens);
+        }
+        if let Some(tokens) = cache_write_input_tokens {
+            usage = usage.cache_write_input_tokens(tokens);
+        }
+        ConverseStreamOutput::Metadata(
+            aws_sdk_bedrockruntime::types::ConverseStreamMetadataEvent::builder()
+                .usage(usage.build().expect("token usage should build"))
+                .build(),
+        )
+    }
+
+    fn converse_message_stop_event(stop_reason: BedrockStopReason) -> ConverseStreamOutput {
+        ConverseStreamOutput::MessageStop(
+            aws_sdk_bedrockruntime::types::MessageStopEvent::builder()
+                .stop_reason(stop_reason)
+                .build()
+                .expect("message stop event should build"),
+        )
+    }
+
+    #[test]
+    fn converse_metadata_after_message_stop_emits_usage_and_exact_input_tokens() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+
+        // AWS documents the order messageStart -> content -> messageStop -> metadata, so
+        // `messageStop` must not end the stream before usage arrives.
+        assert!(
+            accumulator
+                .process_event(
+                    converse_message_stop_event(BedrockStopReason::EndTurn),
+                    &turn
+                )
+                .expect("message stop should process")
+                .is_none(),
+            "messageStop must not terminate the stream before the trailing metadata event"
+        );
+
+        let outcome = accumulator
+            .process_event(converse_metadata_event(47, None, None), &turn)
+            .expect("metadata should process")
+            .expect("metadata after messageStop should terminate the stream");
+        assert_eq!(outcome, StreamOutcome::Finished);
+
+        let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Usage { usage } if usage.input_tokens == Some(47)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 47
+        )));
+    }
+
+    #[test]
+    fn converse_tool_call_turn_still_reports_usage_after_message_stop() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+        accumulator.tool_calls.insert(
+            0,
+            ToolCallAccumulator {
+                id: Some("call-1".to_string()),
+                name: Some("shell_run".to_string()),
+                arguments: "{}".to_string(),
+            },
+        );
+        accumulator.saw_tool_call = true;
+
+        assert!(
+            accumulator
+                .process_event(
+                    converse_message_stop_event(BedrockStopReason::ToolUse),
+                    &turn
+                )
+                .expect("message stop should process")
+                .is_none()
+        );
+        let outcome = accumulator
+            .process_event(converse_metadata_event(31, None, None), &turn)
+            .expect("metadata should process")
+            .expect("metadata after messageStop should terminate the stream");
+        assert_eq!(outcome, StreamOutcome::ToolCall);
+
+        let events = turn.drain();
+        // Tool calls must still be finalized exactly once at messageStop.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 31
+        )));
+    }
+
+    #[test]
+    fn converse_exact_input_tokens_include_cache_reads_and_writes() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+
+        accumulator
+            .process_event(converse_metadata_event(12, Some(400), Some(80)), &turn)
+            .expect("metadata should process");
+
+        let events = turn.drain();
+        // Bedrock reports non-cached input in `inputTokens`, so complete context is 12 + 400 + 80.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 492
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Usage { usage }
+                if usage.input_tokens == Some(12)
+                    && usage.cached_input_tokens == Some(400)
+                    && usage.cache_write_input_tokens == Some(80)
+        )));
+    }
+
+    #[test]
+    fn converse_stream_truncated_after_message_stop_still_terminates() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+
+        accumulator
+            .process_event(
+                converse_message_stop_event(BedrockStopReason::EndTurn),
+                &turn,
+            )
+            .expect("message stop should process");
+
+        // If the provider never sends `metadata`, end-of-stream must still yield the outcome
+        // chosen at `messageStop` rather than hanging or erroring.
+        assert_eq!(accumulator.finish_outcome(), StreamOutcome::Finished);
     }
 
     #[derive(Debug)]
