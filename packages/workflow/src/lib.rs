@@ -3822,6 +3822,74 @@ pub struct WorkflowSourceMap {
     pub entries: Vec<WorkflowSourceMapEntry>,
 }
 
+impl WorkflowSourceMap {
+    /// Remap canonical node-addressed diagnostics to concise source paths.
+    #[must_use]
+    pub fn remap_diagnostics(
+        &self,
+        diagnostics: &[WorkflowValidationDiagnostic],
+    ) -> Vec<WorkflowValidationDiagnostic> {
+        diagnostics
+            .iter()
+            .cloned()
+            .map(|mut diagnostic| {
+                if let Some(entry) = self.entries.iter().find(|entry| {
+                    diagnostic.document_path == format!("definition.nodes.{}", entry.node_id)
+                        || diagnostic
+                            .document_path
+                            .starts_with(&format!("definition.nodes.{}.", entry.node_id))
+                }) {
+                    diagnostic.document_path = diagnostic.document_path.replacen(
+                        &format!("definition.nodes.{}", entry.node_id),
+                        &entry.source_path,
+                        1,
+                    );
+                }
+                diagnostic
+            })
+            .collect()
+    }
+}
+
+/// Portable source-apply result contract version.
+pub const WORKFLOW_SOURCE_APPLY_RESULT_VERSION: u32 = 1;
+/// Default mutable draft identity used by source-aware apply.
+pub const DEFAULT_WORKFLOW_SOURCE_DRAFT_ID: &str = "source";
+
+/// Stable outcome of one source-aware create-or-replace operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSourceApplyOutcome {
+    /// A new logical workflow and generation-1 draft were created.
+    Created,
+    /// One exact existing draft generation was replaced.
+    Updated,
+    /// The single optimistic replacement observed a concurrent generation change.
+    Conflict {
+        expected_generation: u64,
+        current_generation: u64,
+    },
+}
+
+/// Structured renderer-neutral result returned by source-aware apply producers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSourceApplyResult {
+    pub version: u32,
+    pub source_format: WorkflowSourceFormat,
+    pub source_profile: WorkflowSourceProfile,
+    pub workflow_id: String,
+    pub draft_id: String,
+    pub generation: u64,
+    pub canonical_digest_sha256: String,
+    pub validation: WorkflowValidationReport,
+    pub source_map: WorkflowSourceMap,
+    pub requirements: WorkflowRequirementSummary,
+    pub effects: WorkflowEffectSummary,
+    pub permissions: WorkflowPermissionPreview,
+    pub outcome: WorkflowSourceApplyOutcome,
+}
+
 /// Portable result of decoding and lowering one workflow source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4043,6 +4111,7 @@ const fn workflow_source_format_path(format: WorkflowSourceFormat) -> &'static s
 }
 
 fn decode_workflow_yaml_value(source: &str) -> Result<serde_json::Value, WorkflowError> {
+    reject_unsupported_yaml_syntax(source)?;
     let value: yaml_serde::Value = yaml_serde::from_str(source).map_err(|error| {
         authoring_error(
             "source.yaml",
@@ -4050,6 +4119,23 @@ fn decode_workflow_yaml_value(source: &str) -> Result<serde_json::Value, Workflo
         )
     })?;
     yaml_value_to_json(value, "source.yaml", 0)
+}
+
+fn reject_unsupported_yaml_syntax(source: &str) -> Result<(), WorkflowError> {
+    for (line_index, line) in source.lines().enumerate() {
+        let content = line.split('#').next().unwrap_or_default();
+        if content.contains("<<:")
+            || content
+                .split_whitespace()
+                .any(|word| word.starts_with('&') || word.starts_with('*') || word.starts_with('!'))
+        {
+            return Err(authoring_error(
+                format!("source.yaml.line_{}", line_index + 1),
+                "YAML anchors, aliases, merge keys, and custom tags are unsupported",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn yaml_value_to_json(
@@ -10786,6 +10872,23 @@ mod tests {
                 .is_err()
         );
         assert!(
+            decode_workflow_authoring_source(
+                "base: &base value\ncopy: *base",
+                WorkflowSourceFormat::Yaml
+            )
+            .is_err()
+        );
+        assert!(
+            decode_workflow_authoring_source(
+                "base: &base {x: 1}\nvalue:\n  <<: *base",
+                WorkflowSourceFormat::Yaml
+            )
+            .is_err()
+        );
+        assert!(
+            decode_workflow_authoring_source("value: .nan", WorkflowSourceFormat::Yaml).is_err()
+        );
+        assert!(
             decode_workflow_authoring_source("? [complex]\n: value", WorkflowSourceFormat::Yaml)
                 .is_err()
         );
@@ -10865,6 +10968,7 @@ steps:
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn checked_in_concise_sources_lower_identically() {
         let block = WorkflowBlockDefinition {
             block_id: "shell.script".to_string(),
@@ -10940,6 +11044,71 @@ steps:
             serde_json::json!("printf 'first\\n'")
         );
         assert!(compiled.definition.edges[0].transform.is_some());
+
+        let mut catalog_without_shell = catalog.clone();
+        catalog_without_shell.plugins.remove("bcode.shell");
+        catalog_without_shell
+            .blocks
+            .retain(|_, block| block.plugin_id != "bcode.shell");
+        catalog_without_shell
+            .authoring_actions
+            .retain(|_, descriptor| descriptor.plugin_id != "bcode.shell");
+        let error = lower_workflow_authoring_source(
+            include_str!("../../../fixtures/workflows/concise-run.workflow.yaml"),
+            WorkflowSourceFormat::Yaml,
+            &catalog_without_shell,
+        )
+        .expect_err("disabled shell plugin must remove run");
+        let message = error.to_string();
+        assert!(message.contains("run") && message.contains("unavailable"));
+
+        let echo_block = WorkflowBlockDefinition {
+            block_id: "echo".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            operation: "echo".to_string(),
+            input: ValueSchema {
+                type_name: "bcode.example.echo/v1".to_string(),
+                schema: serde_json::json!({"type": "string"}),
+            },
+            output: ValueSchema {
+                type_name: "bcode.example.echo-result/v1".to_string(),
+                schema: serde_json::json!({"type": "string"}),
+            },
+            effect: WorkflowBlockEffect::ReadOnly,
+            resources: Vec::new(),
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::ReadOnly,
+                explicit_grant_required: false,
+            },
+            timeout_ms: 1_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+        };
+        let echo_action = WorkflowAuthoringActionDescriptor {
+            version: WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION,
+            action_key: "echo".to_string(),
+            action_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            input: echo_block.input.clone(),
+            target_block: workflow_block_catalog_key(&echo_block),
+            input_adapter: None,
+        };
+        catalog_without_shell
+            .plugins
+            .insert("bcode.example".to_string());
+        catalog_without_shell
+            .blocks
+            .insert(workflow_block_catalog_key(&echo_block), echo_block);
+        catalog_without_shell
+            .authoring_actions
+            .insert(echo_action.catalog_key(), echo_action);
+        lower_workflow_authoring_source(
+            "workflow_source_version: 1\nworkflow_id: example/no-shell\ntitle: No shell\nsteps:\n  - echo: still-available\n",
+            WorkflowSourceFormat::Yaml,
+            &catalog_without_shell,
+        )
+        .expect("unrelated action remains usable without shell");
     }
 
     #[test]

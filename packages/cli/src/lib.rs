@@ -448,6 +448,18 @@ fn handle_workflow_author_command(
                         .await?,
                 )?;
             }
+            WorkflowAuthorCommand::Apply {
+                file,
+                source_format,
+                draft_id,
+            } => {
+                let loaded = read_workflow_source_file(&file, source_format.as_deref())?;
+                print_json(
+                    &client
+                        .apply_workflow_source(loaded.source_format, loaded.source, draft_id)
+                        .await?,
+                )?;
+            }
             WorkflowAuthorCommand::List {
                 cursor_updated_at_ms,
                 cursor_workflow_id,
@@ -730,15 +742,14 @@ fn handle_workflow_author_command(
                 operation_id,
                 timeout_ms,
             } => {
-                let document =
-                    read_workflow_authoring_document(client, &file, source_format.as_deref())
-                        .await?;
+                let loaded = read_workflow_source_file(&file, source_format.as_deref())?;
                 print_json(
                     &client
-                        .validate_workflow_authoring_with_control(
-                            document,
-                            workflow_computation_control(operation_id, timeout_ms),
-                        )
+                        .validate_workflow_source(bcode_ipc::WorkflowSourceComputationRequest {
+                            source_format: loaded.source_format,
+                            source: loaded.source,
+                            control: workflow_computation_control(operation_id, timeout_ms),
+                        })
                         .await?,
                 )?;
             }
@@ -755,20 +766,19 @@ fn handle_workflow_author_command(
                             .to_string(),
                     ));
                 }
-                let document =
-                    read_workflow_authoring_document(client, &file, source_format.as_deref())
-                        .await?;
+                let loaded = read_workflow_source_file(&file, source_format.as_deref())?;
                 let configuration = configuration
                     .as_deref()
                     .map(read_bounded_json)
                     .transpose()?;
                 print_json(
                     &client
-                        .preview_workflow_compilation_with_control(
-                            document,
+                        .preview_workflow_source(bcode_ipc::WorkflowSourcePreviewRequest {
+                            source_format: loaded.source_format,
+                            source: loaded.source,
                             configuration,
-                            workflow_computation_control(operation_id, timeout_ms),
-                        )
+                            control: workflow_computation_control(operation_id, timeout_ms),
+                        })
                         .await?,
                 )?;
             }
@@ -963,11 +973,61 @@ async fn handle_workflow_preset_command(
     Ok(())
 }
 
-async fn read_workflow_authoring_document(
+struct WorkflowSourceFile {
+    source_format: bcode_workflow::WorkflowSourceFormat,
+    source: String,
+}
+
+fn read_workflow_source_file(
+    path: &Path,
+    explicit_format: Option<&str>,
+) -> Result<WorkflowSourceFile, CliError> {
+    if path == Path::new("-") {
+        return Err(CliError::InvalidArguments(
+            "workflow source apply from stdin is not yet supported".to_string(),
+        ));
+    }
+    let source = fs::read_to_string(path)?;
+    if source.len() > bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
+        return Err(CliError::InvalidArguments(
+            "workflow source exceeds the byte bound".to_string(),
+        ));
+    }
+    let source_format = match explicit_format {
+        Some("json") => bcode_workflow::WorkflowSourceFormat::Json,
+        Some("yaml" | "yml") => bcode_workflow::WorkflowSourceFormat::Yaml,
+        Some("toml") => bcode_workflow::WorkflowSourceFormat::Toml,
+        Some(format) => {
+            return Err(CliError::InvalidArguments(format!(
+                "unsupported workflow source format '{format}'"
+            )));
+        }
+        None => bcode_workflow::WorkflowSourceFormat::from_file_name(
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| {
+                    CliError::InvalidArguments(
+                        "workflow source file name is not valid UTF-8".to_string(),
+                    )
+                })?,
+        )
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))?,
+    };
+    Ok(WorkflowSourceFile {
+        source_format,
+        source,
+    })
+}
+
+struct LoadedWorkflowSource {
+    lowering: bcode_workflow::WorkflowSourceLoweringResult,
+}
+
+async fn read_workflow_source_lowering(
     client: &BcodeClient,
     path: &Path,
     explicit_format: Option<&str>,
-) -> Result<bcode_workflow::WorkflowAuthoringDocument, CliError> {
+) -> Result<LoadedWorkflowSource, CliError> {
     let mut bytes = Vec::new();
     if path == Path::new("-") {
         std::io::stdin()
@@ -1021,9 +1081,19 @@ async fn read_workflow_authoring_document(
         .map_err(|error| CliError::InvalidArguments(error.to_string()))?,
     };
     let catalog = client.workflow_authoring_catalog().await?;
-    bcode_workflow::lower_workflow_authoring_source(source, format, &catalog)
-        .map(|lowered| lowered.document)
-        .map_err(|error| CliError::InvalidArguments(error.to_string()))
+    let lowering = bcode_workflow::lower_workflow_authoring_source(source, format, &catalog)
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    Ok(LoadedWorkflowSource { lowering })
+}
+
+async fn read_workflow_authoring_document(
+    client: &BcodeClient,
+    path: &Path,
+    explicit_format: Option<&str>,
+) -> Result<bcode_workflow::WorkflowAuthoringDocument, CliError> {
+    read_workflow_source_lowering(client, path, explicit_format)
+        .await
+        .map(|loaded| loaded.lowering.document)
 }
 
 fn read_bounded_json(path: &Path) -> Result<serde_json::Value, CliError> {
@@ -1772,6 +1842,17 @@ enum WorkflowAuthorCommand {
         source_format: Option<String>,
         /// Stable identity for the initial mutable draft.
         #[arg(long)]
+        draft_id: String,
+    },
+    /// Apply one source file to the default or selected source draft without publishing or starting.
+    Apply {
+        #[arg(value_name = "FILE", default_value = "-")]
+        file: PathBuf,
+        /// Explicit source format for stdin or to override the file extension.
+        #[arg(long, value_parser = ["json", "yaml", "yml", "toml"])]
+        source_format: Option<String>,
+        /// Stable source-backed draft identity.
+        #[arg(long, default_value = bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID)]
         draft_id: String,
     },
     /// List one bounded keyset page of logical workflows.
@@ -13052,6 +13133,21 @@ mod web_command_tests {
 #[cfg(test)]
 mod workflow_source_tests {
     use super::*;
+
+    #[test]
+    fn primary_cli_apply_loader_preserves_concise_source_and_infers_yaml() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let yaml = root.join("fixtures/workflows/concise-run.workflow.yaml");
+        let loaded = read_workflow_source_file(&yaml, None).expect("concise YAML source");
+        assert_eq!(
+            loaded.source_format,
+            bcode_workflow::WorkflowSourceFormat::Yaml
+        );
+        assert!(loaded.source.contains("workflow_source_version: 1"));
+        assert!(loaded.source.contains("run: printf 'first\\n'"));
+        assert!(!loaded.source.contains("fixtures/workflows"));
+        assert!(read_workflow_source_file(&yaml, Some("xml")).is_err());
+    }
 
     #[test]
     fn primary_cli_reads_json_and_toml_through_the_workflow_decoder() {

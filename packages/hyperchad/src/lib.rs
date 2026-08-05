@@ -910,7 +910,7 @@ fn client_error_message(error: &ClientError) -> String {
             "The running Bcode service is incompatible with this application. Restart Bcode and try again."
                 .to_owned()
         }
-        ClientError::UnexpectedResponse | ClientError::UnexpectedEnvelope => {
+        ClientError::Protocol(_) | ClientError::UnexpectedResponse | ClientError::UnexpectedEnvelope => {
             "The local Bcode service returned an unexpected response. Restart Bcode and try again."
                 .to_owned()
         }

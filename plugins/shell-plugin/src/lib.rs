@@ -270,6 +270,7 @@ fn shell_tool_definition() -> ToolDefinition {
             }
 }
 
+#[allow(clippy::too_many_lines)]
 fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResponse {
     if !matches!(
         context.request.operation.as_str(),
@@ -365,6 +366,12 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
         );
     }
     match execute_workflow_command_plan(context, &invocation, &plan) {
+        Ok(result) if context.request.operation == "shell.script" && !result.passed => {
+            ServiceResponse::error(
+                "script_exit_unaccepted",
+                "shell script exited without an accepted result",
+            )
+        }
         Ok(result) => json_response(&result),
         Err(error) => ServiceResponse::error("command_plan_failed", error),
     }
@@ -386,7 +393,18 @@ fn shell_script_command_plan(
                 .to_string(),
         );
     }
-    let mut shell = request.shell.unwrap_or_else(|| {
+    let contracts::ShellWorkflowScriptRequest {
+        version: _,
+        script,
+        shell,
+        cwd,
+        environment,
+        timeout_ms,
+        accepted_exit_codes,
+        continue_on_unaccepted_exit,
+        output,
+    } = request;
+    let mut shell = shell.unwrap_or_else(|| {
         if cfg!(windows) {
             vec!["cmd".to_string(), "/C".to_string()]
         } else {
@@ -396,22 +414,22 @@ fn shell_script_command_plan(
     if shell.is_empty() || shell.len() > 32 || shell.iter().any(|part| part.contains('\0')) {
         return Err("shell interpreter argv is invalid".to_string());
     }
-    shell.push(request.script);
+    shell.push(script);
     Ok(ShellWorkflowCommandPlan {
         version: contracts::SHELL_COMMAND_PLAN_VERSION,
-        cwd: request.cwd,
+        cwd,
         commands: vec![contracts::ShellWorkflowCommand {
             argv: shell,
-            timeout_ms: request.timeout_ms,
+            timeout_ms,
             continue_on_nonzero: false,
-            accepted_exit_codes: Some(request.accepted_exit_codes),
-            continue_on_unaccepted_exit: request.continue_on_unaccepted_exit,
+            accepted_exit_codes: Some(accepted_exit_codes),
+            continue_on_unaccepted_exit,
         }],
         environment: contracts::ShellWorkflowEnvironment {
             inherit: true,
-            set: request.environment,
+            set: environment,
         },
-        output: request.output,
+        output,
     })
 }
 

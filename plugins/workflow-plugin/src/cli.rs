@@ -80,18 +80,15 @@ struct WorkflowCli {
     session: Option<String>,
 }
 
-fn load_workflow_source(
+fn load_workflow_source_text(
     path: &std::path::Path,
     explicit_format: Option<&str>,
-) -> Result<
-    (
-        bcode_workflow::WorkflowAuthoringDocument,
-        bcode_workflow::WorkflowSourceFormat,
-    ),
-    String,
-> {
+) -> Result<(String, bcode_workflow::WorkflowSourceFormat), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    if source.len() > bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
+        return Err("workflow source exceeds the portable byte bound".to_string());
+    }
     let format = match explicit_format {
         Some("json") => bcode_workflow::WorkflowSourceFormat::Json,
         Some("yaml" | "yml") => bcode_workflow::WorkflowSourceFormat::Yaml,
@@ -104,6 +101,20 @@ fn load_workflow_source(
         )
         .map_err(|error| error.to_string())?,
     };
+    Ok((source, format))
+}
+
+fn load_workflow_source(
+    path: &std::path::Path,
+    explicit_format: Option<&str>,
+) -> Result<
+    (
+        bcode_workflow::WorkflowAuthoringDocument,
+        bcode_workflow::WorkflowSourceFormat,
+    ),
+    String,
+> {
+    let (source, format) = load_workflow_source_text(path, explicit_format)?;
     let document = bcode_workflow::decode_workflow_authoring_source(&source, format)
         .map_err(|error| error.to_string())?;
     Ok((document, format))
@@ -146,15 +157,31 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             args.insert(key.to_string(), version.to_string());
         }
         if let Some(path) = cli.source {
-            let (document, format) = load_workflow_source(&path, cli.source_format.as_deref())?;
-            args.insert(
-                "source_document".to_string(),
-                serde_json::to_string(&document).map_err(|error| error.to_string())?,
-            );
-            args.insert(
-                "source_format".to_string(),
-                serde_json::to_string(&format).map_err(|error| error.to_string())?,
-            );
+            if matches!(
+                cli.action.as_str(),
+                "author-apply" | "workflow.author-apply" | "author-check" | "workflow.author-check"
+            ) {
+                let (source, format) =
+                    load_workflow_source_text(&path, cli.source_format.as_deref())?;
+                args.insert("source".to_string(), source);
+                args.insert(
+                    "source_format".to_string(),
+                    serde_json::to_string(&format).map_err(|error| error.to_string())?,
+                );
+                args.entry("draft_id".to_string()).or_insert_with(|| {
+                    bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID.to_string()
+                });
+            } else {
+                let (document, format) = load_workflow_source(&path, cli.source_format.as_deref())?;
+                args.insert(
+                    "source_document".to_string(),
+                    serde_json::to_string(&document).map_err(|error| error.to_string())?,
+                );
+                args.insert(
+                    "source_format".to_string(),
+                    serde_json::to_string(&format).map_err(|error| error.to_string())?,
+                );
+            }
         }
         if let Some(path) = cli.definition {
             let definition = std::fs::read_to_string(&path)
@@ -233,18 +260,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_loader_infers_and_overrides_formats_without_retaining_paths() {
+    fn source_loaders_support_concise_yaml_without_retaining_paths() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let json = root.join("fixtures/workflows/source-defined-input.workflow.json");
         let toml = root.join("fixtures/workflows/source-defined-input.workflow.toml");
+        let yaml = root.join("fixtures/workflows/source-defined-input.workflow.yaml");
+        let concise = root.join("fixtures/workflows/concise-run.workflow.yaml");
         let (json_document, json_format) = load_workflow_source(&json, None).expect("JSON source");
         let (toml_document, toml_format) =
             load_workflow_source(&toml, Some("toml")).expect("explicit TOML source");
+        let (yaml_document, yaml_format) = load_workflow_source(&yaml, None).expect("YAML source");
         assert_eq!(json_format, bcode_workflow::WorkflowSourceFormat::Json);
         assert_eq!(toml_format, bcode_workflow::WorkflowSourceFormat::Toml);
+        assert_eq!(yaml_format, bcode_workflow::WorkflowSourceFormat::Yaml);
         assert_eq!(json_document, toml_document);
+        assert_eq!(json_document, yaml_document);
         let encoded = serde_json::to_string(&json_document).expect("portable document");
         assert!(!encoded.contains("fixtures/workflows"));
-        assert!(load_workflow_source(&json, Some("yaml")).is_err());
+        let (_, overridden_format) =
+            load_workflow_source(&json, Some("yaml")).expect("JSON is valid YAML");
+        assert_eq!(
+            overridden_format,
+            bcode_workflow::WorkflowSourceFormat::Yaml
+        );
+
+        let (source, format) =
+            load_workflow_source_text(&concise, None).expect("concise YAML source text");
+        assert_eq!(format, bcode_workflow::WorkflowSourceFormat::Yaml);
+        assert!(source.contains("workflow_source_version: 1"));
+        assert!(!source.contains("fixtures/workflows"));
+        assert!(load_workflow_source(&concise, None).is_err());
     }
 }

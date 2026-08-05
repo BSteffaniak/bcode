@@ -268,6 +268,18 @@ if ! rg -q 'pub enum WorkflowSourceFormat' packages/workflow/src/lib.rs \
   violations=1
 fi
 
+if [[ ! -f fixtures/workflows/concise-run.workflow.json ]] \
+  || [[ ! -f fixtures/workflows/concise-run.workflow.yaml ]] \
+  || [[ ! -f fixtures/workflows/concise-run.workflow.toml ]] \
+  || [[ ! -f docs/source-defined-workflows.md ]] \
+  || ! rg -q 'pub struct WorkflowSourceDocument' packages/workflow/src/lib.rs \
+  || ! rg -q 'pub fn lower_workflow_authoring_source' packages/workflow/src/lib.rs \
+  || ! rg -q 'WorkflowAuthoringActionDescriptor' packages/plugin/src/lib.rs \
+  || ! rg -q 'shell.script' plugins/shell-plugin/bcode-plugin.toml; then
+  echo "Usable workflow source violation: format-neutral lowering, plugin-owned actions, or shell isolation drifted." >&2
+  violations=1
+fi
+
 if [[ ! -f fixtures/workflows/source-defined-input.workflow.json ]] \
   || [[ ! -f fixtures/workflows/source-defined-input.workflow.toml ]] \
   || [[ ! -f fixtures/workflows/shell-v2-exit-routing.workflow.json ]] \

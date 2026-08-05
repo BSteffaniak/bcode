@@ -379,6 +379,8 @@ pub enum Request {
     },
     /// Atomically create one logical workflow and its initial mutable draft.
     CreateAuthoredWorkflow(CreateAuthoredWorkflowRequest),
+    /// Apply one already-lowered portable source through a single daemon-owned application operation.
+    ApplyWorkflowSource(ApplyWorkflowSourceRequest),
     /// Cancel one exact in-flight authored-workflow validation or compilation operation.
     CancelWorkflowComputation {
         operation_id: String,
@@ -475,6 +477,10 @@ pub enum Request {
     },
     /// Return the portable runtime-workflow authoring catalog.
     WorkflowAuthoringCatalog,
+    /// Validate and lower one raw workflow source through the daemon-owned catalog.
+    ValidateWorkflowSource(WorkflowSourceComputationRequest),
+    /// Lower and compile-preview one raw workflow source through the daemon-owned catalog.
+    PreviewWorkflowSource(WorkflowSourcePreviewRequest),
     /// Validate one portable workflow authoring document without mutation.
     ValidateWorkflowAuthoring {
         document: bcode_workflow::WorkflowAuthoringDocument,
@@ -1517,6 +1523,45 @@ pub struct WorkflowAuthoringPage<T, C> {
     pub next_cursor: Option<C>,
 }
 
+/// One bounded raw-source validation/lowering request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSourceComputationRequest {
+    pub source_format: bcode_workflow::WorkflowSourceFormat,
+    pub source: String,
+    #[serde(default)]
+    pub control: WorkflowComputationControl,
+}
+
+/// One bounded raw-source compilation preview request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSourcePreviewRequest {
+    pub source_format: bcode_workflow::WorkflowSourceFormat,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<serde_json::Value>,
+    #[serde(default)]
+    pub control: WorkflowComputationControl,
+}
+
+/// Portable source validation/lowering response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSourceValidationResult {
+    pub source_format: bcode_workflow::WorkflowSourceFormat,
+    pub lowering: bcode_workflow::WorkflowSourceLoweringResult,
+}
+
+/// Portable source lowering plus canonical compilation preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSourcePreviewResult {
+    pub source_format: bcode_workflow::WorkflowSourceFormat,
+    pub lowering: bcode_workflow::WorkflowSourceLoweringResult,
+    pub preview: bcode_workflow::WorkflowCompilationPreview,
+}
+
 /// Default bounded deadline for authored-workflow validation and compilation.
 pub const DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS: u64 = 30_000;
 /// Maximum caller-selected authored-workflow computation deadline.
@@ -1729,6 +1774,15 @@ pub struct ApplyWorkflowDraftEditsRequest {
     pub draft_id: String,
     pub batch: bcode_workflow::WorkflowAuthoringEditBatch,
     pub producer: bcode_workflow::WorkflowProducerProvenance,
+}
+
+/// One source-aware create-or-single-replace request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyWorkflowSourceRequest {
+    pub source_format: bcode_workflow::WorkflowSourceFormat,
+    pub source: String,
+    pub draft_id: String,
 }
 
 /// One typed authored-workflow creation request.
@@ -2341,6 +2395,9 @@ pub enum ResponsePayload {
         workflow: AuthoredWorkflowSnapshot,
         draft: Box<WorkflowDraftSnapshot>,
     },
+    WorkflowSourceApplied {
+        result: bcode_workflow::WorkflowSourceApplyResult,
+    },
     WorkflowComputationCancellationRequested {
         cancelled: bool,
     },
@@ -2438,6 +2495,12 @@ pub enum ResponsePayload {
     },
     WorkflowAuthoringCatalog {
         catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    },
+    WorkflowSourceValidated {
+        result: Box<WorkflowSourceValidationResult>,
+    },
+    WorkflowSourcePreviewed {
+        result: Box<WorkflowSourcePreviewResult>,
     },
     WorkflowAuthoringValidated {
         report: bcode_workflow::WorkflowValidationReport,
@@ -4070,6 +4133,7 @@ mod tests {
                 workflow_definitions: BTreeMap::new(),
                 agent_profiles: std::collections::BTreeSet::from(["build".to_string()]),
                 skills: std::collections::BTreeSet::new(),
+                authoring_actions: BTreeMap::new(),
             },
         });
         let encoded = encode_response(&response).expect("encode authoring catalog");
@@ -4305,6 +4369,51 @@ mod tests {
         let encoded = encode_response(&response).expect("encode response");
         assert_eq!(
             decode_response(&encoded).expect("decode response"),
+            response
+        );
+    }
+
+    #[test]
+    fn workflow_source_apply_contract_round_trips() {
+        let request = Request::ApplyWorkflowSource(ApplyWorkflowSourceRequest {
+            source_format: bcode_workflow::WorkflowSourceFormat::Yaml,
+            source: "workflow_source_version: 1\nworkflow_id: example/check\ntitle: Check\nsteps:\n  - run: true\n".to_string(),
+            draft_id: bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID.to_string(),
+        });
+        let encoded = encode_request(&request).expect("encode source apply request");
+        assert_eq!(
+            decode_request(&encoded).expect("decode source apply request"),
+            request
+        );
+
+        let result = bcode_workflow::WorkflowSourceApplyResult {
+            version: bcode_workflow::WORKFLOW_SOURCE_APPLY_RESULT_VERSION,
+            source_format: bcode_workflow::WorkflowSourceFormat::Yaml,
+            source_profile: bcode_workflow::WorkflowSourceProfile::Concise,
+            workflow_id: "example/check".to_string(),
+            draft_id: bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID.to_string(),
+            generation: 1,
+            canonical_digest_sha256: "digest".to_string(),
+            validation: bcode_workflow::WorkflowValidationReport {
+                authoring_version: bcode_workflow::WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+                valid: true,
+                source_digest_sha256: Some("source-digest".to_string()),
+                executable_source_digest_sha256: Some("executable-digest".to_string()),
+                diagnostics: Vec::new(),
+            },
+            source_map: bcode_workflow::WorkflowSourceMap {
+                version: bcode_workflow::WORKFLOW_SOURCE_MAP_VERSION,
+                entries: Vec::new(),
+            },
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            permissions: bcode_workflow::WorkflowPermissionPreview::default(),
+            outcome: bcode_workflow::WorkflowSourceApplyOutcome::Created,
+        };
+        let response = Response::Ok(ResponsePayload::WorkflowSourceApplied { result });
+        let encoded = encode_response(&response).expect("encode source apply response");
+        assert_eq!(
+            decode_response(&encoded).expect("decode source apply response"),
             response
         );
     }

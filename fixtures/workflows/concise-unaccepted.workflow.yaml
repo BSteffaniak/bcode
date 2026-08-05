@@ -1,0 +1,7 @@
+workflow_source_version: 1
+workflow_id: example/concise-unaccepted
+title: Concise unaccepted exit
+steps:
+  - run: exit 7
+  - id: must_not_run
+    run: printf 'unexpected\n'

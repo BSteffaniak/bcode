@@ -1,0 +1,9 @@
+workflow_source_version: 1
+workflow_id: example/concise-accepted-nonzero
+title: Concise accepted nonzero
+steps:
+  - run:
+      script: exit 7
+      accepted_exit_codes: [0, 7]
+  - id: after_accepted
+    run: printf 'accepted\n'

@@ -193,6 +193,8 @@ pub enum ClientError {
     RequestTimeout { timeout: Duration },
     #[error("incompatible daemon: {message}")]
     IncompatibleDaemon { message: String },
+    #[error("client protocol error: {0}")]
+    Protocol(String),
     #[error("unexpected response payload")]
     UnexpectedResponse,
     #[error("unexpected IPC envelope kind")]
@@ -227,6 +229,7 @@ impl ClientError {
             | Self::Codec(_)
             | Self::Server { .. }
             | Self::IncompatibleDaemon { .. }
+            | Self::Protocol(_)
             | Self::UnexpectedResponse
             | Self::UnexpectedEnvelope => false,
         }
@@ -2315,6 +2318,37 @@ impl BcodeClient {
         }
     }
 
+    /// Apply one already-lowered portable source through the canonical authored-workflow lifecycle.
+    ///
+    /// The operation creates an absent logical workflow or performs at most one optimistic
+    /// replacement of an existing source draft. It never publishes, activates, starts, or retries
+    /// a conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, rejects canonical state, or the logical
+    /// workflow exists without the selected source-draft identity.
+    pub async fn apply_workflow_source(
+        &self,
+        source_format: bcode_workflow::WorkflowSourceFormat,
+        source: String,
+        draft_id: String,
+    ) -> Result<bcode_workflow::WorkflowSourceApplyResult, ClientError> {
+        match self
+            .send_request(Request::ApplyWorkflowSource(
+                bcode_ipc::ApplyWorkflowSourceRequest {
+                    source_format,
+                    source,
+                    draft_id,
+                },
+            ))
+            .await?
+        {
+            ResponsePayload::WorkflowSourceApplied { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Apply one bounded renderer-neutral semantic edit batch.
     ///
     /// # Errors
@@ -2880,6 +2914,42 @@ impl BcodeClient {
     ) -> Result<bcode_workflow::WorkflowAuthoringCatalogSnapshot, ClientError> {
         match self.send_request(Request::WorkflowAuthoringCatalog).await? {
             ResponsePayload::WorkflowAuthoringCatalog { catalog } => Ok(catalog),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Validate and lower one raw source through the daemon-owned catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or source lowering fails.
+    pub async fn validate_workflow_source(
+        &self,
+        request: bcode_ipc::WorkflowSourceComputationRequest,
+    ) -> Result<bcode_ipc::WorkflowSourceValidationResult, ClientError> {
+        match self
+            .send_request(Request::ValidateWorkflowSource(request))
+            .await?
+        {
+            ResponsePayload::WorkflowSourceValidated { result } => Ok(*result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Lower and compile-preview one raw source through the daemon-owned catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or source compilation fails.
+    pub async fn preview_workflow_source(
+        &self,
+        request: bcode_ipc::WorkflowSourcePreviewRequest,
+    ) -> Result<bcode_ipc::WorkflowSourcePreviewResult, ClientError> {
+        match self
+            .send_request(Request::PreviewWorkflowSource(request))
+            .await?
+        {
+            ResponsePayload::WorkflowSourcePreviewed { result } => Ok(*result),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

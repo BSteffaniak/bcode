@@ -173,9 +173,10 @@ pub fn classify_client_error(error: &ClientError) -> TuiDaemonIssue {
         ClientError::UnexpectedResponse | ClientError::UnexpectedEnvelope => {
             TuiDaemonIssue::UnexpectedDaemonResponse
         }
-        ClientError::Transport(_) | ClientError::Codec(_) | ClientError::DaemonStart(_) => {
-            TuiDaemonIssue::Other(error.to_string())
-        }
+        ClientError::Protocol(_)
+        | ClientError::Transport(_)
+        | ClientError::Codec(_)
+        | ClientError::DaemonStart(_) => TuiDaemonIssue::Other(error.to_string()),
     }
 }
 

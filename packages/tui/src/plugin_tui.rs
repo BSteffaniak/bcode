@@ -1355,7 +1355,9 @@ library = "libdynamic_visual_test.dylib"
         invocation_id: &str,
         expected: &str,
     ) -> RoutedTuiVisual {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Aggregate workspace tests can heavily contend the single adapter worker. Keep this
+        // bounded while allowing an artifact completion followed by its replacement render.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while std::time::Instant::now() < deadline {
             let _ = presentation.poll_dynamic_visuals();
             if let Some(visual) = dynamic_test_visual(presentation, invocation_id)

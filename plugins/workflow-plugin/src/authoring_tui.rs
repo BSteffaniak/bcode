@@ -3709,6 +3709,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string()]),
             skills: BTreeSet::from(["code-review".to_string(), "commit-message".to_string()]),
+            authoring_actions: BTreeMap::new(),
         };
         let agent_entry = PaletteEntry {
             identity: "agent".to_string(),
@@ -3751,6 +3752,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string(), "review".to_string()]),
             skills: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         };
         let agent_entry = PaletteEntry {
             identity: "agent".to_string(),
@@ -3834,6 +3836,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string()]),
             skills: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         };
         for (identity, expected) in [
             ("agent", NodeKind::Agent),

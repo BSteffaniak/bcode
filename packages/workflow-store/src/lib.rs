@@ -11054,6 +11054,7 @@ mod tests {
             workflow_definitions: BTreeMap::new(),
             agent_profiles: std::collections::BTreeSet::from(["review".to_string()]),
             skills: std::collections::BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
         };
         (workflow, draft, catalog)
     }

@@ -1,0 +1,20 @@
+{
+  "workflow_source_version": 1,
+  "workflow_id": "example/advanced-run",
+  "title": "Advanced run",
+  "steps": [
+    {
+      "id": "accepted_nonzero",
+      "run": {
+        "script": "exit 7",
+        "shell": ["sh", "-c"],
+        "cwd": ".",
+        "environment": {"MODE": "ci"},
+        "timeout_ms": 120000,
+        "accepted_exit_codes": [0, 7],
+        "continue_on_unaccepted_exit": false,
+        "output": {"preview_bytes": 4096, "artifact_spill": true}
+      }
+    }
+  ]
+}

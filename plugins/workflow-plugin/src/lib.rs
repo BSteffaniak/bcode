@@ -324,6 +324,11 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Start a validated workflow template",
         ),
         (
+            "workflow.author-apply",
+            "Workflow: Apply Source",
+            "Create or optimistically update the canonical source draft",
+        ),
+        (
             "workflow.author-check",
             "Workflow: Check Source",
             "Validate and compile-preview one authored workflow source",
@@ -933,53 +938,56 @@ pub(crate) async fn execute_command(
             options.insert("runs".to_string(), serde_json::json!([started.run]));
             "workflow template started".to_string()
         }
-        "workflow.author-check" => {
-            let document: bcode_workflow::WorkflowAuthoringDocument =
-                serde_json::from_str(&required_arg(&request, "source_document")?)
-                    .map_err(|error| error.to_string())?;
+        "workflow.author-apply" => {
             let source_format: bcode_workflow::WorkflowSourceFormat =
                 serde_json::from_str(&required_arg(&request, "source_format")?)
                     .map_err(|error| error.to_string())?;
-            let workflow_id = document.workflow_id.clone();
-            let source_digest_sha256 = document
-                .source_digest_sha256()
+            let source = required_arg(&request, "source")?;
+            let draft_id =
+                request.args.get("draft_id").cloned().unwrap_or_else(|| {
+                    bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID.to_string()
+                });
+            let applied = client
+                .apply_workflow_source(source_format, source, draft_id)
+                .await
                 .map_err(|error| error.to_string())?;
-            let executable_source_digest_sha256 = document
-                .executable_source_digest_sha256()
-                .map_err(|error| error.to_string())?;
+            options.insert(
+                "source_apply".to_string(),
+                serde_json::to_value(applied).map_err(|error| error.to_string())?,
+            );
+            "workflow source apply resolved".to_string()
+        }
+        "workflow.author-check" => {
+            let source_format: bcode_workflow::WorkflowSourceFormat =
+                serde_json::from_str(&required_arg(&request, "source_format")?)
+                    .map_err(|error| error.to_string())?;
+            let source = required_arg(&request, "source")?;
             let validation = client
-                .validate_workflow_authoring(document.clone())
+                .validate_workflow_source(bcode_ipc::WorkflowSourceComputationRequest {
+                    source_format,
+                    source: source.clone(),
+                    control: bcode_ipc::WorkflowComputationControl::default(),
+                })
                 .await
                 .map_err(|error| error.to_string())?;
             let preview = client
-                .preview_workflow_compilation(document, None)
+                .preview_workflow_source(bcode_ipc::WorkflowSourcePreviewRequest {
+                    source_format,
+                    source,
+                    configuration: None,
+                    control: bcode_ipc::WorkflowComputationControl::default(),
+                })
                 .await
                 .map_err(|error| error.to_string())?;
             options.insert(
-                "source_format".to_string(),
-                serde_json::to_value(source_format).map_err(|error| error.to_string())?,
+                "source_validation".to_string(),
+                serde_json::to_value(validation).map_err(|error| error.to_string())?,
             );
             options.insert(
-                "source_identity".to_string(),
-                serde_json::json!({
-                    "workflow_id": workflow_id,
-                    "source_digest_sha256": source_digest_sha256,
-                    "executable_source_digest_sha256": executable_source_digest_sha256,
-                }),
+                "source_preview".to_string(),
+                serde_json::to_value(preview).map_err(|error| error.to_string())?,
             );
-            options.insert(
-                "validation".to_string(),
-                serde_json::to_value(&validation).map_err(|error| error.to_string())?,
-            );
-            options.insert(
-                "compilation_preview".to_string(),
-                serde_json::to_value(&preview).map_err(|error| error.to_string())?,
-            );
-            if validation.valid && preview.compiled.is_some() {
-                "workflow source is valid and available".to_string()
-            } else {
-                "workflow source has validation or availability diagnostics".to_string()
-            }
+            "workflow authoring source validated".to_string()
         }
         "workflow.author-create" => {
             let source_format: bcode_workflow::WorkflowSourceFormat =

@@ -1,0 +1,84 @@
+---
+schema_version: 1
+workflow_id: example/source-defined-input
+metadata:
+  title: Source-defined input
+  description: A portable workflow authored equivalently in JSON and TOML.
+  labels:
+    example: source-defined
+configuration_schema:
+  type_name: bcode.example.source-configuration/v1
+  schema:
+    "$schema": https://json-schema.org/draft/2020-12/schema
+    type: object
+    additionalProperties: false
+configuration_defaults: {}
+definition:
+  schema_version: 1
+  name: Source-defined input
+  input:
+    type_name: bcode.example.source-value/v1
+    schema:
+      "$schema": https://json-schema.org/draft/2020-12/schema
+      type: object
+      additionalProperties: false
+      required:
+      - message
+      properties:
+        message:
+          type: string
+  output:
+    type_name: bcode.example.source-value/v1
+    schema:
+      "$schema": https://json-schema.org/draft/2020-12/schema
+      type: object
+      additionalProperties: false
+      required:
+      - message
+      properties:
+        message:
+          type: string
+  nodes:
+    await_input:
+      id: await_input
+      name: Await input
+      kind: input
+      input:
+        type_name: bcode.example.source-value/v1
+        schema:
+          "$schema": https://json-schema.org/draft/2020-12/schema
+          type: object
+          additionalProperties: false
+          required:
+          - message
+          properties:
+            message:
+              type: string
+      output:
+        type_name: bcode.example.source-value/v1
+        schema:
+          "$schema": https://json-schema.org/draft/2020-12/schema
+          type: object
+          additionalProperties: false
+          required:
+          - message
+          properties:
+            message:
+              type: string
+      configuration:
+        gate_version: 1
+  entries:
+  - await_input
+  exits:
+  - await_input
+  edges: []
+bindings: []
+requirements: {}
+run_limits:
+  node_execution_cap: 8
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+producer:
+  kind: human
+  producer_id: source-fixture
