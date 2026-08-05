@@ -3933,6 +3933,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowPresets { .. } => "list_workflow_presets",
         Request::GetWorkflowPreset { .. } => "get_workflow_preset",
         Request::WorkflowAuthoringCatalog => "workflow_authoring_catalog",
+        Request::ApplyWorkflowPackage(_) => "apply_workflow_package",
+        Request::ValidateWorkflowPackage(_) => "validate_workflow_package",
+        Request::PreviewWorkflowPackage(_) => "preview_workflow_package",
         Request::ValidateWorkflowSource(_) => "validate_workflow_source",
         Request::PreviewWorkflowSource(_) => "preview_workflow_source",
         Request::ValidateWorkflowAuthoring { .. } => "validate_workflow_authoring",
@@ -4749,6 +4752,63 @@ async fn handle_request_inner(
         }
         Request::WorkflowAuthoringCatalog => {
             handle_workflow_authoring_catalog(request_id, state, writer).await
+        }
+        Request::ApplyWorkflowPackage(request) => {
+            let result = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .apply_workflow_package(&request.request, request.applied_at_ms)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPackageApplied {
+                    result: Box::new(result),
+                }),
+            )
+            .await
+        }
+        Request::ValidateWorkflowPackage(request) => {
+            let catalog = workflow_authoring_catalog_snapshot(state).await?;
+            let result = run_workflow_computation(
+                state,
+                request.control,
+                format!("validate-package-{request_id}"),
+                move || bcode_workflow::plan_workflow_package(&request.manifest, &catalog),
+            )
+            .await??;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPackageValidated {
+                    result: Box::new(bcode_ipc::WorkflowPackageValidationResult { plan: result }),
+                }),
+            )
+            .await
+        }
+        Request::PreviewWorkflowPackage(request) => {
+            let catalog = workflow_authoring_catalog_snapshot(state).await?;
+            let result = run_workflow_computation(
+                state,
+                request.control,
+                format!("preview-package-{request_id}"),
+                move || {
+                    bcode_workflow::preview_workflow_package(
+                        &request.plan,
+                        &catalog,
+                        &request.configurations,
+                    )
+                },
+            )
+            .await??;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPackagePreviewed {
+                    preview: Box::new(result),
+                }),
+            )
+            .await
         }
         Request::ValidateWorkflowSource(request) => {
             let catalog = workflow_authoring_catalog_snapshot(state).await?;
@@ -13788,6 +13848,7 @@ async fn publish_and_start_workflow(
                     run_id,
                     parent_session_id,
                     workspace_snapshot,
+                    parent_session_generation: None,
                     configuration,
                 },
                 false,
@@ -14748,6 +14809,7 @@ async fn start_authored_workflow(
             run_id: request.run_id,
             workspace_snapshot: request.workspace_snapshot.unwrap_or_default(),
             parent_session_id: request.parent_session_id,
+            parent_session_generation: request.parent_session_generation,
             binding: Some(bcode_workflow_store::WorkflowRunBinding {
                 owner_plugin_id: "bcode.authored-workflow".to_string(),
                 workflow_kind: workflow_id.clone(),
@@ -15865,6 +15927,7 @@ async fn start_workflow(
             run_id: request.run_id,
             workspace_snapshot: request.workspace_snapshot.unwrap_or_default(),
             parent_session_id: request.parent_session_id,
+            parent_session_generation: None,
             binding: Some(request.binding),
             input: Some(request.input),
             limits: request.limits,
@@ -15913,6 +15976,7 @@ async fn handle_start_workflow_run(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn start_workflow_run(
     state: &Arc<ServerState>,
     request: bcode_ipc::WorkflowRunStartRequest,
@@ -15932,10 +15996,39 @@ async fn start_workflow_run(
     let definition: bcode_workflow::WorkflowDefinition =
         serde_json::from_str(&stored_definition.definition_json)?;
     validate_workflow_definition_for_production(state, &definition)?;
+    let uses_fixed_generation = definition.nodes.values().any(|node| {
+        node.kind == bcode_workflow::NodeKind::Agent
+            && serde_json::from_value::<bcode_workflow::WorkflowAgentConfiguration>(
+                node.configuration.clone(),
+            )
+            .is_ok_and(|configuration| {
+                configuration.execution_target
+                    == bcode_workflow::AgentExecutionTarget::FixedGenerationFork
+            })
+    });
+    if uses_fixed_generation && request.parent_session_generation.is_none() {
+        return Err(WorkflowStoreError::InvalidData(
+            "fixed-generation workflow agents require parent_session_generation at start"
+                .to_string(),
+        )
+        .into());
+    }
     let parent_session = state
         .sessions
         .session_summary(request.parent_session_id)
         .await?;
+    if let Some(expected_generation) = request.parent_session_generation {
+        let current_generation = state
+            .sessions
+            .current_session_generation(request.parent_session_id)
+            .await?;
+        if current_generation != expected_generation {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "parent session generation changed before workflow admission: expected {expected_generation}, current {current_generation}"
+            ))
+            .into());
+        }
+    }
     let run_id = request
         .run_id
         .clone()
@@ -15955,6 +16048,7 @@ async fn start_workflow_run(
         definition_version: request.definition_version,
         workspace_snapshot,
         parent_session_id: Some(request.parent_session_id.to_string()),
+        parent_session_generation: request.parent_session_generation,
         binding: request.binding,
         authored_provenance,
         input: request.input,
@@ -28911,6 +29005,7 @@ async fn dispatch_workflow_child(
             definition_version: target_identity.definition_version,
             workspace_snapshot: parent.workspace_snapshot,
             parent_session_id: parent.parent_session_id,
+            parent_session_generation: parent.parent_session_generation,
             binding: None,
             authored_provenance,
             input: request.activation.input.clone(),
@@ -29420,25 +29515,90 @@ impl ActivationDispatchOwner for WorkflowAgentTurnOwner<'_> {
     }
 }
 
-async fn workflow_child_session_for_attempt(
+async fn workflow_child_session_for_activation(
     state: &ServerState,
     run_id: &str,
     node_id: &str,
+    activation_id: &str,
     attempt: u32,
-) -> Option<bcode_session_models::SessionSummary> {
-    state
+) -> Result<Option<bcode_session_models::SessionSummary>, WorkflowStoreError> {
+    let link = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execution_session_link(run_id, node_id, activation_id, attempt)?;
+    if let Some(link) = link {
+        let session_id = SessionId::from_str(&link.session_id)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let session = state
+            .sessions
+            .session_summary(session_id)
+            .await
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let matches_link = session.execution.as_ref().is_some_and(|execution| {
+            execution.provenance.owner == "bcode.workflow"
+                && execution.provenance.run_id == run_id
+                && execution.provenance.node_id == node_id
+                && execution.provenance.activation_id.as_deref() == Some(activation_id)
+                && execution.provenance.attempt == attempt
+                && execution.provenance.workspace_snapshot.as_deref()
+                    == Some(link.workspace_snapshot.as_str())
+        });
+        if !matches_link {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow execution-session link is inconsistent for {run_id}/{node_id}/{activation_id}/{attempt}"
+            )));
+        }
+        return Ok(Some(session));
+    }
+
+    // Compatibility discovery is bounded by the session catalog and does not mutate session
+    // history. A single trustworthy provenance match is linked into workflow-owned recovery state.
+    let mut matched = state
         .sessions
         .all_session_summaries()
         .await
         .into_iter()
-        .find(|session| {
+        .filter(|session| {
             session.execution.as_ref().is_some_and(|execution| {
                 execution.provenance.owner == "bcode.workflow"
                     && execution.provenance.run_id == run_id
                     && execution.provenance.node_id == node_id
+                    && execution.provenance.activation_id.as_deref() == Some(activation_id)
                     && execution.provenance.attempt == attempt
             })
-        })
+        });
+    let session = matched.next();
+    if matched.next().is_some() {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "multiple workflow execution sessions claim {run_id}/{node_id}/{activation_id}/{attempt}"
+        )));
+    }
+    if let Some(session) = &session {
+        let snapshot = session
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.provenance.workspace_snapshot.clone())
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow execution session has no workspace snapshot".to_string(),
+                )
+            })?;
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .link_execution_session(&bcode_workflow_store::WorkflowExecutionSessionLink::new(
+                run_id.to_string(),
+                node_id.to_string(),
+                activation_id.to_string(),
+                attempt,
+                session.id.to_string(),
+                snapshot,
+                current_unix_millis(),
+            ))?;
+    }
+    Ok(session)
 }
 
 async fn persist_workflow_agent_completion(
@@ -29614,43 +29774,95 @@ async fn dispatch_workflow_agent_turn(
                 .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
         })?;
     let provenance = ExecutionSessionProvenance {
+        version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
         owner: "bcode.workflow".to_string(),
         run_id: request.activation.run_id.clone(),
         node_id: request.activation.node_id.clone(),
+        activation_id: Some(request.activation.activation_id.clone()),
         attempt: request.attempt,
         parent_session_id,
         context_mode: match execution_target {
             bcode_workflow::AgentExecutionTarget::FreshIsolated => {
                 bcode_session_models::ExecutionSessionContextMode::FreshIsolated
             }
+            bcode_workflow::AgentExecutionTarget::FixedGenerationFork => {
+                bcode_session_models::ExecutionSessionContextMode::FixedGenerationFork
+            }
             bcode_workflow::AgentExecutionTarget::SharedParentSequential => {
                 bcode_session_models::ExecutionSessionContextMode::SharedSequential
             }
         },
-        workspace_snapshot: Some(run.workspace_snapshot),
-        parent_generation: None,
+        workspace_snapshot: Some(run.workspace_snapshot.clone()),
+        parent_generation: match execution_target {
+            bcode_workflow::AgentExecutionTarget::FixedGenerationFork => {
+                Some(run.parent_session_generation.ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "fixed-generation agent run has no pinned parent generation".to_string(),
+                    )
+                })?)
+            }
+            bcode_workflow::AgentExecutionTarget::FreshIsolated
+            | bcode_workflow::AgentExecutionTarget::SharedParentSequential => None,
+        },
     };
     let (target_session_id, shared_permit) = match execution_target {
-        bcode_workflow::AgentExecutionTarget::FreshIsolated => {
-            let child = if let Some(existing) = workflow_child_session_for_attempt(
+        bcode_workflow::AgentExecutionTarget::FreshIsolated
+        | bcode_workflow::AgentExecutionTarget::FixedGenerationFork => {
+            let child = if let Some(existing) = workflow_child_session_for_activation(
                 state,
                 &request.activation.run_id,
                 &request.activation.node_id,
+                &request.activation.activation_id,
                 request.attempt,
             )
-            .await
+            .await?
             {
                 existing
             } else {
+                let child = match execution_target {
+                    bcode_workflow::AgentExecutionTarget::FreshIsolated => {
+                        state
+                            .sessions
+                            .create_fresh_execution_session(
+                                Some(format!("workflow {}", request.activation.node.name)),
+                                provenance.clone(),
+                                None,
+                            )
+                            .await
+                    }
+                    bcode_workflow::AgentExecutionTarget::FixedGenerationFork => {
+                        state
+                            .sessions
+                            .create_pinned_generation_execution_session(
+                                Some(format!("workflow {}", request.activation.node.name)),
+                                provenance.clone(),
+                                run.parent_session_generation
+                                    .expect("validated pinned generation"),
+                                None,
+                            )
+                            .await
+                    }
+                    bcode_workflow::AgentExecutionTarget::SharedParentSequential => {
+                        unreachable!("shared execution handled separately")
+                    }
+                }
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
                 state
-                    .sessions
-                    .create_fresh_execution_session(
-                        Some(format!("workflow {}", request.activation.node.name)),
-                        provenance.clone(),
-                        None,
-                    )
-                    .await
-                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .link_execution_session(
+                        &bcode_workflow_store::WorkflowExecutionSessionLink::new(
+                            request.activation.run_id.clone(),
+                            request.activation.node_id.clone(),
+                            request.activation.activation_id.clone(),
+                            request.attempt,
+                            child.id.to_string(),
+                            run.workspace_snapshot.clone(),
+                            current_unix_millis(),
+                        ),
+                    )?;
+                child
             };
             (child.id, None)
         }
@@ -34282,6 +34494,7 @@ mod tests {
                 run_id: Some("authored-pinned-v1".to_string()),
                 parent_session_id: parent.id,
                 workspace_snapshot: None,
+                parent_session_generation: None,
                 configuration: None,
             },
             true,
@@ -34319,6 +34532,7 @@ mod tests {
                 run_id: Some("authored-preset-v1".to_string()),
                 parent_session_id: parent.id,
                 workspace_snapshot: None,
+                parent_session_generation: None,
                 configuration: None,
             },
             true,
@@ -34381,6 +34595,7 @@ mod tests {
                 run_id: Some("authored-active-v2".to_string()),
                 parent_session_id: parent.id,
                 workspace_snapshot: None,
+                parent_session_generation: None,
                 configuration: None,
             },
             true,
@@ -34399,6 +34614,7 @@ mod tests {
                 run_id: Some("authored-explicit-v1".to_string()),
                 parent_session_id: parent.id,
                 workspace_snapshot: None,
+                parent_session_generation: None,
                 configuration: None,
             },
             true,
@@ -34541,6 +34757,7 @@ mod tests {
             run_id: Some("invalid-configuration".to_string()),
             parent_session_id: SessionId::new(),
             workspace_snapshot: None,
+            parent_session_generation: None,
             configuration: Some(serde_json::json!({"mode": 7})),
         };
         assert!(
@@ -50600,6 +50817,7 @@ library = "test"
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -50783,6 +51001,7 @@ library = "test"
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -50874,6 +51093,177 @@ library = "test"
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn distinct_activations_of_one_node_recover_distinct_sessions() {
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(Some("parent".to_string()), PathBuf::from("."))
+            .await
+            .expect("parent");
+        let state = test_server_state(sessions);
+        let run_id = "parallel-activation-run";
+        let node_id = "review";
+        let mut sessions_by_activation = BTreeMap::new();
+        for activation_id in ["activation-a", "activation-b"] {
+            let child = state
+                .sessions
+                .create_fresh_execution_session(
+                    Some(activation_id.to_string()),
+                    ExecutionSessionProvenance {
+                        version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+                        owner: "bcode.workflow".to_string(),
+                        run_id: run_id.to_string(),
+                        node_id: node_id.to_string(),
+                        activation_id: Some(activation_id.to_string()),
+                        attempt: 1,
+                        parent_session_id: parent.id,
+                        context_mode:
+                            bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+                        workspace_snapshot: Some("snapshot-1".to_string()),
+                        parent_generation: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("child");
+            sessions_by_activation.insert(activation_id, child.id);
+        }
+        for (activation_id, expected_session_id) in sessions_by_activation {
+            let recovered = state
+                .sessions
+                .all_session_summaries()
+                .await
+                .into_iter()
+                .find(|summary| {
+                    summary.execution.as_ref().is_some_and(|execution| {
+                        execution.provenance.run_id == run_id
+                            && execution.provenance.node_id == node_id
+                            && execution.provenance.activation_id.as_deref() == Some(activation_id)
+                    })
+                })
+                .expect("activation session");
+            assert_eq!(recovered.id, expected_session_id);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workflow_execution_session_lookup_is_activation_scoped_and_ambiguous_safe() {
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(Some("parent".to_string()), PathBuf::from("."))
+            .await
+            .expect("parent");
+        let state = test_server_state(sessions);
+        let pending = {
+            let mut store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let workflow = bcode_workflow::WorkflowBuilder::new(
+                "activation lookup",
+                bcode_workflow::Step::task(
+                    "review",
+                    |value: u32, _context| async move { Ok(value) },
+                ),
+            )
+            .build()
+            .expect("workflow");
+            store
+                .persist_definition("activation-lookup", 1, workflow.definition())
+                .expect("definition");
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: "activation-run".to_string(),
+                    definition_id: "activation-lookup".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: Some(parent.id.to_string()),
+                    parent_session_generation: None,
+                    binding: None,
+                    authored_provenance: None,
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Disabled,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            let pending = store
+                .pending_activations(1)
+                .expect("pending")
+                .pop()
+                .expect("activation");
+            store
+                .prepare_pending_activation(
+                    &pending.run_id,
+                    &pending.node_id,
+                    &pending.activation_id,
+                    bcode_workflow_store::DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"owner": "test"}),
+                    2,
+                )
+                .expect("prepare")
+                .expect("attempt");
+            drop(store);
+            pending
+        };
+        let child = state
+            .sessions
+            .create_fresh_execution_session(
+                Some("activation".to_string()),
+                ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+                    owner: "bcode.workflow".to_string(),
+                    run_id: pending.run_id.clone(),
+                    node_id: pending.node_id.clone(),
+                    activation_id: Some(pending.activation_id.clone()),
+                    attempt: 1,
+                    parent_session_id: parent.id,
+                    context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+                    workspace_snapshot: Some("snapshot-1".to_string()),
+                    parent_generation: None,
+                },
+                None,
+            )
+            .await
+            .expect("activation session");
+        let recovered = workflow_child_session_for_activation(
+            &state,
+            &pending.run_id,
+            &pending.node_id,
+            &pending.activation_id,
+            1,
+        )
+        .await
+        .expect("unambiguous lookup")
+        .expect("activation session");
+        assert_eq!(recovered.id, child.id);
+        let linked = workflow_child_session_for_activation(
+            &state,
+            &pending.run_id,
+            &pending.node_id,
+            &pending.activation_id,
+            1,
+        )
+        .await
+        .expect("durable lookup")
+        .expect("linked session");
+        assert_eq!(linked.id, child.id);
+        assert!(
+            workflow_child_session_for_activation(
+                &state,
+                &pending.run_id,
+                &pending.node_id,
+                "missing",
+                1,
+            )
+            .await
+            .expect("missing lookup")
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn startup_restore_reconciles_receipt_and_rehydrates_runtime_relationships() {
         let session_root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent_lazy(session_root.path());
@@ -50885,9 +51275,11 @@ library = "test"
             .create_fresh_execution_session(
                 Some("child".to_string()),
                 ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
                     owner: "bcode.workflow".to_string(),
                     run_id: "restore-run".to_string(),
                     node_id: "agent".to_string(),
+                    activation_id: Some("test-activation".to_string()),
                     attempt: 1,
                     parent_session_id: parent.id,
                     context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
@@ -50943,6 +51335,7 @@ library = "test"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
@@ -51013,9 +51406,11 @@ library = "test"
             .create_fresh_execution_session(
                 Some("child".to_string()),
                 ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
                     owner: "bcode.workflow".to_string(),
                     run_id: "cancelled-restore-run".to_string(),
                     node_id: "agent".to_string(),
+                    activation_id: Some("test-activation".to_string()),
                     attempt: 1,
                     parent_session_id: parent.id,
                     context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
@@ -51071,6 +51466,7 @@ library = "test"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
@@ -51232,6 +51628,7 @@ library = "test"
                     definition_version: 1,
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!({"condition_met": false})),
@@ -51516,9 +51913,11 @@ library = "test"
             .create_fresh_execution_session(
                 Some("child".to_string()),
                 ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
                     owner: "bcode.workflow".to_string(),
                     run_id: "observe-run".to_string(),
                     node_id: "agent".to_string(),
+                    activation_id: Some("test-activation".to_string()),
                     attempt: 1,
                     parent_session_id: parent.id,
                     context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
@@ -51574,6 +51973,7 @@ library = "test"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
@@ -51781,6 +52181,7 @@ library = "test"
                     definition_version: 1,
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!({"condition_met": false})),
@@ -51806,9 +52207,11 @@ library = "test"
                 .expect("prepare")
                 .expect("prepared");
             let provenance = ExecutionSessionProvenance {
+                version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
                 owner: "bcode.workflow".to_string(),
                 run_id: run_id.clone(),
                 node_id: prepared.activation.node_id.clone(),
+                activation_id: Some("test-activation".to_string()),
                 attempt: prepared.attempt,
                 parent_session_id: parent.id,
                 context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
@@ -52013,6 +52416,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
@@ -52173,6 +52577,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
@@ -52385,6 +52790,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::to_value(input).expect("input")),
@@ -52762,6 +53168,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: head.clone(),
                 parent_session_id: Some(parent.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::to_value(&commit_request).expect("commit request")),
@@ -53722,6 +54129,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: None,
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::Value::Null),
@@ -53889,6 +54297,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -54030,6 +54439,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
@@ -54217,6 +54627,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
@@ -54324,6 +54735,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(session.id.to_string()),
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
@@ -54412,6 +54824,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: ".".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(false)),
@@ -54573,6 +54986,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: Some(session.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
@@ -54710,6 +55124,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: Some(session.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
@@ -54799,6 +55214,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: Some(session.id.to_string()),
+                parent_session_generation: None,
                 binding: Some(bcode_workflow_store::WorkflowRunBinding {
                     owner_plugin_id: key.owner_plugin_id.clone(),
                     workflow_kind: key.workflow_kind.clone(),
@@ -54889,6 +55305,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: Some(session.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
@@ -54979,6 +55396,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: ".".to_string(),
                     parent_session_id: Some(session.id.to_string()),
+                    parent_session_generation: None,
                     binding: Some(bcode_workflow_store::WorkflowRunBinding {
                         owner_plugin_id: key.owner_plugin_id.clone(),
                         workflow_kind: key.workflow_kind.clone(),
@@ -55040,6 +55458,81 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let stopped = stopped.expect("stopped");
         assert!(stopped.cancellation_requested_at_ms.is_some());
         assert_eq!(stopped.status, bcode_workflow_store::RunStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn fixed_generation_workflow_start_requires_and_pins_exact_parent_generation() {
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(Some("parent".to_string()), PathBuf::from("."))
+            .await
+            .expect("parent");
+        let generation = sessions
+            .current_session_generation(parent.id)
+            .await
+            .expect("generation");
+        let state = Arc::new(test_server_state(sessions));
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "example.fixed/v1".to_string(),
+            schema: serde_json::json!({"type": "integer"}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "fixed-generation".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "agent".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "agent".to_string(),
+                    name: "agent".to_string(),
+                    kind: bcode_workflow::NodeKind::Agent,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                    input: schema.clone(),
+                    output: schema.clone(),
+                    resources: Vec::new(),
+                    configuration: test_workflow_agent_configuration(
+                        schema,
+                        bcode_workflow::AgentExecutionTarget::FixedGenerationFork,
+                    ),
+                },
+            )]),
+            entries: vec!["agent".to_string()],
+            exits: vec!["agent".to_string()],
+            edges: Vec::new(),
+        };
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist_definition("fixed-generation", 1, &definition)
+            .expect("definition");
+        let request =
+            |run_id: &str, parent_session_generation| bcode_ipc::WorkflowRunStartRequest {
+                definition_id: "fixed-generation".to_string(),
+                definition_version: 1,
+                run_id: Some(run_id.to_string()),
+                workspace_snapshot: "snapshot-1".to_string(),
+                parent_session_id: parent.id,
+                parent_session_generation,
+                binding: None,
+                input: Some(serde_json::json!(1)),
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            };
+        assert!(
+            start_workflow_run(&state, request("missing", None), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            start_workflow_run(&state, request("stale", Some(generation + 1)), None)
+                .await
+                .is_err()
+        );
+        let started = start_workflow_run(&state, request("pinned", Some(generation)), None)
+            .await
+            .expect("pinned start");
+        assert_eq!(started.run.parent_session_generation, Some(generation));
     }
 
     #[tokio::test]
@@ -55155,6 +55648,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             run_id: Some("plugin-stable-run".to_string()),
             workspace_snapshot: "snapshot-1".to_string(),
             parent_session_id: session.id,
+            parent_session_generation: None,
             binding: None,
             input: Some(serde_json::json!(1)),
             limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -55234,6 +55728,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: None,
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
@@ -55292,6 +55787,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(session.id.to_string()),
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
@@ -55392,6 +55888,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: Some(session.id.to_string()),
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),

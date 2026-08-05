@@ -477,6 +477,12 @@ pub enum Request {
     },
     /// Return the portable runtime-workflow authoring catalog.
     WorkflowAuthoringCatalog,
+    /// Atomically apply one previously validated package plan as canonical package drafts.
+    ApplyWorkflowPackage(ApplyWorkflowPackageRequest),
+    /// Validate and plan one bounded workflow package through the daemon-owned catalog.
+    ValidateWorkflowPackage(WorkflowPackageComputationRequest),
+    /// Compile-preview one complete package plan through the daemon-owned catalog.
+    PreviewWorkflowPackage(WorkflowPackagePreviewRequest),
     /// Validate and lower one raw workflow source through the daemon-owned catalog.
     ValidateWorkflowSource(WorkflowSourceComputationRequest),
     /// Lower and compile-preview one raw workflow source through the daemon-owned catalog.
@@ -1523,6 +1529,41 @@ pub struct WorkflowAuthoringPage<T, C> {
     pub next_cursor: Option<C>,
 }
 
+/// Atomic package apply request through the daemon-owned workflow store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyWorkflowPackageRequest {
+    pub request: bcode_workflow::WorkflowPackageApplyRequest,
+    pub applied_at_ms: u64,
+}
+
+/// One bounded portable package validation/planning request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageComputationRequest {
+    pub manifest: bcode_workflow::WorkflowPackageManifest,
+    #[serde(default)]
+    pub control: WorkflowComputationControl,
+}
+
+/// One side-effect-free preview request for an already planned package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackagePreviewRequest {
+    pub plan: bcode_workflow::WorkflowPackagePlan,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub configurations: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub control: WorkflowComputationControl,
+}
+
+/// Portable successful package planning response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageValidationResult {
+    pub plan: bcode_workflow::WorkflowPackagePlan,
+}
+
 /// One bounded raw-source validation/lowering request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2080,6 +2121,10 @@ pub struct StartAuthoredWorkflowRequest {
     pub parent_session_id: bcode_session_models::SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_snapshot: Option<String>,
+    /// Exact accepted parent-session generation required when the published workflow contains
+    /// fixed-generation agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration: Option<serde_json::Value>,
 }
@@ -2204,6 +2249,9 @@ pub struct WorkflowRunStartRequest {
     pub workspace_snapshot: String,
     /// Session used for compact generic runtime-work presentation.
     pub parent_session_id: bcode_session_models::SessionId,
+    /// Exact accepted parent-session generation required by fixed-generation workflow agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_generation: Option<u64>,
     /// Optional bounded product ownership and discovery association.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<bcode_workflow_store::WorkflowRunBinding>,
@@ -2495,6 +2543,15 @@ pub enum ResponsePayload {
     },
     WorkflowAuthoringCatalog {
         catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    },
+    WorkflowPackageApplied {
+        result: Box<bcode_workflow::WorkflowPackageMutationResult>,
+    },
+    WorkflowPackageValidated {
+        result: Box<WorkflowPackageValidationResult>,
+    },
+    WorkflowPackagePreviewed {
+        preview: Box<bcode_workflow::WorkflowPackagePreview>,
     },
     WorkflowSourceValidated {
         result: Box<WorkflowSourceValidationResult>,
@@ -3938,6 +3995,7 @@ mod tests {
                 run_id: Some("authored-run".to_string()),
                 parent_session_id: SessionId::new(),
                 workspace_snapshot: Some("snapshot".to_string()),
+                parent_session_generation: None,
                 configuration: Some(serde_json::json!({})),
             }),
             Request::ListAuthoredWorkflows {
@@ -4023,6 +4081,7 @@ mod tests {
                 run_id: Some("review-run".to_string()),
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: SessionId::new(),
+                parent_session_generation: None,
                 binding: None,
                 input: Some(serde_json::json!(1)),
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -4184,6 +4243,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 terminal_output_id: None,
@@ -4370,6 +4430,79 @@ mod tests {
         assert_eq!(
             decode_response(&encoded).expect("decode response"),
             response
+        );
+    }
+
+    #[test]
+    fn workflow_package_computation_contract_round_trips() {
+        let request = Request::ValidateWorkflowPackage(WorkflowPackageComputationRequest {
+            manifest: bcode_workflow::WorkflowPackageManifest {
+                version: bcode_workflow::WORKFLOW_PACKAGE_MANIFEST_VERSION,
+                package_id: "example/package".to_string(),
+                exports: std::collections::BTreeMap::from([(
+                    "main".to_string(),
+                    "main".to_string(),
+                )]),
+                external_dependencies: std::collections::BTreeMap::new(),
+                members: vec![bcode_workflow::WorkflowPackageMember {
+                    member_id: "main".to_string(),
+                    source_name: "main.json".to_string(),
+                    format: bcode_workflow::WorkflowSourceFormat::Json,
+                    source: "{}".to_string(),
+                    dependencies: Vec::new(),
+                }],
+            },
+            control: WorkflowComputationControl::default(),
+        });
+        let encoded = encode_request(&request).expect("encode package request");
+        assert_eq!(
+            decode_request(&encoded).expect("decode package request"),
+            request
+        );
+
+        let preview = Request::PreviewWorkflowPackage(WorkflowPackagePreviewRequest {
+            plan: bcode_workflow::WorkflowPackagePlan {
+                version: bcode_workflow::WORKFLOW_PACKAGE_PLAN_VERSION,
+                package_id: "example/package".to_string(),
+                members: Vec::new(),
+                lock: bcode_workflow::WorkflowPackageLock {
+                    version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
+                    package_id: "example/package".to_string(),
+                    package_source_digest_sha256: "a".repeat(64),
+                    members: Vec::new(),
+                },
+            },
+            configurations: std::collections::BTreeMap::new(),
+            control: WorkflowComputationControl::default(),
+        });
+        let encoded = encode_request(&preview).expect("encode package preview");
+        assert_eq!(
+            decode_request(&encoded).expect("decode package preview"),
+            preview
+        );
+
+        let apply = Request::ApplyWorkflowPackage(ApplyWorkflowPackageRequest {
+            request: bcode_workflow::WorkflowPackageApplyRequest {
+                version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+                plan: bcode_workflow::WorkflowPackagePlan {
+                    version: bcode_workflow::WORKFLOW_PACKAGE_PLAN_VERSION,
+                    package_id: "example/package".to_string(),
+                    members: Vec::new(),
+                    lock: bcode_workflow::WorkflowPackageLock {
+                        version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
+                        package_id: "example/package".to_string(),
+                        package_source_digest_sha256: "a".repeat(64),
+                        members: Vec::new(),
+                    },
+                },
+                expected_generations: Vec::new(),
+            },
+            applied_at_ms: 10,
+        });
+        let encoded = encode_request(&apply).expect("encode package apply");
+        assert_eq!(
+            decode_request(&encoded).expect("decode package apply"),
+            apply
         );
     }
 

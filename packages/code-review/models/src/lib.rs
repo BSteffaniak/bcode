@@ -5,8 +5,9 @@
 //! Shared code review models for Bcode.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
 
 /// Code review plugin service interface.
 pub const CODE_REVIEW_SERVICE_INTERFACE_ID: &str = "bcode.code_review/v1";
@@ -1584,9 +1585,1049 @@ const fn default_true() -> bool {
     true
 }
 
+/// Current portable adversarial review contract version.
+pub const ADVERSARIAL_REVIEW_CONTRACT_VERSION: u32 = 1;
+/// Maximum reviewers retained in one panel result.
+pub const MAX_ADVERSARIAL_REVIEWERS: usize = 32;
+/// Maximum findings retained in one report or consensus.
+pub const MAX_ADVERSARIAL_REVIEW_FINDINGS: usize = 512;
+/// Maximum UTF-8 bytes retained in one evidence/remediation field.
+pub const MAX_ADVERSARIAL_REVIEW_TEXT_BYTES: usize = 16_384;
+/// Maximum model/tool fact entries retained for one reviewer.
+pub const MAX_ADVERSARIAL_REVIEW_FACTS: usize = 64;
+
+/// Portable validation error for adversarial review contracts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdversarialReviewValidationError {
+    /// Stable contract field path.
+    pub path: String,
+    /// Actionable validation message.
+    pub message: String,
+}
+
+impl fmt::Display for AdversarialReviewValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid adversarial review at '{}': {}",
+            self.path, self.message
+        )
+    }
+}
+
+impl std::error::Error for AdversarialReviewValidationError {}
+
+fn adversarial_review_error(
+    path: impl Into<String>,
+    message: impl Into<String>,
+) -> AdversarialReviewValidationError {
+    AdversarialReviewValidationError {
+        path: path.into(),
+        message: message.into(),
+    }
+}
+
+fn validate_review_id(path: &str, value: &str) -> Result<(), AdversarialReviewValidationError> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'_' | b'-' | b':')
+        })
+    {
+        return Err(adversarial_review_error(
+            path,
+            "identity must contain 1..=256 safe ASCII bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(path: &str, value: &str) -> Result<(), AdversarialReviewValidationError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(adversarial_review_error(
+            path,
+            "digest must be 64 lowercase hexadecimal bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_review_path(path: &str, value: &str) -> Result<(), AdversarialReviewValidationError> {
+    let candidate = Path::new(value);
+    if value.is_empty()
+        || value.len() > 4_096
+        || candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(adversarial_review_error(
+            path,
+            "path must be a bounded confined repository-relative path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_review_text(path: &str, value: &str) -> Result<(), AdversarialReviewValidationError> {
+    if value.trim().is_empty() || value.len() > MAX_ADVERSARIAL_REVIEW_TEXT_BYTES {
+        return Err(adversarial_review_error(
+            path,
+            format!("text must contain 1..={MAX_ADVERSARIAL_REVIEW_TEXT_BYTES} UTF-8 bytes"),
+        ));
+    }
+    Ok(())
+}
+
+/// Exact immutable repository state reviewed by every member of one panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewRepositorySnapshot {
+    /// Must equal [`ADVERSARIAL_REVIEW_CONTRACT_VERSION`].
+    pub version: u32,
+    /// Git-owner supplied stable repository identity digest.
+    pub repository_identity_sha256: String,
+    /// Exact HEAD object identity at assignment time.
+    pub head_object_id: String,
+    /// Git-owner supplied aggregate repository snapshot digest.
+    pub aggregate_sha256: String,
+    /// Exact project-instruction fingerprint included in the snapshot.
+    pub project_instruction_fingerprint_sha256: String,
+}
+
+impl ReviewRepositorySnapshot {
+    /// Validate exact repository snapshot facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions or malformed digest/object identities.
+    pub fn validate(&self) -> Result<(), AdversarialReviewValidationError> {
+        if self.version != ADVERSARIAL_REVIEW_CONTRACT_VERSION {
+            return Err(adversarial_review_error(
+                "snapshot.version",
+                "unsupported version",
+            ));
+        }
+        validate_sha256(
+            "snapshot.repository_identity_sha256",
+            &self.repository_identity_sha256,
+        )?;
+        validate_review_id("snapshot.head_object_id", &self.head_object_id)?;
+        validate_sha256("snapshot.aggregate_sha256", &self.aggregate_sha256)?;
+        validate_sha256(
+            "snapshot.project_instruction_fingerprint_sha256",
+            &self.project_instruction_fingerprint_sha256,
+        )
+    }
+}
+
+/// One independent reviewer assignment bound to one exact repository snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAssignment {
+    pub version: u32,
+    pub assignment_id: String,
+    pub reviewer_id: String,
+    pub snapshot: ReviewRepositorySnapshot,
+    /// Bounded confined repository-relative paths selected for review; empty means the full snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_paths: Vec<String>,
+    /// Stable review policy identity.
+    pub policy_id: String,
+}
+
+/// Deterministic request to materialize one independent assignment per reviewer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPanelAssignmentRequest {
+    pub version: u32,
+    /// Stable identity of this review round.
+    pub round_id: String,
+    pub snapshot: ReviewRepositorySnapshot,
+    /// Reviewer identities in deterministic panel order.
+    pub reviewer_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_paths: Vec<String>,
+    pub policy_id: String,
+}
+
+/// Ordered exact assignments for one review round and repository snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPanelAssignments {
+    pub version: u32,
+    pub round_id: String,
+    pub snapshot_sha256: String,
+    pub assignments: Vec<ReviewAssignment>,
+}
+
+impl ReviewPanelAssignmentRequest {
+    /// Materialize stable ordered assignments without runtime or persistence behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed identities/paths/snapshot, fewer than
+    /// two reviewers, excessive reviewers, or reviewer identities not in strict unique order.
+    pub fn materialize(&self) -> Result<ReviewPanelAssignments, AdversarialReviewValidationError> {
+        if self.version != ADVERSARIAL_REVIEW_CONTRACT_VERSION {
+            return Err(adversarial_review_error(
+                "panel_assignment.version",
+                "unsupported version",
+            ));
+        }
+        validate_review_id("panel_assignment.round_id", &self.round_id)?;
+        validate_review_id("panel_assignment.policy_id", &self.policy_id)?;
+        self.snapshot.validate()?;
+        if self.reviewer_ids.len() < 2 || self.reviewer_ids.len() > MAX_ADVERSARIAL_REVIEWERS {
+            return Err(adversarial_review_error(
+                "panel_assignment.reviewer_ids",
+                format!("panel requires 2..={MAX_ADVERSARIAL_REVIEWERS} reviewers"),
+            ));
+        }
+        if self.include_paths.len() > MAX_ADVERSARIAL_REVIEW_FINDINGS {
+            return Err(adversarial_review_error(
+                "panel_assignment.include_paths",
+                "selected paths exceed the review bound",
+            ));
+        }
+        let mut previous = None;
+        for reviewer_id in &self.reviewer_ids {
+            validate_review_id("panel_assignment.reviewer_ids", reviewer_id)?;
+            if previous.is_some_and(|identity: &str| identity >= reviewer_id.as_str()) {
+                return Err(adversarial_review_error(
+                    "panel_assignment.reviewer_ids",
+                    "reviewer identities must be strictly ordered and unique",
+                ));
+            }
+            previous = Some(reviewer_id.as_str());
+        }
+        let mut paths = BTreeSet::new();
+        for path in &self.include_paths {
+            validate_review_path("panel_assignment.include_paths", path)?;
+            if !paths.insert(path) {
+                return Err(adversarial_review_error(
+                    "panel_assignment.include_paths",
+                    "selected paths must be unique",
+                ));
+            }
+        }
+        let assignments = self
+            .reviewer_ids
+            .iter()
+            .map(|reviewer_id| ReviewAssignment {
+                version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+                assignment_id: format!("{}:{reviewer_id}", self.round_id),
+                reviewer_id: reviewer_id.clone(),
+                snapshot: self.snapshot.clone(),
+                include_paths: self.include_paths.clone(),
+                policy_id: self.policy_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        for assignment in &assignments {
+            assignment.validate()?;
+        }
+        Ok(ReviewPanelAssignments {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            round_id: self.round_id.clone(),
+            snapshot_sha256: self.snapshot.aggregate_sha256.clone(),
+            assignments,
+        })
+    }
+}
+
+impl ReviewAssignment {
+    /// Validate assignment identity, exact snapshot binding, and selected paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed identities, duplicate paths, or an
+    /// invalid repository snapshot.
+    pub fn validate(&self) -> Result<(), AdversarialReviewValidationError> {
+        if self.version != ADVERSARIAL_REVIEW_CONTRACT_VERSION {
+            return Err(adversarial_review_error(
+                "assignment.version",
+                "unsupported version",
+            ));
+        }
+        validate_review_id("assignment.assignment_id", &self.assignment_id)?;
+        validate_review_id("assignment.reviewer_id", &self.reviewer_id)?;
+        validate_review_id("assignment.policy_id", &self.policy_id)?;
+        self.snapshot.validate()?;
+        if self.include_paths.len() > MAX_ADVERSARIAL_REVIEW_FINDINGS {
+            return Err(adversarial_review_error(
+                "assignment.include_paths",
+                "selected paths exceed the review bound",
+            ));
+        }
+        let mut paths = BTreeSet::new();
+        for path in &self.include_paths {
+            validate_review_path("assignment.include_paths", path)?;
+            if !paths.insert(path) {
+                return Err(adversarial_review_error(
+                    "assignment.include_paths",
+                    "selected paths must be unique",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Severity of one normalized review finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingSeverity {
+    Advisory,
+    Minor,
+    Major,
+    Critical,
+}
+
+/// Reviewer's requested treatment before consensus disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingDisposition {
+    Required,
+    Advisory,
+}
+
+/// Exact optional repository source range for one finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSourceRange {
+    pub path: String,
+    pub start_line: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_column: Option<u32>,
+    pub end_line: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<u32>,
+}
+
+impl ReviewSourceRange {
+    fn validate(&self) -> Result<(), AdversarialReviewValidationError> {
+        validate_review_path("finding.location.path", &self.path)?;
+        if self.start_line == 0
+            || self.end_line < self.start_line
+            || self.start_column == Some(0)
+            || self.end_column == Some(0)
+            || (self.start_line == self.end_line
+                && self
+                    .start_column
+                    .zip(self.end_column)
+                    .is_some_and(|(start, end)| end < start))
+        {
+            return Err(adversarial_review_error(
+                "finding.location",
+                "source range is malformed or reversed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Stable snapshot-bound normalized review finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFinding {
+    pub version: u32,
+    pub finding_id: String,
+    pub snapshot_sha256: String,
+    pub severity: ReviewFindingSeverity,
+    pub disposition: ReviewFindingDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<ReviewSourceRange>,
+    pub title: String,
+    pub evidence: String,
+    pub remediation: String,
+}
+
+impl ReviewFinding {
+    /// Validate one stable bounded snapshot-bound finding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity/snapshot/range or oversized text.
+    pub fn validate(&self) -> Result<(), AdversarialReviewValidationError> {
+        if self.version != ADVERSARIAL_REVIEW_CONTRACT_VERSION {
+            return Err(adversarial_review_error(
+                "finding.version",
+                "unsupported version",
+            ));
+        }
+        validate_review_id("finding.finding_id", &self.finding_id)?;
+        validate_sha256("finding.snapshot_sha256", &self.snapshot_sha256)?;
+        if let Some(location) = &self.location {
+            location.validate()?;
+        }
+        validate_review_text("finding.title", &self.title)?;
+        validate_review_text("finding.evidence", &self.evidence)?;
+        validate_review_text("finding.remediation", &self.remediation)
+    }
+}
+
+/// Exact normalized model and tool facts recorded for one reviewer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewExecutionFacts {
+    pub provider_id: String,
+    pub model_id: String,
+    pub agent_profile: String,
+    /// Exact read-only tool identities available to this reviewer.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub tools: BTreeSet<String>,
+}
+
+impl ReviewExecutionFacts {
+    fn validate(&self) -> Result<(), AdversarialReviewValidationError> {
+        validate_review_id("report.execution.provider_id", &self.provider_id)?;
+        validate_review_id("report.execution.model_id", &self.model_id)?;
+        validate_review_id("report.execution.agent_profile", &self.agent_profile)?;
+        if self.tools.len() > MAX_ADVERSARIAL_REVIEW_FACTS {
+            return Err(adversarial_review_error(
+                "report.execution.tools",
+                "tool facts exceed the review bound",
+            ));
+        }
+        for tool in &self.tools {
+            validate_review_id("report.execution.tools", tool)?;
+        }
+        Ok(())
+    }
+}
+
+/// One independent typed reviewer report for one exact assignment and snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewReport {
+    pub version: u32,
+    pub assignment_id: String,
+    pub reviewer_id: String,
+    pub snapshot_sha256: String,
+    pub execution: ReviewExecutionFacts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<ReviewFinding>,
+}
+
+impl ReviewReport {
+    /// Validate report identity, bounds, finding uniqueness, and exact snapshot binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed facts, duplicate/conflicting findings,
+    /// or mixed snapshot identities.
+    pub fn validate(&self) -> Result<(), AdversarialReviewValidationError> {
+        if self.version != ADVERSARIAL_REVIEW_CONTRACT_VERSION {
+            return Err(adversarial_review_error(
+                "report.version",
+                "unsupported version",
+            ));
+        }
+        validate_review_id("report.assignment_id", &self.assignment_id)?;
+        validate_review_id("report.reviewer_id", &self.reviewer_id)?;
+        validate_sha256("report.snapshot_sha256", &self.snapshot_sha256)?;
+        self.execution.validate()?;
+        if self.findings.len() > MAX_ADVERSARIAL_REVIEW_FINDINGS {
+            return Err(adversarial_review_error(
+                "report.findings",
+                "findings exceed the review bound",
+            ));
+        }
+        let mut findings = BTreeMap::new();
+        for finding in &self.findings {
+            finding.validate()?;
+            if finding.snapshot_sha256 != self.snapshot_sha256 {
+                return Err(adversarial_review_error(
+                    "report.findings.snapshot_sha256",
+                    "every finding must bind to the report snapshot",
+                ));
+            }
+            if findings.insert(&finding.finding_id, finding).is_some() {
+                return Err(adversarial_review_error(
+                    "report.findings.finding_id",
+                    "finding identities must be unique",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate this report against the exact assignment it answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when assignment/reviewer/snapshot facts differ or either contract is
+    /// malformed.
+    pub fn validate_against_assignment(
+        &self,
+        assignment: &ReviewAssignment,
+    ) -> Result<(), AdversarialReviewValidationError> {
+        self.validate()?;
+        assignment.validate()?;
+        if self.assignment_id != assignment.assignment_id
+            || self.reviewer_id != assignment.reviewer_id
+            || self.snapshot_sha256 != assignment.snapshot.aggregate_sha256
+        {
+            return Err(adversarial_review_error(
+                "report.assignment",
+                "report must exactly match its assignment, reviewer, and repository snapshot",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Ordered independent reports for one exact repository snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPanelResult {
+    pub version: u32,
+    pub snapshot_sha256: String,
+    /// Reports ordered by deterministic panel member identity.
+    pub reports: Vec<ReviewReport>,
+}
+
+impl ReviewPanelResult {
+    /// Validate bounded ordered unique reports and exact common snapshot binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed reports, ordering/identity conflicts,
+    /// or mixed snapshots.
+    pub fn validate(&self) -> Result<(), AdversarialReviewValidationError> {
+        if self.version != ADVERSARIAL_REVIEW_CONTRACT_VERSION {
+            return Err(adversarial_review_error(
+                "panel.version",
+                "unsupported version",
+            ));
+        }
+        validate_sha256("panel.snapshot_sha256", &self.snapshot_sha256)?;
+        if self.reports.len() < 2 || self.reports.len() > MAX_ADVERSARIAL_REVIEWERS {
+            return Err(adversarial_review_error(
+                "panel.reports",
+                format!("panel requires 2..={MAX_ADVERSARIAL_REVIEWERS} reports"),
+            ));
+        }
+        let mut previous = None;
+        let mut findings = BTreeMap::<&str, &ReviewFinding>::new();
+        for report in &self.reports {
+            report.validate()?;
+            if report.snapshot_sha256 != self.snapshot_sha256 {
+                return Err(adversarial_review_error(
+                    "panel.reports.snapshot_sha256",
+                    "every report must bind to the panel snapshot",
+                ));
+            }
+            if previous.is_some_and(|identity: &str| identity >= report.reviewer_id.as_str()) {
+                return Err(adversarial_review_error(
+                    "panel.reports.reviewer_id",
+                    "reports must be strictly ordered by unique reviewer identity",
+                ));
+            }
+            for finding in &report.findings {
+                if findings
+                    .insert(&finding.finding_id, finding)
+                    .is_some_and(|existing| existing != finding)
+                {
+                    return Err(adversarial_review_error(
+                        "panel.reports.findings.finding_id",
+                        "duplicate finding identities must have identical normalized payloads",
+                    ));
+                }
+            }
+            previous = Some(report.reviewer_id.as_str());
+        }
+        Ok(())
+    }
+
+    fn findings_by_id(&self) -> BTreeMap<&str, &ReviewFinding> {
+        self.reports
+            .iter()
+            .flat_map(|report| &report.findings)
+            .map(|finding| (finding.finding_id.as_str(), finding))
+            .collect()
+    }
+}
+
+/// Consensus treatment of one submitted finding identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewConsensusDisposition {
+    Required,
+    Advisory,
+    Invalid,
+    Duplicate,
+}
+
+/// One auditable consensus decision for a submitted finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConsensusDecision {
+    pub finding_id: String,
+    pub disposition: ReviewConsensusDisposition,
+    /// Canonical retained finding for required/advisory decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding: Option<ReviewFinding>,
+    /// Existing canonical finding identity for duplicate decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_of: Option<String>,
+    pub rationale: String,
+}
+
+/// Complete bounded consensus over one exact panel result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConsensus {
+    pub version: u32,
+    pub snapshot_sha256: String,
+    /// Decisions ordered by submitted finding identity.
+    pub decisions: Vec<ReviewConsensusDecision>,
+}
+
+impl ReviewConsensus {
+    /// Validate ordered decisions, disposition payloads, and snapshot binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed/duplicate decisions, inconsistent
+    /// disposition payloads, or mixed snapshot identities.
+    pub fn validate(&self) -> Result<(), AdversarialReviewValidationError> {
+        if self.version != ADVERSARIAL_REVIEW_CONTRACT_VERSION {
+            return Err(adversarial_review_error(
+                "consensus.version",
+                "unsupported version",
+            ));
+        }
+        validate_sha256("consensus.snapshot_sha256", &self.snapshot_sha256)?;
+        if self.decisions.len() > MAX_ADVERSARIAL_REVIEW_FINDINGS {
+            return Err(adversarial_review_error(
+                "consensus.decisions",
+                "decisions exceed the review bound",
+            ));
+        }
+        let mut previous = None;
+        for decision in &self.decisions {
+            validate_review_id("consensus.decisions.finding_id", &decision.finding_id)?;
+            validate_review_text("consensus.decisions.rationale", &decision.rationale)?;
+            if previous.is_some_and(|identity: &str| identity >= decision.finding_id.as_str()) {
+                return Err(adversarial_review_error(
+                    "consensus.decisions.finding_id",
+                    "decisions must be strictly ordered by unique finding identity",
+                ));
+            }
+            match decision.disposition {
+                ReviewConsensusDisposition::Required | ReviewConsensusDisposition::Advisory => {
+                    let finding = decision.finding.as_ref().ok_or_else(|| {
+                        adversarial_review_error(
+                            "consensus.decisions.finding",
+                            "retained decision requires the canonical finding",
+                        )
+                    })?;
+                    finding.validate()?;
+                    if finding.finding_id != decision.finding_id
+                        || finding.snapshot_sha256 != self.snapshot_sha256
+                        || decision.duplicate_of.is_some()
+                    {
+                        return Err(adversarial_review_error(
+                            "consensus.decisions",
+                            "retained decision payload is inconsistent",
+                        ));
+                    }
+                }
+                ReviewConsensusDisposition::Duplicate => {
+                    if decision.finding.is_some()
+                        || decision.duplicate_of.as_deref().is_none_or(|identity| {
+                            identity == decision.finding_id
+                                || validate_review_id("duplicate_of", identity).is_err()
+                        })
+                    {
+                        return Err(adversarial_review_error(
+                            "consensus.decisions.duplicate_of",
+                            "duplicate decision requires one different canonical finding identity",
+                        ));
+                    }
+                }
+                ReviewConsensusDisposition::Invalid => {
+                    if decision.finding.is_some() || decision.duplicate_of.is_some() {
+                        return Err(adversarial_review_error(
+                            "consensus.decisions",
+                            "invalid decision cannot retain a finding or duplicate target",
+                        ));
+                    }
+                }
+            }
+            previous = Some(decision.finding_id.as_str());
+        }
+        Ok(())
+    }
+
+    /// Validate consensus as a complete disposition of the exact panel findings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a panel finding is omitted, an unknown finding is introduced, a
+    /// retained payload differs, a duplicate target is absent, or required reviewer findings are
+    /// silently downgraded or invalidated.
+    pub fn validate_against_panel(
+        &self,
+        panel: &ReviewPanelResult,
+    ) -> Result<(), AdversarialReviewValidationError> {
+        self.validate()?;
+        panel.validate()?;
+        if self.snapshot_sha256 != panel.snapshot_sha256 {
+            return Err(adversarial_review_error(
+                "consensus.snapshot_sha256",
+                "consensus must bind to the panel snapshot",
+            ));
+        }
+        let findings = panel.findings_by_id();
+        if self.decisions.len() != findings.len() {
+            return Err(adversarial_review_error(
+                "consensus.decisions",
+                "consensus must disposition every distinct panel finding exactly once",
+            ));
+        }
+        let decisions = self
+            .decisions
+            .iter()
+            .map(|decision| (decision.finding_id.as_str(), decision))
+            .collect::<BTreeMap<_, _>>();
+        for (finding_id, finding) in findings {
+            let decision = decisions.get(finding_id).ok_or_else(|| {
+                adversarial_review_error(
+                    "consensus.decisions",
+                    "consensus omitted a submitted finding",
+                )
+            })?;
+            if finding.disposition == ReviewFindingDisposition::Required
+                && !matches!(decision.disposition, ReviewConsensusDisposition::Required)
+            {
+                return Err(adversarial_review_error(
+                    "consensus.decisions.disposition",
+                    "required reviewer findings must remain required unless separately adjudicated with an explicit supported proof contract",
+                ));
+            }
+            if matches!(
+                decision.disposition,
+                ReviewConsensusDisposition::Required | ReviewConsensusDisposition::Advisory
+            ) && decision.finding.as_ref() != Some(finding)
+            {
+                return Err(adversarial_review_error(
+                    "consensus.decisions.finding",
+                    "retained consensus finding must equal the normalized panel finding",
+                ));
+            }
+            if let Some(duplicate_of) = &decision.duplicate_of {
+                let Some(target) = decisions.get(duplicate_of.as_str()) else {
+                    return Err(adversarial_review_error(
+                        "consensus.decisions.duplicate_of",
+                        "duplicate target must be another submitted finding",
+                    ));
+                };
+                if matches!(target.disposition, ReviewConsensusDisposition::Duplicate) {
+                    return Err(adversarial_review_error(
+                        "consensus.decisions.duplicate_of",
+                        "duplicate chains are prohibited",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Terminal result of one bounded adversarial review round.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReviewRoundOutcome {
+    Clean {
+        version: u32,
+        snapshot_sha256: String,
+    },
+    RemediationRequired {
+        version: u32,
+        snapshot_sha256: String,
+        consensus: ReviewConsensus,
+    },
+    Exhausted {
+        version: u32,
+        snapshot_sha256: String,
+        rounds: u32,
+        consensus: ReviewConsensus,
+    },
+    Failed {
+        version: u32,
+        snapshot_sha256: String,
+        message: String,
+    },
+    Cancelled {
+        version: u32,
+        snapshot_sha256: String,
+    },
+}
+
+impl ReviewRoundOutcome {
+    /// Validate one terminal review outcome and its exact snapshot binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed snapshots/messages, zero exhaustion
+    /// rounds, or consensus bound to another snapshot.
+    pub fn validate(&self) -> Result<(), AdversarialReviewValidationError> {
+        let (version, snapshot) = match self {
+            Self::Clean {
+                version,
+                snapshot_sha256,
+            }
+            | Self::Cancelled {
+                version,
+                snapshot_sha256,
+            } => (*version, snapshot_sha256),
+            Self::RemediationRequired {
+                version,
+                snapshot_sha256,
+                consensus,
+            } => {
+                consensus.validate()?;
+                if consensus.snapshot_sha256 != *snapshot_sha256 {
+                    return Err(adversarial_review_error(
+                        "outcome.consensus.snapshot_sha256",
+                        "consensus must bind to the outcome snapshot",
+                    ));
+                }
+                (*version, snapshot_sha256)
+            }
+            Self::Exhausted {
+                version,
+                snapshot_sha256,
+                rounds,
+                consensus,
+            } => {
+                if *rounds == 0 {
+                    return Err(adversarial_review_error(
+                        "outcome.rounds",
+                        "exhausted outcome requires at least one round",
+                    ));
+                }
+                consensus.validate()?;
+                if consensus.snapshot_sha256 != *snapshot_sha256 {
+                    return Err(adversarial_review_error(
+                        "outcome.consensus.snapshot_sha256",
+                        "consensus must bind to the outcome snapshot",
+                    ));
+                }
+                (*version, snapshot_sha256)
+            }
+            Self::Failed {
+                version,
+                snapshot_sha256,
+                message,
+            } => {
+                validate_review_text("outcome.message", message)?;
+                (*version, snapshot_sha256)
+            }
+        };
+        if version != ADVERSARIAL_REVIEW_CONTRACT_VERSION {
+            return Err(adversarial_review_error(
+                "outcome.version",
+                "unsupported version",
+            ));
+        }
+        validate_sha256("outcome.snapshot_sha256", snapshot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn review_snapshot() -> ReviewRepositorySnapshot {
+        ReviewRepositorySnapshot {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            repository_identity_sha256: "a".repeat(64),
+            head_object_id: "0123456789abcdef".to_string(),
+            aggregate_sha256: "b".repeat(64),
+            project_instruction_fingerprint_sha256: "c".repeat(64),
+        }
+    }
+
+    fn review_finding(id: &str) -> ReviewFinding {
+        ReviewFinding {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            finding_id: id.to_string(),
+            snapshot_sha256: "b".repeat(64),
+            severity: ReviewFindingSeverity::Major,
+            disposition: ReviewFindingDisposition::Required,
+            location: Some(ReviewSourceRange {
+                path: "src/lib.rs".to_string(),
+                start_line: 10,
+                start_column: Some(2),
+                end_line: 12,
+                end_column: Some(8),
+            }),
+            title: "Terminal state can reopen".to_string(),
+            evidence: "A stale update overwrites the persisted terminal state.".to_string(),
+            remediation: "Reject updates after the authoritative terminal transition.".to_string(),
+        }
+    }
+
+    fn review_report(reviewer: &str, finding_id: &str) -> ReviewReport {
+        ReviewReport {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            assignment_id: format!("assignment-{reviewer}"),
+            reviewer_id: reviewer.to_string(),
+            snapshot_sha256: "b".repeat(64),
+            execution: ReviewExecutionFacts {
+                provider_id: "provider".to_string(),
+                model_id: "model".to_string(),
+                agent_profile: "reviewer".to_string(),
+                tools: BTreeSet::from(["filesystem.read".to_string()]),
+            },
+            findings: vec![review_finding(finding_id)],
+        }
+    }
+
+    #[test]
+    fn adversarial_review_contracts_validate_and_round_trip() {
+        let assignment_request = ReviewPanelAssignmentRequest {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            round_id: "round-1".to_string(),
+            snapshot: review_snapshot(),
+            reviewer_ids: vec!["reviewer-a".to_string(), "reviewer-b".to_string()],
+            include_paths: vec!["src/lib.rs".to_string()],
+            policy_id: "strict".to_string(),
+        };
+        let assignments = assignment_request.materialize().expect("assignments");
+        assert_eq!(assignments.assignments.len(), 2);
+        assert_eq!(
+            assignments.assignments[0].assignment_id,
+            "round-1:reviewer-a"
+        );
+        assert_eq!(
+            assignments.assignments[1].assignment_id,
+            "round-1:reviewer-b"
+        );
+
+        let assignment = ReviewAssignment {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            assignment_id: "assignment-a".to_string(),
+            reviewer_id: "reviewer-a".to_string(),
+            snapshot: review_snapshot(),
+            include_paths: vec!["src/lib.rs".to_string()],
+            policy_id: "strict".to_string(),
+        };
+        assignment.validate().expect("assignment");
+
+        let panel = ReviewPanelResult {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            snapshot_sha256: "b".repeat(64),
+            reports: vec![
+                review_report("reviewer-a", "finding-a"),
+                review_report("reviewer-b", "finding-b"),
+            ],
+        };
+        panel.validate().expect("panel");
+        let encoded = serde_json::to_string(&panel).expect("serialize panel");
+        assert_eq!(
+            serde_json::from_str::<ReviewPanelResult>(&encoded).expect("deserialize panel"),
+            panel
+        );
+
+        let findings = [review_finding("finding-a"), review_finding("finding-b")];
+        let consensus = ReviewConsensus {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            snapshot_sha256: "b".repeat(64),
+            decisions: findings
+                .into_iter()
+                .map(|finding| ReviewConsensusDecision {
+                    finding_id: finding.finding_id.clone(),
+                    disposition: ReviewConsensusDisposition::Required,
+                    finding: Some(finding),
+                    duplicate_of: None,
+                    rationale: "The evidence demonstrates a correctness defect.".to_string(),
+                })
+                .collect(),
+        };
+        consensus.validate().expect("consensus");
+        consensus
+            .validate_against_panel(&panel)
+            .expect("panel consensus");
+        ReviewRoundOutcome::RemediationRequired {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            snapshot_sha256: "b".repeat(64),
+            consensus,
+        }
+        .validate()
+        .expect("outcome");
+    }
+
+    #[test]
+    fn adversarial_review_contracts_reject_mixed_snapshot_and_conflicting_identity() {
+        let mut report = review_report("reviewer-a", "finding-a");
+        report.findings[0].snapshot_sha256 = "d".repeat(64);
+        assert!(report.validate().is_err());
+
+        let unordered = ReviewPanelAssignmentRequest {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            round_id: "round-1".to_string(),
+            snapshot: review_snapshot(),
+            reviewer_ids: vec!["reviewer-b".to_string(), "reviewer-a".to_string()],
+            include_paths: Vec::new(),
+            policy_id: "strict".to_string(),
+        };
+        assert!(unordered.materialize().is_err());
+
+        let duplicate_report = review_report("reviewer-a", "finding-b");
+        let panel = ReviewPanelResult {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            snapshot_sha256: "b".repeat(64),
+            reports: vec![review_report("reviewer-a", "finding-a"), duplicate_report],
+        };
+        assert!(panel.validate().is_err());
+
+        let decision = ReviewConsensusDecision {
+            finding_id: "finding-a".to_string(),
+            disposition: ReviewConsensusDisposition::Duplicate,
+            finding: None,
+            duplicate_of: Some("finding-a".to_string()),
+            rationale: "duplicate".to_string(),
+        };
+        assert!(
+            ReviewConsensus {
+                version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+                snapshot_sha256: "b".repeat(64),
+                decisions: vec![decision],
+            }
+            .validate()
+            .is_err()
+        );
+
+        let panel = ReviewPanelResult {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            snapshot_sha256: "b".repeat(64),
+            reports: vec![
+                review_report("reviewer-a", "finding-a"),
+                review_report("reviewer-b", "finding-b"),
+            ],
+        };
+        let finding = review_finding("finding-a");
+        let incomplete = ReviewConsensus {
+            version: ADVERSARIAL_REVIEW_CONTRACT_VERSION,
+            snapshot_sha256: "b".repeat(64),
+            decisions: vec![ReviewConsensusDecision {
+                finding_id: finding.finding_id.clone(),
+                disposition: ReviewConsensusDisposition::Advisory,
+                finding: Some(finding),
+                duplicate_of: None,
+                rationale: "downgraded".to_string(),
+            }],
+        };
+        assert!(incomplete.validate_against_panel(&panel).is_err());
+    }
 
     #[test]
     fn external_review_import_models_round_trip_json() {

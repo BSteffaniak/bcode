@@ -7,9 +7,10 @@
 use bcode_workflow::{
     WORKFLOW_COMPILATION_PREVIEW_VERSION, WorkflowAuthoringDocument, WorkflowAuthoringListCursor,
     WorkflowBlockDefinition, WorkflowCompilationPreview, WorkflowDefinition,
-    WorkflowDefinitionIdentity, WorkflowNodeDataflowPolicy, WorkflowProducerProvenance,
-    WorkflowRevisionListCursor, WorkflowRunLimitPolicy, prepare_workflow_node_dataflow,
-    validate_persistable_authoring_value,
+    WorkflowDefinitionIdentity, WorkflowNodeDataflowPolicy, WorkflowPackageApplyRequest,
+    WorkflowPackageMutationMemberResult, WorkflowPackageMutationOutcome,
+    WorkflowPackageMutationResult, WorkflowProducerProvenance, WorkflowRevisionListCursor,
+    WorkflowRunLimitPolicy, prepare_workflow_node_dataflow, validate_persistable_authoring_value,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,9 @@ use std::pin::Pin;
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "workflow.db";
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 11;
+/// Current durable workflow execution-session link contract version.
+pub const WORKFLOW_EXECUTION_SESSION_LINK_VERSION: u32 = 1;
 /// Current durable authored-run provenance contract version.
 pub const AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 512;
@@ -158,6 +161,9 @@ pub struct WorkflowRunSummary {
     pub definition_version: u32,
     pub workspace_snapshot: String,
     pub parent_session_id: Option<String>,
+    /// Exact accepted parent generation for fixed-generation workflow agent contexts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_generation: Option<u64>,
     #[serde(default)]
     pub binding: Option<WorkflowRunBinding>,
     /// Exact authored source when this run originated from a published authored workflow.
@@ -405,6 +411,10 @@ pub struct NewWorkflowRun {
     pub workspace_snapshot: String,
     /// Optional parent session identity serialized without coupling this store to session logic.
     pub parent_session_id: Option<String>,
+    /// Exact accepted parent-session generation pinned at root admission when workflow agents use
+    /// fixed-generation context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_generation: Option<u64>,
     /// Optional bounded product ownership and discovery association.
     #[serde(default)]
     pub binding: Option<WorkflowRunBinding>,
@@ -459,6 +469,56 @@ impl PreparedAttempt {
             &self.activation_id,
             self.attempt,
         )
+    }
+}
+
+/// One exact workflow activation/attempt to session relationship.
+///
+/// This row is workflow-owned recovery state only. Session content, visibility, retention, and
+/// history remain canonical in the session domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowExecutionSessionLink {
+    /// Link contract version.
+    pub version: u32,
+    /// Owning workflow run.
+    pub run_id: String,
+    /// Owning workflow node.
+    pub node_id: String,
+    /// Exact logical activation.
+    pub activation_id: String,
+    /// Exact dispatch attempt.
+    pub attempt: u32,
+    /// Session-domain identity, treated as an opaque typed string by workflow persistence.
+    pub session_id: String,
+    /// Exact immutable workspace snapshot associated with the execution session.
+    pub workspace_snapshot: String,
+    /// Time the relationship was accepted durably.
+    pub created_at_ms: u64,
+}
+
+impl WorkflowExecutionSessionLink {
+    /// Construct the current version of an execution-session link.
+    #[must_use]
+    pub const fn new(
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        attempt: u32,
+        session_id: String,
+        workspace_snapshot: String,
+        created_at_ms: u64,
+    ) -> Self {
+        Self {
+            version: WORKFLOW_EXECUTION_SESSION_LINK_VERSION,
+            run_id,
+            node_id,
+            activation_id,
+            attempt,
+            session_id,
+            workspace_snapshot,
+            created_at_ms,
+        }
     }
 }
 
@@ -1548,6 +1608,147 @@ impl WorkflowStore {
             )));
         }
         Ok(())
+    }
+
+    /// Atomically apply every member of one validated package plan as the `package` draft.
+    ///
+    /// Existing members require exact expected generations; omitted members are create-only. Any
+    /// conflict or failure rolls back all authored workflow and draft mutations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid package facts, stale generations, existing create-only
+    /// members, timestamp regression, malformed documents, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn apply_workflow_package(
+        &mut self,
+        request: &WorkflowPackageApplyRequest,
+        applied_at_ms: u64,
+    ) -> Result<WorkflowPackageMutationResult, WorkflowStoreError> {
+        request
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let expected = request
+            .expected_generations
+            .iter()
+            .map(|fact| (fact.member_id.as_str(), fact.expected_generation))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let transaction = self.connection.transaction()?;
+        let producer = WorkflowProducerProvenance {
+            kind: bcode_workflow::WorkflowProducerKind::Human,
+            producer_id: Some(format!("package:{}", request.plan.package_id)),
+            source_revision: None,
+        };
+        producer
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let mut results = Vec::with_capacity(request.plan.members.len());
+        for member in &request.plan.members {
+            let workflow_id = &member.lowering.document.workflow_id;
+            validate_authoring_document(workflow_id, &member.lowering.document)?;
+            let current = transaction
+                .query_row(
+                    "SELECT generation FROM workflow_drafts WHERE workflow_id = ?1 AND draft_id = 'package'",
+                    [workflow_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .optional()?;
+            let expected_generation = expected.get(member.member_id.as_str()).copied();
+            match (current, expected_generation) {
+                (None, None) => {
+                    transaction.execute(
+                        "INSERT INTO authored_workflows (workflow_id, title, description, archived, active_revision, created_at_ms, updated_at_ms) \
+                         VALUES (?1, ?2, ?3, 0, NULL, ?4, ?4)",
+                        (
+                            workflow_id,
+                            &member.lowering.document.metadata.title,
+                            &member.lowering.document.metadata.description,
+                            applied_at_ms,
+                        ),
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO workflow_drafts (workflow_id, draft_id, base_revision, generation, checksum_sha256, document_json, producer_json, created_at_ms, updated_at_ms) \
+                         VALUES (?1, 'package', NULL, 1, ?2, ?3, ?4, ?5, ?5)",
+                        (
+                            workflow_id,
+                            member.lowering.document.source_digest_sha256().map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
+                            bounded_json("package draft document", &member.lowering.document)?,
+                            bounded_json("package draft producer", &producer)?,
+                            applied_at_ms,
+                        ),
+                    )?;
+                    results.push(WorkflowPackageMutationMemberResult {
+                        member_id: member.member_id.clone(),
+                        generation: 1,
+                        revision: None,
+                        definition_identity: member.definition_identity.clone(),
+                    });
+                }
+                (Some(current_generation), Some(expected_generation))
+                    if current_generation == expected_generation =>
+                {
+                    let next = current_generation.checked_add(1).ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "package draft generation overflow".to_string(),
+                        )
+                    })?;
+                    let changed = transaction.execute(
+                        "UPDATE workflow_drafts SET generation = ?3, checksum_sha256 = ?4, document_json = ?5, producer_json = ?6, updated_at_ms = ?7 \
+                         WHERE workflow_id = ?1 AND draft_id = 'package' AND generation = ?2",
+                        rusqlite::params![
+                            workflow_id,
+                            current_generation,
+                            next,
+                            member.lowering.document.source_digest_sha256().map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
+                            bounded_json("package draft document", &member.lowering.document)?,
+                            bounded_json("package draft producer", &producer)?,
+                            applied_at_ms,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(WorkflowStoreError::AuthoringConflict {
+                            entity_id: format!("{workflow_id}/package"),
+                            expected: expected_generation,
+                            current: current_generation,
+                        });
+                    }
+                    results.push(WorkflowPackageMutationMemberResult {
+                        member_id: member.member_id.clone(),
+                        generation: next,
+                        revision: None,
+                        definition_identity: member.definition_identity.clone(),
+                    });
+                }
+                (Some(current), expected) => {
+                    return Err(WorkflowStoreError::AuthoringConflict {
+                        entity_id: format!("{workflow_id}/package"),
+                        expected: expected.unwrap_or(0),
+                        current,
+                    });
+                }
+                (None, Some(expected)) => {
+                    return Err(WorkflowStoreError::AuthoringConflict {
+                        entity_id: format!("{workflow_id}/package"),
+                        expected,
+                        current: 0,
+                    });
+                }
+            }
+        }
+        results.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+        transaction.commit()?;
+        let result = WorkflowPackageMutationResult {
+            version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+            package_id: request.plan.package_id.clone(),
+            outcome: WorkflowPackageMutationOutcome::Applied,
+            members: results,
+            lock: Some(request.plan.lock.clone()),
+            diagnostics: Vec::new(),
+        };
+        result
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        Ok(result)
     }
 
     /// Create one durable mutable draft.
@@ -2955,7 +3156,7 @@ impl WorkflowStore {
         let existing = self
             .connection
             .query_row(
-                "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, \
+                "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, parent_session_generation, \
                  input_json, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
                  owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
                  authored_provenance_json, authorization_ceiling \
@@ -2967,19 +3168,20 @@ impl WorkflowStore {
                         row.get::<_, u32>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<u64>>(5)?,
-                        row.get::<_, u32>(6)?,
+                        row.get::<_, Option<u64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<u64>>(6)?,
                         row.get::<_, u32>(7)?,
                         row.get::<_, u32>(8)?,
                         row.get::<_, u32>(9)?,
-                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, u32>(10)?,
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
-                        row.get::<_, bool>(14)?,
-                        row.get::<_, Option<String>>(15)?,
-                        row.get::<_, String>(16)?,
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, bool>(15)?,
+                        row.get::<_, Option<String>>(16)?,
+                        row.get::<_, String>(17)?,
                     ))
                 },
             )
@@ -2989,6 +3191,7 @@ impl WorkflowStore {
             definition_version,
             workspace_snapshot,
             parent_session_id,
+            parent_session_generation,
             input_json,
             deadline_at_ms,
             node_execution_cap,
@@ -3041,6 +3244,7 @@ impl WorkflowStore {
             && definition_version == run.definition_version
             && workspace_snapshot == run.workspace_snapshot
             && parent_session_id == run.parent_session_id
+            && parent_session_generation == run.parent_session_generation
             && existing_binding == run.binding
             && authored_provenance == run.authored_provenance
             && parse_workflow_capability(&authorization_ceiling)? == run.authorization_ceiling
@@ -5231,6 +5435,101 @@ impl WorkflowStore {
         Ok(result)
     }
 
+    /// Persist or recover one exact workflow activation/attempt execution-session link.
+    ///
+    /// Repeating the identical link is idempotent. Reusing the activation/attempt for another
+    /// session, or reusing one session for another activation/attempt, fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed/version-incompatible identities, missing canonical
+    /// activation/attempt state, conflicting links, or database failure.
+    pub fn link_execution_session(
+        &mut self,
+        link: &WorkflowExecutionSessionLink,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_execution_session_link(link)?;
+        let transaction = self.connection.transaction()?;
+        let existing = execution_session_link_by_activation(&transaction, link)?;
+        if let Some(existing) = existing {
+            if existing == *link {
+                transaction.commit()?;
+                return Ok(false);
+            }
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow execution-session link conflicts for {}/{}/{}/{}",
+                link.run_id, link.node_id, link.activation_id, link.attempt
+            )));
+        }
+        let conflicting_session = transaction
+            .query_row(
+                "SELECT run_id, node_id, activation_id, attempt FROM workflow_execution_sessions \
+                 WHERE session_id = ?1",
+                [&link.session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u32>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if conflicting_session.is_some() {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow execution session '{}' is already linked",
+                link.session_id
+            )));
+        }
+        let inserted = transaction.execute(
+            "INSERT INTO workflow_execution_sessions \
+             (version, run_id, node_id, activation_id, attempt, session_id, workspace_snapshot, created_at_ms) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+             WHERE EXISTS(SELECT 1 FROM workflow_attempts \
+                 WHERE run_id = ?2 AND node_id = ?3 AND activation_id = ?4 AND attempt = ?5)",
+            rusqlite::params![
+                link.version,
+                link.run_id,
+                link.node_id,
+                link.activation_id,
+                link.attempt,
+                link.session_id,
+                link.workspace_snapshot,
+                link.created_at_ms,
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow execution-session link requires an existing exact attempt".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Load one exact workflow activation/attempt execution-session link.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identities, damaged stored state, or query failure.
+    pub fn execution_session_link(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        attempt: u32,
+    ) -> Result<Option<WorkflowExecutionSessionLink>, WorkflowStoreError> {
+        validate_execution_session_link_identity(run_id, node_id, activation_id, attempt)?;
+        execution_session_link_by_activation_connection(
+            &self.connection,
+            run_id,
+            node_id,
+            activation_id,
+            attempt,
+        )
+    }
+
     /// Persist an external admission/service receipt after dispatch.
     ///
     /// # Errors
@@ -6853,7 +7152,7 @@ impl WorkflowStore {
         self.connection
             .query_row(
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
-                 parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
+                 parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
                  single_active, authored_provenance_json, terminal_output_id, \
                  terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
                  created_at_ms, updated_at_ms \
@@ -7094,7 +7393,7 @@ impl WorkflowStore {
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
-             parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
+             parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
              single_active, authored_provenance_json, terminal_output_id, \
              terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
              created_at_ms, updated_at_ms \
@@ -7127,7 +7426,7 @@ impl WorkflowStore {
         self.connection
             .query_row(
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
-                 parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
+                 parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
                  single_active, authored_provenance_json, terminal_output_id, \
                  terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
                  created_at_ms, updated_at_ms \
@@ -8836,6 +9135,7 @@ type RawRunSummary = (
     u32,
     String,
     Option<String>,
+    Option<u64>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -8878,6 +9178,7 @@ fn run_summary_from_row_offset(
         row.get(offset + 15)?,
         row.get(offset + 16)?,
         row.get(offset + 17)?,
+        row.get(offset + 18)?,
     ))
 }
 
@@ -8888,6 +9189,7 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         definition_version,
         workspace_snapshot,
         parent_session_id,
+        parent_session_generation,
         owner_plugin_id,
         workflow_kind,
         scope_key,
@@ -8942,6 +9244,7 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         definition_version,
         workspace_snapshot,
         parent_session_id,
+        parent_session_generation,
         binding,
         authored_provenance,
         terminal_output_id,
@@ -9628,17 +9931,18 @@ fn create_run_in_transaction(
     transaction.execute(
         "INSERT INTO workflow_runs \
              (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
-              owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
+              parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
               authored_provenance_json, input_json, authorization_ceiling, status, deadline_at_ms, \
               node_execution_cap, concurrency_cap, cycle_cap, retry_cap, created_at_ms, updated_at_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                     ?17, ?18, ?19, ?20, ?20)",
+                     ?17, ?18, ?19, ?20, ?21, ?21)",
         rusqlite::params![
             &run.run_id,
             &run.definition_id,
             run.definition_version,
             &run.workspace_snapshot,
             &run.parent_session_id,
+            run.parent_session_generation,
             owner_plugin_id,
             workflow_kind,
             scope_key,
@@ -9896,6 +10200,11 @@ fn validate_run(run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
     if let Some(parent_session_id) = &run.parent_session_id {
         validate_id("parent_session_id", parent_session_id)?;
     }
+    if run.parent_session_generation.is_some() && run.parent_session_id.is_none() {
+        return Err(WorkflowStoreError::InvalidData(
+            "parent session generation requires parent_session_id".to_string(),
+        ));
+    }
     if let Some(binding) = &run.binding {
         validate_binding(binding)?;
     }
@@ -10064,6 +10373,106 @@ fn validate_prepared_attempt(attempt: &PreparedAttempt) -> Result<(), WorkflowSt
         ));
     }
     Ok(())
+}
+
+fn validate_execution_session_link_identity(
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+    attempt: u32,
+) -> Result<(), WorkflowStoreError> {
+    validate_id("run_id", run_id)?;
+    validate_id("node_id", node_id)?;
+    validate_id("activation_id", activation_id)?;
+    if attempt == 0 {
+        return Err(WorkflowStoreError::InvalidData(
+            "execution-session link attempt must be positive".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_execution_session_link(
+    link: &WorkflowExecutionSessionLink,
+) -> Result<(), WorkflowStoreError> {
+    if link.version != WORKFLOW_EXECUTION_SESSION_LINK_VERSION {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "unsupported workflow execution-session link version {}; expected {WORKFLOW_EXECUTION_SESSION_LINK_VERSION}",
+            link.version
+        )));
+    }
+    validate_execution_session_link_identity(
+        &link.run_id,
+        &link.node_id,
+        &link.activation_id,
+        link.attempt,
+    )?;
+    validate_id("session_id", &link.session_id)?;
+    validate_id("workspace_snapshot", &link.workspace_snapshot)
+}
+
+fn decode_execution_session_link(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkflowExecutionSessionLink> {
+    Ok(WorkflowExecutionSessionLink {
+        version: row.get(0)?,
+        run_id: row.get(1)?,
+        node_id: row.get(2)?,
+        activation_id: row.get(3)?,
+        attempt: row.get(4)?,
+        session_id: row.get(5)?,
+        workspace_snapshot: row.get(6)?,
+        created_at_ms: row.get(7)?,
+    })
+}
+
+fn execution_session_link_by_activation_connection(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+    attempt: u32,
+) -> Result<Option<WorkflowExecutionSessionLink>, WorkflowStoreError> {
+    let link = connection
+        .query_row(
+            "SELECT version, run_id, node_id, activation_id, attempt, session_id, \
+             workspace_snapshot, created_at_ms FROM workflow_execution_sessions \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND attempt = ?4",
+            (run_id, node_id, activation_id, attempt),
+            decode_execution_session_link,
+        )
+        .optional()?;
+    link.map(|link| {
+        validate_execution_session_link(&link)?;
+        Ok(link)
+    })
+    .transpose()
+}
+
+fn execution_session_link_by_activation(
+    transaction: &Transaction<'_>,
+    link: &WorkflowExecutionSessionLink,
+) -> Result<Option<WorkflowExecutionSessionLink>, WorkflowStoreError> {
+    let stored = transaction
+        .query_row(
+            "SELECT version, run_id, node_id, activation_id, attempt, session_id, \
+             workspace_snapshot, created_at_ms FROM workflow_execution_sessions \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND attempt = ?4",
+            (
+                &link.run_id,
+                &link.node_id,
+                &link.activation_id,
+                link.attempt,
+            ),
+            decode_execution_session_link,
+        )
+        .optional()?;
+    stored
+        .map(|stored| {
+            validate_execution_session_link(&stored)?;
+            Ok(stored)
+        })
+        .transpose()
 }
 
 fn validate_dispatch_receipt(receipt: &DispatchReceipt) -> Result<(), WorkflowStoreError> {
@@ -10511,6 +10920,7 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              definition_version INTEGER NOT NULL,\
              workspace_snapshot TEXT NOT NULL,\
              parent_session_id TEXT,\
+             parent_session_generation INTEGER,\
              owner_plugin_id TEXT,\
              workflow_kind TEXT,\
              scope_key TEXT,\
@@ -10581,6 +10991,21 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              FOREIGN KEY (run_id, node_id, activation_id)\
                  REFERENCES workflow_activations(run_id, node_id, activation_id)\
          );\
+         CREATE TABLE IF NOT EXISTS workflow_execution_sessions (\
+             version INTEGER NOT NULL CHECK (version > 0),\
+             run_id TEXT NOT NULL,\
+             node_id TEXT NOT NULL,\
+             activation_id TEXT NOT NULL,\
+             attempt INTEGER NOT NULL CHECK (attempt > 0),\
+             session_id TEXT NOT NULL UNIQUE,\
+             workspace_snapshot TEXT NOT NULL,\
+             created_at_ms INTEGER NOT NULL,\
+             PRIMARY KEY (run_id, node_id, activation_id, attempt),\
+             FOREIGN KEY (run_id, node_id, activation_id, attempt)\
+                 REFERENCES workflow_attempts(run_id, node_id, activation_id, attempt)\
+         );\
+         CREATE INDEX IF NOT EXISTS idx_workflow_execution_sessions_run \
+             ON workflow_execution_sessions(run_id, created_at_ms, session_id);\
          CREATE TABLE IF NOT EXISTS workflow_retry_schedules (\
              run_id TEXT NOT NULL,\
              node_id TEXT NOT NULL,\
@@ -10894,6 +11319,46 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
          WHERE contract_id = 1 AND schema_version = 8",
         [],
     )?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workflow_execution_sessions (\
+             version INTEGER NOT NULL CHECK (version > 0),\
+             run_id TEXT NOT NULL,\
+             node_id TEXT NOT NULL,\
+             activation_id TEXT NOT NULL,\
+             attempt INTEGER NOT NULL CHECK (attempt > 0),\
+             session_id TEXT NOT NULL UNIQUE,\
+             workspace_snapshot TEXT NOT NULL,\
+             created_at_ms INTEGER NOT NULL,\
+             PRIMARY KEY (run_id, node_id, activation_id, attempt),\
+             FOREIGN KEY (run_id, node_id, activation_id, attempt)\
+                 REFERENCES workflow_attempts(run_id, node_id, activation_id, attempt)\
+         );\
+         CREATE INDEX IF NOT EXISTS idx_workflow_execution_sessions_run \
+             ON workflow_execution_sessions(run_id, created_at_ms, session_id);",
+    )?;
+    transaction.execute(
+        "UPDATE workflow_store_contract SET schema_version = 10 \
+         WHERE contract_id = 1 AND schema_version = 9",
+        [],
+    )?;
+    let run_columns = transaction
+        .prepare("PRAGMA table_info(workflow_runs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !run_columns
+        .iter()
+        .any(|existing| existing == "parent_session_generation")
+    {
+        transaction.execute(
+            "ALTER TABLE workflow_runs ADD COLUMN parent_session_generation INTEGER",
+            [],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE workflow_store_contract SET schema_version = 11 \
+         WHERE contract_id = 1 AND schema_version = 10",
+        [],
+    )?;
     let actual: u32 = transaction.query_row(
         "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
         [],
@@ -10933,6 +11398,101 @@ mod tests {
     use super::*;
     use bcode_workflow::{Step, WorkflowBuilder};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn package_apply_is_atomic_and_generation_guarded() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let (workflow, draft, catalog) = authored_store_fixture();
+        let mut second_document = draft.document.clone();
+        second_document.workflow_id = "authored/second".to_string();
+        second_document.metadata.title = "Second".to_string();
+        second_document.definition.name = "second".to_string();
+        let member = |member_id: &str, document: WorkflowAuthoringDocument| {
+            let identity = WorkflowDefinitionIdentity::for_definition(
+                document.workflow_id.clone(),
+                &document.definition,
+            )
+            .expect("identity");
+            bcode_workflow::WorkflowPackagePlannedMember {
+                member_id: member_id.to_string(),
+                lowering: bcode_workflow::WorkflowSourceLoweringResult {
+                    version: bcode_workflow::WORKFLOW_SOURCE_LOWERING_VERSION,
+                    profile: bcode_workflow::WorkflowSourceProfile::Canonical,
+                    validation: document.validation_report(),
+                    document,
+                    source_map: bcode_workflow::WorkflowSourceMap {
+                        version: bcode_workflow::WORKFLOW_SOURCE_MAP_VERSION,
+                        entries: Vec::new(),
+                    },
+                },
+                definition_identity: identity,
+                dependency_closure: Vec::new(),
+            }
+        };
+        let members = vec![
+            member("first", draft.document),
+            member("second", second_document),
+        ];
+        let mut locked = members
+            .iter()
+            .map(|member| bcode_workflow::WorkflowPackageLockedMember {
+                member_id: member.member_id.clone(),
+                source_digest_sha256: "a".repeat(64),
+                executable_digest_sha256: "b".repeat(64),
+                definition_identity: member.definition_identity.clone(),
+                published_revision: None,
+                dependency_closure: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        locked.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+        let request = WorkflowPackageApplyRequest {
+            version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+            plan: bcode_workflow::WorkflowPackagePlan {
+                version: bcode_workflow::WORKFLOW_PACKAGE_PLAN_VERSION,
+                package_id: "example/package".to_string(),
+                members,
+                lock: bcode_workflow::WorkflowPackageLock {
+                    version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
+                    package_id: "example/package".to_string(),
+                    package_source_digest_sha256: "c".repeat(64),
+                    members: locked,
+                },
+            },
+            expected_generations: Vec::new(),
+        };
+        let applied = store.apply_workflow_package(&request, 10).expect("apply");
+        assert_eq!(applied.members.len(), 2);
+        assert_eq!(
+            store
+                .workflow_draft(&workflow.workflow_id, "package")
+                .expect("first draft")
+                .expect("first")
+                .generation,
+            1
+        );
+        let mut conflicting = request.clone();
+        conflicting.expected_generations = vec![
+            bcode_workflow::WorkflowPackageExpectedGeneration {
+                member_id: "first".to_string(),
+                expected_generation: 1,
+            },
+            bcode_workflow::WorkflowPackageExpectedGeneration {
+                member_id: "second".to_string(),
+                expected_generation: 99,
+            },
+        ];
+        assert!(store.apply_workflow_package(&conflicting, 11).is_err());
+        assert_eq!(
+            store
+                .workflow_draft(&workflow.workflow_id, "package")
+                .expect("first draft")
+                .expect("first")
+                .generation,
+            1
+        );
+        assert!(catalog.version > 0);
+    }
 
     #[allow(clippy::too_many_lines)]
     fn authored_store_fixture() -> (
@@ -11333,6 +11893,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(input),
@@ -11427,6 +11988,7 @@ mod tests {
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: None,
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(input),
@@ -11529,6 +12091,7 @@ mod tests {
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: None,
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(input),
@@ -11577,6 +12140,7 @@ mod tests {
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: None,
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(input.clone()),
@@ -11632,6 +12196,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(input.clone()),
@@ -11674,6 +12239,7 @@ mod tests {
             definition_version: 1,
             workspace_snapshot: "snapshot-1".to_string(),
             parent_session_id: Some("session-1".to_string()),
+            parent_session_generation: None,
             binding: None,
             authored_provenance: None,
             input: Some(serde_json::json!(1)),
@@ -12388,6 +12954,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
@@ -12475,6 +13042,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
@@ -12561,6 +13129,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
@@ -12638,6 +13207,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
@@ -12728,6 +13298,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
@@ -12855,6 +13426,135 @@ mod tests {
             store
                 .retry_failed_node("run-1", "review", &activation_id(), 1, 23)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn damaged_execution_session_link_fails_closed_on_read() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = initialized_store_at(temp.path());
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("prepared");
+        let link = WorkflowExecutionSessionLink::new(
+            "run-1".to_string(),
+            "review".to_string(),
+            activation_id(),
+            prepared.attempt,
+            "session-1".to_string(),
+            "snapshot-1".to_string(),
+            13,
+        );
+        store.link_execution_session(&link).expect("link");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_execution_sessions SET workspace_snapshot = '' \
+                 WHERE session_id = 'session-1'",
+                [],
+            )
+            .expect("damage link");
+        assert!(
+            store
+                .execution_session_link("run-1", "review", &activation_id(), 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn execution_session_link_survives_retry_and_cancellation_terminalization() {
+        struct FailedObserver;
+        impl AttemptStatusObserver for FailedObserver {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Failed {
+                    message: "retryable".to_string(),
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = initialized_store_at(temp.path());
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("prepared");
+        let link = WorkflowExecutionSessionLink::new(
+            "run-1".to_string(),
+            "review".to_string(),
+            activation_id(),
+            prepared.attempt,
+            "session-1".to_string(),
+            "snapshot-1".to_string(),
+            13,
+        );
+        store.link_execution_session(&link).expect("link");
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: link.run_id.clone(),
+                node_id: link.node_id.clone(),
+                activation_id: link.activation_id.clone(),
+                attempt: link.attempt,
+                dispatch_identity: prepared.dispatch_identity,
+                receipt: serde_json::json!({"turn_id": "turn-1"}),
+                admitted_at_ms: 14,
+            })
+            .expect("receipt");
+        store
+            .reconcile_receipt_backed_attempts(&FailedObserver, 10, 20)
+            .expect("failed reconciliation");
+        store
+            .retry_failed_node("run-1", "review", &activation_id(), 1, 21)
+            .expect("retry");
+        let second = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                22,
+            )
+            .expect("prepare")
+            .expect("second attempt");
+        assert_eq!(second.attempt, 2);
+        assert_eq!(
+            store
+                .execution_session_link("run-1", "review", &activation_id(), 1)
+                .expect("original link"),
+            Some(link)
+        );
+        assert!(
+            store
+                .execution_session_link("run-1", "review", &activation_id(), 2)
+                .expect("new attempt link")
+                .is_none()
+        );
+        assert!(store.request_cancellation("run-1", 23).expect("cancel"));
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            reopened
+                .execution_session_link("run-1", "review", &activation_id(), 1)
+                .expect("link after restart")
+                .is_some()
         );
     }
 
@@ -13337,6 +14037,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -13389,6 +14090,7 @@ mod tests {
                 definition_version: target_identity.definition_version,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -13530,6 +14232,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -13591,6 +14294,7 @@ mod tests {
                     definition_version: 1,
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: None,
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
@@ -13634,6 +14338,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -13686,6 +14391,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "wrong".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -13736,6 +14442,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -13806,6 +14513,7 @@ mod tests {
                 definition_version: parent_identity.definition_version,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -14779,6 +15487,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(3)),
@@ -15262,6 +15971,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -15462,6 +16172,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -15674,6 +16385,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -15887,6 +16599,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -15990,6 +16703,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
@@ -16272,6 +16986,7 @@ mod tests {
                     definition_version: 1,
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: None,
+                    parent_session_generation: None,
                     binding: None,
                     authored_provenance: None,
                     input: Some(value.clone()),
@@ -16848,6 +17563,159 @@ mod tests {
                 .resource_leases_for_run("run-1", 10)
                 .expect("leases")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn execution_session_links_are_exact_idempotent_and_conflict_safe() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let workflow = WorkflowBuilder::new(
+            "execution-link",
+            Step::task("review", |value: u32, _context| async move { Ok(value) }),
+        )
+        .build()
+        .expect("workflow");
+        store
+            .persist_definition("execution-link", 1, workflow.definition())
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "execution-link-run".to_string(),
+                definition_id: "execution-link".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot-1".to_string(),
+                parent_session_id: Some("parent-session".to_string()),
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits::default(),
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Disabled,
+            })
+            .expect("run");
+        let pending = store
+            .pending_activations(1)
+            .expect("pending")
+            .pop()
+            .expect("activation");
+        let prepared = store
+            .prepare_pending_activation(
+                &pending.run_id,
+                &pending.node_id,
+                &pending.activation_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"owner": "test"}),
+                2,
+            )
+            .expect("prepare")
+            .expect("prepared");
+        let link = WorkflowExecutionSessionLink::new(
+            pending.run_id.clone(),
+            pending.node_id.clone(),
+            pending.activation_id.clone(),
+            prepared.attempt,
+            "session-1".to_string(),
+            "snapshot-1".to_string(),
+            3,
+        );
+        assert!(store.link_execution_session(&link).expect("first link"));
+        assert!(
+            !store
+                .link_execution_session(&link)
+                .expect("idempotent link")
+        );
+        assert_eq!(
+            store
+                .execution_session_link(
+                    &link.run_id,
+                    &link.node_id,
+                    &link.activation_id,
+                    link.attempt,
+                )
+                .expect("load link"),
+            Some(link.clone())
+        );
+        let mut conflict = link.clone();
+        conflict.session_id = "session-2".to_string();
+        assert!(store.link_execution_session(&conflict).is_err());
+        let mut future = link.clone();
+        future.version = WORKFLOW_EXECUTION_SESSION_LINK_VERSION + 1;
+        assert!(store.link_execution_session(&future).is_err());
+        let missing = WorkflowExecutionSessionLink::new(
+            link.run_id,
+            link.node_id,
+            link.activation_id,
+            2,
+            "session-3".to_string(),
+            link.workspace_snapshot,
+            4,
+        );
+        assert!(store.link_execution_session(&missing).is_err());
+    }
+
+    #[test]
+    fn schema_nine_migrates_execution_links_and_parent_generation_to_current() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workflows = temp.path().join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows directory");
+        let path = workflows.join(DATABASE_FILE);
+        let connection = Connection::open(&path).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE workflow_store_contract (\
+                     contract_id INTEGER PRIMARY KEY CHECK (contract_id = 1),\
+                     schema_version INTEGER NOT NULL\
+                 );\
+                 INSERT INTO workflow_store_contract (contract_id, schema_version) VALUES (1, 9);\
+                 CREATE TABLE workflow_runs (\
+                     run_id TEXT PRIMARY KEY NOT NULL,\
+                     updated_at_ms INTEGER NOT NULL\
+                 );\
+                 CREATE TABLE workflow_attempts (\
+                     run_id TEXT NOT NULL,\
+                     node_id TEXT NOT NULL,\
+                     activation_id TEXT NOT NULL,\
+                     attempt INTEGER NOT NULL,\
+                     PRIMARY KEY (run_id, node_id, activation_id, attempt)\
+                 );",
+            )
+            .expect("legacy contract");
+        drop(connection);
+
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("migrated store");
+        let version = store
+            .connection
+            .query_row(
+                "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .expect("schema version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let execution_table: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name = 'workflow_execution_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("execution table");
+        assert_eq!(execution_table, 1);
+        let run_columns = store
+            .connection
+            .prepare("PRAGMA table_info(workflow_runs)")
+            .expect("run columns")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("run columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("run columns");
+        assert!(
+            run_columns
+                .iter()
+                .any(|column| column == "parent_session_generation")
         );
     }
 

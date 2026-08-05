@@ -58,14 +58,14 @@ pub use attachment::{
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_session_models::{
-    ClientId, ExecutionSessionContextMode, ExecutionSessionProvenance, ProjectionWindow,
-    ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
-    SessionForkKind, SessionHistoryAroundQuery, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionHistoryWindow, SessionId, SessionImportSummary,
-    SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery, SessionLiveEvent,
-    SessionLiveEventKind, SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
-    SessionOpenOperationSnapshot, SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource,
-    SessionVisibility,
+    ClientId, EXECUTION_SESSION_PROVENANCE_VERSION, ExecutionSessionContextMode,
+    ExecutionSessionProvenance, ProjectionWindow, ProjectionWindowRequest, SessionEvent,
+    SessionEventKind, SessionEventProvenance, SessionForkKind, SessionHistoryAroundQuery,
+    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
+    SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionInspectionPage,
+    SessionInspectionQuery, SessionLiveEvent, SessionLiveEventKind, SessionMigrationProgress,
+    SessionMigrationStage, SessionOpenOperationId, SessionOpenOperationSnapshot,
+    SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource, SessionVisibility,
 };
 pub use catalog::{
     CatalogLoadStatus, SessionCatalogEntry, SessionCatalogLoadStatus, SessionHealth,
@@ -314,6 +314,12 @@ fn validate_execution_session_provenance(
     let Some(provenance) = provenance else {
         return Ok(());
     };
+    if provenance.version != EXECUTION_SESSION_PROVENANCE_VERSION {
+        return Err(SessionError::InvalidExecutionSessionProvenance(format!(
+            "unsupported provenance version {}; expected {EXECUTION_SESSION_PROVENANCE_VERSION}",
+            provenance.version
+        )));
+    }
     for (label, value) in [
         ("owner", provenance.owner.as_str()),
         ("run_id", provenance.run_id.as_str()),
@@ -324,6 +330,19 @@ fn validate_execution_session_provenance(
                 "{label} must contain 1..={MAX_EXECUTION_PROVENANCE_ID_BYTES} bytes"
             )));
         }
+    }
+    if let Some(activation_id) = provenance.activation_id.as_deref()
+        && (activation_id.trim().is_empty()
+            || activation_id.len() > MAX_EXECUTION_PROVENANCE_ID_BYTES)
+    {
+        return Err(SessionError::InvalidExecutionSessionProvenance(format!(
+            "activation_id must contain 1..={MAX_EXECUTION_PROVENANCE_ID_BYTES} bytes"
+        )));
+    }
+    if provenance.owner == "bcode.workflow" && provenance.activation_id.is_none() {
+        return Err(SessionError::InvalidExecutionSessionProvenance(
+            "workflow execution sessions require activation_id".to_string(),
+        ));
     }
     if provenance.attempt == 0 {
         return Err(SessionError::InvalidExecutionSessionProvenance(
@@ -1564,6 +1583,74 @@ impl SessionManager {
             .await
     }
 
+    /// Clone a background execution session from one previously admitted exact parent generation.
+    ///
+    /// Unlike [`Self::create_fixed_generation_execution_session`], later parent events do not
+    /// invalidate this operation. The clone includes only events through `parent_generation`, so
+    /// workflow-owned status events appended after start admission cannot contaminate the child.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pinned generation is unknown/future, provenance is invalid, the
+    /// requested directory is inconsistent, or persistence fails.
+    pub async fn create_pinned_generation_execution_session(
+        &self,
+        name: Option<String>,
+        mut provenance: ExecutionSessionProvenance,
+        parent_generation: u64,
+        working_directory: Option<PathBuf>,
+    ) -> Result<SessionSummary, SessionError> {
+        provenance.context_mode = ExecutionSessionContextMode::FixedGenerationFork;
+        provenance.parent_generation = Some(parent_generation);
+        let parent = self.session_summary(provenance.parent_session_id).await?;
+        let working_directory = match working_directory {
+            None => parent.working_directory.clone(),
+            Some(working_directory)
+                if normalize_working_directory(&working_directory)
+                    == normalize_working_directory(&parent.working_directory) =>
+            {
+                parent.working_directory.clone()
+            }
+            Some(_) => {
+                return Err(SessionError::InvalidExecutionSessionProvenance(
+                    "fixed-generation execution session must inherit its parent's working directory"
+                        .to_string(),
+                ));
+            }
+        };
+        let mut events = self.session_history(provenance.parent_session_id).await?;
+        let current = events.last().map_or(0, |event| event.sequence);
+        if parent_generation > current
+            || (parent_generation > 0
+                && !events
+                    .iter()
+                    .any(|event| event.sequence == parent_generation))
+        {
+            return Err(SessionError::CloneGenerationChanged {
+                session_id: provenance.parent_session_id,
+                expected: parent_generation,
+                current,
+            });
+        }
+        events.retain(|event| event.sequence <= parent_generation);
+        let marker = SessionEventKind::SessionForked {
+            source_session_id: provenance.parent_session_id,
+            source_title: Some(parent.display_title().to_string()),
+            source_cutoff_sequence: events.last().map(|event| event.sequence),
+            source_prompt_sequence: None,
+            forked_at_ms: self.next_activity_timestamp_ms(),
+            kind: SessionForkKind::Clone,
+        };
+        self.copy_session_events_with_execution(
+            name,
+            working_directory,
+            events,
+            marker,
+            Some(provenance),
+        )
+        .await
+    }
+
     /// Clone a fixed-generation execution session into an explicitly declared worktree.
     ///
     /// # Errors
@@ -2005,6 +2092,31 @@ impl SessionManager {
         }
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         Ok(db.all_events().await?)
+    }
+
+    /// Return the current canonical session generation using a bounded one-event tail read.
+    ///
+    /// Empty sessions have generation `0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist or an error when the
+    /// canonical tail cannot be read boundedly.
+    pub async fn current_session_generation(
+        &self,
+        session_id: SessionId,
+    ) -> Result<u64, SessionError> {
+        let page = self
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit: 1,
+                    direction: SessionHistoryDirection::Backward,
+                },
+            )
+            .await?;
+        Ok(page.events.first().map_or(0, |event| event.sequence))
     }
 
     /// Return a bounded page of replayable history for a session.
@@ -9191,9 +9303,11 @@ mod tests {
             .await
             .expect("parent");
         let provenance = ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
             owner: "workflow".to_string(),
             run_id: "run-1".to_string(),
             node_id: "review-a".to_string(),
+            activation_id: None,
             attempt: 1,
             parent_session_id: parent.id,
             workspace_snapshot: Some("snapshot-1".to_string()),
@@ -9265,9 +9379,11 @@ mod tests {
             .expect("event")
             .sequence;
         let create = |node_id: &str| ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
             owner: "workflow".to_string(),
             run_id: "run-1".to_string(),
             node_id: node_id.to_string(),
+            activation_id: None,
             attempt: 1,
             parent_session_id: parent.id,
             workspace_snapshot: Some("snapshot-1".to_string()),
@@ -9362,9 +9478,11 @@ mod tests {
             .create_fresh_execution_session(
                 Some("invalid".to_string()),
                 ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
                     owner: "workflow".to_string(),
                     run_id: "run-1".to_string(),
                     node_id: "review".to_string(),
+                    activation_id: None,
                     attempt: 1,
                     parent_session_id: parent.id,
                     workspace_snapshot: Some("snapshot-1".to_string()),
@@ -9392,9 +9510,11 @@ mod tests {
             .expect("parent");
         let worktree = test_working_directory();
         let provenance = ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
             owner: "workflow".to_string(),
             run_id: "run-1".to_string(),
             node_id: "review".to_string(),
+            activation_id: None,
             attempt: 1,
             parent_session_id: parent.id,
             workspace_snapshot: Some("snapshot-1".to_string()),
@@ -9413,6 +9533,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_session_rejects_unknown_future_provenance_version() {
+        let manager = SessionManager::default();
+        let parent = manager
+            .create_session(Some("parent".to_string()), test_working_directory())
+            .await
+            .expect("parent");
+        let error = manager
+            .create_fresh_execution_session(
+                Some("future".to_string()),
+                ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION + 1,
+                    owner: "workflow".to_string(),
+                    run_id: "run-1".to_string(),
+                    node_id: "review".to_string(),
+                    activation_id: Some("activation-1".to_string()),
+                    attempt: 1,
+                    parent_session_id: parent.id,
+                    workspace_snapshot: Some("snapshot-1".to_string()),
+                    context_mode: ExecutionSessionContextMode::FreshIsolated,
+                    parent_generation: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("future provenance rejected");
+        assert!(matches!(
+            error,
+            SessionError::InvalidExecutionSessionProvenance(reason)
+                if reason.contains("unsupported provenance version")
+        ));
+    }
+
+    #[tokio::test]
     async fn execution_session_rejects_missing_snapshot_identity() {
         let manager = SessionManager::default();
         let parent = manager
@@ -9423,9 +9576,11 @@ mod tests {
             .create_fresh_execution_session(
                 Some("invalid".to_string()),
                 ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
                     owner: "workflow".to_string(),
                     run_id: "run-1".to_string(),
                     node_id: "review".to_string(),
+                    activation_id: None,
                     attempt: 1,
                     parent_session_id: parent.id,
                     workspace_snapshot: None,
@@ -9457,9 +9612,11 @@ mod tests {
                 .create_fresh_execution_session(
                     Some("review".to_string()),
                     ExecutionSessionProvenance {
+                        version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
                         owner: "workflow".to_string(),
                         run_id: "run-1".to_string(),
                         node_id: "review".to_string(),
+                        activation_id: None,
                         attempt: 1,
                         parent_session_id: parent.id,
                         workspace_snapshot: Some("snapshot-1".to_string()),
@@ -9516,9 +9673,11 @@ mod tests {
             .expect("event")
             .sequence;
         let provenance = ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
             owner: "workflow".to_string(),
             run_id: "run-1".to_string(),
             node_id: "review-a".to_string(),
+            activation_id: None,
             attempt: 1,
             parent_session_id: parent.id,
             workspace_snapshot: Some("snapshot-1".to_string()),
@@ -9577,6 +9736,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_generation_execution_excludes_later_parent_events() {
+        let manager = SessionManager::default();
+        let parent = manager
+            .create_session(Some("parent".to_string()), test_working_directory())
+            .await
+            .expect("parent");
+        manager
+            .append_event(
+                parent.id,
+                SessionEventKind::SystemMessage {
+                    text: "pinned".to_string(),
+                },
+            )
+            .await
+            .expect("pinned event");
+        let generation = manager
+            .current_session_generation(parent.id)
+            .await
+            .expect("generation");
+        manager
+            .append_event(
+                parent.id,
+                SessionEventKind::SystemMessage {
+                    text: "later".to_string(),
+                },
+            )
+            .await
+            .expect("later event");
+        let child = manager
+            .create_pinned_generation_execution_session(
+                Some("child".to_string()),
+                ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+                    owner: "workflow".to_string(),
+                    run_id: "run-1".to_string(),
+                    node_id: "review".to_string(),
+                    activation_id: Some("activation-1".to_string()),
+                    attempt: 1,
+                    parent_session_id: parent.id,
+                    workspace_snapshot: Some("snapshot-1".to_string()),
+                    context_mode: ExecutionSessionContextMode::FixedGenerationFork,
+                    parent_generation: Some(generation),
+                },
+                generation,
+                None,
+            )
+            .await
+            .expect("pinned child");
+        let history = manager.session_history(child.id).await.expect("history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::SystemMessage { text } if text == "pinned"
+        )));
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::SystemMessage { text } if text == "later"
+        )));
+    }
+
+    #[tokio::test]
     async fn shared_execution_admission_serializes_one_parent() {
         let manager = SessionManager::default();
         let parent = manager
@@ -9584,9 +9803,11 @@ mod tests {
             .await
             .expect("parent");
         let provenance = ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
             owner: "workflow".to_string(),
             run_id: "run-1".to_string(),
             node_id: "sequential".to_string(),
+            activation_id: None,
             attempt: 1,
             parent_session_id: parent.id,
             workspace_snapshot: Some("snapshot-1".to_string()),
@@ -9618,9 +9839,11 @@ mod tests {
     fn shared_execution_requires_declared_parent_and_no_child() {
         let parent = SessionId::new();
         let provenance = ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
             owner: "workflow".to_string(),
             run_id: "run-1".to_string(),
             node_id: "sequential".to_string(),
+            activation_id: None,
             attempt: 1,
             parent_session_id: parent,
             workspace_snapshot: Some("snapshot-1".to_string()),

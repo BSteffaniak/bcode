@@ -489,6 +489,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
                     run_id: None,
                     parent_session_id,
                     workspace_snapshot,
+                    parent_session_generation: None,
                     configuration,
                 })
                 .await

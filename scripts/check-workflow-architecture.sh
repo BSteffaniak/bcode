@@ -256,6 +256,15 @@ if rg -n 'shell|command-plan|exit_code' packages/workflow/src/lib.rs \
 fi
 rm -f /tmp/bcode-workflow-selector-violations
 
+if ! rg -q 'WORKFLOW_SOURCE_V1_DOCUMENT_VERSION' packages/workflow/src/lib.rs \
+  || ! rg -q 'pub struct WorkflowStructuredSourceDocument' packages/workflow/src/lib.rs \
+  || ! rg -q 'WorkflowSourceProfile::Structured' packages/workflow/src/lib.rs \
+  || ! rg -q 'structured_source_v2_lowers_deterministically_and_preserves_v1' packages/workflow/src/lib.rs \
+  || ! rg -q 'Structured profile v2' docs/source-defined-workflows.md; then
+  echo "Workflow source-v2 violation: explicit v2 selection, v1 compatibility, lowering, or documentation drifted." >&2
+  violations=1
+fi
+
 if ! rg -q 'pub enum WorkflowSourceFormat' packages/workflow/src/lib.rs \
   || ! rg -q 'pub fn decode_workflow_authoring_source' packages/workflow/src/lib.rs \
   || ! rg -q 'checked_in_workflow_sources_have_identical_compiled_semantics' packages/workflow/src/lib.rs \
@@ -265,6 +274,54 @@ if ! rg -q 'pub enum WorkflowSourceFormat' packages/workflow/src/lib.rs \
   || ! rg -q 'name = "workflow-ui"' plugins/workflow-plugin/src/cli.rs \
   || rg -q 'std::fs|tokio::fs|bcode_workflow_store|rusqlite' packages/workflow/src/lib.rs; then
   echo "Workflow source-format violation: one workflow-owned decoder must serve SDK and frontend adapters." >&2
+  violations=1
+fi
+
+if ! rg -q 'distinct_activations_of_one_node_recover_distinct_sessions' packages/server/src/lib.rs \
+  || ! rg -q 'execution_session_link_survives_retry_and_cancellation_terminalization' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'damaged_execution_session_link_fails_closed_on_read' packages/workflow-store/src/lib.rs; then
+  echo "Workflow execution-session recovery violation: activation, retry/restart, cancellation, and damage coverage drifted." >&2
+  violations=1
+fi
+
+if ! rg -q 'schema_nine_migrates_execution_links_and_parent_generation_to_current' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'execution_session_rejects_unknown_future_provenance_version' packages/session/src/lib.rs \
+  || ! rg -q 'pinned_generation_execution_excludes_later_parent_events' packages/session/src/lib.rs; then
+  echo "Workflow execution-session migration violation: version migration and future/pinned context coverage drifted." >&2
+  violations=1
+fi
+
+if ! rg -q 'shared_execution_admission_serializes_one_parent' packages/session/src/lib.rs \
+  || ! rg -q 'admit_shared_execution_session' packages/server/src/lib.rs \
+  || ! rg -q 'SharedParentSequential' packages/workflow/src/lib.rs; then
+  echo "Workflow shared-parent context violation: shared execution must remain parent-scoped and serialized." >&2
+  violations=1
+fi
+
+if ! rg -q 'background sessions' docs/workflow-persistence-architecture.md \
+  || ! rg -q 'list_sessions_with_background' packages/session/src/lib.rs \
+  || ! rg -q 'SessionVisibility::Background' packages/session/src/lib.rs; then
+  echo "Workflow execution-session lifecycle violation: background visibility and retention boundaries must remain explicit." >&2
+  violations=1
+fi
+
+if ! rg -q 'FixedGenerationFork' packages/workflow/src/lib.rs \
+  || ! rg -q 'parent_session_generation' packages/ipc/src/lib.rs packages/workflow-store/src/lib.rs \
+  || ! rg -q 'create_pinned_generation_execution_session' packages/session/src/lib.rs packages/server/src/lib.rs \
+  || ! rg -q 'fixed_generation_workflow_start_requires_and_pins_exact_parent_generation' packages/server/src/lib.rs; then
+  echo "Workflow fixed-generation context violation: exact start admission and pinned child context support drifted." >&2
+  violations=1
+fi
+
+if ! rg -q 'workflow_execution_sessions' docs/workflow-persistence-architecture.md \
+  || ! rg -q 'WORKFLOW_EXECUTION_SESSION_LINK_VERSION' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'workflow_execution_sessions' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'execution_session_link' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'EXECUTION_SESSION_PROVENANCE_VERSION' packages/session/models/src/lib.rs \
+  || ! rg -q 'activation_id: Option<String>' packages/session/models/src/lib.rs \
+  || ! rg -q 'workflow_child_session_for_activation' packages/server/src/lib.rs \
+  || rg -q 'workflow_child_session_for_attempt' packages/server/src/lib.rs; then
+  echo "Workflow execution-session identity violation: workflow sessions must be recovered by exact activation and attempt." >&2
   violations=1
 fi
 

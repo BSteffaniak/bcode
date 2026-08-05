@@ -2918,6 +2918,61 @@ impl BcodeClient {
         }
     }
 
+    /// Atomically apply one validated package plan through the daemon-owned workflow store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, optimistic generations conflict, or
+    /// the complete transaction cannot commit.
+    pub async fn apply_workflow_package(
+        &self,
+        request: bcode_ipc::ApplyWorkflowPackageRequest,
+    ) -> Result<bcode_workflow::WorkflowPackageMutationResult, ClientError> {
+        match self
+            .send_request(Request::ApplyWorkflowPackage(request))
+            .await?
+        {
+            ResponsePayload::WorkflowPackageApplied { result } => Ok(*result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Validate and plan one bounded workflow package through the daemon-owned catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or package planning fails.
+    pub async fn validate_workflow_package(
+        &self,
+        request: bcode_ipc::WorkflowPackageComputationRequest,
+    ) -> Result<bcode_ipc::WorkflowPackageValidationResult, ClientError> {
+        match self
+            .send_request(Request::ValidateWorkflowPackage(request))
+            .await?
+        {
+            ResponsePayload::WorkflowPackageValidated { result } => Ok(*result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Compile-preview one complete package plan through the daemon-owned catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or any package member cannot compile.
+    pub async fn preview_workflow_package(
+        &self,
+        request: bcode_ipc::WorkflowPackagePreviewRequest,
+    ) -> Result<bcode_workflow::WorkflowPackagePreview, ClientError> {
+        match self
+            .send_request(Request::PreviewWorkflowPackage(request))
+            .await?
+        {
+            ResponsePayload::WorkflowPackagePreviewed { preview } => Ok(*preview),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Validate and lower one raw source through the daemon-owned catalog.
     ///
     /// # Errors

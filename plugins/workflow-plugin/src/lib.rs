@@ -1141,6 +1141,7 @@ pub(crate) async fn execute_command(
                     run_id: None,
                     workspace_snapshot,
                     parent_session_id,
+                    parent_session_generation: None,
                     binding: None,
                     input,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),

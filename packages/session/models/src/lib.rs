@@ -637,15 +637,27 @@ pub enum ExecutionSessionContextMode {
     SharedSequential,
 }
 
+/// Current execution-session provenance contract version.
+pub const EXECUTION_SESSION_PROVENANCE_VERSION: u32 = 2;
+
 /// Generic durable provenance for a background execution session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionSessionProvenance {
+    /// Provenance contract version.
+    pub version: u32,
     /// Domain owner that created the execution session.
     pub owner: String,
     /// Stable owner-defined run identity.
     pub run_id: String,
     /// Stable owner-defined node/unit identity.
     pub node_id: String,
+    /// Exact owner-defined activation identity when the owner schedules repeatable units.
+    ///
+    /// This is optional for owners whose execution model has no activation concept. Workflow-owned
+    /// sessions always set it so distinct activations of one node cannot share a transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_id: Option<String>,
     /// Positive attempt number.
     pub attempt: u32,
     /// Interactive parent session.
@@ -3637,6 +3649,25 @@ mod tests {
         );
 
         assert_eq!(projected.context_tokens.tokens(), 70);
+    }
+
+    #[test]
+    fn execution_session_provenance_rejects_unknown_future_versions() {
+        let parent_session_id = SessionId::new();
+        let encoded = serde_json::json!({
+            "version": EXECUTION_SESSION_PROVENANCE_VERSION + 1,
+            "owner": "workflow",
+            "run_id": "run-1",
+            "node_id": "review",
+            "activation_id": "activation-1",
+            "attempt": 1,
+            "parent_session_id": parent_session_id,
+            "context_mode": "fresh_isolated",
+            "workspace_snapshot": "snapshot-1"
+        });
+        let provenance: ExecutionSessionProvenance =
+            serde_json::from_value(encoded).expect("portable future provenance");
+        assert_eq!(provenance.version, EXECUTION_SESSION_PROVENANCE_VERSION + 1);
     }
 
     #[test]

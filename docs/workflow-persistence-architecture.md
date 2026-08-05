@@ -23,6 +23,28 @@ session transcript databases remain independent and contain only compact generic
 user-facing status events where a real integration requires them; detailed workflow rows never belong
 in session history.
 
+Workflow agent recovery uses a versioned `workflow_execution_sessions` relation keyed by exact run,
+node, activation, and attempt identity. The relation stores only the opaque session ID, immutable
+workspace snapshot, and creation time; session content, visibility, retention, and history remain
+session-owned. Identical insertion is idempotent, while activation/session identity reuse or damaged
+cross-domain provenance fails closed. A bounded compatibility lookup may recover one unique
+session-provenance match and persist the missing relation, but ambiguity is surfaced rather than
+silently selected.
+
+Workflow execution sessions are durable background sessions: normal pickers exclude them, while
+direct inspection and explicitly background-inclusive bounded catalog APIs expose them. Their
+workflow-store links are retained with the owning run for restart and audit; ordinary run completion
+or cancellation does not delete session history or unlink provenance. Cleanup follows explicit
+session/run retention or deletion policy rather than renderer lifetime, daemon restart, or catalog
+visibility. Shared-parent agents create no child session and are serialized by a parent-session lock
+held through turn completion; fixed/fresh children remain activation-scoped.
+
+Runs containing `FixedGenerationFork` agents must pin one exact parent-session generation during
+start admission. The daemon verifies that generation before creating canonical run state, persists it
+on the run, and each activation clones only parent events through the pinned generation. Later
+workflow status or user events cannot enter that child context, while missing, future, stale-at-start,
+or cross-session generation facts fail closed.
+
 ## Runtime-authored workflow lifecycle
 
 The authoritative source/compile/run boundary is defined in

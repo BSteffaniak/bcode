@@ -412,6 +412,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
                         run_id,
                         parent_session_id,
                         workspace_snapshot,
+                        parent_session_generation: None,
                         configuration,
                     })
                     .await?,

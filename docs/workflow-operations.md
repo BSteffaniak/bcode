@@ -7,6 +7,9 @@ Normal workflow list, status, inspect, and history operations are read-only and 
 The workflow status surface exposes:
 
 * run and exact definition identity;
+* pinned parent-session generation when fixed-generation context is used;
+* activation-scoped background execution-session summaries, which remain hidden from ordinary
+  session pickers but directly inspectable;
 * activation node, generation, durable status, and next eligible action;
 * waiting input/approval records and exact pending mutation approvals;
 * attempts, dispatch identities, receipt presence, and terminal timestamps;
