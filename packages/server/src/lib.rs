@@ -5396,6 +5396,12 @@ async fn handle_workflow_validation_request(
     }
 }
 
+/// Dispatch requests not handled by an earlier domain dispatcher.
+///
+/// Every dispatcher hop in this chain is awaited through a boxed future. Clippy's
+/// `large_stack_frames` lint is per-function, but stack depth accumulates across hops, so a chain
+/// of individually-acceptable frames can still exhaust a default thread stack. Boxing each hop
+/// keeps the total bounded regardless of how many domains a request traverses.
 async fn handle_remaining_request(
     request: Request,
     request_id: u64,
@@ -5403,7 +5409,10 @@ async fn handle_remaining_request(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    handle_agent_permission_plugin_request(request, request_id, client_id, state, writer).await
+    Box::pin(handle_agent_permission_plugin_request(
+        request, request_id, client_id, state, writer,
+    ))
+    .await
 }
 
 async fn handle_agent_permission_plugin_request(
@@ -5440,8 +5449,10 @@ async fn handle_agent_permission_plugin_request(
         | Request::ResolvePermissionBatch { .. }
         | Request::ListPendingToolExchanges
         | Request::ResolveToolExchange { .. } => {
-            handle_permission_interaction_request(request, request_id, client_id, state, writer)
-                .await
+            Box::pin(handle_permission_interaction_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
         }
         Request::AddPermissionRule {
             agent_id,
