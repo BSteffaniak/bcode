@@ -114,16 +114,19 @@ if ! rg -q 'pub const WORKFLOW_SOURCE_DOCUMENT_VERSION: u32 = 3;' packages/workf
   violations=1
 fi
 
-if ! rg -q 'missing_mutation_verification' packages/workflow/src/lib.rs \
-  || ! rg -q 'WorkflowBlockEffect::ReadOnly' packages/workflow/src/lib.rs \
-  || ! rg -q 'workflow_prompt_catalog_omits_disabled_and_model_disabled_skills' packages/server/src/lib.rs \
+if ! rg -q 'workflow_prompt_catalog_omits_disabled_and_model_disabled_skills' packages/server/src/lib.rs \
   || ! rg -q 'workflow_prompt_planning_marks_mutating_turns_without_skill_requirements' packages/server/src/lib.rs \
   || ! rg -q 'startup_redispatch_reuses_execution_session_and_turn_admission' packages/server/src/lib.rs \
   || ! rg -q 'fixed_generation_workflow_start_requires_and_pins_exact_parent_generation' packages/server/src/lib.rs \
   || ! rg -q 'shared_parent_workflow_runs_each_agent_node_in_the_initiating_session' packages/server/src/lib.rs \
   || ! rg -q 'active_workflow_prompt_cancellation_reaches_turn_and_durable_attempt' packages/server/src/lib.rs \
   || ! rg -q 'workflow_prompt_completion_maps_provider_cancellation_and_schema_failures' packages/server/src/lib.rs; then
-  echo "Composable workflow prompt violation: deterministic post-mutation verification admission is missing." >&2
+  echo "Composable workflow prompt violation: generic durable prompt execution contracts are missing." >&2
+  violations=1
+fi
+
+if rg -q 'missing_mutation_verification|validate_mutating_prompt_verification' packages/workflow/src/lib.rs; then
+  echo "Composable workflow prompt violation: production admission prescribes post-mutation workflow topology." >&2
   violations=1
 fi
 

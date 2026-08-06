@@ -1593,6 +1593,14 @@ mod tests {
             definition.nodes["loop.implementation"].configuration["tools"].is_null(),
             "implementation keeps the current session's unrestricted tool policy"
         );
+        let admission = definition
+            .production_admission(&bcode_workflow::WorkflowProductionCapabilities::current())
+            .expect("valid loop definition");
+        assert!(
+            admission.is_supported(),
+            "loop definition must pass production admission: {:?}",
+            admission.diagnostics
+        );
         assert!(definition.edges.iter().any(|edge| matches!(
             edge.kind,
             bcode_workflow::EdgeKind::Back {

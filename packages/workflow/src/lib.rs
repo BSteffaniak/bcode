@@ -11360,7 +11360,6 @@ impl WorkflowDefinition {
                 }
             }
         }
-        validate_mutating_prompt_verification(self, &mut diagnostics);
         for edge in &self.edges {
             if let Some(transform) = &edge.transform {
                 if capabilities.transforms != WorkflowCapabilitySupport::Supported {
@@ -13203,57 +13202,6 @@ fn validate_production_edge_schema(
                 edge.from, edge.to, source.output.type_name, target.input.type_name
             ),
         });
-    }
-}
-
-fn validate_mutating_prompt_verification(
-    definition: &WorkflowDefinition,
-    diagnostics: &mut Vec<WorkflowCapabilityDiagnostic>,
-) {
-    for node in definition
-        .nodes
-        .values()
-        .filter(|node| node.kind == NodeKind::Agent)
-    {
-        let Ok(prompt) =
-            serde_json::from_value::<WorkflowPromptConfiguration>(node.configuration.clone())
-        else {
-            continue;
-        };
-        if prompt.read_only {
-            continue;
-        }
-        let successors = definition
-            .edges
-            .iter()
-            .filter(|edge| edge.from == node.id)
-            .filter_map(|edge| definition.node(&edge.to))
-            .collect::<Vec<_>>();
-        let valid_verifier = successors.len() == 1
-            && match successors[0].kind {
-                NodeKind::Task | NodeKind::Branch | NodeKind::WorkflowCall => true,
-                NodeKind::PluginBlock => serde_json::from_value::<WorkflowBlockDefinition>(
-                    successors[0].configuration.clone(),
-                )
-                .is_ok_and(|block| block.effect == WorkflowBlockEffect::ReadOnly),
-                NodeKind::Agent
-                | NodeKind::Repeat
-                | NodeKind::Retry
-                | NodeKind::Parallel
-                | NodeKind::FanOut
-                | NodeKind::Input
-                | NodeKind::Approval => false,
-            };
-        if !valid_verifier {
-            diagnostics.push(WorkflowCapabilityDiagnostic {
-                code: "missing_mutation_verification".to_string(),
-                node_id: Some(node.id.clone()),
-                message: format!(
-                    "mutating prompt node '{}' must have exactly one deterministic non-agent verifier successor",
-                    node.id
-                ),
-            });
-        }
     }
 }
 
@@ -20544,126 +20492,30 @@ steps:
         }
     }
 
-    fn verifier_node(id: &str, schema: &ValueSchema) -> NodeDefinition {
-        let block = WorkflowBlockDefinition {
-            block_id: "example.verify".to_string(),
-            block_version: 1,
-            plugin_id: "example.verifier".to_string(),
-            operation: "verify".to_string(),
-            input: schema.clone(),
-            output: schema.clone(),
-            effect: WorkflowBlockEffect::ReadOnly,
-            resources: Vec::new(),
-            authorization: WorkflowBlockAuthorization {
-                capability: WorkflowToolCapability::ReadOnly,
-                explicit_grant_required: false,
-            },
-            timeout_ms: 30_000,
-            cancellation_supported: true,
-            reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
-            automatic_retry: None,
-            preparation_required: false,
+    #[test]
+    fn production_admission_allows_mutating_prompts_without_prescribing_successors() {
+        let schema = ValueSchema {
+            type_name: "example.value/v1".to_string(),
+            schema: serde_json::json!({"type": "object", "additionalProperties": true}),
         };
-        NodeDefinition {
-            id: id.to_string(),
-            name: id.to_string(),
-            kind: NodeKind::PluginBlock,
-            dataflow: WorkflowNodeDataflowPolicy::Direct,
-            input: schema.clone(),
-            output: schema.clone(),
-            resources: Vec::new(),
-            configuration: serde_json::to_value(block).expect("verifier block"),
-        }
-    }
-
-    fn prompt_verification_definition(
-        prompt: NodeDefinition,
-        verifier: Option<NodeDefinition>,
-    ) -> WorkflowDefinition {
-        let schema = prompt.input.clone();
-        let prompt_id = prompt.id.clone();
-        let mut nodes = BTreeMap::from([(prompt_id.clone(), prompt)]);
-        let (output, exits, edges) = verifier.map_or_else(
-            || (schema.clone(), vec![prompt_id.clone()], Vec::new()),
-            |verifier| {
-                let verifier_id = verifier.id.clone();
-                let output = verifier.output.clone();
-                nodes.insert(verifier_id.clone(), verifier);
-                (
-                    output,
-                    vec![verifier_id.clone()],
-                    vec![EdgeDefinition {
-                        from: prompt_id.clone(),
-                        to: verifier_id,
-                        kind: EdgeKind::Direct,
-                        transform: None,
-                    }],
-                )
-            },
-        );
-        WorkflowDefinition {
+        let prompt = prompt_node("mutate", &schema, prompt_configuration(&schema, false));
+        let definition = WorkflowDefinition {
             schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
-            name: "prompt-verification".to_string(),
-            input: schema,
-            output,
-            nodes,
-            entries: vec![prompt_id],
-            exits,
-            edges,
-        }
-    }
-
-    #[test]
-    fn production_admission_requires_deterministic_verification_after_mutating_prompts() {
-        let schema = ValueSchema {
-            type_name: "example.value/v1".to_string(),
-            schema: serde_json::json!({"type": "object", "additionalProperties": true}),
+            name: "mutating-prompt".to_string(),
+            input: schema.clone(),
+            output: schema,
+            nodes: BTreeMap::from([("mutate".to_string(), prompt)]),
+            entries: vec!["mutate".to_string()],
+            exits: vec!["mutate".to_string()],
+            edges: Vec::new(),
         };
-        let unverified = prompt_verification_definition(
-            prompt_node("mutate", &schema, prompt_configuration(&schema, false)),
-            None,
-        );
-        let admission = unverified
-            .production_admission(&WorkflowProductionCapabilities::current())
-            .expect("valid definition");
-        assert!(admission.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "missing_mutation_verification"
-                && diagnostic.node_id.as_deref() == Some("mutate")
-        }));
-
-        let verified = prompt_verification_definition(
-            prompt_node("mutate", &schema, prompt_configuration(&schema, false)),
-            Some(verifier_node("verify", &schema)),
-        );
-        let admission = verified
-            .production_admission(&WorkflowProductionCapabilities::current())
-            .expect("valid definition");
-        assert!(
-            !admission
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "missing_mutation_verification")
-        );
-    }
-
-    #[test]
-    fn read_only_prompts_do_not_require_mutation_verification() {
-        let schema = ValueSchema {
-            type_name: "example.value/v1".to_string(),
-            schema: serde_json::json!({"type": "object", "additionalProperties": true}),
-        };
-        let definition = prompt_verification_definition(
-            prompt_node("inspect", &schema, prompt_configuration(&schema, true)),
-            None,
-        );
         let admission = definition
             .production_admission(&WorkflowProductionCapabilities::current())
             .expect("valid definition");
         assert!(
-            !admission
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "missing_mutation_verification")
+            admission.is_supported(),
+            "mutating prompt topology is the workflow author's choice: {:?}",
+            admission.diagnostics
         );
     }
 
