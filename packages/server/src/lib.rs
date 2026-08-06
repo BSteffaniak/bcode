@@ -4636,7 +4636,7 @@ async fn handle_workflow_mutation_request(
 ) -> Result<(), ServerError> {
     match request {
         Request::CreateAuthoredWorkflow(request) => {
-            handle_create_authored_workflow(request_id, client_id, state, writer, request).await
+            handle_create_authored_workflow(request_id, client_id, state, writer, *request).await
         }
         Request::CancelWorkflowComputation { operation_id } => {
             let cancelled = cancel_workflow_computation(state, &operation_id);
@@ -4664,7 +4664,7 @@ async fn handle_workflow_mutation_request(
             handle_apply_workflow_draft_edits(request_id, client_id, state, writer, request).await
         }
         Request::UpdateWorkflowDraft(request) => {
-            handle_update_workflow_draft(request_id, client_id, state, writer, request).await
+            handle_update_workflow_draft(request_id, client_id, state, writer, *request).await
         }
         Request::PublishWorkflowDraft(request) => {
             handle_publish_workflow_draft(request_id, client_id, state, writer, request).await
@@ -4698,16 +4698,16 @@ async fn handle_workflow_mutation_request(
             handle_export_workflow_revision(request_id, state, writer, request).await
         }
         Request::PreviewWorkflowImport(request) => {
-            handle_preview_workflow_import(request_id, state, writer, request).await
+            handle_preview_workflow_import(request_id, state, writer, *request).await
         }
         Request::ImportWorkflow(request) => {
-            handle_import_workflow(request_id, client_id, state, writer, request).await
+            handle_import_workflow(request_id, client_id, state, writer, *request).await
         }
         Request::ImportWorkflowDraft(request) => {
-            handle_import_workflow_draft(request_id, client_id, state, writer, request).await
+            handle_import_workflow_draft(request_id, client_id, state, writer, *request).await
         }
         Request::ImportWorkflowRevision(request) => {
-            handle_import_workflow_revision(request_id, client_id, state, writer, request).await
+            handle_import_workflow_revision(request_id, client_id, state, writer, *request).await
         }
         Request::StartAuthoredWorkflow(request) => {
             handle_start_authored_workflow(request_id, client_id, state, writer, request).await
@@ -5150,7 +5150,7 @@ async fn handle_workflow_validation_request(
             handle_register_workflow_definition(request_id, state, writer, request).await
         }
         Request::StartWorkflow(request) => {
-            handle_start_workflow(request_id, state, writer, request).await
+            handle_start_workflow(request_id, state, writer, *request).await
         }
         Request::StartWorkflowRun(request) => {
             handle_start_workflow_run(request_id, state, writer, request).await
@@ -34742,10 +34742,10 @@ mod tests {
         let created = send(
             &mut stream,
             1,
-            Request::CreateAuthoredWorkflow(bcode_ipc::CreateAuthoredWorkflowRequest {
+            Request::CreateAuthoredWorkflow(Box::new(bcode_ipc::CreateAuthoredWorkflowRequest {
                 document: document.clone(),
                 draft_id: "draft-1".to_string(),
-            }),
+            })),
         )
         .await;
         let Response::Ok(ResponsePayload::AuthoredWorkflowCreated { workflow, draft }) = created
@@ -34758,13 +34758,13 @@ mod tests {
         let updated = send(
             &mut stream,
             2,
-            Request::UpdateWorkflowDraft(bcode_ipc::UpdateWorkflowDraftRequest {
+            Request::UpdateWorkflowDraft(Box::new(bcode_ipc::UpdateWorkflowDraftRequest {
                 workflow_id: workflow_id.clone(),
                 draft_id: "draft-1".to_string(),
                 expected_generation: 1,
                 document: document.clone(),
                 producer: producer.clone(),
-            }),
+            })),
         )
         .await;
         assert!(matches!(
@@ -34777,13 +34777,13 @@ mod tests {
         let conflict = send(
             &mut stream,
             3,
-            Request::UpdateWorkflowDraft(bcode_ipc::UpdateWorkflowDraftRequest {
+            Request::UpdateWorkflowDraft(Box::new(bcode_ipc::UpdateWorkflowDraftRequest {
                 workflow_id,
                 draft_id: "draft-1".to_string(),
                 expected_generation: 1,
                 document,
                 producer,
-            }),
+            })),
         )
         .await;
         let Response::Ok(ResponsePayload::WorkflowDraftUpdateResult {

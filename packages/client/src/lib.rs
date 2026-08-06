@@ -2343,7 +2343,7 @@ impl BcodeClient {
         ClientError,
     > {
         match self
-            .send_request(Request::CreateAuthoredWorkflow(request))
+            .send_request(Request::CreateAuthoredWorkflow(Box::new(request)))
             .await?
         {
             ResponsePayload::AuthoredWorkflowCreated { workflow, draft } => Ok((workflow, *draft)),
@@ -2410,7 +2410,7 @@ impl BcodeClient {
         request: bcode_ipc::UpdateWorkflowDraftRequest,
     ) -> Result<bcode_ipc::WorkflowDraftUpdateResult, ClientError> {
         match self
-            .send_request(Request::UpdateWorkflowDraft(request))
+            .send_request(Request::UpdateWorkflowDraft(Box::new(request)))
             .await?
         {
             ResponsePayload::WorkflowDraftUpdateResult { result } => Ok(result),
@@ -2609,7 +2609,7 @@ impl BcodeClient {
         request: bcode_ipc::PreviewWorkflowImportRequest,
     ) -> Result<bcode_workflow::WorkflowImportPreview, ClientError> {
         match self
-            .send_request(Request::PreviewWorkflowImport(request))
+            .send_request(Request::PreviewWorkflowImport(Box::new(request)))
             .await?
         {
             ResponsePayload::WorkflowImportPreview { preview } => Ok(*preview),
@@ -2632,7 +2632,10 @@ impl BcodeClient {
         ),
         ClientError,
     > {
-        match self.send_request(Request::ImportWorkflow(request)).await? {
+        match self
+            .send_request(Request::ImportWorkflow(Box::new(request)))
+            .await?
+        {
             ResponsePayload::WorkflowImported { workflow, draft } => Ok((workflow, *draft)),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -2648,7 +2651,7 @@ impl BcodeClient {
         request: bcode_ipc::ImportWorkflowDraftRequest,
     ) -> Result<bcode_ipc::WorkflowDraftImportResult, ClientError> {
         match self
-            .send_request(Request::ImportWorkflowDraft(request))
+            .send_request(Request::ImportWorkflowDraft(Box::new(request)))
             .await?
         {
             ResponsePayload::WorkflowDraftImported { result } => Ok(result),
@@ -2666,7 +2669,7 @@ impl BcodeClient {
         request: bcode_ipc::ImportWorkflowRevisionRequest,
     ) -> Result<bcode_ipc::WorkflowRevisionImportResult, ClientError> {
         match self
-            .send_request(Request::ImportWorkflowRevision(request))
+            .send_request(Request::ImportWorkflowRevision(Box::new(request)))
             .await?
         {
             ResponsePayload::WorkflowRevisionImported { result } => Ok(result),
@@ -3319,7 +3322,10 @@ impl BcodeClient {
         &self,
         request: bcode_ipc::WorkflowStartRequest,
     ) -> Result<bcode_ipc::WorkflowRunStartResponse, ClientError> {
-        match self.send_request(Request::StartWorkflow(request)).await? {
+        match self
+            .send_request(Request::StartWorkflow(Box::new(request)))
+            .await?
+        {
             ResponsePayload::WorkflowRunStarted(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }

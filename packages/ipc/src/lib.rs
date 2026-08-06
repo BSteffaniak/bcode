@@ -378,7 +378,7 @@ pub enum Request {
         work_id: WorkId,
     },
     /// Atomically create one logical workflow and its initial mutable draft.
-    CreateAuthoredWorkflow(CreateAuthoredWorkflowRequest),
+    CreateAuthoredWorkflow(Box<CreateAuthoredWorkflowRequest>),
     /// Apply one already-lowered portable source through a single daemon-owned application operation.
     ApplyWorkflowSource(ApplyWorkflowSourceRequest),
     /// Cancel one exact in-flight authored-workflow validation or compilation operation.
@@ -393,7 +393,7 @@ pub enum Request {
     /// Apply one atomic semantic edit batch to an exact draft generation.
     ApplyWorkflowDraftEdits(ApplyWorkflowDraftEditsRequest),
     /// Replace one exact draft generation.
-    UpdateWorkflowDraft(UpdateWorkflowDraftRequest),
+    UpdateWorkflowDraft(Box<UpdateWorkflowDraftRequest>),
     /// Publish one exact draft generation, optionally activating it atomically.
     PublishWorkflowDraft(PublishWorkflowDraftRequest),
     /// Publish one exact draft and then independently attempt durable run admission.
@@ -415,13 +415,16 @@ pub enum Request {
     /// Export one exact immutable authored revision.
     ExportWorkflowRevision(ExportWorkflowRevisionRequest),
     /// Preview one portable import without mutation.
-    PreviewWorkflowImport(PreviewWorkflowImportRequest),
+    ///
+    /// Boxed so this large authoring payload does not set the size of every `Request` value, and
+    /// therefore of every stack frame that matches on one.
+    PreviewWorkflowImport(Box<PreviewWorkflowImportRequest>),
     /// Import one portable bundle as a new logical workflow and draft.
-    ImportWorkflow(ImportWorkflowRequest),
+    ImportWorkflow(Box<ImportWorkflowRequest>),
     /// Import one portable bundle as a new draft in an existing logical workflow.
-    ImportWorkflowDraft(ImportWorkflowDraftRequest),
+    ImportWorkflowDraft(Box<ImportWorkflowDraftRequest>),
     /// Import one portable bundle as the exact next immutable revision of an existing workflow.
-    ImportWorkflowRevision(ImportWorkflowRevisionRequest),
+    ImportWorkflowRevision(Box<ImportWorkflowRevisionRequest>),
     /// Resolve and start one immutable authored-workflow revision.
     StartAuthoredWorkflow(StartAuthoredWorkflowRequest),
     /// Resolve one exact published package export and start its authored revision.
@@ -531,7 +534,7 @@ pub enum Request {
     /// Register one immutable, structurally validated workflow definition.
     RegisterWorkflowDefinition(WorkflowDefinitionRegistrationRequest),
     /// Register an exact definition and start its bound durable run through one retry-safe request.
-    StartWorkflow(WorkflowStartRequest),
+    StartWorkflow(Box<WorkflowStartRequest>),
     /// Start one durable workflow from an existing exact definition.
     StartWorkflowRun(WorkflowRunStartRequest),
     /// List bounded, checksum-verified durable workflow definitions.
@@ -3876,10 +3879,10 @@ mod tests {
             presentation: None,
         };
         let requests = vec![
-            Request::CreateAuthoredWorkflow(CreateAuthoredWorkflowRequest {
+            Request::CreateAuthoredWorkflow(Box::new(CreateAuthoredWorkflowRequest {
                 document: authoring_document.clone(),
                 draft_id: "draft-1".to_string(),
-            }),
+            })),
             Request::ApplyWorkflowDraftEdits(ApplyWorkflowDraftEditsRequest {
                 workflow_id: authoring_document.workflow_id.clone(),
                 draft_id: "draft-1".to_string(),
@@ -3892,13 +3895,13 @@ mod tests {
                 },
                 producer: authoring_document.producer.clone(),
             }),
-            Request::UpdateWorkflowDraft(UpdateWorkflowDraftRequest {
+            Request::UpdateWorkflowDraft(Box::new(UpdateWorkflowDraftRequest {
                 workflow_id: authoring_document.workflow_id.clone(),
                 draft_id: "draft-1".to_string(),
                 expected_generation: 1,
                 document: authoring_document.clone(),
                 producer: authoring_document.producer.clone(),
-            }),
+            })),
             Request::PublishWorkflowDraft(PublishWorkflowDraftRequest {
                 workflow_id: authoring_document.workflow_id.clone(),
                 draft_id: "draft-1".to_string(),
@@ -3922,7 +3925,7 @@ mod tests {
                 parent_session_id: bcode_session_models::SessionId::new(),
                 workspace_snapshot: Some("snapshot-1".to_string()),
             })),
-            Request::ImportWorkflowDraft(ImportWorkflowDraftRequest {
+            Request::ImportWorkflowDraft(Box::new(ImportWorkflowDraftRequest {
                 bundle: bcode_workflow::WorkflowExportBundle {
                     version: bcode_workflow::WORKFLOW_EXPORT_BUNDLE_VERSION,
                     revision: bcode_workflow::WorkflowPortableRevision {
@@ -3952,8 +3955,8 @@ mod tests {
                 draft_id: "imported-draft".to_string(),
                 collision_policy: WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft,
                 control: WorkflowComputationControl::default(),
-            }),
-            Request::ImportWorkflowRevision(ImportWorkflowRevisionRequest {
+            })),
+            Request::ImportWorkflowRevision(Box::new(ImportWorkflowRevisionRequest {
                 bundle: bcode_workflow::WorkflowExportBundle {
                     version: bcode_workflow::WORKFLOW_EXPORT_BUNDLE_VERSION,
                     revision: bcode_workflow::WorkflowPortableRevision {
@@ -3986,7 +3989,7 @@ mod tests {
                 collision_policy:
                     WorkflowImportCollisionPolicy::RequireExistingWorkflowNextRevision,
                 control: WorkflowComputationControl::default(),
-            }),
+            })),
             Request::ActivateWorkflowRevision(ActivateWorkflowRevisionRequest {
                 workflow_id: authoring_document.workflow_id.clone(),
                 revision: 1,
@@ -4039,7 +4042,7 @@ mod tests {
                 workflow_id: authoring_document.workflow_id.clone(),
                 revision: 1,
             }),
-            Request::PreviewWorkflowImport(PreviewWorkflowImportRequest {
+            Request::PreviewWorkflowImport(Box::new(PreviewWorkflowImportRequest {
                 bundle: bcode_workflow::WorkflowExportBundle {
                     version: bcode_workflow::WORKFLOW_EXPORT_BUNDLE_VERSION,
                     revision: bcode_workflow::WorkflowPortableRevision {
@@ -4067,7 +4070,7 @@ mod tests {
                 },
                 target_workflow_id: "authored/imported".to_string(),
                 control: WorkflowComputationControl::default(),
-            }),
+            })),
             Request::StartAuthoredWorkflow(StartAuthoredWorkflowRequest {
                 selection: AuthoredWorkflowRunSelection::Revision {
                     workflow_id: authoring_document.workflow_id.clone(),
@@ -4137,7 +4140,7 @@ mod tests {
                 version: 1,
                 definition: definition.clone(),
             }),
-            Request::StartWorkflow(WorkflowStartRequest {
+            Request::StartWorkflow(Box::new(WorkflowStartRequest {
                 identity: bcode_workflow::WorkflowDefinitionIdentity::for_definition(
                     "review",
                     &definition,
@@ -4156,7 +4159,7 @@ mod tests {
                     single_active: true,
                 },
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
-            }),
+            })),
             Request::StartWorkflowRun(WorkflowRunStartRequest {
                 definition_id: "review".to_string(),
                 definition_version: 1,
