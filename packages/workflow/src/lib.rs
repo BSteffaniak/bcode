@@ -6041,9 +6041,9 @@ fn empty_workflow_source_configuration_schema() -> ValueSchema {
 }
 
 impl WorkflowStructuredSourceDocument {
-    /// Deterministically lower the initial source-v3 action/condition profile to canonical nodes
-    /// and edges. Unsupported future structured constructs are rejected by `deny_unknown_fields`
-    /// rather than approximated.
+    /// Deterministically lower source-v3 actions, conditions, control flow, and child calls to
+    /// canonical nodes and edges. Unsupported future structured constructs are rejected by
+    /// `deny_unknown_fields` rather than approximated.
     ///
     /// # Errors
     ///
@@ -6081,6 +6081,7 @@ impl WorkflowStructuredSourceDocument {
             ));
         }
         let (mut document, mut source_map) = self.lower_mixed_steps(catalog)?;
+        self.materialize_static_source_dependencies(&mut document, catalog)?;
         let order = self
             .steps
             .iter()
@@ -6278,6 +6279,69 @@ impl WorkflowStructuredSourceDocument {
         }
         document.validate()?;
         Ok((document, source_map))
+    }
+
+    fn materialize_static_source_dependencies(
+        &self,
+        document: &mut WorkflowAuthoringDocument,
+        catalog: &WorkflowAuthoringCatalogSnapshot,
+    ) -> Result<(), WorkflowError> {
+        for (index, step) in self.steps.iter().enumerate() {
+            if step.input_from.is_some()
+                || step.when.is_some()
+                || matches!(
+                    &step.operation,
+                    WorkflowStructuredSourceOperation::Parallel(_)
+                        | WorkflowStructuredSourceOperation::WorkflowCall(_)
+                        | WorkflowStructuredSourceOperation::Input(_)
+                        | WorkflowStructuredSourceOperation::Approval(_)
+                        | WorkflowStructuredSourceOperation::Agent(_)
+                )
+            {
+                continue;
+            }
+            let target_input = document
+                .definition
+                .node(&step.id)
+                .ok_or_else(|| {
+                    authoring_error(
+                        format!("steps[{index}].id"),
+                        "structured step did not lower to a canonical node",
+                    )
+                })?
+                .input
+                .clone();
+            let static_input = match &step.operation {
+                WorkflowStructuredSourceOperation::Action(action) => {
+                    Some(lower_workflow_source_action(action, catalog, index)?.1)
+                }
+                WorkflowStructuredSourceOperation::FanOut(_)
+                | WorkflowStructuredSourceOperation::Parallel(_)
+                | WorkflowStructuredSourceOperation::WorkflowCall(_)
+                | WorkflowStructuredSourceOperation::Input(_)
+                | WorkflowStructuredSourceOperation::Approval(_)
+                | WorkflowStructuredSourceOperation::Prompt(_)
+                | WorkflowStructuredSourceOperation::Agent(_) => None,
+            };
+            let Some(static_input) = static_input else {
+                continue;
+            };
+            for edge in document
+                .definition
+                .edges
+                .iter_mut()
+                .filter(|edge| edge.to == step.id)
+            {
+                edge.transform = Some(WorkflowTransform {
+                    version: WORKFLOW_TRANSFORM_VERSION,
+                    expression: WorkflowTransformExpression::Constant {
+                        value: static_input.clone(),
+                    },
+                    output: target_input.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7633,6 +7697,21 @@ impl WorkflowAuthoringDocument {
             &plugin_input_defaults,
             &mut input_defaults,
         )?;
+        for node_id in normalized.plugin_input_defaults.keys() {
+            if !definition.entries.contains(node_id)
+                && definition.edges.iter().any(|edge| {
+                    edge.to == *node_id
+                        && edge.transform.as_ref().is_some_and(|transform| {
+                            matches!(
+                                transform.expression,
+                                WorkflowTransformExpression::Constant { .. }
+                            )
+                        })
+                })
+            {
+                plugin_input_defaults.remove(node_id);
+            }
+        }
         let definition = normalize_authored_definition(definition)?;
         if input_defaults == serde_json::json!({}) {
             input_defaults = serde_json::Value::Null;
@@ -14639,6 +14718,91 @@ steps:
             lower_workflow_authoring_source(&old, WorkflowSourceFormat::Yaml, &catalog).is_err(),
             "previous source versions must fail closed"
         );
+    }
+
+    #[test]
+    fn structured_source_v3_materializes_static_inputs_between_source_components() {
+        let schema = ValueSchema {
+            type_name: "example.static/v1".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["message"],
+                "properties": {"message": {"type": "string"}}
+            }),
+        };
+        let block = WorkflowBlockDefinition {
+            block_id: "echo".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            operation: "echo".to_string(),
+            input: schema.clone(),
+            output: ValueSchema {
+                type_name: "example.other/v1".to_string(),
+                schema: serde_json::json!({"type": "boolean"}),
+            },
+            effect: WorkflowBlockEffect::ReadOnly,
+            resources: Vec::new(),
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::ReadOnly,
+                explicit_grant_required: false,
+            },
+            timeout_ms: 30_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
+            preparation_required: false,
+        };
+        let action = WorkflowAuthoringActionDescriptor {
+            version: WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION,
+            action_key: "echo".to_string(),
+            action_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            input: schema,
+            target_block: workflow_block_catalog_key(&block),
+            input_adapter: None,
+        };
+        let mut catalog = authoring_catalog();
+        catalog.plugins.insert("bcode.example".to_string());
+        catalog
+            .blocks
+            .insert(workflow_block_catalog_key(&block), block);
+        catalog
+            .authoring_actions
+            .insert(action.catalog_key(), action);
+        let source = serde_json::json!({
+            "workflow_source_version": 3,
+            "workflow_id": "example/static-chain",
+            "title": "Static chain",
+            "steps": [
+                {"id": "first", "echo": {"message": "first"}},
+                {"id": "second", "echo": {"message": "second"}}
+            ]
+        });
+        let lowered = lower_workflow_authoring_source(
+            &serde_json::to_string(&source).expect("source"),
+            WorkflowSourceFormat::Json,
+            &catalog,
+        )
+        .expect("static source chain");
+        let edge = &lowered.document.definition.edges[0];
+        assert!(matches!(
+            edge.transform.as_ref().map(|transform| &transform.expression),
+            Some(WorkflowTransformExpression::Constant { value })
+                if value == &serde_json::json!({"message": "second"})
+        ));
+        assert!(
+            lowered
+                .document
+                .plugin_input_defaults
+                .contains_key("second")
+        );
+        let compiled = lowered
+            .document
+            .compilation_preview(&catalog, None)
+            .compiled
+            .expect("compiled static chain");
+        assert!(!compiled.plugin_input_defaults.contains_key("second"));
     }
 
     #[test]

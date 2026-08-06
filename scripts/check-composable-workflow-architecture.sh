@@ -173,6 +173,23 @@ if ! rg -q 'WorkflowCallConfiguration' packages/workflow/src/lib.rs \
   violations=1
 fi
 
+if [[ ! -f fixtures/workflow-components/package.workflow-package.yaml ]] \
+  || ! rg -q 'run-command-and-assert' fixtures/workflow-components/package.workflow-package.yaml \
+  || ! rg -q 'prompt-and-verify' fixtures/workflow-components/package.workflow-package.yaml \
+  || ! rg -q 'completion-evaluation' fixtures/workflow-components/package.workflow-package.yaml \
+  || ! rg -q 'non-git-data-quality' fixtures/workflow-components/package.workflow-package.yaml; then
+  echo "Composable workflow source-component violation: generic source package inventory drifted." >&2
+  violations=1
+fi
+
+if rg -ni '(^|[^a-z])git([[:space:]]|[-_./])' fixtures/workflow-components/non-git-data-quality.workflow.yaml \
+  >/tmp/bcode-non-git-workflow-leaks.txt 2>/dev/null; then
+  echo "Composable workflow generality violation: non-Git example acquired Git semantics." >&2
+  cat /tmp/bcode-non-git-workflow-leaks.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-non-git-workflow-leaks.txt
+
 if ! grep -F 'The TUI owns terminal canvas layout' "$architecture" >/dev/null \
   || ! grep -F 'Unrestricted JSON Patch is not the primary contract' "$architecture" >/dev/null; then
   echo "Composable workflow frontend violation: renderer-neutral editing boundaries drifted." >&2

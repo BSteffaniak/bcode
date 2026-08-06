@@ -1,0 +1,28 @@
+workflow_source_version: 3
+workflow_id: components/checkpoint
+title: Checkpoint creation
+description: Verifies the worktree, excludes the local progress document, and creates a normal Git checkpoint.
+run_limits:
+  maximum_duration_ms: 300000
+  node_execution_cap: 2
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: checkpoint
+    run:
+      version: 1
+      script: |-
+        set -eu
+        git diff --check
+        git add --all -- ':!local-composable-workflows-progress.md'
+        test -n "$(git diff --cached --name-only)"
+        git commit -m "${CHECKPOINT_MESSAGE:-Workflow checkpoint}"
+      shell: [sh, -c]
+      cwd: .
+      environment:
+        CHECKPOINT_MESSAGE: Workflow checkpoint
+      timeout_ms: 240000
+      accepted_exit_codes: [0]
+      continue_on_unaccepted_exit: false
+      output: {preview_bytes: 16384, artifact_spill: true}

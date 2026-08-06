@@ -1,0 +1,28 @@
+workflow_source_version: 3
+workflow_id: components/interaction-state
+title: Typed operator checkpoint
+description: Pauses durably without changing the component state shape.
+run_limits:
+  maximum_duration_ms: 3600000
+  node_execution_cap: 2
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: operator_checkpoint
+    name: Confirm or amend structured state
+    input:
+      schema:
+        type_name: bcode.component.state/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [status, detail, retry]
+          properties:
+            status:
+              type: string
+              enum: [ready, needs_remediation, complete, blocked]
+            detail: {type: string, maxLength: 16384}
+            retry: {type: boolean}
+      resources:
+        - {resource: operator, access: read}

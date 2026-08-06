@@ -13549,6 +13549,72 @@ mod workflow_source_tests {
     }
 
     #[test]
+    fn primary_cli_loads_generic_source_component_package() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("fixtures/workflow-components/package.workflow-package.yaml");
+        let loaded = read_workflow_package_manifest(&manifest).expect("component package");
+        loaded.validate().expect("valid component package manifest");
+        assert_eq!(loaded.package_id, "bcode/generic-source-components");
+        assert_eq!(loaded.members.len(), 13);
+        assert!(loaded.exports.contains_key("run-command-and-assert"));
+        assert!(loaded.exports.contains_key("non-git-data-quality"));
+        assert!(
+            loaded
+                .members
+                .iter()
+                .all(|member| !member.source.is_empty())
+        );
+
+        let shell_manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/shell-plugin/bcode-plugin.toml"
+        ))
+        .expect("shell plugin manifest");
+        let service = shell_manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("shell workflow service");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::from(["bcode.shell".to_string()]),
+            blocks: service
+                .workflow_blocks
+                .iter()
+                .cloned()
+                .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+                .collect(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::from([
+                "build".to_string(),
+                "review".to_string(),
+            ]),
+            authoring_actions: service
+                .workflow_authoring_actions
+                .iter()
+                .cloned()
+                .map(|action| (action.catalog_key(), action))
+                .collect(),
+        };
+        for member_id in ["run-command-and-assert", "completion-evaluation"] {
+            let member = loaded
+                .members
+                .iter()
+                .find(|member| member.member_id == member_id)
+                .expect("component member");
+            bcode_workflow::lower_workflow_authoring_source(
+                &member.source,
+                member.format,
+                &catalog,
+            )
+            .expect("component lowers through ordinary source contract");
+        }
+    }
+
+    #[test]
     fn primary_cli_parses_exact_package_generations() {
         let facts =
             parse_package_expected_generations(&["parent=4".to_string(), "child=2".to_string()])

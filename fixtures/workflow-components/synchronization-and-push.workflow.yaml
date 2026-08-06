@@ -1,0 +1,36 @@
+workflow_source_version: 3
+workflow_id: components/synchronization-and-push
+title: Synchronization and push
+description: Uses bounded normal non-force synchronization and push commands.
+run_limits:
+  maximum_duration_ms: 600000
+  node_execution_cap: 3
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: synchronize
+    run:
+      version: 1
+      script: |-
+        set -eu
+        git pull --rebase --autostash
+        git push
+      shell: [sh, -c]
+      cwd: .
+      timeout_ms: 480000
+      accepted_exit_codes: [0]
+      continue_on_unaccepted_exit: false
+      output: {preview_bytes: 16384, artifact_spill: true}
+  - id: verify_tracking
+    run:
+      version: 1
+      script: |-
+        set -eu
+        test "$(git rev-parse HEAD)" = "$(git rev-parse '@{upstream}')"
+      shell: [sh, -c]
+      cwd: .
+      timeout_ms: 60000
+      accepted_exit_codes: [0]
+      continue_on_unaccepted_exit: false
+      output: {preview_bytes: 4096, artifact_spill: true}

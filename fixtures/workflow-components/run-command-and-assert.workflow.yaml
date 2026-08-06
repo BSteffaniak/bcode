@@ -1,0 +1,29 @@
+workflow_source_version: 3
+workflow_id: components/run-command-and-assert
+title: Run command and assert
+description: Runs a visible command and treats any unaccepted exit as failure.
+run_limits:
+  maximum_duration_ms: 120000
+  node_execution_cap: 2
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: run_assertion
+    name: Run visible assertion command
+    run:
+      version: 1
+      script: |-
+        set -eu
+        test -n "${ASSERT_TARGET:-source-controlled}"
+        printf '%s\n' "$ASSERT_TARGET"
+      shell: [sh, -c]
+      cwd: .
+      environment:
+        ASSERT_TARGET: source-controlled
+      timeout_ms: 60000
+      accepted_exit_codes: [0]
+      continue_on_unaccepted_exit: false
+      output:
+        preview_bytes: 4096
+        artifact_spill: true

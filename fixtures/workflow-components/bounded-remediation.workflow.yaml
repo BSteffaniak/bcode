@@ -1,0 +1,39 @@
+workflow_source_version: 3
+workflow_id: components/bounded-remediation
+title: Bounded remediation
+description: Repeats an exact child remediation turn at most three times, then verifies state.
+run_limits:
+  maximum_duration_ms: 2700000
+  node_execution_cap: 20
+  concurrency_cap: 1
+  cycle_cap: 3
+  retry_cap: 1
+steps:
+  - id: remediation_cycle
+    name: Run bounded remediation child
+    package_call:
+      member: remediation-turn
+    repeat:
+      while_predicate:
+        operation: selected_equals
+        version: 3
+        selector:
+          version: 1
+          segments:
+            - {kind: field, name: status}
+        value: needs_remediation
+      max_iterations: 3
+      exhaustion_policy: emit_outcome
+  - id: verify_after_remediation
+    name: Verify after bounded remediation
+    run:
+      version: 1
+      script: |-
+        set -eu
+        test -d .
+      shell: [sh, -c]
+      cwd: .
+      timeout_ms: 60000
+      accepted_exit_codes: [0]
+      continue_on_unaccepted_exit: false
+      output: {preview_bytes: 4096, artifact_spill: true}

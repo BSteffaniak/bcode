@@ -94,6 +94,15 @@ prompt-and-verify, adversarial review, conflict resolution, validation, formatti
 synchronization, progress planning, completion evaluation, and bounded implementation cycles.
 Changing one of these procedures edits source rather than Rust host or plugin behavior.
 
+A generic component package is checked in at
+`fixtures/workflow-components/package.workflow-package.yaml`. Its child workflows keep commands,
+prompts, schemas, limits, branch predicates, interaction gates, and child dependencies visible in
+source. It includes command assertion, prompt verification, bounded remediation, isolated
+adversarial review, conflict resolution, validation/formatting, checkpointing, normal non-force
+synchronization, progress planning/refocus, completion evaluation, and a non-Git data-quality
+example. These are examples and reusable source members, not privileged host templates; users can
+copy or replace them and publication still goes through the ordinary package boundary.
+
 A non-Git package must prove that the same shell, prompt, condition, retry, fan-out, and package
 primitives are generic.
 

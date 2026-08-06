@@ -1,0 +1,46 @@
+version: 2
+package_id: bcode/generic-source-components
+exports:
+  run-command-and-assert: run-command-and-assert
+  prompt-and-verify: prompt-and-verify
+  bounded-remediation: bounded-remediation
+  adversarial-review: adversarial-review
+  conflict-resolution: conflict-resolution
+  validation-and-formatting: validation-and-formatting
+  checkpoint: checkpoint
+  synchronization-and-push: synchronization-and-push
+  progress-planning-and-refocus: progress-planning-and-refocus
+  completion-evaluation: completion-evaluation
+  non-git-data-quality: non-git-data-quality
+members:
+  - member_id: interaction-state
+    source_name: interaction-state.workflow.yaml
+  - member_id: remediation-turn
+    source_name: remediation-turn.workflow.yaml
+    dependencies: [interaction-state]
+  - member_id: run-command-and-assert
+    source_name: run-command-and-assert.workflow.yaml
+  - member_id: prompt-and-verify
+    source_name: prompt-and-verify.workflow.yaml
+    dependencies: [interaction-state]
+  - member_id: bounded-remediation
+    source_name: bounded-remediation.workflow.yaml
+    dependencies: [remediation-turn]
+  - member_id: adversarial-review
+    source_name: adversarial-review.workflow.yaml
+  - member_id: conflict-resolution
+    source_name: conflict-resolution.workflow.yaml
+    dependencies: [interaction-state]
+  - member_id: validation-and-formatting
+    source_name: validation-and-formatting.workflow.yaml
+  - member_id: checkpoint
+    source_name: checkpoint.workflow.yaml
+  - member_id: synchronization-and-push
+    source_name: synchronization-and-push.workflow.yaml
+  - member_id: progress-planning-and-refocus
+    source_name: progress-planning-and-refocus.workflow.yaml
+    dependencies: [interaction-state]
+  - member_id: completion-evaluation
+    source_name: completion-evaluation.workflow.yaml
+  - member_id: non-git-data-quality
+    source_name: non-git-data-quality.workflow.yaml

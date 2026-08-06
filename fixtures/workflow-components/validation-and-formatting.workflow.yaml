@@ -1,0 +1,34 @@
+workflow_source_version: 3
+workflow_id: components/validation-and-formatting
+title: Validation and formatting
+description: Runs visible formatting and validation commands with stable accepted-exit behavior.
+run_limits:
+  maximum_duration_ms: 1800000
+  node_execution_cap: 4
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: format
+    run:
+      version: 1
+      script: cargo fmt
+      shell: [sh, -c]
+      cwd: .
+      timeout_ms: 300000
+      accepted_exit_codes: [0]
+      continue_on_unaccepted_exit: false
+      output: {preview_bytes: 16384, artifact_spill: true}
+  - id: validate
+    run:
+      version: 1
+      script: |-
+        set -eu
+        cargo check --workspace
+        cargo clippy --workspace --all-targets -- -D warnings
+      shell: [sh, -c]
+      cwd: .
+      timeout_ms: 1200000
+      accepted_exit_codes: [0]
+      continue_on_unaccepted_exit: false
+      output: {preview_bytes: 32768, artifact_spill: true}

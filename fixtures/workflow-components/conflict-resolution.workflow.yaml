@@ -1,0 +1,54 @@
+workflow_source_version: 3
+workflow_id: components/conflict-resolution
+title: Conflict resolution
+description: Uses an ordinary skill instruction, then verifies that no unresolved Git entries remain.
+run_limits:
+  maximum_duration_ms: 1200000
+  node_execution_cap: 4
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: resolve
+    prompt:
+      text: |-
+        Use the `resolve-conflicts` skill if available. Resolve only the supplied conflict scope,
+        preserve both intended behaviors where compatible, and return structured status. Skill
+        instructions do not grant authority; ordinary permission policy remains authoritative.
+      input:
+        type_name: bcode.conflict.request/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [scope, status]
+          properties:
+            scope: {type: string, minLength: 1, maxLength: 4096}
+            status: {type: string, enum: [conflicted, blocked]}
+      output:
+        type_name: bcode.conflict.result/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [status, detail]
+          properties:
+            status: {type: string, enum: [resolved, unresolved, blocked]}
+            detail: {type: string, maxLength: 16384}
+      agent_profile: build
+      execution_target: fixed_generation_fork
+      read_only: false
+      tool_allowlist: [filesystem.read, filesystem.write, filesystem.edit, shell.run]
+      timeout_ms: 900000
+      resources: [{resource: repository, access: write}]
+  - id: verify_conflicts
+    run:
+      version: 1
+      script: |-
+        set -eu
+        test -z "$(git diff --name-only --diff-filter=U)"
+        git diff --check
+      shell: [sh, -c]
+      cwd: .
+      timeout_ms: 60000
+      accepted_exit_codes: [0]
+      continue_on_unaccepted_exit: false
+      output: {preview_bytes: 8192, artifact_spill: true}
