@@ -1,5 +1,5 @@
 {
-  "workflow_source_version": 1,
+  "workflow_source_version": 3,
   "workflow_id": "example/advanced-run",
   "title": "Advanced run",
   "steps": [

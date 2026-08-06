@@ -194,7 +194,7 @@ assert json_validation["lowering"]["validation"]["valid"] and toml_validation["l
 assert json_validation["lowering"]["validation"]["source_digest_sha256"] == toml_validation["lowering"]["validation"]["source_digest_sha256"]
 assert json_validation["lowering"]["validation"]["executable_source_digest_sha256"] == toml_validation["lowering"]["validation"]["executable_source_digest_sha256"]
 preview=json.loads((root/"shell-preview.json").read_text())["preview"]
-assert preview["compiled"]["requirements"]["blocks"] == ["bcode.shell/shell.command-plan@2"]
+assert preview["compiled"]["requirements"]["blocks"] == ["bcode.shell/exec@1"]
 portable_created=json.loads((root/"portable-created.json").read_text())
 portable_updated=json.loads((root/"portable-updated.json").read_text())
 portable_conflict=json.loads((root/"portable-conflict.json").read_text())

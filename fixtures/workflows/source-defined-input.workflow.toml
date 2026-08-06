@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 workflow_id = "example/source-defined-input"
 
 [metadata]
@@ -19,7 +19,7 @@ additionalProperties = false
 [configuration_defaults]
 
 [definition]
-schema_version = 1
+schema_version = 2
 name = "Source-defined input"
 entries = ["await_input"]
 exits = ["await_input"]

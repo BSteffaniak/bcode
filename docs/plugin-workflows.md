@@ -9,7 +9,7 @@ implementations ship. Fail-fast persists a generation-scoped decision and exact 
 cancellation intents before signaling runtime owners; unsignalled intents survive restart and
 terminal sibling outcomes return through ordinary attempt observation. Explicit operator retry of a terminal failed activation remains a
 separate bounded store operation; ambiguous mutation requires explicit repair before any later
-attempt and is never automatic retry. Deterministic branch and repeat predicates use the explicit version 1
+attempt and is never automatic retry. Deterministic branch and repeat predicates use the current explicit versioned
 contract and are bounded and validated during production admission. Versioned bounded edge
 transforms are supported, including immutable run-state and canonical parallel `join.left`/`join.right`
 sources.
@@ -18,13 +18,12 @@ Registration and start both rerun production admission. Plugin block nodes must 
 byte-equivalent enabled manifest declaration, so a definition cannot be persisted or started with
 an ownerless or stale block contract.
 
-Durable agent nodes use the versioned `WorkflowAgentConfiguration` contract. The server resolves
-required/preferred/disabled skill selections before preparing external dispatch and embeds exact
-bounded resolved context in the prepared intent and immutable turn metadata. Required resolution
-fails closed, preferred failures omit context with a bounded diagnostic, and read-only nodes reject
-skills declaring tool access. Compatible skill model policy updates only that turn's provider/model
-selection; conflicting required selection fails closed. This does not modify session-wide active-skill
-state.
+Durable prompt nodes use the versioned `WorkflowPromptConfiguration` contract. Skills are not
+selected, required, or resolved by workflow contracts. Prompt text may ask the ordinary Bcode agent
+to load a named skill through the normal skill catalog and tool boundary; missing or disabled skills
+therefore remain ordinary prompt/tool outcomes and never invalidate a workflow definition or widen
+authority. The prompt's explicit model, tool, timeout, context-target, and structured-output policy
+remain authoritative.
 
 Use typed workflow composition for domain behavior and let the host own durable registration,
 execution, discovery, and lifecycle state.

@@ -338,8 +338,9 @@ impl SkillRegistry {
         SkillList {
             skills: self
                 .entries
-                .values()
-                .map(|entry| entry.summary.clone())
+                .iter()
+                .filter(|(id, _)| !self.options.disabled_ids.contains(*id))
+                .map(|(_, entry)| entry.summary.clone())
                 .collect(),
             diagnostics: self.diagnostics.clone(),
         }

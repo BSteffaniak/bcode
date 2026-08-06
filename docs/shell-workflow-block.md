@@ -1,6 +1,6 @@
 # Shell workflow block
 
-The shell plugin owns `shell.command-plan` through `bcode.workflow-block/v1`.
+The shell plugin owns `exec@1` through `bcode.workflow-block/v1`.
 
 Version 1 plans use **argv mode only**. Each command is an ordered non-empty array whose first item
 is the executable and remaining items are exact arguments. The owner never implicitly reparses an
@@ -24,7 +24,21 @@ therefore be non-secret. Names containing common secret-bearing markers (`TOKEN`
 rejected. Secrets must enter through an owner/runtime secret-injection facility that does not
 serialize them into the workflow plan, intent, trace, or output.
 
-The block is declared mutating because arbitrary commands can modify the workspace. It therefore
+## Source-authored exit protocols
+
+Complex command checks remain ordinary source composition rather than host-side command semantics:
+
+* Put dynamic values only in explicit argv elements or `environment.set` entries. The `exec@1`
+  schema rejects dynamic whole-input binding and any dynamic binding path outside
+  `commands.*.argv.*` and `environment.set.*`.
+* Never build or interpolate shell source from prior output. A script is static authored source;
+  dynamic shell-source constructs fail owner command analysis closed.
+* Have commands emit bounded structured JSON and a documented accepted exit code. Route first on
+  typed `status`, `exit_accepted`, byte length, encoding, truncation, or SHA-256 fields, then pass
+  complete JSON to a prompt or later typed step. Do not parse presentation text or truncated output.
+* For output beyond preview bounds, assert typed artifact byte length/checksum metadata or consume
+  it through an authorized artifact owner. Artifact references are not implicitly read as text.
+
 requires an exact workflow grant, uses repair-required reconciliation for ambiguous accepted work,
 and claims repository write access. The owner resolves workspace-relative cwd against the canonical
 workflow workspace, executes exact argv commands sequentially, applies explicit inherited/cleared

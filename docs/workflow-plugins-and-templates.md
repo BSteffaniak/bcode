@@ -37,7 +37,7 @@ schema = { type = "object", additionalProperties = false }
 
 The declaration also carries exact authorization and resource claims when applicable. Block identity, schemas, effect, reconciliation class, timeout, cancellation support, authorization, and resources are part of the compiled workflow definition and its digest. Registration and start resolve every block to an exact enabled declaration.
 
-Use a procedural block for deterministic domain work already owned by a plugin: command execution, repository inspection, committing, or another operation with a typed request/result contract. Use an agent node when model reasoning is necessary. Use a skill selection on an agent node when reusable instructions or model/tool policy are required. Do not use an agent to reinterpret output that a typed transform or procedural owner can handle deterministically.
+Use a procedural block for deterministic domain work already owned by a plugin: command execution or another operation with a typed request/result contract. Use a prompt node when model reasoning is necessary. A prompt may request a skill in ordinary instruction text; workflow definitions do not select skills or inherit skill model/tool policy. Do not use a prompt to reinterpret output that a typed transform or procedural owner can handle deterministically.
 
 ## Declaring workflow templates
 
@@ -47,14 +47,13 @@ Use a procedural block for deterministic domain work already owned by a plugin: 
 * stable owner-local `template_id` and positive `template_version`;
 * bounded title and description;
 * a typed configuration schema;
-* optional bounded generic compilation bindings that map a validated nullable skill-ID field to an exact agent skill selection and declare a validated deterministic bypass edge for the absent case;
 * one exact declarative compiled workflow definition;
-* required plugin, skill, and production-capability identities;
+* required plugin and production-capability identities;
 * renderer-neutral presentation metadata.
 
-Discovery validates the contribution and current production admission without starting a run. At start, generic compilation bindings either inject the configured exact skill into their declared agent node or remove that optional node and install its declared deterministic bypass. The host then derives identity from owner plugin, template ID/version, and the complete normalized compiled-definition digest, so topology, selected skill, or policy changes cannot reuse an old exact identity.
+Discovery validates the contribution and current production admission without starting a run. The host derives identity from owner plugin, template ID/version, and the complete normalized compiled-definition digest, so topology or policy changes cannot reuse an old exact identity.
 
-The bounded list/describe APIs retain unavailable templates with explicit diagnostics for missing plugins, missing skills, or unsupported capabilities. Typed start resolves the currently loaded contribution again, rejects diagnostics, validates configuration on the daemon, applies only declared generic compilation bindings, persists the resulting exact compiled definition, and then creates the parent-session-bound run.
+The bounded list/describe APIs retain unavailable templates with explicit diagnostics for missing plugins or unsupported capabilities. Typed start resolves the currently loaded contribution again, rejects diagnostics, validates configuration on the daemon, persists the resulting exact compiled definition, and then creates the parent-session-bound run. Skill requests, if any, are ordinary prompt text inside the definition rather than template requirements or host compilation bindings.
 
 ## Typed transforms and state envelopes
 

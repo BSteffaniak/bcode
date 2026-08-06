@@ -17,13 +17,24 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "workflow.db";
-const SCHEMA_VERSION: u32 = 11;
+const LOCK_FILE: &str = "workflow.lock";
+const ARTIFACT_DIRECTORY: &str = "artifacts";
+const RESET_RECEIPT_FILE: &str = "workflow-reset-receipt.json";
+const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
+/// Stable destructive confirmation required by public workflow-store reset surfaces.
+pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
+/// Current clean-break workflow store schema version.
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 12;
+/// Current bounded workflow-store reset receipt version.
+pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current durable workflow execution-session link contract version.
 pub const WORKFLOW_EXECUTION_SESSION_LINK_VERSION: u32 = 1;
 /// Current durable authored-run provenance contract version.
@@ -162,7 +173,7 @@ pub struct WorkflowRunSummary {
     pub definition_version: u32,
     pub workspace_snapshot: String,
     pub parent_session_id: Option<String>,
-    /// Exact accepted parent generation for fixed-generation workflow agent contexts.
+    /// Exact accepted parent generation for fixed-generation workflow prompt contexts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_generation: Option<u64>,
     #[serde(default)]
@@ -176,7 +187,7 @@ pub struct WorkflowRunSummary {
     /// Checksum of the canonical successful terminal output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_output_checksum_sha256: Option<String>,
-    /// Persisted immutable authorization ceiling for this run and its descendants.
+    /// Persisted immutable pinned authorization profile for this run and its descendants.
     #[serde(default)]
     pub authorization_ceiling: bcode_workflow::WorkflowToolCapability,
     pub status: RunStatus,
@@ -412,7 +423,7 @@ pub struct NewWorkflowRun {
     pub workspace_snapshot: String,
     /// Optional parent session identity serialized without coupling this store to session logic.
     pub parent_session_id: Option<String>,
-    /// Exact accepted parent-session generation pinned at root admission when workflow agents use
+    /// Exact accepted parent-session generation pinned at root admission when workflow prompts use
     /// fixed-generation context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_generation: Option<u64>,
@@ -428,6 +439,8 @@ pub struct NewWorkflowRun {
     /// Creation timestamp supplied by the host clock.
     pub created_at_ms: u64,
     /// Maximum capability inherited from the initiating context for this run and descendants.
+    /// This immutable value is the run's pinned authorization profile: every attempt still requires
+    /// normalized operation authorization, while no retry, restart, or child may exceed this ceiling.
     #[serde(default)]
     pub authorization_ceiling: bcode_workflow::WorkflowToolCapability,
     /// Persisted execution limits enforced by durable admission.
@@ -925,16 +938,25 @@ pub struct ActivationDispatchSummary {
 /// Host owner boundary for executable durable workflow activations.
 pub trait ActivationDispatchOwner: Sync {
     /// Build the exact bounded intent that must be committed before external dispatch.
+    /// Blocks with `preparation_required` must complete the versioned owner preparation contract;
+    /// `operation_facts`, descriptor, owner identity, exact input checksum, and preparation version
+    /// are persisted opaquely in this intent before authorization or dispatch.
     ///
     /// Returning `None` leaves an unsupported activation pending for another owner.
     ///
     /// # Errors
     ///
     /// Returns an error when the node contract is malformed or policy admission fails.
-    fn plan(
-        &self,
-        activation: &PendingActivation,
-    ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError>;
+    fn plan<'a>(
+        &'a self,
+        activation: &'a PendingActivation,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<ActivationDispatchPlan>, WorkflowStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
 
     /// Dispatch one activation only after its prepared intent has committed.
     ///
@@ -1080,9 +1102,39 @@ pub enum WorkflowStoreError {
         expected: u64,
         current: u64,
     },
+    /// An existing workflow database belongs to an unsupported schema generation.
+    #[error(
+        "unsupported workflow store schema version {actual:?}; expected {expected}; run the explicit workflow-store reset maintenance operation after reviewing the retained state"
+    )]
+    UnsupportedStore {
+        /// Detected schema version, or `None` when the contract table is absent or malformed.
+        actual: Option<u32>,
+        /// Sole supported clean-break schema version.
+        expected: u32,
+    },
     /// Persisted data violated the storage contract.
     #[error("invalid workflow store data: {0}")]
     InvalidData(String),
+}
+
+/// Bounded durable evidence from one explicit destructive workflow-store reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStoreResetReceipt {
+    /// Must equal [`WORKFLOW_STORE_RESET_RECEIPT_VERSION`].
+    pub version: u32,
+    /// Store schema detected before reset, when readable.
+    pub previous_schema_version: Option<u32>,
+    /// Newly initialized clean-break store schema.
+    pub new_schema_version: u32,
+    /// Canonical retained backup database path.
+    pub backup_path: PathBuf,
+    /// SHA-256 of the verified backup database bytes.
+    pub backup_sha256: String,
+    /// Number of workflow-owned artifact entries removed.
+    pub removed_artifact_entries: u64,
+    /// Caller-supplied maintenance timestamp.
+    pub reset_at_ms: u64,
 }
 
 /// Canonical persisted definition identity and content.
@@ -1277,6 +1329,7 @@ pub struct WorkflowAuthoringRepairReport {
 pub struct WorkflowStore {
     path: PathBuf,
     connection: Connection,
+    _ownership: File,
 }
 
 impl WorkflowStore {
@@ -1284,7 +1337,7 @@ impl WorkflowStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when the directory/database cannot be opened or migrations fail.
+    /// Returns an error when the directory/database cannot be opened or an existing schema is unsupported.
     pub fn open_in_state_dir(state_dir: &Path) -> Result<Self, WorkflowStoreError> {
         Self::open_at(&workflow_database_path(state_dir))
     }
@@ -1296,7 +1349,7 @@ impl WorkflowStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when the directory/database cannot be opened or migrations fail.
+    /// Returns an error when the directory/database cannot be opened or an existing schema is unsupported.
     pub fn open_at_path(path: &Path) -> Result<Self, WorkflowStoreError> {
         Self::open_at(path)
     }
@@ -1305,23 +1358,132 @@ impl WorkflowStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when the directory/database cannot be opened or migrations fail.
+    /// Returns an error when the directory/database cannot be opened or an existing schema is unsupported.
     pub fn open_default() -> Result<Self, WorkflowStoreError> {
         Self::open_in_state_dir(&bcode_config::default_state_dir())
     }
 
     fn open_at(path: &Path) -> Result<Self, WorkflowStoreError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let root = path.parent().ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow database has no parent directory".to_string())
+        })?;
+        std::fs::create_dir_all(root)?;
+        let ownership = open_ownership_file(root)?;
+        ownership.lock_shared()?;
+        let existed = path.exists();
         let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        migrate(&mut connection)?;
+        if existed {
+            verify_store_schema(&connection)?;
+        } else {
+            initialize_schema(&mut connection)?;
+        }
         Ok(Self {
             path: path.to_path_buf(),
             connection,
+            _ownership: ownership,
         })
+    }
+
+    /// Explicitly replace incompatible workflow state after retaining a verified backup.
+    ///
+    /// This destructive maintenance operation takes exclusive workflow-store ownership, verifies
+    /// that no store handles or `SQLite` writers are active, creates a confined backup, removes only
+    /// workflow-owned database sidecars and artifacts, initializes the sole current schema, and
+    /// atomically records a bounded receipt. Normal open paths never invoke this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when ownership is unavailable, the database is already current or absent,
+    /// backup creation or verification fails, a workflow-owned path is unsafe, or reset fails.
+    pub fn reset_incompatible_store_in_state_dir(
+        state_dir: &Path,
+        reset_at_ms: u64,
+    ) -> Result<WorkflowStoreResetReceipt, WorkflowStoreError> {
+        let path = workflow_database_path(state_dir);
+        let root = path.parent().ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow database has no parent directory".to_string())
+        })?;
+        std::fs::create_dir_all(root)?;
+        let ownership = open_ownership_file(root)?;
+        match ownership.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow store reset requires exclusive ownership; stop active workflow writers"
+                        .to_string(),
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        if !path.is_file() {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow store reset requires an existing incompatible database".to_string(),
+            ));
+        }
+
+        let source = Connection::open(&path)?;
+        source.busy_timeout(std::time::Duration::ZERO)?;
+        let previous_schema_version = detected_store_schema(&source);
+        if previous_schema_version == Some(WORKFLOW_STORE_SCHEMA_VERSION) {
+            return Err(WorkflowStoreError::InvalidData(
+                "refusing to reset a current workflow store".to_string(),
+            ));
+        }
+        source.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        let backup_directory = root.join(RESET_BACKUP_DIRECTORY);
+        std::fs::create_dir_all(&backup_directory)?;
+        let backup_path = backup_directory.join(format!("workflow-{reset_at_ms}"));
+        std::fs::create_dir(&backup_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                WorkflowStoreError::InvalidData(
+                    "workflow reset backup already exists for this timestamp".to_string(),
+                )
+            } else {
+                error.into()
+            }
+        })?;
+        let backup_database = backup_path.join(DATABASE_FILE);
+        source.backup(rusqlite::DatabaseName::Main, &backup_database, None)?;
+        drop(source);
+        let backup_sha256 = verify_reset_backup(&backup_database)?;
+        let artifacts = root.join(ARTIFACT_DIRECTORY);
+        let backup_artifacts = backup_path.join(ARTIFACT_DIRECTORY);
+        let removed_artifact_entries = backup_workflow_artifacts(&artifacts, &backup_artifacts)?;
+
+        let reset = (|| -> Result<WorkflowStoreResetReceipt, WorkflowStoreError> {
+            if artifacts.exists() {
+                std::fs::remove_dir_all(&artifacts)?;
+            }
+            std::fs::remove_file(&path)?;
+            for sidecar in [path.with_extension("db-wal"), path.with_extension("db-shm")] {
+                if sidecar.exists() {
+                    std::fs::remove_file(sidecar)?;
+                }
+            }
+            let mut connection = Connection::open(&path)?;
+            connection.pragma_update(None, "foreign_keys", true)?;
+            initialize_schema(&mut connection)?;
+            verify_store_schema(&connection)?;
+            drop(connection);
+
+            let receipt = WorkflowStoreResetReceipt {
+                version: WORKFLOW_STORE_RESET_RECEIPT_VERSION,
+                previous_schema_version,
+                new_schema_version: WORKFLOW_STORE_SCHEMA_VERSION,
+                backup_path: backup_path.clone(),
+                backup_sha256: backup_sha256.clone(),
+                removed_artifact_entries,
+                reset_at_ms,
+            };
+            write_reset_receipt(root, &receipt)?;
+            Ok(receipt)
+        })();
+        if reset.is_err() {
+            restore_reset_backup(&path, &artifacts, &backup_database, &backup_artifacts)?;
+        }
+        reset
     }
 
     /// Return the canonical database path.
@@ -3116,7 +3278,7 @@ impl WorkflowStore {
             [],
             |row| row.get(0),
         )?;
-        if integrity != "ok" || backup_version != SCHEMA_VERSION {
+        if integrity != "ok" || backup_version != WORKFLOW_STORE_SCHEMA_VERSION {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow maintenance backup verification failed".to_string(),
             ));
@@ -3744,7 +3906,7 @@ impl WorkflowStore {
             "SELECT l.root_run_id, l.parent_run_id, l.parent_node_id, l.parent_activation_id, \
              l.parent_attempt, l.child_run_id, l.version, l.target_json, l.depth, l.created_at_ms, \
              r.run_id, r.definition_id, r.definition_version, r.workspace_snapshot, \
-             r.parent_session_id, r.owner_plugin_id, r.workflow_kind, r.scope_key, r.display_label, \
+             r.parent_session_id, r.parent_session_generation, r.owner_plugin_id, r.workflow_kind, r.scope_key, r.display_label, \
              r.single_active, r.authored_provenance_json, r.terminal_output_id, \
              r.terminal_output_checksum_sha256, r.authorization_ceiling, r.status, \
              r.cancellation_requested_at_ms, r.created_at_ms, r.updated_at_ms \
@@ -5277,7 +5439,7 @@ impl WorkflowStore {
     {
         let mut summary = ActivationDispatchSummary::default();
         for activation in pending {
-            let Some(plan) = owner.plan(&activation)? else {
+            let Some(plan) = owner.plan(&activation).await? else {
                 summary.unsupported.push(activation.activation_id);
                 continue;
             };
@@ -5482,6 +5644,108 @@ impl WorkflowStore {
         Ok(identity)
     }
 
+    /// Classify one owner observation and schedule it only when the durable retry policy permits.
+    ///
+    /// Non-terminal observations return `Ok(None)`. Terminal unsafe outcomes fail closed through
+    /// the same finite policy used by direct scheduling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an ineligible terminal outcome, missing/stale durable attempt state,
+    /// exhausted limits, invalid backoff, conflicting schedule identity, or database failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn schedule_automatic_retry_from_observation(
+        &mut self,
+        request: &AttemptReconciliationRequest,
+        observation: &AttemptObservation,
+        effect: bcode_workflow::WorkflowBlockEffect,
+        reconciliation: bcode_workflow::WorkflowBlockReconciliation,
+        max_attempts: u32,
+        backoff_ms: u64,
+        scheduled_at_ms: u64,
+    ) -> Result<Option<AutomaticRetrySchedule>, WorkflowStoreError> {
+        let failure = match observation {
+            AttemptObservation::Failed { .. } => {
+                bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable
+            }
+            AttemptObservation::Unknown => {
+                bcode_workflow::AutomaticRetryFailureKind::AmbiguousMutation
+            }
+            AttemptObservation::Cancelled => {
+                bcode_workflow::AutomaticRetryFailureKind::Cancellation
+            }
+            AttemptObservation::Paused {
+                reason: AttemptPauseReason::IdleTimeout,
+                ..
+            } => bcode_workflow::AutomaticRetryFailureKind::TerminalTimeout,
+            AttemptObservation::Paused { .. } => {
+                bcode_workflow::AutomaticRetryFailureKind::TerminalFailure
+            }
+            AttemptObservation::Admitted
+            | AttemptObservation::Running
+            | AttemptObservation::Succeeded { .. } => return Ok(None),
+        };
+        self.schedule_automatic_retry_for_failed_attempt(
+            &request.run_id,
+            &request.node_id,
+            &request.activation_id,
+            failure,
+            effect,
+            reconciliation,
+            max_attempts,
+            backoff_ms,
+            scheduled_at_ms,
+        )
+        .map(Some)
+    }
+
+    /// Derive current durable attempt/run facts and persist an eligible retry schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing durable state, ineligible failure/effect/reconciliation facts,
+    /// exhausted limits, conflicting schedules, invalid backoff, or database failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn schedule_automatic_retry_for_failed_attempt(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        failure_kind: bcode_workflow::AutomaticRetryFailureKind,
+        effect: bcode_workflow::WorkflowBlockEffect,
+        reconciliation: bcode_workflow::WorkflowBlockReconciliation,
+        max_attempts: u32,
+        backoff_ms: u64,
+        scheduled_at_ms: u64,
+    ) -> Result<AutomaticRetrySchedule, WorkflowStoreError> {
+        let (attempts_completed, retry_cap): (u32, u32) = self.connection.query_row(
+            "SELECT COALESCE(MAX(attempt.attempt), 0), run.retry_cap \
+             FROM workflow_runs run LEFT JOIN workflow_attempts attempt \
+               ON attempt.run_id = run.run_id AND attempt.node_id = ?2 \
+              AND attempt.activation_id = ?3 WHERE run.run_id = ?1 \
+             GROUP BY run.retry_cap",
+            (run_id, node_id, activation_id),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        self.schedule_automatic_retry(
+            bcode_workflow::AutomaticRetryEligibility {
+                version: bcode_workflow::WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION,
+                effect,
+                reconciliation,
+                failure: failure_kind,
+                attempts_completed,
+                max_attempts,
+                retry_cap,
+            },
+            run_id,
+            node_id,
+            activation_id,
+            failure_kind,
+            backoff_ms,
+            scheduled_at_ms,
+        )
+    }
+
     /// Persist an eligible automatic-retry schedule without sleeping or requeueing work.
     ///
     /// The exact next attempt and due time are durable and idempotent. Production capability
@@ -5576,6 +5840,70 @@ impl WorkflowStore {
         }
         transaction.commit()?;
         Ok(schedule)
+    }
+
+    /// Consume the next due automatic-retry schedule for one run using bounded indexed discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, corrupt schedule state, stale/cancelled retry state,
+    /// or database failure.
+    pub fn consume_next_due_automatic_retry_for_run(
+        &mut self,
+        run_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<WorkflowNodeRetryResult>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let schedule = self
+            .connection
+            .query_row(
+                "SELECT node_id, activation_id FROM workflow_retry_schedules \
+                 WHERE run_id = ?1 AND next_attempt_at_ms <= ?2 \
+                 ORDER BY next_attempt_at_ms, node_id, activation_id LIMIT 1",
+                (run_id, now_ms),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((node_id, activation_id)) = schedule else {
+            return Ok(None);
+        };
+        self.consume_due_automatic_retry(run_id, &node_id, &activation_id, now_ms)
+            .map(Some)
+    }
+
+    /// Atomically consume one due automatic-retry schedule and requeue its exact failed activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schedule is missing, not due, stale, cancelled, exhausted, or no
+    /// longer points at the latest failed attempt.
+    pub fn consume_due_automatic_retry(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        now_ms: u64,
+    ) -> Result<WorkflowNodeRetryResult, WorkflowStoreError> {
+        let schedule = self
+            .automatic_retry_schedule(run_id, node_id, activation_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "automatic retry schedule does not exist".to_string(),
+                )
+            })?;
+        if schedule.next_attempt_at_ms > now_ms {
+            return Err(WorkflowStoreError::InvalidData(
+                "automatic retry schedule is not due".to_string(),
+            ));
+        }
+        self.retry_failed_node_with_schedule(
+            run_id,
+            node_id,
+            activation_id,
+            schedule.failed_attempt,
+            now_ms,
+            Some(&schedule),
+        )
     }
 
     /// Load one exact persisted automatic-retry schedule.
@@ -6555,6 +6883,26 @@ impl WorkflowStore {
         failed_attempt: u32,
         retried_at_ms: u64,
     ) -> Result<WorkflowNodeRetryResult, WorkflowStoreError> {
+        self.retry_failed_node_with_schedule(
+            run_id,
+            node_id,
+            activation_id,
+            failed_attempt,
+            retried_at_ms,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn retry_failed_node_with_schedule(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        failed_attempt: u32,
+        retried_at_ms: u64,
+        retry_schedule: Option<&AutomaticRetrySchedule>,
+    ) -> Result<WorkflowNodeRetryResult, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
         validate_id("node_id", node_id)?;
         validate_id("activation_id", activation_id)?;
@@ -6665,6 +7013,36 @@ impl WorkflowStore {
             &serde_json::to_string(&result)?,
             retried_at_ms,
         )?;
+        if let Some(schedule) = retry_schedule {
+            if schedule.failed_attempt != failed_attempt || schedule.next_attempt != next_attempt {
+                return Err(WorkflowStoreError::InvalidData(
+                    "automatic retry schedule next attempt became stale".to_string(),
+                ));
+            }
+            let removed = transaction.execute(
+                "DELETE FROM workflow_retry_schedules WHERE run_id = ?1 AND node_id = ?2 \
+                 AND activation_id = ?3 AND failed_attempt = ?4 AND next_attempt = ?5",
+                (
+                    run_id,
+                    node_id,
+                    activation_id,
+                    schedule.failed_attempt,
+                    schedule.next_attempt,
+                ),
+            )?;
+            if removed != 1 {
+                return Err(WorkflowStoreError::InvalidData(
+                    "automatic retry schedule changed before consumption".to_string(),
+                ));
+            }
+            append_event(
+                &transaction,
+                run_id,
+                "automatic_retry_consumed",
+                &serde_json::to_string(schedule)?,
+                retried_at_ms,
+            )?;
+        }
         transaction.commit()?;
         Ok(result)
     }
@@ -9653,6 +10031,188 @@ pub fn workflow_database_path(state_dir: &Path) -> PathBuf {
     state_dir.join("workflows").join(DATABASE_FILE)
 }
 
+fn open_ownership_file(root: &Path) -> Result<File, WorkflowStoreError> {
+    Ok(OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(LOCK_FILE))?)
+}
+
+fn detected_store_schema(connection: &Connection) -> Option<u32> {
+    connection
+        .query_row(
+            "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
+            [],
+            |row| row.get::<_, u32>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+}
+
+fn verify_reset_backup(path: &Path) -> Result<String, WorkflowStoreError> {
+    let backup = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let integrity =
+        backup.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
+    if integrity != "ok" {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow reset backup failed integrity verification: {integrity}"
+        )));
+    }
+    drop(backup);
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut encoded, byte| {
+            write!(encoded, "{byte:02x}").expect("writing to a string cannot fail");
+            encoded
+        }))
+}
+
+fn backup_workflow_artifacts(source: &Path, backup: &Path) -> Result<u64, WorkflowStoreError> {
+    if !source.exists() {
+        return Ok(0);
+    }
+    if !source.is_dir() {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow artifact root is not a directory".to_string(),
+        ));
+    }
+    copy_artifact_tree_verified(source, backup, 0)
+}
+
+fn copy_artifact_tree_verified(
+    source: &Path,
+    destination: &Path,
+    depth: usize,
+) -> Result<u64, WorkflowStoreError> {
+    if depth > 64 {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow artifact tree exceeds 64 directories of depth".to_string(),
+        ));
+    }
+    std::fs::create_dir(destination)?;
+    let mut copied = 0_u64;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if kind.is_symlink() {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow artifact backup refuses symbolic links".to_string(),
+            ));
+        }
+        if kind.is_dir() {
+            copied = copied
+                .checked_add(copy_artifact_tree_verified(
+                    &entry.path(),
+                    &target,
+                    depth + 1,
+                )?)
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "workflow artifact entry count exceeds u64".to_string(),
+                    )
+                })?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target)?;
+            if sha256_file(&entry.path())? != sha256_file(&target)? {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow artifact backup checksum verification failed".to_string(),
+                ));
+            }
+            copied = copied.checked_add(1).ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow artifact entry count exceeds u64".to_string(),
+                )
+            })?;
+        } else {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow artifact backup refuses non-file entries".to_string(),
+            ));
+        }
+    }
+    Ok(copied)
+}
+
+fn restore_reset_backup(
+    database: &Path,
+    artifacts: &Path,
+    backup_database: &Path,
+    backup_artifacts: &Path,
+) -> Result<(), WorkflowStoreError> {
+    if database.exists() {
+        std::fs::remove_file(database)?;
+    }
+    std::fs::copy(backup_database, database)?;
+    if artifacts.exists() {
+        std::fs::remove_dir_all(artifacts)?;
+    }
+    if backup_artifacts.exists() {
+        copy_artifact_tree_verified(backup_artifacts, artifacts, 0)?;
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, WorkflowStoreError> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut encoded, byte| {
+            write!(encoded, "{byte:02x}").expect("writing to a string cannot fail");
+            encoded
+        }))
+}
+
+fn write_reset_receipt(
+    root: &Path,
+    receipt: &WorkflowStoreResetReceipt,
+) -> Result<(), WorkflowStoreError> {
+    let path = root.join(RESET_RECEIPT_FILE);
+    if path.exists() {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow reset receipt already exists; retain it before another reset".to_string(),
+        ));
+    }
+    let temporary = root.join(format!("{RESET_RECEIPT_FILE}.tmp-{}", receipt.reset_at_ms));
+    let bytes = serde_json::to_vec_pretty(receipt)?;
+    if bytes.len() > 16_384 {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow reset receipt exceeds 16384 bytes".to_string(),
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn verify_stored_definition(
     stored: StoredWorkflowDefinition,
 ) -> Result<StoredWorkflowDefinition, WorkflowStoreError> {
@@ -9856,6 +10416,13 @@ fn validate_mutation_approval_input_checksum(
     if sha256_hex(&input) != approval.scope.input_checksum_sha256 {
         return Err(WorkflowStoreError::InvalidData(
             "mutation approval input checksum is stale".to_string(),
+        ));
+    }
+    if approval.scope.operation_facts.is_some()
+        != approval.scope.preparation_descriptor_sha256.is_some()
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "mutation approval preparation identity is incomplete".to_string(),
         ));
     }
     Ok(())
@@ -10263,7 +10830,7 @@ fn required_definition_capability(
             |maximum, node| {
                 let capability = match node.kind {
                     bcode_workflow::NodeKind::Agent => {
-                        let configuration: bcode_workflow::WorkflowAgentConfiguration =
+                        let configuration: bcode_workflow::WorkflowPromptConfiguration =
                             serde_json::from_value(node.configuration.clone())?;
                         configuration.tool_capability
                     }
@@ -11091,16 +11658,13 @@ fn decode_workflow_preset(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowP
 }
 
 #[allow(clippy::too_many_lines)]
-fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
+fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
     let transaction = connection.transaction()?;
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS workflow_store_contract (\
              contract_id INTEGER PRIMARY KEY CHECK (contract_id = 1),\
              schema_version INTEGER NOT NULL\
          );\
-         INSERT OR IGNORE INTO workflow_store_contract (contract_id, schema_version) VALUES (1, 3);\
-         UPDATE workflow_store_contract SET schema_version = 2 WHERE contract_id = 1 AND schema_version = 1;\
-         UPDATE workflow_store_contract SET schema_version = 3 WHERE contract_id = 1 AND schema_version = 2;\
          CREATE TABLE IF NOT EXISTS workflow_definitions (\
              definition_id TEXT NOT NULL,\
              version INTEGER NOT NULL CHECK (version > 0),\
@@ -11295,81 +11859,6 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              last_event_seq INTEGER NOT NULL\
          );",
     )?;
-    let columns = transaction
-        .prepare("PRAGMA table_info(workflow_activations)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|column| column == "input_json") {
-        transaction.execute(
-            "ALTER TABLE workflow_activations ADD COLUMN input_json TEXT",
-            [],
-        )?;
-    }
-    let grant_columns = transaction
-        .prepare("PRAGMA table_info(workflow_grants)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !grant_columns.iter().any(|column| column == "max_uses") {
-        transaction.execute(
-            "ALTER TABLE workflow_grants ADD COLUMN max_uses INTEGER",
-            [],
-        )?;
-    }
-    if !grant_columns.iter().any(|column| column == "uses_consumed") {
-        transaction.execute(
-            "ALTER TABLE workflow_grants ADD COLUMN uses_consumed INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    transaction.execute(
-        "UPDATE workflow_store_contract SET schema_version = 4 \
-         WHERE contract_id = 1 AND schema_version = 3",
-        [],
-    )?;
-    let run_columns = transaction
-        .prepare("PRAGMA table_info(workflow_runs)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    for (column, sql) in [
-        (
-            "owner_plugin_id",
-            "ALTER TABLE workflow_runs ADD COLUMN owner_plugin_id TEXT",
-        ),
-        (
-            "workflow_kind",
-            "ALTER TABLE workflow_runs ADD COLUMN workflow_kind TEXT",
-        ),
-        (
-            "scope_key",
-            "ALTER TABLE workflow_runs ADD COLUMN scope_key TEXT",
-        ),
-        (
-            "display_label",
-            "ALTER TABLE workflow_runs ADD COLUMN display_label TEXT",
-        ),
-        (
-            "single_active",
-            "ALTER TABLE workflow_runs ADD COLUMN single_active INTEGER NOT NULL DEFAULT 0",
-        ),
-    ] {
-        if !run_columns.iter().any(|existing| existing == column) {
-            transaction.execute(sql, [])?;
-        }
-    }
-    transaction.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_workflow_runs_binding_updated \
-             ON workflow_runs(owner_plugin_id, workflow_kind, scope_key, updated_at_ms DESC, run_id);",
-    )?;
-    transaction.execute(
-        "UPDATE workflow_store_contract SET schema_version = 5 \
-         WHERE contract_id = 1 AND schema_version = 4",
-        [],
-    )?;
-    transaction.execute(
-        "UPDATE workflow_store_contract SET schema_version = 6 \
-         WHERE contract_id = 1 AND schema_version = 5",
-        [],
-    )?;
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS authored_workflows (\
              workflow_id TEXT PRIMARY KEY NOT NULL,\
@@ -11455,115 +11944,29 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              ON workflow_authoring_events(workflow_id, event_seq);",
     )?;
     transaction.execute(
-        "UPDATE workflow_store_contract SET schema_version = 7 \
-         WHERE contract_id = 1 AND schema_version = 6",
-        [],
+        "INSERT INTO workflow_store_contract (contract_id, schema_version) VALUES (1, ?1)",
+        [WORKFLOW_STORE_SCHEMA_VERSION],
     )?;
-    let run_columns = transaction
-        .prepare("PRAGMA table_info(workflow_runs)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !run_columns
-        .iter()
-        .any(|existing| existing == "authored_provenance_json")
-    {
-        transaction.execute(
-            "ALTER TABLE workflow_runs ADD COLUMN authored_provenance_json TEXT",
-            [],
-        )?;
-    }
-    transaction.execute(
-        "UPDATE workflow_store_contract SET schema_version = 8 \
-         WHERE contract_id = 1 AND schema_version = 7",
-        [],
-    )?;
-    let run_columns = transaction
-        .prepare("PRAGMA table_info(workflow_runs)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !run_columns
-        .iter()
-        .any(|existing| existing == "terminal_output_id")
-    {
-        transaction.execute(
-            "ALTER TABLE workflow_runs ADD COLUMN terminal_output_id TEXT",
-            [],
-        )?;
-    }
-    if !run_columns
-        .iter()
-        .any(|existing| existing == "terminal_output_checksum_sha256")
-    {
-        transaction.execute(
-            "ALTER TABLE workflow_runs ADD COLUMN terminal_output_checksum_sha256 TEXT",
-            [],
-        )?;
-    }
-    if !run_columns
-        .iter()
-        .any(|existing| existing == "authorization_ceiling")
-    {
-        transaction.execute(
-            "ALTER TABLE workflow_runs ADD COLUMN authorization_ceiling TEXT NOT NULL DEFAULT 'disabled'",
-            [],
-        )?;
-    }
-    transaction.execute(
-        "UPDATE workflow_store_contract SET schema_version = 9 \
-         WHERE contract_id = 1 AND schema_version = 8",
-        [],
-    )?;
-    transaction.execute_batch(
-        "CREATE TABLE IF NOT EXISTS workflow_execution_sessions (\
-             version INTEGER NOT NULL CHECK (version > 0),\
-             run_id TEXT NOT NULL,\
-             node_id TEXT NOT NULL,\
-             activation_id TEXT NOT NULL,\
-             attempt INTEGER NOT NULL CHECK (attempt > 0),\
-             session_id TEXT NOT NULL UNIQUE,\
-             workspace_snapshot TEXT NOT NULL,\
-             created_at_ms INTEGER NOT NULL,\
-             PRIMARY KEY (run_id, node_id, activation_id, attempt),\
-             FOREIGN KEY (run_id, node_id, activation_id, attempt)\
-                 REFERENCES workflow_attempts(run_id, node_id, activation_id, attempt)\
-         );\
-         CREATE INDEX IF NOT EXISTS idx_workflow_execution_sessions_run \
-             ON workflow_execution_sessions(run_id, created_at_ms, session_id);",
-    )?;
-    transaction.execute(
-        "UPDATE workflow_store_contract SET schema_version = 10 \
-         WHERE contract_id = 1 AND schema_version = 9",
-        [],
-    )?;
-    let run_columns = transaction
-        .prepare("PRAGMA table_info(workflow_runs)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !run_columns
-        .iter()
-        .any(|existing| existing == "parent_session_generation")
-    {
-        transaction.execute(
-            "ALTER TABLE workflow_runs ADD COLUMN parent_session_generation INTEGER",
-            [],
-        )?;
-    }
-    transaction.execute(
-        "UPDATE workflow_store_contract SET schema_version = 11 \
-         WHERE contract_id = 1 AND schema_version = 10",
-        [],
-    )?;
-    let actual: u32 = transaction.query_row(
-        "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    if actual != SCHEMA_VERSION {
-        return Err(WorkflowStoreError::InvalidData(format!(
-            "unsupported workflow schema version {actual}; expected {SCHEMA_VERSION}"
-        )));
-    }
     transaction.commit()?;
+    Ok(())
+}
+
+fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    let actual = connection
+        .query_row(
+            "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
+            [],
+            |row| row.get::<_, u32>(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if actual != Some(WORKFLOW_STORE_SCHEMA_VERSION) {
+        return Err(WorkflowStoreError::UnsupportedStore {
+            actual,
+            expected: WORKFLOW_STORE_SCHEMA_VERSION,
+        });
+    }
     Ok(())
 }
 
@@ -11819,14 +12222,14 @@ mod tests {
                         output: schema.clone(),
                         resources: Vec::new(),
                         configuration: serde_json::to_value(
-                            bcode_workflow::WorkflowAgentConfiguration {
-                                version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+                            bcode_workflow::WorkflowPromptConfiguration {
+                                version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
                                 execution_target:
-                                    bcode_workflow::AgentExecutionTarget::FreshIsolated,
+                                    bcode_workflow::PromptContextTarget::FreshIsolated,
                                 agent_profile: "review".to_string(),
                                 provider: None,
                                 model: None,
-                                structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                                structured_output: bcode_workflow::PromptStructuredOutputPolicy {
                                     schema,
                                     strict: true,
                                 },
@@ -11834,7 +12237,6 @@ mod tests {
                                 tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
                                 tool_allowlist: Vec::new(),
                                 timeout_ms: 30_000,
-                                skills: Vec::new(),
                                 prompt_mode: "json_input".to_string(),
                                 system_prompt: "Review input".to_string(),
                             },
@@ -11854,7 +12256,6 @@ mod tests {
                 plugins: std::collections::BTreeSet::new(),
                 blocks: std::collections::BTreeSet::new(),
                 agents: std::collections::BTreeSet::from(["review".to_string()]),
-                skills: std::collections::BTreeSet::new(),
             },
             run_limits: WorkflowRunLimitPolicy::default(),
             producer: WorkflowProducerProvenance {
@@ -11895,7 +12296,6 @@ mod tests {
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: std::collections::BTreeSet::from(["review".to_string()]),
-            skills: std::collections::BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         };
         (workflow, draft, catalog)
@@ -12146,6 +12546,8 @@ mod tests {
                 block_version: 1,
                 operation: "git.commit".to_string(),
                 input_checksum_sha256: sha256_hex(input_json.as_bytes()),
+                operation_facts: None,
+                preparation_descriptor_sha256: None,
                 input_summary: input.clone(),
                 resource_claims: vec![bcode_workflow::ResourceClaim {
                     resource: "repository".to_string(),
@@ -12157,6 +12559,92 @@ mod tests {
             requested_at_ms: 20,
             expires_at_ms: Some(100),
         }
+    }
+
+    #[test]
+    fn prepared_mutation_approval_facts_are_persisted_and_survive_restart() {
+        let temp = tempfile::tempdir().expect("temp");
+        let input = serde_json::json!({"expected_head": "abc"});
+        let mut approval = mutation_approval(&input);
+        approval.scope.operation_facts = Some(serde_json::json!({
+            "version": 1,
+            "program": "git",
+            "arguments": ["commit"]
+        }));
+        approval.scope.preparation_descriptor_sha256 = Some("a".repeat(64));
+        {
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("mutation-definition", 1, &mutation_approval_definition())
+                .expect("definition");
+            store
+                .create_run(&NewWorkflowRun {
+                    run_id: "mutation-run".to_string(),
+                    definition_id: "mutation-definition".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: None,
+                    parent_session_generation: None,
+                    binding: None,
+                    authored_provenance: None,
+                    input: Some(input),
+                    created_at_ms: 10,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                    limits: WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            store
+                .request_mutation_approval(&approval)
+                .expect("approval");
+            store
+                .request_mutation_approval(&approval)
+                .expect("duplicate approval");
+            assert_eq!(
+                store
+                    .pending_mutation_approvals("mutation-run", 10)
+                    .expect("pending duplicate")
+                    .len(),
+                1
+            );
+            let resolution = store
+                .resolve_mutation_approval(
+                    &approval.approval_id,
+                    WorkflowMutationApprovalDecision::Approve,
+                    25,
+                )
+                .expect("approve prepared facts");
+            assert!(resolution.grant_id.is_some());
+            let grant = store
+                .grants_for_run("mutation-run", 10)
+                .expect("grant")
+                .pop()
+                .expect("prepared grant");
+            assert_eq!(
+                grant.scope,
+                serde_json::to_value(&approval.scope).expect("scope")
+            );
+        }
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert!(
+            store
+                .pending_mutation_approvals("mutation-run", 10)
+                .expect("approvals")
+                .is_empty()
+        );
+        let restored: bcode_workflow::WorkflowMutationGrantScope = serde_json::from_value(
+            store
+                .grants_for_run("mutation-run", 10)
+                .expect("grants")
+                .pop()
+                .expect("grant")
+                .scope,
+        )
+        .expect("prepared scope");
+        assert_eq!(restored.operation_facts, approval.scope.operation_facts);
+        assert_eq!(
+            restored.preparation_descriptor_sha256,
+            approval.scope.preparation_descriptor_sha256
+        );
     }
 
     #[test]
@@ -12230,14 +12718,22 @@ mod tests {
     struct MutationDispatchOwner(std::sync::atomic::AtomicUsize);
 
     impl ActivationDispatchOwner for MutationDispatchOwner {
-        fn plan(
-            &self,
-            _activation: &PendingActivation,
-        ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
-            Ok(Some(ActivationDispatchPlan {
-                side_effect: DispatchSideEffect::Mutating,
-                intent: serde_json::json!({"operation": "git.commit"}),
-            }))
+        fn plan<'a>(
+            &'a self,
+            _activation: &'a PendingActivation,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<ActivationDispatchPlan>, WorkflowStoreError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(Some(ActivationDispatchPlan {
+                    side_effect: DispatchSideEffect::Mutating,
+                    intent: serde_json::json!({"operation": "git.commit"}),
+                }))
+            })
         }
 
         fn dispatch<'a>(
@@ -12734,8 +13230,24 @@ mod tests {
         assert!(store.create_run_idempotent(&run).expect("create"));
         assert!(!store.create_run_idempotent(&run).expect("idempotent"));
         assert_eq!(store.list_runs(10).expect("runs").len(), 1);
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let restored = store
+            .run_summary(&run.run_id)
+            .expect("restored run")
+            .expect("run");
+        assert_eq!(restored.authorization_ceiling, run.authorization_ceiling);
+        assert!(
+            !store
+                .create_run_idempotent(&run)
+                .expect("restart idempotent")
+        );
 
         for conflict in [
+            NewWorkflowRun {
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                ..run.clone()
+            },
             NewWorkflowRun {
                 authored_provenance: None,
                 input: Some(serde_json::json!(2)),
@@ -12823,14 +13335,22 @@ mod tests {
 
         struct Owner(Mutex<Vec<String>>);
         impl ActivationDispatchOwner for Owner {
-            fn plan(
-                &self,
-                _activation: &PendingActivation,
-            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
-                Ok(Some(ActivationDispatchPlan {
-                    side_effect: DispatchSideEffect::ReadOnly,
-                    intent: serde_json::json!({"operation": "review"}),
-                }))
+            fn plan<'a>(
+                &'a self,
+                _activation: &'a PendingActivation,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ActivationDispatchPlan>, WorkflowStoreError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(Some(ActivationDispatchPlan {
+                        side_effect: DispatchSideEffect::ReadOnly,
+                        intent: serde_json::json!({"operation": "review"}),
+                    }))
+                })
             }
 
             fn dispatch<'a>(
@@ -12890,18 +13410,26 @@ mod tests {
             observed_status: Mutex<Option<String>>,
         }
         impl ActivationDispatchOwner for Owner {
-            fn plan(
-                &self,
-                activation: &PendingActivation,
-            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
-                Ok(
-                    (activation.node.kind == bcode_workflow::NodeKind::Task).then(|| {
-                        ActivationDispatchPlan {
-                            side_effect: DispatchSideEffect::ReadOnly,
-                            intent: serde_json::json!({"operation": "review"}),
-                        }
-                    }),
-                )
+            fn plan<'a>(
+                &'a self,
+                activation: &'a PendingActivation,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ActivationDispatchPlan>, WorkflowStoreError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(
+                        (activation.node.kind == bcode_workflow::NodeKind::Task).then(|| {
+                            ActivationDispatchPlan {
+                                side_effect: DispatchSideEffect::ReadOnly,
+                                intent: serde_json::json!({"operation": "review"}),
+                            }
+                        }),
+                    )
+                })
             }
 
             fn dispatch<'a>(
@@ -12956,14 +13484,22 @@ mod tests {
 
         struct Owner(AtomicUsize);
         impl ActivationDispatchOwner for Owner {
-            fn plan(
-                &self,
-                _activation: &PendingActivation,
-            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
-                Ok(Some(ActivationDispatchPlan {
-                    side_effect: DispatchSideEffect::Mutating,
-                    intent: serde_json::json!({"operation": "apply"}),
-                }))
+            fn plan<'a>(
+                &'a self,
+                _activation: &'a PendingActivation,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ActivationDispatchPlan>, WorkflowStoreError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(Some(ActivationDispatchPlan {
+                        side_effect: DispatchSideEffect::Mutating,
+                        intent: serde_json::json!({"operation": "apply"}),
+                    }))
+                })
             }
 
             fn dispatch<'a>(
@@ -14083,6 +14619,110 @@ mod tests {
     }
 
     #[test]
+    fn due_automatic_retry_consumption_is_atomic_and_cancellation_safe() {
+        struct FailedObserver;
+        impl AttemptStatusObserver for FailedObserver {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Failed {
+                    message: "retryable".to_string(),
+                })
+            }
+        }
+
+        let (_temp, mut store) = initialized_store();
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                10,
+            )
+            .expect("prepare")
+            .expect("attempt");
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                attempt: 1,
+                dispatch_identity: prepared.dispatch_identity,
+                receipt: serde_json::json!({"receipt": "failed"}),
+                admitted_at_ms: 11,
+            })
+            .expect("receipt");
+        store
+            .reconcile_receipt_backed_attempts(&FailedObserver, 10, 20)
+            .expect("failed");
+        let request = AttemptReconciliationRequest {
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_id(),
+            attempt: 1,
+            dispatch_identity: dispatch_identity("run-1", "review", &activation_id(), 1),
+            side_effect: DispatchSideEffect::ReadOnly,
+            receipt: serde_json::json!({"receipt": "failed"}),
+        };
+        store
+            .schedule_automatic_retry_from_observation(
+                &request,
+                &AttemptObservation::Failed {
+                    message: "retryable".to_string(),
+                },
+                bcode_workflow::WorkflowBlockEffect::ReadOnly,
+                bcode_workflow::WorkflowBlockReconciliation::ReceiptStatus,
+                3,
+                100,
+                20,
+            )
+            .expect("schedule from owner outcome")
+            .expect("retry schedule");
+        assert!(
+            store
+                .schedule_automatic_retry_from_observation(
+                    &request,
+                    &AttemptObservation::Unknown,
+                    bcode_workflow::WorkflowBlockEffect::Mutating,
+                    bcode_workflow::WorkflowBlockReconciliation::RepairRequired,
+                    3,
+                    100,
+                    20,
+                )
+                .is_err(),
+            "ambiguous owner outcomes must never schedule mutation retries"
+        );
+        assert!(
+            store
+                .consume_next_due_automatic_retry_for_run("run-1", 119)
+                .expect("nothing due")
+                .is_none()
+        );
+        let consumed = store
+            .consume_next_due_automatic_retry_for_run("run-1", 120)
+            .expect("due retry")
+            .expect("schedule");
+        assert_eq!(consumed.next_attempt, 2);
+        assert!(
+            store
+                .automatic_retry_schedule("run-1", "review", &activation_id())
+                .expect("schedule")
+                .is_none()
+        );
+        assert!(
+            store
+                .consume_next_due_automatic_retry_for_run("run-1", 121)
+                .expect("consumed schedule")
+                .is_none(),
+            "consumed schedules must not duplicate requeue"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn automatic_retry_backoff_schedule_survives_restart_without_requeueing() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = initialized_store_at(temp.path());
@@ -14159,6 +14799,34 @@ mod tests {
                 .filter(|event| event.event_type == "automatic_retry_scheduled")
                 .count(),
             1
+        );
+
+        let ambiguous = bcode_workflow::AutomaticRetryEligibility {
+            effect: bcode_workflow::WorkflowBlockEffect::Mutating,
+            reconciliation: bcode_workflow::WorkflowBlockReconciliation::RepairRequired,
+            failure: bcode_workflow::AutomaticRetryFailureKind::AmbiguousMutation,
+            ..eligibility
+        };
+        assert!(
+            reopened
+                .schedule_automatic_retry(
+                    ambiguous,
+                    "run-1",
+                    "review",
+                    &activation_id(),
+                    bcode_workflow::AutomaticRetryFailureKind::AmbiguousMutation,
+                    5_000,
+                    100,
+                )
+                .is_err(),
+            "ambiguous mutations must never acquire an automatic retry schedule"
+        );
+        assert_eq!(
+            reopened
+                .automatic_retry_schedule("run-1", "review", &activation_id())
+                .expect("existing schedule"),
+            Some(schedule),
+            "rejected conflicting facts must not alter the durable schedule"
         );
     }
 
@@ -14259,6 +14927,38 @@ mod tests {
                 .expect("history")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn cancelled_receipt_backed_mutation_is_terminal_not_repair_required() {
+        struct Observer;
+        impl AttemptStatusObserver for Observer {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Cancelled)
+            }
+        }
+
+        let (temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        store.request_cancellation("run-1", 19).expect("cancel");
+        let summary = store
+            .reconcile_receipt_backed_attempts(&Observer, 10, 20)
+            .expect("reconcile");
+        assert_eq!(summary.cancelled, [identity]);
+        assert!(summary.repair_required.is_empty());
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
         );
     }
 
@@ -14573,7 +15273,14 @@ mod tests {
                             unreachable!("definition target")
                         }
                     },
-                    definition_version: 1,
+                    definition_version: match &link.target {
+                        bcode_workflow::WorkflowCallTarget::Definition { identity } => {
+                            identity.definition_version
+                        }
+                        bcode_workflow::WorkflowCallTarget::AuthoredRevision { .. } => {
+                            unreachable!("definition target")
+                        }
+                    },
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: None,
                     parent_session_generation: None,
@@ -15602,7 +16309,7 @@ mod tests {
             schema: serde_json::json!({"type": "integer", "minimum": 0}),
         };
         let definition = bcode_workflow::WorkflowDefinition {
-            schema_version: 1,
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
             name: "input-gate".to_string(),
             input: schema.clone(),
             output: schema.clone(),
@@ -15718,7 +16425,7 @@ mod tests {
             schema: serde_json::json!({"type": "integer"}),
         };
         let definition = bcode_workflow::WorkflowDefinition {
-            schema_version: 1,
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
             name: "approval".to_string(),
             input: schema.clone(),
             output: schema.clone(),
@@ -15885,14 +16592,22 @@ mod tests {
 
         struct Owner(AtomicUsize);
         impl ActivationDispatchOwner for Owner {
-            fn plan(
-                &self,
-                _activation: &PendingActivation,
-            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
-                Ok(Some(ActivationDispatchPlan {
-                    side_effect: DispatchSideEffect::ReadOnly,
-                    intent: serde_json::json!({"operation": "review"}),
-                }))
+            fn plan<'a>(
+                &'a self,
+                _activation: &'a PendingActivation,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ActivationDispatchPlan>, WorkflowStoreError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(Some(ActivationDispatchPlan {
+                        side_effect: DispatchSideEffect::ReadOnly,
+                        intent: serde_json::json!({"operation": "review"}),
+                    }))
+                })
             }
 
             fn dispatch<'a>(
@@ -15969,13 +16684,21 @@ mod tests {
     async fn prepared_read_only_redispatch_reuses_identity_and_persists_receipt() {
         use std::sync::Mutex;
 
-        struct Owner(Mutex<Vec<String>>);
+        struct Owner(Mutex<Vec<(String, serde_json::Value)>>);
         impl ActivationDispatchOwner for Owner {
-            fn plan(
-                &self,
-                _activation: &PendingActivation,
-            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
-                unreachable!("redispatch uses the already committed intent")
+            fn plan<'a>(
+                &'a self,
+                _activation: &'a PendingActivation,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ActivationDispatchPlan>, WorkflowStoreError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(
+                    async move { unreachable!("redispatch uses the already committed intent") },
+                )
             }
 
             fn dispatch<'a>(
@@ -15988,7 +16711,7 @@ mod tests {
                     self.0
                         .lock()
                         .expect("calls")
-                        .push(request.dispatch_identity.clone());
+                        .push((request.dispatch_identity.clone(), request.intent.clone()));
                     Ok(serde_json::json!({"owner": "test"}))
                 })
             }
@@ -15996,13 +16719,24 @@ mod tests {
 
         let (temp, mut store) = initialized_store();
         let activation = activation_id();
+        let intent = serde_json::json!({
+            "operation": "review",
+            "preparation": {
+                "version": 1,
+                "owner_id": "bcode.test",
+                "input_sha256": "a".repeat(64),
+                "operation_facts": {"subject": "repository"},
+                "descriptor": {"nonce": "prepared-once"},
+                "diagnostics": []
+            }
+        });
         let identity = store
             .prepare_pending_activation(
                 "run-1",
                 "review",
                 &activation,
                 DispatchSideEffect::ReadOnly,
-                serde_json::json!({"operation": "review"}),
+                intent.clone(),
                 12,
             )
             .expect("prepare")
@@ -16016,9 +16750,19 @@ mod tests {
             .await
             .expect("redispatch");
         assert_eq!(admitted.as_slice(), std::slice::from_ref(&identity));
+        let prepared = reopened
+            .reconcile_prepared_attempts(10, 22)
+            .expect("prepared attempts");
+        assert!(
+            prepared.safe_prepared.is_empty(),
+            "receipt persistence closes redispatch scan"
+        );
+        let calls = owner.0.lock().expect("calls").clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, identity);
         assert_eq!(
-            owner.0.lock().expect("calls").as_slice(),
-            std::slice::from_ref(&identity)
+            calls[0].1, intent,
+            "restart redispatch must invoke the owner with the exact persisted preparation"
         );
         let attempt = reopened
             .attempt_history("run-1", None, 10)
@@ -16216,14 +16960,22 @@ mod tests {
     async fn dispatch_admission_enforces_declared_resources_and_run_concurrency() {
         struct Owner;
         impl ActivationDispatchOwner for Owner {
-            fn plan(
-                &self,
-                _activation: &PendingActivation,
-            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
-                Ok(Some(ActivationDispatchPlan {
-                    side_effect: DispatchSideEffect::ReadOnly,
-                    intent: serde_json::json!({"operation": "read"}),
-                }))
+            fn plan<'a>(
+                &'a self,
+                _activation: &'a PendingActivation,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ActivationDispatchPlan>, WorkflowStoreError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(Some(ActivationDispatchPlan {
+                        side_effect: DispatchSideEffect::ReadOnly,
+                        intent: serde_json::json!({"operation": "read"}),
+                    }))
+                })
             }
 
             fn dispatch<'a>(
@@ -16290,7 +17042,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn decisions_grants_leases_and_checkpoints_are_durable_and_fail_closed() {
-        let (_temp, mut store) = initialized_store();
+        let (temp, mut store) = initialized_store();
         let decision = WorkflowDecision {
             decision_id: "decision-1".to_string(),
             run_id: "run-1".to_string(),
@@ -16427,9 +17179,40 @@ mod tests {
             store
                 .advance_projection_checkpoint(&WorkflowProjectionCheckpoint {
                     last_event_seq: event_tail.saturating_sub(1),
-                    ..checkpoint
+                    ..checkpoint.clone()
                 })
                 .is_err()
+        );
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert_eq!(
+            reopened.decision("decision-1").expect("restored decision"),
+            Some(decision)
+        );
+        assert_eq!(
+            reopened
+                .grant("grant-1")
+                .expect("restored grant")
+                .expect("grant")
+                .uses_consumed,
+            2
+        );
+        assert_eq!(
+            reopened
+                .projection_checkpoint("run_summary")
+                .expect("restored checkpoint"),
+            Some(checkpoint)
+        );
+        assert!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workflow_resource_leases \
+                     WHERE lease_id = 'lease-write' AND released_at_ms IS NULL)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("restored active lease")
         );
     }
 
@@ -17938,7 +18721,112 @@ mod tests {
     }
 
     #[test]
-    fn schema_nine_migrates_execution_links_and_parent_generation_to_current() {
+    fn incompatible_store_reset_is_exclusive_backed_up_verified_and_receipted() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workflows = temp.path().join("workflows");
+        std::fs::create_dir_all(workflows.join(ARTIFACT_DIRECTORY)).expect("artifact root");
+        std::fs::write(
+            workflows.join(ARTIFACT_DIRECTORY).join("output.bin"),
+            b"artifact",
+        )
+        .expect("artifact");
+        let path = workflows.join(DATABASE_FILE);
+        let connection = Connection::open(&path).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE workflow_store_contract (
+                     contract_id INTEGER PRIMARY KEY CHECK (contract_id = 1),
+                     schema_version INTEGER NOT NULL
+                 );
+                 INSERT INTO workflow_store_contract (contract_id, schema_version) VALUES (1, 9);
+                 CREATE TABLE legacy_payload (value TEXT NOT NULL);
+                 INSERT INTO legacy_payload (value) VALUES ('retain me');",
+            )
+            .expect("legacy state");
+        drop(connection);
+
+        let receipt = WorkflowStore::reset_incompatible_store_in_state_dir(temp.path(), 42)
+            .expect("explicit reset");
+        assert_eq!(receipt.version, WORKFLOW_STORE_RESET_RECEIPT_VERSION);
+        assert_eq!(receipt.previous_schema_version, Some(9));
+        assert_eq!(receipt.new_schema_version, WORKFLOW_STORE_SCHEMA_VERSION);
+        assert_eq!(receipt.removed_artifact_entries, 1);
+        assert!(
+            receipt
+                .backup_path
+                .join(ARTIFACT_DIRECTORY)
+                .join("output.bin")
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read(
+                receipt
+                    .backup_path
+                    .join(ARTIFACT_DIRECTORY)
+                    .join("output.bin")
+            )
+            .expect("backed-up artifact"),
+            b"artifact"
+        );
+        assert_eq!(receipt.backup_sha256.len(), 64);
+        assert!(receipt.backup_path.is_dir());
+        assert!(!workflows.join(ARTIFACT_DIRECTORY).exists());
+        let retained = Connection::open_with_flags(
+            receipt.backup_path.join(DATABASE_FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("backup");
+        assert_eq!(
+            retained
+                .query_row("SELECT value FROM legacy_payload", [], |row| row
+                    .get::<_, String>(0))
+                .expect("retained value"),
+            "retain me"
+        );
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("current store");
+        assert_eq!(
+            detected_store_schema(&reopened.connection),
+            Some(WORKFLOW_STORE_SCHEMA_VERSION)
+        );
+        drop(reopened);
+        let persisted: WorkflowStoreResetReceipt = serde_json::from_slice(
+            &std::fs::read(workflows.join(RESET_RECEIPT_FILE)).expect("receipt"),
+        )
+        .expect("receipt JSON");
+        assert_eq!(persisted, receipt);
+    }
+
+    #[test]
+    fn incompatible_store_reset_refuses_active_owner_and_current_store() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workflows = temp.path().join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflow root");
+        let path = workflows.join(DATABASE_FILE);
+        let connection = Connection::open(&path).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE workflow_store_contract (contract_id INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL);
+                 INSERT INTO workflow_store_contract VALUES (1, 9);",
+            )
+            .expect("legacy state");
+        drop(connection);
+        let owner = open_ownership_file(&workflows).expect("owner");
+        owner.lock_shared().expect("shared owner");
+        assert!(
+            WorkflowStore::reset_incompatible_store_in_state_dir(temp.path(), 43).is_err(),
+            "reset must not run under an active store owner"
+        );
+        drop(owner);
+        WorkflowStore::reset_incompatible_store_in_state_dir(temp.path(), 43)
+            .expect("reset after owner exits");
+        assert!(
+            WorkflowStore::reset_incompatible_store_in_state_dir(temp.path(), 44).is_err(),
+            "current stores must not be destructively reset"
+        );
+    }
+
+    #[test]
+    fn schema_nine_is_rejected_without_mutation() {
         let temp = tempfile::tempdir().expect("temp");
         let workflows = temp.path().join("workflows");
         std::fs::create_dir_all(&workflows).expect("workflows directory");
@@ -17966,43 +18854,23 @@ mod tests {
             .expect("legacy contract");
         drop(connection);
 
-        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("migrated store");
-        let version = store
-            .connection
-            .query_row(
-                "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
-                [],
-                |row| row.get::<_, u32>(0),
-            )
-            .expect("schema version");
-        assert_eq!(version, SCHEMA_VERSION);
-        let execution_table: u64 = store
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
-                 AND name = 'workflow_execution_sessions'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("execution table");
-        assert_eq!(execution_table, 1);
-        let run_columns = store
-            .connection
-            .prepare("PRAGMA table_info(workflow_runs)")
-            .expect("run columns")
-            .query_map([], |row| row.get::<_, String>(1))
-            .expect("run columns")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("run columns");
-        assert!(
-            run_columns
-                .iter()
-                .any(|column| column == "parent_session_generation")
+        let before = std::fs::read(&path).expect("legacy bytes");
+        let error = WorkflowStore::open_in_state_dir(temp.path()).expect_err("unsupported store");
+        assert!(matches!(
+            error,
+            WorkflowStoreError::UnsupportedStore {
+                actual: Some(9),
+                expected: WORKFLOW_STORE_SCHEMA_VERSION
+            }
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged legacy bytes"),
+            before
         );
     }
 
     #[test]
-    fn schema_six_migrates_to_canonical_authoring_schema_seven() {
+    fn schema_six_is_rejected_without_mutation() {
         let temp = tempfile::tempdir().expect("temp");
         let workflows = temp.path().join("workflows");
         std::fs::create_dir_all(&workflows).expect("workflows directory");
@@ -18019,37 +18887,23 @@ mod tests {
             .expect("legacy contract");
         drop(connection);
 
-        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("migrated store");
-        let version = store
-            .connection
-            .query_row(
-                "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
-                [],
-                |row| row.get::<_, u32>(0),
-            )
-            .expect("schema version");
-        assert_eq!(version, SCHEMA_VERSION);
-        for table in [
-            "authored_workflows",
-            "workflow_drafts",
-            "workflow_revisions",
-            "workflow_presets",
-            "workflow_authoring_events",
-        ] {
-            let count = store
-                .connection
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    [table],
-                    |row| row.get::<_, u64>(0),
-                )
-                .expect("table lookup");
-            assert_eq!(count, 1, "missing migrated table {table}");
-        }
+        let before = std::fs::read(&path).expect("legacy bytes");
+        let error = WorkflowStore::open_in_state_dir(temp.path()).expect_err("unsupported store");
+        assert!(matches!(
+            error,
+            WorkflowStoreError::UnsupportedStore {
+                actual: Some(6),
+                expected: WORKFLOW_STORE_SCHEMA_VERSION
+            }
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged legacy bytes"),
+            before
+        );
     }
 
     #[test]
-    fn schema_seven_migrates_authored_run_provenance_column_to_schema_eight() {
+    fn schema_seven_is_rejected_without_mutation() {
         let temp = tempfile::tempdir().expect("temp");
         let workflows = temp.path().join("workflows");
         std::fs::create_dir_all(&workflows).expect("workflows directory");
@@ -18073,29 +18927,19 @@ mod tests {
             .expect("legacy contract");
         drop(connection);
 
-        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("migrated store");
-        let columns = store
-            .connection
-            .prepare("PRAGMA table_info(workflow_runs)")
-            .expect("columns")
-            .query_map([], |row| row.get::<_, String>(1))
-            .expect("column rows")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("column names");
-        assert!(
-            columns
-                .iter()
-                .any(|column| column == "authored_provenance_json")
+        let before = std::fs::read(&path).expect("legacy bytes");
+        let error = WorkflowStore::open_in_state_dir(temp.path()).expect_err("unsupported store");
+        assert!(matches!(
+            error,
+            WorkflowStoreError::UnsupportedStore {
+                actual: Some(7),
+                expected: WORKFLOW_STORE_SCHEMA_VERSION
+            }
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged legacy bytes"),
+            before
         );
-        let version = store
-            .connection
-            .query_row(
-                "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
-                [],
-                |row| row.get::<_, u32>(0),
-            )
-            .expect("schema version");
-        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

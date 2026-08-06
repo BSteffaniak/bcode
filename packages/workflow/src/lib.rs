@@ -39,7 +39,7 @@ const MAX_DEFINITION_EDGES: usize = 100_000;
 const MAX_DEFINITION_BOUNDARIES: usize = 10_000;
 
 /// Stable workflow definition schema version.
-pub const WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 1;
+pub const WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 2;
 
 /// Stable durable-production capability contract version.
 pub const WORKFLOW_PRODUCTION_CAPABILITY_VERSION: u32 = 1;
@@ -1371,6 +1371,165 @@ const MAX_TRANSFORM_VALUE_BYTES: usize = 1_048_576;
 /// Stable plugin workflow-block service interface.
 pub const WORKFLOW_BLOCK_INTERFACE_ID: &str = "bcode.workflow-block/v1";
 
+pub const WORKFLOW_BLOCK_INVOKE_OPERATION: &str = "invoke";
+/// Standard plugin workflow-block owner preparation operation.
+pub const WORKFLOW_BLOCK_PREPARE_OPERATION: &str = "prepare";
+
+/// Stable owner-prepared workflow dispatch contract version.
+pub const WORKFLOW_BLOCK_PREPARATION_VERSION: u32 = 1;
+/// Maximum serialized owner-preparation request bytes.
+pub const MAX_WORKFLOW_BLOCK_PREPARATION_REQUEST_BYTES: usize = 1_048_576;
+/// Maximum serialized owner-preparation payload or diagnostics bytes.
+pub const MAX_WORKFLOW_BLOCK_PREPARATION_BYTES: usize = 131_072;
+/// Maximum owner-preparation diagnostics.
+pub const MAX_WORKFLOW_BLOCK_PREPARATION_DIAGNOSTICS: usize = 64;
+
+/// Generic host context supplied to a block owner before authorization or invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowBlockPreparationContext {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    /// Attempt is zero during pre-admission preparation; the durable attempt identity is assigned
+    /// only when this preparation is atomically persisted.
+    pub attempt: u32,
+    /// Stable activation-scoped correlation identity available before durable attempt admission.
+    pub preparation_identity: String,
+    pub workspace_root: std::path::PathBuf,
+}
+
+/// Compute the stable SHA-256 identity of an exact workflow-block owner input.
+///
+/// # Errors
+///
+/// Returns an error when the JSON value cannot be encoded.
+pub fn workflow_block_input_sha256(input: &serde_json::Value) -> Result<String, String> {
+    use sha2::Digest as _;
+
+    serde_json::to_vec(input)
+        .map(|encoded| format!("{:x}", sha2::Sha256::digest(encoded)))
+        .map_err(|error| format!("failed to encode workflow block input: {error}"))
+}
+
+/// Compute the stable SHA-256 identity of a canonical JSON value.
+///
+/// # Errors
+///
+/// Returns an error when the value cannot be canonicalized.
+pub fn workflow_canonical_value_sha256(input: &serde_json::Value) -> Result<String, String> {
+    canonical_sha256(input, "workflow.canonical_value").map_err(|error| error.to_string())
+}
+
+/// Versioned generic request for owner-provided canonical operation facts and descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowBlockPreparationRequest {
+    pub version: u32,
+    pub block: WorkflowBlockDefinition,
+    pub context: WorkflowBlockPreparationContext,
+    pub input: serde_json::Value,
+}
+
+impl WorkflowBlockPreparationRequest {
+    /// Validate generic request version, identity, path, and payload bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed context, invalid block contracts, or
+    /// oversized requests.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        self.block.validate()?;
+        let identities = [
+            self.context.run_id.as_str(),
+            self.context.node_id.as_str(),
+            self.context.activation_id.as_str(),
+            self.context.preparation_identity.as_str(),
+        ];
+        if self.version != WORKFLOW_BLOCK_PREPARATION_VERSION
+            || self.context.attempt != 0
+            || !self.context.workspace_root.is_absolute()
+            || identities
+                .iter()
+                .any(|value| value.trim().is_empty() || value.len() > 4_096)
+            || serde_json::to_vec(self).map_or(true, |encoded| {
+                encoded.len() > MAX_WORKFLOW_BLOCK_PREPARATION_REQUEST_BYTES
+            })
+        {
+            return Err(WorkflowError::Build {
+                path: "block_preparation.request".to_string(),
+                message:
+                    "workflow block preparation request is unsupported, malformed, or unbounded"
+                        .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Versioned owner preparation result transported opaquely by generic workflow layers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowBlockPreparationResponse {
+    pub version: u32,
+    /// SHA-256 of the exact canonical owner input prepared by the owner.
+    pub input_sha256: String,
+    /// Stable owner identity for routing and descriptor provenance.
+    pub owner_id: String,
+    /// Canonical normalized operation facts consumed by application authorization.
+    pub operation_facts: serde_json::Value,
+    /// Owner-issued descriptor that invocation must verify against the exact input.
+    pub descriptor: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+impl WorkflowBlockPreparationResponse {
+    /// Validate version and generic payload bounds without interpreting owner facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, oversized payloads or diagnostics, empty
+    /// descriptors/facts, or malformed diagnostic text.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_BLOCK_PREPARATION_VERSION
+            || self.input_sha256.len() != 64
+            || !self
+                .input_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.owner_id.trim().is_empty()
+            || self.owner_id.len() > 256
+            || self.operation_facts.is_null()
+            || self.descriptor.is_null()
+            || self.diagnostics.len() > MAX_WORKFLOW_BLOCK_PREPARATION_DIAGNOSTICS
+            || self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.is_empty() || diagnostic.len() > 4_096)
+        {
+            return Err(WorkflowError::Build {
+                path: "block_preparation".to_string(),
+                message: "workflow block preparation is unsupported, empty, or unbounded"
+                    .to_string(),
+            });
+        }
+        let bytes = serde_json::to_vec(self).map_err(|error| WorkflowError::Build {
+            path: "block_preparation".to_string(),
+            message: error.to_string(),
+        })?;
+        if bytes.len() > MAX_WORKFLOW_BLOCK_PREPARATION_BYTES {
+            return Err(WorkflowError::Build {
+                path: "block_preparation".to_string(),
+                message: format!(
+                    "workflow block preparation exceeds {MAX_WORKFLOW_BLOCK_PREPARATION_BYTES} bytes"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Versioned host envelope for one exact plugin-owned workflow-block invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1379,6 +1538,9 @@ pub struct WorkflowBlockInvocation {
     pub dispatch_identity: String,
     pub workspace_root: std::path::PathBuf,
     pub input: serde_json::Value,
+    /// Exact owner preparation persisted before authorization and invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<WorkflowBlockPreparationResponse>,
 }
 
 impl WorkflowBlockInvocation {
@@ -1597,6 +1759,9 @@ pub struct WorkflowBlockDefinition {
     pub timeout_ms: u64,
     pub cancellation_supported: bool,
     pub reconciliation: WorkflowBlockReconciliation,
+    /// Whether the external owner must prepare canonical operation facts before authorization.
+    #[serde(default)]
+    pub preparation_required: bool,
 }
 
 impl WorkflowBlockDefinition {
@@ -1685,7 +1850,7 @@ impl ValueSchema {
 }
 
 /// Current portable runtime-workflow authoring document version.
-pub const WORKFLOW_AUTHORING_DOCUMENT_VERSION: u32 = 1;
+pub const WORKFLOW_AUTHORING_DOCUMENT_VERSION: u32 = 2;
 /// Current generic authoring configuration-binding contract version.
 pub const WORKFLOW_CONFIGURATION_BINDING_VERSION: u32 = 1;
 /// Current optional authoring-presentation contract version.
@@ -2419,6 +2584,36 @@ impl WorkflowRunLimitPolicy {
     }
 }
 
+fn workflow_dynamic_binding_path_allowed(schema: &ValueSchema, path: &str) -> bool {
+    let Some(patterns) = schema
+        .schema
+        .get("x-bcode-dynamic-binding-paths")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return true;
+    };
+    let path = path.split('.').collect::<Vec<_>>();
+    patterns.iter().any(|pattern| {
+        let Some(pattern) = pattern.as_str() else {
+            return false;
+        };
+        let pattern = pattern.split('.').collect::<Vec<_>>();
+        pattern.len() == path.len()
+            && pattern
+                .iter()
+                .zip(&path)
+                .all(|(expected, actual)| *expected == "*" || expected == actual)
+    })
+}
+
+fn workflow_allows_dynamic_complete_input(schema: &ValueSchema) -> bool {
+    schema
+        .schema
+        .get("x-bcode-allow-dynamic-complete-input")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
 /// Declared target populated from runtime workflow configuration during compilation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -2427,8 +2622,6 @@ pub enum WorkflowConfigurationTarget {
     NodeConfiguration { node_id: String, path: String },
     /// Populate a declared agent selection field.
     AgentSelection { node_id: String, field: String },
-    /// Populate one declared indexed skill selection.
-    SkillSelection { node_id: String, index: usize },
     /// Populate a plugin-block input default field.
     PluginBlockInput { node_id: String, path: String },
     /// Populate a declared edge predicate or transform field.
@@ -2472,13 +2665,32 @@ impl WorkflowConfigurationBinding {
             }
             WorkflowConfigurationTarget::PluginBlockInput { node_id, path } => {
                 validate_authoring_node_target(definition, node_id, path)?;
-                if definition
-                    .node(node_id)
-                    .is_none_or(|node| node.kind != NodeKind::PluginBlock)
-                {
+                let node = definition.node(node_id).ok_or_else(|| {
+                    authoring_error(
+                        "bindings.target.node_id",
+                        format!("binding references unknown node '{node_id}'"),
+                    )
+                })?;
+                if node.kind != NodeKind::PluginBlock {
                     return Err(authoring_error(
                         "bindings.target.node_id",
                         format!("binding target '{node_id}' is not a plugin-block node"),
+                    ));
+                }
+                let block: WorkflowBlockDefinition =
+                    serde_json::from_value(node.configuration.clone()).map_err(|error| {
+                        authoring_error(
+                            "bindings.target.node_id",
+                            format!("plugin-block contract is invalid: {error}"),
+                        )
+                    })?;
+                if !workflow_dynamic_binding_path_allowed(&block.input, path) {
+                    return Err(authoring_error(
+                        "bindings.target.path",
+                        format!(
+                            "dynamic binding path '{path}' is not authorized by block {}",
+                            block.block_id
+                        ),
                     ));
                 }
             }
@@ -2488,24 +2700,6 @@ impl WorkflowConfigurationBinding {
                     return Err(authoring_error(
                         "bindings.target.field",
                         format!("unsupported agent selection field '{field}'"),
-                    ));
-                }
-                if definition
-                    .node(node_id)
-                    .is_none_or(|node| node.kind != NodeKind::Agent)
-                {
-                    return Err(authoring_error(
-                        "bindings.target.node_id",
-                        format!("binding target '{node_id}' is not an agent node"),
-                    ));
-                }
-            }
-            WorkflowConfigurationTarget::SkillSelection { node_id, index } => {
-                validate_authoring_id("bindings.target.node_id", node_id)?;
-                if *index >= 32 {
-                    return Err(authoring_error(
-                        "bindings.target.index",
-                        "skill selection index must be less than 32",
                     ));
                 }
                 if definition
@@ -2567,21 +2761,15 @@ pub struct WorkflowRequirementSummary {
     /// Required exact block references, encoded as stable owner/block/version identities.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub blocks: BTreeSet<String>,
-    /// Required portable agent profile identities.
+    /// Required portable prompt profile identities.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub agents: BTreeSet<String>,
-    /// Required skill identities.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub skills: BTreeSet<String>,
 }
 
 impl WorkflowRequirementSummary {
     fn validate(&self) -> Result<(), WorkflowError> {
-        let count = self.capabilities.len()
-            + self.plugins.len()
-            + self.blocks.len()
-            + self.agents.len()
-            + self.skills.len();
+        let count =
+            self.capabilities.len() + self.plugins.len() + self.blocks.len() + self.agents.len();
         if count > MAX_WORKFLOW_AUTHORING_REQUIREMENTS {
             return Err(authoring_error(
                 "requirements",
@@ -2594,7 +2782,6 @@ impl WorkflowRequirementSummary {
             .chain(&self.plugins)
             .chain(&self.blocks)
             .chain(&self.agents)
-            .chain(&self.skills)
         {
             validate_authoring_id("requirements", value)?;
         }
@@ -2752,7 +2939,7 @@ pub struct WorkflowAuthoringCapabilitySummary {
     pub fan_out: WorkflowCapabilitySupport,
     pub transforms: WorkflowCapabilitySupport,
     pub artifact_references: WorkflowCapabilitySupport,
-    pub agent_execution_targets: BTreeSet<AgentExecutionTarget>,
+    pub agent_execution_targets: BTreeSet<PromptContextTarget>,
     pub schema_dialects: BTreeSet<String>,
 }
 
@@ -3020,12 +3207,9 @@ pub struct WorkflowAuthoringCatalogSnapshot {
     /// Exact immutable definitions available for child-call preview, keyed by compiled identity.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workflow_definitions: BTreeMap<String, WorkflowDefinition>,
-    /// Portable configured agent profile identities.
+    /// Portable configured prompt profile identities.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub agent_profiles: BTreeSet<String>,
-    /// Portable available skill identities.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub skills: BTreeSet<String>,
     /// Versioned plugin-contributed concise authoring actions keyed by exact action identity.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub authoring_actions: BTreeMap<String, WorkflowAuthoringActionDescriptor>,
@@ -3039,7 +3223,6 @@ pub enum WorkflowRequirementKind {
     Plugin,
     Block,
     Agent,
-    Skill,
 }
 
 /// One missing current-host requirement, separate from immutable publication facts.
@@ -3095,7 +3278,6 @@ impl WorkflowAuthoringCatalogSnapshot {
             + self.node_configuration_schemas.len()
             + self.workflow_definitions.len()
             + self.agent_profiles.len()
-            + self.skills.len()
             + self.authoring_actions.len();
         if entry_count > MAX_WORKFLOW_AUTHORING_REQUIREMENTS {
             return Err(authoring_error(
@@ -3103,12 +3285,7 @@ impl WorkflowAuthoringCatalogSnapshot {
                 format!("catalog exceeds {MAX_WORKFLOW_AUTHORING_REQUIREMENTS} entries"),
             ));
         }
-        for value in self
-            .plugins
-            .iter()
-            .chain(self.agent_profiles.iter())
-            .chain(self.skills.iter())
-        {
+        for value in self.plugins.iter().chain(self.agent_profiles.iter()) {
             validate_authoring_id("catalog.identity", value)?;
         }
         for (key, block) in &self.blocks {
@@ -3199,7 +3376,6 @@ pub fn workflow_node_configuration_schemas() -> BTreeMap<String, ValueSchema> {
                         "read_only": {"type": "boolean", "title": "Read only"},
                         "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 3_600_000},
                         "system_prompt": {"type": "string", "title": "System prompt"},
-                        "skills": {"type": "array", "title": "Skills"},
                         "tool_allowlist": {"type": "array", "title": "Tool allowlist"}
                     },
                     "required": ["agent_profile", "read_only", "timeout_ms", "system_prompt"]
@@ -3746,10 +3922,10 @@ pub fn workflow_authoring_semantic_diff(
     })
 }
 
-/// Portable concise workflow source document version retained for compatibility.
-pub const WORKFLOW_SOURCE_V1_DOCUMENT_VERSION: u32 = 1;
 /// Current structurally explicit workflow source document version.
-pub const WORKFLOW_SOURCE_DOCUMENT_VERSION: u32 = 2;
+///
+/// Versions 1 and 2 are intentionally unsupported by the clean composable-workflow contract.
+pub const WORKFLOW_SOURCE_DOCUMENT_VERSION: u32 = 3;
 /// Current portable workflow source map version.
 pub const WORKFLOW_SOURCE_MAP_VERSION: u32 = 1;
 /// Current portable workflow source lowering result version.
@@ -3761,9 +3937,7 @@ pub const MAX_WORKFLOW_SOURCE_STEPS: usize = 1_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowSourceProfile {
-    /// Ordered concise v1 steps that lower into the canonical authoring graph.
-    Concise,
-    /// Structurally explicit v2 source that lowers into the same canonical authoring graph.
+    /// Structurally explicit source that lowers into the canonical authoring graph.
     Structured,
     /// The complete canonical [`WorkflowAuthoringDocument`] contract.
     Canonical,
@@ -3785,53 +3959,7 @@ pub enum WorkflowSourceAction {
     Shorthand(BTreeMap<String, serde_json::Value>),
 }
 
-/// One ordered concise workflow step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowSourceStep {
-    /// Optional stable author-supplied identity. Omitted identities are generated from source order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    /// Optional display name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Explicit predecessor identities. Omission selects the immediately preceding step.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub needs: Vec<String>,
-    /// Exactly one generic action.
-    #[serde(flatten)]
-    pub action: WorkflowSourceAction,
-}
-
-/// Versioned concise workflow source document.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowSourceDocument {
-    /// Concise source contract version.
-    pub workflow_source_version: u32,
-    /// Stable logical workflow identity.
-    pub workflow_id: String,
-    /// User-facing title.
-    pub title: String,
-    /// Optional user-facing description.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Discovery labels.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub labels: BTreeMap<String, String>,
-    /// Runtime configuration schema. Omission selects a closed empty object.
-    #[serde(default = "empty_workflow_source_configuration_schema")]
-    pub configuration_schema: ValueSchema,
-    /// Optional runtime configuration defaults.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configuration_defaults: Option<serde_json::Value>,
-    /// Portable run limits.
-    #[serde(default)]
-    pub run_limits: WorkflowRunLimitPolicy,
-    /// Ordered concise steps.
-    pub steps: Vec<WorkflowSourceStep>,
-}
-
-/// One explicit source-v2 reference to a prior step output.
+/// One explicit source-v3 reference to a prior step output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStructuredSourceReference {
@@ -3842,7 +3970,7 @@ pub struct WorkflowStructuredSourceReference {
     pub select: Option<WorkflowValueSelector>,
 }
 
-/// Deterministic condition used by a source-v2 step.
+/// Deterministic condition used by a source-v3 step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStructuredSourceCondition {
@@ -3859,12 +3987,12 @@ const fn default_true() -> bool {
     true
 }
 
-/// One source-v2 structured agent declaration.
+/// One source-v3 structured agent declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkflowStructuredSourceAgent {
+pub struct WorkflowStructuredSourcePrompt {
     /// Complete existing canonical agent configuration.
-    pub configuration: WorkflowAgentConfiguration,
+    pub configuration: WorkflowPromptConfiguration,
     /// Exact typed agent input schema.
     pub input: ValueSchema,
     /// Exact typed structured output schema. Must equal `configuration.structured_output.schema`.
@@ -3874,7 +4002,79 @@ pub struct WorkflowStructuredSourceAgent {
     pub resources: Vec<ResourceClaim>,
 }
 
-/// One source-v2 durable gate declaration.
+/// Concise source-v3 prompt declaration using safe durable defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStructuredSourceConcisePrompt {
+    /// Plain prompt instruction. Skill use is requested through this text, not workflow coupling.
+    pub text: String,
+    /// Exact structured input schema.
+    pub input: ValueSchema,
+    /// Exact structured output schema.
+    pub output: ValueSchema,
+    /// Agent profile selected through the normal application catalog.
+    pub agent_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub execution_target: PromptContextTarget,
+    #[serde(default = "default_true")]
+    pub read_only: bool,
+    #[serde(default)]
+    pub tool_allowlist: Vec<String>,
+    #[serde(default = "default_prompt_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceClaim>,
+}
+
+const fn default_prompt_timeout_ms() -> u64 {
+    300_000
+}
+
+impl WorkflowStructuredSourceConcisePrompt {
+    fn expand(&self) -> Result<WorkflowStructuredSourcePrompt, WorkflowError> {
+        if self.text.trim().is_empty() || self.text.len() > 262_144 {
+            return Err(authoring_error(
+                "prompt.text",
+                "prompt text must contain 1..=262144 bytes",
+            ));
+        }
+        let tool_capability = if self.read_only {
+            WorkflowToolCapability::ReadOnly
+        } else {
+            WorkflowToolCapability::Mutating
+        };
+        let configuration = WorkflowPromptConfiguration {
+            version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_target: self.execution_target,
+            agent_profile: self.agent_profile.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            structured_output: PromptStructuredOutputPolicy {
+                schema: self.output.clone(),
+                strict: true,
+            },
+            read_only: self.read_only,
+            tool_capability,
+            tool_allowlist: self.tool_allowlist.clone(),
+            timeout_ms: self.timeout_ms,
+            prompt_mode: "json_input".to_string(),
+            system_prompt: self.text.clone(),
+        };
+        configuration.validate()?;
+        Ok(WorkflowStructuredSourcePrompt {
+            configuration,
+            input: self.input.clone(),
+            output: self.output.clone(),
+            resources: self.resources.clone(),
+        })
+    }
+}
+
+/// One source-v3 durable gate declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStructuredSourceGate {
@@ -3885,7 +4085,7 @@ pub struct WorkflowStructuredSourceGate {
     pub resources: Vec<ResourceClaim>,
 }
 
-/// One bounded source-v2 repeat controller over a completed prior step.
+/// One bounded source-v3 repeat controller over a completed prior step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStructuredSourceRepeat {
@@ -3898,7 +4098,7 @@ pub struct WorkflowStructuredSourceRepeat {
     pub exhaustion_policy: WorkflowRepeatExhaustionPolicy,
 }
 
-/// One source-v2 fixed two-branch typed parallel join.
+/// One source-v3 fixed two-branch typed parallel join.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStructuredSourceParallelJoin {
@@ -3911,7 +4111,7 @@ pub struct WorkflowStructuredSourceParallelJoin {
     pub failure_policy: ParallelFailurePolicy,
 }
 
-/// One bounded source-v2 retry declaration. Runtime production admission remains separate.
+/// One bounded source-v3 retry declaration. Runtime production admission remains separate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStructuredSourceRetry {
@@ -3927,7 +4127,7 @@ pub struct WorkflowStructuredSourceRetry {
     pub maximum_backoff_ms: u64,
 }
 
-/// One bounded source-v2 homogeneous fan-out declaration. Runtime admission remains separate.
+/// One bounded source homogeneous fan-out declaration. Runtime admission remains separate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStructuredSourceFanOut {
@@ -3948,7 +4148,7 @@ pub struct WorkflowStructuredSourceFanOut {
     pub failure_policy: ParallelFailurePolicy,
 }
 
-/// One source-v2 step operation.
+/// One source-v3 step operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowStructuredSourceOperation {
     /// Homogeneous bounded fan-out over one generic nested operation.
@@ -3961,8 +4161,10 @@ pub enum WorkflowStructuredSourceOperation {
     Input(Box<WorkflowStructuredSourceGate>),
     /// Durable explicit human approval gate.
     Approval(Box<WorkflowStructuredSourceGate>),
-    /// Agent-owned structured turn.
-    Agent(Box<WorkflowStructuredSourceAgent>),
+    /// Concise prompt using safe durable defaults.
+    Prompt(Box<WorkflowStructuredSourceConcisePrompt>),
+    /// Agent-owned complete structured turn.
+    Agent(Box<WorkflowStructuredSourcePrompt>),
     /// Generic exact or shorthand plugin action.
     Action(WorkflowSourceAction),
 }
@@ -3998,9 +4200,14 @@ impl Serialize for WorkflowStructuredSourceOperation {
                 serde_json::to_value(approval).map_err(serde::ser::Error::custom)?,
             )])
             .serialize(serializer),
-            Self::Agent(agent) => BTreeMap::from([(
+            Self::Prompt(prompt) => BTreeMap::from([(
+                "prompt".to_string(),
+                serde_json::to_value(prompt).map_err(serde::ser::Error::custom)?,
+            )])
+            .serialize(serializer),
+            Self::Agent(prompt) => BTreeMap::from([(
                 "agent".to_string(),
-                serde_json::to_value(agent).map_err(serde::ser::Error::custom)?,
+                serde_json::to_value(prompt).map_err(serde::ser::Error::custom)?,
             )])
             .serialize(serializer),
             Self::Action(action) => action.serialize(serializer),
@@ -4040,6 +4247,11 @@ impl<'de> Deserialize<'de> for WorkflowStructuredSourceOperation {
                     .map(|value| Self::Approval(Box::new(value)))
                     .map_err(serde::de::Error::custom);
             }
+            if let Some(value) = fields.get("prompt") {
+                return serde_json::from_value(value.clone())
+                    .map(|value| Self::Prompt(Box::new(value)))
+                    .map_err(serde::de::Error::custom);
+            }
             if let Some(value) = fields.get("agent") {
                 return serde_json::from_value(value.clone())
                     .map(|value| Self::Agent(Box::new(value)))
@@ -4052,7 +4264,7 @@ impl<'de> Deserialize<'de> for WorkflowStructuredSourceOperation {
     }
 }
 
-/// One structurally explicit source-v2 step.
+/// One structurally explicit source-v3 step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStructuredSourceStep {
     /// Stable explicit identity. Unlike v1, v2 never derives semantic identity from display text.
@@ -4083,7 +4295,7 @@ pub struct WorkflowStructuredSourceStep {
     pub operation: WorkflowStructuredSourceOperation,
 }
 
-/// Versioned structurally explicit workflow source-v2 document.
+/// Versioned structurally explicit workflow source-v3 document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStructuredSourceDocument {
@@ -4250,14 +4462,14 @@ pub struct WorkflowSourceLoweringResult {
     pub profile: WorkflowSourceProfile,
     /// Canonical authoring document used by all durable application operations.
     pub document: WorkflowAuthoringDocument,
-    /// Concise source mapping; empty for canonical source.
+    /// Structured source mapping; empty for canonical source.
     pub source_map: WorkflowSourceMap,
     /// Deterministic canonical source validation report.
     pub validation: WorkflowValidationReport,
 }
 
 /// Current portable workflow package manifest version.
-pub const WORKFLOW_PACKAGE_MANIFEST_VERSION: u32 = 1;
+pub const WORKFLOW_PACKAGE_MANIFEST_VERSION: u32 = 2;
 /// Maximum source members in one package.
 pub const MAX_WORKFLOW_PACKAGE_MEMBERS: usize = 64;
 /// Maximum direct dependencies declared by one package member.
@@ -4469,7 +4681,7 @@ pub fn preview_workflow_package(
 ///
 /// Package-local source calls use `package_call: { member: <id> }` and must also declare that
 /// member in the caller's manifest dependency list. Calls are replaced with exact immutable
-/// canonical definition identities before normal source-v2 lowering.
+/// canonical definition identities before normal source-v3 lowering.
 ///
 /// # Errors
 ///
@@ -5003,7 +5215,7 @@ fn validate_workflow_package_plan(plan: &WorkflowPackagePlan) -> Result<(), Work
 }
 
 /// Current deterministic workflow package lock/result version.
-pub const WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 1;
+pub const WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 2;
 
 /// One exact successfully compiled/published package member result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5436,38 +5648,23 @@ pub fn lower_workflow_authoring_source(
                     "workflow source version must be an unsigned integer",
                 )
             })?;
-        match version {
-            value_version if value_version == u64::from(WORKFLOW_SOURCE_V1_DOCUMENT_VERSION) => {
-                let source_document: WorkflowSourceDocument = serde_json::from_value(value.clone())
-                    .map_err(|error| {
-                        authoring_error(
-                            "source.concise",
-                            format!("invalid concise workflow source: {error}"),
-                        )
-                    })?;
-                let (document, source_map) = source_document.lower(catalog)?;
-                (WorkflowSourceProfile::Concise, document, source_map)
-            }
-            value_version if value_version == u64::from(WORKFLOW_SOURCE_DOCUMENT_VERSION) => {
-                let source_document: WorkflowStructuredSourceDocument =
-                    serde_json::from_value(value.clone()).map_err(|error| {
-                        authoring_error(
-                            "source.structured",
-                            format!("invalid structured workflow source: {error}"),
-                        )
-                    })?;
-                let (document, source_map) = source_document.lower(catalog)?;
-                (WorkflowSourceProfile::Structured, document, source_map)
-            }
-            _ => {
-                return Err(authoring_error(
-                    "workflow_source_version",
-                    format!(
-                        "unsupported workflow source version {version}; expected {WORKFLOW_SOURCE_V1_DOCUMENT_VERSION} or {WORKFLOW_SOURCE_DOCUMENT_VERSION}"
-                    ),
-                ));
-            }
+        if version != u64::from(WORKFLOW_SOURCE_DOCUMENT_VERSION) {
+            return Err(authoring_error(
+                "workflow_source_version",
+                format!(
+                    "unsupported workflow source version {version}; expected {WORKFLOW_SOURCE_DOCUMENT_VERSION}"
+                ),
+            ));
         }
+        let source_document: WorkflowStructuredSourceDocument =
+            serde_json::from_value(value.clone()).map_err(|error| {
+                authoring_error(
+                    "source.structured",
+                    format!("invalid structured workflow source: {error}"),
+                )
+            })?;
+        let (document, source_map) = source_document.lower(catalog)?;
+        (WorkflowSourceProfile::Structured, document, source_map)
     } else {
         let document: WorkflowAuthoringDocument =
             serde_json::from_value(value).map_err(|error| {
@@ -5657,189 +5854,8 @@ fn empty_workflow_source_configuration_schema() -> ValueSchema {
     }
 }
 
-impl WorkflowSourceDocument {
-    /// Deterministically lower this concise source through one portable catalog snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for unsupported versions, invalid identities, duplicate or missing step
-    /// dependencies, malformed action declarations, unavailable actions or blocks, invalid typed
-    /// inputs, or an invalid canonical result.
-    #[allow(clippy::too_many_lines)]
-    pub fn lower(
-        &self,
-        catalog: &WorkflowAuthoringCatalogSnapshot,
-    ) -> Result<(WorkflowAuthoringDocument, WorkflowSourceMap), WorkflowError> {
-        catalog.validate()?;
-        if self.workflow_source_version != WORKFLOW_SOURCE_V1_DOCUMENT_VERSION {
-            return Err(authoring_error(
-                "workflow_source_version",
-                format!(
-                    "unsupported concise workflow source version {}; expected {}",
-                    self.workflow_source_version, WORKFLOW_SOURCE_V1_DOCUMENT_VERSION
-                ),
-            ));
-        }
-        validate_authoring_id("workflow_id", &self.workflow_id)?;
-        WorkflowAuthoringMetadata {
-            title: self.title.clone(),
-            description: self.description.clone(),
-            labels: self.labels.clone(),
-        }
-        .validate()?;
-        validate_runtime_value_schema("configuration_schema", &self.configuration_schema)?;
-        self.run_limits.validate()?;
-        if self.steps.is_empty() || self.steps.len() > MAX_WORKFLOW_SOURCE_STEPS {
-            return Err(authoring_error(
-                "steps",
-                format!("concise workflows require 1..={MAX_WORKFLOW_SOURCE_STEPS} steps"),
-            ));
-        }
-
-        let mut node_ids = Vec::with_capacity(self.steps.len());
-        let mut seen = BTreeSet::new();
-        for (index, step) in self.steps.iter().enumerate() {
-            let node_id = step
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("step_{:04}", index + 1));
-            validate_authoring_id(&format!("steps[{index}].id"), &node_id)?;
-            if !seen.insert(node_id.clone()) {
-                return Err(authoring_error(
-                    format!("steps[{index}].id"),
-                    format!("duplicate concise step identity '{node_id}'"),
-                ));
-            }
-            node_ids.push(node_id);
-        }
-
-        let mut nodes = BTreeMap::new();
-        let mut edges = Vec::new();
-        let mut entries = Vec::new();
-        let mut outgoing = BTreeSet::new();
-        let mut plugin_input_defaults = BTreeMap::new();
-        let mut source_entries = Vec::with_capacity(self.steps.len());
-        for (index, step) in self.steps.iter().enumerate() {
-            let node_id = &node_ids[index];
-            let (block, input) = lower_workflow_source_action(&step.action, catalog, index)?;
-            let predecessors = if step.needs.is_empty() && index > 0 {
-                vec![node_ids[index - 1].clone()]
-            } else {
-                step.needs.clone()
-            };
-            if predecessors.is_empty() {
-                entries.push(node_id.clone());
-            }
-            for predecessor in predecessors {
-                let predecessor_index = node_ids
-                    .iter()
-                    .position(|candidate| candidate == &predecessor)
-                    .ok_or_else(|| {
-                        authoring_error(
-                            format!("steps[{index}].needs"),
-                            format!("unknown predecessor '{predecessor}'"),
-                        )
-                    })?;
-                if predecessor_index >= index {
-                    return Err(authoring_error(
-                        format!("steps[{index}].needs"),
-                        "concise dependencies must reference an earlier step",
-                    ));
-                }
-                outgoing.insert(predecessor.clone());
-                edges.push(EdgeDefinition {
-                    from: predecessor,
-                    to: node_id.clone(),
-                    kind: EdgeKind::Direct,
-                    transform: None,
-                });
-            }
-            let node = NodeDefinition {
-                id: node_id.clone(),
-                name: step.name.clone().unwrap_or_else(|| node_id.clone()),
-                kind: NodeKind::PluginBlock,
-                dataflow: WorkflowNodeDataflowPolicy::Direct,
-                input: block.input.clone(),
-                output: block.output.clone(),
-                resources: block.resources.clone(),
-                configuration: serde_json::to_value(&block).map_err(|error| {
-                    authoring_error(
-                        format!("steps[{index}]"),
-                        format!("target block cannot be serialized: {error}"),
-                    )
-                })?,
-            };
-            plugin_input_defaults.insert(node_id.clone(), input);
-            nodes.insert(node_id.clone(), node);
-            source_entries.push(WorkflowSourceMapEntry {
-                step_index: index,
-                source_path: format!("steps[{index}]"),
-                target_kind: WorkflowSourceMapTargetKind::Node,
-                node_id: node_id.clone(),
-                edge_to: None,
-            });
-        }
-        let exits = node_ids
-            .iter()
-            .filter(|node_id| !outgoing.contains(*node_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let first_id = entries
-            .first()
-            .ok_or_else(|| authoring_error("steps", "concise workflow has no entry step"))?;
-        let first = nodes
-            .get(first_id)
-            .ok_or_else(|| authoring_error("steps", "concise workflow entry node is missing"))?;
-        let last_id = exits
-            .first()
-            .ok_or_else(|| authoring_error("steps", "concise workflow has no exit step"))?;
-        let last = nodes
-            .get(last_id)
-            .ok_or_else(|| authoring_error("steps", "concise workflow exit node is missing"))?;
-        let document = WorkflowAuthoringDocument {
-            schema_version: WORKFLOW_AUTHORING_DOCUMENT_VERSION,
-            workflow_id: self.workflow_id.clone(),
-            metadata: WorkflowAuthoringMetadata {
-                title: self.title.clone(),
-                description: self.description.clone(),
-                labels: self.labels.clone(),
-            },
-            configuration_schema: self.configuration_schema.clone(),
-            configuration_defaults: self.configuration_defaults.clone(),
-            plugin_input_defaults,
-            definition: WorkflowDefinition {
-                schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
-                name: self.title.clone(),
-                input: first.input.clone(),
-                output: last.output.clone(),
-                nodes,
-                entries,
-                exits,
-                edges,
-            },
-            bindings: Vec::new(),
-            requirements: WorkflowRequirementSummary::default(),
-            run_limits: self.run_limits.clone(),
-            producer: WorkflowProducerProvenance {
-                kind: WorkflowProducerKind::Human,
-                producer_id: None,
-                source_revision: None,
-            },
-            presentation: None,
-        };
-        document.validate()?;
-        Ok((
-            document,
-            WorkflowSourceMap {
-                version: WORKFLOW_SOURCE_MAP_VERSION,
-                entries: source_entries,
-            },
-        ))
-    }
-}
-
 impl WorkflowStructuredSourceDocument {
-    /// Deterministically lower the initial source-v2 action/condition profile to canonical nodes
+    /// Deterministically lower the initial source-v3 action/condition profile to canonical nodes
     /// and edges. Unsupported future structured constructs are rejected by `deny_unknown_fields`
     /// rather than approximated.
     ///
@@ -5878,45 +5894,7 @@ impl WorkflowStructuredSourceDocument {
                 format!("structured workflows require 1..={MAX_WORKFLOW_SOURCE_STEPS} steps"),
             ));
         }
-        let all_actions = self.steps.iter().all(|step| {
-            step.input_from.is_none()
-                && step.retry.is_none()
-                && step.repeat.is_none()
-                && matches!(step.operation, WorkflowStructuredSourceOperation::Action(_))
-        });
-        let v1 = all_actions.then(|| WorkflowSourceDocument {
-            workflow_source_version: WORKFLOW_SOURCE_V1_DOCUMENT_VERSION,
-            workflow_id: self.workflow_id.clone(),
-            title: self.title.clone(),
-            description: self.description.clone(),
-            labels: self.labels.clone(),
-            configuration_schema: self.configuration_schema.clone(),
-            configuration_defaults: self.configuration_defaults.clone(),
-            run_limits: self.run_limits.clone(),
-            steps: self
-                .steps
-                .iter()
-                .map(|step| WorkflowSourceStep {
-                    id: Some(step.id.clone()),
-                    name: step.name.clone(),
-                    needs: step.needs.clone(),
-                    action: match &step.operation {
-                        WorkflowStructuredSourceOperation::Action(action) => action.clone(),
-                        WorkflowStructuredSourceOperation::FanOut(_)
-                        | WorkflowStructuredSourceOperation::Parallel(_)
-                        | WorkflowStructuredSourceOperation::WorkflowCall(_)
-                        | WorkflowStructuredSourceOperation::Input(_)
-                        | WorkflowStructuredSourceOperation::Approval(_)
-                        | WorkflowStructuredSourceOperation::Agent(_) => unreachable!(),
-                    },
-                })
-                .collect(),
-        });
-        let (mut document, mut source_map) = if let Some(v1) = v1 {
-            v1.lower(catalog)?
-        } else {
-            self.lower_mixed_steps(catalog)?
-        };
+        let (mut document, mut source_map) = self.lower_mixed_steps(catalog)?;
         let order = self
             .steps
             .iter()
@@ -5944,6 +5922,21 @@ impl WorkflowStructuredSourceDocument {
                         "structured step did not lower to a canonical node",
                     )
                 })?;
+                if target.kind == NodeKind::PluginBlock {
+                    let block: WorkflowBlockDefinition =
+                        serde_json::from_value(target.configuration.clone()).map_err(|error| {
+                            authoring_error(
+                                format!("steps[{index}].input_from"),
+                                format!("plugin-block contract is invalid: {error}"),
+                            )
+                        })?;
+                    if !workflow_allows_dynamic_complete_input(&block.input) {
+                        return Err(authoring_error(
+                            format!("steps[{index}].input_from"),
+                            "plugin block forbids dynamic complete-input binding; bind only declared safe fields",
+                        ));
+                    }
+                }
                 let edge = document
                     .definition
                     .edges
@@ -6250,19 +6243,39 @@ impl WorkflowStructuredSourceDocument {
                         })?,
                     }
                 }
-                WorkflowStructuredSourceOperation::Agent(agent) => {
-                    agent.configuration.validate()?;
+                WorkflowStructuredSourceOperation::Prompt(prompt) => {
+                    let prompt = prompt.expand()?;
+                    NodeDefinition {
+                        id: step.id.clone(),
+                        name: step.name.clone().unwrap_or_else(|| step.id.clone()),
+                        kind: NodeKind::Agent,
+                        dataflow: WorkflowNodeDataflowPolicy::Direct,
+                        input: prompt.input,
+                        output: prompt.output,
+                        resources: prompt.resources,
+                        configuration: serde_json::to_value(prompt.configuration).map_err(
+                            |error| {
+                                authoring_error(
+                                    format!("steps[{index}].prompt"),
+                                    format!("prompt configuration cannot be serialized: {error}"),
+                                )
+                            },
+                        )?,
+                    }
+                }
+                WorkflowStructuredSourceOperation::Agent(prompt) => {
+                    prompt.configuration.validate()?;
                     validate_runtime_value_schema(
-                        &format!("steps[{index}].agent.input"),
-                        &agent.input,
+                        &format!("steps[{index}].prompt.input"),
+                        &prompt.input,
                     )?;
                     validate_runtime_value_schema(
-                        &format!("steps[{index}].agent.output"),
-                        &agent.output,
+                        &format!("steps[{index}].prompt.output"),
+                        &prompt.output,
                     )?;
-                    if agent.configuration.structured_output.schema != agent.output {
+                    if prompt.configuration.structured_output.schema != prompt.output {
                         return Err(authoring_error(
-                            format!("steps[{index}].agent.output"),
+                            format!("steps[{index}].prompt.output"),
                             "agent output must match its structured-output schema exactly",
                         ));
                     }
@@ -6271,14 +6284,14 @@ impl WorkflowStructuredSourceDocument {
                         name: step.name.clone().unwrap_or_else(|| step.id.clone()),
                         kind: NodeKind::Agent,
                         dataflow: WorkflowNodeDataflowPolicy::Direct,
-                        input: agent.input.clone(),
-                        output: agent.output.clone(),
-                        resources: agent.resources.clone(),
-                        configuration: serde_json::to_value(&agent.configuration).map_err(
+                        input: prompt.input.clone(),
+                        output: prompt.output.clone(),
+                        resources: prompt.resources.clone(),
+                        configuration: serde_json::to_value(&prompt.configuration).map_err(
                             |error| {
                                 authoring_error(
                                     format!("steps[{index}].agent"),
-                                    format!("agent configuration cannot be serialized: {error}"),
+                                    format!("prompt configuration cannot be serialized: {error}"),
                                 )
                             },
                         )?,
@@ -6427,8 +6440,17 @@ fn validate_structured_source_fan_out(
     let output = workflow_fan_out_result_schema(&fan_out.output_member)?;
     validate_runtime_value_schema(&format!("steps[{index}].fan_out.output"), &output)?;
     match &fan_out.operation {
-        WorkflowStructuredSourceOperation::Agent(agent)
-            if agent.input == fan_out.member && agent.output == fan_out.output_member => {}
+        WorkflowStructuredSourceOperation::Prompt(prompt) => {
+            let expanded = prompt.expand()?;
+            if expanded.input != fan_out.member || expanded.output != fan_out.output_member {
+                return Err(authoring_error(
+                    format!("steps[{index}].fan_out.operation"),
+                    "fan-out prompt schemas must match member schemas",
+                ));
+            }
+        }
+        WorkflowStructuredSourceOperation::Agent(prompt)
+            if prompt.input == fan_out.member && prompt.output == fan_out.output_member => {}
         WorkflowStructuredSourceOperation::WorkflowCall(_)
         | WorkflowStructuredSourceOperation::Action(_)
         | WorkflowStructuredSourceOperation::Input(_)
@@ -7765,9 +7787,6 @@ fn apply_authoring_binding(
         WorkflowConfigurationTarget::AgentSelection { node_id, field } => {
             apply_authoring_agent_selection(definition, node_id, field, &value)?;
         }
-        WorkflowConfigurationTarget::SkillSelection { node_id, index } => {
-            apply_authoring_skill_selection(definition, node_id, *index, value)?;
-        }
         WorkflowConfigurationTarget::PluginBlockInput { node_id, path } => {
             let defaults = plugin_input_defaults
                 .entry(node_id.clone())
@@ -7835,17 +7854,17 @@ fn apply_authoring_agent_selection(
             format!("binding references unknown node '{node_id}'"),
         )
     })?;
-    let mut agent: WorkflowAgentConfiguration = serde_json::from_value(node.configuration.clone())
-        .map_err(|error| {
+    let mut prompt: WorkflowPromptConfiguration =
+        serde_json::from_value(node.configuration.clone()).map_err(|error| {
             authoring_error(
                 format!("definition.nodes.{node_id}.configuration"),
-                format!("agent configuration is invalid: {error}"),
+                format!("prompt configuration is invalid: {error}"),
             )
         })?;
     match field {
-        "agent_profile" => agent.agent_profile = authoring_non_empty_string(field, value)?,
-        "provider" => agent.provider = authoring_optional_string(field, value)?,
-        "model" => agent.model = authoring_optional_string(field, value)?,
+        "agent_profile" => prompt.agent_profile = authoring_non_empty_string(field, value)?,
+        "provider" => prompt.provider = authoring_optional_string(field, value)?,
+        "model" => prompt.model = authoring_optional_string(field, value)?,
         _ => {
             return Err(authoring_error(
                 "bindings.target.field",
@@ -7853,57 +7872,11 @@ fn apply_authoring_agent_selection(
             ));
         }
     }
-    agent.validate()?;
-    node.configuration = serde_json::to_value(agent).map_err(|error| {
+    prompt.validate()?;
+    node.configuration = serde_json::to_value(prompt).map_err(|error| {
         authoring_error(
             format!("definition.nodes.{node_id}.configuration"),
-            format!("agent configuration cannot be serialized: {error}"),
-        )
-    })?;
-    Ok(())
-}
-
-fn apply_authoring_skill_selection(
-    definition: &mut WorkflowDefinition,
-    node_id: &str,
-    index: usize,
-    value: serde_json::Value,
-) -> Result<(), WorkflowError> {
-    let node = definition.nodes.get_mut(node_id).ok_or_else(|| {
-        authoring_error(
-            "bindings.target.node_id",
-            format!("binding references unknown node '{node_id}'"),
-        )
-    })?;
-    let mut agent: WorkflowAgentConfiguration = serde_json::from_value(node.configuration.clone())
-        .map_err(|error| {
-            authoring_error(
-                format!("definition.nodes.{node_id}.configuration"),
-                format!("agent configuration is invalid: {error}"),
-            )
-        })?;
-    let selection: AgentSkillSelection = serde_json::from_value(value).map_err(|error| {
-        authoring_error(
-            "bindings.target.skill",
-            format!("skill selection is invalid: {error}"),
-        )
-    })?;
-    if index > agent.skills.len() {
-        return Err(authoring_error(
-            "bindings.target.index",
-            "skill selection index cannot leave gaps",
-        ));
-    }
-    if index == agent.skills.len() {
-        agent.skills.push(selection);
-    } else {
-        agent.skills[index] = selection;
-    }
-    agent.validate()?;
-    node.configuration = serde_json::to_value(agent).map_err(|error| {
-        authoring_error(
-            format!("definition.nodes.{node_id}.configuration"),
-            format!("agent configuration cannot be serialized: {error}"),
+            format!("prompt configuration cannot be serialized: {error}"),
         )
     })?;
     Ok(())
@@ -8032,11 +8005,6 @@ pub fn workflow_requirement_availability(
         &declared.agents,
         &catalog.agent_profiles,
     );
-    append_missing(
-        WorkflowRequirementKind::Skill,
-        &declared.skills,
-        &catalog.skills,
-    );
     Ok(WorkflowRequirementAvailabilityReport {
         version: WORKFLOW_REQUIREMENT_AVAILABILITY_VERSION,
         available: unavailable.is_empty(),
@@ -8055,14 +8023,12 @@ fn validate_declared_authoring_requirements(
             WorkflowRequirementKind::Plugin => "requirements.plugins",
             WorkflowRequirementKind::Block => "requirements.blocks",
             WorkflowRequirementKind::Agent => "requirements.agents",
-            WorkflowRequirementKind::Skill => "requirements.skills",
         };
         let label = match unavailable.kind {
             WorkflowRequirementKind::Capability => "capability",
             WorkflowRequirementKind::Plugin => "plugin",
             WorkflowRequirementKind::Block => "block",
-            WorkflowRequirementKind::Agent => "agent profile",
-            WorkflowRequirementKind::Skill => "skill",
+            WorkflowRequirementKind::Agent => "prompt profile",
         };
         return Err(authoring_error(
             path,
@@ -8119,37 +8085,24 @@ fn resolve_authoring_catalog_inner(
         effects.resources.extend(node.resources.clone());
         match node.kind {
             NodeKind::Agent => {
-                let agent: WorkflowAgentConfiguration =
+                let prompt: WorkflowPromptConfiguration =
                     serde_json::from_value(node.configuration.clone()).map_err(|error| {
                         authoring_error(
                             format!("definition.nodes.{node_id}.configuration"),
-                            format!("agent configuration is invalid: {error}"),
+                            format!("prompt configuration is invalid: {error}"),
                         )
                     })?;
-                agent.validate()?;
-                if !catalog.agent_profiles.contains(&agent.agent_profile) {
+                prompt.validate()?;
+                if !catalog.agent_profiles.contains(&prompt.agent_profile) {
                     return Err(authoring_error(
                         format!("definition.nodes.{node_id}.configuration.agent_profile"),
-                        format!("agent profile '{}' is unavailable", agent.agent_profile),
+                        format!("prompt profile '{}' is unavailable", prompt.agent_profile),
                     ));
                 }
-                requirements.agents.insert(agent.agent_profile.clone());
-                for skill in &agent.skills {
-                    if skill.mode != AgentSkillActivationMode::Disabled
-                        && !catalog.skills.contains(&skill.skill_id)
-                    {
-                        return Err(authoring_error(
-                            format!("definition.nodes.{node_id}.configuration.skills"),
-                            format!("skill '{}' is unavailable", skill.skill_id),
-                        ));
-                    }
-                    if skill.mode != AgentSkillActivationMode::Disabled {
-                        requirements.skills.insert(skill.skill_id.clone());
-                    }
-                }
-                effects.maximum_capability = effects.maximum_capability.max(agent.tool_capability);
+                requirements.agents.insert(prompt.agent_profile.clone());
+                effects.maximum_capability = effects.maximum_capability.max(prompt.tool_capability);
                 permissions.maximum_capability =
-                    permissions.maximum_capability.max(agent.tool_capability);
+                    permissions.maximum_capability.max(prompt.tool_capability);
             }
             NodeKind::PluginBlock => resolve_authoring_plugin_block(
                 node_id,
@@ -8216,7 +8169,6 @@ fn merge_child_preview(
     requirements.plugins.extend(child_requirements.plugins);
     requirements.blocks.extend(child_requirements.blocks);
     requirements.agents.extend(child_requirements.agents);
-    requirements.skills.extend(child_requirements.skills);
     effects.maximum_capability = effects
         .maximum_capability
         .max(child_effects.maximum_capability);
@@ -8851,6 +8803,12 @@ pub struct WorkflowMutationGrantScope {
     pub block_version: u32,
     pub operation: String,
     pub input_checksum_sha256: String,
+    /// Exact owner-prepared canonical operation facts authorized for this activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_facts: Option<serde_json::Value>,
+    /// SHA-256 identity of the exact owner-issued preparation descriptor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_descriptor_sha256: Option<String>,
     /// Bounded renderer-neutral summary of the immutable dispatch input.
     pub input_summary: serde_json::Value,
     /// Exact normalized resource claims required by the dispatch.
@@ -8886,6 +8844,22 @@ impl WorkflowMutationGrantScope {
             || serde_json::to_vec(&self.input_summary).map_or(true, |summary| {
                 summary.len() > MAX_WORKFLOW_MUTATION_APPROVAL_INPUT_BYTES
             })
+            || self.operation_facts.as_ref().is_some_and(|facts| {
+                facts.is_null()
+                    || serde_json::to_vec(facts).map_or(true, |encoded| {
+                        encoded.len() > MAX_WORKFLOW_BLOCK_PREPARATION_BYTES
+                    })
+            })
+            || self
+                .preparation_descriptor_sha256
+                .as_ref()
+                .is_some_and(|checksum| {
+                    checksum.len() != 64
+                        || !checksum
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                })
+            || self.operation_facts.is_some() != self.preparation_descriptor_sha256.is_some()
             || identities
                 .iter()
                 .any(|value| value.trim().is_empty() || value.len() > 4_096)
@@ -9170,66 +9144,48 @@ impl ResourceClaim {
     }
 }
 
-/// Stable durable agent-node configuration version.
-pub const WORKFLOW_AGENT_CONFIGURATION_VERSION: u32 = 1;
+/// Stable durable prompt-node configuration version.
+pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2;
 
-/// Skill activation behavior for one durable agent node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentSkillActivationMode {
-    Required,
-    Preferred,
-    Disabled,
-}
-
-/// Exact skill selection embedded in durable definition identity.
+/// Typed structured-output policy for a durable prompt node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentSkillSelection {
-    pub skill_id: String,
-    pub mode: AgentSkillActivationMode,
-}
-
-/// Typed structured-output policy for a durable agent node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentStructuredOutputPolicy {
+pub struct PromptStructuredOutputPolicy {
     pub schema: ValueSchema,
     pub strict: bool,
 }
 
-/// Versioned serializable durable agent-node configuration.
+/// Versioned serializable durable prompt-node configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkflowAgentConfiguration {
+pub struct WorkflowPromptConfiguration {
     pub version: u32,
-    pub execution_target: AgentExecutionTarget,
+    pub execution_target: PromptContextTarget,
     pub agent_profile: String,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub structured_output: AgentStructuredOutputPolicy,
+    pub structured_output: PromptStructuredOutputPolicy,
     pub read_only: bool,
     pub tool_capability: WorkflowToolCapability,
     pub tool_allowlist: Vec<String>,
     pub timeout_ms: u64,
-    pub skills: Vec<AgentSkillSelection>,
     pub prompt_mode: String,
     pub system_prompt: String,
 }
 
-impl WorkflowAgentConfiguration {
-    /// Validate bounded identity, policy, and skill-isolation rules.
+impl WorkflowPromptConfiguration {
+    /// Validate bounded identity and policy rules.
     ///
     /// # Errors
     ///
     /// Returns an error for unsupported versions, empty identities, invalid timeout/prompt mode,
-    /// duplicate skills/tools, or read-only policy escalation.
+    /// duplicate tools, or read-only policy escalation.
     pub fn validate(&self) -> Result<(), WorkflowError> {
-        if self.version != WORKFLOW_AGENT_CONFIGURATION_VERSION {
+        if self.version != WORKFLOW_PROMPT_CONFIGURATION_VERSION {
             return Err(WorkflowError::Build {
-                path: "agent.configuration.version".to_string(),
+                path: "prompt.configuration.version".to_string(),
                 message: format!(
-                    "unsupported agent configuration version {}; expected {WORKFLOW_AGENT_CONFIGURATION_VERSION}",
+                    "unsupported prompt configuration version {}; expected {WORKFLOW_PROMPT_CONFIGURATION_VERSION}",
                     self.version
                 ),
             });
@@ -9241,21 +9197,21 @@ impl WorkflowAgentConfiguration {
             || self.system_prompt.len() > 262_144
         {
             return Err(WorkflowError::Build {
-                path: "agent.configuration".to_string(),
-                message: "agent profile, prompt mode, timeout, or system prompt is invalid"
+                path: "prompt.configuration".to_string(),
+                message: "prompt profile, prompt mode, timeout, or system prompt is invalid"
                     .to_string(),
             });
         }
         if self.read_only && self.tool_capability != WorkflowToolCapability::ReadOnly {
             return Err(WorkflowError::Build {
-                path: "agent.tool_capability".to_string(),
-                message: "read-only agent must request the read-only tool capability".to_string(),
+                path: "prompt.tool_capability".to_string(),
+                message: "read-only prompt must request the read-only tool capability".to_string(),
             });
         }
         if !self.read_only && self.tool_capability == WorkflowToolCapability::ReadOnly {
             return Err(WorkflowError::Build {
-                path: "agent.tool_capability".to_string(),
-                message: "read-write agent cannot claim a read-only tool capability".to_string(),
+                path: "prompt.tool_capability".to_string(),
+                message: "mutating prompt cannot claim a read-only tool capability".to_string(),
             });
         }
         if self
@@ -9273,39 +9229,26 @@ impl WorkflowAgentConfiguration {
                 .is_some_and(|value| value.len() > 256)
             || self.model.as_ref().is_some_and(|value| value.len() > 512)
             || self.tool_allowlist.len() > 256
-            || self.skills.len() > 32
             || self
                 .tool_allowlist
                 .iter()
                 .any(|tool| tool.trim().is_empty() || tool.len() > 256)
-            || self.skills.iter().any(|skill| skill.skill_id.len() > 256)
         {
             return Err(WorkflowError::Build {
-                path: "agent.configuration".to_string(),
-                message: "agent identity, tool, or skill fields exceed durable bounds".to_string(),
+                path: "prompt.configuration".to_string(),
+                message: "prompt identity or tool fields exceed durable bounds".to_string(),
             });
         }
         let tools = self.tool_allowlist.iter().collect::<BTreeSet<_>>();
-        let skills = self
-            .skills
-            .iter()
-            .map(|skill| skill.skill_id.as_str())
-            .collect::<BTreeSet<_>>();
-        if tools.len() != self.tool_allowlist.len()
-            || skills.len() != self.skills.len()
-            || self
-                .skills
-                .iter()
-                .any(|skill| skill.skill_id.trim().is_empty())
-        {
+        if tools.len() != self.tool_allowlist.len() {
             return Err(WorkflowError::Build {
-                path: "agent.configuration".to_string(),
-                message: "agent tools and skill IDs must be non-empty and unique".to_string(),
+                path: "prompt.configuration".to_string(),
+                message: "agent tool IDs must be non-empty and unique".to_string(),
             });
         }
         jsonschema::validator_for(&self.structured_output.schema.schema).map_err(|error| {
             WorkflowError::Build {
-                path: "agent.structured_output".to_string(),
+                path: "prompt.structured_output".to_string(),
                 message: format!("invalid structured output schema: {error}"),
             }
         })?;
@@ -9313,12 +9256,12 @@ impl WorkflowAgentConfiguration {
     }
 }
 
-/// Execution target for a daemon-hosted workflow agent node.
+/// Execution target for a daemon-hosted workflow prompt node.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum AgentExecutionTarget {
+pub enum PromptContextTarget {
     /// Execute in a fresh isolated child session.
     #[default]
     FreshIsolated,
@@ -9613,7 +9556,7 @@ pub struct WorkflowProductionCapabilities {
     /// Durable support classification for opaque artifact references.
     pub artifact_references: WorkflowCapabilitySupport,
     /// Supported durable agent execution targets.
-    pub agent_execution_targets: BTreeSet<AgentExecutionTarget>,
+    pub agent_execution_targets: BTreeSet<PromptContextTarget>,
 }
 
 impl WorkflowProductionCapabilities {
@@ -9667,9 +9610,9 @@ impl WorkflowProductionCapabilities {
             transforms: WorkflowCapabilitySupport::Supported,
             artifact_references: WorkflowCapabilitySupport::Supported,
             agent_execution_targets: BTreeSet::from([
-                AgentExecutionTarget::FreshIsolated,
-                AgentExecutionTarget::FixedGenerationFork,
-                AgentExecutionTarget::SharedParentSequential,
+                PromptContextTarget::FreshIsolated,
+                PromptContextTarget::FixedGenerationFork,
+                PromptContextTarget::SharedParentSequential,
             ]),
         }
     }
@@ -9921,6 +9864,97 @@ impl WorkflowValueSelector {
     }
 }
 
+/// Deterministic assertion over a selected typed workflow value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "assertion", rename_all = "snake_case")]
+pub enum WorkflowValueAssertion {
+    /// Require a complete UTF-8 string equal to the expected text.
+    TextEquals { expected: String },
+    /// Require an exact byte length for a UTF-8 string or typed artifact reference.
+    ByteLength { expected: u64 },
+    /// Require the SHA-256 identity of a UTF-8 string or typed artifact reference.
+    Sha256 { expected: String },
+}
+
+impl WorkflowValueAssertion {
+    /// Evaluate this assertion over one already-selected value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected value has the wrong schema, text is marked binary or
+    /// truncated, the assertion is malformed, or an artifact does not carry the required identity.
+    pub fn evaluate(&self, value: &serde_json::Value) -> Result<bool, WorkflowError> {
+        match self {
+            Self::TextEquals { expected } => {
+                let (text, complete_utf8) = assertion_text(value)?;
+                if !complete_utf8 {
+                    return Err(assertion_error(
+                        "text assertions require complete valid UTF-8 without truncation",
+                    ));
+                }
+                Ok(text == expected)
+            }
+            Self::ByteLength { expected } => Ok(assertion_byte_length(value)? == *expected),
+            Self::Sha256 { expected } => {
+                validate_sha256("assertion.sha256", expected)?;
+                Ok(assertion_sha256(value)? == *expected)
+            }
+        }
+    }
+}
+
+fn assertion_error(message: impl Into<String>) -> WorkflowError {
+    WorkflowError::Build {
+        path: "assertion".to_string(),
+        message: message.into(),
+    }
+}
+
+fn assertion_text(value: &serde_json::Value) -> Result<(&str, bool), WorkflowError> {
+    if let Some(text) = value.as_str() {
+        return Ok((text, true));
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| assertion_error("text assertion requires a string or typed text result"))?;
+    let text = object
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| assertion_error("typed text result is missing text"))?;
+    let encoding = object
+        .get("encoding")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| assertion_error("typed text result is missing encoding"))?;
+    let truncated = object
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| assertion_error("typed text result is missing truncation state"))?;
+    Ok((text, encoding == "utf8" && !truncated))
+}
+
+fn assertion_byte_length(value: &serde_json::Value) -> Result<u64, WorkflowError> {
+    if let Some(text) = value.as_str() {
+        return u64::try_from(text.len()).map_err(|error| assertion_error(error.to_string()));
+    }
+    value
+        .get("byte_length")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| assertion_error("byte-length assertion requires typed byte_length"))
+}
+
+fn assertion_sha256(value: &serde_json::Value) -> Result<String, WorkflowError> {
+    if let Some(text) = value.as_str() {
+        use sha2::Digest as _;
+        return Ok(format!("{:x}", sha2::Sha256::digest(text.as_bytes())));
+    }
+    let checksum = value
+        .get("checksum_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| assertion_error("SHA-256 assertion requires typed checksum_sha256"))?;
+    validate_sha256("assertion.value.checksum_sha256", checksum)?;
+    Ok(checksum.to_string())
+}
+
 /// Serializable deterministic predicate over a structured workflow value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -9975,6 +10009,13 @@ pub enum PredicateExpression {
         /// Ordering relation that must hold.
         comparison: PredicateNumericComparison,
     },
+    /// Apply one bounded typed assertion to an explicit selected value.
+    SelectedAssertion {
+        /// Predicate contract version. This operation requires version 3.
+        version: u32,
+        selector: WorkflowValueSelector,
+        assertion: WorkflowValueAssertion,
+    },
     /// Compare a value selected with explicit field/index segments to one constant.
     SelectedEquals {
         /// Predicate contract version. This operation requires version 3.
@@ -10025,6 +10066,7 @@ impl PredicateExpression {
             | Self::Any { version, .. }
             | Self::Not { version, .. }
             | Self::NumericCompare { version, .. }
+            | Self::SelectedAssertion { version, .. }
             | Self::SelectedEquals { version, .. }
             | Self::SelectedValuesEqual { version, .. }
             | Self::SelectedNumericCompare { version, .. } => *version,
@@ -10042,6 +10084,7 @@ impl PredicateExpression {
         self.evaluate_validated(value)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn evaluate_validated(&self, value: &serde_json::Value) -> Result<bool, WorkflowError> {
         match self {
             Self::Equals {
@@ -10105,6 +10148,11 @@ impl PredicateExpression {
                 left_path,
                 right_path,
             ),
+            Self::SelectedAssertion {
+                version: _,
+                selector,
+                assertion,
+            } => assertion.evaluate(selector.select(value)?),
             Self::SelectedEquals {
                 version: _,
                 selector,
@@ -10821,6 +10869,7 @@ impl WorkflowDefinition {
                 validate_production_agent_node(node, capabilities, &mut diagnostics);
             }
         }
+        validate_mutating_prompt_verification(self, &mut diagnostics);
         for edge in &self.edges {
             if let Some(transform) = &edge.transform {
                 if capabilities.transforms != WorkflowCapabilitySupport::Supported {
@@ -11208,7 +11257,7 @@ where
     ///
     /// Panics when called on a composed flow or a non-agent leaf.
     #[must_use]
-    pub fn agent_execution_target(mut self, target: AgentExecutionTarget) -> Self {
+    pub fn agent_execution_target(mut self, target: PromptContextTarget) -> Self {
         let leaf = self
             .leaf_node_id
             .as_ref()
@@ -11227,7 +11276,7 @@ where
         let configuration = node
             .configuration
             .as_object_mut()
-            .expect("agent node configuration must be an object");
+            .expect("prompt node configuration must be an object");
         configuration.insert(
             "execution_target".to_string(),
             serde_json::to_value(target).expect("agent execution target should serialize"),
@@ -12665,6 +12714,57 @@ fn validate_production_edge_schema(
     }
 }
 
+fn validate_mutating_prompt_verification(
+    definition: &WorkflowDefinition,
+    diagnostics: &mut Vec<WorkflowCapabilityDiagnostic>,
+) {
+    for node in definition
+        .nodes
+        .values()
+        .filter(|node| node.kind == NodeKind::Agent)
+    {
+        let Ok(prompt) =
+            serde_json::from_value::<WorkflowPromptConfiguration>(node.configuration.clone())
+        else {
+            continue;
+        };
+        if prompt.read_only {
+            continue;
+        }
+        let successors = definition
+            .edges
+            .iter()
+            .filter(|edge| edge.from == node.id)
+            .filter_map(|edge| definition.node(&edge.to))
+            .collect::<Vec<_>>();
+        let valid_verifier = successors.len() == 1
+            && match successors[0].kind {
+                NodeKind::Task | NodeKind::Branch | NodeKind::WorkflowCall => true,
+                NodeKind::PluginBlock => serde_json::from_value::<WorkflowBlockDefinition>(
+                    successors[0].configuration.clone(),
+                )
+                .is_ok_and(|block| block.effect == WorkflowBlockEffect::ReadOnly),
+                NodeKind::Agent
+                | NodeKind::Repeat
+                | NodeKind::Retry
+                | NodeKind::Parallel
+                | NodeKind::FanOut
+                | NodeKind::Input
+                | NodeKind::Approval => false,
+            };
+        if !valid_verifier {
+            diagnostics.push(WorkflowCapabilityDiagnostic {
+                code: "missing_mutation_verification".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "mutating prompt node '{}' must have exactly one deterministic non-agent verifier successor",
+                    node.id
+                ),
+            });
+        }
+    }
+}
+
 fn validate_production_agent_node(
     node: &NodeDefinition,
     capabilities: &WorkflowProductionCapabilities,
@@ -12679,22 +12779,22 @@ fn validate_production_agent_node(
         return;
     };
     if configuration.contains_key("version") {
-        let contract = match serde_json::from_value::<WorkflowAgentConfiguration>(
-            node.configuration.clone(),
-        ) {
-            Ok(contract) => contract,
-            Err(error) => {
-                diagnostics.push(WorkflowCapabilityDiagnostic {
-                    code: "invalid_agent_configuration".to_string(),
-                    node_id: Some(node.id.clone()),
-                    message: format!(
-                        "agent node '{}' has an invalid versioned configuration: {error}",
-                        node.id
-                    ),
-                });
-                return;
-            }
-        };
+        let contract =
+            match serde_json::from_value::<WorkflowPromptConfiguration>(node.configuration.clone())
+            {
+                Ok(contract) => contract,
+                Err(error) => {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "invalid_agent_configuration".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!(
+                            "agent node '{}' has an invalid versioned configuration: {error}",
+                            node.id
+                        ),
+                    });
+                    return;
+                }
+            };
         if let Err(error) = contract.validate() {
             diagnostics.push(WorkflowCapabilityDiagnostic {
                 code: "invalid_agent_configuration".to_string(),
@@ -12732,7 +12832,7 @@ fn validate_production_agent_node(
         });
     }
     let execution_target = configuration.get("execution_target").map_or_else(
-        || Ok(AgentExecutionTarget::FreshIsolated),
+        || Ok(PromptContextTarget::FreshIsolated),
         |value| serde_json::from_value(value.clone()),
     );
     match execution_target {
@@ -12820,6 +12920,29 @@ fn validate_predicate_expression_inner(
             }
             validate_predicate_path(left_path)?;
             validate_predicate_path(right_path)?;
+        }
+        PredicateExpression::SelectedAssertion {
+            selector,
+            assertion,
+            ..
+        } => {
+            if version < 3 {
+                return Err(predicate_operation_requires_version_three(expression));
+            }
+            selector.validate()?;
+            let encoded = serde_json::to_vec(assertion).map_err(|error| WorkflowError::Build {
+                path: "assertion".to_string(),
+                message: format!("assertion cannot be serialized: {error}"),
+            })?;
+            if encoded.len() > MAX_PREDICATE_VALUE_BYTES {
+                return Err(WorkflowError::Build {
+                    path: "assertion".to_string(),
+                    message: format!("assertion exceeds {MAX_PREDICATE_VALUE_BYTES} bytes"),
+                });
+            }
+            if let WorkflowValueAssertion::Sha256 { expected } = assertion {
+                validate_sha256("assertion.sha256", expected)?;
+            }
         }
         PredicateExpression::SelectedEquals {
             selector, value, ..
@@ -13206,13 +13329,13 @@ mod tests {
                         input: value_schema.clone(),
                         output: value_schema.clone(),
                         resources: vec![ResourceClaim::read("repository")],
-                        configuration: serde_json::to_value(WorkflowAgentConfiguration {
-                            version: WORKFLOW_AGENT_CONFIGURATION_VERSION,
-                            execution_target: AgentExecutionTarget::FreshIsolated,
+                        configuration: serde_json::to_value(WorkflowPromptConfiguration {
+                            version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                            execution_target: PromptContextTarget::FreshIsolated,
                             agent_profile: "review".to_string(),
                             provider: None,
                             model: None,
-                            structured_output: AgentStructuredOutputPolicy {
+                            structured_output: PromptStructuredOutputPolicy {
                                 schema: value_schema,
                                 strict: true,
                             },
@@ -13220,7 +13343,6 @@ mod tests {
                             tool_capability: WorkflowToolCapability::ReadOnly,
                             tool_allowlist: Vec::new(),
                             timeout_ms: 30_000,
-                            skills: Vec::new(),
                             prompt_mode: "json_input".to_string(),
                             system_prompt: "Review the structured input.".to_string(),
                         })
@@ -13263,7 +13385,6 @@ mod tests {
                 plugins: BTreeSet::new(),
                 blocks: BTreeSet::new(),
                 agents: BTreeSet::from(["review".to_string()]),
-                skills: BTreeSet::new(),
             },
             run_limits: WorkflowRunLimitPolicy::default(),
             producer: WorkflowProducerProvenance {
@@ -13294,8 +13415,8 @@ mod tests {
             serde_json::from_value(document.definition.nodes["run_shell"].configuration.clone())
                 .expect("exact shell block");
         assert_eq!(block.plugin_id, "bcode.shell");
-        assert_eq!(block.block_id, "shell.command-plan");
-        assert_eq!(block.block_version, 2);
+        assert_eq!(block.block_id, "exec");
+        assert_eq!(block.block_version, 1);
         let mut catalog = WorkflowAuthoringCatalogSnapshot {
             version: WORKFLOW_AUTHORING_CATALOG_VERSION,
             capabilities: WorkflowAuthoringCapabilitySummary::from(
@@ -13306,7 +13427,6 @@ mod tests {
             node_configuration_schemas: workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
-            skills: BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         };
         catalog.validate().expect("shell example catalog");
@@ -13321,12 +13441,7 @@ mod tests {
             compiled.input_defaults["commands"][0]["accepted_exit_codes"],
             serde_json::json!([0, 7])
         );
-        assert!(
-            compiled
-                .requirements
-                .blocks
-                .contains("bcode.shell/shell.command-plan@2")
-        );
+        assert!(compiled.requirements.blocks.contains("bcode.shell/exec@1"));
         assert_eq!(
             compiled.effects.block_effects,
             BTreeSet::from([WorkflowBlockEffect::Mutating])
@@ -13397,7 +13512,7 @@ mod tests {
     #[test]
     fn workflow_package_cross_format_members_lower_byte_equivalently() {
         let json = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/member",
             "title": "Member",
             "steps": [{
@@ -13414,20 +13529,20 @@ mod tests {
             (
                 WorkflowSourceFormat::Yaml,
                 "member.yaml",
-                "workflow_source_version: 2\nworkflow_id: example/member\ntitle: Member\nsteps:\n  - id: input\n    input:\n      schema:\n        type_name: value/v1\n        schema:\n          type: string\n"
+                "workflow_source_version: 3\nworkflow_id: example/member\ntitle: Member\nsteps:\n  - id: input\n    input:\n      schema:\n        type_name: value/v1\n        schema:\n          type: string\n"
                     .to_string(),
             ),
             (
                 WorkflowSourceFormat::Toml,
                 "member.toml",
-                "workflow_source_version = 2\nworkflow_id = \"example/member\"\ntitle = \"Member\"\n\n[[steps]]\nid = \"input\"\n[steps.input.schema]\ntype_name = \"value/v1\"\n[steps.input.schema.schema]\ntype = \"string\"\n"
+                "workflow_source_version = 3\nworkflow_id = \"example/member\"\ntitle = \"Member\"\n\n[[steps]]\nid = \"input\"\n[steps.input.schema]\ntype_name = \"value/v1\"\n[steps.input.schema.schema]\ntype = \"string\"\n"
                     .to_string(),
             ),
         ];
         let plans = sources.map(|(format, source_name, source)| {
             plan_workflow_package(
                 &WorkflowPackageManifest {
-                    version: 1,
+                    version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
                     package_id: "example/package".to_string(),
                     exports: BTreeMap::from([("main".to_string(), "member".to_string())]),
                     external_dependencies: BTreeMap::new(),
@@ -13526,7 +13641,7 @@ mod tests {
 
     fn workflow_package_test_plan() -> WorkflowPackagePlan {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/member",
             "title": "Member",
             "steps": [{
@@ -13535,7 +13650,7 @@ mod tests {
             }]
         });
         let manifest = WorkflowPackageManifest {
-            version: 1,
+            version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "member".to_string())]),
             external_dependencies: BTreeMap::new(),
@@ -13553,7 +13668,7 @@ mod tests {
     #[test]
     fn workflow_package_plan_compiles_children_before_exact_parent_calls() {
         let child = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/child",
             "title": "Child",
             "steps": [{
@@ -13562,13 +13677,13 @@ mod tests {
             }]
         });
         let parent = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/parent",
             "title": "Parent",
             "steps": [{"id": "child", "package_call": {"member": "child"}}]
         });
         let manifest = WorkflowPackageManifest {
-            version: 1,
+            version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "parent".to_string())]),
             external_dependencies: BTreeMap::new(),
@@ -13640,7 +13755,7 @@ mod tests {
     #[test]
     fn workflow_package_preview_rejects_unknown_member_configuration() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/member",
             "title": "Member",
             "steps": [{"id": "input", "input": {
@@ -13648,7 +13763,7 @@ mod tests {
             }}]
         });
         let manifest = WorkflowPackageManifest {
-            version: 1,
+            version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "member".to_string())]),
             external_dependencies: BTreeMap::new(),
@@ -13677,7 +13792,7 @@ mod tests {
     #[test]
     fn workflow_package_member_diagnostics_are_exactly_qualified() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/member",
             "title": "Member",
             "steps": [{"id": "input", "input": {
@@ -13685,7 +13800,7 @@ mod tests {
             }}]
         });
         let manifest = WorkflowPackageManifest {
-            version: 1,
+            version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "member".to_string())]),
             external_dependencies: BTreeMap::new(),
@@ -13744,13 +13859,13 @@ mod tests {
     #[test]
     fn workflow_package_plan_rejects_undeclared_local_call() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/parent",
             "title": "Parent",
             "steps": [{"id": "child", "package_call": {"member": "missing"}}]
         });
         let manifest = WorkflowPackageManifest {
-            version: 1,
+            version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "parent".to_string())]),
             external_dependencies: BTreeMap::new(),
@@ -13840,19 +13955,31 @@ mod tests {
             members,
         };
         assert!(
-            lock(2, "a".repeat(64), vec![member("a")])
-                .validate()
-                .is_err()
+            lock(
+                WORKFLOW_PACKAGE_LOCK_VERSION + 1,
+                "a".repeat(64),
+                vec![member("a")]
+            )
+            .validate()
+            .is_err()
         );
         assert!(
-            lock(1, "not-a-digest".to_string(), vec![member("a")])
-                .validate()
-                .is_err()
+            lock(
+                WORKFLOW_PACKAGE_LOCK_VERSION,
+                "not-a-digest".to_string(),
+                vec![member("a")]
+            )
+            .validate()
+            .is_err()
         );
         assert!(
-            lock(1, "a".repeat(64), vec![member("a"), member("a")])
-                .validate()
-                .is_err()
+            lock(
+                WORKFLOW_PACKAGE_LOCK_VERSION,
+                "a".repeat(64),
+                vec![member("a"), member("a")]
+            )
+            .validate()
+            .is_err()
         );
     }
 
@@ -13868,14 +13995,14 @@ mod tests {
                     member_id: "child".to_string(),
                     source_name: "workflows/child.workflow.yaml".to_string(),
                     format: WorkflowSourceFormat::Yaml,
-                    source: "workflow_source_version: 2".to_string(),
+                    source: "workflow_source_version: 3".to_string(),
                     dependencies: Vec::new(),
                 },
                 WorkflowPackageMember {
                     member_id: "parent".to_string(),
                     source_name: "workflows/parent.workflow.yaml".to_string(),
                     format: WorkflowSourceFormat::Yaml,
-                    source: "workflow_source_version: 2".to_string(),
+                    source: "workflow_source_version: 3".to_string(),
                     dependencies: vec!["child".to_string()],
                 },
             ],
@@ -13893,7 +14020,7 @@ mod tests {
             member_id: id.to_string(),
             source_name: source_name.to_string(),
             format: WorkflowSourceFormat::Yaml,
-            source: "workflow_source_version: 2".to_string(),
+            source: "workflow_source_version: 3".to_string(),
             dependencies: dependencies.into_iter().map(str::to_string).collect(),
         };
         let package = |version, members| WorkflowPackageManifest {
@@ -13905,7 +14032,7 @@ mod tests {
         };
         assert!(
             package(
-                1,
+                WORKFLOW_PACKAGE_MANIFEST_VERSION,
                 vec![
                     member("a", "a.yaml", vec!["b"]),
                     member("b", "b.yaml", vec!["a"])
@@ -13916,21 +14043,27 @@ mod tests {
         );
         assert!(
             package(
-                1,
+                WORKFLOW_PACKAGE_MANIFEST_VERSION,
                 vec![member("a", "a.yaml", vec![]), member("a", "b.yaml", vec![])]
             )
             .validate()
             .is_err()
         );
         assert!(
-            package(1, vec![member("a", "../a.yaml", vec![])])
-                .validate()
-                .is_err()
+            package(
+                WORKFLOW_PACKAGE_MANIFEST_VERSION,
+                vec![member("a", "../a.yaml", vec![])]
+            )
+            .validate()
+            .is_err()
         );
         assert!(
-            package(2, vec![member("a", "a.yaml", vec![])])
-                .validate()
-                .is_err()
+            package(
+                WORKFLOW_PACKAGE_MANIFEST_VERSION + 1,
+                vec![member("a", "a.yaml", vec![])]
+            )
+            .validate()
+            .is_err()
         );
     }
 
@@ -13979,7 +14112,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_source_v2_lowers_deterministically_and_preserves_v1() {
+    fn structured_source_v3_lowers_deterministically_and_rejects_previous_versions() {
         let block = WorkflowBlockDefinition {
             block_id: "example.echo".to_string(),
             block_version: 1,
@@ -14002,6 +14135,7 @@ mod tests {
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            preparation_required: false,
         };
         let action = WorkflowAuthoringActionDescriptor {
             version: WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION,
@@ -14020,8 +14154,8 @@ mod tests {
         catalog
             .authoring_actions
             .insert(action.catalog_key(), action);
-        let v2 = r#"
-workflow_source_version: 2
+        let v3 = r#"
+workflow_source_version: 3
 workflow_id: example/structured
  title: Structured
 steps:
@@ -14039,41 +14173,37 @@ steps:
         value: ready
     echo: done
 "#;
-        let v2 = v2.replace("\n title:", "\ntitle:");
-        let first = lower_workflow_authoring_source(&v2, WorkflowSourceFormat::Yaml, &catalog)
-            .expect("structured v2");
-        let second = lower_workflow_authoring_source(&v2, WorkflowSourceFormat::Yaml, &catalog)
-            .expect("deterministic structured v2");
+        let v3 = v3.replace("\n title:", "\ntitle:");
+        let first = lower_workflow_authoring_source(&v3, WorkflowSourceFormat::Yaml, &catalog)
+            .expect("structured v3");
+        let second = lower_workflow_authoring_source(&v3, WorkflowSourceFormat::Yaml, &catalog)
+            .expect("deterministic structured v3");
         assert_eq!(first, second);
         assert_eq!(first.profile, WorkflowSourceProfile::Structured);
         assert!(matches!(
             first.document.definition.edges[0].kind,
             EdgeKind::Conditional { expected: true, .. }
         ));
-        let v1 = v2
-            .replace("workflow_source_version: 2", "workflow_source_version: 1")
-            .replace(
-                "    when:\n      source:\n        step: first\n      predicate:\n        operation: equals\n        version: 3\n        path: \"\"\n        value: ready\n",
-                "",
-            );
-        let compatible = lower_workflow_authoring_source(&v1, WorkflowSourceFormat::Yaml, &catalog)
-            .expect("v1 compatibility");
-        assert_eq!(compatible.profile, WorkflowSourceProfile::Concise);
+        let old = v3.replace("workflow_source_version: 3", "workflow_source_version: 2");
+        assert!(
+            lower_workflow_authoring_source(&old, WorkflowSourceFormat::Yaml, &catalog).is_err(),
+            "previous source versions must fail closed"
+        );
     }
 
     #[test]
-    fn structured_source_v2_lowers_agents_with_exact_context_policy() {
+    fn structured_source_v3_lowers_agents_with_exact_context_policy() {
         let schema = ValueSchema {
             type_name: "example.agent-value/v1".to_string(),
             schema: serde_json::json!({"type": "object", "additionalProperties": true}),
         };
-        let configuration = WorkflowAgentConfiguration {
-            version: WORKFLOW_AGENT_CONFIGURATION_VERSION,
-            execution_target: AgentExecutionTarget::FixedGenerationFork,
+        let configuration = WorkflowPromptConfiguration {
+            version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_target: PromptContextTarget::FixedGenerationFork,
             agent_profile: "review".to_string(),
             provider: None,
             model: None,
-            structured_output: AgentStructuredOutputPolicy {
+            structured_output: PromptStructuredOutputPolicy {
                 schema: schema.clone(),
                 strict: true,
             },
@@ -14081,12 +14211,11 @@ steps:
             tool_capability: WorkflowToolCapability::ReadOnly,
             tool_allowlist: vec!["filesystem.read".to_string()],
             timeout_ms: 30_000,
-            skills: Vec::new(),
             prompt_mode: "json_input".to_string(),
             system_prompt: "Review the input.".to_string(),
         };
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/agent",
             "title": "Agent",
             "steps": [{
@@ -14108,18 +14237,18 @@ steps:
         assert_eq!(lowered.profile, WorkflowSourceProfile::Structured);
         let node = &lowered.document.definition.nodes["review"];
         assert_eq!(node.kind, NodeKind::Agent);
-        let configuration: WorkflowAgentConfiguration =
+        let configuration: WorkflowPromptConfiguration =
             serde_json::from_value(node.configuration.clone()).expect("agent configuration");
         assert_eq!(
             configuration.execution_target,
-            AgentExecutionTarget::FixedGenerationFork
+            PromptContextTarget::FixedGenerationFork
         );
     }
 
     #[test]
-    fn structured_source_v2_rejects_agent_output_schema_mismatch() {
+    fn structured_source_v3_rejects_agent_output_schema_mismatch() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/agent-invalid",
             "title": "Agent invalid",
             "steps": [{
@@ -14128,7 +14257,7 @@ steps:
                     "configuration": {
                         "version": 1,
                         "execution_target": "fresh_isolated",
-                        "agent_profile": "review",
+                        "profile": "review",
                         "provider": null,
                         "model": null,
                         "structured_output": {
@@ -14139,7 +14268,6 @@ steps:
                         "tool_capability": "read_only",
                         "tool_allowlist": [],
                         "timeout_ms": 30000,
-                        "skills": [],
                         "prompt_mode": "json_input",
                         "system_prompt": "Review."
                     },
@@ -14160,7 +14288,7 @@ steps:
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn structured_source_v2_lowers_typed_selected_input_reference() {
+    fn structured_source_v3_lowers_typed_selected_input_reference() {
         let source_schema = ValueSchema {
             type_name: "example.record/v1".to_string(),
             schema: serde_json::json!({
@@ -14191,6 +14319,7 @@ steps:
                 timeout_ms: 30_000,
                 cancellation_supported: true,
                 reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+                preparation_required: false,
             };
         let produce = block("example.produce", source_schema.clone(), source_schema);
         let consume = block("example.consume", target_schema.clone(), target_schema);
@@ -14203,7 +14332,7 @@ steps:
             .blocks
             .insert(workflow_block_catalog_key(&consume), consume);
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/selected-input",
             "title": "Selected input",
             "steps": [
@@ -14276,9 +14405,9 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_rejects_ambiguous_selector_schema() {
+    fn structured_source_v3_rejects_ambiguous_selector_schema() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/ambiguous-selector",
             "title": "Ambiguous selector",
             "steps": [{
@@ -14287,7 +14416,7 @@ steps:
                     "configuration": {
                         "version": 1,
                         "execution_target": "fresh_isolated",
-                        "agent_profile": "review",
+                        "profile": "review",
                         "structured_output": {
                             "schema": {"type_name": "choice/v1", "schema": {
                                 "oneOf": [{"type": "object", "properties": {"value": {"type": "string"}}}]
@@ -14298,7 +14427,6 @@ steps:
                         "tool_capability": "read_only",
                         "tool_allowlist": [],
                         "timeout_ms": 30000,
-                        "skills": [],
                         "prompt_mode": "json_input",
                         "system_prompt": "Review."
                     },
@@ -14318,13 +14446,12 @@ steps:
                     "configuration": {
                         "version": 1,
                         "execution_target": "fresh_isolated",
-                        "agent_profile": "review",
+                        "profile": "review",
                         "structured_output": {"schema": {"type_name": "string/v1", "schema": {"type": "string"}}, "strict": true},
                         "read_only": true,
                         "tool_capability": "read_only",
                         "tool_allowlist": [],
                         "timeout_ms": 30000,
-                        "skills": [],
                         "prompt_mode": "json_input",
                         "system_prompt": "Review."
                     },
@@ -14344,10 +14471,10 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_fan_out_contract_validates_then_fails_capability_closed() {
+    fn structured_source_v3_fan_out_contract_validates_then_fails_capability_closed() {
         let member = serde_json::json!({"type_name": "value/v1", "schema": {"type": "string"}});
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/fan-out",
             "title": "Fan out",
             "steps": [{
@@ -14376,9 +14503,9 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_fan_out_contract_rejects_unbounded_or_mismatched_members() {
+    fn structured_source_v3_fan_out_contract_rejects_unbounded_or_mismatched_members() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/fan-out-invalid",
             "title": "Fan out invalid",
             "steps": [{
@@ -14404,9 +14531,9 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_retry_contract_validates_then_fails_capability_closed() {
+    fn structured_source_v3_retry_contract_validates_then_fails_capability_closed() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/retry",
             "title": "Retry",
             "steps": [{
@@ -14431,9 +14558,9 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_retry_contract_rejects_unsafe_failure_classes() {
+    fn structured_source_v3_retry_contract_rejects_unsafe_failure_classes() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/retry-invalid",
             "title": "Retry invalid",
             "steps": [{
@@ -14458,13 +14585,13 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_lowers_fixed_parallel_join() {
+    fn structured_source_v3_lowers_fixed_parallel_join() {
         let value_schema = serde_json::json!({
             "type_name": "value/v1",
             "schema": {"type": "string"}
         });
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/parallel",
             "title": "Parallel",
             "steps": [{
@@ -14517,10 +14644,10 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_rejects_parallel_without_exact_branches() {
+    fn structured_source_v3_rejects_parallel_without_exact_branches() {
         let schema = serde_json::json!({"type_name": "value/v1", "schema": {"type": "string"}});
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/parallel-invalid",
             "title": "Parallel invalid",
             "steps": [{"id": "left", "input": {"schema": schema}}, {
@@ -14540,7 +14667,7 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_lowers_bounded_repeat_topology() {
+    fn structured_source_v3_lowers_bounded_repeat_topology() {
         let block = WorkflowBlockDefinition {
             block_id: "example.echo".to_string(),
             block_version: 1,
@@ -14563,6 +14690,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            preparation_required: false,
         };
         let mut catalog = authoring_catalog();
         catalog.plugins.insert("bcode.example".to_string());
@@ -14570,7 +14698,7 @@ steps:
             .blocks
             .insert(workflow_block_catalog_key(&block), block);
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/repeat",
             "title": "Repeat",
             "run_limits": {
@@ -14635,9 +14763,9 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_rejects_unbounded_repeat() {
+    fn structured_source_v3_rejects_unbounded_repeat() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/repeat-invalid",
             "title": "Repeat invalid",
             "steps": [{
@@ -14661,14 +14789,14 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_lowers_typed_repeat_outcome_boundary() {
+    fn structured_source_v3_lowers_typed_repeat_outcome_boundary() {
         let value_schema = ValueSchema {
             type_name: "value/v1".to_string(),
             schema: serde_json::json!({"type": "string"}),
         };
         let outcome_schema = workflow_repeat_outcome_schema(&value_schema).expect("outcome schema");
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/repeat-outcome",
             "title": "Repeat outcome",
             "steps": [{
@@ -14704,7 +14832,7 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_lowers_exact_immutable_workflow_calls() {
+    fn structured_source_v3_lowers_exact_immutable_workflow_calls() {
         let schema = ValueSchema {
             type_name: "example.call/v1".to_string(),
             schema: serde_json::json!({"type": "string"}),
@@ -14744,7 +14872,7 @@ steps:
             .workflow_definitions
             .insert(identity.definition_id.clone(), child);
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/parent",
             "title": "Parent",
             "steps": [{
@@ -14771,9 +14899,9 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_rejects_unavailable_workflow_call() {
+    fn structured_source_v3_rejects_unavailable_workflow_call() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/parent",
             "title": "Parent",
             "steps": [{
@@ -14802,13 +14930,13 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_lowers_durable_input_and_approval_gates() {
+    fn structured_source_v3_lowers_durable_input_and_approval_gates() {
         let schema = serde_json::json!({
             "type_name": "example.request/v1",
             "schema": {"type": "string"}
         });
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/gates",
             "title": "Gates",
             "steps": [
@@ -14843,9 +14971,9 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_rejects_malformed_gate_fields() {
+    fn structured_source_v3_rejects_malformed_gate_fields() {
         let source = serde_json::json!({
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/gate-invalid",
             "title": "Invalid gate",
             "steps": [{
@@ -14867,9 +14995,9 @@ steps:
     }
 
     #[test]
-    fn structured_source_v2_rejects_future_references_and_unknown_fields() {
+    fn structured_source_v3_rejects_future_references_and_unknown_fields() {
         let source = r#"{
-            "workflow_source_version": 2,
+            "workflow_source_version": 3,
             "workflow_id": "example/invalid",
             "title": "Invalid",
             "steps": [{
@@ -14891,7 +15019,7 @@ steps:
     }
 
     #[test]
-    fn concise_source_lowers_deterministically_through_exact_actions() {
+    fn source_v3_shorthand_lowers_deterministically_through_exact_actions() {
         let block = WorkflowBlockDefinition {
             block_id: "example.echo".to_string(),
             block_version: 1,
@@ -14914,6 +15042,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            preparation_required: false,
         };
         let key = workflow_block_catalog_key(&block);
         let action = WorkflowAuthoringActionDescriptor {
@@ -14939,23 +15068,24 @@ steps:
             .authoring_actions
             .insert(action.catalog_key(), action);
         let source = r"
-workflow_source_version: 1
+workflow_source_version: 3
 workflow_id: example/concise
 title: Concise
 steps:
-  - echo: first
+  - id: first
+    echo: first
   - id: final
     echo: second
 ";
         let first = lower_workflow_authoring_source(source, WorkflowSourceFormat::Yaml, &catalog)
-            .expect("concise source");
+            .expect("source-v3 shorthand");
         let second = lower_workflow_authoring_source(source, WorkflowSourceFormat::Yaml, &catalog)
             .expect("repeat lowering");
         assert_eq!(first, second);
-        assert_eq!(first.profile, WorkflowSourceProfile::Concise);
-        assert_eq!(first.source_map.entries[0].node_id, "step_0001");
+        assert_eq!(first.profile, WorkflowSourceProfile::Structured);
+        assert_eq!(first.source_map.entries[0].node_id, "first");
         assert_eq!(first.source_map.entries[1].node_id, "final");
-        assert_eq!(first.document.definition.edges[0].from, "step_0001");
+        assert_eq!(first.document.definition.edges[0].from, "first");
         assert_eq!(first.document.definition.edges[0].to, "final");
         assert_eq!(
             first.document.plugin_input_defaults["final"],
@@ -14965,14 +15095,14 @@ steps:
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn checked_in_concise_sources_lower_identically() {
+    fn checked_in_source_v3_shorthand_lowers_identically() {
         let block = WorkflowBlockDefinition {
-            block_id: "shell.script".to_string(),
+            block_id: "exec".to_string(),
             block_version: 1,
             plugin_id: "bcode.shell".to_string(),
-            operation: "shell.script".to_string(),
+            operation: "exec".to_string(),
             input: ValueSchema {
-                type_name: "bcode.shell.script/v1".to_string(),
+                type_name: "bcode.shell.exec/v1".to_string(),
                 schema: serde_json::json!({
                     "oneOf": [
                         {"type": "string", "minLength": 1},
@@ -14981,7 +15111,7 @@ steps:
                 }),
             },
             output: ValueSchema {
-                type_name: "bcode.shell.command-plan-result/v2".to_string(),
+                type_name: "bcode.shell.exec-result/v1".to_string(),
                 schema: serde_json::json!({"type": "object"}),
             },
             effect: WorkflowBlockEffect::Mutating,
@@ -14993,6 +15123,7 @@ steps:
             timeout_ms: 300_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            preparation_required: false,
         };
         let action = WorkflowAuthoringActionDescriptor {
             version: WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION,
@@ -15017,24 +15148,24 @@ steps:
                 WorkflowSourceFormat::Json,
                 &catalog,
             )
-            .expect("concise JSON"),
+            .expect("source-v3 JSON"),
             lower_workflow_authoring_source(
                 include_str!("../../../fixtures/workflows/concise-run.workflow.yaml"),
                 WorkflowSourceFormat::Yaml,
                 &catalog,
             )
-            .expect("concise YAML"),
+            .expect("source-v3 YAML"),
             lower_workflow_authoring_source(
                 include_str!("../../../fixtures/workflows/concise-run.workflow.toml"),
                 WorkflowSourceFormat::Toml,
                 &catalog,
             )
-            .expect("concise TOML"),
+            .expect("source-v3 TOML"),
         ];
         assert_eq!(lowered[0], lowered[1]);
         assert_eq!(lowered[1], lowered[2]);
         let preview = lowered[0].document.compilation_preview(&catalog, None);
-        let compiled = preview.compiled.expect("compiled concise workflow");
+        let compiled = preview.compiled.expect("compiled source-v3 workflow");
         assert_eq!(
             compiled.input_defaults,
             serde_json::json!("printf 'first\\n'")
@@ -15080,6 +15211,7 @@ steps:
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            preparation_required: false,
         };
         let echo_action = WorkflowAuthoringActionDescriptor {
             version: WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION,
@@ -15100,7 +15232,7 @@ steps:
             .authoring_actions
             .insert(echo_action.catalog_key(), echo_action);
         lower_workflow_authoring_source(
-            "workflow_source_version: 1\nworkflow_id: example/no-shell\ntitle: No shell\nsteps:\n  - echo: still-available\n",
+            "workflow_source_version: 3\nworkflow_id: example/no-shell\ntitle: No shell\nsteps:\n  - id: echo\n    echo: still-available\n",
             WorkflowSourceFormat::Yaml,
             &catalog_without_shell,
         )
@@ -15460,9 +15592,41 @@ steps:
             node_configuration_schemas: workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string(), "review".to_string()]),
-            skills: BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn plugin_dynamic_bindings_are_confined_to_owner_declared_paths() {
+        let schema = ValueSchema {
+            type_name: "bcode.shell.exec/v1".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "x-bcode-allow-dynamic-complete-input": false,
+                "x-bcode-dynamic-binding-paths": ["commands.*.argv.*", "environment.set.*"]
+            }),
+        };
+        assert!(workflow_dynamic_binding_path_allowed(
+            &schema,
+            "commands.0.argv.1"
+        ));
+        assert!(workflow_dynamic_binding_path_allowed(
+            &schema,
+            "environment.set.VERSION"
+        ));
+        assert!(!workflow_dynamic_binding_path_allowed(&schema, "script"));
+        assert!(!workflow_dynamic_binding_path_allowed(
+            &schema,
+            "commands.0.timeout_ms"
+        ));
+        assert!(!workflow_allows_dynamic_complete_input(&schema));
+
+        let unrestricted = ValueSchema::of::<serde_json::Value>();
+        assert!(workflow_dynamic_binding_path_allowed(
+            &unrestricted,
+            "message"
+        ));
+        assert!(workflow_allows_dynamic_complete_input(&unrestricted));
     }
 
     #[test]
@@ -15520,6 +15684,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            preparation_required: false,
         };
         document.definition.nodes = BTreeMap::from([(
             "commit".to_string(),
@@ -15586,6 +15751,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            preparation_required: false,
         };
         let mutate = WorkflowBlockDefinition {
             block_id: "example.mutate".to_string(),
@@ -15603,6 +15769,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            preparation_required: false,
         };
         let predicate = PredicateExpression::Equals {
             version: WORKFLOW_PREDICATE_VERSION,
@@ -15788,7 +15955,7 @@ steps:
             preview.validation.diagnostics
         );
         let compiled = preview.compiled.as_ref().expect("compiled preview");
-        let agent: WorkflowAgentConfiguration = serde_json::from_value(
+        let prompt: WorkflowPromptConfiguration = serde_json::from_value(
             compiled
                 .definition
                 .node("agent")
@@ -15797,7 +15964,7 @@ steps:
                 .clone(),
         )
         .expect("agent configuration");
-        assert_eq!(agent.agent_profile, "build");
+        assert_eq!(prompt.agent_profile, "build");
         assert_eq!(compiled.run_limits.maximum_duration_ms, Some(45_000));
         assert_eq!(
             compiled.input_defaults,
@@ -16025,7 +16192,6 @@ steps:
             !matches!(
                 binding.target,
                 WorkflowConfigurationTarget::AgentSelection { .. }
-                    | WorkflowConfigurationTarget::SkillSelection { .. }
             )
         });
         unsupported.requirements.agents.clear();
@@ -16470,6 +16636,7 @@ steps:
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            preparation_required: false,
         };
         child_block.validate().expect("block");
         catalog.plugins.insert("bcode.child".to_string());
@@ -16557,7 +16724,7 @@ steps:
         let unavailable = document.compilation_preview(&catalog, None);
         assert!(unavailable.compiled.is_none());
         assert!(unavailable.validation.diagnostics.iter().any(|diagnostic| {
-            diagnostic.document_path == "definition.nodes.agent.configuration.target"
+            diagnostic.document_path.ends_with(".configuration.target")
                 && diagnostic.message.contains("unavailable")
         }));
     }
@@ -16700,7 +16867,7 @@ steps:
     #[should_panic(expected = "agent execution target requires an agent node")]
     fn agent_execution_target_rejects_non_agent_leaf() {
         let _ = Step::map("task", |value: u32| Ok(value))
-            .agent_execution_target(AgentExecutionTarget::SharedParentSequential);
+            .agent_execution_target(PromptContextTarget::SharedParentSequential);
     }
 
     #[test]
@@ -17678,14 +17845,14 @@ steps:
     }
 
     #[test]
-    fn versioned_agent_configuration_validates_skills_identity_and_read_only_policy() {
-        let contract = WorkflowAgentConfiguration {
-            version: WORKFLOW_AGENT_CONFIGURATION_VERSION,
-            execution_target: AgentExecutionTarget::FreshIsolated,
+    fn versioned_agent_configuration_rejects_workflow_skill_selection_and_escalation() {
+        let contract = WorkflowPromptConfiguration {
+            version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
             provider: Some("configured".to_string()),
             model: Some("configured".to_string()),
-            structured_output: AgentStructuredOutputPolicy {
+            structured_output: PromptStructuredOutputPolicy {
                 schema: ValueSchema::of::<serde_json::Value>(),
                 strict: true,
             },
@@ -17693,48 +17860,223 @@ steps:
             tool_capability: WorkflowToolCapability::ReadOnly,
             tool_allowlist: vec!["filesystem.read".to_string()],
             timeout_ms: 30_000,
-            skills: vec![
-                AgentSkillSelection {
-                    skill_id: "commit-message".to_string(),
-                    mode: AgentSkillActivationMode::Required,
-                },
-                AgentSkillSelection {
-                    skill_id: "style-guide".to_string(),
-                    mode: AgentSkillActivationMode::Preferred,
-                },
-                AgentSkillSelection {
-                    skill_id: "legacy".to_string(),
-                    mode: AgentSkillActivationMode::Disabled,
-                },
-            ],
             prompt_mode: "json_input".to_string(),
-            system_prompt: "Return structured output.".to_string(),
+            system_prompt: "Use the `commit-message` skill when available.".to_string(),
         };
         contract.validate().expect("valid contract");
-        let encoded = serde_json::to_value(&contract).expect("serialize");
-        assert_eq!(encoded["skills"][0]["skill_id"], "commit-message");
-        assert!(
-            serde_json::from_value::<WorkflowAgentConfiguration>(serde_json::json!({
-                "version": 1,
-                "execution_target": "fresh_isolated",
-                "agent_profile": "build",
-                "provider": null,
-                "model": null,
-                "structured_output": {"schema": {"type": "object"}, "strict": true},
-                "read_only": true,
-                "tool_capability": "mutating",
-                "tool_allowlist": [],
-                "timeout_ms": 30000,
-                "skills": [],
-                "prompt_mode": "json_input",
-                "system_prompt": "test",
-                "unknown": true
-            }))
-            .is_err()
-        );
+        let mut encoded = serde_json::to_value(&contract).expect("serialize");
+        encoded["skills"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<WorkflowPromptConfiguration>(encoded).is_err());
         let mut escalated = contract;
         escalated.tool_capability = WorkflowToolCapability::Mutating;
         assert!(escalated.validate().is_err());
+    }
+
+    #[test]
+    fn workflow_block_preparation_contract_is_versioned_bounded_and_strict() {
+        let block = WorkflowBlockDefinition {
+            block_id: "exec".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.shell".to_string(),
+            operation: "exec".to_string(),
+            input: ValueSchema::of::<serde_json::Value>(),
+            output: ValueSchema::of::<serde_json::Value>(),
+            effect: WorkflowBlockEffect::Mutating,
+            resources: vec![ResourceClaim::write("repository")],
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::Mutating,
+                explicit_grant_required: true,
+            },
+            timeout_ms: 30_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            preparation_required: true,
+        };
+        let request = WorkflowBlockPreparationRequest {
+            version: WORKFLOW_BLOCK_PREPARATION_VERSION,
+            block,
+            context: WorkflowBlockPreparationContext {
+                run_id: "run-1".to_string(),
+                node_id: "shell".to_string(),
+                activation_id: "activation-1".to_string(),
+                attempt: 0,
+                preparation_identity: "workflow-preparation:run-1:shell:activation-1".to_string(),
+                workspace_root: std::path::PathBuf::from("/workspace"),
+            },
+            input: serde_json::json!({"argv": ["true"]}),
+        };
+        let encoded = serde_json::to_value(&request).expect("request");
+        assert!(serde_json::from_value::<WorkflowBlockPreparationRequest>(encoded).is_ok());
+        request.validate().expect("valid request");
+        let mut future_request = request.clone();
+        future_request.version += 1;
+        assert!(future_request.validate().is_err());
+        let mut invalid_context = request.clone();
+        invalid_context.context.attempt = 1;
+        assert!(invalid_context.validate().is_err());
+        let mut oversized_request = request;
+        oversized_request.input =
+            serde_json::Value::String("x".repeat(MAX_WORKFLOW_BLOCK_PREPARATION_REQUEST_BYTES));
+        assert!(oversized_request.validate().is_err());
+        let response = WorkflowBlockPreparationResponse {
+            version: WORKFLOW_BLOCK_PREPARATION_VERSION,
+            input_sha256: "a".repeat(64),
+            owner_id: "bcode.shell".to_string(),
+            operation_facts: serde_json::json!({"program": "true", "arguments": []}),
+            descriptor: serde_json::json!({"input_sha256": "a".repeat(64)}),
+            diagnostics: Vec::new(),
+        };
+        response.validate().expect("response");
+        let mut future = response.clone();
+        future.version += 1;
+        assert!(future.validate().is_err());
+        let mut oversized_response = response.clone();
+        oversized_response.descriptor =
+            serde_json::Value::String("x".repeat(MAX_WORKFLOW_BLOCK_PREPARATION_BYTES));
+        assert!(oversized_response.validate().is_err());
+        let mut too_many_diagnostics = response.clone();
+        too_many_diagnostics.diagnostics =
+            vec!["diagnostic".to_string(); MAX_WORKFLOW_BLOCK_PREPARATION_DIAGNOSTICS + 1];
+        assert!(too_many_diagnostics.validate().is_err());
+        let input_sha256 = response.input_sha256.clone();
+        let owner_id = response.owner_id.clone();
+        let mut encoded = serde_json::to_value(&response).expect("serialize");
+        encoded["private_owner_state"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WorkflowBlockPreparationResponse>(encoded).is_err());
+        let mut null_facts = response.clone();
+        null_facts.operation_facts = serde_json::Value::Null;
+        assert!(null_facts.validate().is_err());
+        let mut wrong_owner = response.clone();
+        wrong_owner.owner_id.clear();
+        assert!(wrong_owner.validate().is_err());
+        let mut stale_input = response;
+        stale_input.input_sha256 = "z".repeat(64);
+        assert!(stale_input.validate().is_err());
+        assert_eq!(input_sha256.len(), 64);
+        assert_eq!(owner_id, "bcode.shell");
+    }
+
+    #[test]
+    fn concise_prompt_source_expands_to_complete_safe_configuration() {
+        let input = ValueSchema {
+            type_name: "example.prompt-input/v1".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        let output = ValueSchema {
+            type_name: "example.prompt-output/v1".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        let prompt = WorkflowStructuredSourceConcisePrompt {
+            text: "Use the commit-message skill if available; return JSON.".to_string(),
+            input: input.clone(),
+            output: output.clone(),
+            agent_profile: "review".to_string(),
+            provider: Some("configured".to_string()),
+            model: Some("configured".to_string()),
+            execution_target: PromptContextTarget::FixedGenerationFork,
+            read_only: true,
+            tool_allowlist: vec!["filesystem.read".to_string()],
+            timeout_ms: 30_000,
+            resources: vec![ResourceClaim::read("repository")],
+        };
+        let expanded = prompt.expand().expect("prompt");
+        assert_eq!(expanded.input, input);
+        assert_eq!(expanded.output, output);
+        assert_eq!(expanded.configuration.prompt_mode, "json_input");
+        assert_eq!(
+            expanded.configuration.execution_target,
+            PromptContextTarget::FixedGenerationFork
+        );
+        assert!(expanded.configuration.read_only);
+        assert_eq!(
+            expanded.configuration.tool_capability,
+            WorkflowToolCapability::ReadOnly
+        );
+        assert_eq!(
+            expanded.configuration.structured_output.schema,
+            expanded.output
+        );
+        assert!(expanded.configuration.structured_output.strict);
+        assert!(
+            expanded
+                .configuration
+                .system_prompt
+                .contains("commit-message")
+        );
+    }
+
+    #[test]
+    fn typed_assertions_enforce_utf8_truncation_byte_length_sha_and_artifact_boundaries() {
+        let selector = WorkflowValueSelector {
+            version: WORKFLOW_VALUE_SELECTOR_VERSION,
+            segments: vec![WorkflowValueSelectorSegment::Field {
+                name: "stream".to_string(),
+            }],
+        };
+        let text = PredicateExpression::SelectedAssertion {
+            version: WORKFLOW_PREDICATE_VERSION,
+            selector: selector.clone(),
+            assertion: WorkflowValueAssertion::TextEquals {
+                expected: "hello".to_string(),
+            },
+        };
+        let complete = serde_json::json!({
+            "stream": {
+                "text": "hello",
+                "encoding": "utf8",
+                "truncated": false,
+                "byte_length": 5,
+                "checksum_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            }
+        });
+        assert!(text.evaluate_value(&complete).expect("complete text"));
+        let mut binary = complete.clone();
+        binary["stream"]["encoding"] = serde_json::json!("binary");
+        assert!(text.evaluate_value(&binary).is_err());
+        let mut truncated = complete.clone();
+        truncated["stream"]["truncated"] = serde_json::json!(true);
+        assert!(text.evaluate_value(&truncated).is_err());
+
+        let length = PredicateExpression::SelectedAssertion {
+            version: WORKFLOW_PREDICATE_VERSION,
+            selector: selector.clone(),
+            assertion: WorkflowValueAssertion::ByteLength { expected: 5 },
+        };
+        assert!(length.evaluate_value(&complete).expect("length"));
+        let checksum = PredicateExpression::SelectedAssertion {
+            version: WORKFLOW_PREDICATE_VERSION,
+            selector,
+            assertion: WorkflowValueAssertion::Sha256 {
+                expected: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                    .to_string(),
+            },
+        };
+        assert!(checksum.evaluate_value(&complete).expect("checksum"));
+        let artifact = serde_json::json!({
+            "byte_length": 5,
+            "checksum_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "artifact_id": "opaque"
+        });
+        assert!(
+            WorkflowValueAssertion::ByteLength { expected: 5 }
+                .evaluate(&artifact)
+                .expect("artifact length")
+        );
+        assert!(
+            WorkflowValueAssertion::Sha256 {
+                expected: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                    .to_string()
+            }
+            .evaluate(&artifact)
+            .expect("artifact checksum")
+        );
+        assert!(
+            WorkflowValueAssertion::TextEquals {
+                expected: "secret".to_string()
+            }
+            .evaluate(&artifact)
+            .is_err()
+        );
     }
 
     #[test]
@@ -17745,7 +18087,7 @@ steps:
             serde_json::json!({"prompt_mode": "json_input"}),
             |value: u32, _context| async move { Ok(value) },
         )
-        .agent_execution_target(AgentExecutionTarget::SharedParentSequential);
+        .agent_execution_target(PromptContextTarget::SharedParentSequential);
         let workflow = WorkflowBuilder::new("target", step)
             .build()
             .expect("workflow");
@@ -19446,6 +19788,169 @@ steps:
         let output = workflow.run(Input { value: 3 }).await.expect("run");
         assert_eq!(output.0.value, 6);
         assert_eq!(output.1.label, "3");
+    }
+
+    fn prompt_configuration(schema: &ValueSchema, read_only: bool) -> WorkflowPromptConfiguration {
+        WorkflowPromptConfiguration {
+            version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_target: PromptContextTarget::FreshIsolated,
+            agent_profile: "build".to_string(),
+            provider: None,
+            model: None,
+            structured_output: PromptStructuredOutputPolicy {
+                schema: schema.clone(),
+                strict: true,
+            },
+            read_only,
+            tool_capability: if read_only {
+                WorkflowToolCapability::ReadOnly
+            } else {
+                WorkflowToolCapability::Mutating
+            },
+            tool_allowlist: Vec::new(),
+            timeout_ms: 30_000,
+            prompt_mode: "json_input".to_string(),
+            system_prompt: "Perform the requested operation.".to_string(),
+        }
+    }
+
+    fn prompt_node(
+        id: &str,
+        schema: &ValueSchema,
+        configuration: WorkflowPromptConfiguration,
+    ) -> NodeDefinition {
+        NodeDefinition {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: NodeKind::Agent,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::to_value(configuration).expect("prompt configuration"),
+        }
+    }
+
+    fn verifier_node(id: &str, schema: &ValueSchema) -> NodeDefinition {
+        let block = WorkflowBlockDefinition {
+            block_id: "example.verify".to_string(),
+            block_version: 1,
+            plugin_id: "example.verifier".to_string(),
+            operation: "verify".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            effect: WorkflowBlockEffect::ReadOnly,
+            resources: Vec::new(),
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::ReadOnly,
+                explicit_grant_required: false,
+            },
+            timeout_ms: 30_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            preparation_required: false,
+        };
+        NodeDefinition {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: NodeKind::PluginBlock,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::to_value(block).expect("verifier block"),
+        }
+    }
+
+    fn prompt_verification_definition(
+        prompt: NodeDefinition,
+        verifier: Option<NodeDefinition>,
+    ) -> WorkflowDefinition {
+        let schema = prompt.input.clone();
+        let prompt_id = prompt.id.clone();
+        let mut nodes = BTreeMap::from([(prompt_id.clone(), prompt)]);
+        let (output, exits, edges) = verifier.map_or_else(
+            || (schema.clone(), vec![prompt_id.clone()], Vec::new()),
+            |verifier| {
+                let verifier_id = verifier.id.clone();
+                let output = verifier.output.clone();
+                nodes.insert(verifier_id.clone(), verifier);
+                (
+                    output,
+                    vec![verifier_id.clone()],
+                    vec![EdgeDefinition {
+                        from: prompt_id.clone(),
+                        to: verifier_id,
+                        kind: EdgeKind::Direct,
+                        transform: None,
+                    }],
+                )
+            },
+        );
+        WorkflowDefinition {
+            schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "prompt-verification".to_string(),
+            input: schema,
+            output,
+            nodes,
+            entries: vec![prompt_id],
+            exits,
+            edges,
+        }
+    }
+
+    #[test]
+    fn production_admission_requires_deterministic_verification_after_mutating_prompts() {
+        let schema = ValueSchema {
+            type_name: "example.value/v1".to_string(),
+            schema: serde_json::json!({"type": "object", "additionalProperties": true}),
+        };
+        let unverified = prompt_verification_definition(
+            prompt_node("mutate", &schema, prompt_configuration(&schema, false)),
+            None,
+        );
+        let admission = unverified
+            .production_admission(&WorkflowProductionCapabilities::current())
+            .expect("valid definition");
+        assert!(admission.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "missing_mutation_verification"
+                && diagnostic.node_id.as_deref() == Some("mutate")
+        }));
+
+        let verified = prompt_verification_definition(
+            prompt_node("mutate", &schema, prompt_configuration(&schema, false)),
+            Some(verifier_node("verify", &schema)),
+        );
+        let admission = verified
+            .production_admission(&WorkflowProductionCapabilities::current())
+            .expect("valid definition");
+        assert!(
+            !admission
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "missing_mutation_verification")
+        );
+    }
+
+    #[test]
+    fn read_only_prompts_do_not_require_mutation_verification() {
+        let schema = ValueSchema {
+            type_name: "example.value/v1".to_string(),
+            schema: serde_json::json!({"type": "object", "additionalProperties": true}),
+        };
+        let definition = prompt_verification_definition(
+            prompt_node("inspect", &schema, prompt_configuration(&schema, true)),
+            None,
+        );
+        let admission = definition
+            .production_admission(&WorkflowProductionCapabilities::current())
+            .expect("valid definition");
+        assert!(
+            !admission
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "missing_mutation_verification")
+        );
     }
 
     #[test]

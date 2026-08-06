@@ -385,6 +385,11 @@ pub enum Request {
     CancelWorkflowComputation {
         operation_id: String,
     },
+    /// Explicitly reset an incompatible workflow store after destructive confirmation.
+    ResetIncompatibleWorkflowStore {
+        /// Must equal the documented destructive confirmation token.
+        confirm: String,
+    },
     /// Apply one atomic semantic edit batch to an exact draft generation.
     ApplyWorkflowDraftEdits(ApplyWorkflowDraftEditsRequest),
     /// Replace one exact draft generation.
@@ -2259,7 +2264,7 @@ pub struct WorkflowRunStartRequest {
     pub workspace_snapshot: String,
     /// Session used for compact generic runtime-work presentation.
     pub parent_session_id: bcode_session_models::SessionId,
-    /// Exact accepted parent-session generation required by fixed-generation workflow agents.
+    /// Exact accepted parent-session generation required by fixed-generation workflow prompts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_generation: Option<u64>,
     /// Optional bounded product ownership and discovery association.
@@ -2458,6 +2463,10 @@ pub enum ResponsePayload {
     },
     WorkflowComputationCancellationRequested {
         cancelled: bool,
+    },
+    /// Receipt from a completed explicit incompatible workflow-store reset.
+    WorkflowStoreReset {
+        receipt: bcode_workflow_store::WorkflowStoreResetReceipt,
     },
     WorkflowDraftEditResult {
         result: WorkflowDraftEditResult,
@@ -4204,7 +4213,6 @@ mod tests {
                 node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
                 workflow_definitions: BTreeMap::new(),
                 agent_profiles: std::collections::BTreeSet::from(["build".to_string()]),
-                skills: std::collections::BTreeSet::new(),
                 authoring_actions: BTreeMap::new(),
             },
         });
@@ -4355,6 +4363,31 @@ mod tests {
         });
         let decoded: Response =
             decode_typed_stable(&encode_typed_stable(&response).expect("encode")).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn workflow_store_reset_contract_round_trips_portably() {
+        let request = Request::ResetIncompatibleWorkflowStore {
+            confirm: bcode_workflow_store::WORKFLOW_STORE_RESET_CONFIRMATION.to_string(),
+        };
+        let decoded: Request =
+            decode_typed_stable(&encode_typed_stable(&request).expect("encode reset request"))
+                .expect("decode reset request");
+        assert_eq!(decoded, request);
+        let receipt = bcode_workflow_store::WorkflowStoreResetReceipt {
+            version: bcode_workflow_store::WORKFLOW_STORE_RESET_RECEIPT_VERSION,
+            previous_schema_version: Some(9),
+            new_schema_version: bcode_workflow_store::WORKFLOW_STORE_SCHEMA_VERSION,
+            backup_path: PathBuf::from("workflows/reset-backups/workflow-42"),
+            backup_sha256: "a".repeat(64),
+            removed_artifact_entries: 2,
+            reset_at_ms: 42,
+        };
+        let response = Response::Ok(ResponsePayload::WorkflowStoreReset { receipt });
+        let decoded: Response =
+            decode_typed_stable(&encode_typed_stable(&response).expect("encode reset response"))
+                .expect("decode reset response");
         assert_eq!(decoded, response);
     }
 
@@ -4543,7 +4576,7 @@ mod tests {
     fn workflow_source_apply_contract_round_trips() {
         let request = Request::ApplyWorkflowSource(ApplyWorkflowSourceRequest {
             source_format: bcode_workflow::WorkflowSourceFormat::Yaml,
-            source: "workflow_source_version: 1\nworkflow_id: example/check\ntitle: Check\nsteps:\n  - run: true\n".to_string(),
+            source: "workflow_source_version: 3\nworkflow_id: example/check\ntitle: Check\nsteps:\n  - run: true\n".to_string(),
             draft_id: bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID.to_string(),
         });
         let encoded = encode_request(&request).expect("encode source apply request");
@@ -4555,7 +4588,7 @@ mod tests {
         let result = bcode_workflow::WorkflowSourceApplyResult {
             version: bcode_workflow::WORKFLOW_SOURCE_APPLY_RESULT_VERSION,
             source_format: bcode_workflow::WorkflowSourceFormat::Yaml,
-            source_profile: bcode_workflow::WorkflowSourceProfile::Concise,
+            source_profile: bcode_workflow::WorkflowSourceProfile::Structured,
             workflow_id: "example/check".to_string(),
             draft_id: bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID.to_string(),
             generation: 1,

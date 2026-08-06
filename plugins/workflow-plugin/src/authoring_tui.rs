@@ -70,7 +70,6 @@ enum PendingMutation {
     CyclePredicate,
     SetNodeName,
     SetAgentModel,
-    SetAgentSkills,
     SetRepeatBound,
     SetPredicatePath,
     SetSchemaField,
@@ -80,7 +79,6 @@ enum PendingMutation {
 enum InspectorEditTarget {
     NodeName,
     AgentModel,
-    AgentSkills,
     RepeatBound,
     PredicatePath,
     SchemaField {
@@ -585,7 +583,6 @@ impl WorkflowAuthorSurface {
                 let mutation = match &edit.target {
                     InspectorEditTarget::NodeName => PendingMutation::SetNodeName,
                     InspectorEditTarget::AgentModel => PendingMutation::SetAgentModel,
-                    InspectorEditTarget::AgentSkills => PendingMutation::SetAgentSkills,
                     InspectorEditTarget::RepeatBound => PendingMutation::SetRepeatBound,
                     InspectorEditTarget::PredicatePath => PendingMutation::SetPredicatePath,
                     InspectorEditTarget::SchemaField { .. } => PendingMutation::SetSchemaField,
@@ -805,7 +802,7 @@ impl WorkflowAuthorSurface {
                         .catalog
                         .as_ref()
                         .ok_or_else(|| "portable catalog is unavailable".to_string())?;
-                    cycle_agent_profile(node, catalog)
+                    cycle_profile(node, catalog)
                 })?,
             }],
             PendingMutation::ToggleAgentReadOnly => vec![WorkflowAuthoringEdit::UpdateNode {
@@ -831,17 +828,6 @@ impl WorkflowAuthorSurface {
                     set_agent_model(
                         node,
                         self.take_inspector_buffer(&InspectorEditTarget::AgentModel)?,
-                    )
-                })?,
-            }],
-            PendingMutation::SetAgentSkills => vec![WorkflowAuthoringEdit::UpdateNode {
-                node: updated_selected_node(document, self.selected_node, |node| {
-                    set_agent_skills(
-                        node,
-                        &self.take_inspector_buffer(&InspectorEditTarget::AgentSkills)?,
-                        self.catalog
-                            .as_ref()
-                            .ok_or_else(|| "portable catalog is unavailable".to_string())?,
                     )
                 })?,
             }],
@@ -1496,12 +1482,6 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 if key.key == KeyCode::Char('M') && self.focus == EditorPane::Inspector =>
             {
                 self.begin_inspector_edit(InspectorEditTarget::AgentModel);
-                true
-            }
-            Event::Key(key)
-                if key.key == KeyCode::Char('S') && self.focus == EditorPane::Inspector =>
-            {
-                self.begin_inspector_edit(InspectorEditTarget::AgentSkills);
                 true
             }
             Event::Key(key)
@@ -2289,19 +2269,19 @@ fn generic_node(
     let schema = selected_port_schema(document);
     let configuration = match kind {
         NodeKind::Agent => {
-            let agent_profile = catalog
+            let profile = catalog
                 .agent_profiles
                 .iter()
                 .next()
                 .cloned()
-                .ok_or_else(|| "no configured agent profile is available".to_string())?;
-            serde_json::to_value(bcode_workflow::WorkflowAgentConfiguration {
-                version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
-                execution_target: bcode_workflow::AgentExecutionTarget::FreshIsolated,
-                agent_profile,
+                .ok_or_else(|| "no configured prompt profile is available".to_string())?;
+            serde_json::to_value(bcode_workflow::WorkflowPromptConfiguration {
+                version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
+                agent_profile: profile,
                 provider: None,
                 model: None,
-                structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                structured_output: bcode_workflow::PromptStructuredOutputPolicy {
                     schema: schema.clone(),
                     strict: true,
                 },
@@ -2309,7 +2289,6 @@ fn generic_node(
                 tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
                 tool_allowlist: Vec::new(),
                 timeout_ms: 300_000,
-                skills: Vec::new(),
                 prompt_mode: "json_input".to_string(),
                 system_prompt:
                     "Process the typed workflow input and return the required structured output."
@@ -2398,23 +2377,10 @@ fn inspector_edit_value(node: &NodeDefinition, target: &InspectorEditTarget) -> 
     match target {
         InspectorEditTarget::NodeName => node.name.clone(),
         InspectorEditTarget::AgentModel => serde_json::from_value::<
-            bcode_workflow::WorkflowAgentConfiguration,
+            bcode_workflow::WorkflowPromptConfiguration,
         >(node.configuration.clone())
         .ok()
         .and_then(|agent| agent.model)
-        .unwrap_or_default(),
-        InspectorEditTarget::AgentSkills => serde_json::from_value::<
-            bcode_workflow::WorkflowAgentConfiguration,
-        >(node.configuration.clone())
-        .map(|agent| {
-            agent
-                .skills
-                .into_iter()
-                .filter(|skill| skill.mode != bcode_workflow::AgentSkillActivationMode::Disabled)
-                .map(|skill| skill.skill_id)
-                .collect::<Vec<_>>()
-                .join(",")
-        })
         .unwrap_or_default(),
         InspectorEditTarget::RepeatBound => node.configuration["max_iterations"]
             .as_u64()
@@ -2516,44 +2482,9 @@ fn set_agent_model(node: &mut NodeDefinition, value: String) -> Result<(), Strin
     if node.kind != NodeKind::Agent {
         return Err("model controls apply only to agent nodes".to_string());
     }
-    let mut configuration: bcode_workflow::WorkflowAgentConfiguration =
+    let mut configuration: bcode_workflow::WorkflowPromptConfiguration =
         serde_json::from_value(node.configuration.clone()).map_err(|error| error.to_string())?;
     configuration.model = (!value.is_empty()).then_some(value);
-    node.configuration = serde_json::to_value(configuration).map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-fn set_agent_skills(
-    node: &mut NodeDefinition,
-    value: &str,
-    catalog: &WorkflowAuthoringCatalogSnapshot,
-) -> Result<(), String> {
-    if node.kind != NodeKind::Agent {
-        return Err("skill controls apply only to agent nodes".to_string());
-    }
-    let skill_ids = value
-        .split(',')
-        .map(str::trim)
-        .filter(|skill| !skill.is_empty())
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    if let Some(unavailable) = skill_ids
-        .iter()
-        .find(|skill| !catalog.skills.contains(*skill))
-    {
-        return Err(format!(
-            "skill '{unavailable}' is unavailable in the portable catalog"
-        ));
-    }
-    let mut configuration: bcode_workflow::WorkflowAgentConfiguration =
-        serde_json::from_value(node.configuration.clone()).map_err(|error| error.to_string())?;
-    configuration.skills = skill_ids
-        .into_iter()
-        .map(|skill_id| bcode_workflow::AgentSkillSelection {
-            skill_id,
-            mode: bcode_workflow::AgentSkillActivationMode::Required,
-        })
-        .collect();
     node.configuration = serde_json::to_value(configuration).map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -2599,18 +2530,18 @@ fn updated_selected_node(
     Ok(node)
 }
 
-fn cycle_agent_profile(
+fn cycle_profile(
     node: &mut NodeDefinition,
     catalog: &WorkflowAuthoringCatalogSnapshot,
 ) -> Result<(), String> {
     if node.kind != NodeKind::Agent {
-        return Err("agent profile controls apply only to agent nodes".to_string());
+        return Err("prompt profile controls apply only to agent nodes".to_string());
     }
-    let mut configuration: bcode_workflow::WorkflowAgentConfiguration =
+    let mut configuration: bcode_workflow::WorkflowPromptConfiguration =
         serde_json::from_value(node.configuration.clone()).map_err(|error| error.to_string())?;
     let profiles = catalog.agent_profiles.iter().collect::<Vec<_>>();
     if profiles.is_empty() {
-        return Err("no configured agent profile is available".to_string());
+        return Err("no configured prompt profile is available".to_string());
     }
     let next = profiles
         .iter()
@@ -2625,7 +2556,7 @@ fn toggle_agent_read_only(node: &mut NodeDefinition) -> Result<(), String> {
     if node.kind != NodeKind::Agent {
         return Err("agent policy controls apply only to agent nodes".to_string());
     }
-    let mut configuration: bcode_workflow::WorkflowAgentConfiguration =
+    let mut configuration: bcode_workflow::WorkflowPromptConfiguration =
         serde_json::from_value(node.configuration.clone()).map_err(|error| error.to_string())?;
     configuration.read_only = !configuration.read_only;
     configuration.tool_capability = if configuration.read_only {
@@ -2982,11 +2913,11 @@ fn inspector_lines(
         );
     }
     if node.kind == NodeKind::Agent
-        && let Ok(agent) = serde_json::from_value::<bcode_workflow::WorkflowAgentConfiguration>(
+        && let Ok(agent) = serde_json::from_value::<bcode_workflow::WorkflowPromptConfiguration>(
             node.configuration.clone(),
         )
     {
-        lines.push("Agent controls [a profile · t read-only · M model · S skills]".to_string());
+        lines.push("Agent controls [a profile · t read-only · M model]".to_string());
         lines.push(format!(
             "  profile={} · provider={} · model={} · read_only={} · capability={:?}",
             agent.agent_profile,
@@ -2995,16 +2926,7 @@ fn inspector_lines(
             agent.read_only,
             agent.tool_capability
         ));
-        lines.push(format!(
-            "  skills={} · tools={}",
-            agent
-                .skills
-                .iter()
-                .map(|skill| skill.skill_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            agent.tool_allowlist.join(", ")
-        ));
+        lines.push(format!("  tools={}", agent.tool_allowlist.join(", ")));
     }
     if matches!(node.kind, NodeKind::Branch | NodeKind::Repeat) {
         lines.push("Predicate control [v toggle · P path]".to_string());
@@ -3073,19 +2995,12 @@ fn inspector_lines(
             compiled.permissions.explicit_grant_nodes.len(),
             compiled.permissions.mutation_approval_nodes.len()
         ));
-        if !compiled.requirements.agents.is_empty() || !compiled.requirements.skills.is_empty() {
+        if !compiled.requirements.agents.is_empty() {
             lines.push(format!(
-                "  agents={} · skills={}",
+                "  agents={}",
                 compiled
                     .requirements
                     .agents
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                compiled
-                    .requirements
-                    .skills
                     .iter()
                     .cloned()
                     .collect::<Vec<_>>()
@@ -3359,7 +3274,7 @@ mod tests {
             configuration_defaults: Some(serde_json::json!({"message": "hello"})),
             plugin_input_defaults: std::collections::BTreeMap::new(),
             definition: WorkflowDefinition {
-                schema_version: 1,
+                schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
                 name: "editor-test".to_string(),
                 input: schema.clone(),
                 output: schema.clone(),
@@ -3450,7 +3365,6 @@ mod tests {
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
-            skills: BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         };
         let entries = palette_entries(&catalog);
@@ -3492,6 +3406,7 @@ mod tests {
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay,
+            preparation_required: false,
         };
         let key = bcode_workflow::workflow_block_catalog_key(&block);
         let catalog = WorkflowAuthoringCatalogSnapshot {
@@ -3504,7 +3419,6 @@ mod tests {
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
-            skills: BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         };
         let entry = palette_entries(&catalog)
@@ -3696,7 +3610,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_text_inspector_edits_model_skills_bounds_and_predicate_paths() {
+    fn bounded_text_inspector_edits_model_bounds_and_predicate_paths() {
         let editor_document = document();
         let catalog = WorkflowAuthoringCatalogSnapshot {
             version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
@@ -3708,7 +3622,6 @@ mod tests {
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string()]),
-            skills: BTreeSet::from(["code-review".to_string(), "commit-message".to_string()]),
             authoring_actions: BTreeMap::new(),
         };
         let agent_entry = PaletteEntry {
@@ -3718,11 +3631,9 @@ mod tests {
         };
         let mut agent = add_node(&editor_document, &agent_entry, &catalog).expect("agent");
         set_agent_model(&mut agent, "model-x".to_string()).expect("model");
-        set_agent_skills(&mut agent, "commit-message,code-review", &catalog).expect("skills");
-        let configuration: bcode_workflow::WorkflowAgentConfiguration =
+        let configuration: bcode_workflow::WorkflowPromptConfiguration =
             serde_json::from_value(agent.configuration.clone()).expect("configuration");
         assert_eq!(configuration.model.as_deref(), Some("model-x"));
-        assert_eq!(configuration.skills.len(), 2);
 
         let repeat_entry = PaletteEntry {
             identity: "repeat".to_string(),
@@ -3735,7 +3646,6 @@ mod tests {
         assert_eq!(repeat.configuration["max_iterations"], 37);
         assert_eq!(repeat.configuration["predicate"]["path"], "condition_met");
         assert!(set_repeat_bound(&mut repeat, "0").is_err());
-        assert!(set_agent_skills(&mut agent, "missing", &catalog).is_err());
     }
 
     #[test]
@@ -3751,7 +3661,6 @@ mod tests {
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string(), "review".to_string()]),
-            skills: BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         };
         let agent_entry = PaletteEntry {
@@ -3760,9 +3669,9 @@ mod tests {
             kind: PaletteEntryKind::NodeKind,
         };
         let mut agent = add_node(&editor_document, &agent_entry, &catalog).expect("agent");
-        cycle_agent_profile(&mut agent, &catalog).expect("profile");
+        cycle_profile(&mut agent, &catalog).expect("profile");
         toggle_agent_read_only(&mut agent).expect("policy");
-        let configuration: bcode_workflow::WorkflowAgentConfiguration =
+        let configuration: bcode_workflow::WorkflowPromptConfiguration =
             serde_json::from_value(agent.configuration.clone()).expect("configuration");
         assert_eq!(configuration.agent_profile, "review");
         assert!(!configuration.read_only);
@@ -3835,7 +3744,6 @@ mod tests {
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string()]),
-            skills: BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         };
         for (identity, expected) in [
@@ -3876,7 +3784,6 @@ mod tests {
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
-            skills: BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         };
         let request = generation_request(
@@ -3948,7 +3855,6 @@ mod tests {
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
-            skills: BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         };
         assert!(decode_generated_candidate(serde_json::json!({}), Some(&catalog)).is_err());
@@ -4042,7 +3948,6 @@ mod tests {
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::new(),
-            skills: BTreeSet::new(),
             authoring_actions: BTreeMap::new(),
         };
         surface.install_catalog(catalog);

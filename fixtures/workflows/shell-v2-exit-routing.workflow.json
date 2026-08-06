@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "workflow_id": "example/shell-v2-exit-routing",
   "metadata": {
     "title": "Shell v2 exit routing",
@@ -152,7 +152,7 @@
     }
   },
   "definition": {
-    "schema_version": 1,
+    "schema_version": 2,
     "name": "Shell v2 exit routing",
     "input": {
       "schema": {
@@ -256,7 +256,7 @@
           }
         }
       },
-      "type_name": "bcode.shell.command-plan/v2"
+      "type_name": "bcode.shell.exec/v1"
     },
     "output": {
       "schema": {
@@ -374,7 +374,7 @@
           }
         }
       },
-      "type_name": "bcode.shell.command-plan-result/v2"
+      "type_name": "bcode.shell.exec-result/v1"
     },
     "nodes": {
       "run_shell": {
@@ -483,7 +483,7 @@
               }
             }
           },
-          "type_name": "bcode.shell.command-plan/v2"
+          "type_name": "bcode.shell.exec/v1"
         },
         "output": {
           "schema": {
@@ -601,7 +601,7 @@
               }
             }
           },
-          "type_name": "bcode.shell.command-plan-result/v2"
+          "type_name": "bcode.shell.exec-result/v1"
         },
         "resources": [
           {
@@ -610,11 +610,11 @@
           }
         ],
         "configuration": {
-          "block_id": "shell.command-plan",
-          "block_version": 2,
+          "block_id": "exec",
+          "block_version": 1,
           "cancellation_supported": true,
           "effect": "mutating",
-          "operation": "shell.command-plan",
+          "operation": "exec",
           "plugin_id": "bcode.shell",
           "reconciliation": "repair_required",
           "timeout_ms": 300000,
@@ -720,7 +720,7 @@
                 }
               }
             },
-            "type_name": "bcode.shell.command-plan/v2"
+            "type_name": "bcode.shell.exec/v1"
           },
           "output": {
             "schema": {
@@ -838,7 +838,7 @@
                 }
               }
             },
-            "type_name": "bcode.shell.command-plan-result/v2"
+            "type_name": "bcode.shell.exec-result/v1"
           },
           "authorization": {
             "capability": "mutating",
@@ -972,7 +972,7 @@
               }
             }
           },
-          "type_name": "bcode.shell.command-plan-result/v2"
+          "type_name": "bcode.shell.exec-result/v1"
         },
         "output": {
           "schema": {
@@ -1090,7 +1090,7 @@
               }
             }
           },
-          "type_name": "bcode.shell.command-plan-result/v2"
+          "type_name": "bcode.shell.exec-result/v1"
         },
         "configuration": {
           "predicate_version": 3,
@@ -1250,7 +1250,7 @@
               }
             }
           },
-          "type_name": "bcode.shell.command-plan-result/v2"
+          "type_name": "bcode.shell.exec-result/v1"
         },
         "output": {
           "schema": {
@@ -1368,7 +1368,7 @@
               }
             }
           },
-          "type_name": "bcode.shell.command-plan-result/v2"
+          "type_name": "bcode.shell.exec-result/v1"
         },
         "configuration": {
           "gate_version": 1
@@ -1494,7 +1494,7 @@
               }
             }
           },
-          "type_name": "bcode.shell.command-plan-result/v2"
+          "type_name": "bcode.shell.exec-result/v1"
         },
         "output": {
           "schema": {
@@ -1612,7 +1612,7 @@
               }
             }
           },
-          "type_name": "bcode.shell.command-plan-result/v2"
+          "type_name": "bcode.shell.exec-result/v1"
         },
         "configuration": {
           "gate_version": 1
@@ -1746,7 +1746,7 @@
       "bcode.shell"
     ],
     "blocks": [
-      "bcode.shell/shell.command-plan@2"
+      "bcode.shell/exec@1"
     ]
   },
   "run_limits": {

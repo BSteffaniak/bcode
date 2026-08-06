@@ -288,6 +288,7 @@ pattern = "ok"
                 dispatch_identity: "test-dispatch".to_string(),
                 workspace_root: std::env::temp_dir(),
                 input: serde_json::to_value(&suite).expect("suite"),
+                preparation: None,
             })
             .expect("request"),
         };
@@ -305,6 +306,7 @@ pattern = "ok"
                 dispatch_identity: "test-dispatch".to_string(),
                 workspace_root: std::env::temp_dir(),
                 input: serde_json::to_value(&suite).expect("suite"),
+                preparation: None,
             })
             .expect("invalid request"),
             ..request

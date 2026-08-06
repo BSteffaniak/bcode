@@ -156,7 +156,7 @@ updated=json.loads((root/"updated.json").read_text())
 assert applied["outcome"] == "created"
 assert updated["outcome"] == "updated"
 assert applied["draft_id"] == "source" and updated["generation"] == 2
-assert applied["requirements"]["blocks"] == ["bcode.shell/shell.script@1"]
+assert applied["requirements"]["blocks"] == ["bcode.shell/exec@1"]
 assert applied["effects"]["block_effects"] == ["mutating"]
 assert len(applied["source_map"]["entries"]) == 2
 published=json.loads((root/"published.json").read_text())

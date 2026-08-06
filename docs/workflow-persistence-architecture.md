@@ -23,7 +23,7 @@ session transcript databases remain independent and contain only compact generic
 user-facing status events where a real integration requires them; detailed workflow rows never belong
 in session history.
 
-Workflow agent recovery uses a versioned `workflow_execution_sessions` relation keyed by exact run,
+Workflow prompt recovery uses a versioned `workflow_execution_sessions` relation keyed by exact run,
 node, activation, and attempt identity. The relation stores only the opaque session ID, immutable
 workspace snapshot, and creation time; session content, visibility, retention, and history remain
 session-owned. Identical insertion is idempotent, while activation/session identity reuse or damaged
@@ -95,16 +95,12 @@ previously registered definition fails closed when its owner plugin is disabled 
 Unsupported definitions and unavailable capabilities use the stable IPC error codes
 `workflow_definition_unsupported` and `workflow_capability_unavailable`.
 
-Versioned durable agent configuration is serialized into definition identity and covers execution
-target, profile, provider/model, structured output, read-only/tool policy, allowlist, timeout,
-prompt, and exact required/preferred/disabled skill IDs. Before prepared intent, the server resolves
-required and preferred skills against the bounded registry. Required failures fail closed; preferred
-failures omit context with a bounded diagnostic; disabled selections never attach. Exact resolved
-context and source/model-policy metadata enter the prepared intent and the immutable turn execution
-metadata, so attachment is turn-local and never mutates session-wide active-skill state. Compatible
-skill model policy is applied to the turn-local provider/model selection, while conflicting required
-selection fails closed. Read-only workflow agents require read-only tool capability and reject skills
-that declare tool access.
+Versioned durable prompt configuration is serialized into definition identity and covers execution
+target, profile, provider/model, structured output, read-only/tool policy, allowlist, timeout, and
+prompt text. Workflow contracts contain no skill IDs, activation modes, requirements, or model-policy
+resolution. Prompt text may request skills through the ordinary agent skill catalog and tool path,
+but skill availability is not an admission requirement and skill metadata cannot widen the configured
+tool or authorization ceiling. Read-only workflow prompts require read-only tool capability.
 
 ## Plugin-owned blocks and templates
 
@@ -186,13 +182,12 @@ The complete contracts and fixed bounds are defined in
 
 ## Durable agent configuration
 
-Version 1 `WorkflowAgentConfiguration` is the strict serialized agent-node contract. It includes the
-execution target, profile, provider/model overrides, strict structured-output schema, read-only and
-tool-capability policy, tool allowlist, timeout, prompt mode/system prompt, and exact skill IDs with
-`required`, `preferred`, or `disabled` activation modes. Unknown fields, unsupported versions,
-duplicate IDs, invalid schemas, and read-only mutation escalation fail admission. Because this
-configuration is ordinary node JSON, exact skills participate in canonical definition identity and
-checksums; resolution must remain turn-local and is a separate execution concern.
+The current `WorkflowPromptConfiguration` is the strict serialized prompt-node contract. It includes
+the execution target, profile, provider/model overrides, strict structured-output schema, read-only
+and tool-capability policy, tool allowlist, timeout, and prompt mode/system prompt. Unknown fields,
+unsupported versions, duplicate tool IDs, invalid schemas, and read-only mutation escalation fail
+admission. Skill requests belong in prompt text and use ordinary agent infrastructure rather than
+durable workflow fields.
 
 ## Explicit retained state
 
@@ -303,12 +298,24 @@ explicit doctor/reconcile/repair operations. Maintenance acquires exclusive work
 ownership and records its outcome. Normal read paths remain non-mutating even when the database is
 damaged or stale.
 
-## Migrations and compatibility
+## Clean-break schema and explicit reset
 
-The workflow database has its own migration ledger and storage contract. Migrations are ordered,
-idempotent where practical, and never selected by build namespace. A newer incompatible schema or
-unknown migration fails closed with an upgrade/repair diagnostic. Destructive rebuilds require an
-explicit maintenance command and verified backup once user-created durable runs exist.
+The workflow database has one supported schema version. A missing database is initialized directly
+at that version. An existing database with an absent, malformed, older, or future contract is
+rejected without writes; normal startup never migrates or reinterprets it.
+
+Destructive reset is a separate maintenance operation. It acquires the workflow ownership lock
+exclusively (proving no workflow store handles are active), obtains an immediate exclusive SQLite
+lock (proving no uncoordinated writer is active), creates a confined SQLite backup, verifies backup
+integrity and records its SHA-256, removes only the canonical database sidecars and workflow-owned
+artifact directory, initializes the current schema, and atomically writes a bounded reset receipt.
+The backup is retained under `workflows/reset-backups/`. Reset refuses an absent or already-current
+store and never runs from open, status, history, attach, or repair paths. The public maintenance
+entry point is `bcode workflow reset-store --confirm DELETE-INCOMPATIBLE-WORKFLOW-STATE`; it runs
+through the application/server boundary while offline rather than opening private persistence from
+the CLI or requiring the daemon whose store is intentionally incompatible. The portable IPC request
+exists only to return an actionable refusal from a running daemon; online reset cannot race the
+daemon's live store ownership.
 
 Operator status, doctor, shell/Git reconciliation, explicit repair, and backup-safe maintenance
 procedures are documented in [`workflow-operations.md`](workflow-operations.md).

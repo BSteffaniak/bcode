@@ -30,8 +30,6 @@ pub const SHELL_RECORDING_MEDIA_TYPE: &str = "application/x-bcode-shell-recordin
 /// Current authoritative shell recording content type.
 pub const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording; version=3";
 
-/// Legacy typed command-plan workflow block contract version.
-pub const SHELL_COMMAND_PLAN_VERSION_1: u32 = 1;
 /// Current typed command-plan workflow block contract version.
 pub const SHELL_COMMAND_PLAN_VERSION: u32 = 2;
 /// Current typed script workflow block contract version.
@@ -90,13 +88,10 @@ const fn default_workflow_output() -> ShellWorkflowOutputPolicy {
 pub struct ShellWorkflowCommand {
     pub argv: Vec<String>,
     pub timeout_ms: u64,
-    /// Version-1 continuation policy retained for exact compatibility.
-    #[serde(default)]
-    pub continue_on_nonzero: bool,
-    /// Accepted process exit codes. Version 1 always uses `[0]`; version 2 defaults to `[0]`.
+    /// Accepted process exit codes. The clean contract defaults to `[0]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_exit_codes: Option<Vec<i32>>,
-    /// Whether version 2 continues after an exited code outside the accepted set.
+    /// Whether execution continues after an exited code outside the accepted set.
     #[serde(default)]
     pub continue_on_unaccepted_exit: bool,
 }
@@ -142,6 +137,14 @@ pub enum ShellWorkflowCommandStatus {
     Cancelled,
 }
 
+/// Encoding classification for one retained output preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellWorkflowOutputEncoding {
+    Utf8,
+    Binary,
+}
+
 /// Typed result for one command, preserving declaration order by index.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -153,13 +156,17 @@ pub struct ShellWorkflowCommandResult {
     /// Exact accepted exit codes used to classify this command.
     pub accepted_exit_codes: Vec<i32>,
     /// Whether an ordinary exited code was contained in `accepted_exit_codes`.
-    /// Version-1 results omit this field for exact compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_accepted: Option<bool>,
+    pub exit_accepted: bool,
     pub signal: Option<i32>,
     pub duration_ms: u64,
     pub stdout_preview: String,
     pub stderr_preview: String,
+    /// Exact raw stream byte lengths before preview truncation.
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    /// Encoding status of each retained preview.
+    pub stdout_encoding: ShellWorkflowOutputEncoding,
+    pub stderr_encoding: ShellWorkflowOutputEncoding,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
 }
@@ -274,7 +281,6 @@ mod tests {
             commands: vec![ShellWorkflowCommand {
                 argv: vec!["cargo".to_string(), "test".to_string()],
                 timeout_ms: 30_000,
-                continue_on_nonzero: false,
                 accepted_exit_codes: None,
                 continue_on_unaccepted_exit: false,
             }],
@@ -300,25 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn workflow_command_plan_v1_decodes_without_v2_fields() {
-        let payload = serde_json::json!({
-            "version": SHELL_COMMAND_PLAN_VERSION_1,
-            "cwd": ".",
-            "commands": [{
-                "argv": ["true"],
-                "timeout_ms": 1_000,
-                "continue_on_nonzero": false
-            }],
-            "environment": {"inherit": false, "set": {}},
-            "output": {"preview_bytes": 1_024, "artifact_spill": false}
-        });
-        let plan: ShellWorkflowCommandPlan = serde_json::from_value(payload).expect("version 1");
-        assert_eq!(plan.version, SHELL_COMMAND_PLAN_VERSION_1);
-        assert_eq!(plan.commands[0].accepted_exit_codes, None);
-        assert!(!plan.commands[0].continue_on_unaccepted_exit);
-    }
-
-    #[test]
     fn workflow_command_plan_result_carries_terminal_detail_and_artifacts() {
         let result = ShellWorkflowCommandPlanResult {
             version: SHELL_COMMAND_PLAN_VERSION,
@@ -329,11 +316,15 @@ mod tests {
                 status: ShellWorkflowCommandStatus::Exited,
                 exit_code: Some(1),
                 accepted_exit_codes: vec![0],
-                exit_accepted: Some(false),
+                exit_accepted: false,
                 signal: None,
                 duration_ms: 12,
                 stdout_preview: String::new(),
                 stderr_preview: "failed".to_string(),
+                stdout_bytes: 0,
+                stderr_bytes: 6,
+                stdout_encoding: ShellWorkflowOutputEncoding::Utf8,
+                stderr_encoding: ShellWorkflowOutputEncoding::Utf8,
                 stdout_truncated: false,
                 stderr_truncated: true,
             }],

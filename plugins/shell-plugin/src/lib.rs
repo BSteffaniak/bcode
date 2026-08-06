@@ -74,7 +74,11 @@ impl RustPlugin for ShellPlugin {
 
 fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
     if context.request.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID {
-        return invoke_workflow_block_contract(context);
+        return if context.request.operation == bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION {
+            prepare_workflow_block_contract(&context.request)
+        } else {
+            invoke_workflow_block_contract(context)
+        };
     }
     if context.request.interface_id != TOOL_SERVICE_INTERFACE_ID {
         return ServiceResponse::error(
@@ -270,29 +274,23 @@ fn shell_tool_definition() -> ToolDefinition {
             }
 }
 
-#[allow(clippy::too_many_lines)]
-fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResponse {
-    if !matches!(
-        context.request.operation.as_str(),
-        "shell.command-plan" | "shell.script"
-    ) {
-        return ServiceResponse::error(
-            "unsupported_operation",
-            "unsupported shell workflow block operation",
-        );
-    }
-    if context.cancellation.is_cancelled() {
-        return ServiceResponse::error("cancelled", "shell command plan cancelled");
-    }
-    let invocation = match context
-        .request
-        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
-    {
-        Ok(invocation) => invocation,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-    let plan = if context.request.operation == "shell.script" {
-        let request = if let Some(script) = invocation.input.as_str() {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellWorkflowPreparationDescriptor {
+    version: u32,
+    block_id: String,
+    input_sha256: String,
+}
+
+fn workflow_block_input_sha256(input: &serde_json::Value) -> Result<String, String> {
+    bcode_workflow::workflow_block_input_sha256(input)
+}
+
+fn shell_workflow_command_plan(
+    input: &serde_json::Value,
+) -> Result<ShellWorkflowCommandPlan, String> {
+    if input.is_string() || input.get("script").is_some() {
+        let request = if let Some(script) = input.as_str() {
             contracts::ShellWorkflowScriptRequest {
                 version: contracts::SHELL_SCRIPT_VERSION,
                 script: script.to_string(),
@@ -308,25 +306,195 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
                 },
             }
         } else {
-            match invocation.typed_input::<contracts::ShellWorkflowScriptRequest>() {
-                Ok(request) => request,
-                Err(error) => return ServiceResponse::error("invalid_request", error),
-            }
+            serde_json::from_value::<contracts::ShellWorkflowScriptRequest>(input.clone())
+                .map_err(|error| error.to_string())?
         };
-        match shell_script_command_plan(request) {
-            Ok(plan) => plan,
-            Err(error) => return ServiceResponse::error("invalid_request", error),
-        }
+        shell_script_command_plan(request)
     } else {
-        match invocation.typed_input::<ShellWorkflowCommandPlan>() {
-            Ok(plan) => plan,
-            Err(error) => return ServiceResponse::error("invalid_request", error),
-        }
+        serde_json::from_value::<ShellWorkflowCommandPlan>(input.clone())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn posix_quote_workflow_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/'))
+    {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+fn workflow_command_analysis(
+    input: &serde_json::Value,
+    plan: &ShellWorkflowCommandPlan,
+) -> bcode_plugin_sdk::ToolPolicyOperation {
+    let command = input
+        .as_str()
+        .or_else(|| input.get("script").and_then(serde_json::Value::as_str))
+        .map_or_else(
+            || {
+                plan.commands
+                    .iter()
+                    .map(|command| {
+                        command
+                            .argv
+                            .iter()
+                            .map(|word| posix_quote_workflow_word(word))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ; ")
+            },
+            ToString::to_string,
+        );
+    let (analysis, analysis_error) = match bcode_shell_command_analysis::analyze(
+        &bcode_shell_command_analysis_models::ShellAnalysisRequest::posix(command.clone()),
+    ) {
+        Ok(analysis) => (Some(analysis), None),
+        Err(error) => (None, Some(error)),
     };
-    if !matches!(
-        plan.version,
-        contracts::SHELL_COMMAND_PLAN_VERSION_1 | contracts::SHELL_COMMAND_PLAN_VERSION
-    ) || plan.commands.is_empty()
+    bcode_plugin_sdk::ToolPolicyOperation::Command {
+        command: Some(command),
+        analysis,
+        analysis_error,
+    }
+}
+
+fn prepare_workflow_block_contract(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<bcode_workflow::WorkflowBlockPreparationRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_preparation", error.to_string()),
+    };
+    if let Err(error) = request.validate() {
+        return ServiceResponse::error("invalid_preparation", error.to_string());
+    }
+    if request.block.plugin_id != "bcode.shell"
+        || request.block.operation != "exec"
+        || request.block.block_id != "exec"
+        || request.block.block_version != 1
+    {
+        return ServiceResponse::error(
+            "invalid_preparation",
+            "unsupported or malformed shell workflow preparation request",
+        );
+    }
+    let input_sha256 = match workflow_block_input_sha256(&request.input) {
+        Ok(checksum) => checksum,
+        Err(error) => return ServiceResponse::error("invalid_preparation", error),
+    };
+    let plan = match shell_workflow_command_plan(&request.input) {
+        Ok(plan) => plan,
+        Err(error) => return ServiceResponse::error("invalid_preparation", error),
+    };
+    let operation = workflow_command_analysis(&request.input, &plan);
+    if matches!(
+        &operation,
+        bcode_plugin_sdk::ToolPolicyOperation::Command { analysis: None, .. }
+            | bcode_plugin_sdk::ToolPolicyOperation::Command {
+                analysis: Some(bcode_shell_command_analysis_models::ShellAnalysis {
+                    completeness:
+                        bcode_shell_command_analysis_models::ShellAnalysisCompleteness::Incomplete { .. },
+                    ..
+                }),
+                ..
+            }
+    ) {
+        return ServiceResponse::error(
+            "command_analysis_failed",
+            "shell workflow command analysis failed closed",
+        );
+    }
+    let descriptor = ShellWorkflowPreparationDescriptor {
+        version: 1,
+        block_id: request.block.block_id,
+        input_sha256: input_sha256.clone(),
+    };
+    match ServiceResponse::json(&bcode_workflow::WorkflowBlockPreparationResponse {
+        version: bcode_workflow::WORKFLOW_BLOCK_PREPARATION_VERSION,
+        input_sha256,
+        owner_id: "bcode.shell".to_string(),
+        operation_facts: serde_json::to_value(
+            bcode_agent_profile::ToolPolicyAuthorizationMetadata {
+                requires_permission: true,
+                aliases: vec![SHELL_RUN_TOOL_NAME.to_string()],
+                compatibility_aliases: Vec::new(),
+                capabilities: shell_policy_identity().capabilities,
+                permission_category: Some("command".to_string()),
+                operation,
+            },
+        )
+        .unwrap_or(serde_json::Value::Null),
+        descriptor: serde_json::to_value(descriptor).unwrap_or(serde_json::Value::Null),
+        diagnostics: Vec::new(),
+    }) {
+        Ok(response) => response,
+        Err(error) => ServiceResponse::error("preparation_encoding_failed", error.to_string()),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResponse {
+    if !matches!(context.request.operation.as_str(), "exec") {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported shell workflow block operation",
+        );
+    }
+    if context.cancellation.is_cancelled() {
+        return ServiceResponse::error("cancelled", "shell command plan cancelled");
+    }
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let Some(preparation) = invocation.preparation.as_ref() else {
+        return ServiceResponse::error(
+            "invalid_preparation",
+            "shell workflow invocation requires owner preparation",
+        );
+    };
+    if let Err(error) = preparation.validate() {
+        return ServiceResponse::error("invalid_preparation", error.to_string());
+    }
+    let descriptor = match serde_json::from_value::<ShellWorkflowPreparationDescriptor>(
+        preparation.descriptor.clone(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => return ServiceResponse::error("invalid_preparation", error.to_string()),
+    };
+    let input_sha256 = match workflow_block_input_sha256(&invocation.input) {
+        Ok(checksum) => checksum,
+        Err(error) => return ServiceResponse::error("invalid_preparation", error),
+    };
+    if preparation.owner_id != "bcode.shell"
+        || serde_json::from_value::<bcode_agent_profile::ToolPolicyAuthorizationMetadata>(
+            preparation.operation_facts.clone(),
+        )
+        .is_err()
+        || descriptor.version != 1
+        || descriptor.block_id != context.request.operation
+        || descriptor.input_sha256 != input_sha256
+        || preparation.input_sha256 != input_sha256
+    {
+        return ServiceResponse::error(
+            "invalid_preparation",
+            "shell workflow preparation descriptor does not match the invocation",
+        );
+    }
+    let plan = match shell_workflow_command_plan(&invocation.input) {
+        Ok(plan) => plan,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
+    };
+    if plan.version != contracts::SHELL_COMMAND_PLAN_VERSION
+        || plan.commands.is_empty()
         || plan.commands.len() > 64
         || plan.cwd.is_absolute()
         || plan.cwd.components().any(|component| {
@@ -351,11 +519,6 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
                             .len()
                             != codes.len()
                 })
-                || plan.version == contracts::SHELL_COMMAND_PLAN_VERSION_1
-                    && (command.accepted_exit_codes.is_some()
-                        || command.continue_on_unaccepted_exit)
-                || plan.version == contracts::SHELL_COMMAND_PLAN_VERSION
-                    && command.continue_on_nonzero
         })
         || plan.environment.set.len() > 128
         || plan.output.preview_bytes > 65_536
@@ -366,12 +529,6 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
         );
     }
     match execute_workflow_command_plan(context, &invocation, &plan) {
-        Ok(result) if context.request.operation == "shell.script" && !result.passed => {
-            ServiceResponse::error(
-                "script_exit_unaccepted",
-                "shell script exited without an accepted result",
-            )
-        }
         Ok(result) => json_response(&result),
         Err(error) => ServiceResponse::error("command_plan_failed", error),
     }
@@ -421,7 +578,6 @@ fn shell_script_command_plan(
         commands: vec![contracts::ShellWorkflowCommand {
             argv: shell,
             timeout_ms,
-            continue_on_nonzero: false,
             accepted_exit_codes: Some(accepted_exit_codes),
             continue_on_unaccepted_exit,
         }],
@@ -434,8 +590,8 @@ fn shell_script_command_plan(
 }
 
 const SHELL_WORKFLOW_ARTIFACT_CONTENT_TYPE: &str = "application/octet-stream";
-const SHELL_WORKFLOW_STDOUT_SCHEMA: &str = "bcode.shell.command-plan.stdout";
-const SHELL_WORKFLOW_STDERR_SCHEMA: &str = "bcode.shell.command-plan.stderr";
+const SHELL_WORKFLOW_STDOUT_SCHEMA: &str = "bcode.shell.exec.stdout";
+const SHELL_WORKFLOW_STDERR_SCHEMA: &str = "bcode.shell.exec.stderr";
 
 fn normalized_command_plan(plan: &ShellWorkflowCommandPlan) -> ShellWorkflowCommandPlan {
     let mut normalized = plan.clone();
@@ -448,7 +604,6 @@ fn normalized_command_plan(plan: &ShellWorkflowCommandPlan) -> ShellWorkflowComm
             codes.sort_unstable();
             codes.dedup();
             command.accepted_exit_codes = Some(codes);
-            command.continue_on_nonzero = false;
         }
     }
     normalized
@@ -469,7 +624,7 @@ fn execute_workflow_command_plan(
     let mut progress = context.transient_progress(
         invocation.dispatch_identity.clone(),
         "command-plan-progress",
-        "bcode.shell.command-plan.progress",
+        "bcode.shell.exec.progress",
         1,
     );
     let workspace = invocation
@@ -502,16 +657,8 @@ fn execute_workflow_command_plan(
         }
         let (result, command_artifacts) =
             execute_workflow_command(context, invocation, plan, command, index, &cwd)?;
-        let accepted_exit = result.exit_accepted.unwrap_or_else(|| {
-            result
-                .exit_code
-                .is_some_and(|code| result.accepted_exit_codes.contains(&code))
-        });
-        let continue_on_unaccepted = if plan.version == contracts::SHELL_COMMAND_PLAN_VERSION_1 {
-            command.continue_on_nonzero
-        } else {
-            command.continue_on_unaccepted_exit
-        };
+        let accepted_exit = result.exit_accepted;
+        let continue_on_unaccepted = command.continue_on_unaccepted_exit;
         let should_stop = result.status != ShellWorkflowCommandStatus::Exited
             || !accepted_exit && !continue_on_unaccepted;
         commands.push(result);
@@ -523,12 +670,7 @@ fn execute_workflow_command_plan(
     let _ = progress.finish();
     let passed = commands.len() == plan.commands.len()
         && commands.iter().all(|result| {
-            result.status == ShellWorkflowCommandStatus::Exited
-                && result.exit_accepted.unwrap_or_else(|| {
-                    result
-                        .exit_code
-                        .is_some_and(|code| result.accepted_exit_codes.contains(&code))
-                })
+            result.status == ShellWorkflowCommandStatus::Exited && result.exit_accepted
         });
     Ok(ShellWorkflowCommandPlanResult {
         version: plan.version,
@@ -540,20 +682,16 @@ fn execute_workflow_command_plan(
 }
 
 fn command_accepted_exit_codes(
-    plan_version: u32,
+    _plan_version: u32,
     command: &contracts::ShellWorkflowCommand,
 ) -> Vec<i32> {
-    if plan_version == contracts::SHELL_COMMAND_PLAN_VERSION_1 {
-        vec![0]
-    } else {
-        let mut codes = command
-            .accepted_exit_codes
-            .clone()
-            .unwrap_or_else(|| vec![0]);
-        codes.sort_unstable();
-        codes.dedup();
-        codes
-    }
+    let mut codes = command
+        .accepted_exit_codes
+        .clone()
+        .unwrap_or_else(|| vec![0]);
+    codes.sort_unstable();
+    codes.dedup();
+    codes
 }
 
 fn workflow_environment_name_is_sensitive(name: &str) -> bool {
@@ -655,33 +793,42 @@ fn execute_workflow_command(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(bcode_tool_runtime::ToolRuntimeError::Io(error)) => {
+            let error = error.to_string();
+            let (stderr_preview, stderr_utf8, stderr_truncated) =
+                bounded_preview(error.as_bytes(), plan.output.preview_bytes);
             return Ok((
                 ShellWorkflowCommandResult {
                     index: u32::try_from(index).map_err(|error| error.to_string())?,
                     status: ShellWorkflowCommandStatus::SpawnFailed,
                     exit_code: None,
                     accepted_exit_codes,
-                    exit_accepted: None,
+                    exit_accepted: false,
                     signal: None,
                     duration_ms: elapsed_millis(started),
                     stdout_preview: String::new(),
-                    stderr_preview: bounded_preview(
-                        error.to_string().as_bytes(),
-                        plan.output.preview_bytes,
-                    )
-                    .0,
+                    stderr_preview,
+                    stdout_bytes: 0,
+                    stderr_bytes: u64::try_from(error.len()).unwrap_or(u64::MAX),
+                    stdout_encoding: contracts::ShellWorkflowOutputEncoding::Utf8,
+                    stderr_encoding: if stderr_utf8 {
+                        contracts::ShellWorkflowOutputEncoding::Utf8
+                    } else {
+                        contracts::ShellWorkflowOutputEncoding::Binary
+                    },
                     stdout_truncated: false,
-                    stderr_truncated: false,
+                    stderr_truncated,
                 },
                 Vec::new(),
             ));
         }
         Err(error) => return Err(error.to_string()),
     };
-    let (stdout_preview, stdout_truncated) =
+    let (stdout_preview, stdout_utf8, stdout_truncated) =
         bounded_preview(&outcome.stdout.bytes, plan.output.preview_bytes);
-    let (stderr_preview, stderr_truncated) =
+    let (stderr_preview, stderr_utf8, stderr_truncated) =
         bounded_preview(&outcome.stderr.bytes, plan.output.preview_bytes);
+    let stdout_bytes = u64::try_from(outcome.stdout.bytes.len()).unwrap_or(u64::MAX);
+    let stderr_bytes = u64::try_from(outcome.stderr.bytes.len()).unwrap_or(u64::MAX);
     let mut artifacts = Vec::new();
     if plan.output.artifact_spill && stdout_truncated {
         artifacts.push(write_workflow_output_artifact(
@@ -727,12 +874,23 @@ fn execute_workflow_command(
             status,
             exit_code,
             accepted_exit_codes,
-            exit_accepted: (plan.version != contracts::SHELL_COMMAND_PLAN_VERSION_1)
-                .then_some(exit_accepted),
+            exit_accepted,
             signal,
             duration_ms: outcome.duration_ms,
             stdout_preview,
             stderr_preview,
+            stdout_bytes,
+            stderr_bytes,
+            stdout_encoding: if stdout_utf8 {
+                contracts::ShellWorkflowOutputEncoding::Utf8
+            } else {
+                contracts::ShellWorkflowOutputEncoding::Binary
+            },
+            stderr_encoding: if stderr_utf8 {
+                contracts::ShellWorkflowOutputEncoding::Utf8
+            } else {
+                contracts::ShellWorkflowOutputEncoding::Binary
+            },
             stdout_truncated,
             stderr_truncated,
         },
@@ -740,11 +898,13 @@ fn execute_workflow_command(
     ))
 }
 
-fn bounded_preview(bytes: &[u8], limit: u32) -> (String, bool) {
+fn bounded_preview(bytes: &[u8], limit: u32) -> (String, bool, bool) {
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let retained = bytes.get(..bytes.len().min(limit)).unwrap_or(bytes);
+    let utf8 = std::str::from_utf8(retained).is_ok();
     (
         String::from_utf8_lossy(retained).into_owned(),
+        utf8,
         bytes.len() > retained.len(),
     )
 }
@@ -790,7 +950,7 @@ fn write_workflow_output_artifact(
 
 fn cancelled_workflow_command_result(
     index: usize,
-    plan_version: u32,
+    _plan_version: u32,
     accepted_exit_codes: Vec<i32>,
 ) -> ShellWorkflowCommandResult {
     ShellWorkflowCommandResult {
@@ -798,11 +958,15 @@ fn cancelled_workflow_command_result(
         status: ShellWorkflowCommandStatus::Cancelled,
         exit_code: None,
         accepted_exit_codes,
-        exit_accepted: (plan_version != contracts::SHELL_COMMAND_PLAN_VERSION_1).then_some(false),
+        exit_accepted: false,
         signal: None,
         duration_ms: 0,
         stdout_preview: String::new(),
         stderr_preview: String::new(),
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        stdout_encoding: contracts::ShellWorkflowOutputEncoding::Utf8,
+        stderr_encoding: contracts::ShellWorkflowOutputEncoding::Utf8,
         stdout_truncated: false,
         stderr_truncated: false,
     }
@@ -2374,9 +2538,10 @@ mod tests {
                 dispatch_identity: "dispatch-test".to_string(),
                 workspace_root: workspace.to_path_buf(),
                 input: serde_json::Value::Null,
+                preparation: None,
             },
             ShellWorkflowCommandPlan {
-                version: contracts::SHELL_COMMAND_PLAN_VERSION_1,
+                version: contracts::SHELL_COMMAND_PLAN_VERSION,
                 cwd: PathBuf::from("."),
                 commands,
                 environment: contracts::ShellWorkflowEnvironment {
@@ -2400,7 +2565,7 @@ mod tests {
             plugin_id: "bcode.shell".to_string(),
             request: ServiceRequest {
                 interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
-                operation: "shell.command-plan".to_string(),
+                operation: "exec".to_string(),
                 payload: serde_json::to_vec(invocation).expect("invocation"),
             },
             config: bcode_plugin_sdk::PluginConfigContext::default(),
@@ -2416,6 +2581,151 @@ mod tests {
         cancellation: bcode_plugin_sdk::ServiceCancellation,
     ) -> NativeServiceContext {
         workflow_context_with_bridge(invocation, cancellation, ServiceBridge::default())
+    }
+
+    #[test]
+    fn shell_workflow_preparation_is_required_and_stale_descriptors_fail_closed() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (mut invocation, plan) = workflow_command_plan(
+            workspace.path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec!["true".to_string()],
+                timeout_ms: 1_000,
+                accepted_exit_codes: Some(vec![0]),
+                continue_on_unaccepted_exit: false,
+            }],
+        );
+        invocation.input = serde_json::to_value(&plan).expect("input");
+        let context = workflow_context(
+            &invocation,
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let missing = invoke_workflow_block_contract(&context);
+        assert_eq!(
+            missing.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid_preparation")
+        );
+
+        let block = shell_workflow_block_definition("exec");
+        let request = bcode_workflow::WorkflowBlockPreparationRequest {
+            version: bcode_workflow::WORKFLOW_BLOCK_PREPARATION_VERSION,
+            block,
+            context: bcode_workflow::WorkflowBlockPreparationContext {
+                run_id: "run".to_string(),
+                node_id: "node".to_string(),
+                activation_id: "activation".to_string(),
+                attempt: 0,
+                preparation_identity: "workflow-preparation:run:node:activation".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+            },
+            input: invocation.input.clone(),
+        };
+        let response = prepare_workflow_block_contract(&ServiceRequest {
+            interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
+            operation: bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION.to_string(),
+            payload: serde_json::to_vec(&request).expect("request"),
+        });
+        let preparation: bcode_workflow::WorkflowBlockPreparationResponse =
+            serde_json::from_slice(&response.payload).expect("preparation");
+        let policy: bcode_agent_profile::ToolPolicyAuthorizationMetadata =
+            serde_json::from_value(preparation.operation_facts.clone()).expect("policy facts");
+        assert!(policy.requires_permission);
+        match policy.operation {
+            bcode_agent_profile::ToolPolicyOperation::Command {
+                command,
+                analysis,
+                analysis_error,
+            } => {
+                assert!(command.is_some_and(|command| command.contains("true")));
+                assert!(analysis.is_some());
+                assert!(analysis_error.is_none());
+            }
+            operation => panic!("unexpected shell policy operation: {operation:?}"),
+        }
+        let duplicate = prepare_workflow_block_contract(&ServiceRequest {
+            interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
+            operation: bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION.to_string(),
+            payload: serde_json::to_vec(&request).expect("duplicate request"),
+        });
+        let duplicate: bcode_workflow::WorkflowBlockPreparationResponse =
+            serde_json::from_slice(&duplicate.payload).expect("duplicate preparation");
+        assert_eq!(
+            duplicate, preparation,
+            "duplicate preparation must be stable"
+        );
+
+        let mut stale_preparation = preparation.clone();
+        stale_preparation.input_sha256 = "f".repeat(64);
+        invocation.preparation = Some(stale_preparation);
+        let stale = invoke_workflow_block_contract(&workflow_context(
+            &invocation,
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        ));
+        assert_eq!(
+            stale.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid_preparation")
+        );
+
+        invocation.preparation = Some(preparation);
+        let cancelled = bcode_plugin_sdk::ServiceCancellation::default();
+        cancelled.cancel();
+        let cancelled_response =
+            invoke_workflow_block_contract(&workflow_context(&invocation, cancelled));
+        assert_eq!(
+            cancelled_response
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("cancelled")
+        );
+    }
+
+    fn shell_workflow_block_definition(operation: &str) -> bcode_workflow::WorkflowBlockDefinition {
+        bcode_workflow::WorkflowBlockDefinition {
+            block_id: operation.to_string(),
+            block_version: 1,
+            plugin_id: "bcode.shell".to_string(),
+            operation: operation.to_string(),
+            input: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
+            output: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
+            effect: bcode_workflow::WorkflowBlockEffect::Mutating,
+            resources: vec![bcode_workflow::ResourceClaim::write("repository")],
+            authorization: bcode_workflow::WorkflowBlockAuthorization {
+                capability: bcode_workflow::WorkflowToolCapability::Mutating,
+                explicit_grant_required: true,
+            },
+            timeout_ms: 300_000,
+            cancellation_supported: true,
+            reconciliation: bcode_workflow::WorkflowBlockReconciliation::RepairRequired,
+            preparation_required: true,
+        }
+    }
+
+    #[test]
+    fn shell_workflow_preparation_fails_closed_on_invalid_script_analysis() {
+        let block = shell_workflow_block_definition("exec");
+        let request = bcode_workflow::WorkflowBlockPreparationRequest {
+            version: bcode_workflow::WORKFLOW_BLOCK_PREPARATION_VERSION,
+            block,
+            context: bcode_workflow::WorkflowBlockPreparationContext {
+                run_id: "run".to_string(),
+                node_id: "node".to_string(),
+                activation_id: "activation".to_string(),
+                attempt: 0,
+                preparation_identity: "workflow-preparation:run:node:activation".to_string(),
+                workspace_root: std::env::temp_dir(),
+            },
+            input: serde_json::json!({"script": "eval \"$DYNAMIC_SOURCE\""}),
+        };
+        let response = prepare_workflow_block_contract(&ServiceRequest {
+            interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
+            operation: bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION.to_string(),
+            payload: serde_json::to_vec(&request).expect("request"),
+        });
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("command_analysis_failed")
+        );
     }
 
     #[test]
@@ -2472,7 +2782,6 @@ mod tests {
             vec![contracts::ShellWorkflowCommand {
                 argv: vec!["true".to_string()],
                 timeout_ms: 1_000,
-                continue_on_nonzero: false,
                 accepted_exit_codes: None,
                 continue_on_unaccepted_exit: false,
             }],
@@ -2495,6 +2804,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workflow_output_preview_preserves_binary_identity_without_claiming_utf8() {
+        let bytes = [b'f', b'o', 0x80, b'o'];
+        let (preview, utf8, truncated) = bounded_preview(&bytes, 4);
+        assert_eq!(preview, "fo�o");
+        assert!(!utf8);
+        assert!(!truncated);
+        let (_, utf8, truncated) = bounded_preview(b"abcdef", 3);
+        assert!(utf8);
+        assert!(truncated);
+    }
+
     #[cfg(unix)]
     #[test]
     fn workflow_command_plan_v2_accepts_declared_exit_codes_and_controls_continuation() {
@@ -2503,7 +2824,6 @@ mod tests {
             contracts::ShellWorkflowCommand {
                 argv: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
                 timeout_ms: 5_000,
-                continue_on_nonzero: false,
                 accepted_exit_codes,
                 continue_on_unaccepted_exit,
             }
@@ -2529,7 +2849,7 @@ mod tests {
         assert_eq!(result.version, contracts::SHELL_COMMAND_PLAN_VERSION);
         assert_eq!(result.commands[0].exit_code, Some(7));
         assert_eq!(result.commands[0].accepted_exit_codes, vec![0, 7]);
-        assert_eq!(result.commands[0].exit_accepted, Some(true));
+        assert!(result.commands[0].exit_accepted);
 
         plan.commands = vec![
             command("exit 8", Some(vec![7]), true),
@@ -2547,19 +2867,18 @@ mod tests {
         assert!(!continued.passed);
         assert_eq!(continued.commands.len(), 2);
         assert_eq!(continued.commands[0].accepted_exit_codes, vec![7]);
-        assert_eq!(continued.commands[0].exit_accepted, Some(false));
+        assert!(!continued.commands[0].exit_accepted);
     }
 
     #[cfg(unix)]
     #[test]
     fn workflow_command_plan_runs_sequentially_and_branches_on_nonzero() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let command = |script: &str, continue_on_nonzero| contracts::ShellWorkflowCommand {
+        let command = |script: &str, continue_on_unaccepted_exit| contracts::ShellWorkflowCommand {
             argv: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
             timeout_ms: 5_000,
-            continue_on_nonzero,
             accepted_exit_codes: None,
-            continue_on_unaccepted_exit: false,
+            continue_on_unaccepted_exit,
         };
         let (invocation, plan) = workflow_command_plan(
             workspace.path(),
@@ -2578,7 +2897,7 @@ mod tests {
         )
         .expect("result");
         assert!(!result.passed);
-        assert_eq!(result.version, contracts::SHELL_COMMAND_PLAN_VERSION_1);
+        assert_eq!(result.version, contracts::SHELL_COMMAND_PLAN_VERSION);
         assert!(
             result
                 .commands
@@ -2640,7 +2959,6 @@ mod tests {
                     "kill -TERM $$".to_string(),
                 ],
                 timeout_ms: 1_000,
-                continue_on_nonzero: false,
                 accepted_exit_codes: None,
                 continue_on_unaccepted_exit: false,
             }],
@@ -2662,7 +2980,7 @@ mod tests {
         );
         assert_eq!(result.commands[0].exit_code, None);
         assert_eq!(result.commands[0].signal, Some(15));
-        assert_eq!(result.commands[0].exit_accepted, Some(false));
+        assert!(!result.commands[0].exit_accepted);
     }
 
     #[cfg(unix)]
@@ -2674,7 +2992,6 @@ mod tests {
                 contracts::ShellWorkflowCommand {
                     argv: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
                     timeout_ms: 10,
-                    continue_on_nonzero: false,
                     accepted_exit_codes: None,
                     continue_on_unaccepted_exit: false,
                 },
@@ -2685,7 +3002,6 @@ mod tests {
                 contracts::ShellWorkflowCommand {
                     argv: vec!["bcode-definitely-missing-command".to_string()],
                     timeout_ms: 1_000,
-                    continue_on_nonzero: false,
                     accepted_exit_codes: None,
                     continue_on_unaccepted_exit: false,
                 },
@@ -2710,7 +3026,6 @@ mod tests {
             vec![contracts::ShellWorkflowCommand {
                 argv: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
                 timeout_ms: 1_000,
-                continue_on_nonzero: false,
                 accepted_exit_codes: None,
                 continue_on_unaccepted_exit: false,
             }],
@@ -2771,7 +3086,6 @@ mod tests {
                     "printf abcdef".to_string(),
                 ],
                 timeout_ms: 1_000,
-                continue_on_nonzero: false,
                 accepted_exit_codes: None,
                 continue_on_unaccepted_exit: false,
             }],
@@ -2805,7 +3119,6 @@ mod tests {
             vec![contracts::ShellWorkflowCommand {
                 argv: vec!["true".to_string()],
                 timeout_ms: 1_000,
-                continue_on_nonzero: false,
                 accepted_exit_codes: None,
                 continue_on_unaccepted_exit: false,
             }],
@@ -2831,7 +3144,6 @@ mod tests {
             vec![contracts::ShellWorkflowCommand {
                 argv: vec!["true".to_string()],
                 timeout_ms: 1_000,
-                continue_on_nonzero: false,
                 accepted_exit_codes: None,
                 continue_on_unaccepted_exit: false,
             }],
@@ -2873,11 +3185,15 @@ mod tests {
                 status: ShellWorkflowCommandStatus::Exited,
                 exit_code: Some(7),
                 accepted_exit_codes: vec![0],
-                exit_accepted: Some(false),
+                exit_accepted: false,
                 signal: None,
                 duration_ms: 1,
                 stdout_preview: String::new(),
                 stderr_preview: String::new(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                stdout_encoding: contracts::ShellWorkflowOutputEncoding::Utf8,
+                stderr_encoding: contracts::ShellWorkflowOutputEncoding::Utf8,
                 stdout_truncated: false,
                 stderr_truncated: false,
             }],
@@ -2892,6 +3208,7 @@ mod tests {
                     dispatch_identity: "dispatch".to_string(),
                     workspace_root: std::env::temp_dir(),
                     input: serde_json::Value::Null,
+                    preparation: None,
                 },
                 bcode_plugin_sdk::ServiceCancellation::default(),
             )
@@ -2909,7 +3226,6 @@ mod tests {
             vec![contracts::ShellWorkflowCommand {
                 argv: vec!["command".to_string()],
                 timeout_ms: 1_000,
-                continue_on_nonzero: false,
                 accepted_exit_codes: None,
                 continue_on_unaccepted_exit: false,
             }],
@@ -2938,7 +3254,6 @@ mod tests {
                 .map(|_| contracts::ShellWorkflowCommand {
                     argv: vec!["true".to_string()],
                     timeout_ms: 1_000,
-                    continue_on_nonzero: false,
                     accepted_exit_codes: None,
                     continue_on_unaccepted_exit: false,
                 })
@@ -2949,13 +3264,36 @@ mod tests {
             &invocation,
             bcode_plugin_sdk::ServiceCancellation::default(),
         );
+        let mut prepared_invocation = invocation;
+        let prepared_input = serde_json::to_value(&oversized).expect("plan");
+        let input_sha256 = workflow_block_input_sha256(&prepared_input).expect("checksum");
+        prepared_invocation.input = prepared_input;
+        prepared_invocation.preparation = Some(bcode_workflow::WorkflowBlockPreparationResponse {
+            version: bcode_workflow::WORKFLOW_BLOCK_PREPARATION_VERSION,
+            input_sha256: input_sha256.clone(),
+            owner_id: "bcode.shell".to_string(),
+            operation_facts: serde_json::to_value(
+                bcode_agent_profile::ToolPolicyAuthorizationMetadata {
+                    requires_permission: true,
+                    aliases: vec![SHELL_RUN_TOOL_NAME.to_string()],
+                    compatibility_aliases: Vec::new(),
+                    capabilities: shell_policy_identity().capabilities,
+                    permission_category: Some("command".to_string()),
+                    operation: workflow_command_analysis(&prepared_invocation.input, &plan),
+                },
+            )
+            .expect("facts"),
+            descriptor: serde_json::to_value(ShellWorkflowPreparationDescriptor {
+                version: 1,
+                block_id: "exec".to_string(),
+                input_sha256,
+            })
+            .expect("descriptor"),
+            diagnostics: Vec::new(),
+        });
         let response = invoke_workflow_block_contract(&NativeServiceContext {
             request: ServiceRequest {
-                payload: serde_json::to_vec(&bcode_workflow::WorkflowBlockInvocation {
-                    input: serde_json::to_value(oversized).expect("plan"),
-                    ..invocation
-                })
-                .expect("invocation"),
+                payload: serde_json::to_vec(&prepared_invocation).expect("invocation"),
                 ..context.request.clone()
             },
             ..context

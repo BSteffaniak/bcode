@@ -1098,17 +1098,17 @@ impl CommitMessageResult {
 #[allow(dead_code)]
 fn commit_message_agent_configuration(
     skill_id: &str,
-) -> Result<bcode_workflow::WorkflowAgentConfiguration, String> {
+) -> Result<bcode_workflow::WorkflowPromptConfiguration, String> {
     if skill_id.trim().is_empty() || skill_id.len() > 256 {
         return Err("commit-message skill ID is invalid".to_string());
     }
-    Ok(bcode_workflow::WorkflowAgentConfiguration {
-        version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
-        execution_target: bcode_workflow::AgentExecutionTarget::FreshIsolated,
+    Ok(bcode_workflow::WorkflowPromptConfiguration {
+        version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+        execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
         agent_profile: "plan".to_string(),
         provider: None,
         model: None,
-        structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+        structured_output: bcode_workflow::PromptStructuredOutputPolicy {
             schema: bcode_workflow::ValueSchema::of::<CommitMessageResult>(),
             strict: true,
         },
@@ -1116,12 +1116,10 @@ fn commit_message_agent_configuration(
         tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
         tool_allowlist: vec!["git.diff".to_string()],
         timeout_ms: 120_000,
-        skills: vec![bcode_workflow::AgentSkillSelection {
-            skill_id: skill_id.to_string(),
-            mode: bcode_workflow::AgentSkillActivationMode::Required,
-        }],
         prompt_mode: "json_input".to_string(),
-        system_prompt: "Generate only the typed commit-message result for the exact repository snapshot and changed paths. Remain read-only and never commit or mutate Git state.".to_string(),
+        system_prompt: format!(
+            "Use the `{skill_id}` skill when available. Generate only the typed commit-message result for the exact repository snapshot and changed paths. Remain read-only and never commit or mutate Git state."
+        ),
     })
 }
 
@@ -1153,14 +1151,14 @@ fn commit_message_agent_step(
 fn loop_agent_configuration(
     system_prompt: &str,
     read_only: bool,
-) -> bcode_workflow::WorkflowAgentConfiguration {
-    bcode_workflow::WorkflowAgentConfiguration {
-        version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
-        execution_target: bcode_workflow::AgentExecutionTarget::SharedParentSequential,
+) -> bcode_workflow::WorkflowPromptConfiguration {
+    bcode_workflow::WorkflowPromptConfiguration {
+        version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+        execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
         agent_profile: if read_only { "plan" } else { "build" }.to_string(),
         provider: None,
         model: None,
-        structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+        structured_output: bcode_workflow::PromptStructuredOutputPolicy {
             schema: bcode_workflow::ValueSchema::of::<LoopWorkflowIteration>(),
             strict: true,
         },
@@ -1172,7 +1170,6 @@ fn loop_agent_configuration(
         },
         tool_allowlist: Vec::new(),
         timeout_ms: 3_600_000,
-        skills: Vec::new(),
         prompt_mode: "json_input".to_string(),
         system_prompt: system_prompt.to_string(),
     }
@@ -1203,9 +1200,9 @@ fn loop_workflow_spec(
     );
     let cycle =
         implementation
-            .agent_execution_target(bcode_workflow::AgentExecutionTarget::SharedParentSequential)
+            .agent_execution_target(bcode_workflow::PromptContextTarget::SharedParentSequential)
             .then(evaluation.agent_execution_target(
-                bcode_workflow::AgentExecutionTarget::SharedParentSequential,
+                bcode_workflow::PromptContextTarget::SharedParentSequential,
             ))
             .repeat_while(
                 "loop.repeat",
@@ -1364,7 +1361,7 @@ mod tests {
             .build()
             .expect("workflow");
         let node = &workflow.definition().nodes["loop.commit-message"];
-        let configuration: bcode_workflow::WorkflowAgentConfiguration =
+        let configuration: bcode_workflow::WorkflowPromptConfiguration =
             serde_json::from_value(node.configuration.clone()).expect("configuration");
         assert!(configuration.read_only);
         assert_eq!(
@@ -1372,11 +1369,7 @@ mod tests {
             bcode_workflow::WorkflowToolCapability::ReadOnly
         );
         assert_eq!(configuration.tool_allowlist, ["git.diff"]);
-        assert_eq!(configuration.skills.len(), 1);
-        assert_eq!(
-            configuration.skills[0].mode,
-            bcode_workflow::AgentSkillActivationMode::Required
-        );
+        assert!(configuration.system_prompt.contains("commit-message"));
         assert_eq!(
             configuration.structured_output.schema.type_name,
             std::any::type_name::<CommitMessageResult>()

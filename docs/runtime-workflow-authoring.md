@@ -160,7 +160,7 @@ reference expansion. Remote or network-dependent references are rejected. Unknow
 future versions fail closed with source-addressed diagnostics.
 
 Generic configuration bindings target only declared fields in node configuration, agent selection,
-skill selection, plugin-block defaults, permitted predicates/transforms, run limits, or initial input.
+plugin-block defaults, permitted predicates/transforms, run limits, or initial input.
 Bindings use the existing bounded transform language or a separately versioned bounded extension;
 they never execute arbitrary code. The fully bound result is validated again as an exact definition.
 
@@ -172,7 +172,7 @@ outcomes. A client can ignore an unknown presentation namespace and still unders
 ## Producer-neutral authoring
 
 UI, CLI, SDK, plugin, and generated producers discover the same bounded portable catalogs and submit
-the same authoring document. Catalogs describe durable node kinds, block contracts, agent profiles,
+the same authoring document. Catalogs describe durable node kinds, block contracts, prompt profiles,
 skills, predicates, transforms, schema dialects, production capabilities, and limit bounds without
 leaking implementation objects.
 

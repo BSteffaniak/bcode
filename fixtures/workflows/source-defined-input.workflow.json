@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "workflow_id": "example/source-defined-input",
   "metadata": {
     "title": "Source-defined input",
@@ -18,7 +18,7 @@
   },
   "configuration_defaults": {},
   "definition": {
-    "schema_version": 1,
+    "schema_version": 2,
     "name": "Source-defined input",
     "input": {
       "type_name": "bcode.example.source-value/v1",

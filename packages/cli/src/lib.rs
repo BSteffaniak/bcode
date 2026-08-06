@@ -379,6 +379,19 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         WorkflowCommand::CancelComputation { operation_id } => {
             print_json(&client.cancel_workflow_computation(operation_id).await?)?;
         }
+        WorkflowCommand::ResetStore { confirm } => {
+            if confirm != "DELETE-INCOMPATIBLE-WORKFLOW-STATE" {
+                return Err(CliError::InvalidArguments(
+                    "workflow store reset requires --confirm DELETE-INCOMPATIBLE-WORKFLOW-STATE"
+                        .to_string(),
+                ));
+            }
+            print_json(&bcode_server::reset_incompatible_workflow_store_offline(
+                &bcode_config::default_state_dir(),
+                &confirm,
+                current_unix_time_ms()?,
+            )?)?;
+        }
         WorkflowCommand::Start {
             selection,
             parent_session_id,
@@ -2072,6 +2085,12 @@ enum WorkflowCommand {
     Package {
         #[command(subcommand)]
         command: WorkflowPackageCommand,
+    },
+    /// Explicitly back up and delete only incompatible workflow-owned state.
+    ResetStore {
+        /// Required destructive-operation acknowledgement.
+        #[arg(long, value_name = "DELETE-INCOMPATIBLE-WORKFLOW-STATE")]
+        confirm: String,
     },
     /// Start one immutable authored-workflow revision.
     Start {
@@ -12705,6 +12724,25 @@ mod web_command_tests {
     }
 
     #[test]
+    fn workflow_store_reset_requires_explicit_confirmation_value() {
+        assert!(Cli::try_parse_from(["bcode", "workflow", "reset-store"]).is_err());
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "workflow",
+            "reset-store",
+            "--confirm",
+            "DELETE-INCOMPATIBLE-WORKFLOW-STATE",
+        ])
+        .expect("explicit reset command");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Workflow {
+                command: WorkflowCommand::ResetStore { confirm }
+            }) if confirm == "DELETE-INCOMPATIBLE-WORKFLOW-STATE"
+        ));
+    }
+
+    #[test]
     fn exact_revision_import_command_parses_machine_readable_controls() {
         let cli = Cli::try_parse_from([
             "bcode",
@@ -13464,15 +13502,15 @@ mod workflow_source_tests {
     use super::*;
 
     #[test]
-    fn primary_cli_apply_loader_preserves_concise_source_and_infers_yaml() {
+    fn primary_cli_apply_loader_preserves_source_v3_shorthand_and_infers_yaml() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let yaml = root.join("fixtures/workflows/concise-run.workflow.yaml");
-        let loaded = read_workflow_source_file(&yaml, None).expect("concise YAML source");
+        let loaded = read_workflow_source_file(&yaml, None).expect("source-v3 YAML source");
         assert_eq!(
             loaded.source_format,
             bcode_workflow::WorkflowSourceFormat::Yaml
         );
-        assert!(loaded.source.contains("workflow_source_version: 1"));
+        assert!(loaded.source.contains("workflow_source_version: 3"));
         assert!(loaded.source.contains("run: printf 'first\\n'"));
         assert!(!loaded.source.contains("fixtures/workflows"));
         assert!(read_workflow_source_file(&yaml, Some("xml")).is_err());
@@ -13484,13 +13522,13 @@ mod workflow_source_tests {
         let member = temp.path().join("member.workflow.yaml");
         std::fs::write(
             &member,
-            "workflow_source_version: 2\nworkflow_id: example/member\ntitle: Member\nsteps:\n  - id: input\n    input:\n      schema:\n        type_name: value/v1\n        schema:\n          type: string\n",
+            "workflow_source_version: 3\nworkflow_id: example/member\ntitle: Member\nsteps:\n  - id: input\n    input:\n      schema:\n        type_name: value/v1\n        schema:\n          type: string\n",
         )
         .expect("member");
         let manifest = temp.path().join("workflow-package.yaml");
         std::fs::write(
             &manifest,
-            "version: 1\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n",
+            "version: 2\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n",
         )
         .expect("manifest");
         let loaded = read_workflow_package_manifest(&manifest).expect("package");
@@ -13504,7 +13542,7 @@ mod workflow_source_tests {
 
         std::fs::write(
             &manifest,
-            "version: 1\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: ../outside.yaml\n",
+            "version: 2\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: ../outside.yaml\n",
         )
         .expect("escaping manifest");
         assert!(read_workflow_package_manifest(&manifest).is_err());

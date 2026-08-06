@@ -95,13 +95,6 @@ fn author_lines(options: &serde_json::Value) -> Vec<String> {
     append_named_rows(
         &mut lines,
         template,
-        "required_skills",
-        "Required skills",
-        |value| format!("  {}", value.as_str().unwrap_or("-")),
-    );
-    append_named_rows(
-        &mut lines,
-        template,
         "required_capabilities",
         "Required capabilities",
         |value| format!("  {}", value.as_str().unwrap_or("-")),
@@ -555,26 +548,11 @@ fn append_graph(lines: &mut Vec<String>, stored: &serde_json::Value) {
             if text(node, "kind") == "agent"
                 && let Some(configuration) = node.get("configuration")
             {
-                let skills = configuration
-                    .get("skills")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or_else(
-                        || "-".to_string(),
-                        |skills| {
-                            skills
-                                .iter()
-                                .map(|skill| {
-                                    format!("{}:{}", text(skill, "skill_id"), text(skill, "mode"))
-                                })
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        },
-                    );
                 write!(
                     line,
-                    " · target={} · profile={} · provider={} · model={} · skills={skills}",
+                    " · target={} · profile={} · provider={} · model={}",
                     text(configuration, "execution_target"),
-                    text(configuration, "agent_profile"),
+                    text(configuration, "profile"),
                     text(configuration, "provider"),
                     text(configuration, "model")
                 )
@@ -775,10 +753,9 @@ mod tests {
                     "kind": "agent",
                     "configuration": {
                         "execution_target": "fresh_isolated",
-                        "agent_profile": "review",
+                        "profile": "review",
                         "provider": "bcode.fake-provider",
                         "model": "fake-review",
-                        "skills": [{"skill_id": "code-review", "mode": "required"}]
                     }
                 },
                 "approve": {"kind": "approval"}
@@ -837,7 +814,6 @@ mod tests {
         assert!(rendered.contains("Graph (2 nodes, 1 edges)"));
         assert!(rendered.contains("target=fresh_isolated · profile=review"));
         assert!(rendered.contains("provider=bcode.fake-provider · model=fake-review"));
-        assert!(rendered.contains("skills=code-review:required"));
         assert!(rendered.contains("review -> approve · direct"));
         assert!(rendered.contains("Waits (1)"));
         assert!(rendered.contains("Mutation approvals (1)"));
@@ -892,7 +868,6 @@ mod tests {
                     "title": "Implementation verification commit",
                     "description": "Implement, verify, and optionally commit.",
                     "required_plugins": ["bcode.shell", "bcode.git"],
-                    "required_skills": ["commit-message"],
                     "required_capabilities": ["workflow-production/v1"],
                     "definition": {"nodes": {"commit": {"configuration": {
                         "plugin_id": "bcode.git", "block_id": "git.commit",
@@ -904,7 +879,6 @@ mod tests {
         let rendered = author_lines(&options).join("\n");
         assert!(rendered.contains("Implementation verification commit"));
         assert!(rendered.contains("Required plugins (2)"));
-        assert!(rendered.contains("Required skills (1)"));
         assert!(rendered.contains("bcode.git / git.commit · effect=mutating"));
         assert!(rendered.contains("reconciliation=repair_required"));
         assert!(rendered.contains("Validated configuration preview"));

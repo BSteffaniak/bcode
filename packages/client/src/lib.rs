@@ -3127,6 +3127,27 @@ impl BcodeClient {
         }
     }
 
+    /// Explicitly request incompatible workflow-store reset.
+    ///
+    /// The running daemon refuses this request because it owns the store; clients use the typed
+    /// error to direct operators to the offline maintenance entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or refuses online reset.
+    pub async fn reset_incompatible_workflow_store(
+        &self,
+        confirm: String,
+    ) -> Result<bcode_workflow_store::WorkflowStoreResetReceipt, ClientError> {
+        match self
+            .send_request(Request::ResetIncompatibleWorkflowStore { confirm })
+            .await?
+        {
+            ResponsePayload::WorkflowStoreReset { receipt } => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List bounded plugin-owned workflow templates with availability diagnostics.
     ///
     /// # Errors

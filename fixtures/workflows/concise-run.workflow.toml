@@ -1,8 +1,9 @@
-workflow_source_version = 1
+workflow_source_version = 3
 workflow_id = "example/concise-run"
 title = "Concise run"
 
 [[steps]]
+id = "first"
 run = "printf 'first\\n'"
 
 [[steps]]

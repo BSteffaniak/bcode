@@ -40,7 +40,7 @@ committed path set. Approval remains exact and per checkpoint. The complete auth
 
 The proposed message has a bounded single-line title and bounded description. Paths are unique, non-empty, repository-relative, and bounded. Composition does not stage or commit.
 
-A commit-message agent, when configured, remains read-only. It receives the exact repository root, expected HEAD, and changed paths; uses a strict typed output schema; and cannot invoke `git.commit`. Required skill resolution fails before model dispatch. Optional-skill fallback is template policy and must be explicit.
+A commit-message agent, when configured, remains read-only. It receives the exact repository root, expected HEAD, and changed paths; uses a strict typed output schema; and cannot invoke `git.commit`. The prompt may request a commit-message skill through ordinary instruction text; skill availability does not alter workflow admission or authority.
 
 ## Exact mutation approval and dispatch
 

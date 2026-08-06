@@ -277,7 +277,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_loaders_support_concise_yaml_without_retaining_paths() {
+    fn source_loaders_support_source_v3_yaml_without_retaining_paths() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let json = root.join("fixtures/workflows/source-defined-input.workflow.json");
         let toml = root.join("fixtures/workflows/source-defined-input.workflow.toml");
@@ -302,9 +302,9 @@ mod tests {
         );
 
         let (source, format) =
-            load_workflow_source_text(&concise, None).expect("concise YAML source text");
+            load_workflow_source_text(&concise, None).expect("source-v3 YAML source text");
         assert_eq!(format, bcode_workflow::WorkflowSourceFormat::Yaml);
-        assert!(source.contains("workflow_source_version: 1"));
+        assert!(source.contains("workflow_source_version: 3"));
         assert!(!source.contains("fixtures/workflows"));
         assert!(load_workflow_source(&concise, None).is_err());
     }

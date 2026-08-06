@@ -8,18 +8,18 @@ use crate::{
     StructuredOutputOptions,
 };
 pub use bcode_workflow::{
-    AbortTaskOnDrop, AgentExecutionTarget, ArtifactReference, EdgeDefinition, EdgeKind, Field,
-    NodeDefinition, NodeKind, NodeRunState, ParallelFailurePolicy, Predicate, PredicateExpression,
+    AbortTaskOnDrop, ArtifactReference, EdgeDefinition, EdgeKind, Field, NodeDefinition, NodeKind,
+    NodeRunState, ParallelFailurePolicy, Predicate, PredicateExpression, PromptContextTarget,
     ResourceAccess, ResourceClaim, RetryPolicy, Step, StepContext, ValueSchema, Workflow,
     WorkflowApprovalResolver, WorkflowAuthoringDocument, WorkflowBuilder, WorkflowCancellation,
     WorkflowDefinition, WorkflowDefinitionIdentity, WorkflowError, WorkflowEvent,
     WorkflowEventReceiver, WorkflowEventSender, WorkflowGrantScope, WorkflowOutcome, WorkflowPlan,
     WorkflowPolicyGrant, WorkflowPolicyPreflight, WorkflowPolicyRequest, WorkflowRunObserver,
-    WorkflowRunSnapshot, WorkflowSourceDocument, WorkflowSourceFormat,
-    WorkflowSourceLoweringResult, WorkflowSourceMap, WorkflowSourceMapEntry, WorkflowSourceProfile,
-    WorkflowSourceStep, WorkflowSpec, WorkflowToolCapability, authorize_workflow_policy,
-    decode_workflow_authoring_source, fan_out, field, lower_workflow_authoring_source, parallel,
-    parallel_named_with_policy, preflight_workflow_policy, workflow_event_channel,
+    WorkflowRunSnapshot, WorkflowSourceFormat, WorkflowSourceLoweringResult, WorkflowSourceMap,
+    WorkflowSourceMapEntry, WorkflowSourceProfile, WorkflowSpec, WorkflowToolCapability,
+    authorize_workflow_policy, decode_workflow_authoring_source, fan_out, field,
+    lower_workflow_authoring_source, parallel, parallel_named_with_policy,
+    preflight_workflow_policy, workflow_event_channel,
 };
 use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
@@ -52,10 +52,10 @@ pub struct AgentStep<I, O> {
     prompt_mode: AgentPromptMode,
     strict: bool,
     max_repairs: u32,
-    agent_profile_configured: bool,
+    profile_configured: bool,
     tool_restriction: Option<Vec<String>>,
     read_only_tools: bool,
-    execution_target: AgentExecutionTarget,
+    execution_target: PromptContextTarget,
     resources: Vec<ResourceClaim>,
     timeout: Option<Duration>,
     _types: PhantomData<fn(I) -> O>,
@@ -68,7 +68,7 @@ impl<I, O> std::fmt::Debug for AgentStep<I, O> {
             .field("name", &self.name)
             .field("strict", &self.strict)
             .field("max_repairs", &self.max_repairs)
-            .field("agent_profile_configured", &self.agent_profile_configured)
+            .field("profile_configured", &self.profile_configured)
             .field("tool_restriction", &self.tool_restriction)
             .field("read_only_tools", &self.read_only_tools)
             .field("resources", &self.resources)
@@ -101,7 +101,7 @@ where
             name: name.into(),
             prompt: Arc::new(|input| {
                 serde_json::to_string_pretty(input)
-                    .expect("workflow agent input should serialize to JSON")
+                    .expect("workflow prompt input should serialize to JSON")
             }),
             agent: Agent::builder(),
             provider: Arc::new(move || Box::new(provider())),
@@ -112,23 +112,23 @@ where
             prompt_mode: AgentPromptMode::JsonInput,
             strict: true,
             max_repairs: 0,
-            agent_profile_configured: false,
+            profile_configured: false,
             tool_restriction: None,
             read_only_tools: false,
-            execution_target: AgentExecutionTarget::FreshIsolated,
+            execution_target: PromptContextTarget::FreshIsolated,
             resources: Vec::new(),
             timeout: None,
             _types: PhantomData,
         }
     }
 
-    /// Configure the Bcode agent profile used by this step.
+    /// Configure the Bcode prompt profile used by this step.
     #[must_use]
     pub fn agent_id(mut self, agent_id: impl Into<String>) -> Self {
         let agent_id = agent_id.into();
         self.agent = self.agent.agent_id(agent_id.clone());
         self.agent_id = Some(agent_id);
-        self.agent_profile_configured = true;
+        self.profile_configured = true;
         self
     }
 
@@ -172,7 +172,7 @@ where
 
     /// Restrict this step to an exact set of tool names.
     ///
-    /// This composes by intersection with the selected agent profile; it never enables tools that
+    /// This composes by intersection with the selected prompt profile; it never enables tools that
     /// the profile disabled.
     #[must_use]
     pub fn restrict_tools(mut self, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -197,7 +197,7 @@ where
     /// Execute this agent sequentially in the workflow run's parent session.
     #[must_use]
     pub const fn shared_parent_sequential(mut self) -> Self {
-        self.execution_target = AgentExecutionTarget::SharedParentSequential;
+        self.execution_target = PromptContextTarget::SharedParentSequential;
         self
     }
 
@@ -241,7 +241,7 @@ where
     /// # Errors
     ///
     /// Returns an error when the step requests mutating capability without an explicitly
-    /// configured agent profile or its compiled policy metadata is malformed.
+    /// configured prompt profile or its compiled policy metadata is malformed.
     pub fn policy_request(
         &self,
         initiating: WorkflowToolCapability,
@@ -249,10 +249,10 @@ where
         scope: WorkflowGrantScope,
         grant: Option<WorkflowPolicyGrant>,
     ) -> Result<WorkflowPolicyRequest, WorkflowError> {
-        if requested == WorkflowToolCapability::Mutating && !self.agent_profile_configured {
+        if requested == WorkflowToolCapability::Mutating && !self.profile_configured {
             return Err(WorkflowError::Build {
                 path: self.name.clone(),
-                message: "mutating workflow nodes require an explicitly configured agent profile"
+                message: "mutating workflow nodes require an explicitly configured prompt profile"
                     .to_string(),
             });
         }
@@ -283,7 +283,7 @@ where
         let model_id = self.model_id;
         let system_prompt = self.system_prompt;
         let prompt_mode = self.prompt_mode;
-        let agent_profile_configured = self.agent_profile_configured;
+        let profile_configured = self.profile_configured;
         let tool_restriction = self.tool_restriction;
         let read_only_tools = self.read_only_tools;
         let execution_target = self.execution_target;
@@ -301,7 +301,7 @@ where
         };
         let configuration = json!({
             "agent_id": agent_id,
-            "agent_profile_configured": agent_profile_configured,
+            "profile_configured": profile_configured,
             "provider_plugin_id": provider_plugin_id,
             "model_id": model_id,
             "system_prompt": system_prompt,

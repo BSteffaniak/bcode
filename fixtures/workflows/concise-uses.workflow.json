@@ -1,10 +1,11 @@
 {
-  "workflow_source_version": 1,
+  "workflow_source_version": 3,
   "workflow_id": "example/generic-uses",
   "title": "Generic uses",
   "steps": [
     {
-      "uses": "bcode.shell/shell.script@1",
+      "id": "generic_uses",
+      "uses": "bcode.shell/exec@1",
       "with": "printf 'generic uses\\n'"
     }
   ]

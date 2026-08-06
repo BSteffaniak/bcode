@@ -304,41 +304,6 @@ impl WorkflowTemplateDocumentSource {
     }
 }
 
-/// One generic configuration binding applied to an exact template definition before start.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowTemplateCompilationBinding {
-    /// Dotted path below the validated configuration value.
-    pub configuration_path: String,
-    /// Target agent node whose exact skill selection is replaced.
-    pub node_id: String,
-    /// Direct fallback edge compiled when the configured skill is absent/null.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub absent_fallback_edge: Option<bcode_workflow::EdgeDefinition>,
-    /// Activation mode assigned when the optional configured skill is present.
-    pub skill_mode: bcode_workflow::AgentSkillActivationMode,
-}
-
-impl WorkflowTemplateCompilationBinding {
-    fn validate(&self) -> Result<(), String> {
-        if self.configuration_path.trim().is_empty()
-            || self.configuration_path.len() > 512
-            || self.node_id.trim().is_empty()
-            || self.node_id.len() > 256
-            || self.configuration_path.split('.').any(|part| {
-                part.is_empty()
-                    || part.len() > 128
-                    || !part
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
-            })
-        {
-            return Err("template compilation binding identity or path is invalid".to_string());
-        }
-        Ok(())
-    }
-}
-
 /// One stable plugin-owned workflow template contribution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -357,9 +322,6 @@ pub struct WorkflowTemplateContribution {
     /// External templates derive this from their normalized authoring document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration_schema: Option<bcode_workflow::ValueSchema>,
-    /// Generic bounded bindings applied from validated configuration before exact identity is derived.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub compilation_bindings: Vec<WorkflowTemplateCompilationBinding>,
     /// Inline exact declarative compiled definition retained for version-1 compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<bcode_workflow::WorkflowDefinition>,
@@ -372,74 +334,12 @@ pub struct WorkflowTemplateContribution {
     /// Plugin IDs required by the compiled definition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_plugins: Vec<String>,
-    /// Skill IDs required by the compiled definition.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_skills: Vec<String>,
     /// Capability labels required from the production host.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_capabilities: Vec<String>,
     /// Renderer-neutral bounded presentation metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub presentation: BTreeMap<String, String>,
-}
-
-fn validate_template_compilation_bindings(
-    template: &WorkflowTemplateContribution,
-    definition: &bcode_workflow::WorkflowDefinition,
-) -> Result<(), String> {
-    if template.compilation_bindings.len() > 32 {
-        return Err("template compilation binding count exceeds 32".to_string());
-    }
-    let mut binding_targets = BTreeSet::new();
-    let mut fallback_edges = BTreeSet::new();
-    for binding in &template.compilation_bindings {
-        binding.validate()?;
-        if !binding_targets.insert((
-            binding.configuration_path.as_str(),
-            binding.node_id.as_str(),
-        )) {
-            return Err("template compilation bindings must be unique".to_string());
-        }
-        let Some(node) = definition.nodes.get(&binding.node_id) else {
-            return Err(format!(
-                "template compilation binding references missing node '{}'",
-                binding.node_id
-            ));
-        };
-        if node.kind != bcode_workflow::NodeKind::Agent {
-            return Err(format!(
-                "template compilation binding target '{}' is not an agent node",
-                binding.node_id
-            ));
-        }
-        let Some(edge) = &binding.absent_fallback_edge else {
-            continue;
-        };
-        if !fallback_edges.insert((edge.from.as_str(), edge.to.as_str())) {
-            return Err("template compilation fallback edges must be unique".to_string());
-        }
-        if edge.from == binding.node_id
-            || edge.to == binding.node_id
-            || !definition.nodes.contains_key(&edge.from)
-            || !definition.nodes.contains_key(&edge.to)
-            || edge.kind != bcode_workflow::EdgeKind::Direct
-        {
-            return Err(format!(
-                "template compilation fallback for '{}' must be a direct bypass edge between existing nodes",
-                binding.node_id
-            ));
-        }
-        if let Some(transform) = &edge.transform {
-            transform.validate().map_err(|error| error.to_string())?;
-            if transform.output != definition.nodes[&edge.to].input {
-                return Err(format!(
-                    "template compilation fallback output does not match target '{}' input",
-                    edge.to
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 impl WorkflowTemplateContribution {
@@ -535,7 +435,6 @@ impl WorkflowTemplateContribution {
                 ));
             }
         };
-        validate_template_compilation_bindings(self, definition).map_err(&invalid)?;
         let configuration_schema = match (
             self.configuration_schema.as_ref(),
             self.authoring_document.as_ref(),
@@ -557,7 +456,6 @@ impl WorkflowTemplateContribution {
             ));
         }
         validate_template_values("required_plugins", &self.required_plugins)?;
-        validate_template_values("required_skills", &self.required_skills)?;
         validate_template_values("required_capabilities", &self.required_capabilities)?;
         if self.presentation.len() > 64
             || self
@@ -4387,10 +4285,10 @@ fn classify_invocation(interface_id: &str, operation: &str) -> PluginInvocationC
             PluginInvocationClass::Query
         }
         ("bcode.model-provider/v1", _) => PluginInvocationClass::ModelProvider,
-        ("bcode.agent_profile", "policy_status" | "list_agents" | "agent_context") => {
+        ("bcode.profile", "policy_status" | "list_agents" | "agent_context") => {
             PluginInvocationClass::Control
         }
-        ("bcode.agent_profile", "evaluate_tool_call") => PluginInvocationClass::Control,
+        ("bcode.profile", "evaluate_tool_call") => PluginInvocationClass::Control,
         _ => PluginInvocationClass::Service,
     }
 }
@@ -5112,7 +5010,6 @@ pub fn resolve_external_workflow_templates(
             .map_err(|error| fail(format!("source authoring validation failed: {error}")))?;
         template.configuration_schema = None;
         template.required_plugins = document.requirements.plugins.iter().cloned().collect();
-        template.required_skills = document.requirements.skills.iter().cloned().collect();
         template.authoring_document = Some(document);
         template
             .validate()
@@ -5320,67 +5217,27 @@ mod tests {
             .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
             .expect("workflow block service");
         let blocks = &service.workflow_blocks;
-        assert_eq!(blocks.len(), 3);
-        for block in blocks {
-            block.validate().expect("valid workflow block");
-            assert!(matches!(
-                block.block_id.as_str(),
-                "shell.command-plan" | "shell.script"
-            ));
-            assert_eq!(block.plugin_id, manifest.id);
-            assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::Mutating);
-            assert!(block.authorization.explicit_grant_required);
-            assert_eq!(
-                block.reconciliation,
-                bcode_workflow::WorkflowBlockReconciliation::RepairRequired
-            );
-        }
+        assert_eq!(blocks.len(), 1);
+        let block = &blocks[0];
+        block.validate().expect("valid workflow block");
+        assert_eq!(block.block_id, "exec");
+        assert_eq!(block.operation, "exec");
+        assert_eq!(block.block_version, 1);
+        assert_eq!(block.plugin_id, manifest.id);
+        assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::Mutating);
+        assert!(block.authorization.explicit_grant_required);
+        assert!(block.preparation_required);
         assert_eq!(
-            blocks
-                .iter()
-                .filter(|block| block.block_id == "shell.command-plan")
-                .map(|block| block.block_version)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([1, 2])
+            block.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::RepairRequired
         );
-        assert_eq!(blocks[0].input.type_name, "bcode.shell.script/v1");
-        assert_eq!(blocks[1].input.type_name, "bcode.shell.command-plan/v1");
-        assert_eq!(blocks[2].input.type_name, "bcode.shell.command-plan/v2");
-        assert_eq!(
-            blocks[1].output.type_name,
-            "bcode.shell.command-plan-result/v1"
-        );
-        assert_eq!(
-            blocks[2].output.type_name,
-            "bcode.shell.command-plan-result/v2"
-        );
+        assert_eq!(block.input.type_name, "bcode.shell.exec/v1");
+        assert_eq!(block.output.type_name, "bcode.shell.exec-result/v1");
         assert_eq!(service.workflow_authoring_actions.len(), 1);
         assert_eq!(service.workflow_authoring_actions[0].catalog_key(), "run@1");
         assert_eq!(
             service.workflow_authoring_actions[0].target_block,
-            "bcode.shell/shell.script@1"
-        );
-    }
-
-    #[test]
-    fn code_review_manifest_declares_valid_workflow_block_contract() {
-        let manifest: PluginManifest = toml::from_str(include_str!(
-            "../../../plugins/code-review-plugin/bcode-plugin.toml"
-        ))
-        .expect("code review manifest");
-        let service = manifest
-            .services
-            .iter()
-            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
-            .expect("workflow block service");
-        assert_eq!(service.workflow_blocks.len(), 1);
-        let block = &service.workflow_blocks[0];
-        block.validate().expect("valid workflow block");
-        assert_eq!(block.plugin_id, manifest.id);
-        assert_eq!(block.operation, "review.bundle.get");
-        assert_eq!(
-            block.reconciliation,
-            bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay
+            "bcode.shell/exec@1"
         );
     }
 
@@ -8022,12 +7879,10 @@ library = "libexample_plugin.dylib"
             title: "Example".to_string(),
             description: "A declarative example workflow.".to_string(),
             configuration_schema: Some(definition.input.clone()),
-            compilation_bindings: Vec::new(),
             definition: Some(definition),
             document_source: None,
             authoring_document: None,
             required_plugins: Vec::new(),
-            required_skills: Vec::new(),
             required_capabilities: vec!["transforms/v1".to_string()],
             presentation: BTreeMap::from([("category".to_string(), "examples".to_string())]),
         }
@@ -8045,21 +7900,6 @@ library = "libexample_plugin.dylib"
                 .definition_id
                 .starts_with("bcode.example/example@1@")
         );
-
-        let mut binding = WorkflowTemplateCompilationBinding {
-            configuration_path: "commit_message_skill".to_string(),
-            node_id: "transform".to_string(),
-            skill_mode: bcode_workflow::AgentSkillActivationMode::Required,
-            absent_fallback_edge: None,
-        };
-        let mut non_agent = template.clone();
-        non_agent.compilation_bindings.push(binding.clone());
-        assert!(non_agent.validate().is_err());
-
-        binding.node_id = "missing".to_string();
-        let mut missing = template.clone();
-        missing.compilation_bindings.push(binding);
-        assert!(missing.validate().is_err());
 
         let mut changed = template;
         changed.definition.as_mut().expect("inline definition").name =

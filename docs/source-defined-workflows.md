@@ -1,26 +1,10 @@
 # Source-defined workflow authoring
 
-Bcode accepts three explicit source profiles through `bcode workflow author`:
+Bcode accepts one structurally explicit source profile through `bcode workflow author` and package operations. It uses `workflow_source_version: 3`, requires stable step IDs, and supports plugin-owned shorthand actions alongside explicit typed prior-step input/condition references, durable input/approval gates, bounded repeats, bounded retry and homogeneous fan-out declarations, fixed two-branch parallel joins, exact immutable workflow calls, and complete canonical prompt configurations. Prompt nodes lower to canonical `WorkflowPromptConfiguration` with exact input/output schemas, resources, tools, models, prompts, timeouts, and context targets. Skills, when useful, are requested in prompt text rather than selected by the workflow contract.
 
-* **Concise pipeline profile v1** uses `workflow_source_version: 1` and ordered `steps`. It remains fully compatible for ordinary source-controlled automation.
-* **Structured profile v2** uses `workflow_source_version: 2`, requires stable step IDs, and adds explicit typed prior-step input/condition references, durable input/approval gates, bounded repeats, bounded retry and homogeneous fan-out declarations, fixed two-branch parallel joins, exact immutable workflow calls, and complete canonical agent configurations over the same plugin-owned actions. Agents lower to canonical `WorkflowAgentConfiguration`, exact input/output schemas, resources, tools, skills, models, prompts, timeouts, and context targets. Input and approval declarations lower to canonical typed durable gate nodes with exact schemas and atomic resource claims. A repeat deterministically inserts `<step-id>__repeat`, redirects successors through that controller, and emits the existing bounded back edge; its maximum must not exceed the run cycle cap and its body boundary schemas must match. `fail` exhaustion preserves the body schema, while `emit_outcome` produces the exact versioned typed repeat-outcome boundary and requires every successor to accept that schema. A fixed parallel declaration names exactly two distinct prior dependency exits, derives a closed ordered two-member schema, and lowers to the existing canonical parallel join with explicit `wait_all` or `fail_fast` policy. Workflow calls accept only the existing versioned `WorkflowCallConfiguration`, resolve an exact immutable definition identity from the authoring catalog, and copy its typed boundaries; unavailable or identity-mismatched children fail closed. `input_from` references lower explicit field/index selectors to canonical `WorkflowTransform` values; selected conditions compose the same selector into canonical selector-based predicates. References may target only prior dependencies and traverse only unambiguous exact object/array schemas; unknown fields, union/combinator traversal, missing fields/indices, and schema mismatches fail closed. Retry declarations validate bounded attempts/backoff and only owner-safe failure classes. Homogeneous fan-out declarations validate exact array/member/result schemas, a leaf operation, member/concurrency bounds, and sibling failure policy. Both remain capability-gated until their durable scheduling is production-admitted. Unknown future structured constructs are rejected rather than approximated.
-* **Canonical profile** is the complete versioned `WorkflowAuthoringDocument`. Use it for uncommon graph, binding, retry, routing, agent, and presentation capabilities.
+Versions 1 and 2 are intentionally unsupported. They are rejected as old contracts rather than migrated, guessed, or interpreted as version 3. Canonical `WorkflowAuthoringDocument` input remains a separate explicit profile selected by `schema_version`; a source document must declare exactly one profile marker.
 
-Both profiles lower to one canonical `WorkflowAuthoringDocument`. Only that canonical document is persisted, published, and executed. Source paths and raw source text remain client-local.
-
-## Workflow packages
-
-A portable package manifest uses `version: 1`, one stable `package_id`, a bounded non-empty `exports` map, and at most 64 source members. Each member carries a package-local ID, a confined relative diagnostic name with an explicit JSON/YAML/TOML suffix, the matching source format, a bounded source payload, and explicit package-local dependencies. The transported name is never interpreted as a host path; clients must confine and read local files before constructing this contract.
-
-Validation rejects duplicate member IDs or source names, missing exports/dependencies, duplicate dependency entries, cycles, dependency depth beyond eight, excessive members/dependencies/aggregate bytes, path traversal or absolute names, malformed IDs, and unknown future versions. Package source remains an authoring/reproducibility input and is not canonical runtime state.
-
-A version-1 package lock/result records the validated package source digest and, for each deterministically ordered member, its source digest, exact content-derived definition identity, optional successful published revision, and bounded package-local dependency closure. Locks reject malformed/future/duplicate/inconsistent state and never authorize publication or execution. They may be generated or updated only from successful canonical daemon outcomes; their presence is not proof that canonical publication still exists or is valid.
-
-Pure package planning validates the manifest, topologically compiles children before parents, and rewrites `package_call: { member: ... }` only when the target is a declared direct dependency that has compiled successfully. The rewrite uses the exact content-derived canonical definition identity and then runs ordinary source-v2 lowering and recursive catalog preview. The result contains child-before-parent lowering facts plus a deterministic unsigned lock candidate; planning performs no persistence and publication remains a separate transaction.
-
-Portable IPC and client boundaries expose bounded package validation/planning as a daemon-owned computation with the existing deadline/cancellation control. The request transports the manifest and client-read source payloads, never trusted local paths; the response returns the pure typed plan.
-
-Version-1 apply and publish contracts carry exact plans/lock candidates plus optimistic per-member generations. Apply generation facts identify only existing members; omitted members must not already exist. Publication requires one exact generation for every locked member. Typed results distinguish applied, published, conflict, and rejected outcomes: success must contain complete identity-ordered canonical member facts and a matching lock, while conflict/rejection is forbidden from carrying partial mutation facts. These contracts define fail-closed transaction semantics but do not by themselves implement durable atomic storage.
+Input and approval declarations lower to canonical typed durable gate nodes with exact schemas and atomic resource claims. A repeat deterministically inserts `<step-id>__repeat`, redirects successors through that controller, and emits the bounded back edge; its maximum must not exceed the run cycle cap and its body boundary schemas must match. `fail` exhaustion preserves the body schema, while `emit_outcome` produces the exact versioned typed repeat-outcome boundary. Parallel declarations name exactly two distinct prior dependency exits and lower to canonical joins with explicit policy. Workflow calls target exact immutable identities. Selectors traverse only unambiguous exact schemas. Retry and fan-out declarations validate fully but remain capability-gated until their durable schedulers are production-admitted. Unknown future constructs are rejected rather than approximated.
 
 ## Formats
 
@@ -29,15 +13,17 @@ JSON, YAML, and TOML are equivalent adapters selected explicitly or by `.json`, 
 ## Concise shell steps
 
 ```yaml
-workflow_source_version: 1
+workflow_source_version: 3
 workflow_id: project/check
 title: Check
 steps:
-  - run: cargo fmt --check
-  - run: cargo test --workspace
+  - id: format
+    run: cargo fmt --check
+  - id: test
+    run: cargo test --workspace
 ```
 
-The shell plugin owns `run@1` and `shell.script@1`. On Unix the default interpreter argv is `sh -c`; on Windows it is `cmd /C`. Exit code `0` is accepted by default, timeout defaults to 300,000 ms, output preview defaults to 8,192 bytes with artifact spill enabled, and an unaccepted exit fails the node so later sequential steps do not run.
+Each step has a stable `id`. The shell plugin owns `run@1` and `exec@1`. On Unix the default interpreter argv is `sh -c`; on Windows it is `cmd /C`. Exit code `0` is accepted by default, timeout defaults to 300,000 ms, output preview defaults to 8,192 bytes with artifact spill enabled, and an unaccepted exit fails the node so later sequential steps do not run.
 
 Advanced form:
 

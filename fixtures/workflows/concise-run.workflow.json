@@ -1,9 +1,9 @@
 {
-  "workflow_source_version": 1,
+  "workflow_source_version": 3,
   "workflow_id": "example/concise-run",
   "title": "Concise run",
   "steps": [
-    { "run": "printf 'first\\n'" },
+    { "id": "first", "run": "printf 'first\\n'" },
     { "id": "second", "run": "printf 'second\\n'" }
   ]
 }

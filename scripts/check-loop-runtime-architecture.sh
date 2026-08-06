@@ -6,6 +6,17 @@ cd "$root"
 
 violations=0
 
+if ! rg -q 'AutomaticRetryFailureKind::AmbiguousMutation' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'schedule_automatic_retry_from_observation' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'schedule_automatic_retry_for_failed_attempt' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'consume_next_due_automatic_retry_for_run' packages/server/src/lib.rs \
+  || ! rg -q 'consume_due_automatic_retry' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'due_automatic_retry_consumption_is_atomic_and_cancellation_safe' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'automatic_retry_backoff_schedule_survives_restart_without_requeueing' packages/workflow-store/src/lib.rs; then
+  echo "Runtime architecture violation: durable retry safety no longer proves ambiguous mutations are excluded." >&2
+  violations=1
+fi
+
 if rg -n -i 'bcode\.shell|shell[_ .-]?recording|terminal[_ .-]?pty|pty[_ .-]?stream' packages/tui/src/artifact_stream.rs >/tmp/bcode-artifact-stream-domain-leak.txt; then
   echo "Runtime architecture violation: generic TUI artifact transport contains shell-domain knowledge." >&2
   cat /tmp/bcode-artifact-stream-domain-leak.txt >&2
@@ -542,7 +553,7 @@ if rg -n 'loop_role|bcode\.loop' packages/server/src/lib.rs \
 fi
 rm -f /tmp/bcode-loop-workflow-host-special-case.txt
 
-if ! grep -F 'AgentExecutionTarget::SharedParentSequential' plugins/loop-plugin/src/lib.rs >/dev/null \
+if ! grep -F 'PromptContextTarget::SharedParentSequential' plugins/loop-plugin/src/lib.rs >/dev/null \
   || ! grep -F 'admit_shared_execution_session' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: durable loop lost generic shared-parent execution." >&2
   violations=1

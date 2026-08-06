@@ -523,6 +523,7 @@ mod tests {
                     "profile": "openai",
                     "policy": "required",
                 }),
+                preparation: None,
             })
             .expect("request"),
         });
