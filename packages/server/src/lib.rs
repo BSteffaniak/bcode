@@ -16041,20 +16041,21 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         .to_path_buf();
     loop {
         let iteration_started_at = std::time::Instant::now();
+        let now_ms = current_unix_millis();
+        if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+            .expire_run_deadline(run_id, now_ms)?
+        {
+            break;
+        }
         let settled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .settle_pending_control_nodes(run_id, 1_000, current_unix_millis())?;
+            .settle_pending_control_nodes(run_id, 1_000, now_ms)?;
         let owner = WorkflowActivationOwner { state };
         let dispatched = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .dispatch_pending_activations_for_run(&owner, run_id, 1_000, current_unix_millis())
+            .dispatch_pending_activations_for_run(&owner, run_id, 1_000, now_ms)
             .await?;
         let observer = WorkflowTurnReceiptObserver { state };
         let reconciled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .reconcile_receipt_backed_attempts_for_run_async(
-                &observer,
-                run_id,
-                1_000,
-                current_unix_millis(),
-            )
+            .reconcile_receipt_backed_attempts_for_run_async(&observer, run_id, 1_000, now_ms)
             .await?;
         if !reconciled.sibling_cancellations.is_empty() {
             propagate_fail_fast_sibling_cancellation(
@@ -16064,7 +16065,7 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
             .await?;
         }
         let retried = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .consume_next_due_automatic_retry_for_run(run_id, current_unix_millis())?;
+            .consume_next_due_automatic_retry_for_run(run_id, now_ms)?;
         if !dispatched.unsupported.is_empty() {
             tracing::debug!(
                 run_id,
@@ -29023,6 +29024,22 @@ async fn dispatch_workflow_child(
             WorkflowStoreError::InvalidData("parent workflow limits are missing".to_string())
         })?
     };
+    let child_limits = child_limits.map_or_else(
+        || parent_limits.clone(),
+        |child| bcode_workflow_store::WorkflowRunLimits {
+            deadline_at_ms: match (parent_limits.deadline_at_ms, child.deadline_at_ms) {
+                (Some(parent), Some(child)) => Some(parent.min(child)),
+                (Some(parent), None) => Some(parent),
+                (None, child) => child,
+            },
+            node_execution_cap: parent_limits
+                .node_execution_cap
+                .min(child.node_execution_cap),
+            concurrency_cap: parent_limits.concurrency_cap.min(child.concurrency_cap),
+            cycle_cap: parent_limits.cycle_cap.min(child.cycle_cap),
+            retry_cap: parent_limits.retry_cap.min(child.retry_cap),
+        },
+    );
     let child = bcode_workflow_store::NewChildWorkflowRun {
         link: bcode_workflow_store::WorkflowRunLink {
             version: bcode_workflow_store::WORKFLOW_RUN_LINK_VERSION,
@@ -29048,7 +29065,7 @@ async fn dispatch_workflow_child(
             input: request.activation.input.clone(),
             created_at_ms: now,
             authorization_ceiling: parent.authorization_ceiling,
-            limits: child_limits.unwrap_or(parent_limits),
+            limits: child_limits,
         },
     };
     state
@@ -29724,6 +29741,9 @@ async fn dispatch_workflow_prompt_turn(
     let (target_session_id, shared_permit) = match execution_target {
         bcode_workflow::PromptContextTarget::FreshIsolated
         | bcode_workflow::PromptContextTarget::FixedGenerationFork => {
+            // Recovery keys include the complete run/node/activation/attempt tuple. Repeat
+            // generations, retry attempts, fan-out members, and child runs therefore cannot share
+            // isolated context accidentally, while exact duplicate delivery recovers one session.
             let child = if let Some(existing) = workflow_child_session_for_activation(
                 state,
                 &request.activation.run_id,

@@ -3752,6 +3752,54 @@ impl WorkflowStore {
                 "workflow child parent attempt is not durably prepared".to_string(),
             ));
         }
+        let parent_limits: WorkflowRunLimits = transaction.query_row(
+            "SELECT deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap \
+             FROM workflow_runs WHERE run_id = ?1",
+            [&request.link.parent_run_id],
+            |row| {
+                Ok(WorkflowRunLimits {
+                    deadline_at_ms: row.get(0)?,
+                    node_execution_cap: row.get(1)?,
+                    concurrency_cap: row.get(2)?,
+                    cycle_cap: row.get(3)?,
+                    retry_cap: row.get(4)?,
+                })
+            },
+        )?;
+        let deadline_exceeds = match (
+            request.run.limits.deadline_at_ms,
+            parent_limits.deadline_at_ms,
+        ) {
+            (None, Some(_)) => true,
+            (Some(child), Some(parent)) => child > parent,
+            _ => false,
+        };
+        if deadline_exceeds
+            || request.run.limits.node_execution_cap > parent_limits.node_execution_cap
+            || request.run.limits.concurrency_cap > parent_limits.concurrency_cap
+            || request.run.limits.cycle_cap > parent_limits.cycle_cap
+            || request.run.limits.retry_cap > parent_limits.retry_cap
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child execution limits exceed the inherited parent limits".to_string(),
+            ));
+        }
+        let root_execution_count: u32 = transaction.query_row(
+            "SELECT COALESCE(SUM(run_attempts.attempt_count), 0) FROM (\
+               SELECT run.run_id, COUNT(attempt.dispatch_identity) AS attempt_count \
+               FROM workflow_runs run \
+               LEFT JOIN workflow_attempts attempt ON attempt.run_id = run.run_id \
+               WHERE run.run_id = ?1 OR run.run_id IN (SELECT child_run_id \
+                 FROM workflow_run_links WHERE root_run_id = ?1) GROUP BY run.run_id\
+             ) run_attempts",
+            [&request.link.root_run_id],
+            |row| row.get(0),
+        )?;
+        if root_execution_count >= parent_limits.node_execution_cap {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow root node-execution cap reached before child admission".to_string(),
+            ));
+        }
         let descendant_count: u32 = transaction.query_row(
             "SELECT COUNT(*) FROM workflow_run_links WHERE root_run_id = ?1",
             [&request.link.root_run_id],
@@ -5512,7 +5560,15 @@ impl WorkflowStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let activation =
-            pending_activation_by_identity(&transaction, run_id, node_id, activation_id)?;
+            match pending_activation_by_identity(&transaction, run_id, node_id, activation_id)? {
+                Some(activation) => Some(activation),
+                None => pending_fan_out_member_by_identity(
+                    &transaction,
+                    run_id,
+                    node_id,
+                    activation_id,
+                )?,
+            };
         let Some(activation) = activation else {
             return Ok(None);
         };
@@ -5537,6 +5593,11 @@ impl WorkflowStore {
         let changed = transaction.execute(
             "UPDATE workflow_activations SET status = 'running' \
              WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
+            (run_id, node_id, activation_id),
+        )? + transaction.execute(
+            "UPDATE workflow_fan_out_members SET status = 'running' \
+             WHERE run_id = ?1 AND member_node_id = ?2 AND member_activation_id = ?3 \
+               AND status = 'pending'",
             (run_id, node_id, activation_id),
         )?;
         if changed != 1 {
@@ -7080,6 +7141,7 @@ impl WorkflowStore {
                         | bcode_workflow::NodeKind::Repeat
                         | bcode_workflow::NodeKind::Retry
                         | bcode_workflow::NodeKind::Parallel
+                        | bcode_workflow::NodeKind::FanOut
                 )
             })
         {
@@ -7089,6 +7151,12 @@ impl WorkflowStore {
                     activation.node_id
                 ))
             })?;
+            if activation.node.kind == bcode_workflow::NodeKind::FanOut {
+                let result = self.settle_fan_out_node(&activation, &input, settled_at_ms)?;
+                summary.settled.push(activation.activation_id);
+                summary.activated.extend(result);
+                continue;
+            }
             if activation.node.kind == bcode_workflow::NodeKind::Repeat {
                 let result = self.settle_repeat_node(&activation, &input, settled_at_ms)?;
                 summary.settled.push(activation.activation_id);
@@ -7111,6 +7179,157 @@ impl WorkflowStore {
             summary.activated.extend(result.activated);
         }
         Ok(summary)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn settle_fan_out_node(
+        &mut self,
+        activation: &PendingActivation,
+        input: &serde_json::Value,
+        settled_at_ms: u64,
+    ) -> Result<Vec<NewActivation>, WorkflowStoreError> {
+        let configuration: bcode_workflow::WorkflowFanOutConfiguration =
+            serde_json::from_value(activation.node.configuration.clone())?;
+        configuration
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let members = input.as_array().ok_or_else(|| {
+            WorkflowStoreError::InvalidData("fan-out activation input must be an array".to_string())
+        })?;
+        if members.len() > usize::try_from(configuration.max_members).unwrap_or(usize::MAX) {
+            return Err(WorkflowStoreError::InvalidData(
+                "fan-out member count exceeds the configured bound".to_string(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: u32 = transaction.query_row(
+            "SELECT COUNT(*) FROM workflow_fan_out_members WHERE run_id = ?1 \
+             AND controller_activation_id = ?2",
+            (&activation.run_id, &activation.activation_id),
+            |row| row.get(0),
+        )?;
+        if existing > 0 && existing != u32::try_from(members.len()).unwrap_or(u32::MAX) {
+            return Err(WorkflowStoreError::InvalidData(
+                "persisted fan-out member inventory conflicts with controller input".to_string(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE workflow_activations SET status = 'running' \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
+            (
+                &activation.run_id,
+                &activation.node_id,
+                &activation.activation_id,
+            ),
+        )?;
+        if changed != 1 && existing == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "fan-out controller is not pending for first materialization".to_string(),
+            ));
+        }
+        let mut activated = Vec::new();
+        for (index, value) in members.iter().enumerate() {
+            let index = u32::try_from(index).map_err(|error| {
+                WorkflowStoreError::InvalidData(format!("fan-out member index overflow: {error}"))
+            })?;
+            let member_node_id = fan_out_member_node_id(&activation.node_id, index);
+            let member_activation_id = fan_out_member_activation_identity(
+                &activation.run_id,
+                &activation.activation_id,
+                index,
+            );
+            let input_json = bounded_json("fan-out member input", value)?;
+            let member_status = if index < configuration.max_concurrency {
+                "pending"
+            } else {
+                "waiting"
+            };
+            let inserted = transaction.execute(
+                "INSERT INTO workflow_fan_out_members \
+                 (run_id, controller_node_id, controller_activation_id, member_index, \
+                  member_node_id, member_activation_id, status, input_json, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(run_id, controller_activation_id, member_index) DO NOTHING",
+                (
+                    &activation.run_id,
+                    &activation.node_id,
+                    &activation.activation_id,
+                    index,
+                    &member_node_id,
+                    &member_activation_id,
+                    member_status,
+                    &input_json,
+                    settled_at_ms,
+                ),
+            )?;
+            transaction.execute(
+                "INSERT INTO workflow_activations \
+                 (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(run_id, node_id, activation_id) DO NOTHING",
+                (
+                    &activation.run_id,
+                    &member_node_id,
+                    &member_activation_id,
+                    u64::from(index),
+                    &input_json,
+                    member_status,
+                    settled_at_ms,
+                ),
+            )?;
+            if inserted == 1 {
+                append_event(
+                    &transaction,
+                    &activation.run_id,
+                    "fan_out_member_created",
+                    &serde_json::json!({
+                        "controller_activation_id": activation.activation_id,
+                        "member_index": index,
+                        "member_activation_id": member_activation_id,
+                    })
+                    .to_string(),
+                    settled_at_ms,
+                )?;
+            } else {
+                let stored: (String, String) = transaction.query_row(
+                    "SELECT member_activation_id, input_json FROM workflow_fan_out_members \
+                     WHERE run_id = ?1 AND controller_activation_id = ?2 AND member_index = ?3",
+                    (&activation.run_id, &activation.activation_id, index),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if stored != (member_activation_id.clone(), input_json.clone()) {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "fan-out duplicate member identity or input conflicts".to_string(),
+                    ));
+                }
+            }
+            if member_status == "pending" {
+                activated.push(NewActivation {
+                    run_id: activation.run_id.clone(),
+                    node_id: member_node_id,
+                    activation_id: member_activation_id,
+                    dependency_generation: u64::from(index),
+                    input: Some(value.clone()),
+                    created_at_ms: settled_at_ms,
+                });
+            }
+        }
+        append_event(
+            &transaction,
+            &activation.run_id,
+            "fan_out_materialized",
+            &serde_json::json!({
+                "controller_activation_id": activation.activation_id,
+                "member_count": members.len(),
+                "max_concurrency": configuration.max_concurrency,
+            })
+            .to_string(),
+            settled_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(activated)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7391,6 +7610,11 @@ impl WorkflowStore {
             (run_id, requested_at_ms),
         )?;
         if changed == 1 {
+            transaction.execute(
+                "UPDATE workflow_fan_out_members SET status = 'cancelled', terminal_at_ms = ?2 \
+                 WHERE run_id = ?1 AND status IN ('pending', 'waiting')",
+                (run_id, requested_at_ms),
+            )?;
             let cancelled_approvals = transaction.execute(
                 "UPDATE workflow_mutation_approvals SET status = 'cancelled', resolved_at_ms = ?2 \
                  WHERE run_id = ?1 AND status = 'pending'",
@@ -7904,6 +8128,27 @@ impl WorkflowStore {
         run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<PendingActivation>, WorkflowStoreError> {
+        let mut activations = self.pending_standard_activations_matching(run_id, limit)?;
+        let remaining = limit.saturating_sub(i64::try_from(activations.len()).unwrap_or(limit));
+        if remaining > 0 {
+            activations.extend(self.pending_fan_out_members_matching(run_id, remaining)?);
+        }
+        activations.sort_by(|left, right| {
+            (&left.created_at_ms, &left.run_id, &left.node_id).cmp(&(
+                &right.created_at_ms,
+                &right.run_id,
+                &right.node_id,
+            ))
+        });
+        activations.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(activations)
+    }
+
+    fn pending_standard_activations_matching(
+        &self,
+        run_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<PendingActivation>, WorkflowStoreError> {
         let sql = "SELECT activation.run_id, activation.node_id, activation.activation_id, \
              activation.dependency_generation, activation.input_json, activation.created_at_ms, \
              definition.definition_json \
@@ -7913,6 +8158,9 @@ impl WorkflowStore {
                AND definition.version = run.definition_version \
              WHERE activation.status = 'pending' AND run.status = 'running' \
                AND run.cancellation_requested_at_ms IS NULL \
+               AND NOT EXISTS(SELECT 1 FROM workflow_fan_out_members member \
+                 WHERE member.run_id = activation.run_id \
+                   AND member.member_activation_id = activation.activation_id) \
                AND (?1 = '' OR activation.run_id = ?1) \
              ORDER BY activation.created_at_ms, activation.run_id, activation.node_id LIMIT ?2";
         let mut statement = self.connection.prepare(sql)?;
@@ -7953,6 +8201,71 @@ impl WorkflowStore {
                     input: input_json
                         .map(|json| serde_json::from_str(&json))
                         .transpose()?,
+                    node,
+                    created_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    fn pending_fan_out_members_matching(
+        &self,
+        run_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<PendingActivation>, WorkflowStoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT member.run_id, member.controller_node_id, member.member_node_id, \
+             member.member_activation_id, member.member_index, member.input_json, \
+             member.created_at_ms, definition.definition_json \
+             FROM workflow_fan_out_members member \
+             JOIN workflow_runs run ON run.run_id = member.run_id \
+             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+               AND definition.version = run.definition_version \
+             WHERE member.status = 'pending' AND run.status = 'running' \
+               AND run.cancellation_requested_at_ms IS NULL AND (?1 = '' OR member.run_id = ?1) \
+             ORDER BY member.created_at_ms, member.run_id, member.controller_activation_id, \
+               member.member_index LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id.unwrap_or(""), limit), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u32>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .map(|row| {
+                let (
+                    run_id,
+                    controller_node_id,
+                    node_id,
+                    activation_id,
+                    index,
+                    input_json,
+                    created_at_ms,
+                    definition_json,
+                ) = row?;
+                let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+                let controller = definition.node(&controller_node_id).ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "fan-out controller node is missing".to_string(),
+                    )
+                })?;
+                let configuration: bcode_workflow::WorkflowFanOutConfiguration =
+                    serde_json::from_value(controller.configuration.clone())?;
+                let mut node = *configuration.member_node;
+                node.id.clone_from(&node_id);
+                Ok(PendingActivation {
+                    run_id,
+                    node_id,
+                    activation_id,
+                    dependency_generation: u64::from(index),
+                    input: Some(serde_json::from_str(&input_json)?),
                     node,
                     created_at_ms,
                 })
@@ -8014,6 +8327,71 @@ impl WorkflowStore {
             .optional()?
             .map(parse_run_summary)
             .transpose()
+    }
+
+    /// Fail one running workflow whose durable wall-clock deadline has elapsed.
+    ///
+    /// Active external attempts are not rewritten: the caller must cancel them through the normal
+    /// end-to-end owner cancellation path. This transition applies only when no active attempt can
+    /// still report an authoritative outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, missing/corrupt run state, or database failure.
+    pub fn expire_run_deadline(
+        &mut self,
+        run_id: &str,
+        now_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let transaction = self.connection.transaction()?;
+        let (status, deadline): (String, Option<u64>) = transaction
+            .query_row(
+                "SELECT status, deadline_at_ms FROM workflow_runs WHERE run_id = ?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| WorkflowStoreError::RunNotFound {
+                run_id: run_id.to_string(),
+            })?;
+        if parse_run_status(&status)? != RunStatus::Running
+            || deadline.is_none_or(|deadline| now_ms < deadline)
+        {
+            return Ok(false);
+        }
+        let active_attempt: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id = ?1 \
+             AND status IN ('prepared', 'admitted', 'running', 'cancelling', 'sibling_cancelling'))",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if active_attempt {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+             WHERE run_id = ?1 AND status = 'running'",
+            (run_id, now_ms),
+        )?;
+        if changed == 1 {
+            transaction.execute(
+                "UPDATE workflow_activations SET status = 'failed' WHERE run_id = ?1 \
+                 AND status IN ('pending', 'running', 'waiting_input', 'waiting_approval', \
+                   'waiting_mutation_approval') AND output_id IS NULL",
+                [run_id],
+            )?;
+            append_event(
+                &transaction,
+                run_id,
+                "run_deadline_elapsed",
+                &serde_json::json!({"deadline_at_ms": deadline, "observed_at_ms": now_ms})
+                    .to_string(),
+                now_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
     }
 
     /// Return bounded run IDs whose pending activations or due retries are safe to continue after
@@ -9468,12 +9846,28 @@ fn apply_attempt_observation(
         }
         AttemptObservation::Succeeded { output } => {
             validate_observed_output(request, &output)?;
-            persist_validated_output_transaction(transaction, &output)?;
+            if fan_out_member_controller(transaction, request)?.is_some() {
+                settle_fan_out_member_success(transaction, request, &output, reconciled_at_ms)?;
+            } else {
+                persist_validated_output_transaction(transaction, &output)?;
+            }
             transition_attempt(transaction, request, "succeeded", Some(reconciled_at_ms))?;
             summary.succeeded.push(request.dispatch_identity.clone());
         }
         AttemptObservation::RetryableFailure { message }
         | AttemptObservation::Failed { message } => {
+            if fan_out_member_controller(transaction, request)?.is_some() {
+                let sibling_cancellations = settle_fan_out_member_failure(
+                    transaction,
+                    request,
+                    &message,
+                    reconciled_at_ms,
+                )?;
+                transition_attempt(transaction, request, "failed", Some(reconciled_at_ms))?;
+                summary.sibling_cancellations.extend(sibling_cancellations);
+                summary.failed.push(request.dispatch_identity.clone());
+                return Ok(());
+            }
             transition_attempt(transaction, request, "failed", Some(reconciled_at_ms))?;
             let activation_changed = transaction.execute(
                 "UPDATE workflow_activations SET status = 'failed' \
@@ -9644,6 +10038,314 @@ fn apply_paused_attempt_observation(
     Ok(())
 }
 
+fn fan_out_member_controller(
+    transaction: &Transaction<'_>,
+    request: &AttemptReconciliationRequest,
+) -> Result<Option<(String, String, u32)>, WorkflowStoreError> {
+    transaction
+        .query_row(
+            "SELECT controller_node_id, controller_activation_id, member_index \
+             FROM workflow_fan_out_members WHERE run_id = ?1 AND member_node_id = ?2 \
+               AND member_activation_id = ?3",
+            (&request.run_id, &request.node_id, &request.activation_id),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(WorkflowStoreError::from)
+}
+
+#[allow(clippy::too_many_lines)]
+fn settle_fan_out_member_failure(
+    transaction: &Transaction<'_>,
+    request: &AttemptReconciliationRequest,
+    message: &str,
+    settled_at_ms: u64,
+) -> Result<Vec<ActiveAttemptCancellation>, WorkflowStoreError> {
+    let (controller_node_id, controller_activation_id, member_index) =
+        fan_out_member_controller(transaction, request)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("fan-out member controller is missing".to_string())
+        })?;
+    let definition_json: String = transaction.query_row(
+        "SELECT definition.definition_json FROM workflow_runs run \
+         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+           AND definition.version = run.definition_version WHERE run.run_id = ?1",
+        [&request.run_id],
+        |row| row.get(0),
+    )?;
+    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+    let controller = definition.node(&controller_node_id).ok_or_else(|| {
+        WorkflowStoreError::InvalidData("fan-out controller node is missing".to_string())
+    })?;
+    let configuration: bcode_workflow::WorkflowFanOutConfiguration =
+        serde_json::from_value(controller.configuration.clone())?;
+    transaction.execute(
+        "UPDATE workflow_fan_out_members SET status = 'failed', terminal_at_ms = ?4 \
+         WHERE run_id = ?1 AND member_node_id = ?2 AND member_activation_id = ?3 \
+           AND status = 'running'",
+        (
+            &request.run_id,
+            &request.node_id,
+            &request.activation_id,
+            settled_at_ms,
+        ),
+    )?;
+    transaction.execute(
+        "UPDATE workflow_activations SET status = 'failed' WHERE run_id = ?1 \
+         AND node_id = ?2 AND activation_id = ?3 AND status = 'running'",
+        (&request.run_id, &request.node_id, &request.activation_id),
+    )?;
+    let mut sibling_cancellations = Vec::new();
+    if configuration.failure_policy == bcode_workflow::ParallelFailurePolicy::FailFast {
+        let mut statement = transaction.prepare(
+            "SELECT attempt.run_id, attempt.node_id, attempt.activation_id, attempt.attempt, \
+             attempt.dispatch_identity, attempt.receipt_json \
+             FROM workflow_attempts attempt JOIN workflow_fan_out_members member \
+               ON member.run_id = attempt.run_id \
+              AND member.member_activation_id = attempt.activation_id \
+             WHERE member.controller_activation_id = ?1 \
+               AND attempt.dispatch_identity != ?2 \
+               AND attempt.status IN ('prepared', 'admitted', 'running') \
+             ORDER BY member.member_index",
+        )?;
+        sibling_cancellations = statement
+            .query_map(
+                (&controller_activation_id, &request.dispatch_identity),
+                active_attempt_cancellation_row,
+            )?
+            .map(|row| active_attempt_cancellation(row?))
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        transaction.execute(
+            "UPDATE workflow_attempts SET status = 'sibling_cancelling' \
+             WHERE run_id = ?1 AND activation_id IN (SELECT member_activation_id \
+               FROM workflow_fan_out_members WHERE controller_activation_id = ?2) \
+               AND dispatch_identity != ?3 AND status IN ('prepared', 'admitted', 'running')",
+            (
+                &request.run_id,
+                &controller_activation_id,
+                &request.dispatch_identity,
+            ),
+        )?;
+        transaction.execute(
+            "UPDATE workflow_fan_out_members SET status = 'cancelled', terminal_at_ms = ?3 \
+             WHERE run_id = ?1 AND controller_activation_id = ?2 \
+               AND status IN ('pending', 'waiting')",
+            (&request.run_id, &controller_activation_id, settled_at_ms),
+        )?;
+        transaction.execute(
+            "UPDATE workflow_activations SET status = 'cancelled' WHERE run_id = ?1 \
+             AND activation_id IN (SELECT member_activation_id FROM workflow_fan_out_members \
+               WHERE run_id = ?1 AND controller_activation_id = ?2 AND status = 'cancelled') \
+             AND status IN ('pending', 'waiting')",
+            (&request.run_id, &controller_activation_id),
+        )?;
+    }
+    if configuration.failure_policy == bcode_workflow::ParallelFailurePolicy::WaitAll {
+        let active: u32 = transaction.query_row(
+            "SELECT COUNT(*) FROM workflow_fan_out_members WHERE run_id = ?1 \
+             AND controller_activation_id = ?2 AND status IN ('pending', 'running')",
+            (&request.run_id, &controller_activation_id),
+            |row| row.get(0),
+        )?;
+        if active < configuration.max_concurrency {
+            transaction.execute(
+                "UPDATE workflow_fan_out_members SET status = 'pending' WHERE rowid IN (\
+                 SELECT rowid FROM workflow_fan_out_members WHERE run_id = ?1 \
+                   AND controller_activation_id = ?2 AND status = 'waiting' \
+                 ORDER BY member_index LIMIT ?3)",
+                (
+                    &request.run_id,
+                    &controller_activation_id,
+                    configuration.max_concurrency - active,
+                ),
+            )?;
+            transaction.execute(
+                "UPDATE workflow_activations SET status = 'pending' WHERE run_id = ?1 \
+                 AND activation_id IN (SELECT member_activation_id FROM workflow_fan_out_members \
+                   WHERE run_id = ?1 AND controller_activation_id = ?2 AND status = 'pending') \
+                 AND status = 'waiting'",
+                (&request.run_id, &controller_activation_id),
+            )?;
+        }
+        let active_or_waiting: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1 \
+             AND controller_activation_id = ?2 AND status IN ('pending', 'running', 'waiting'))",
+            (&request.run_id, &controller_activation_id),
+            |row| row.get(0),
+        )?;
+        if active_or_waiting {
+            append_event(
+                transaction,
+                &request.run_id,
+                "fan_out_member_failed",
+                &serde_json::json!({
+                    "controller_activation_id": controller_activation_id,
+                    "member_index": member_index,
+                    "member_activation_id": request.activation_id,
+                    "message": message,
+                })
+                .to_string(),
+                settled_at_ms,
+            )?;
+            return Ok(Vec::new());
+        }
+    }
+    transaction.execute(
+        "UPDATE workflow_activations SET status = 'failed' WHERE run_id = ?1 \
+         AND node_id = ?2 AND activation_id = ?3 AND status = 'running'",
+        (
+            &request.run_id,
+            &controller_node_id,
+            &controller_activation_id,
+        ),
+    )?;
+    transaction.execute(
+        "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+         WHERE run_id = ?1 AND status = 'running'",
+        (&request.run_id, settled_at_ms),
+    )?;
+    append_event(
+        transaction,
+        &request.run_id,
+        "fan_out_member_failed",
+        &serde_json::json!({
+            "controller_activation_id": controller_activation_id,
+            "member_index": member_index,
+            "member_activation_id": request.activation_id,
+            "message": message,
+        })
+        .to_string(),
+        settled_at_ms,
+    )?;
+    Ok(sibling_cancellations)
+}
+
+#[allow(clippy::too_many_lines)]
+fn settle_fan_out_member_success(
+    transaction: &Transaction<'_>,
+    request: &AttemptReconciliationRequest,
+    output: &ValidatedOutput,
+    settled_at_ms: u64,
+) -> Result<(), WorkflowStoreError> {
+    let (controller_node_id, controller_activation_id, member_index) =
+        fan_out_member_controller(transaction, request)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("fan-out member controller is missing".to_string())
+        })?;
+    let output_json = bounded_json("fan-out member output", &output.value)?;
+    let changed = transaction.execute(
+        "UPDATE workflow_fan_out_members SET status = 'completed', output_json = ?4, \
+         terminal_at_ms = ?5 WHERE run_id = ?1 AND member_node_id = ?2 \
+           AND member_activation_id = ?3 AND status = 'running'",
+        (
+            &request.run_id,
+            &request.node_id,
+            &request.activation_id,
+            &output_json,
+            settled_at_ms,
+        ),
+    )?;
+    if changed != 1 {
+        return Err(WorkflowStoreError::InvalidData(
+            "fan-out member is not running or already settled".to_string(),
+        ));
+    }
+    transaction.execute(
+        "UPDATE workflow_activations SET status = 'completed' WHERE run_id = ?1 \
+         AND node_id = ?2 AND activation_id = ?3 AND status = 'running'",
+        (&request.run_id, &request.node_id, &request.activation_id),
+    )?;
+    append_event(
+        transaction,
+        &request.run_id,
+        "fan_out_member_completed",
+        &serde_json::json!({
+            "controller_activation_id": controller_activation_id,
+            "member_index": member_index,
+            "member_activation_id": request.activation_id,
+        })
+        .to_string(),
+        settled_at_ms,
+    )?;
+    let definition_json: String = transaction.query_row(
+        "SELECT definition.definition_json FROM workflow_runs run \
+         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+           AND definition.version = run.definition_version WHERE run.run_id = ?1",
+        [&request.run_id],
+        |row| row.get(0),
+    )?;
+    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+    let controller = definition.node(&controller_node_id).ok_or_else(|| {
+        WorkflowStoreError::InvalidData("fan-out controller node is missing".to_string())
+    })?;
+    let configuration: bcode_workflow::WorkflowFanOutConfiguration =
+        serde_json::from_value(controller.configuration.clone())?;
+    let running: u32 = transaction.query_row(
+        "SELECT COUNT(*) FROM workflow_fan_out_members WHERE run_id = ?1 \
+         AND controller_activation_id = ?2 AND status IN ('pending', 'running')",
+        (&request.run_id, &controller_activation_id),
+        |row| row.get(0),
+    )?;
+    if running < configuration.max_concurrency {
+        transaction.execute(
+            "UPDATE workflow_fan_out_members SET status = 'pending' WHERE rowid IN (\
+             SELECT rowid FROM workflow_fan_out_members WHERE run_id = ?1 \
+               AND controller_activation_id = ?2 AND status = 'waiting' \
+             ORDER BY member_index LIMIT ?3)",
+            (
+                &request.run_id,
+                &controller_activation_id,
+                configuration.max_concurrency - running,
+            ),
+        )?;
+        transaction.execute(
+            "UPDATE workflow_activations SET status = 'pending' WHERE run_id = ?1 \
+             AND activation_id IN (SELECT member_activation_id FROM workflow_fan_out_members \
+               WHERE run_id = ?1 AND controller_activation_id = ?2 AND status = 'pending') \
+             AND status = 'waiting'",
+            (&request.run_id, &controller_activation_id),
+        )?;
+    }
+    let incomplete: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1 \
+         AND controller_activation_id = ?2 AND status != 'completed')",
+        (&request.run_id, &controller_activation_id),
+        |row| row.get(0),
+    )?;
+    if incomplete {
+        return Ok(());
+    }
+    let mut statement = transaction.prepare(
+        "SELECT member_index, output_json FROM workflow_fan_out_members WHERE run_id = ?1 \
+         AND controller_activation_id = ?2 ORDER BY member_index",
+    )?;
+    let members = statement
+        .query_map((&request.run_id, &controller_activation_id), |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })?
+        .map(|row| {
+            let (index, json) = row?;
+            Ok(serde_json::json!({"index": index, "value": serde_json::from_str::<serde_json::Value>(&json)?}))
+        })
+        .collect::<Result<Vec<_>, WorkflowStoreError>>()?;
+    drop(statement);
+    let controller_output = ValidatedOutput {
+        output_id: format!("{controller_activation_id}:fan-out-output"),
+        run_id: request.run_id.clone(),
+        node_id: controller_node_id,
+        activation_id: controller_activation_id,
+        schema_id: controller.output.type_name.clone(),
+        schema_version: 1,
+        value: serde_json::json!({
+            "version": bcode_workflow::WORKFLOW_FAN_OUT_RESULT_VERSION,
+            "members": members,
+        }),
+        artifact_reference: None,
+        created_at_ms: settled_at_ms,
+    };
+    persist_validated_output_transaction(transaction, &controller_output)?;
+    Ok(())
+}
+
 fn transition_attempt(
     transaction: &Transaction<'_>,
     request: &AttemptReconciliationRequest,
@@ -9730,6 +10432,59 @@ fn pending_activation_by_identity(
                 input: input_json
                     .map(|json| serde_json::from_str(&json))
                     .transpose()?,
+                node,
+                created_at_ms,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn pending_fan_out_member_by_identity(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<Option<PendingActivation>, WorkflowStoreError> {
+    let row = connection
+        .query_row(
+            "SELECT member.controller_node_id, member.member_index, member.input_json, \
+             member.created_at_ms, definition.definition_json \
+             FROM workflow_fan_out_members member \
+             JOIN workflow_runs run ON run.run_id = member.run_id \
+             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+               AND definition.version = run.definition_version \
+             WHERE member.run_id = ?1 AND member.member_node_id = ?2 \
+               AND member.member_activation_id = ?3 AND member.status = 'pending' \
+               AND run.status = 'running' AND run.cancellation_requested_at_ms IS NULL",
+            (run_id, node_id, activation_id),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(controller_node_id, index, input_json, created_at_ms, definition_json)| {
+            let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+            let controller = definition.node(&controller_node_id).ok_or_else(|| {
+                WorkflowStoreError::InvalidData("fan-out controller node is missing".to_string())
+            })?;
+            let configuration: bcode_workflow::WorkflowFanOutConfiguration =
+                serde_json::from_value(controller.configuration.clone())?;
+            let mut node = *configuration.member_node;
+            node.id = node_id.to_string();
+            Ok(PendingActivation {
+                run_id: run_id.to_string(),
+                node_id: node_id.to_string(),
+                activation_id: activation_id.to_string(),
+                dependency_generation: u64::from(index),
+                input: Some(serde_json::from_str(&input_json)?),
                 node,
                 created_at_ms,
             })
@@ -10161,6 +10916,22 @@ fn insert_activation_with_status(
 #[must_use]
 pub fn activation_identity(run_id: &str, node_id: &str, generation: u64) -> String {
     sha256_hex(format!("{run_id}\0{node_id}\0{generation}").as_bytes())
+}
+
+/// Return the stable identity for one fan-out virtual member node.
+#[must_use]
+pub fn fan_out_member_node_id(controller_node_id: &str, member_index: u32) -> String {
+    format!("{controller_node_id}::member::{member_index}")
+}
+
+/// Return the stable identity for one fan-out member activation.
+#[must_use]
+pub fn fan_out_member_activation_identity(
+    run_id: &str,
+    controller_activation_id: &str,
+    member_index: u32,
+) -> String {
+    sha256_hex(format!("{run_id}\0{controller_activation_id}\0fan-out\0{member_index}").as_bytes())
 }
 
 /// Return the stable idempotency identity for one durable attempt.
@@ -11875,6 +12646,24 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
              PRIMARY KEY (run_id, node_id, activation_id),\
              FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id)\
          );\
+         CREATE TABLE IF NOT EXISTS workflow_fan_out_members (\
+             run_id TEXT NOT NULL,\
+             controller_node_id TEXT NOT NULL,\
+             controller_activation_id TEXT NOT NULL,\
+             member_index INTEGER NOT NULL CHECK (member_index >= 0),\
+             member_node_id TEXT NOT NULL,\
+             member_activation_id TEXT NOT NULL UNIQUE,\
+             status TEXT NOT NULL,\
+             input_json TEXT NOT NULL,\
+             output_json TEXT,\
+             created_at_ms INTEGER NOT NULL,\
+             terminal_at_ms INTEGER,\
+             PRIMARY KEY (run_id, controller_activation_id, member_index),\
+             FOREIGN KEY (run_id, controller_node_id, controller_activation_id)\
+                 REFERENCES workflow_activations(run_id, node_id, activation_id)\
+         );\
+         CREATE INDEX IF NOT EXISTS idx_workflow_fan_out_members_dispatch \
+             ON workflow_fan_out_members(run_id, controller_activation_id, status, member_index);\
          CREATE TABLE IF NOT EXISTS workflow_attempts (\
              run_id TEXT NOT NULL,\
              node_id TEXT NOT NULL,\
@@ -12473,6 +13262,67 @@ mod tests {
         .expect("workflow")
         .definition()
         .clone()
+    }
+
+    fn fan_out_definition() -> WorkflowDefinition {
+        let member_schema = bcode_workflow::ValueSchema::of::<u32>();
+        let member_node = bcode_workflow::NodeDefinition {
+            id: "member".to_string(),
+            name: "member".to_string(),
+            kind: bcode_workflow::NodeKind::Approval,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+            input: member_schema.clone(),
+            output: member_schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::json!({"gate_version": 1}),
+        };
+        let node = bcode_workflow::NodeDefinition {
+            id: "fan-out".to_string(),
+            name: "fan-out".to_string(),
+            kind: bcode_workflow::NodeKind::FanOut,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+            input: bcode_workflow::ValueSchema {
+                type_name: "values/v1".to_string(),
+                schema: serde_json::json!({"type": "array", "items": &member_schema.schema}),
+            },
+            output: bcode_workflow::ValueSchema {
+                type_name: format!("workflow.fan-out-result/v1<{}>", member_schema.type_name),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["version", "members"],
+                    "properties": {
+                        "version": {"type": "integer", "const": bcode_workflow::WORKFLOW_FAN_OUT_RESULT_VERSION},
+                        "members": {"type": "array", "items": {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["index", "value"],
+                            "properties": {"index": {"type": "integer", "minimum": 0}, "value": &member_schema.schema}
+                        }}
+                    }
+                }),
+            },
+            resources: Vec::new(),
+            configuration: serde_json::to_value(bcode_workflow::WorkflowFanOutConfiguration {
+                version: bcode_workflow::WORKFLOW_FAN_OUT_CONFIGURATION_VERSION,
+                member_node: Box::new(member_node),
+                max_members: 4,
+                max_concurrency: 2,
+                failure_policy: bcode_workflow::ParallelFailurePolicy::WaitAll,
+            })
+            .expect("configuration"),
+        };
+        let definition = WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "fan-out".to_string(),
+            input: node.input.clone(),
+            output: node.output.clone(),
+            nodes: BTreeMap::from([("fan-out".to_string(), node)]),
+            entries: vec!["fan-out".to_string()],
+            exits: vec!["fan-out".to_string()],
+            edges: Vec::new(),
+        };
+        definition.validate().expect("fan-out definition");
+        definition
     }
 
     fn repeat_definition() -> WorkflowDefinition {
@@ -14763,6 +15613,51 @@ mod tests {
     }
 
     #[test]
+    fn durable_fan_out_materialization_is_bounded_ordered_and_restart_safe() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("fan-out", 1, &fan_out_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "fan-out".to_string();
+        run.input = Some(serde_json::json!([3, 1, 2]));
+        store.create_run(&run).expect("run");
+
+        let summary = store
+            .settle_pending_control_nodes("run-1", 10, 20)
+            .expect("materialize");
+        assert_eq!(summary.settled.len(), 1);
+        assert_eq!(summary.activated.len(), 2);
+        assert_eq!(
+            summary
+                .activated
+                .iter()
+                .map(|member| member.dependency_generation)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        drop(store);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            reopened
+                .settle_pending_control_nodes("run-1", 10, 21)
+                .expect("idempotent")
+                .settled
+                .is_empty(),
+            "a materialized controller must not duplicate members after restart"
+        );
+        let pending = reopened
+            .pending_activations_for_run("run-1", 10)
+            .expect("pending members");
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].input, Some(serde_json::json!(3)));
+        assert_eq!(pending[1].input, Some(serde_json::json!(1)));
+        assert_ne!(pending[0].activation_id, pending[1].activation_id);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn automatic_retry_policy_from_owner_observation_is_atomic_and_restart_safe() {
         struct RetryableFailureObserver;
@@ -15659,6 +16554,12 @@ mod tests {
                 .is_empty()
         );
         request.run.workspace_snapshot = "snapshot".to_string();
+        request.run.limits.node_execution_cap += 1;
+        assert!(
+            store.create_child_run_idempotent(&request).is_err(),
+            "child limits must not exceed the inherited parent envelope"
+        );
+        request.run.limits = WorkflowRunLimits::default();
         request.link.depth = MAX_WORKFLOW_RUN_DEPTH + 1;
         assert!(store.create_child_run_idempotent(&request).is_err());
         assert!(store.run_summary(&child_id).expect("child").is_none());
@@ -16287,6 +17188,38 @@ mod tests {
                 .active_attempts_for_cancellation("run-1", 10)
                 .expect("children"),
             [identity]
+        );
+    }
+
+    #[test]
+    fn elapsed_deadline_fails_idle_run_once_without_replay() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET deadline_at_ms = 20 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("deadline");
+        assert!(!store.expire_run_deadline("run-1", 19).expect("early"));
+        assert!(store.expire_run_deadline("run-1", 20).expect("expired"));
+        assert!(!store.expire_run_deadline("run-1", 21).expect("stable"));
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Failed
+        );
+        assert_eq!(
+            store
+                .event_history("run-1", None, 20)
+                .expect("events")
+                .into_iter()
+                .filter(|event| event.event_type == "run_deadline_elapsed")
+                .count(),
+            1
         );
     }
 

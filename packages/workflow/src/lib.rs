@@ -1349,6 +1349,61 @@ impl<T> WorkflowFanOutResult<T> {
     }
 }
 
+/// Stable durable fan-out controller contract version.
+pub const WORKFLOW_FAN_OUT_CONFIGURATION_VERSION: u32 = 1;
+
+/// Durable homogeneous fan-out controller configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowFanOutConfiguration {
+    /// Fan-out controller contract version.
+    pub version: u32,
+    /// Exact virtual member operation dispatched for every input item.
+    pub member_node: Box<NodeDefinition>,
+    /// Maximum admitted members.
+    pub max_members: u32,
+    /// Maximum concurrently active member attempts.
+    pub max_concurrency: u32,
+    /// Failure behavior for sibling members.
+    pub failure_policy: ParallelFailurePolicy,
+}
+
+impl WorkflowFanOutConfiguration {
+    /// Validate bounded member execution and owner configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, invalid bounds, nested controllers, or an
+    /// invalid virtual member node.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_FAN_OUT_CONFIGURATION_VERSION
+            || self.max_members == 0
+            || self.max_concurrency == 0
+            || self.max_concurrency > self.max_members
+        {
+            return Err(WorkflowError::Build {
+                path: "fan_out".to_string(),
+                message: "fan-out version, member bound, or concurrency bound is invalid"
+                    .to_string(),
+            });
+        }
+        if matches!(
+            self.member_node.kind,
+            NodeKind::FanOut
+                | NodeKind::Parallel
+                | NodeKind::Repeat
+                | NodeKind::Retry
+                | NodeKind::Branch
+        ) {
+            return Err(WorkflowError::Build {
+                path: "fan_out.member_node".to_string(),
+                message: "fan-out member must be one externally owned leaf operation".to_string(),
+            });
+        }
+        validate_control_node(&self.member_node)
+    }
+}
+
 /// Stable durable transform contract version.
 pub const WORKFLOW_TRANSFORM_VERSION: u32 = 2;
 /// Earliest declarative transform contract version retained for compatibility.
@@ -6247,10 +6302,30 @@ impl WorkflowStructuredSourceDocument {
             let node = match &step.operation {
                 WorkflowStructuredSourceOperation::FanOut(fan_out) => {
                     validate_structured_source_fan_out(fan_out, &self.run_limits, index)?;
-                    return Err(authoring_error(
-                        format!("steps[{index}].fan_out"),
-                        "fan-out source is valid but unavailable until durable production fan-out capability is admitted",
-                    ));
+                    let member_node = lower_structured_fan_out_member(fan_out, catalog, index)?;
+                    let configuration = WorkflowFanOutConfiguration {
+                        version: WORKFLOW_FAN_OUT_CONFIGURATION_VERSION,
+                        member_node: Box::new(member_node),
+                        max_members: fan_out.max_members,
+                        max_concurrency: fan_out.max_concurrency,
+                        failure_policy: fan_out.failure_policy,
+                    };
+                    configuration.validate()?;
+                    NodeDefinition {
+                        id: step.id.clone(),
+                        name: step.name.clone().unwrap_or_else(|| step.id.clone()),
+                        kind: NodeKind::FanOut,
+                        dataflow: WorkflowNodeDataflowPolicy::Direct,
+                        input: fan_out.input.clone(),
+                        output: workflow_fan_out_result_schema(&fan_out.output_member)?,
+                        resources: Vec::new(),
+                        configuration: serde_json::to_value(configuration).map_err(|error| {
+                            authoring_error(
+                                format!("steps[{index}].fan_out"),
+                                format!("fan-out configuration cannot be serialized: {error}"),
+                            )
+                        })?,
+                    }
                 }
                 WorkflowStructuredSourceOperation::Parallel(parallel) => {
                     if step.needs.len() != 2
@@ -6592,6 +6667,121 @@ fn validate_structured_source_fan_out(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn lower_structured_fan_out_member(
+    fan_out: &WorkflowStructuredSourceFanOut,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+    index: usize,
+) -> Result<NodeDefinition, WorkflowError> {
+    let member_id = format!("__fan_out_member_{index}");
+    let member_name = format!("Fan-out member for step {index}");
+    let mut node = match &fan_out.operation {
+        WorkflowStructuredSourceOperation::Prompt(prompt) => {
+            let prompt = prompt.expand()?;
+            NodeDefinition {
+                id: member_id,
+                name: member_name,
+                kind: NodeKind::Agent,
+                dataflow: WorkflowNodeDataflowPolicy::Direct,
+                input: prompt.input,
+                output: prompt.output,
+                resources: prompt.resources,
+                configuration: serde_json::to_value(prompt.configuration).map_err(|error| {
+                    authoring_error(
+                        format!("steps[{index}].fan_out.operation"),
+                        format!("fan-out prompt configuration cannot be serialized: {error}"),
+                    )
+                })?,
+            }
+        }
+        WorkflowStructuredSourceOperation::Agent(prompt) => NodeDefinition {
+            id: member_id,
+            name: member_name,
+            kind: NodeKind::Agent,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
+            input: prompt.input.clone(),
+            output: prompt.output.clone(),
+            resources: prompt.resources.clone(),
+            configuration: serde_json::to_value(&prompt.configuration).map_err(|error| {
+                authoring_error(
+                    format!("steps[{index}].fan_out.operation"),
+                    format!("fan-out agent configuration cannot be serialized: {error}"),
+                )
+            })?,
+        },
+        WorkflowStructuredSourceOperation::WorkflowCall(call) => {
+            let identity = call.target.definition_identity();
+            let child = catalog
+                .workflow_definitions
+                .get(&identity.definition_id)
+                .ok_or_else(|| {
+                    authoring_error(
+                        format!("steps[{index}].fan_out.operation.workflow_call"),
+                        "fan-out child workflow is unavailable",
+                    )
+                })?;
+            NodeDefinition {
+                id: member_id,
+                name: member_name,
+                kind: NodeKind::WorkflowCall,
+                dataflow: WorkflowNodeDataflowPolicy::Direct,
+                input: child.input.clone(),
+                output: child.output.clone(),
+                resources: Vec::new(),
+                configuration: serde_json::to_value(call).map_err(|error| {
+                    authoring_error(
+                        format!("steps[{index}].fan_out.operation.workflow_call"),
+                        format!("fan-out child call cannot be serialized: {error}"),
+                    )
+                })?,
+            }
+        }
+        WorkflowStructuredSourceOperation::Action(action) => {
+            let (block, _input) = lower_workflow_source_action(action, catalog, index)?;
+            NodeDefinition {
+                id: member_id,
+                name: member_name,
+                kind: NodeKind::PluginBlock,
+                dataflow: WorkflowNodeDataflowPolicy::Direct,
+                input: block.input.clone(),
+                output: block.output.clone(),
+                resources: block.resources.clone(),
+                configuration: serde_json::to_value(block).map_err(|error| {
+                    authoring_error(
+                        format!("steps[{index}].fan_out.operation"),
+                        format!("fan-out block cannot be serialized: {error}"),
+                    )
+                })?,
+            }
+        }
+        WorkflowStructuredSourceOperation::Input(gate)
+        | WorkflowStructuredSourceOperation::Approval(gate) => NodeDefinition {
+            id: member_id,
+            name: member_name,
+            kind: match &fan_out.operation {
+                WorkflowStructuredSourceOperation::Input(_) => NodeKind::Input,
+                WorkflowStructuredSourceOperation::Approval(_) => NodeKind::Approval,
+                _ => unreachable!(),
+            },
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
+            input: gate.schema.clone(),
+            output: gate.schema.clone(),
+            resources: gate.resources.clone(),
+            configuration: serde_json::json!({"gate_version": 1}),
+        },
+        WorkflowStructuredSourceOperation::FanOut(_)
+        | WorkflowStructuredSourceOperation::Parallel(_) => unreachable!(),
+    };
+    if node.input != fan_out.member || node.output != fan_out.output_member {
+        return Err(authoring_error(
+            format!("steps[{index}].fan_out.operation"),
+            "fan-out member operation schemas must exactly match member boundaries",
+        ));
+    }
+    node.id = "member".to_string();
+    Ok(node)
 }
 
 fn workflow_fan_out_result_schema(member: &ValueSchema) -> Result<ValueSchema, WorkflowError> {
@@ -9697,7 +9887,7 @@ impl WorkflowProductionCapabilities {
             (NodeKind::Repeat, WorkflowCapabilitySupport::Supported),
             (NodeKind::Retry, WorkflowCapabilitySupport::Unsupported),
             (NodeKind::Parallel, WorkflowCapabilitySupport::Supported),
-            (NodeKind::FanOut, WorkflowCapabilitySupport::Unsupported),
+            (NodeKind::FanOut, WorkflowCapabilitySupport::Supported),
             (NodeKind::PluginBlock, WorkflowCapabilitySupport::Supported),
             (NodeKind::Input, WorkflowCapabilitySupport::Supported),
             (NodeKind::Approval, WorkflowCapabilitySupport::Supported),
@@ -9733,7 +9923,7 @@ impl WorkflowProductionCapabilities {
                 ParallelFailurePolicy::FailFast,
             ]),
             automatic_retry: WorkflowCapabilitySupport::Supported,
-            fan_out: WorkflowCapabilitySupport::Unsupported,
+            fan_out: WorkflowCapabilitySupport::Supported,
             transforms: WorkflowCapabilitySupport::Supported,
             artifact_references: WorkflowCapabilitySupport::Supported,
             agent_execution_targets: BTreeSet::from([
@@ -10994,6 +11184,19 @@ impl WorkflowDefinition {
             }
             if node.kind == NodeKind::Agent {
                 validate_production_agent_node(node, capabilities, &mut diagnostics);
+            }
+            if node.kind == NodeKind::FanOut
+                && serde_json::from_value::<WorkflowFanOutConfiguration>(node.configuration.clone())
+                    .is_err()
+            {
+                diagnostics.push(WorkflowCapabilityDiagnostic {
+                    code: "invalid_fan_out_configuration".to_string(),
+                    node_id: Some(node.id.clone()),
+                    message: format!(
+                        "fan-out node '{}' does not use the durable member-operation contract",
+                        node.id
+                    ),
+                });
             }
             if node.kind == NodeKind::PluginBlock
                 && let Ok(block) =
@@ -13297,6 +13500,7 @@ fn validate_repeat_outcome_configuration(node: &NodeDefinition) -> Result<(), Wo
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
     if matches!(node.kind, NodeKind::Branch | NodeKind::Repeat) {
         let declared_version = node
@@ -13338,8 +13542,40 @@ fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
             validate_repeat_outcome_configuration(node)?;
         }
     }
-    if node.kind == NodeKind::FanOut
-        && (node
+    if node.kind == NodeKind::FanOut {
+        if node.configuration.get("member_node").is_some() {
+            let configuration: WorkflowFanOutConfiguration =
+                serde_json::from_value(node.configuration.clone()).map_err(|error| {
+                    WorkflowError::Build {
+                        path: node.id.clone(),
+                        message: format!("fan-out configuration is invalid: {error}"),
+                    }
+                })?;
+            configuration.validate()?;
+            let items = node
+                .input
+                .schema
+                .get("items")
+                .ok_or_else(|| WorkflowError::Build {
+                    path: node.id.clone(),
+                    message: "fan-out input must declare homogeneous items".to_string(),
+                })?;
+            if items != &configuration.member_node.input.schema {
+                return Err(WorkflowError::Build {
+                    path: node.id.clone(),
+                    message: "fan-out member input schema does not match array items".to_string(),
+                });
+            }
+            let expected_output =
+                workflow_fan_out_result_schema(&configuration.member_node.output)?;
+            if node.output != expected_output {
+                return Err(WorkflowError::Build {
+                    path: node.id.clone(),
+                    message: "fan-out output schema does not match the member operation"
+                        .to_string(),
+                });
+            }
+        } else if node
             .configuration
             .get("fan_out_version")
             .and_then(serde_json::Value::as_u64)
@@ -13348,14 +13584,15 @@ fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
                 .configuration
                 .get("ordering")
                 .and_then(serde_json::Value::as_str)
-                != Some("input_index_ascending"))
-    {
-        return Err(WorkflowError::Build {
-            path: node.id.clone(),
-            message: format!(
-                "fan_out must declare version {WORKFLOW_FAN_OUT_RESULT_VERSION} and input-index ordering"
-            ),
-        });
+                != Some("input_index_ascending")
+        {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message: format!(
+                    "fan_out must declare version {WORKFLOW_FAN_OUT_RESULT_VERSION} and input-index ordering"
+                ),
+            });
+        }
     }
     let invalid = match node.kind {
         NodeKind::Repeat => node
@@ -14627,7 +14864,7 @@ steps:
     }
 
     #[test]
-    fn structured_source_v3_fan_out_contract_validates_then_fails_capability_closed() {
+    fn structured_source_v3_fan_out_lowers_durable_member_contract() {
         let member = serde_json::json!({"type_name": "value/v1", "schema": {"type": "string"}});
         let source = serde_json::json!({
             "workflow_source_version": 3,
@@ -14646,16 +14883,19 @@ steps:
                 }
             }]
         });
-        let error = lower_workflow_authoring_source(
+        let lowered = lower_workflow_authoring_source(
             &serde_json::to_string(&source).expect("source"),
             WorkflowSourceFormat::Json,
             &authoring_catalog(),
         )
-        .expect_err("fan-out unavailable");
-        assert!(
-            error.to_string().contains("production fan-out capability"),
-            "{error}"
-        );
+        .expect("fan-out source");
+        let node = &lowered.document.definition.nodes["reviewers"];
+        assert_eq!(node.kind, NodeKind::FanOut);
+        let configuration: WorkflowFanOutConfiguration =
+            serde_json::from_value(node.configuration.clone()).expect("configuration");
+        assert_eq!(configuration.max_members, 4);
+        assert_eq!(configuration.max_concurrency, 2);
+        assert_eq!(configuration.member_node.kind, NodeKind::Approval);
     }
 
     #[test]
@@ -17112,6 +17352,7 @@ steps:
             NodeKind::Branch,
             NodeKind::Repeat,
             NodeKind::Parallel,
+            NodeKind::FanOut,
             NodeKind::PluginBlock,
             NodeKind::Input,
             NodeKind::Approval,
@@ -17121,12 +17362,10 @@ steps:
                 WorkflowCapabilitySupport::Supported
             );
         }
-        for kind in [NodeKind::Retry, NodeKind::FanOut] {
-            assert_eq!(
-                capabilities.node_support(kind),
-                WorkflowCapabilitySupport::Unsupported
-            );
-        }
+        assert_eq!(
+            capabilities.node_support(NodeKind::Retry),
+            WorkflowCapabilitySupport::Unsupported
+        );
         assert_eq!(capabilities.edge_kinds.len(), ALL_WORKFLOW_EDGE_KINDS.len());
         assert_eq!(
             capabilities
@@ -17165,7 +17404,7 @@ steps:
             capabilities.automatic_retry,
             WorkflowCapabilitySupport::Supported
         );
-        assert_eq!(capabilities.fan_out, WorkflowCapabilitySupport::Unsupported);
+        assert_eq!(capabilities.fan_out, WorkflowCapabilitySupport::Supported);
         assert_eq!(
             capabilities.transforms,
             WorkflowCapabilitySupport::Supported
@@ -17238,7 +17477,7 @@ steps:
                     "body_entries": ["node"],
                     "body_exits": ["node"]
                 }),
-                "unsupported_node_kind",
+                "invalid_fan_out_configuration",
             ),
         ] {
             let definition = WorkflowDefinition {

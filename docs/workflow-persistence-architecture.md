@@ -173,9 +173,13 @@ receipt rather than creating another child. Parent cancellation propagates to th
 a stable outcome; version 1 does not abandon children.
 
 Child dependency depth, descendant count, recursion, exact target, and output-schema compatibility
-are validated before start. Parent resource leases are not retained while waiting for a child that may
-need them. Child grants do not become ambient parent authority, and parent grants apply to descendants
-only through an explicit exact descendant-operation scope.
+are validated before start. Child duration, node-execution, concurrency, cycle, and retry limits can
+only narrow the inherited parent envelope; durable admission rejects widening and accounts root-tree
+attempts before adding another descendant. The scheduler settles an elapsed idle-run deadline once
+without replay; active external attempts continue through normal cancellation and authoritative owner
+observation. Parent resource leases are not retained while waiting for a child that may need them.
+Child grants do not become ambient parent authority, and parent grants apply to descendants only
+through an explicit exact descendant-operation scope.
 
 The complete contracts and fixed bounds are defined in
 [`composable-coding-workflows.md`](composable-coding-workflows.md).
@@ -245,9 +249,15 @@ claim. Attempt reservation then enforces the persisted run concurrency cap befor
 
 Canonical fan-out results use version 1 `{ index, value }` members in strict contiguous ascending
 input-index order. This shape is independent of completion order and rejects sparse or reordered
-members. The in-process SDK implementation enforces bounded concurrency and preserves this ordering,
-but production `FanOut` remains rejected until durable item admission, resource/cancellation state,
-and restart-safe partial completion are implemented.
+members. Production fan-out persists one member row per controller/input index with a stable
+controller-derived activation identity, exact typed input, lifecycle state, output, and terminal
+time. Initial admission is bounded by both the fan-out and run concurrency limits; waiting members
+become pending in ascending index order as earlier members settle. Virtual member nodes retain the
+owner operation's resources and use ordinary preparation, authorization, dispatch, reconciliation,
+and cancellation paths. Canonical aggregation occurs only after every member succeeds. Fail-fast
+failure persists cancellation intent for active siblings, cancels undispatched siblings, and fails
+the controller/run; wait-all retains all admitted work before terminal failure. Reopening discovers
+persisted pending members without rematerializing identities or inputs.
 
 For supported wait-all joins, a failed member does not terminate the run while another member is
 non-terminal. Once all declared members are terminal, the store persists one generation-scoped
