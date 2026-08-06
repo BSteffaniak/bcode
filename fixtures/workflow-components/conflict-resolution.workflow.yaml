@@ -25,14 +25,15 @@ steps:
             scope: {type: string, minLength: 1, maxLength: 4096}
             status: {type: string, enum: [conflicted, blocked]}
       output:
-        type_name: bcode.conflict.result/v1
+        type_name: bcode.component.state/v1
         schema:
           type: object
           additionalProperties: false
-          required: [status, detail]
+          required: [status, detail, retry]
           properties:
-            status: {type: string, enum: [resolved, unresolved, blocked]}
+            status: {type: string, enum: [ready, needs_remediation, complete, blocked]}
             detail: {type: string, maxLength: 16384}
+            retry: {type: boolean}
       agent_profile: build
       execution_target: fixed_generation_fork
       read_only: false
@@ -40,15 +41,5 @@ steps:
       timeout_ms: 900000
       resources: [{resource: repository, access: write}]
   - id: verify_conflicts
-    run:
-      version: 1
-      script: |-
-        set -eu
-        test -z "$(git diff --name-only --diff-filter=U)"
-        git diff --check
-      shell: [sh, -c]
-      cwd: .
-      timeout_ms: 60000
-      accepted_exit_codes: [0]
-      continue_on_unaccepted_exit: false
-      output: {preview_bytes: 8192, artifact_spill: true}
+    package_call:
+      member: interaction-state

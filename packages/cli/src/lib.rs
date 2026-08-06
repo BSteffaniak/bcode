@@ -13612,8 +13612,14 @@ mod workflow_source_tests {
             )
             .expect("component lowers through ordinary source contract");
         }
-        bcode_workflow::plan_workflow_package(&loaded, &catalog)
+        let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
             .expect("complete source component package plans");
+        assert_eq!(plan.members.len(), loaded.members.len());
+        assert!(
+            plan.members
+                .iter()
+                .all(|member| member.lowering.validation.is_valid())
+        );
     }
 
     #[test]

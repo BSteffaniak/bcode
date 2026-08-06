@@ -4154,6 +4154,10 @@ pub struct WorkflowStructuredSourcePrompt {
 pub struct WorkflowStructuredSourceConcisePrompt {
     /// Plain prompt instruction. Skill use is requested through this text, not workflow coupling.
     pub text: String,
+    /// Optional exact static structured input. This is materialized as a constant edge transform
+    /// when the prompt follows another source step.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "with")]
+    pub input_value: Option<serde_json::Value>,
     /// Exact structured input schema.
     pub input: ValueSchema,
     /// Exact structured output schema.
@@ -4431,9 +4435,13 @@ pub struct WorkflowStructuredSourceStep {
     /// Optional display name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Explicit predecessor identities. Omission selects the immediately preceding step.
+    /// Explicit predecessor identities. Omission selects the immediately preceding step unless
+    /// `independent` is true.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs: Vec<String>,
+    /// Start a new graph branch instead of implicitly depending on the previous source step.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub independent: bool,
     /// Optional exact prior-step output used as this step's input.
     ///
     /// Omission preserves the canonical dependency payload. A selected reference lowers to the
@@ -4896,11 +4904,20 @@ pub fn plan_workflow_package(
             &resolved_catalog,
         )
         .map_err(|error| qualify_workflow_package_member_error(member, error))?;
-        let identity = WorkflowDefinitionIdentity::for_definition(
-            lowering.document.workflow_id.clone(),
-            &lowering.document.definition,
-        )
-        .map_err(|error| qualify_workflow_package_member_error(member, error))?;
+        let compilation = lowering
+            .document
+            .compilation_preview(&resolved_catalog, None);
+        let compiled = compilation.compiled.ok_or_else(|| {
+            let message = compilation
+                .validation
+                .diagnostics
+                .first()
+                .map_or("package member did not compile", |diagnostic| {
+                    diagnostic.message.as_str()
+                });
+            qualify_workflow_package_member_error(member, authoring_error("compilation", message))
+        })?;
+        let identity = compiled.definition_identity;
         let closure = workflow_package_member_closure(member, &members)?;
         let source_digest = digest_serializable(&serde_json::json!({
             "source_name": member.source_name,
@@ -4908,12 +4925,11 @@ pub fn plan_workflow_package(
             "source": member.source,
             "dependencies": member.dependencies,
         }))?;
-        let executable_digest = digest_serializable(&lowering.document.definition)?;
+        let executable_digest = digest_serializable(&compiled.definition)?;
         identities.insert(member.member_id.clone(), identity.clone());
-        resolved_catalog.workflow_definitions.insert(
-            identity.definition_id.clone(),
-            lowering.document.definition.clone(),
-        );
+        resolved_catalog
+            .workflow_definitions
+            .insert(identity.definition_id.clone(), compiled.definition);
         locked.push(WorkflowPackageLockedMember {
             member_id: member.member_id.clone(),
             source_digest_sha256: source_digest,
@@ -6328,12 +6344,12 @@ impl WorkflowStructuredSourceDocument {
                 WorkflowStructuredSourceOperation::Action(action) => {
                     Some(lower_workflow_source_action(action, catalog, index)?.1)
                 }
+                WorkflowStructuredSourceOperation::Prompt(prompt) => prompt.input_value.clone(),
                 WorkflowStructuredSourceOperation::FanOut(_)
                 | WorkflowStructuredSourceOperation::Parallel(_)
                 | WorkflowStructuredSourceOperation::WorkflowCall(_)
                 | WorkflowStructuredSourceOperation::Input(_)
                 | WorkflowStructuredSourceOperation::Approval(_)
-                | WorkflowStructuredSourceOperation::Prompt(_)
                 | WorkflowStructuredSourceOperation::Agent(_) => None,
             };
             let Some(static_input) = static_input else {
@@ -6376,7 +6392,7 @@ impl WorkflowStructuredSourceDocument {
                     "structured step IDs must be unique",
                 ));
             }
-            let dependencies = if step.needs.is_empty() && index > 0 {
+            let dependencies = if step.needs.is_empty() && index > 0 && !step.independent {
                 vec![node_ids[index - 1].clone()]
             } else {
                 step.needs.clone()
@@ -18664,6 +18680,7 @@ steps:
         };
         let prompt = WorkflowStructuredSourceConcisePrompt {
             text: "Use the commit-message skill if available; return JSON.".to_string(),
+            input_value: None,
             input: input.clone(),
             output: output.clone(),
             agent_profile: "review".to_string(),

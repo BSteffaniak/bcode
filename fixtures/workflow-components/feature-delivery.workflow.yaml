@@ -36,27 +36,8 @@ run_limits:
   cycle_cap: 4
   retry_cap: 2
 steps:
-  - id: inspect_progress
-    name: Inspect repository and progress document
-    run:
-      version: 1
-      script: |-
-        set -eu
-        test -f "${PROGRESS_DOCUMENT:-local-composable-workflows-progress.md}"
-        test -f AGENTS.md
-        test -f INVARIANTS.md
-        git status --short
-        grep -n -- '- \[ \]' "$PROGRESS_DOCUMENT" | head -n 64 || true
-      shell: [sh, -c]
-      cwd: .
-      environment:
-        PROGRESS_DOCUMENT: local-composable-workflows-progress.md
-      timeout_ms: 60000
-      accepted_exit_codes: [0]
-      continue_on_unaccepted_exit: false
-      output: {preview_bytes: 16384, artifact_spill: true}
   - id: plan_and_implement
-    name: Plan and implement one bounded tranche
+    name: Inspect, plan, and implement one bounded tranche
     prompt:
       text: |-
         Implement one coherent incomplete tranche from the configured progress document. Use the
@@ -69,15 +50,22 @@ steps:
         type_name: bcode.flagship.implementation-input/v1
         schema:
           type: object
-          additionalProperties: true
+          additionalProperties: false
+          required: [progress_document, implementation_prompt]
+          properties:
+            progress_document: {type: string, minLength: 1, maxLength: 1024}
+            implementation_prompt: {type: string, minLength: 1, maxLength: 16384}
+      with:
+        progress_document: local-composable-workflows-progress.md
+        implementation_prompt: Implement the next incomplete progress-document item without shortcuts.
       output:
-        type_name: bcode.flagship.state/v1
+        type_name: bcode.component.state/v1
         schema:
           type: object
           additionalProperties: false
           required: [status, detail, retry]
           properties:
-            status: {type: string, enum: [implemented, needs_remediation, conflicted, blocked]}
+            status: {type: string, enum: [ready, needs_remediation, complete, blocked]}
             detail: {type: string, maxLength: 16384}
             retry: {type: boolean}
       agent_profile: build
@@ -88,64 +76,57 @@ steps:
       resources: [{resource: repository, access: write}]
   - id: verify_prompt_work
     name: Verify repository state after prompt work
-    run:
-      version: 1
-      script: |-
-        set -eu
-        test -f "${PROGRESS_DOCUMENT:-local-composable-workflows-progress.md}"
-        git diff --check
-        test -z "$(git diff --name-only --diff-filter=U)"
-        test -z "$(git ls-files --error-unmatch "$PROGRESS_DOCUMENT" 2>/dev/null || true)"
-      shell: [sh, -c]
-      cwd: .
-      environment:
-        PROGRESS_DOCUMENT: local-composable-workflows-progress.md
-      timeout_ms: 60000
-      accepted_exit_codes: [0]
-      continue_on_unaccepted_exit: false
-      output: {preview_bytes: 8192, artifact_spill: true}
+    package_call:
+      member: interaction-state
   - id: validation
     name: Run generic validation and formatting component
+    independent: true
     package_call:
       member: validation-and-formatting
   - id: review
     name: Run isolated adversarial reviews
+    independent: true
     package_call:
       member: adversarial-review
   - id: completion
     name: Evaluate the configured completion condition
+    independent: true
     package_call:
       member: completion-evaluation
   - id: operator_decision
     name: Surface completion, exhaustion, ambiguity, or policy decision
-    input:
+    approval:
       schema:
-        type_name: bcode.flagship.operator-decision/v1
+        type_name: bcode.completion.result/v1
         schema:
           type: object
           additionalProperties: false
-          required: [decision, detail]
+          required: [condition_met, summary, remaining]
           properties:
-            decision:
-              type: string
-              enum: [continue, remediate, resolve_conflicts, refocus, checkpoint, synchronize, stop, cancel, repair_required]
-            detail: {type: string, maxLength: 16384}
+            condition_met: {type: boolean}
+            summary: {type: string, minLength: 1, maxLength: 4096}
+            remaining:
+              type: array
+              maxItems: 128
+              items: {type: string, maxLength: 4096}
       resources: [{resource: operator, access: read}]
-  - id: checkpoint_decision
-    name: Confirm checkpoint policy and state
+  - id: completion_confirmed
+    name: Confirm complete terminal state
     needs: [operator_decision]
     approval:
       schema:
-        type_name: bcode.flagship.operator-decision/v1
+        type_name: bcode.completion.result/v1
         schema:
           type: object
           additionalProperties: false
-          required: [decision, detail]
+          required: [condition_met, summary, remaining]
           properties:
-            decision:
-              type: string
-              enum: [continue, remediate, resolve_conflicts, refocus, checkpoint, synchronize, stop, cancel, repair_required]
-            detail: {type: string, maxLength: 16384}
+            condition_met: {type: boolean}
+            summary: {type: string, minLength: 1, maxLength: 4096}
+            remaining:
+              type: array
+              maxItems: 128
+              items: {type: string, maxLength: 4096}
     when:
       source:
         step: operator_decision
@@ -154,23 +135,25 @@ steps:
         version: 3
         selector:
           version: 1
-          segments: [{kind: field, name: decision}]
-        value: checkpoint
-  - id: synchronize_decision
-    name: Confirm synchronization policy and state
+          segments: [{kind: field, name: condition_met}]
+        value: true
+  - id: continuation_required
+    name: Surface bounded continuation, repair, or cancellation policy
     needs: [operator_decision]
     approval:
       schema:
-        type_name: bcode.flagship.operator-decision/v1
+        type_name: bcode.completion.result/v1
         schema:
           type: object
           additionalProperties: false
-          required: [decision, detail]
+          required: [condition_met, summary, remaining]
           properties:
-            decision:
-              type: string
-              enum: [continue, remediate, resolve_conflicts, refocus, checkpoint, synchronize, stop, cancel, repair_required]
-            detail: {type: string, maxLength: 16384}
+            condition_met: {type: boolean}
+            summary: {type: string, minLength: 1, maxLength: 4096}
+            remaining:
+              type: array
+              maxItems: 128
+              items: {type: string, maxLength: 4096}
     when:
       source:
         step: operator_decision
@@ -179,55 +162,5 @@ steps:
         version: 3
         selector:
           version: 1
-          segments: [{kind: field, name: decision}]
-        value: synchronize
-  - id: conflict_decision
-    name: Confirm conflict-resolution policy and state
-    needs: [operator_decision]
-    approval:
-      schema:
-        type_name: bcode.flagship.operator-decision/v1
-        schema:
-          type: object
-          additionalProperties: false
-          required: [decision, detail]
-          properties:
-            decision:
-              type: string
-              enum: [continue, remediate, resolve_conflicts, refocus, checkpoint, synchronize, stop, cancel, repair_required]
-            detail: {type: string, maxLength: 16384}
-    when:
-      source:
-        step: operator_decision
-      predicate:
-        operation: selected_equals
-        version: 3
-        selector:
-          version: 1
-          segments: [{kind: field, name: decision}]
-        value: resolve_conflicts
-  - id: refocus_decision
-    name: Confirm refocus policy and state
-    needs: [operator_decision]
-    approval:
-      schema:
-        type_name: bcode.flagship.operator-decision/v1
-        schema:
-          type: object
-          additionalProperties: false
-          required: [decision, detail]
-          properties:
-            decision:
-              type: string
-              enum: [continue, remediate, resolve_conflicts, refocus, checkpoint, synchronize, stop, cancel, repair_required]
-            detail: {type: string, maxLength: 16384}
-    when:
-      source:
-        step: operator_decision
-      predicate:
-        operation: selected_equals
-        version: 3
-        selector:
-          version: 1
-          segments: [{kind: field, name: decision}]
-        value: refocus
+          segments: [{kind: field, name: condition_met}]
+        value: false
