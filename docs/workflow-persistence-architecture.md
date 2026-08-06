@@ -27,9 +27,10 @@ Workflow prompt recovery uses a versioned `workflow_execution_sessions` relation
 node, activation, and attempt identity. The relation stores only the opaque session ID, immutable
 workspace snapshot, and creation time; session content, visibility, retention, and history remain
 session-owned. Identical insertion is idempotent, while activation/session identity reuse or damaged
-cross-domain provenance fails closed. A bounded compatibility lookup may recover one unique
-session-provenance match and persist the missing relation, but ambiguity is surfaced rather than
-silently selected.
+cross-domain provenance fails closed. A bounded recovery lookup may find one unique execution session
+from the current canonical provenance contract and persist a missing relation; this repairs only a
+derived link, never decodes an obsolete workflow schema. Ambiguity is surfaced rather than silently
+selected.
 
 Workflow execution sessions are durable background sessions: normal pickers exclude them, while
 direct inspection and explicitly background-inclusive bounded catalog APIs expose them. Their
@@ -183,6 +184,21 @@ through an explicit exact descendant-operation scope.
 
 The complete contracts and fixed bounds are defined in
 [`composable-coding-workflows.md`](composable-coding-workflows.md).
+
+## Atomic package lifecycle
+
+Workflow package manifests are bounded portable inputs. Clients confine local member paths before
+transport; portable validation independently bounds members, source bytes, direct and total edges,
+dependency depth, exports, external dependencies, versions, duplicates, and cycles. Pure planning
+lowers members child-before-parent and retains package-qualified source maps. Preview diagnostics are
+remapped through those maps without persistence.
+
+Apply and publish use exact typed plans, locks, and optimistic member generations. Existing members
+require exact generations; omitted members are create-only. Every member is staged in one immediate
+database transaction, so conflicts or injected failures expose no partial draft, revision, or lock
+facts. Publication regenerates the authoritative lock only after all canonical revisions commit.
+Validate, preview, apply, and publish are available through IPC, client, CLI, and workflow-plugin
+application boundaries; frontends consume the renderer-neutral typed results.
 
 ## Durable agent configuration
 

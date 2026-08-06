@@ -29455,8 +29455,9 @@ async fn workflow_child_session_for_activation(
         return Ok(Some(session));
     }
 
-    // Compatibility discovery is bounded by the session catalog and does not mutate session
-    // history. A single trustworthy provenance match is linked into workflow-owned recovery state.
+    // Derived-link recovery is bounded by the session catalog and does not mutate canonical session
+    // history. It accepts only the current exact provenance contract; one trustworthy match is
+    // linked into workflow-owned recovery state and ambiguity fails closed.
     let mut matched = state
         .sessions
         .all_session_summaries()

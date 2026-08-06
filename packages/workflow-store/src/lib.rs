@@ -117,6 +117,41 @@ impl DispatchSideEffect {
     }
 }
 
+/// Deterministic fault boundaries for atomic package mutation tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowPackageMutationBoundary {
+    /// One package member has been staged inside the transaction.
+    MemberStaged,
+    /// Every member has been staged but the transaction has not committed.
+    AllMembersStaged,
+}
+
+/// Deterministic package mutation fault injection.
+pub trait WorkflowPackageMutationFault {
+    /// Fail after one exact transactional boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error to force complete transaction rollback.
+    fn after_boundary(
+        &self,
+        boundary: WorkflowPackageMutationBoundary,
+        member_id: Option<&str>,
+    ) -> Result<(), WorkflowStoreError>;
+}
+
+struct NoopWorkflowPackageMutationFault;
+
+impl WorkflowPackageMutationFault for NoopWorkflowPackageMutationFault {
+    fn after_boundary(
+        &self,
+        _boundary: WorkflowPackageMutationBoundary,
+        _member_id: Option<&str>,
+    ) -> Result<(), WorkflowStoreError> {
+        Ok(())
+    }
+}
+
 /// Exact authored-workflow source and resolved configuration used to create one durable run.
 ///
 /// This is diagnostic provenance only. Runtime dispatch and authorization continue to use the
@@ -1792,6 +1827,28 @@ impl WorkflowStore {
         request: &WorkflowPackageApplyRequest,
         applied_at_ms: u64,
     ) -> Result<WorkflowPackageMutationResult, WorkflowStoreError> {
+        self.apply_workflow_package_with_fault(
+            request,
+            applied_at_ms,
+            &NoopWorkflowPackageMutationFault,
+        )
+    }
+
+    /// Apply one package with deterministic in-transaction fault injection.
+    ///
+    /// # Errors
+    ///
+    /// Returns any normal apply error or injected fault; every staged member is rolled back.
+    #[allow(clippy::too_many_lines)]
+    pub fn apply_workflow_package_with_fault<F>(
+        &mut self,
+        request: &WorkflowPackageApplyRequest,
+        applied_at_ms: u64,
+        fault: &F,
+    ) -> Result<WorkflowPackageMutationResult, WorkflowStoreError>
+    where
+        F: WorkflowPackageMutationFault + ?Sized,
+    {
         request
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
@@ -1901,7 +1958,12 @@ impl WorkflowStore {
                     });
                 }
             }
+            fault.after_boundary(
+                WorkflowPackageMutationBoundary::MemberStaged,
+                Some(&member.member_id),
+            )?;
         }
+        fault.after_boundary(WorkflowPackageMutationBoundary::AllMembersStaged, None)?;
         results.sort_by(|left, right| left.member_id.cmp(&right.member_id));
         transaction.commit()?;
         let result = WorkflowPackageMutationResult {
@@ -1933,6 +1995,29 @@ impl WorkflowStore {
         request: &WorkflowPackagePublishRequest,
         published_at_ms: u64,
     ) -> Result<WorkflowPackageMutationResult, WorkflowStoreError> {
+        self.publish_workflow_package_with_fault(
+            request,
+            published_at_ms,
+            &NoopWorkflowPackageMutationFault,
+        )
+    }
+
+    /// Publish one package with deterministic in-transaction fault injection.
+    ///
+    /// # Errors
+    ///
+    /// Returns any normal publication error or injected fault; no partial revisions or lock facts
+    /// are exposed.
+    #[allow(clippy::too_many_lines)]
+    pub fn publish_workflow_package_with_fault<F>(
+        &mut self,
+        request: &WorkflowPackagePublishRequest,
+        published_at_ms: u64,
+        fault: &F,
+    ) -> Result<WorkflowPackageMutationResult, WorkflowStoreError>
+    where
+        F: WorkflowPackageMutationFault + ?Sized,
+    {
         request
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
@@ -2085,7 +2170,12 @@ impl WorkflowStore {
             let mut published = lock.clone();
             published.published_revision = Some(revision_identity);
             published_lock_members.push(published);
+            fault.after_boundary(
+                WorkflowPackageMutationBoundary::MemberStaged,
+                Some(member_id),
+            )?;
         }
+        fault.after_boundary(WorkflowPackageMutationBoundary::AllMembersStaged, None)?;
         results.sort_by(|left, right| left.member_id.cmp(&right.member_id));
         published_lock_members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
         transaction.commit()?;
@@ -12929,10 +13019,27 @@ mod tests {
     use bcode_workflow::{Step, WorkflowBuilder};
     use std::collections::BTreeMap;
 
+    struct RejectPackageMutationBoundary(WorkflowPackageMutationBoundary);
+
+    impl WorkflowPackageMutationFault for RejectPackageMutationBoundary {
+        fn after_boundary(
+            &self,
+            boundary: WorkflowPackageMutationBoundary,
+            _member_id: Option<&str>,
+        ) -> Result<(), WorkflowStoreError> {
+            if boundary == self.0 {
+                Err(WorkflowStoreError::InvalidData(
+                    "injected package mutation fault".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn package_apply_is_atomic_and_generation_guarded() {
-        let temp = tempfile::tempdir().expect("temp");
-        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
         let (workflow, draft, catalog) = authored_store_fixture();
         let mut second_document = draft.document.clone();
         second_document.workflow_id = "authored/second".to_string();
@@ -12998,6 +13105,27 @@ mod tests {
             },
             expected_generations: Vec::new(),
         };
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        assert!(
+            store
+                .apply_workflow_package_with_fault(
+                    &request,
+                    9,
+                    &RejectPackageMutationBoundary(
+                        WorkflowPackageMutationBoundary::AllMembersStaged,
+                    ),
+                )
+                .is_err()
+        );
+        for member in &request.plan.members {
+            assert!(
+                store
+                    .workflow_draft(&member.lowering.document.workflow_id, "package")
+                    .expect("rolled back draft")
+                    .is_none()
+            );
+        }
         let applied = store.apply_workflow_package(&request, 10).expect("apply");
         assert_eq!(applied.members.len(), 2);
         assert_eq!(
@@ -13032,6 +13160,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn package_publish_is_atomic_and_generates_authoritative_lock() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -13074,6 +13203,31 @@ mod tests {
                 expected_generation: 1,
             }],
         };
+        assert!(
+            store
+                .publish_workflow_package_with_fault(
+                    &request,
+                    19,
+                    &RejectPackageMutationBoundary(
+                        WorkflowPackageMutationBoundary::AllMembersStaged,
+                    ),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .workflow_revision(&workflow.workflow_id, 1)
+                .expect("rolled back revision")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .workflow_draft(&workflow.workflow_id, "package")
+                .expect("draft retained")
+                .expect("draft")
+                .generation,
+            1
+        );
         let published = store
             .publish_workflow_package(&request, 20)
             .expect("publish package");
@@ -13099,6 +13253,26 @@ mod tests {
                 .is_none()
         );
 
+        let published_lock = published.lock.expect("published lock");
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert_eq!(
+            reopened
+                .workflow_revision(&workflow.workflow_id, 1)
+                .expect("revision after restart")
+                .expect("revision")
+                .definition_identity,
+            identity
+        );
+        assert_eq!(
+            published_lock.members[0]
+                .published_revision
+                .as_ref()
+                .expect("lock revision")
+                .revision,
+            1
+        );
+        let mut store = reopened;
         let mut stale = request;
         stale.expected_generations[0].expected_generation = 2;
         assert!(store.publish_workflow_package(&stale, 21).is_err());

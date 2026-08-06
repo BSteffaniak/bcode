@@ -91,6 +91,24 @@ if rg -n 'WORKFLOW_SOURCE_V1_DOCUMENT_VERSION|WorkflowSourceDocument|WorkflowSou
 fi
 rm -f /tmp/bcode-workflow-legacy-source.txt
 
+if rg -n 'bcode\.(git|review|progress-doc)/|GitWorkflow|ReviewWorkflow|ProgressDocumentWorkflow|workflow_(git|review|progress)' \
+  packages/workflow packages/workflow-store packages/server plugins/workflow-plugin \
+  --glob '*.rs' --glob '*.toml' \
+  >/tmp/bcode-product-workflow-blocks.txt 2>/dev/null; then
+  echo "Composable workflow specialization violation: product-specific workflow blocks were reintroduced." >&2
+  cat /tmp/bcode-product-workflow-blocks.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-product-workflow-blocks.txt
+
+if rg -n 'fn migrate\(|ALTER TABLE workflow_|UPDATE workflow_store_contract SET schema_version' \
+  packages/workflow-store/src/lib.rs >/tmp/bcode-workflow-store-compatibility.txt 2>/dev/null; then
+  echo "Composable workflow compatibility violation: obsolete store migration paths remain." >&2
+  cat /tmp/bcode-workflow-store-compatibility.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-workflow-store-compatibility.txt
+
 if ! rg -q 'pub const WORKFLOW_SOURCE_DOCUMENT_VERSION: u32 = 3;' packages/workflow/src/lib.rs; then
   echo "Composable workflow source violation: clean source-v3 boundary drifted." >&2
   violations=1

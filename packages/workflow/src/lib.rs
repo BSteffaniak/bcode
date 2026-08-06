@@ -4637,6 +4637,8 @@ pub const MAX_WORKFLOW_PACKAGE_MEMBER_DEPENDENCIES: usize = 32;
 pub const MAX_WORKFLOW_PACKAGE_DEPTH: usize = 8;
 /// Maximum aggregate package source bytes.
 pub const MAX_WORKFLOW_PACKAGE_SOURCE_BYTES: usize = 4_194_304;
+/// Maximum total direct dependency edges in one package.
+pub const MAX_WORKFLOW_PACKAGE_EDGES: usize = 1_024;
 
 /// Current pure workflow package planning result version.
 pub const WORKFLOW_PACKAGE_PLAN_VERSION: u32 = 1;
@@ -4747,6 +4749,19 @@ impl WorkflowPackagePreview {
                 .members
                 .iter()
                 .all(|member| member.compilation.is_compiled())
+    }
+
+    /// Return package-qualified diagnostics remapped through every member source map.
+    #[must_use]
+    pub fn remapped_diagnostics(&self) -> Vec<WorkflowValidationDiagnostic> {
+        self.members
+            .iter()
+            .flat_map(|member| {
+                member
+                    .source_map
+                    .remap_diagnostics(&member.compilation.validation.diagnostics)
+            })
+            .collect()
     }
 }
 
@@ -5590,6 +5605,7 @@ impl WorkflowPackageManifest {
         let mut by_id = BTreeMap::new();
         let mut source_names = BTreeSet::new();
         let mut total_bytes = 0_usize;
+        let mut total_edges = 0_usize;
         for (index, member) in self.members.iter().enumerate() {
             validate_authoring_id(
                 &format!("package.members[{index}].member_id"),
@@ -5600,6 +5616,11 @@ impl WorkflowPackageManifest {
                 .checked_add(member.source.len())
                 .ok_or_else(|| {
                     authoring_error("package.members", "package source byte count overflow")
+                })?;
+            total_edges = total_edges
+                .checked_add(member.dependencies.len())
+                .ok_or_else(|| {
+                    authoring_error("package.members", "package dependency edge count overflow")
                 })?;
             if member.source.is_empty()
                 || member.dependencies.len() > MAX_WORKFLOW_PACKAGE_MEMBER_DEPENDENCIES
@@ -5623,6 +5644,12 @@ impl WorkflowPackageManifest {
             return Err(authoring_error(
                 "package.members",
                 format!("package source exceeds {MAX_WORKFLOW_PACKAGE_SOURCE_BYTES} bytes"),
+            ));
+        }
+        if total_edges > MAX_WORKFLOW_PACKAGE_EDGES {
+            return Err(authoring_error(
+                "package.members.dependencies",
+                format!("package dependency graph exceeds {MAX_WORKFLOW_PACKAGE_EDGES} edges"),
             ));
         }
         for (name, member_id) in &self.exports {
@@ -14234,6 +14261,37 @@ mod tests {
         .remap_package_member_diagnostics(&plan.members[0].member_source_map);
         assert_eq!(
             report.diagnostics[0].document_path,
+            "package.members.member.source.steps[0].configuration"
+        );
+        let preview = WorkflowPackagePreview {
+            version: WORKFLOW_PACKAGE_PREVIEW_VERSION,
+            package_id: manifest.package_id.clone(),
+            members: vec![WorkflowPackageMemberPreview {
+                member_id: "member".to_string(),
+                source_name: "member.yaml".to_string(),
+                source_map: plan.members[0].member_source_map.clone(),
+                compilation: WorkflowCompilationPreview {
+                    version: WORKFLOW_COMPILATION_PREVIEW_VERSION,
+                    validation: WorkflowValidationReport {
+                        authoring_version: WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+                        valid: false,
+                        source_digest_sha256: None,
+                        executable_source_digest_sha256: None,
+                        diagnostics: vec![WorkflowValidationDiagnostic {
+                            severity: WorkflowValidationSeverity::Error,
+                            code: "node".to_string(),
+                            document_path: "definition.nodes.input.configuration".to_string(),
+                            message: "node".to_string(),
+                            remediation: "fix node".to_string(),
+                        }],
+                    },
+                    compiled: None,
+                },
+            }],
+            lock: plan.lock.clone(),
+        };
+        assert_eq!(
+            preview.remapped_diagnostics()[0].document_path,
             "package.members.member.source.steps[0].configuration"
         );
 
