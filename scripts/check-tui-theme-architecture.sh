@@ -116,6 +116,11 @@ if rg -n 'color\.r, color\.g, color\.b|foreground_r|foreground_g|foreground_b' \
   fail "syntax theme propagation must preserve terminal, ANSI, indexed, and RGB colors"
 fi
 
+if rg -n 'added_row: style\("diff\.added_row"\)\.unwrap_or_else\(bmux_tui::style::Style::new\)|removed_row: style\("diff\.removed_row"\)\.unwrap_or_else\(bmux_tui::style::Style::new\)|diff\.added_emphasis[\s\S]*Modifier::UNDERLINE|diff\.removed_emphasis[\s\S]*Modifier::UNDERLINE' \
+  packages/tui/src/theme.rs; then
+  fail "missing diff theme roles must retain visible changed-row and intraline backgrounds"
+fi
+
 if rg -n 'frame\.fill\(area,[^\n]*Color::Black' \
   plugins/code-review-plugin/src/code_review_tui_render.rs; then
   fail "code-review full-screen canvas must use renderer-owned theme presentation"

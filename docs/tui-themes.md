@@ -106,7 +106,7 @@ Layouts are `plain`, `left_bar`, or `panel`; widths are `content` or `full`; bor
 
 ### Terminal-native inheritance
 
-Use terminal defaults and override only one semantic role:
+Use terminal defaults and override only one semantic role. Unspecified diff row and intraline-emphasis roles retain Bcode's default green/red backgrounds; define those roles explicitly when a theme intentionally wants another treatment.
 
 ```toml
 schema_version = 1

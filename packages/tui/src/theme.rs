@@ -489,22 +489,19 @@ pub(crate) fn resolved_definition_theme(
         gutter: style("source.gutter").unwrap_or(muted),
         truncated: style("source.truncated").unwrap_or(muted),
     };
+    let default_diff = bcode_tui_components::diff_viewer::DiffViewerStyle::default();
     let diff = bcode_tui_components::diff_viewer::DiffViewerStyle {
         text: style("diff.text").unwrap_or(text),
         muted: style("diff.muted").unwrap_or(muted),
         title: style("diff.title").unwrap_or(focused),
         label: style("diff.label").unwrap_or_else(|| text.add_modifier(Modifier::BOLD)),
-        added: style("diff.added")
-            .unwrap_or_else(|| bmux_tui::style::Style::new().fg(Color::Green)),
-        removed: style("diff.removed")
-            .unwrap_or_else(|| bmux_tui::style::Style::new().fg(Color::Red)),
+        added: style("diff.added").unwrap_or(default_diff.added),
+        removed: style("diff.removed").unwrap_or(default_diff.removed),
         hunk: style("diff.hunk").unwrap_or(focused),
-        added_row: style("diff.added_row").unwrap_or_else(bmux_tui::style::Style::new),
-        removed_row: style("diff.removed_row").unwrap_or_else(bmux_tui::style::Style::new),
-        added_emphasis: style("diff.added_emphasis")
-            .unwrap_or_else(|| bmux_tui::style::Style::new().add_modifier(Modifier::UNDERLINE)),
-        removed_emphasis: style("diff.removed_emphasis")
-            .unwrap_or_else(|| bmux_tui::style::Style::new().add_modifier(Modifier::UNDERLINE)),
+        added_row: style("diff.added_row").unwrap_or(default_diff.added_row),
+        removed_row: style("diff.removed_row").unwrap_or(default_diff.removed_row),
+        added_emphasis: style("diff.added_emphasis").unwrap_or(default_diff.added_emphasis),
+        removed_emphasis: style("diff.removed_emphasis").unwrap_or(default_diff.removed_emphasis),
     };
     let default_container = definition::ContainerRecipe {
         layout: definition::ContainerLayout::Plain,
@@ -758,6 +755,40 @@ mod capability_tests {
             ),
             definition::ResolvedThemeVariant::Light
         );
+    }
+
+    #[test]
+    fn terminal_native_diff_fallbacks_preserve_changed_row_backgrounds() {
+        let catalog = definition::ThemeCatalog::bundled().expect("bundled themes parse");
+        for theme_id in ["terminal-native", "terminal-native-structured"] {
+            let resolved = catalog
+                .resolve(&definition::ThemeSelection::new(theme_id))
+                .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+            let presented =
+                resolved_definition_theme(Some(&resolved), PENDING_AGENT_METADATA_ACCENT)
+                    .presented(PENDING_AGENT_METADATA_ACCENT);
+
+            assert!(presented.diff.added_row.bg.is_some(), "{theme_id}");
+            assert!(presented.diff.removed_row.bg.is_some(), "{theme_id}");
+            assert!(presented.diff.added_emphasis.bg.is_some(), "{theme_id}");
+            assert!(presented.diff.removed_emphasis.bg.is_some(), "{theme_id}");
+            assert!(
+                !presented
+                    .diff
+                    .added_emphasis
+                    .modifiers
+                    .contains(Modifier::UNDERLINE),
+                "{theme_id}"
+            );
+            assert!(
+                !presented
+                    .diff
+                    .removed_emphasis
+                    .modifiers
+                    .contains(Modifier::UNDERLINE),
+                "{theme_id}"
+            );
+        }
     }
 
     #[test]
