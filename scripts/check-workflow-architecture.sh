@@ -221,9 +221,8 @@ fi
 
 if ! rg -q 'explicit_grant_required = true' plugins/shell-plugin/bcode-plugin.toml \
   || ! rg -q 'reconciliation[[:space:]]*=[[:space:]]*"repair_required"' plugins/shell-plugin/bcode-plugin.toml \
-  || ! rg -q 'explicit_grant_required = true' plugins/git-plugin/bcode-plugin.toml \
-  || ! rg -q 'reconciliation[[:space:]]*=[[:space:]]*"repair_required"' plugins/git-plugin/bcode-plugin.toml; then
-  echo "Workflow mutation contract violation: mutating shell/Git blocks require exact grants and safe reconciliation." >&2
+  || rg -q 'bcode\.workflow-block/v1|workflow_blocks' plugins/git-plugin/bcode-plugin.toml; then
+  echo "Workflow mutation contract violation: shell requires safe authorization/reconciliation and Git must not own workflow operations." >&2
   violations=1
 fi
 

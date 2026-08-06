@@ -209,10 +209,6 @@ static-bundled-plugins = [
     "bcode_bundled_plugins/static-bundled-plugins",
     "bcode_cli/static-bundled-plugins",
 ]
-static-bundled-progress-doc-plugin = [
-    "bundled-plugins",
-    "bcode_bundled_plugins/static-bundled-progress-doc-plugin",
-]
 static-bundled-question-plugin = [
     "bundled-plugins",
     "cli",

@@ -24,7 +24,6 @@ bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_session_models = { workspace = true }
 bcode_session_view_models = { workspace = true }
 bcode_syntax_render = { workspace = true }
-bcode_workflow = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["crossterm", "diff"] }

@@ -1414,6 +1414,7 @@ mod tests {
             definition_version: 1,
             workspace_snapshot: ".".to_string(),
             parent_session_id: None,
+            parent_session_generation: None,
             binding: None,
             authored_provenance: None,
             terminal_output_id: None,
@@ -1439,6 +1440,7 @@ mod tests {
             definition_version: 1,
             workspace_snapshot: "snapshot".to_string(),
             parent_session_id: None,
+            parent_session_generation: None,
             binding: Some(bcode_workflow_store::WorkflowRunBinding {
                 owner_plugin_id: PLUGIN_ID.to_string(),
                 workflow_kind: WORKFLOW_KIND.to_string(),
@@ -1467,6 +1469,7 @@ mod tests {
             definition_version: 1,
             workspace_snapshot: "snapshot".to_string(),
             parent_session_id: None,
+            parent_session_generation: None,
             binding: None,
             authored_provenance: None,
             terminal_output_id: None,

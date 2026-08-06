@@ -234,8 +234,6 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(opencode_session_import_plugin());
     #[cfg(feature = "static-bundled-pi-session-import-plugin")]
     plugins.push(pi_session_import_plugin());
-    #[cfg(feature = "static-bundled-progress-doc-plugin")]
-    plugins.push(progress_doc_plugin());
     #[cfg(feature = "static-bundled-question-plugin")]
     plugins.push(question_plugin());
     #[cfg(feature = "static-bundled-loop-plugin")]
@@ -387,14 +385,6 @@ fn pi_session_import_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
         bcode_pi_session_import_plugin::static_plugin(),
-    )
-}
-
-#[cfg(feature = "static-bundled-progress-doc-plugin")]
-fn progress_doc_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/progress-doc-plugin/bcode-plugin.toml"),
-        bcode_progress_doc_plugin::static_plugin(),
     )
 }
 
@@ -611,46 +601,6 @@ mod tests {
         paths
     }
 
-    #[cfg(feature = "static-bundled-progress-doc-plugin")]
-    #[test]
-    fn progress_document_bundle_is_disableable_without_affecting_other_plugins() {
-        let static_plugins = super::static_bundled_plugins();
-        let enabled = bcode_plugin::filter_selected_static_plugins(
-            &static_plugins,
-            &bcode_plugin::PluginSelection::all_enabled(),
-        )
-        .expect("static plugin manifests parse");
-        let manifest = enabled
-            .iter()
-            .find_map(|(manifest, _)| (manifest.id == "bcode.progress-doc").then_some(manifest))
-            .expect("progress-document plugin is included in the static bundle");
-        assert_eq!(manifest.services[0].workflow_blocks.len(), 4);
-
-        let selection = bcode_plugin::PluginSelection {
-            mode: bcode_plugin::PluginSelectionMode::All,
-            enabled: std::collections::BTreeSet::new(),
-            disabled: std::collections::BTreeSet::from(["bcode.progress-doc".to_owned()]),
-        };
-        let selected = bcode_plugin::filter_selected_static_plugins(&static_plugins, &selection)
-            .expect("disabled static plugin selection parses");
-        assert!(
-            selected
-                .iter()
-                .all(|(manifest, _)| manifest.id != "bcode.progress-doc")
-        );
-        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &selection,
-            &static_plugins,
-        )
-        .expect("disabled static plugin host should load");
-        assert!(
-            !host
-                .plugin_ids()
-                .iter()
-                .any(|id| id == "bcode.progress-doc")
-        );
-    }
-
     #[cfg(feature = "static-bundled-loop-plugin")]
     #[test]
     fn disabling_loop_removes_all_manifest_contributions() {
@@ -751,7 +701,6 @@ mod tests {
         feature = "static-bundled-openai-compatible-provider-plugin",
         feature = "static-bundled-opencode-session-import-plugin",
         feature = "static-bundled-pi-session-import-plugin",
-        feature = "static-bundled-progress-doc-plugin",
         feature = "static-bundled-question-plugin",
         feature = "static-bundled-ralph-plugin",
         feature = "static-bundled-read-plugin",

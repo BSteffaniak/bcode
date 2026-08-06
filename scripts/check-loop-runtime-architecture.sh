@@ -1368,11 +1368,13 @@ if {
   violations=1
 fi
 
-if ! grep -F 'template_id           = "implementation-verification-commit"' plugins/workflow-plugin/bcode-plugin.toml >/dev/null \
-  || ! grep -F 'required_plugins      = ["bcode.shell", "bcode.git"]' plugins/workflow-plugin/bcode-plugin.toml >/dev/null; then
-  echo "Runtime architecture violation: reference-template identity/requirements must remain workflow-plugin owned." >&2
+if rg -n 'implementation-verification-commit|required_plugins[[:space:]]*=[[:space:]]*\["bcode\.shell", "bcode\.git"\]' \
+  plugins/workflow-plugin/bcode-plugin.toml >/tmp/bcode-specialized-reference-template.txt; then
+  echo "Runtime architecture violation: hardcoded shell/Git reference template remains workflow-plugin owned." >&2
+  cat /tmp/bcode-specialized-reference-template.txt >&2
   violations=1
 fi
+rm -f /tmp/bcode-specialized-reference-template.txt
 
 if rg -n 'crossterm(_event)?::read\(|TuiInput::(new|recv)|run_onboarding_loop' \
   packages/tui/src --glob '*.rs' >/tmp/bcode-tui-direct-input-loops.txt; then

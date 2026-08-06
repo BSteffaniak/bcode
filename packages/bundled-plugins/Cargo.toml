@@ -31,7 +31,6 @@ bcode_opencode_session_import_plugin    = { workspace = true, optional = true }
 bcode_pi_session_import_plugin          = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true }
 bcode_plugin_sdk                        = { workspace = true, features = ["tui"] }
-bcode_progress_doc_plugin               = { workspace = true, optional = true }
 bcode_question_plugin                   = { workspace = true, optional = true }
 bcode_ralph_plugin                      = { workspace = true, optional = true }
 bcode_read_plugin                       = { workspace = true, optional = true }
@@ -162,7 +161,6 @@ static-bundled-plugins = [
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
-    "static-bundled-progress-doc-plugin",
     "static-bundled-question-plugin",
     "static-bundled-loop-plugin",
     "static-bundled-ralph-plugin",
@@ -174,10 +172,6 @@ static-bundled-plugins = [
     "static-bundled-web-search-plugin",
     "static-bundled-worktree-plugin",
     "static-bundled-workflow-plugin",
-]
-static-bundled-progress-doc-plugin = [
-    "dep:bcode_progress_doc_plugin",
-    "bcode_progress_doc_plugin/static-bundled",
 ]
 static-bundled-question-plugin = [
     "dep:bcode_question_plugin",

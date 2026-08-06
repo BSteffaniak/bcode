@@ -35,18 +35,18 @@ use bcode_code_review_models::{
     OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse, PublishReviewRequest,
     PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse, ResolveThreadRequest,
     ResolveThreadResponse, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind,
-    ReviewAssignment, ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewConsensus,
-    ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine,
-    ReviewLineKind, ReviewPanelAssignmentRequest, ReviewPanelResult, ReviewPublishRecord,
-    ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewReport, ReviewRepositoryCommit,
-    ReviewScope, ReviewSource, ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity,
-    ReviewSourceKind, ReviewSuggestion, ReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind,
-    ReviewTarget, ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspaceListItem,
-    ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse,
-    SaveExternalReviewImportRequest, SaveExternalReviewImportResponse, SavePublishRecordRequest,
-    SavePublishRecordResponse, SaveReviewAiExchangeRequest, SaveReviewAiExchangeResponse,
-    SaveReviewSuggestionRequest, SaveReviewSuggestionResponse, UpdateDraftRequest,
-    UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
+    ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
+    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
+    ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
+    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSuggestion, ReviewSuggestionStatus,
+    ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind, ReviewThreadSeverity,
+    ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization, SaveDraftRequest,
+    SaveDraftResponse, SaveExternalReviewImportRequest, SaveExternalReviewImportResponse,
+    SavePublishRecordRequest, SavePublishRecordResponse, SaveReviewAiExchangeRequest,
+    SaveReviewAiExchangeResponse, SaveReviewSuggestionRequest, SaveReviewSuggestionResponse,
+    UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
+    UpdateReviewWorkspaceResponse,
 };
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
@@ -54,7 +54,6 @@ use bcode_command::{
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
-use bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -148,26 +147,6 @@ pub struct CodeReviewPluginConfig {
     pub state_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ValidateReviewReportRequest {
-    assignment: ReviewAssignment,
-    report: ReviewReport,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ValidateReviewConsensusRequest {
-    panel: ReviewPanelResult,
-    consensus: ReviewConsensus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewContractValidationResponse {
-    valid: bool,
-}
-
 /// local code review plugin.
 #[derive(Default)]
 pub struct CodeReviewPlugin;
@@ -182,19 +161,6 @@ impl RustPlugin for CodeReviewPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id == COMMAND_INTERFACE_ID {
             return invoke_command_service(&context.request);
-        }
-        if context.request.interface_id == WORKFLOW_BLOCK_INTERFACE_ID {
-            return match context.request.operation.as_str() {
-                OP_REVIEW_BUNDLE_GET => review_bundle_get(&context),
-                OP_REVIEW_ASSIGNMENT_VALIDATE => review_assignment_validate(&context),
-                OP_REVIEW_ASSIGNMENTS_MATERIALIZE => review_assignments_materialize(&context),
-                OP_REVIEW_REPORT_VALIDATE => review_report_validate(&context),
-                OP_REVIEW_CONSENSUS_VALIDATE => review_consensus_validate(&context),
-                _ => ServiceResponse::error(
-                    "unsupported_operation",
-                    "unsupported code review workflow block operation",
-                ),
-            };
         }
         if context.request.interface_id != CODE_REVIEW_SERVICE_INTERFACE_ID {
             return ServiceResponse::error(
@@ -780,92 +746,10 @@ fn review_diff_get(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
-fn review_assignments_materialize(context: &NativeServiceContext) -> ServiceResponse {
-    let invocation = match context
-        .request
-        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
-    {
-        Ok(invocation) => invocation,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-    let request = match invocation.typed_input::<ReviewPanelAssignmentRequest>() {
-        Ok(request) => request,
-        Err(error) => return ServiceResponse::error("invalid_request", error),
-    };
-    match request.materialize() {
-        Ok(assignments) => json_response(&assignments),
-        Err(error) => ServiceResponse::error("invalid_review_panel", error.to_string()),
-    }
-}
-
-fn review_assignment_validate(context: &NativeServiceContext) -> ServiceResponse {
-    let invocation = match context
-        .request
-        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
-    {
-        Ok(invocation) => invocation,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-    let assignment = match invocation.typed_input::<ReviewAssignment>() {
-        Ok(assignment) => assignment,
-        Err(error) => return ServiceResponse::error("invalid_request", error),
-    };
-    match assignment.validate() {
-        Ok(()) => json_response(&ReviewContractValidationResponse { valid: true }),
-        Err(error) => ServiceResponse::error("invalid_review_assignment", error.to_string()),
-    }
-}
-
-fn review_report_validate(context: &NativeServiceContext) -> ServiceResponse {
-    let invocation = match context
-        .request
-        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
-    {
-        Ok(invocation) => invocation,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-    let request = match invocation.typed_input::<ValidateReviewReportRequest>() {
-        Ok(request) => request,
-        Err(error) => return ServiceResponse::error("invalid_request", error),
-    };
-    match request
-        .report
-        .validate_against_assignment(&request.assignment)
-    {
-        Ok(()) => json_response(&ReviewContractValidationResponse { valid: true }),
-        Err(error) => ServiceResponse::error("invalid_review_report", error.to_string()),
-    }
-}
-
-fn review_consensus_validate(context: &NativeServiceContext) -> ServiceResponse {
-    let invocation = match context
-        .request
-        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
-    {
-        Ok(invocation) => invocation,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-    let request = match invocation.typed_input::<ValidateReviewConsensusRequest>() {
-        Ok(request) => request,
-        Err(error) => return ServiceResponse::error("invalid_request", error),
-    };
-    match request.consensus.validate_against_panel(&request.panel) {
-        Ok(()) => json_response(&ReviewContractValidationResponse { valid: true }),
-        Err(error) => ServiceResponse::error("invalid_review_consensus", error.to_string()),
-    }
-}
-
 fn review_bundle_get(context: &NativeServiceContext) -> ServiceResponse {
-    let invocation = match context
-        .request
-        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
-    {
-        Ok(invocation) => invocation,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-    let request = match invocation.typed_input::<PublishReviewRequest>() {
+    let request = match context.request.payload_json::<PublishReviewRequest>() {
         Ok(request) => request,
-        Err(error) => return ServiceResponse::error("invalid_request", error),
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
     let config = match plugin_config(context) {
         Ok(config) => config,
