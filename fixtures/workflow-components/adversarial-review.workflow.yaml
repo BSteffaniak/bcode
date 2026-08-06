@@ -88,4 +88,4 @@ steps:
     parallel:
       left: correctness_review
       right: security_review
-      failure_policy: collect_all
+      failure_policy: wait_all

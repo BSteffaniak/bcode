@@ -13555,7 +13555,7 @@ mod workflow_source_tests {
         let loaded = read_workflow_package_manifest(&manifest).expect("component package");
         loaded.validate().expect("valid component package manifest");
         assert_eq!(loaded.package_id, "bcode/generic-source-components");
-        assert_eq!(loaded.members.len(), 13);
+        assert_eq!(loaded.members.len(), 14);
         assert!(loaded.exports.contains_key("run-command-and-assert"));
         assert!(loaded.exports.contains_key("non-git-data-quality"));
         assert!(
@@ -13612,6 +13612,8 @@ mod workflow_source_tests {
             )
             .expect("component lowers through ordinary source contract");
         }
+        bcode_workflow::plan_workflow_package(&loaded, &catalog)
+            .expect("complete source component package plans");
     }
 
     #[test]

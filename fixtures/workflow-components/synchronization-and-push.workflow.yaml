@@ -18,7 +18,7 @@ steps:
         git push
       shell: [sh, -c]
       cwd: .
-      timeout_ms: 480000
+      timeout_ms: 300000
       accepted_exit_codes: [0]
       continue_on_unaccepted_exit: false
       output: {preview_bytes: 16384, artifact_spill: true}

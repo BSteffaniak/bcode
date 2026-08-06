@@ -12,6 +12,7 @@ exports:
   progress-planning-and-refocus: progress-planning-and-refocus
   completion-evaluation: completion-evaluation
   non-git-data-quality: non-git-data-quality
+  feature-delivery: feature-delivery
 members:
   - member_id: interaction-state
     source_name: interaction-state.workflow.yaml
@@ -44,3 +45,17 @@ members:
     source_name: completion-evaluation.workflow.yaml
   - member_id: non-git-data-quality
     source_name: non-git-data-quality.workflow.yaml
+  - member_id: feature-delivery
+    source_name: feature-delivery.workflow.yaml
+    dependencies:
+      - run-command-and-assert
+      - prompt-and-verify
+      - bounded-remediation
+      - adversarial-review
+      - conflict-resolution
+      - validation-and-formatting
+      - checkpoint
+      - synchronization-and-push
+      - progress-planning-and-refocus
+      - completion-evaluation
+      - interaction-state

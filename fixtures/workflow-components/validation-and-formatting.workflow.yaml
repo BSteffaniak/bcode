@@ -28,7 +28,7 @@ steps:
         cargo clippy --workspace --all-targets -- -D warnings
       shell: [sh, -c]
       cwd: .
-      timeout_ms: 1200000
+      timeout_ms: 300000
       accepted_exit_codes: [0]
       continue_on_unaccepted_exit: false
       output: {preview_bytes: 32768, artifact_spill: true}

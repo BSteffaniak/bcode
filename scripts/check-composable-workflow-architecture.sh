@@ -177,7 +177,9 @@ if [[ ! -f fixtures/workflow-components/package.workflow-package.yaml ]] \
   || ! rg -q 'run-command-and-assert' fixtures/workflow-components/package.workflow-package.yaml \
   || ! rg -q 'prompt-and-verify' fixtures/workflow-components/package.workflow-package.yaml \
   || ! rg -q 'completion-evaluation' fixtures/workflow-components/package.workflow-package.yaml \
-  || ! rg -q 'non-git-data-quality' fixtures/workflow-components/package.workflow-package.yaml; then
+  || ! rg -q 'non-git-data-quality' fixtures/workflow-components/package.workflow-package.yaml \
+  || ! rg -q 'feature-delivery' fixtures/workflow-components/package.workflow-package.yaml \
+  || ! rg -q 'package_call' fixtures/workflow-components/feature-delivery.workflow.yaml; then
   echo "Composable workflow source-component violation: generic source package inventory drifted." >&2
   violations=1
 fi
@@ -189,6 +191,24 @@ if rg -ni '(^|[^a-z])git([[:space:]]|[-_./])' fixtures/workflow-components/non-g
   violations=1
 fi
 rm -f /tmp/bcode-non-git-workflow-leaks.txt
+
+if rg -n 'force-with-lease|force[[:space:]]+push|push[[:space:]]+--force' \
+  fixtures/workflow-components --glob '*.yaml' --glob '*.md' \
+  >/tmp/bcode-flagship-force-push.txt 2>/dev/null; then
+  echo "Composable workflow flagship violation: source package contains force-push behavior." >&2
+  cat /tmp/bcode-flagship-force-push.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-flagship-force-push.txt
+
+if rg -n 'bcode\.(git|code-review|progress-doc|workflow-product)/' \
+  fixtures/workflow-components --glob '*.yaml' --glob '*.json' \
+  >/tmp/bcode-flagship-specialized-actions.txt 2>/dev/null; then
+  echo "Composable workflow flagship violation: source package uses specialized product blocks." >&2
+  cat /tmp/bcode-flagship-specialized-actions.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-flagship-specialized-actions.txt
 
 if ! grep -F 'The TUI owns terminal canvas layout' "$architecture" >/dev/null \
   || ! grep -F 'Unrestricted JSON Patch is not the primary contract' "$architecture" >/dev/null; then

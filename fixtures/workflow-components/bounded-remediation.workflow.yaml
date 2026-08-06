@@ -23,7 +23,7 @@ steps:
             - {kind: field, name: status}
         value: needs_remediation
       max_iterations: 3
-      exhaustion_policy: emit_outcome
+      exhaustion_policy: fail
   - id: verify_after_remediation
     name: Verify after bounded remediation
     run:

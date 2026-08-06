@@ -6089,7 +6089,7 @@ impl WorkflowStructuredSourceDocument {
             .map(|(index, step)| (step.id.as_str(), index))
             .collect::<BTreeMap<_, _>>();
         for (index, step) in self.steps.iter().enumerate() {
-            if step.input_from.is_some() || step.when.is_some() {
+            if step.input_from.is_some() {
                 // Referenced dependency payloads are canonical runtime input; action `with` values
                 // remain schema-checked authoring data but must not replace the selected edge.
                 document.plugin_input_defaults.remove(&step.id);
@@ -6235,10 +6235,24 @@ impl WorkflowStructuredSourceDocument {
                     "structured step did not lower to a canonical node",
                 )
             })?;
-            if selected_schema.schema != target.input.schema {
+            let uses_selected_input = condition.source.select.is_some();
+            let uses_dependency_input = step.input_from.is_some();
+            let condition_gate = matches!(
+                step.operation,
+                WorkflowStructuredSourceOperation::Input(_)
+                    | WorkflowStructuredSourceOperation::Approval(_)
+            );
+            if uses_selected_input || uses_dependency_input || condition_gate {
+                if selected_schema.schema != target.input.schema {
+                    return Err(authoring_error(
+                        format!("steps[{index}].when"),
+                        "condition source output and target input schemas must match exactly",
+                    ));
+                }
+            } else if edge.transform.is_none() {
                 return Err(authoring_error(
                     format!("steps[{index}].when"),
-                    "condition source output and target input schemas must match exactly",
+                    "condition-only dependencies require static source input or an explicit input_from",
                 ));
             }
             let predicate = if let Some(selector) = &condition.source.select {
@@ -6288,7 +6302,6 @@ impl WorkflowStructuredSourceDocument {
     ) -> Result<(), WorkflowError> {
         for (index, step) in self.steps.iter().enumerate() {
             if step.input_from.is_some()
-                || step.when.is_some()
                 || matches!(
                     &step.operation,
                     WorkflowStructuredSourceOperation::Parallel(_)

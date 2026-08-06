@@ -106,6 +106,12 @@ copy or replace them and publication still goes through the ordinary package bou
 A non-Git package must prove that the same shell, prompt, condition, retry, fan-out, and package
 primitives are generic.
 
+The flagship `feature-delivery` export is part of that ordinary package. It composes exact local
+children for validation, review, completion evaluation, checkpointing, synchronization, conflict
+resolution, and refocus. Commands, prompts, typed gates, limits, skill requests, context isolation,
+and non-force synchronization remain visible in source; no specialized Git, review, progress, or
+skill workflow service is required.
+
 ## Package and publication authority
 
 A package contains bounded confined source members and exact local or external dependencies. Parsing
