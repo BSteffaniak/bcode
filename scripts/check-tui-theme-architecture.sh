@@ -107,6 +107,11 @@ if rg -n 'syntax_palette:\s*None' \
   fail "filesystem source/diff adapters must not bypass the active syntax theme"
 fi
 
+if rg -n 'themes\.themes\.values\(\)\.next\(\)' \
+  packages/syntax-render/src/lib.rs; then
+  fail "syntax classification must select its canonical theme deterministically"
+fi
+
 if rg -n 'color\.r, color\.g, color\.b|foreground_r|foreground_g|foreground_b' \
   packages/tui/src \
   packages/tui-components/src \

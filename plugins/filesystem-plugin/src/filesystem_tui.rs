@@ -710,6 +710,54 @@ const fn muted() -> Style {
 mod tests {
     use super::*;
 
+    fn terminal_native_syntax_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffTheme, PluginTuiSourceTheme, PluginTuiSyntaxColor, PluginTuiSyntaxTheme,
+            PluginTuiTheme,
+        };
+
+        let style = Style::new();
+        PluginTuiTheme {
+            canvas: style,
+            text: style,
+            muted: style.fg(Color::BrightBlack),
+            border: style.fg(Color::BrightBlack),
+            focused: style.fg(Color::Cyan),
+            selection: style,
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style.fg(Color::BrightBlack),
+                gutter: style.fg(Color::BrightBlack),
+                truncated: style.fg(Color::BrightBlack),
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: PluginTuiSyntaxColor::from_tui(Color::Default),
+                comment: PluginTuiSyntaxColor::from_tui(Color::BrightBlack),
+                keyword: PluginTuiSyntaxColor::from_tui(Color::Blue),
+                function: PluginTuiSyntaxColor::from_tui(Color::Cyan),
+                variable: PluginTuiSyntaxColor::from_tui(Color::BrightCyan),
+                string: PluginTuiSyntaxColor::from_tui(Color::Green),
+                number: PluginTuiSyntaxColor::from_tui(Color::Yellow),
+                type_name: PluginTuiSyntaxColor::from_tui(Color::Cyan),
+                operator: PluginTuiSyntaxColor::from_tui(Color::Default),
+                punctuation: PluginTuiSyntaxColor::from_tui(Color::Default),
+            },
+        }
+    }
+
     fn line_text(line: &Line) -> String {
         line.spans
             .iter()
@@ -977,15 +1025,17 @@ mod tests {
             "start_line": 9,
             "truncated": false
         });
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+            None,
+        )
+        .with_theme(terminal_native_syntax_theme());
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
             &FilesystemTuiVisualAdapter,
             "bcode.filesystem.read",
             &payload,
-            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
-                80,
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
-                None,
-            ),
+            &context,
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("9 │ pub fn main() {}"), "{rendered}");
@@ -994,8 +1044,25 @@ mod tests {
         assert!(
             rows.iter()
                 .flat_map(|line| line.spans.iter())
-                .any(|span| span.content.as_str() == "p" && span.style.fg.is_some()),
-            "expected highlighted Rust source spans: {rows:?}"
+                .any(|span| span.style.fg == Some(Color::Blue)),
+            "expected themed Rust keyword spans: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style.fg == Some(Color::Yellow)),
+            "expected themed Rust number spans: {rows:?}"
+        );
+        assert!(
+            [Color::Blue, Color::Cyan, Color::BrightCyan, Color::Yellow]
+                .into_iter()
+                .filter(|color| rows
+                    .iter()
+                    .flat_map(|line| line.spans.iter())
+                    .any(|span| span.style.fg == Some(*color)))
+                .count()
+                >= 3,
+            "expected multiple syntax colors in themed file contents: {rows:?}"
         );
     }
 

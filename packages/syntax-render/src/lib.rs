@@ -279,7 +279,11 @@ fn syntax_set() -> &'static SyntaxSet {
 fn classification_theme() -> &'static Theme {
     DEFAULT_THEME.get_or_init(|| {
         let themes = ThemeSet::load_defaults();
-        themes.themes.values().next().cloned().unwrap_or_default()
+        themes
+            .themes
+            .get("base16-ocean.dark")
+            .cloned()
+            .unwrap_or_else(|| panic!("Syntect default themes must include base16-ocean.dark"))
     })
 }
 
@@ -503,16 +507,27 @@ mod tests {
             operator: SyntaxColor::rgb(9, 9, 9),
             punctuation: SyntaxColor::rgb(10, 10, 10),
         };
+        let lines = ["// comment", "pub fn main() { let value = 42; }"];
         let spans = SyntaxHighlighter::with_palette(palette)
-            .highlight_line_tokens("rust", "// comment\nfn main() { let value = 42; }");
+            .highlight_lines_tokens("rust", &lines)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let colors = spans
+            .iter()
+            .map(|span| span.style.foreground)
+            .collect::<Vec<_>>();
 
-        assert!(spans.iter().all(|span| {
-            matches!(
-                span.style.foreground,
-                SyntaxColor::Rgb(red, green, blue)
-                    if (1..=10).contains(&red) && green == red && blue == red
-            )
-        }));
+        assert!(colors.contains(&palette.comment), "{spans:?}");
+        assert!(colors.contains(&palette.keyword), "{spans:?}");
+        assert!(colors.contains(&palette.function), "{spans:?}");
+        assert!(colors.contains(&palette.number), "{spans:?}");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.style.foreground != palette.text),
+            "semantic highlighting collapsed to plain text: {spans:?}"
+        );
     }
 
     #[test]
