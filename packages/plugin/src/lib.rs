@@ -19,7 +19,9 @@ use bcode_plugin_sdk::{
     ServiceCancellationWaitCallback, ServiceEventCallback, ServiceRequest, StaticPluginVtable,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
-pub use bcode_provider_auth_models::{AuthContractError, AuthProviderContribution};
+pub use bcode_provider_auth_models::{
+    AuthContractError, AuthMethodContribution, AuthProviderContribution,
+};
 
 /// Authentication provider contribution with canonical host-attached plugin ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]

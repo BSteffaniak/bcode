@@ -4260,6 +4260,61 @@ pub struct DiscoveredPluginTool {
     pub definition: ToolDefinition,
 }
 
+/// Non-secret authentication method advertised by an enabled provider plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupAuthMethod {
+    /// Provider-local authentication method ID.
+    pub method_id: String,
+    /// Human-readable method name supplied by the provider plugin.
+    pub display_name: String,
+}
+
+/// Non-secret authentication status for one configured model candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupAuthReport {
+    /// Plugin-owned authentication provider ID, when one can be selected safely.
+    pub provider_id: Option<String>,
+    /// Human-readable provider name supplied by the provider plugin.
+    pub display_name: Option<String>,
+    /// Plugin that owns the authentication provider.
+    pub owner_plugin_id: Option<String>,
+    /// Resolved profile name, when configured declaratively or at runtime.
+    pub profile: Option<String>,
+    /// Whether non-secret configuration indicates usable authentication.
+    pub ready: bool,
+    /// Authentication methods advertised by the enabled provider plugin.
+    pub methods: Vec<ProviderSetupAuthMethod>,
+}
+
+/// One effective or named model candidate from Bcode configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupCandidateReport {
+    /// Named model profile, or `None` for the effective default selection.
+    pub model_profile: Option<String>,
+    /// Selected model provider plugin ID.
+    pub provider_plugin_id: String,
+    /// Selected provider-native model ID.
+    pub model_id: String,
+    /// Authentication readiness and provider-owned setup metadata.
+    pub auth: ProviderSetupAuthReport,
+}
+
+/// Safe read-only provider setup report for embedding applications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupReport {
+    /// Effective default followed by configured named model profiles.
+    pub candidates: Vec<ProviderSetupCandidateReport>,
+}
+
+#[cfg(all(feature = "config", feature = "embedded-plugins"))]
+struct ProviderSetupCandidateInput<'a> {
+    model_profile: Option<String>,
+    provider_plugin_id: String,
+    model_id: String,
+    explicit_auth_profile: Option<&'a str>,
+    auth_pool: Option<&'a str>,
+}
+
 /// Top-level SDK handle.
 #[derive(Debug, Clone)]
 pub struct Bcode {
@@ -4401,6 +4456,175 @@ impl Bcode {
     #[must_use]
     pub const fn provider_context(&self) -> &ProviderRequestContext {
         &self.provider_context
+    }
+
+    /// Build a safe provider/model/auth setup report for embedding applications.
+    ///
+    /// The report includes no credential values, vault paths, or provider environment values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if layered Bcode configuration cannot be loaded.
+    #[cfg(all(feature = "config", feature = "embedded-plugins"))]
+    pub fn provider_setup_report(&self) -> Result<ProviderSetupReport> {
+        let config = bcode_config::load_config()?;
+        let runtime_auth = bcode_config::load_runtime_auth_subscriptions();
+        Ok(self.provider_setup_report_from_config(&config, &runtime_auth))
+    }
+
+    /// Build a deterministic safe setup report from explicit configuration and runtime auth state.
+    #[cfg(all(feature = "config", feature = "embedded-plugins"))]
+    #[must_use]
+    pub fn provider_setup_report_from_config(
+        &self,
+        config: &bcode_config::BcodeConfig,
+        runtime_auth: &bcode_config::RuntimeAuthSubscriptions,
+    ) -> ProviderSetupReport {
+        let mut candidates = Vec::new();
+        let selection = config.resolved_model_selection();
+        if let (Some(provider_plugin_id), Some(model_id)) =
+            (selection.provider_plugin_id, selection.model_id)
+        {
+            candidates.push(self.provider_setup_candidate(
+                config,
+                runtime_auth,
+                ProviderSetupCandidateInput {
+                    model_profile: selection.model_profile,
+                    provider_plugin_id,
+                    model_id,
+                    explicit_auth_profile: selection.auth_profile.as_deref(),
+                    auth_pool: selection.auth_pool.as_deref(),
+                },
+            ));
+        }
+        for (name, profile) in &config.model.profiles {
+            let Some(model_id) = profile.model_id.clone() else {
+                continue;
+            };
+            if candidates.iter().any(|candidate| {
+                candidate.provider_plugin_id == profile.provider_plugin_id
+                    && candidate.model_id == model_id
+            }) {
+                continue;
+            }
+            candidates.push(self.provider_setup_candidate(
+                config,
+                runtime_auth,
+                ProviderSetupCandidateInput {
+                    model_profile: Some(name.clone()),
+                    provider_plugin_id: profile.provider_plugin_id.clone(),
+                    model_id,
+                    explicit_auth_profile: profile.auth_profile.as_deref(),
+                    auth_pool: profile.auth_pool.as_deref(),
+                },
+            ));
+        }
+        ProviderSetupReport { candidates }
+    }
+
+    #[cfg(all(feature = "config", feature = "embedded-plugins"))]
+    fn provider_setup_candidate(
+        &self,
+        config: &bcode_config::BcodeConfig,
+        runtime_auth: &bcode_config::RuntimeAuthSubscriptions,
+        input: ProviderSetupCandidateInput<'_>,
+    ) -> ProviderSetupCandidateReport {
+        let ProviderSetupCandidateInput {
+            model_profile,
+            provider_plugin_id,
+            model_id,
+            explicit_auth_profile,
+            auth_pool,
+        } = input;
+        let registered = self.plugins.as_ref().and_then(|plugins| {
+            let exact = plugins.auth_provider(&provider_plugin_id);
+            exact.or_else(|| {
+                let owned = plugins
+                    .auth_provider_registry()
+                    .providers()
+                    .into_iter()
+                    .filter(|provider| provider.plugin_id == provider_plugin_id)
+                    .collect::<Vec<_>>();
+                owned
+                    .iter()
+                    .copied()
+                    .find(|provider| {
+                        bcode_provider_auth::resolve_auth_provider_profile(
+                            config,
+                            &provider.contribution.provider_id,
+                            &provider.plugin_id,
+                            explicit_auth_profile,
+                            runtime_auth,
+                        )
+                        .is_ok()
+                    })
+                    .or_else(|| (owned.len() == 1).then_some(owned[0]))
+            })
+        });
+        let resolved = registered.and_then(|provider| {
+            bcode_provider_auth::resolve_auth_provider_profile(
+                config,
+                &provider.contribution.provider_id,
+                &provider.plugin_id,
+                explicit_auth_profile,
+                runtime_auth,
+            )
+            .ok()
+        });
+        let pool_ready = auth_pool.is_some_and(|pool| {
+            config
+                .auth
+                .pools
+                .get(pool)
+                .is_some_and(|pool| !pool.profiles.is_empty())
+                || runtime_auth
+                    .pools
+                    .get(pool)
+                    .is_some_and(|pool| !pool.profiles.is_empty())
+        });
+        let auth = registered.map_or_else(
+            || ProviderSetupAuthReport {
+                provider_id: None,
+                display_name: None,
+                owner_plugin_id: None,
+                profile: explicit_auth_profile.map(str::to_owned),
+                ready: pool_ready || self.provider_context.auth.is_some(),
+                methods: Vec::new(),
+            },
+            |provider| ProviderSetupAuthReport {
+                provider_id: Some(provider.contribution.provider_id.clone()),
+                display_name: Some(provider.contribution.display_name.clone()),
+                owner_plugin_id: Some(provider.plugin_id.clone()),
+                profile: resolved
+                    .as_ref()
+                    .map(|profile| profile.profile_name.clone()),
+                ready: resolved.is_some() || pool_ready,
+                methods: provider
+                    .contribution
+                    .methods
+                    .iter()
+                    .map(|method| ProviderSetupAuthMethod {
+                        method_id: method.method_id().to_owned(),
+                        display_name: match method {
+                            bcode_plugin::AuthMethodContribution::SecretFields {
+                                display_name,
+                                ..
+                            }
+                            | bcode_plugin::AuthMethodContribution::Interactive {
+                                display_name,
+                                ..
+                            } => display_name.clone(),
+                        },
+                    })
+                    .collect(),
+            },
+        );
+        ProviderSetupCandidateReport {
+            model_profile,
+            provider_plugin_id,
+            model_id,
+            auth,
+        }
     }
 
     /// Return the configured runtime mode.
