@@ -829,22 +829,92 @@ pub enum PluginTuiDiffLayout {
     SideBySide,
 }
 
-/// Portable RGB color used by terminal syntax presentation.
+/// Compact terminal syntax color supplied by the TUI host without palette conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PluginTuiSyntaxColor {
-    /// Red channel.
-    pub r: u8,
-    /// Green channel.
-    pub g: u8,
-    /// Blue channel.
-    pub b: u8,
-}
+pub struct PluginTuiSyntaxColor(u32);
 
 impl PluginTuiSyntaxColor {
-    /// Construct an RGB syntax color.
+    const DEFAULT: u32 = 0;
+    const ANSI_BASE: u32 = 1;
+    const INDEXED_BASE: u32 = 17;
+    const RGB_BASE: u32 = 273;
+
+    /// Preserve a terminal backend color in the plugin presentation contract.
+    #[must_use]
+    pub const fn from_tui(color: bmux_tui::style::Color) -> Self {
+        use bmux_tui::style::Color;
+        let value = match color {
+            Color::Default => Self::DEFAULT,
+            Color::Black => Self::ANSI_BASE,
+            Color::Red => Self::ANSI_BASE + 1,
+            Color::Green => Self::ANSI_BASE + 2,
+            Color::Yellow => Self::ANSI_BASE + 3,
+            Color::Blue => Self::ANSI_BASE + 4,
+            Color::Magenta => Self::ANSI_BASE + 5,
+            Color::Cyan => Self::ANSI_BASE + 6,
+            Color::White => Self::ANSI_BASE + 7,
+            Color::BrightBlack => Self::ANSI_BASE + 8,
+            Color::BrightRed => Self::ANSI_BASE + 9,
+            Color::BrightGreen => Self::ANSI_BASE + 10,
+            Color::BrightYellow => Self::ANSI_BASE + 11,
+            Color::BrightBlue => Self::ANSI_BASE + 12,
+            Color::BrightMagenta => Self::ANSI_BASE + 13,
+            Color::BrightCyan => Self::ANSI_BASE + 14,
+            Color::BrightWhite => Self::ANSI_BASE + 15,
+            Color::Indexed(index) => Self::INDEXED_BASE + index as u32,
+            Color::Rgb(r, g, b) => {
+                Self::RGB_BASE + ((r as u32) << 16) + ((g as u32) << 8) + b as u32
+            }
+        };
+        Self(value)
+    }
+
+    /// Construct an explicit RGB syntax color.
     #[must_use]
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b }
+        Self::from_tui(bmux_tui::style::Color::Rgb(r, g, b))
+    }
+
+    /// Restore the exact terminal backend color.
+    #[must_use]
+    pub fn to_tui(self) -> bmux_tui::style::Color {
+        use bmux_tui::style::Color;
+        match self.0 {
+            Self::DEFAULT => Color::Default,
+            1 => Color::Black,
+            2 => Color::Red,
+            3 => Color::Green,
+            4 => Color::Yellow,
+            5 => Color::Blue,
+            6 => Color::Magenta,
+            7 => Color::Cyan,
+            8 => Color::White,
+            9 => Color::BrightBlack,
+            10 => Color::BrightRed,
+            11 => Color::BrightGreen,
+            12 => Color::BrightYellow,
+            13 => Color::BrightBlue,
+            14 => Color::BrightMagenta,
+            15 => Color::BrightCyan,
+            16 => Color::BrightWhite,
+            value if value < Self::RGB_BASE => {
+                Color::Indexed(u8::try_from(value - Self::INDEXED_BASE).unwrap_or(u8::MAX))
+            }
+            value => {
+                let rgb = value - Self::RGB_BASE;
+                Color::Rgb(
+                    u8::try_from((rgb >> 16) & 0xff).unwrap_or_default(),
+                    u8::try_from((rgb >> 8) & 0xff).unwrap_or_default(),
+                    u8::try_from(rgb & 0xff).unwrap_or_default(),
+                )
+            }
+        }
+    }
+}
+
+impl From<PluginTuiSyntaxColor> for bmux_tui::style::Color {
+    fn from(color: PluginTuiSyntaxColor) -> Self {
+        color.to_tui()
     }
 }
 
@@ -912,8 +982,6 @@ pub struct PluginTuiTheme {
     pub diff: PluginTuiDiffTheme,
     /// Syntax presentation.
     pub syntax: PluginTuiSyntaxTheme,
-    /// Stable identity of the resolved presentation.
-    pub fingerprint: u64,
 }
 
 /// Host-owned presentation context for visual adapters.

@@ -107,6 +107,15 @@ if rg -n 'syntax_palette:\s*None' \
   fail "filesystem source/diff adapters must not bypass the active syntax theme"
 fi
 
+if rg -n 'color\.r, color\.g, color\.b|foreground_r|foreground_g|foreground_b' \
+  packages/tui/src \
+  packages/tui-components/src \
+  plugins/filesystem-plugin/src \
+  plugins/code-review-plugin/src \
+  --glob '*.rs'; then
+  fail "syntax theme propagation must preserve terminal, ANSI, indexed, and RGB colors"
+fi
+
 if rg -n 'frame\.fill\(area,[^\n]*Color::Black' \
   plugins/code-review-plugin/src/code_review_tui_render.rs; then
   fail "code-review full-screen canvas must use renderer-owned theme presentation"

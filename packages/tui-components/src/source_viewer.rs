@@ -248,11 +248,7 @@ fn highlight_lines(_hint: &str, lines: &[&str]) -> Vec<Vec<Span>> {
 
 #[cfg(feature = "syntax")]
 const fn syntax_style(style: SyntaxStyle) -> Style {
-    let mut output = Style::new().fg(Color::Rgb(
-        style.foreground_r,
-        style.foreground_g,
-        style.foreground_b,
-    ));
+    let mut output = Style::new().fg(style.foreground.to_tui());
     if style.bold {
         output = output.add_modifier(bmux_tui::prelude::Modifier::BOLD);
     }

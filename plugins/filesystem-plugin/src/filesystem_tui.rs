@@ -666,7 +666,7 @@ fn syntax_palette(
     theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
 ) -> bcode_syntax_render::SyntaxPalette {
     let color = |color: bcode_plugin_sdk::tui::PluginTuiSyntaxColor| {
-        bcode_syntax_render::SyntaxColor::rgb(color.r, color.g, color.b)
+        bcode_syntax_render::SyntaxColor::from_tui(color.into())
     };
     bcode_syntax_render::SyntaxPalette {
         text: color(theme.text),

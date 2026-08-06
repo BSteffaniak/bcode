@@ -328,8 +328,14 @@ mod tests {
             .build_file(&file);
         assert!(display.rows[1].segments.iter().all(|segment| {
             segment.roles.iter().any(|role| {
-                matches!(role, ReviewDisplayTextRole::Syntax(style)
-                    if (style.foreground_r, style.foreground_g, style.foreground_b) == (12, 34, 56))
+                matches!(
+                    role,
+                    ReviewDisplayTextRole::Syntax(style)
+                        if matches!(
+                            style.foreground,
+                            bcode_syntax_render::SyntaxColor::Rgb(12, 34, 56)
+                        )
+                )
             })
         }));
     }

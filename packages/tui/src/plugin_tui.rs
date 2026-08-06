@@ -645,7 +645,7 @@ impl PluginTuiPresentation {
                 schema_version,
                 payload_revision,
                 width: context.width(),
-                theme_fingerprint: context.theme().map_or(0, |theme| theme.fingerprint),
+                theme_fingerprint: context.theme().map_or(0, theme_fingerprint),
             };
             let response = {
                 let dynamic = self.dynamic_visuals.lock().ok()?;
@@ -678,7 +678,7 @@ impl PluginTuiPresentation {
                         width: context.width(),
                         diff_layout: format!("{:?}", context.diff_layout()),
                         working_directory: context.working_directory().map(ToOwned::to_owned),
-                        theme_fingerprint: context.theme().map_or(0, |theme| theme.fingerprint),
+                        theme_fingerprint: context.theme().map_or(0, theme_fingerprint),
                     },
                 },
             });
@@ -906,6 +906,14 @@ fn serialized_render_mode(
         "full_block" => bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::FullBlock,
         _ => manifest_render_mode(default),
     }
+}
+
+fn theme_fingerprint(theme: bcode_plugin_sdk::tui::PluginTuiTheme) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{theme:?}").hash(&mut hasher);
+    hasher.finish()
 }
 
 fn serialized_visual_rows(
@@ -1338,7 +1346,11 @@ library = "libdynamic_visual_test.dylib"
         let added = Style::new().fg(Color::Green);
         let removed = Style::new().fg(Color::Red);
         let hunk = Style::new().fg(Color::Yellow);
-        let syntax = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(1, 2, 3);
+        let syntax = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(
+            u8::try_from(fingerprint).unwrap_or(u8::MAX),
+            2,
+            3,
+        );
         bcode_plugin_sdk::tui::PluginTuiTheme {
             canvas: style,
             text: style.fg(Color::White),
@@ -1377,7 +1389,6 @@ library = "libdynamic_visual_test.dylib"
                 operator: syntax,
                 punctuation: syntax,
             },
-            fingerprint,
         }
     }
 

@@ -101,7 +101,7 @@ fn syntax_palette(
     theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
 ) -> bcode_syntax_render::SyntaxPalette {
     let color = |color: bcode_plugin_sdk::tui::PluginTuiSyntaxColor| {
-        bcode_syntax_render::SyntaxColor::rgb(color.r, color.g, color.b)
+        bcode_syntax_render::SyntaxColor::from_tui(color.into())
     };
     bcode_syntax_render::SyntaxPalette {
         text: color(theme.text),
@@ -5680,7 +5680,13 @@ impl ReviewApp {
 
     /// Update renderer-owned syntax presentation and invalidate derived display rows when changed.
     pub fn set_tui_theme(&mut self, theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) {
-        let fingerprint = theme.map_or(0, |theme| theme.fingerprint);
+        use std::hash::{Hash, Hasher};
+
+        let fingerprint = theme.map_or(0, |theme| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{theme:?}").hash(&mut hasher);
+            hasher.finish()
+        });
         if self.theme_fingerprint == fingerprint {
             return;
         }
@@ -12593,7 +12599,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn test_plugin_theme(fingerprint: u64, red: u8) -> bcode_plugin_sdk::tui::PluginTuiTheme {
+    fn test_plugin_theme(red: u8) -> bcode_plugin_sdk::tui::PluginTuiTheme {
         let style = bmux_tui::style::Style::new();
         let syntax_color = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(red, 34, 56);
         bcode_plugin_sdk::tui::PluginTuiTheme {
@@ -12634,7 +12640,6 @@ pub(crate) mod tests {
                 operator: syntax_color,
                 punctuation: syntax_color,
             },
-            fingerprint,
         }
     }
 
@@ -12651,7 +12656,7 @@ pub(crate) mod tests {
                 .is_some()
         );
 
-        app.set_tui_theme(Some(test_plugin_theme(7, 12)));
+        app.set_tui_theme(Some(test_plugin_theme(12)));
         assert!(
             app.view_document_cache
                 .read()
@@ -12660,6 +12665,8 @@ pub(crate) mod tests {
         );
         let themed = app.current_review_view_document().expect("themed document");
         assert_eq!(first.rows.len(), themed.rows.len());
+        let themed_fingerprint = app.theme_fingerprint;
+        assert_ne!(themed_fingerprint, 0);
         assert_eq!(
             app.view_document_cache
                 .read()
@@ -12668,17 +12675,17 @@ pub(crate) mod tests {
                 .expect("one cached document")
                 .key
                 .theme_fingerprint,
-            7
+            themed_fingerprint
         );
 
-        app.set_tui_theme(Some(test_plugin_theme(7, 99)));
+        app.set_tui_theme(Some(test_plugin_theme(12)));
         assert!(
             app.view_document_cache
                 .read()
                 .expect("same identity preserves cache")
                 .is_some()
         );
-        app.set_tui_theme(Some(test_plugin_theme(8, 99)));
+        app.set_tui_theme(Some(test_plugin_theme(99)));
         assert!(
             app.view_document_cache
                 .read()

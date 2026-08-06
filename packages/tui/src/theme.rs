@@ -593,8 +593,7 @@ fn syntax_palette(
     let color = |role: &str, fallback: SyntaxColor| {
         theme
             .and_then(|theme| theme.style(role).and_then(|style| style.fg))
-            .and_then(tui_color_to_syntax)
-            .unwrap_or(fallback)
+            .map_or(fallback, tui_color_to_syntax)
     };
     SyntaxPalette {
         text: color("syntax.text", SyntaxColor::rgb(212, 212, 212)),
@@ -610,29 +609,8 @@ fn syntax_palette(
     }
 }
 
-const fn tui_color_to_syntax(color: Color) -> Option<bcode_syntax_render::SyntaxColor> {
-    use bcode_syntax_render::SyntaxColor;
-
-    match color {
-        Color::Rgb(r, g, b) => Some(SyntaxColor::rgb(r, g, b)),
-        Color::Black => Some(SyntaxColor::rgb(0, 0, 0)),
-        Color::Red => Some(SyntaxColor::rgb(128, 0, 0)),
-        Color::Green => Some(SyntaxColor::rgb(0, 128, 0)),
-        Color::Yellow => Some(SyntaxColor::rgb(128, 128, 0)),
-        Color::Blue => Some(SyntaxColor::rgb(0, 0, 128)),
-        Color::Magenta => Some(SyntaxColor::rgb(128, 0, 128)),
-        Color::Cyan => Some(SyntaxColor::rgb(0, 128, 128)),
-        Color::White => Some(SyntaxColor::rgb(192, 192, 192)),
-        Color::BrightBlack => Some(SyntaxColor::rgb(128, 128, 128)),
-        Color::BrightRed => Some(SyntaxColor::rgb(255, 0, 0)),
-        Color::BrightGreen => Some(SyntaxColor::rgb(0, 255, 0)),
-        Color::BrightYellow => Some(SyntaxColor::rgb(255, 255, 0)),
-        Color::BrightBlue => Some(SyntaxColor::rgb(0, 0, 255)),
-        Color::BrightMagenta => Some(SyntaxColor::rgb(255, 0, 255)),
-        Color::BrightCyan => Some(SyntaxColor::rgb(0, 255, 255)),
-        Color::BrightWhite => Some(SyntaxColor::rgb(255, 255, 255)),
-        Color::Default | Color::Indexed(_) => None,
-    }
+const fn tui_color_to_syntax(color: Color) -> bcode_syntax_render::SyntaxColor {
+    bcode_syntax_render::SyntaxColor::from_tui(color)
 }
 
 fn markdown_theme(

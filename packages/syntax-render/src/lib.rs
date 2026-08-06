@@ -43,12 +43,8 @@ impl SyntaxSpan {
 /// Renderer-neutral syntax style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntaxStyle {
-    /// Foreground red channel.
-    pub foreground_r: u8,
-    /// Foreground green channel.
-    pub foreground_g: u8,
-    /// Foreground blue channel.
-    pub foreground_b: u8,
+    /// Foreground terminal color, preserved without palette conversion.
+    pub foreground: SyntaxColor,
     /// Whether text should be bold.
     pub bold: bool,
     /// Whether text should be italic.
@@ -92,22 +88,99 @@ pub struct SyntaxPalette {
     pub punctuation: SyntaxColor,
 }
 
-/// Portable RGB syntax color.
+/// Portable terminal syntax color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SyntaxColor {
-    /// Red channel.
-    pub r: u8,
-    /// Green channel.
-    pub g: u8,
-    /// Blue channel.
-    pub b: u8,
+pub enum SyntaxColor {
+    /// Terminal-defined default foreground.
+    Default,
+    /// One of the terminal's sixteen named ANSI colors.
+    Ansi(AnsiColor),
+    /// One entry in the terminal's indexed color palette.
+    Indexed(u8),
+    /// Explicit true-color value.
+    Rgb(u8, u8, u8),
+}
+
+/// Named ANSI terminal color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnsiColor {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
 }
 
 impl SyntaxColor {
     /// Create an RGB syntax color.
     #[must_use]
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b }
+        Self::Rgb(r, g, b)
+    }
+
+    /// Create a syntax color from the terminal backend representation without conversion.
+    #[must_use]
+    pub const fn from_tui(color: Color) -> Self {
+        match color {
+            Color::Default => Self::Default,
+            Color::Indexed(index) => Self::Indexed(index),
+            Color::Rgb(r, g, b) => Self::Rgb(r, g, b),
+            Color::Black => Self::Ansi(AnsiColor::Black),
+            Color::Red => Self::Ansi(AnsiColor::Red),
+            Color::Green => Self::Ansi(AnsiColor::Green),
+            Color::Yellow => Self::Ansi(AnsiColor::Yellow),
+            Color::Blue => Self::Ansi(AnsiColor::Blue),
+            Color::Magenta => Self::Ansi(AnsiColor::Magenta),
+            Color::Cyan => Self::Ansi(AnsiColor::Cyan),
+            Color::White => Self::Ansi(AnsiColor::White),
+            Color::BrightBlack => Self::Ansi(AnsiColor::BrightBlack),
+            Color::BrightRed => Self::Ansi(AnsiColor::BrightRed),
+            Color::BrightGreen => Self::Ansi(AnsiColor::BrightGreen),
+            Color::BrightYellow => Self::Ansi(AnsiColor::BrightYellow),
+            Color::BrightBlue => Self::Ansi(AnsiColor::BrightBlue),
+            Color::BrightMagenta => Self::Ansi(AnsiColor::BrightMagenta),
+            Color::BrightCyan => Self::Ansi(AnsiColor::BrightCyan),
+            Color::BrightWhite => Self::Ansi(AnsiColor::BrightWhite),
+        }
+    }
+
+    /// Convert this renderer-neutral color to the terminal backend color.
+    #[must_use]
+    pub const fn to_tui(self) -> Color {
+        match self {
+            Self::Default => Color::Default,
+            Self::Indexed(index) => Color::Indexed(index),
+            Self::Rgb(r, g, b) => Color::Rgb(r, g, b),
+            Self::Ansi(color) => match color {
+                AnsiColor::Black => Color::Black,
+                AnsiColor::Red => Color::Red,
+                AnsiColor::Green => Color::Green,
+                AnsiColor::Yellow => Color::Yellow,
+                AnsiColor::Blue => Color::Blue,
+                AnsiColor::Magenta => Color::Magenta,
+                AnsiColor::Cyan => Color::Cyan,
+                AnsiColor::White => Color::White,
+                AnsiColor::BrightBlack => Color::BrightBlack,
+                AnsiColor::BrightRed => Color::BrightRed,
+                AnsiColor::BrightGreen => Color::BrightGreen,
+                AnsiColor::BrightYellow => Color::BrightYellow,
+                AnsiColor::BrightBlue => Color::BrightBlue,
+                AnsiColor::BrightMagenta => Color::BrightMagenta,
+                AnsiColor::BrightCyan => Color::BrightCyan,
+                AnsiColor::BrightWhite => Color::BrightWhite,
+            },
+        }
     }
 }
 
@@ -285,51 +358,39 @@ fn remap_spans(mut spans: Vec<SyntaxSpan>, palette: Option<SyntaxPalette>) -> Ve
     let Some(palette) = palette else {
         return spans;
     };
+    let default = default_syntax_style();
     for span in &mut spans {
-        let color = classify_scope_color(span.style, default_syntax_style(), palette);
-        span.style.foreground_r = color.r;
-        span.style.foreground_g = color.g;
-        span.style.foreground_b = color.b;
+        span.style.foreground =
+            classify_scope_color(span.style.foreground, default.foreground, palette);
     }
     spans
 }
 
 fn classify_scope_color(
-    style: SyntaxStyle,
-    default: SyntaxStyle,
+    foreground: SyntaxColor,
+    default: SyntaxColor,
     palette: SyntaxPalette,
 ) -> SyntaxColor {
     // Syntect's bundled theme supplies stable source scope colors. Map those
     // known colors to semantic categories; unknown scope colors remain plain
     // text rather than leaking the bundled dark palette into a caller theme.
-    match (style.foreground_r, style.foreground_g, style.foreground_b) {
-        (101, 115, 126) | (92, 99, 112) => palette.comment,
-        (180, 142, 173) | (198, 120, 221) => palette.keyword,
-        (143, 161, 179) | (220, 220, 170) => palette.function,
-        (192, 197, 206) | (156, 220, 254) => palette.variable,
-        (163, 190, 140) | (206, 145, 120) => palette.string,
-        (208, 135, 112) | (181, 206, 168) => palette.number,
-        (235, 203, 139) | (78, 201, 176) => palette.type_name,
-        (197, 200, 198) | (212, 212, 212) => palette.operator,
-        channels
-            if channels
-                == (
-                    default.foreground_r,
-                    default.foreground_g,
-                    default.foreground_b,
-                ) =>
-        {
-            palette.text
-        }
+    match foreground {
+        SyntaxColor::Rgb(101, 115, 126) | SyntaxColor::Rgb(92, 99, 112) => palette.comment,
+        SyntaxColor::Rgb(180, 142, 173) | SyntaxColor::Rgb(198, 120, 221) => palette.keyword,
+        SyntaxColor::Rgb(143, 161, 179) | SyntaxColor::Rgb(220, 220, 170) => palette.function,
+        SyntaxColor::Rgb(192, 197, 206) | SyntaxColor::Rgb(156, 220, 254) => palette.variable,
+        SyntaxColor::Rgb(163, 190, 140) | SyntaxColor::Rgb(206, 145, 120) => palette.string,
+        SyntaxColor::Rgb(208, 135, 112) | SyntaxColor::Rgb(181, 206, 168) => palette.number,
+        SyntaxColor::Rgb(235, 203, 139) | SyntaxColor::Rgb(78, 201, 176) => palette.type_name,
+        SyntaxColor::Rgb(197, 200, 198) | SyntaxColor::Rgb(212, 212, 212) => palette.operator,
+        color if color == default => palette.text,
         _ => palette.punctuation,
     }
 }
 
 const fn syntax_style(color: SyntaxColor) -> SyntaxStyle {
     SyntaxStyle {
-        foreground_r: color.r,
-        foreground_g: color.g,
-        foreground_b: color.b,
+        foreground: color,
         bold: false,
         italic: false,
         underline: false,
@@ -338,9 +399,7 @@ const fn syntax_style(color: SyntaxColor) -> SyntaxStyle {
 
 const fn default_syntax_style() -> SyntaxStyle {
     SyntaxStyle {
-        foreground_r: 255,
-        foreground_g: 255,
-        foreground_b: 255,
+        foreground: SyntaxColor::rgb(255, 255, 255),
         bold: false,
         italic: false,
         underline: false,
@@ -353,9 +412,7 @@ fn syntax_span_to_tui(span: SyntaxSpan) -> Span {
 
 const fn syntect_style_to_syntax(style: syntect::highlighting::Style) -> SyntaxStyle {
     SyntaxStyle {
-        foreground_r: style.foreground.r,
-        foreground_g: style.foreground.g,
-        foreground_b: style.foreground.b,
+        foreground: SyntaxColor::rgb(style.foreground.r, style.foreground.g, style.foreground.b),
         bold: style.font_style.contains(FontStyle::BOLD),
         italic: style.font_style.contains(FontStyle::ITALIC),
         underline: style.font_style.contains(FontStyle::UNDERLINE),
@@ -363,11 +420,7 @@ const fn syntect_style_to_syntax(style: syntect::highlighting::Style) -> SyntaxS
 }
 
 const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
-    let mut output = Style::new().fg(Color::Rgb(
-        style.foreground_r,
-        style.foreground_g,
-        style.foreground_b,
-    ));
+    let mut output = Style::new().fg(style.foreground.to_tui());
     if style.bold {
         output = output.add_modifier(Modifier::BOLD);
     }
@@ -382,7 +435,59 @@ const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{SyntaxColor, SyntaxHighlighter, SyntaxPalette, syntax_for};
+    use super::{
+        AnsiColor, SyntaxColor, SyntaxHighlighter, SyntaxPalette, classify_scope_color, syntax_for,
+    };
+    use bmux_tui::prelude::Color;
+
+    #[test]
+    fn syntax_colors_preserve_terminal_representations() {
+        for color in [
+            Color::Default,
+            Color::Blue,
+            Color::BrightCyan,
+            Color::Indexed(173),
+            Color::Rgb(12, 34, 56),
+        ] {
+            assert_eq!(SyntaxColor::from_tui(color).to_tui(), color);
+        }
+        assert_eq!(
+            SyntaxColor::from_tui(Color::Blue),
+            SyntaxColor::Ansi(AnsiColor::Blue)
+        );
+    }
+
+    #[test]
+    fn semantic_palette_preserves_non_rgb_colors() {
+        let palette = SyntaxPalette {
+            text: SyntaxColor::Default,
+            comment: SyntaxColor::Ansi(AnsiColor::BrightBlack),
+            keyword: SyntaxColor::Ansi(AnsiColor::Blue),
+            function: SyntaxColor::Indexed(173),
+            variable: SyntaxColor::Ansi(AnsiColor::BrightCyan),
+            string: SyntaxColor::Ansi(AnsiColor::Green),
+            number: SyntaxColor::Indexed(214),
+            type_name: SyntaxColor::Ansi(AnsiColor::Cyan),
+            operator: SyntaxColor::Default,
+            punctuation: SyntaxColor::Rgb(12, 34, 56),
+        };
+        assert_eq!(
+            classify_scope_color(
+                SyntaxColor::rgb(101, 115, 126),
+                SyntaxColor::rgb(255, 255, 255),
+                palette,
+            ),
+            SyntaxColor::Ansi(AnsiColor::BrightBlack)
+        );
+        assert_eq!(
+            classify_scope_color(
+                SyntaxColor::rgb(143, 161, 179),
+                SyntaxColor::rgb(255, 255, 255),
+                palette,
+            ),
+            SyntaxColor::Indexed(173)
+        );
+    }
 
     #[test]
     fn semantic_palette_replaces_bundled_dark_colors() {
@@ -402,10 +507,11 @@ mod tests {
             .highlight_line_tokens("rust", "// comment\nfn main() { let value = 42; }");
 
         assert!(spans.iter().all(|span| {
-            let red = span.style.foreground_r;
-            (1..=10).contains(&red)
-                && span.style.foreground_g == red
-                && span.style.foreground_b == red
+            matches!(
+                span.style.foreground,
+                SyntaxColor::Rgb(red, green, blue)
+                    if (1..=10).contains(&red) && green == red && blue == red
+            )
         }));
     }
 

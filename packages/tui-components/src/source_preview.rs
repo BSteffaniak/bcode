@@ -275,11 +275,7 @@ fn push_truncation_marker(output: &mut Vec<SourceSpan>, style: Option<Style>) {
 
 #[cfg(feature = "syntax")]
 const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
-    let mut output = Style::new().fg(Color::Rgb(
-        style.foreground_r,
-        style.foreground_g,
-        style.foreground_b,
-    ));
+    let mut output = Style::new().fg(style.foreground.to_tui());
     if style.bold {
         output = output.add_modifier(Modifier::BOLD);
     }

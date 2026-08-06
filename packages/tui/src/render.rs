@@ -263,7 +263,7 @@ pub fn plugin_theme_for_app(app: &BmuxApp) -> bcode_plugin_sdk::tui::PluginTuiTh
 
 fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::tui::PluginTuiTheme {
     let syntax_color = |color: bcode_syntax_render::SyntaxColor| {
-        bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(color.r, color.g, color.b)
+        bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(color.to_tui())
     };
     let syntax = theme.syntax;
     bcode_plugin_sdk::tui::PluginTuiTheme {
@@ -304,7 +304,6 @@ fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::t
             operator: syntax_color(syntax.operator),
             punctuation: syntax_color(syntax.punctuation),
         },
-        fingerprint: theme.fingerprint,
     }
 }
 

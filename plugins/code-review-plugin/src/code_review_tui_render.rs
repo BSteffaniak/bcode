@@ -32,7 +32,7 @@ fn syntax_palette(
     theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
 ) -> bcode_syntax_render::SyntaxPalette {
     let color = |color: bcode_plugin_sdk::tui::PluginTuiSyntaxColor| {
-        bcode_syntax_render::SyntaxColor::rgb(color.r, color.g, color.b)
+        bcode_syntax_render::SyntaxColor::from_tui(color.into())
     };
     bcode_syntax_render::SyntaxPalette {
         text: color(theme.text),
@@ -2529,11 +2529,7 @@ const fn marker_style(source: ReviewDisplayRowSource) -> Style {
 }
 
 const fn syntax_style_to_tui(style: bcode_syntax_render::SyntaxStyle) -> Style {
-    let mut output = Style::new().fg(Color::Rgb(
-        style.foreground_r,
-        style.foreground_g,
-        style.foreground_b,
-    ));
+    let mut output = Style::new().fg(style.foreground.to_tui());
     if style.bold {
         output = output.add_modifier(Modifier::BOLD);
     }
@@ -3772,7 +3768,6 @@ mod tests {
                 operator: syntax_color,
                 punctuation: syntax_color,
             },
-            fingerprint: 7,
         };
 
         let rendered = render_app_text_with_theme(&mut app, 100, 24, Some(theme));

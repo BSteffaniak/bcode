@@ -1583,11 +1583,7 @@ fn line_count_label(count: u32) -> String {
 
 #[cfg(feature = "syntax")]
 const fn syntax_style(style: SyntaxStyle) -> Style {
-    let mut tui_style = Style::new().fg(Color::Rgb(
-        style.foreground_r,
-        style.foreground_g,
-        style.foreground_b,
-    ));
+    let mut tui_style = Style::new().fg(style.foreground.to_tui());
     if style.bold {
         tui_style = tui_style.add_modifier(Modifier::BOLD);
     }
