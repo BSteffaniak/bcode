@@ -211,14 +211,17 @@ inferring context from an unstructured message.
 
 Automatic retry eligibility is a versioned owner-neutral policy over persisted facts: node effect,
 owner reconciliation contract, stable failure kind, completed attempt count, definition maximum, and
-run retry cap. Cancellation, terminal timeout, approval denial, schema failure, ambiguous mutation,
+run retry cap. Plugin-owned blocks may declare the versioned policy directly; source-v3 `retry`
+lowers into that exact block contract. Cancellation, terminal timeout, approval denial, schema failure, ambiguous mutation,
 and terminal failure are never eligible. A mutating owner-reported failure requires receipt/status
-reconciliation; repair-required mutation is never automatically retried. This pure decision does not
-schedule work. The workflow store schema version 6 persists one
-exact retry schedule per activation with failed/next attempt numbers, failure kind, backoff duration,
-due timestamp, and scheduling timestamp. Scheduling is idempotent and never sleeps or creates the
-attempt; conflicting reschedules fail closed. Production automatic retry remains unsupported until a
-bounded scheduler safely consumes due schedules.
+reconciliation; repair-required mutation is never automatically retried. The workflow store schema
+version 6 persists one exact retry schedule per activation with failed/next attempt numbers, failure
+kind, backoff duration, due timestamp, and scheduling timestamp. Owner reconciliation classifies the
+terminal observation and atomically commits both terminal attempt state and an eligible schedule.
+Scheduling is idempotent and never sleeps or creates the attempt; conflicting reschedules fail
+closed. The bounded production driver consumes due schedules atomically, requeues only the exact
+latest failed activation, and startup discovery includes failed runs carrying durable schedules.
+Cancellation and stale or duplicate consumption fail closed.
 
 Repeat iteration is the persisted activation `dependency_generation`, starting at zero. Settlement
 computes the next generation with checked arithmetic and applies the effective bound

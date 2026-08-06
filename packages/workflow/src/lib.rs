@@ -1743,6 +1743,91 @@ pub const fn automatic_retry_decision(
     }
 }
 
+/// One bounded owner-neutral durable automatic retry policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAutomaticRetryPolicy {
+    /// Retry policy contract version.
+    pub version: u32,
+    /// Maximum attempts including the initial attempt.
+    pub max_attempts: u32,
+    /// Explicit owner-neutral failure classes eligible for retry.
+    pub eligible_failures: Vec<AutomaticRetryFailureKind>,
+    /// Initial deterministic backoff delay.
+    pub initial_backoff_ms: u64,
+    /// Integer backoff multiplier for later attempts.
+    pub backoff_multiplier: u32,
+    /// Maximum deterministic backoff delay.
+    pub maximum_backoff_ms: u64,
+}
+
+impl WorkflowAutomaticRetryPolicy {
+    /// Validate finite retry classes and bounded backoff configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the version, limits, failure inventory, or backoff is invalid.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION
+            || self.max_attempts == 0
+            || self.initial_backoff_ms == 0
+            || self.maximum_backoff_ms < self.initial_backoff_ms
+            || self.maximum_backoff_ms > 86_400_000
+            || self.backoff_multiplier == 0
+            || self.backoff_multiplier > 100
+            || self.eligible_failures.is_empty()
+        {
+            return Err(WorkflowError::Build {
+                path: "automatic_retry".to_string(),
+                message: "retry version, limits, backoff, or failure inventory is invalid"
+                    .to_string(),
+            });
+        }
+        let unique = self.eligible_failures.iter().collect::<BTreeSet<_>>();
+        if unique.len() != self.eligible_failures.len()
+            || self.eligible_failures.iter().any(|failure| {
+                !matches!(
+                    failure,
+                    AutomaticRetryFailureKind::OwnerUnavailableBeforeAcceptance
+                        | AutomaticRetryFailureKind::OwnerReportedRetryable
+                )
+            })
+        {
+            return Err(WorkflowError::Build {
+                path: "automatic_retry.eligible_failures".to_string(),
+                message: "retry failure classes must be unique and safely owner-retryable"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Return whether this policy explicitly admits the failure class.
+    #[must_use]
+    pub fn admits(&self, failure: AutomaticRetryFailureKind) -> bool {
+        self.eligible_failures.contains(&failure)
+    }
+
+    /// Calculate deterministic capped exponential backoff for the next attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when arithmetic overflows.
+    pub fn backoff_ms(&self, next_attempt: u32) -> Result<u64, WorkflowError> {
+        let exponent = next_attempt.saturating_sub(2);
+        let multiplier = u64::from(self.backoff_multiplier)
+            .checked_pow(exponent)
+            .ok_or_else(|| WorkflowError::Build {
+                path: "automatic_retry.backoff_multiplier".to_string(),
+                message: "retry backoff multiplier overflow".to_string(),
+            })?;
+        Ok(self
+            .initial_backoff_ms
+            .saturating_mul(multiplier)
+            .min(self.maximum_backoff_ms))
+    }
+}
+
 /// One real plugin-owned workflow block contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowBlockDefinition {
@@ -1759,6 +1844,9 @@ pub struct WorkflowBlockDefinition {
     pub timeout_ms: u64,
     pub cancellation_supported: bool,
     pub reconciliation: WorkflowBlockReconciliation,
+    /// Owner-neutral automatic retry policy applied only to explicitly eligible observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_retry: Option<WorkflowAutomaticRetryPolicy>,
     /// Whether the external owner must prepare canonical operation facts before authorization.
     #[serde(default)]
     pub preparation_required: bool,
@@ -1806,6 +1894,9 @@ impl WorkflowBlockDefinition {
                     "mutating blocks must use receipt status or repair-required reconciliation"
                         .to_string(),
             });
+        }
+        if let Some(retry) = &self.automatic_retry {
+            retry.validate()?;
         }
         Ok(())
     }
@@ -4127,6 +4218,19 @@ pub struct WorkflowStructuredSourceRetry {
     pub maximum_backoff_ms: u64,
 }
 
+impl From<&WorkflowStructuredSourceRetry> for WorkflowAutomaticRetryPolicy {
+    fn from(retry: &WorkflowStructuredSourceRetry) -> Self {
+        Self {
+            version: WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION,
+            max_attempts: retry.max_attempts,
+            eligible_failures: retry.eligible_failures.clone(),
+            initial_backoff_ms: retry.initial_backoff_ms,
+            backoff_multiplier: retry.backoff_multiplier,
+            maximum_backoff_ms: retry.maximum_backoff_ms,
+        }
+    }
+}
+
 /// One bounded source homogeneous fan-out declaration. Runtime admission remains separate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4284,7 +4388,7 @@ pub struct WorkflowStructuredSourceStep {
     /// Optional deterministic condition over one prior typed output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<WorkflowStructuredSourceCondition>,
-    /// Optional bounded retry policy. Rejected until production retry capability is admitted.
+    /// Optional bounded retry policy for an external owner operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<WorkflowStructuredSourceRetry>,
     /// Bounded repeat controller applied after this operation completes.
@@ -5982,10 +6086,33 @@ impl WorkflowStructuredSourceDocument {
             }
             if let Some(retry) = &step.retry {
                 validate_structured_source_retry(retry, &document.run_limits, index)?;
-                return Err(authoring_error(
-                    format!("steps[{index}].retry"),
-                    "retry source is valid but unavailable until durable production retry capability is admitted",
-                ));
+                let node = document.definition.nodes.get_mut(&step.id).ok_or_else(|| {
+                    authoring_error(
+                        format!("steps[{index}].id"),
+                        "structured step did not lower to a canonical node",
+                    )
+                })?;
+                if node.kind != NodeKind::PluginBlock {
+                    return Err(authoring_error(
+                        format!("steps[{index}].retry"),
+                        "durable automatic retry currently requires a plugin-owned action",
+                    ));
+                }
+                let mut block: WorkflowBlockDefinition =
+                    serde_json::from_value(node.configuration.clone()).map_err(|error| {
+                        authoring_error(
+                            format!("steps[{index}].retry"),
+                            format!("retryable block configuration is invalid: {error}"),
+                        )
+                    })?;
+                block.automatic_retry = Some(WorkflowAutomaticRetryPolicy::from(retry));
+                block.validate()?;
+                node.configuration = serde_json::to_value(block).map_err(|error| {
+                    authoring_error(
+                        format!("steps[{index}].retry"),
+                        format!("retry policy cannot be serialized: {error}"),
+                    )
+                })?;
             }
             if let Some(repeat) = &step.repeat {
                 lower_structured_source_repeat(
@@ -9596,7 +9723,7 @@ impl WorkflowProductionCapabilities {
             definition_schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
             predicate_version: WORKFLOW_PREDICATE_VERSION,
             transform_version: Some(WORKFLOW_TRANSFORM_VERSION),
-            automatic_retry_policy_version: None,
+            automatic_retry_policy_version: Some(WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION),
             agent_configuration_version: 1,
             workflow_block_interface_version: WORKFLOW_BLOCK_INTERFACE_VERSION,
             node_kinds,
@@ -9605,7 +9732,7 @@ impl WorkflowProductionCapabilities {
                 ParallelFailurePolicy::WaitAll,
                 ParallelFailurePolicy::FailFast,
             ]),
-            automatic_retry: WorkflowCapabilitySupport::Unsupported,
+            automatic_retry: WorkflowCapabilitySupport::Supported,
             fan_out: WorkflowCapabilitySupport::Unsupported,
             transforms: WorkflowCapabilitySupport::Supported,
             artifact_references: WorkflowCapabilitySupport::Supported,
@@ -10868,6 +10995,32 @@ impl WorkflowDefinition {
             if node.kind == NodeKind::Agent {
                 validate_production_agent_node(node, capabilities, &mut diagnostics);
             }
+            if node.kind == NodeKind::PluginBlock
+                && let Ok(block) =
+                    serde_json::from_value::<WorkflowBlockDefinition>(node.configuration.clone())
+                && let Some(retry) = &block.automatic_retry
+            {
+                if capabilities.automatic_retry != WorkflowCapabilitySupport::Supported {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "unsupported_automatic_retry".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!(
+                            "node '{}' declares automatic retry without durable production support",
+                            node.id
+                        ),
+                    });
+                }
+                if capabilities.automatic_retry_policy_version != Some(retry.version) {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "unsupported_automatic_retry_version".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!(
+                            "node '{}' uses unsupported automatic retry version {}",
+                            node.id, retry.version
+                        ),
+                    });
+                }
+            }
         }
         validate_mutating_prompt_verification(self, &mut diagnostics);
         for edge in &self.edges {
@@ -10931,7 +11084,8 @@ impl WorkflowDefinition {
             }
             match &edge.kind {
                 EdgeKind::Retry { .. }
-                    if capabilities.automatic_retry != WorkflowCapabilitySupport::Supported =>
+                    if capabilities.edge_support(WorkflowEdgeKind::Retry)
+                        != WorkflowCapabilitySupport::Supported =>
                 {
                     diagnostics.push(WorkflowCapabilityDiagnostic {
                         code: "unsupported_retry_edge".to_string(),
@@ -14135,6 +14289,7 @@ mod tests {
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
             preparation_required: false,
         };
         let action = WorkflowAuthoringActionDescriptor {
@@ -14319,6 +14474,7 @@ steps:
                 timeout_ms: 30_000,
                 cancellation_supported: true,
                 reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+                automatic_retry: None,
                 preparation_required: false,
             };
         let produce = block("example.produce", source_schema.clone(), source_schema);
@@ -14531,30 +14687,87 @@ steps:
     }
 
     #[test]
-    fn structured_source_v3_retry_contract_validates_then_fails_capability_closed() {
+    fn structured_source_v3_retry_lowers_into_plugin_block_policy() {
+        let schema = ValueSchema {
+            type_name: "value/v1".to_string(),
+            schema: serde_json::json!({"type": "string"}),
+        };
+        let block = WorkflowBlockDefinition {
+            block_id: "example.retryable".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            operation: "example.retryable".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            effect: WorkflowBlockEffect::ReadOnly,
+            resources: Vec::new(),
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::ReadOnly,
+                explicit_grant_required: false,
+            },
+            timeout_ms: 1_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::ReceiptStatus,
+            automatic_retry: None,
+            preparation_required: false,
+        };
+        let mut catalog = authoring_catalog();
+        catalog.plugins.insert("bcode.example".to_string());
+        catalog
+            .blocks
+            .insert(workflow_block_catalog_key(&block), block.clone());
+        catalog.authoring_actions.insert(
+            "retryable@1".to_string(),
+            WorkflowAuthoringActionDescriptor {
+                version: WORKFLOW_AUTHORING_ACTION_DESCRIPTOR_VERSION,
+                action_key: "retryable".to_string(),
+                action_version: 1,
+                plugin_id: "bcode.example".to_string(),
+                input: schema,
+                target_block: workflow_block_catalog_key(&block),
+                input_adapter: None,
+            },
+        );
         let source = serde_json::json!({
             "workflow_source_version": 3,
             "workflow_id": "example/retry",
             "title": "Retry",
             "steps": [{
-                "id": "input",
+                "id": "work",
                 "retry": {
                     "max_attempts": 2,
-                    "eligible_failures": ["owner_unavailable_before_acceptance"],
+                    "eligible_failures": ["owner_reported_retryable"],
                     "initial_backoff_ms": 100,
                     "backoff_multiplier": 2,
                     "maximum_backoff_ms": 1000
                 },
-                "input": {"schema": {"type_name": "value/v1", "schema": {"type": "string"}}}
+                "uses": "bcode.example/example.retryable@1",
+                "with": "value"
             }]
         });
-        let error = lower_workflow_authoring_source(
+        let lowered = lower_workflow_authoring_source(
             &serde_json::to_string(&source).expect("source"),
             WorkflowSourceFormat::Json,
-            &authoring_catalog(),
+            &catalog,
         )
-        .expect_err("retry capability unavailable");
-        assert!(error.to_string().contains("production retry capability"));
+        .expect("retry source");
+        let block: WorkflowBlockDefinition = serde_json::from_value(
+            lowered.document.definition.nodes["work"]
+                .configuration
+                .clone(),
+        )
+        .expect("block");
+        assert_eq!(
+            block.automatic_retry,
+            Some(WorkflowAutomaticRetryPolicy {
+                version: WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION,
+                max_attempts: 2,
+                eligible_failures: vec![AutomaticRetryFailureKind::OwnerReportedRetryable],
+                initial_backoff_ms: 100,
+                backoff_multiplier: 2,
+                maximum_backoff_ms: 1_000,
+            })
+        );
     }
 
     #[test]
@@ -14690,6 +14903,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
             preparation_required: false,
         };
         let mut catalog = authoring_catalog();
@@ -15042,6 +15256,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
             preparation_required: false,
         };
         let key = workflow_block_catalog_key(&block);
@@ -15123,6 +15338,7 @@ steps:
             timeout_ms: 300_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            automatic_retry: None,
             preparation_required: false,
         };
         let action = WorkflowAuthoringActionDescriptor {
@@ -15211,6 +15427,7 @@ steps:
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
             preparation_required: false,
         };
         let echo_action = WorkflowAuthoringActionDescriptor {
@@ -15684,6 +15901,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            automatic_retry: None,
             preparation_required: false,
         };
         document.definition.nodes = BTreeMap::from([(
@@ -15751,6 +15969,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
             preparation_required: false,
         };
         let mutate = WorkflowBlockDefinition {
@@ -15769,6 +15988,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            automatic_retry: None,
             preparation_required: false,
         };
         let predicate = PredicateExpression::Equals {
@@ -16636,6 +16856,7 @@ steps:
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            automatic_retry: None,
             preparation_required: false,
         };
         child_block.validate().expect("block");
@@ -16942,7 +17163,7 @@ steps:
         );
         assert_eq!(
             capabilities.automatic_retry,
-            WorkflowCapabilitySupport::Unsupported
+            WorkflowCapabilitySupport::Supported
         );
         assert_eq!(capabilities.fan_out, WorkflowCapabilitySupport::Unsupported);
         assert_eq!(
@@ -17112,11 +17333,11 @@ steps:
         }
         assert_eq!(
             WorkflowProductionCapabilities::current().automatic_retry,
-            WorkflowCapabilitySupport::Unsupported
+            WorkflowCapabilitySupport::Supported
         );
         assert_eq!(
             WorkflowProductionCapabilities::current().automatic_retry_policy_version,
-            None
+            Some(WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION)
         );
     }
 
@@ -17133,7 +17354,7 @@ steps:
         );
         assert_eq!(
             capabilities.automatic_retry,
-            WorkflowCapabilitySupport::Unsupported
+            WorkflowCapabilitySupport::Supported
         );
     }
 
@@ -17890,6 +18111,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::RepairRequired,
+            automatic_retry: None,
             preparation_required: true,
         };
         let request = WorkflowBlockPreparationRequest {
@@ -19848,6 +20070,7 @@ steps:
             timeout_ms: 30_000,
             cancellation_supported: true,
             reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
             preparation_required: false,
         };
         NodeDefinition {

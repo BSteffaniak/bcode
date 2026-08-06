@@ -721,8 +721,10 @@ pub enum AttemptObservation {
     Running,
     /// External work completed with schema-validated output.
     Succeeded { output: ValidatedOutput },
-    /// External work failed terminally.
+    /// External work failed terminally and must not be retried automatically.
     Failed { message: String },
+    /// A trustworthy owner receipt reports a terminal failure that is explicitly retryable.
+    RetryableFailure { message: String },
     /// External work stopped in a recoverable state and requires explicit run resume.
     Paused {
         /// Stable owner-neutral reason for the pause.
@@ -769,6 +771,8 @@ pub struct ReceiptReconciliationSummary {
     pub running: Vec<String>,
     pub succeeded: Vec<String>,
     pub failed: Vec<String>,
+    /// Durable retries scheduled from exact owner observations and node policy.
+    pub retries_scheduled: Vec<AutomaticRetrySchedule>,
     /// Active sibling attempts whose cancellation intent committed during fail-fast settlement.
     pub sibling_cancellations: Vec<ActiveAttemptCancellation>,
     pub paused: Vec<String>,
@@ -5665,21 +5669,21 @@ impl WorkflowStore {
         scheduled_at_ms: u64,
     ) -> Result<Option<AutomaticRetrySchedule>, WorkflowStoreError> {
         let failure = match observation {
-            AttemptObservation::Failed { .. } => {
+            AttemptObservation::RetryableFailure { .. } => {
                 bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable
+            }
+            AttemptObservation::Paused {
+                reason: AttemptPauseReason::IdleTimeout,
+                ..
+            } => bcode_workflow::AutomaticRetryFailureKind::TerminalTimeout,
+            AttemptObservation::Failed { .. } | AttemptObservation::Paused { .. } => {
+                bcode_workflow::AutomaticRetryFailureKind::TerminalFailure
             }
             AttemptObservation::Unknown => {
                 bcode_workflow::AutomaticRetryFailureKind::AmbiguousMutation
             }
             AttemptObservation::Cancelled => {
                 bcode_workflow::AutomaticRetryFailureKind::Cancellation
-            }
-            AttemptObservation::Paused {
-                reason: AttemptPauseReason::IdleTimeout,
-                ..
-            } => bcode_workflow::AutomaticRetryFailureKind::TerminalTimeout,
-            AttemptObservation::Paused { .. } => {
-                bcode_workflow::AutomaticRetryFailureKind::TerminalFailure
             }
             AttemptObservation::Admitted
             | AttemptObservation::Running
@@ -8012,10 +8016,12 @@ impl WorkflowStore {
             .transpose()
     }
 
-    /// Return bounded run IDs whose pending activations are safe to continue after startup.
+    /// Return bounded run IDs whose pending activations or due retries are safe to continue after
+    /// startup.
     ///
-    /// Eligible runs are running without cancellation intent, active attempts, or unresolved
-    /// input/approval waits. The query is projection-backed and does not replay workflow events.
+    /// Eligible runs are either running with pending work or failed with a due durable retry, and
+    /// have no cancellation intent, active attempts, or unresolved input/approval waits. The query
+    /// is projection-backed and does not replay workflow events.
     ///
     /// # Errors
     ///
@@ -8026,17 +8032,21 @@ impl WorkflowStore {
     ) -> Result<Vec<String>, WorkflowStoreError> {
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
-            "SELECT DISTINCT activation.run_id FROM workflow_activations activation \
-             JOIN workflow_runs run ON run.run_id = activation.run_id \
-             WHERE activation.status = 'pending' AND run.status = 'running' \
-               AND run.cancellation_requested_at_ms IS NULL \
+            "SELECT DISTINCT run.run_id FROM workflow_runs run \
+             WHERE run.cancellation_requested_at_ms IS NULL \
+               AND ( \
+                 (run.status = 'running' AND EXISTS(SELECT 1 FROM workflow_activations activation \
+                   WHERE activation.run_id = run.run_id AND activation.status = 'pending')) \
+                 OR (run.status = 'failed' AND EXISTS(SELECT 1 FROM workflow_retry_schedules retry \
+                   WHERE retry.run_id = run.run_id)) \
+               ) \
                AND NOT EXISTS(SELECT 1 FROM workflow_attempts attempt \
                  WHERE attempt.run_id = run.run_id \
                    AND attempt.status IN ('prepared', 'admitted', 'running', 'cancelling', 'sibling_cancelling')) \
                AND NOT EXISTS(SELECT 1 FROM workflow_activations waiting \
                  WHERE waiting.run_id = run.run_id \
                    AND waiting.status IN ('waiting_input', 'waiting_approval')) \
-             ORDER BY activation.run_id LIMIT ?1",
+             ORDER BY run.run_id LIMIT ?1",
         )?;
         statement
             .query_map([limit], |row| row.get(0))?
@@ -9278,6 +9288,114 @@ fn settle_parallel_failure(
     Ok(None)
 }
 
+fn schedule_retry_for_observation_transaction(
+    transaction: &Transaction<'_>,
+    request: &AttemptReconciliationRequest,
+    failure_kind: bcode_workflow::AutomaticRetryFailureKind,
+    scheduled_at_ms: u64,
+) -> Result<Option<AutomaticRetrySchedule>, WorkflowStoreError> {
+    let (definition_json, retry_cap): (String, u32) = transaction.query_row(
+        "SELECT definition.definition_json, run.retry_cap FROM workflow_runs run \
+         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+           AND definition.version = run.definition_version WHERE run.run_id = ?1",
+        [&request.run_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+    let node = definition.node(&request.node_id).ok_or_else(|| {
+        WorkflowStoreError::InvalidData(format!(
+            "retry observation references missing node: {}",
+            request.node_id
+        ))
+    })?;
+    if node.kind != bcode_workflow::NodeKind::PluginBlock {
+        return Ok(None);
+    }
+    let block: WorkflowBlockDefinition = serde_json::from_value(node.configuration.clone())?;
+    let Some(policy) = block.automatic_retry else {
+        return Ok(None);
+    };
+    policy
+        .validate()
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    if !policy.admits(failure_kind) {
+        return Ok(None);
+    }
+    let decision =
+        bcode_workflow::automatic_retry_decision(bcode_workflow::AutomaticRetryEligibility {
+            version: policy.version,
+            effect: block.effect,
+            reconciliation: block.reconciliation,
+            failure: failure_kind,
+            attempts_completed: request.attempt,
+            max_attempts: policy.max_attempts,
+            retry_cap,
+        });
+    let bcode_workflow::AutomaticRetryDecision::Eligible { next_attempt } = decision else {
+        return Ok(None);
+    };
+    let backoff_ms = policy
+        .backoff_ms(next_attempt)
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    let next_attempt_at_ms = scheduled_at_ms.checked_add(backoff_ms).ok_or_else(|| {
+        WorkflowStoreError::InvalidData("automatic retry backoff timestamp overflow".to_string())
+    })?;
+    let schedule = AutomaticRetrySchedule {
+        run_id: request.run_id.clone(),
+        node_id: request.node_id.clone(),
+        activation_id: request.activation_id.clone(),
+        failed_attempt: request.attempt,
+        next_attempt,
+        failure_kind,
+        backoff_ms,
+        next_attempt_at_ms,
+        scheduled_at_ms,
+    };
+    let failure_json = serde_json::to_string(&failure_kind)?;
+    let inserted = transaction.execute(
+        "INSERT INTO workflow_retry_schedules \
+         (run_id, node_id, activation_id, failed_attempt, next_attempt, failure_kind, \
+          backoff_ms, next_attempt_at_ms, scheduled_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         ON CONFLICT(run_id, node_id, activation_id) DO NOTHING",
+        (
+            &schedule.run_id,
+            &schedule.node_id,
+            &schedule.activation_id,
+            schedule.failed_attempt,
+            schedule.next_attempt,
+            &failure_json,
+            schedule.backoff_ms,
+            schedule.next_attempt_at_ms,
+            schedule.scheduled_at_ms,
+        ),
+    )?;
+    let stored = automatic_retry_schedule(
+        transaction,
+        &request.run_id,
+        &request.node_id,
+        &request.activation_id,
+    )?
+    .ok_or_else(|| {
+        WorkflowStoreError::InvalidData("automatic retry schedule was not persisted".to_string())
+    })?;
+    if stored != schedule {
+        return Err(WorkflowStoreError::InvalidData(
+            "automatic retry schedule conflicts with persisted state".to_string(),
+        ));
+    }
+    if inserted == 1 {
+        append_event(
+            transaction,
+            &request.run_id,
+            "automatic_retry_scheduled",
+            &serde_json::to_string(&schedule)?,
+            scheduled_at_ms,
+        )?;
+    }
+    Ok(Some(schedule))
+}
+
 #[allow(clippy::too_many_lines)]
 fn apply_attempt_observation(
     transaction: &Transaction<'_>,
@@ -9301,10 +9419,13 @@ fn apply_attempt_observation(
         ) || matches!(
             (current_status.as_str(), &observation),
             ("succeeded", AttemptObservation::Succeeded { .. })
-                | ("failed", AttemptObservation::Failed { .. })
                 | ("paused", AttemptObservation::Paused { .. })
                 | ("cancelled", AttemptObservation::Cancelled)
                 | ("repair_required", AttemptObservation::Unknown)
+                | (
+                    "failed",
+                    AttemptObservation::Failed { .. } | AttemptObservation::RetryableFailure { .. }
+                )
         );
         if compatible {
             return Ok(());
@@ -9335,6 +9456,7 @@ fn apply_attempt_observation(
     if cancellation_requested {
         observation = AttemptObservation::Cancelled;
     }
+    let retryable_observation = matches!(&observation, AttemptObservation::RetryableFailure { .. });
     match observation {
         AttemptObservation::Admitted => {
             transition_attempt(transaction, request, "admitted", None)?;
@@ -9350,7 +9472,8 @@ fn apply_attempt_observation(
             transition_attempt(transaction, request, "succeeded", Some(reconciled_at_ms))?;
             summary.succeeded.push(request.dispatch_identity.clone());
         }
-        AttemptObservation::Failed { message } => {
+        AttemptObservation::RetryableFailure { message }
+        | AttemptObservation::Failed { message } => {
             transition_attempt(transaction, request, "failed", Some(reconciled_at_ms))?;
             let activation_changed = transaction.execute(
                 "UPDATE workflow_activations SET status = 'failed' \
@@ -9364,19 +9487,37 @@ fn apply_attempt_observation(
                     request.dispatch_identity
                 )));
             }
-            let parallel_state = settle_parallel_failure(
-                transaction,
-                &request.run_id,
-                &request.node_id,
-                true,
-                reconciled_at_ms,
-            )?;
-            if let Some(parallel_state) = &parallel_state {
-                summary
-                    .sibling_cancellations
-                    .extend(parallel_state.sibling_cancellations.clone());
-            }
-            if parallel_state.is_none() {
+            let retry_schedule = if retryable_observation {
+                schedule_retry_for_observation_transaction(
+                    transaction,
+                    request,
+                    bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable,
+                    reconciled_at_ms,
+                )?
+            } else {
+                None
+            };
+            if retry_schedule.is_none() {
+                let parallel_state = settle_parallel_failure(
+                    transaction,
+                    &request.run_id,
+                    &request.node_id,
+                    true,
+                    reconciled_at_ms,
+                )?;
+                if let Some(parallel_state) = &parallel_state {
+                    summary
+                        .sibling_cancellations
+                        .extend(parallel_state.sibling_cancellations.clone());
+                }
+                if parallel_state.is_none() {
+                    transaction.execute(
+                        "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+                         WHERE run_id = ?1 AND status = 'running'",
+                        (&request.run_id, reconciled_at_ms),
+                    )?;
+                }
+            } else {
                 transaction.execute(
                     "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
                      WHERE run_id = ?1 AND status = 'running'",
@@ -9394,6 +9535,9 @@ fn apply_attempt_observation(
                 .to_string(),
                 reconciled_at_ms,
             )?;
+            if let Some(schedule) = retry_schedule {
+                summary.retries_scheduled.push(schedule);
+            }
             summary.failed.push(request.dispatch_identity.clone());
         }
         AttemptObservation::Paused { reason, message } => {
@@ -14619,6 +14763,123 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automatic_retry_policy_from_owner_observation_is_atomic_and_restart_safe() {
+        struct RetryableFailureObserver;
+        impl AttemptStatusObserver for RetryableFailureObserver {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::RetryableFailure {
+                    message: "retryable".to_string(),
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp");
+        let mut definition = definition("retry-policy");
+        let node = definition.nodes.get_mut("review").expect("node");
+        node.kind = bcode_workflow::NodeKind::PluginBlock;
+        node.configuration = serde_json::to_value(bcode_workflow::WorkflowBlockDefinition {
+            block_id: "example.retryable".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            operation: "retryable".to_string(),
+            input: node.input.clone(),
+            output: node.output.clone(),
+            effect: bcode_workflow::WorkflowBlockEffect::ReadOnly,
+            resources: Vec::new(),
+            authorization: bcode_workflow::WorkflowBlockAuthorization {
+                capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                explicit_grant_required: false,
+            },
+            timeout_ms: 1_000,
+            cancellation_supported: true,
+            reconciliation: bcode_workflow::WorkflowBlockReconciliation::ReceiptStatus,
+            automatic_retry: Some(bcode_workflow::WorkflowAutomaticRetryPolicy {
+                version: bcode_workflow::WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION,
+                max_attempts: 3,
+                eligible_failures: vec![
+                    bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable,
+                ],
+                initial_backoff_ms: 100,
+                backoff_multiplier: 2,
+                maximum_backoff_ms: 1_000,
+            }),
+            preparation_required: false,
+        })
+        .expect("block");
+        definition.validate().expect("definition");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition)
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "retryable"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("pending activation");
+        let identity = prepared.dispatch_identity;
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                attempt: 1,
+                dispatch_identity: identity.clone(),
+                receipt: serde_json::json!({"receipt": "retryable"}),
+                admitted_at_ms: 13,
+            })
+            .expect("receipt");
+
+        let summary = store
+            .reconcile_receipt_backed_attempts(&RetryableFailureObserver, 10, 20)
+            .expect("reconcile");
+        assert_eq!(summary.failed, [identity]);
+        assert_eq!(summary.retries_scheduled.len(), 1);
+        assert_eq!(summary.retries_scheduled[0].next_attempt, 2);
+        assert_eq!(summary.retries_scheduled[0].next_attempt_at_ms, 120);
+        drop(store);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            reopened
+                .automatic_retry_schedule("run-1", "review", &activation_id())
+                .expect("schedule"),
+            Some(summary.retries_scheduled[0].clone())
+        );
+        assert_eq!(
+            reopened.resumable_pending_run_ids(10).expect("resumable"),
+            vec!["run-1".to_string()]
+        );
+        assert!(
+            reopened
+                .consume_next_due_automatic_retry_for_run("run-1", 119)
+                .expect("not due")
+                .is_none()
+        );
+        let retry = reopened
+            .consume_next_due_automatic_retry_for_run("run-1", 120)
+            .expect("consume")
+            .expect("retry");
+        assert_eq!(retry.next_attempt, 2);
+        assert!(
+            reopened
+                .consume_next_due_automatic_retry_for_run("run-1", 120)
+                .expect("duplicate")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn due_automatic_retry_consumption_is_atomic_and_cancellation_safe() {
         struct FailedObserver;
         impl AttemptStatusObserver for FailedObserver {
@@ -14670,7 +14931,7 @@ mod tests {
         store
             .schedule_automatic_retry_from_observation(
                 &request,
-                &AttemptObservation::Failed {
+                &AttemptObservation::RetryableFailure {
                     message: "retryable".to_string(),
                 },
                 bcode_workflow::WorkflowBlockEffect::ReadOnly,

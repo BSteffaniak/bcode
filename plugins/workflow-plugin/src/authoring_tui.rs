@@ -3388,6 +3388,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn typed_plugin_blocks_can_be_added_duplicated_removed_and_repositioned() {
         let mut document = document();
         let block = WorkflowBlockDefinition {
@@ -3406,6 +3407,7 @@ mod tests {
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
             preparation_required: false,
         };
         let key = bcode_workflow::workflow_block_catalog_key(&block);

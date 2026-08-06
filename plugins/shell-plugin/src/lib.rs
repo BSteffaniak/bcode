@@ -2697,6 +2697,7 @@ mod tests {
             timeout_ms: 300_000,
             cancellation_supported: true,
             reconciliation: bcode_workflow::WorkflowBlockReconciliation::RepairRequired,
+            automatic_retry: None,
             preparation_required: true,
         }
     }

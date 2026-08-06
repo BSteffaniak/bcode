@@ -16083,6 +16083,7 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
             && reconciled.paused.is_empty()
             && reconciled.cancelled.is_empty()
             && reconciled.repair_required.is_empty()
+            && reconciled.retries_scheduled.is_empty()
             && retried.is_none()
         {
             break;
@@ -30016,6 +30017,12 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
                                 .find(|attempt| &attempt.dispatch_identity == identity)
                                 .map(|attempt| attempt.run_id.clone())
                         })
+                        .chain(
+                            summary
+                                .retries_scheduled
+                                .iter()
+                                .map(|retry| retry.run_id.clone()),
+                        )
                         .collect::<BTreeSet<_>>();
                     let sibling_cancellations = summary.sibling_cancellations;
                     drop(store);
@@ -49616,6 +49623,7 @@ library = "test"
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
             preparation_required: false,
         };
         let definition = bcode_workflow::WorkflowDefinition {
@@ -52282,6 +52290,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             timeout_ms: 1_000,
             cancellation_supported: true,
             reconciliation: bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay,
+            automatic_retry: None,
             preparation_required: false,
         };
         let activation_input = serde_json::json!({"value": "current"});
