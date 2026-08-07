@@ -266,6 +266,8 @@ bcode theme validate ~/.config/bcode/themes/my-theme.toml
 
 Then select `my-theme` in `[tui.theme]`, `/theme apply my-theme`, or the theme picker. Saving a valid edit hot-reloads the full presentation without recompiling Rust. A parse error leaves the last valid presentation active and emits a bounded source-specific diagnostic; fixing the file permits the next poll to apply it atomically.
 
+Syntax grammars classify source tokens into semantic roles; the resolved Bcode theme exclusively selects their final colors. The semantic roles are `syntax.text`, `syntax.comment`, `syntax.keyword`, `syntax.function`, `syntax.variable`, `syntax.string`, `syntax.number`, `syntax.type`, `syntax.operator`, and `syntax.punctuation`. Omitted roles derive from the resolved text, muted, info/accent, success, and warning presentation rather than from a bundled syntax theme.
+
 ## Color and terminal behavior
 
 `terminal`/`default` deliberately preserve the terminal backend value. Omitted fields inherit or leave the prior layer unchanged; they are not aliases for terminal defaults. Opaque `bg` values should therefore be intentional.

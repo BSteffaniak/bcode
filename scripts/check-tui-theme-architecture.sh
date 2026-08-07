@@ -107,6 +107,11 @@ if rg -n 'syntax_palette:\s*None' \
   fail "filesystem source/diff adapters must not bypass the active syntax theme"
 fi
 
+if rg -n 'ThemeSet|classify_scope_color|SyntaxColor::Rgb\(101, 115, 126\)' \
+  packages/syntax-render/src/lib.rs; then
+  fail "syntax semantics must come from parser scopes rather than aesthetic theme colors"
+fi
+
 if rg -n 'themes\.themes\.values\(\)\.next\(\)' \
   packages/syntax-render/src/lib.rs; then
   fail "syntax classification must select its canonical theme deterministically"

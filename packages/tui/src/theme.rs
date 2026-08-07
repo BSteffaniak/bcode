@@ -482,7 +482,7 @@ pub(crate) fn resolved_definition_theme(
     let warning = style("state.warning").unwrap_or(text);
     let error = style("state.error").unwrap_or(text);
     let markdown = markdown_theme(theme, text, muted);
-    let syntax = syntax_palette(theme);
+    let syntax = syntax_palette(theme, text, muted, info, success, warning);
     let source = bcode_tui_components::source_viewer::SourceViewerStyle {
         source: style("source.text").unwrap_or(text),
         border: style("source.border").unwrap_or(border),
@@ -584,25 +584,38 @@ pub(crate) fn resolved_definition_theme(
 
 fn syntax_palette(
     theme: Option<&definition::ResolvedThemeDefinition>,
+    text: bmux_tui::style::Style,
+    muted: bmux_tui::style::Style,
+    info: bmux_tui::style::Style,
+    success: bmux_tui::style::Style,
+    warning: bmux_tui::style::Style,
 ) -> bcode_syntax_render::SyntaxPalette {
     use bcode_syntax_render::{SyntaxColor, SyntaxPalette};
 
+    let style_color = |style: bmux_tui::style::Style, fallback: SyntaxColor| {
+        style.fg.map_or(fallback, tui_color_to_syntax)
+    };
+    let text_color = style_color(text, SyntaxColor::Default);
+    let muted_color = style_color(muted, text_color);
+    let info_color = style_color(info, text_color);
+    let success_color = style_color(success, text_color);
+    let warning_color = style_color(warning, text_color);
     let color = |role: &str, fallback: SyntaxColor| {
         theme
             .and_then(|theme| theme.style(role).and_then(|style| style.fg))
             .map_or(fallback, tui_color_to_syntax)
     };
     SyntaxPalette {
-        text: color("syntax.text", SyntaxColor::rgb(212, 212, 212)),
-        comment: color("syntax.comment", SyntaxColor::rgb(106, 153, 85)),
-        keyword: color("syntax.keyword", SyntaxColor::rgb(86, 156, 214)),
-        function: color("syntax.function", SyntaxColor::rgb(220, 220, 170)),
-        variable: color("syntax.variable", SyntaxColor::rgb(156, 220, 254)),
-        string: color("syntax.string", SyntaxColor::rgb(206, 145, 120)),
-        number: color("syntax.number", SyntaxColor::rgb(181, 206, 168)),
-        type_name: color("syntax.type", SyntaxColor::rgb(78, 201, 176)),
-        operator: color("syntax.operator", SyntaxColor::rgb(212, 212, 212)),
-        punctuation: color("syntax.punctuation", SyntaxColor::rgb(212, 212, 212)),
+        text: color("syntax.text", text_color),
+        comment: color("syntax.comment", muted_color),
+        keyword: color("syntax.keyword", info_color),
+        function: color("syntax.function", info_color),
+        variable: color("syntax.variable", text_color),
+        string: color("syntax.string", success_color),
+        number: color("syntax.number", warning_color),
+        type_name: color("syntax.type", info_color),
+        operator: color("syntax.operator", text_color),
+        punctuation: color("syntax.punctuation", text_color),
     }
 }
 
@@ -755,6 +768,46 @@ mod capability_tests {
             ),
             definition::ResolvedThemeVariant::Light
         );
+    }
+
+    #[test]
+    fn bundled_theme_syntax_roles_resolve_to_declared_colors() {
+        use bcode_syntax_render::SyntaxColor;
+
+        let catalog = definition::ThemeCatalog::bundled().expect("bundled themes parse");
+        for theme_id in [
+            "terminal-native",
+            "bcode-dark",
+            "bcode-light",
+            "nord",
+            "monochrome",
+        ] {
+            let resolved = catalog
+                .resolve(&definition::ThemeSelection::new(theme_id))
+                .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+            let presented =
+                resolved_definition_theme(Some(&resolved), PENDING_AGENT_METADATA_ACCENT)
+                    .presented(PENDING_AGENT_METADATA_ACCENT);
+
+            for (role, actual) in [
+                ("syntax.text", presented.syntax.text),
+                ("syntax.comment", presented.syntax.comment),
+                ("syntax.keyword", presented.syntax.keyword),
+                ("syntax.function", presented.syntax.function),
+                ("syntax.variable", presented.syntax.variable),
+                ("syntax.string", presented.syntax.string),
+                ("syntax.number", presented.syntax.number),
+                ("syntax.type", presented.syntax.type_name),
+                ("syntax.operator", presented.syntax.operator),
+                ("syntax.punctuation", presented.syntax.punctuation),
+            ] {
+                let expected = resolved
+                    .style(role)
+                    .and_then(|style| style.fg)
+                    .map_or(actual, SyntaxColor::from_tui);
+                assert_eq!(actual, expected, "{theme_id} {role}");
+            }
+        }
     }
 
     #[test]

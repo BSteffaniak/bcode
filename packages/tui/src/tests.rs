@@ -5120,6 +5120,75 @@ fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
         .expect("static filesystem plugin should load")
 }
 
+fn filesystem_visual_source_colors(
+    app: &BmuxApp,
+    schema: &str,
+    payload: &serde_json::Value,
+) -> Vec<bmux_tui::style::Color> {
+    let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+        80,
+        bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+        None,
+    )
+    .with_theme(render::plugin_theme_for_app(app));
+    let visual = app
+        .plugin_presentation()
+        .expect("filesystem presentation installed")
+        .routed_visual(
+            "filesystem-theme-test",
+            0,
+            schema,
+            1,
+            Some("bcode.filesystem"),
+            payload,
+            &context,
+        )
+        .expect("filesystem visual resolves");
+    visual
+        .rows
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .filter_map(|span| span.style.fg)
+        .collect()
+}
+
+#[test]
+fn filesystem_read_and_grep_follow_resolved_bundled_themes() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    disable_theme_transition(&mut app);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    let read = serde_json::json!({
+        "path": "src/lib.rs",
+        "contents": "pub fn main() {}",
+        "start_line": 1,
+        "truncated": false
+    });
+    let grep = serde_json::json!({
+        "matches": [{"path": "src/lib.rs", "line_number": 1, "line": "pub fn main() {}"}],
+        "backend": "rust",
+        "partial": false
+    });
+
+    assert!(app.apply_theme("terminal-native"));
+    let terminal_read = filesystem_visual_source_colors(&app, "bcode.filesystem.read", &read);
+    let terminal_grep = filesystem_visual_source_colors(&app, "bcode.filesystem.grep", &grep);
+    assert!(terminal_read.contains(&bmux_tui::style::Color::Blue));
+    assert!(terminal_read.contains(&bmux_tui::style::Color::Cyan));
+    assert!(terminal_grep.contains(&bmux_tui::style::Color::Blue));
+    assert!(terminal_grep.contains(&bmux_tui::style::Color::Cyan));
+
+    assert!(app.apply_theme("nord"));
+    let nord_read = filesystem_visual_source_colors(&app, "bcode.filesystem.read", &read);
+    let nord_grep = filesystem_visual_source_colors(&app, "bcode.filesystem.grep", &grep);
+    let nord_keyword = bmux_tui::style::Color::Rgb(129, 161, 193);
+    let nord_function = bmux_tui::style::Color::Rgb(136, 192, 208);
+    assert!(nord_read.contains(&nord_keyword));
+    assert!(nord_read.contains(&nord_function));
+    assert!(nord_grep.contains(&nord_keyword));
+    assert!(nord_grep.contains(&nord_function));
+    assert_ne!(nord_read, terminal_read);
+}
+
 fn vim_edit_plugin_host() -> bcode_plugin::PluginHost {
     let bundled = [bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/vim-edit-plugin/bcode-plugin.toml"),

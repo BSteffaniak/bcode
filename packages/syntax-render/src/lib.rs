@@ -15,13 +15,25 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use bmux_tui::prelude::{Color, Modifier, Span, Style};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
-use syntect::util::LinesWithEndings;
+use syntect::easy::ScopeRegionIterator;
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static DEFAULT_THEME: OnceLock<Theme> = OnceLock::new();
+
+/// Renderer-neutral semantic syntax role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyntaxRole {
+    Text,
+    Comment,
+    Keyword,
+    Function,
+    Variable,
+    String,
+    Number,
+    Type,
+    Operator,
+    Punctuation,
+}
 
 /// Renderer-neutral syntax-highlighted text span.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +55,9 @@ impl SyntaxSpan {
 /// Renderer-neutral syntax style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntaxStyle {
-    /// Foreground terminal color, preserved without palette conversion.
+    /// Semantic token role determined from syntax scopes.
+    pub role: SyntaxRole,
+    /// Foreground terminal color selected by the active palette.
     pub foreground: SyntaxColor,
     /// Whether text should be bold.
     pub bold: bool,
@@ -60,7 +74,7 @@ pub struct SyntaxStyle {
 /// modifiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxHighlighter {
-    palette: Option<SyntaxPalette>,
+    palette: SyntaxPalette,
 }
 
 /// Semantic syntax color palette.
@@ -86,6 +100,40 @@ pub struct SyntaxPalette {
     pub operator: SyntaxColor,
     /// Punctuation and delimiters.
     pub punctuation: SyntaxColor,
+}
+
+impl Default for SyntaxPalette {
+    fn default() -> Self {
+        Self {
+            text: SyntaxColor::rgb(212, 212, 212),
+            comment: SyntaxColor::rgb(106, 153, 85),
+            keyword: SyntaxColor::rgb(86, 156, 214),
+            function: SyntaxColor::rgb(220, 220, 170),
+            variable: SyntaxColor::rgb(156, 220, 254),
+            string: SyntaxColor::rgb(206, 145, 120),
+            number: SyntaxColor::rgb(181, 206, 168),
+            type_name: SyntaxColor::rgb(78, 201, 176),
+            operator: SyntaxColor::rgb(212, 212, 212),
+            punctuation: SyntaxColor::rgb(212, 212, 212),
+        }
+    }
+}
+
+impl SyntaxPalette {
+    const fn color(self, role: SyntaxRole) -> SyntaxColor {
+        match role {
+            SyntaxRole::Text => self.text,
+            SyntaxRole::Comment => self.comment,
+            SyntaxRole::Keyword => self.keyword,
+            SyntaxRole::Function => self.function,
+            SyntaxRole::Variable => self.variable,
+            SyntaxRole::String => self.string,
+            SyntaxRole::Number => self.number,
+            SyntaxRole::Type => self.type_name,
+            SyntaxRole::Operator => self.operator,
+            SyntaxRole::Punctuation => self.punctuation,
+        }
+    }
 }
 
 /// Portable terminal syntax color.
@@ -191,22 +239,18 @@ impl Default for SyntaxHighlighter {
 }
 
 impl SyntaxHighlighter {
-    /// Create a syntax highlighter using a neutral bundled classification theme.
-    ///
-    /// Application presentation should use [`Self::with_palette`]. This
-    /// compatibility constructor is retained for standalone callers that have
-    /// not supplied semantic syntax colors.
+    /// Create a syntax highlighter using Bcode's compatibility palette.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { palette: None }
+    pub fn new() -> Self {
+        Self {
+            palette: SyntaxPalette::default(),
+        }
     }
 
     /// Create a syntax highlighter using an application-supplied semantic palette.
     #[must_use]
     pub const fn with_palette(palette: SyntaxPalette) -> Self {
-        Self {
-            palette: Some(palette),
-        }
+        Self { palette }
     }
 
     /// Return whether a syntax can be detected for a path or language hint.
@@ -228,13 +272,12 @@ impl SyntaxHighlighter {
     #[must_use]
     pub fn highlight_line_tokens(&self, path_or_language: &str, line: &str) -> Vec<SyntaxSpan> {
         let Some(syntax) = syntax_for(path_or_language) else {
-            return plain_syntax_spans(line);
+            return plain_syntax_spans(line, self.palette);
         };
-        let mut highlighter = HighlightLines::new(syntax, classification_theme());
-        highlight_line_tokens_with(&mut highlighter, line).map_or_else(
-            || plain_syntax_spans_with_palette(line, self.palette),
-            |spans| remap_spans(spans, self.palette),
-        )
+        let mut classifier = ScopeClassifier::new(syntax, self.palette);
+        classifier
+            .classify_line(line)
+            .unwrap_or_else(|| plain_syntax_spans(line, self.palette))
     }
 
     /// Highlight multiple lines using a path or language hint.
@@ -256,17 +299,16 @@ impl SyntaxHighlighter {
         let Some(syntax) = syntax_for(path_or_language) else {
             return lines
                 .iter()
-                .map(|line| plain_syntax_spans_with_palette(line, self.palette))
+                .map(|line| plain_syntax_spans(line, self.palette))
                 .collect();
         };
-        let mut highlighter = HighlightLines::new(syntax, classification_theme());
+        let mut classifier = ScopeClassifier::new(syntax, self.palette);
         lines
             .iter()
             .map(|line| {
-                highlight_line_tokens_with(&mut highlighter, line).map_or_else(
-                    || plain_syntax_spans_with_palette(line, self.palette),
-                    |spans| remap_spans(spans, self.palette),
-                )
+                classifier
+                    .classify_line(line)
+                    .unwrap_or_else(|| plain_syntax_spans(line, self.palette))
             })
             .collect()
     }
@@ -274,17 +316,6 @@ impl SyntaxHighlighter {
 
 fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
-}
-
-fn classification_theme() -> &'static Theme {
-    DEFAULT_THEME.get_or_init(|| {
-        let themes = ThemeSet::load_defaults();
-        themes
-            .themes
-            .get("base16-ocean.dark")
-            .cloned()
-            .unwrap_or_else(|| panic!("Syntect default themes must include base16-ocean.dark"))
-    })
 }
 
 fn syntax_for(path_or_language: &str) -> Option<&'static SyntaxReference> {
@@ -319,91 +350,110 @@ fn language_alias(language: &str) -> &str {
     }
 }
 
-fn highlight_line_tokens_with(
-    highlighter: &mut HighlightLines<'_>,
-    line: &str,
-) -> Option<Vec<SyntaxSpan>> {
-    let ranges = highlighter.highlight_line(line, syntax_set()).ok()?;
-    let spans = ranges
-        .into_iter()
-        .flat_map(|(style, content)| {
-            LinesWithEndings::from(content).filter_map(move |line| {
-                let content = line.trim_end_matches(['\r', '\n']);
-                if content.is_empty() {
-                    None
-                } else {
-                    Some(SyntaxSpan::new(
-                        content.to_owned(),
-                        syntect_style_to_syntax(style),
-                    ))
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    Some(if spans.is_empty() {
-        plain_syntax_spans(line)
-    } else {
-        spans
-    })
+struct ScopeClassifier {
+    parse_state: ParseState,
+    scope_stack: ScopeStack,
+    palette: SyntaxPalette,
 }
 
-fn plain_syntax_spans_with_palette(line: &str, palette: Option<SyntaxPalette>) -> Vec<SyntaxSpan> {
+impl ScopeClassifier {
+    fn new(syntax: &SyntaxReference, palette: SyntaxPalette) -> Self {
+        Self {
+            parse_state: ParseState::new(syntax),
+            scope_stack: ScopeStack::new(),
+            palette,
+        }
+    }
+
+    fn classify_line(&mut self, line: &str) -> Option<Vec<SyntaxSpan>> {
+        let operations = self.parse_state.parse_line(line, syntax_set()).ok()?;
+        let mut spans = Vec::new();
+        for (content, operation) in ScopeRegionIterator::new(&operations, line) {
+            self.scope_stack.apply(operation).ok()?;
+            let content = content.trim_end_matches(['\r', '\n']);
+            if content.is_empty() {
+                continue;
+            }
+            let role = classify_scope_stack(&self.scope_stack);
+            spans.push(SyntaxSpan::new(
+                content.to_owned(),
+                syntax_style(role, self.palette.color(role)),
+            ));
+        }
+        Some(if spans.is_empty() {
+            plain_syntax_spans(line, self.palette)
+        } else {
+            spans
+        })
+    }
+}
+
+fn classify_scope_stack(stack: &ScopeStack) -> SyntaxRole {
+    let scopes = stack
+        .scopes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let has = |needle: &str| scopes.iter().any(|scope| scope_contains(scope, needle));
+
+    if has("comment") {
+        SyntaxRole::Comment
+    } else if has("string") || has("character") || has("regexp") {
+        SyntaxRole::String
+    } else if has("constant.numeric")
+        || has("constant.language.boolean")
+        || has("constant.language.null")
+    {
+        SyntaxRole::Number
+    } else if has("entity.name.function") || has("support.function") || has("meta.function-call") {
+        SyntaxRole::Function
+    } else if has("entity.name.type")
+        || has("entity.name.class")
+        || has("entity.name.struct")
+        || has("entity.name.enum")
+        || has("entity.name.namespace")
+        || has("support.type")
+    {
+        SyntaxRole::Type
+    } else if has("keyword.operator") {
+        SyntaxRole::Operator
+    } else if has("keyword")
+        || has("storage.modifier")
+        || has("storage.control")
+        || has("storage.type")
+    {
+        SyntaxRole::Keyword
+    } else if has("variable")
+        || has("entity.name.field")
+        || has("entity.name.property")
+        || has("support.variable")
+    {
+        SyntaxRole::Variable
+    } else if has("punctuation") {
+        SyntaxRole::Punctuation
+    } else {
+        SyntaxRole::Text
+    }
+}
+
+fn scope_contains(scope: &str, needle: &str) -> bool {
+    scope == needle
+        || scope
+            .strip_prefix(needle)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn plain_syntax_spans(line: &str, palette: SyntaxPalette) -> Vec<SyntaxSpan> {
     vec![SyntaxSpan::new(
         line.to_owned(),
-        palette.map_or_else(default_syntax_style, |palette| syntax_style(palette.text)),
+        syntax_style(SyntaxRole::Text, palette.text),
     )]
 }
 
-fn plain_syntax_spans(line: &str) -> Vec<SyntaxSpan> {
-    plain_syntax_spans_with_palette(line, None)
-}
-
-fn remap_spans(mut spans: Vec<SyntaxSpan>, palette: Option<SyntaxPalette>) -> Vec<SyntaxSpan> {
-    let Some(palette) = palette else {
-        return spans;
-    };
-    let default = default_syntax_style();
-    for span in &mut spans {
-        span.style.foreground =
-            classify_scope_color(span.style.foreground, default.foreground, palette);
-    }
-    spans
-}
-
-fn classify_scope_color(
-    foreground: SyntaxColor,
-    default: SyntaxColor,
-    palette: SyntaxPalette,
-) -> SyntaxColor {
-    // Syntect's bundled theme supplies stable source scope colors. Map those
-    // known colors to semantic categories; unknown scope colors remain plain
-    // text rather than leaking the bundled dark palette into a caller theme.
-    match foreground {
-        SyntaxColor::Rgb(101, 115, 126) | SyntaxColor::Rgb(92, 99, 112) => palette.comment,
-        SyntaxColor::Rgb(180, 142, 173) | SyntaxColor::Rgb(198, 120, 221) => palette.keyword,
-        SyntaxColor::Rgb(143, 161, 179) | SyntaxColor::Rgb(220, 220, 170) => palette.function,
-        SyntaxColor::Rgb(192, 197, 206) | SyntaxColor::Rgb(156, 220, 254) => palette.variable,
-        SyntaxColor::Rgb(163, 190, 140) | SyntaxColor::Rgb(206, 145, 120) => palette.string,
-        SyntaxColor::Rgb(208, 135, 112) | SyntaxColor::Rgb(181, 206, 168) => palette.number,
-        SyntaxColor::Rgb(235, 203, 139) | SyntaxColor::Rgb(78, 201, 176) => palette.type_name,
-        SyntaxColor::Rgb(197, 200, 198) | SyntaxColor::Rgb(212, 212, 212) => palette.operator,
-        color if color == default => palette.text,
-        _ => palette.punctuation,
-    }
-}
-
-const fn syntax_style(color: SyntaxColor) -> SyntaxStyle {
+const fn syntax_style(role: SyntaxRole, color: SyntaxColor) -> SyntaxStyle {
     SyntaxStyle {
+        role,
         foreground: color,
-        bold: false,
-        italic: false,
-        underline: false,
-    }
-}
-
-const fn default_syntax_style() -> SyntaxStyle {
-    SyntaxStyle {
-        foreground: SyntaxColor::rgb(255, 255, 255),
         bold: false,
         italic: false,
         underline: false,
@@ -412,15 +462,6 @@ const fn default_syntax_style() -> SyntaxStyle {
 
 fn syntax_span_to_tui(span: SyntaxSpan) -> Span {
     Span::styled(span.content, syntax_style_to_tui(span.style))
-}
-
-const fn syntect_style_to_syntax(style: syntect::highlighting::Style) -> SyntaxStyle {
-    SyntaxStyle {
-        foreground: SyntaxColor::rgb(style.foreground.r, style.foreground.g, style.foreground.b),
-        bold: style.font_style.contains(FontStyle::BOLD),
-        italic: style.font_style.contains(FontStyle::ITALIC),
-        underline: style.font_style.contains(FontStyle::UNDERLINE),
-    }
 }
 
 const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
@@ -439,9 +480,7 @@ const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AnsiColor, SyntaxColor, SyntaxHighlighter, SyntaxPalette, classify_scope_color, syntax_for,
-    };
+    use super::{AnsiColor, SyntaxColor, SyntaxHighlighter, SyntaxPalette, SyntaxRole, syntax_for};
     use bmux_tui::prelude::Color;
 
     #[test]
@@ -475,22 +514,26 @@ mod tests {
             operator: SyntaxColor::Default,
             punctuation: SyntaxColor::Rgb(12, 34, 56),
         };
-        assert_eq!(
-            classify_scope_color(
-                SyntaxColor::rgb(101, 115, 126),
-                SyntaxColor::rgb(255, 255, 255),
-                palette,
-            ),
-            SyntaxColor::Ansi(AnsiColor::BrightBlack)
-        );
-        assert_eq!(
-            classify_scope_color(
-                SyntaxColor::rgb(143, 161, 179),
-                SyntaxColor::rgb(255, 255, 255),
-                palette,
-            ),
-            SyntaxColor::Indexed(173)
-        );
+        let lines = ["// comment", "pub fn main() { let value = 42; }"];
+        let spans = SyntaxHighlighter::with_palette(palette)
+            .highlight_lines_tokens("rust", &lines)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        for (role, color) in [
+            (SyntaxRole::Comment, palette.comment),
+            (SyntaxRole::Keyword, palette.keyword),
+            (SyntaxRole::Function, palette.function),
+            (SyntaxRole::Number, palette.number),
+        ] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.style.role == role && span.style.foreground == color),
+                "missing {role:?} with {color:?}: {spans:?}"
+            );
+        }
     }
 
     #[test]
@@ -513,20 +556,93 @@ mod tests {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        let colors = spans
-            .iter()
-            .map(|span| span.style.foreground)
-            .collect::<Vec<_>>();
+        let roles = spans.iter().map(|span| span.style.role).collect::<Vec<_>>();
 
-        assert!(colors.contains(&palette.comment), "{spans:?}");
-        assert!(colors.contains(&palette.keyword), "{spans:?}");
-        assert!(colors.contains(&palette.function), "{spans:?}");
-        assert!(colors.contains(&palette.number), "{spans:?}");
+        assert!(roles.contains(&SyntaxRole::Comment), "{spans:?}");
+        assert!(roles.contains(&SyntaxRole::Keyword), "{spans:?}");
+        assert!(roles.contains(&SyntaxRole::Function), "{spans:?}");
+        assert!(roles.contains(&SyntaxRole::Number), "{spans:?}");
         assert!(
             spans
                 .iter()
-                .any(|span| span.style.foreground != palette.text),
-            "semantic highlighting collapsed to plain text: {spans:?}"
+                .all(|span| { span.style.foreground == palette.color(span.style.role) })
+        );
+    }
+
+    #[test]
+    fn semantic_roles_cover_representative_languages() {
+        let cases = [
+            (
+                "rust",
+                "// note\npub fn main() { let value = 42; }",
+                SyntaxRole::Comment,
+            ),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"bcode\"",
+                SyntaxRole::String,
+            ),
+            (
+                "data.json",
+                "{\"enabled\": true, \"count\": 3}",
+                SyntaxRole::Number,
+            ),
+            (
+                "script.sh",
+                "# note\nif true; then echo ok; fi",
+                SyntaxRole::Comment,
+            ),
+            (
+                "file.ts",
+                "export function main(): number { return 3; }",
+                SyntaxRole::Keyword,
+            ),
+            (
+                "default.nix",
+                "{ pkgs }: \"${pkgs.hello}\"",
+                SyntaxRole::String,
+            ),
+        ];
+
+        for (hint, source, expected) in cases {
+            let lines = source.lines().collect::<Vec<_>>();
+            let spans = SyntaxHighlighter::new()
+                .highlight_lines_tokens(hint, &lines)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            assert!(
+                spans.iter().any(|span| span.style.role == expected),
+                "expected {expected:?} for {hint}: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_scope_state_is_preserved() {
+        let lines = ["/* first", "second */", "let value = 1;"];
+        let rendered = SyntaxHighlighter::new().highlight_lines_tokens("rust", &lines);
+
+        assert!(
+            rendered[0]
+                .iter()
+                .all(|span| span.style.role == SyntaxRole::Comment),
+            "{:?}",
+            rendered[0]
+        );
+        assert!(
+            rendered[1]
+                .iter()
+                .all(|span| span.style.role == SyntaxRole::Comment),
+            "{:?}",
+            rendered[1]
+        );
+        assert!(
+            rendered[2]
+                .iter()
+                .any(|span| span.style.role == SyntaxRole::Keyword),
+            "{:?}",
+            rendered[2]
         );
     }
 
@@ -619,7 +735,7 @@ mod tests {
                 token_lines
                     .iter()
                     .flatten()
-                    .any(|span| { span.style != super::default_syntax_style() }),
+                    .any(|span| span.style.role != SyntaxRole::Text),
                 "expected syntax styles for {hint}"
             );
         }
