@@ -26,6 +26,18 @@ fg = "$text"
 [styles."text.primary"]
 fg = "$text"
 
+[styles."surface.raised"]
+bg = "$muted_background"
+fg = "$text"
+
+[styles."surface.overlay"]
+bg = "#111a2c"
+fg = "$text"
+
+[styles."control.focused"]
+fg        = "$accent"
+modifiers = ["bold"]
+
 [styles."text.muted"]
 fg = "$muted"
 

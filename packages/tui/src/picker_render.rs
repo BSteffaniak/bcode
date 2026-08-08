@@ -82,7 +82,8 @@ pub fn render_picker_panel(
         .border(Border::single().style(theme.border))
         .title(title)
         .padding(Insets::new(1, 1, 1, 1))
-        .background(theme.text);
+        .background(theme.raised)
+        .content_style(theme.raised);
     panel.render(area, frame);
     panel.inner_area(area)
 }
@@ -130,10 +131,10 @@ mod tests {
             );
             assert_eq!(
                 frame.buffer().get(Point::new(1, 1)).expect("body").style,
-                theme.text,
+                theme.raised,
                 "{theme_id} body"
             );
-            observed.push((theme_id, theme.text, theme.border));
+            observed.push((theme_id, theme.raised, theme.border));
         }
 
         assert!(observed[0].1.bg.is_none());

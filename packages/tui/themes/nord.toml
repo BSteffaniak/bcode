@@ -12,7 +12,7 @@ border             = "#4c566a"
 error              = "#bf616a"
 error_background   = "#3b303b"
 info               = "#81a1c1"
-muted              = "#7b88a1"
+muted              = "#8492aa"
 muted_background   = "#3b4252"
 selection          = "#434c5e"
 success            = "#a3be8c"
@@ -27,6 +27,18 @@ fg = "$text"
 
 [styles."text.primary"]
 fg = "$text"
+
+[styles."surface.raised"]
+bg = "$muted_background"
+fg = "$text"
+
+[styles."surface.overlay"]
+bg = "#3b4252"
+fg = "$text"
+
+[styles."control.focused"]
+fg        = "$accent"
+modifiers = ["bold"]
 
 [styles."text.muted"]
 fg = "$muted"

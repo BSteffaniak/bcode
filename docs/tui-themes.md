@@ -2,6 +2,12 @@
 
 Bcode themes are declarative, versioned TOML files. They control terminal presentation only: theme values cannot change authorization, tool dispatch, plugin routing, session persistence, or execution outcomes.
 
+Bcode ships an adaptive flagship family as `bcode`. It inherits the canonical dark presentation and
+provides explicit dark and independently tuned light variant patches. Existing `bcode-dark` and
+`bcode-light` IDs remain available for configuration compatibility; `bcode` is the convenient choice
+when `variant = "auto"` should follow terminal background detection. `terminal-native` remains the
+default unless selected explicitly.
+
 ## Configuration layers
 
 Bcode merges configuration in this order, with later files overriding earlier fields:
@@ -101,6 +107,30 @@ padding_x = 1
 ```
 
 Layouts are `plain`, `left_bar`, or `panel`; widths are `content` or `full`; borders are `none`, `left`, or `all`.
+
+## Semantic surfaces
+
+Schema version 1 accepts three optional roles for the existing interactive surface hierarchy:
+
+* `surface.raised` styles pickers, palettes, and the composer;
+* `surface.overlay` styles opaque modal and dialog panels;
+* `control.focused` styles focused borders, titles, inputs, and controls.
+
+`surface.scrim` is an optional full-parent modal scrim. Because terminal cells do not support alpha,
+a scrim is an opaque presentation choice and should be used sparingly. Missing `surface.raised` and
+`surface.overlay` roles fall back to the resolved canvas; missing `control.focused` falls back to
+`border.focused`; missing scrims remain disabled. These optional fallbacks preserve existing
+schema-v1 external themes and keep `terminal-native` transparent.
+
+## Theme picker preview
+
+On wide terminals, `/theme` presents a responsive comparison pane beside the catalog list. The
+preview uses bounded renderer-owned semantic fixture rows for user/assistant labels, tool lifecycle,
+code-like content, selection, and focus; it never reads or mutates the live session event stream.
+Narrow or short terminals retain the single-column catalog. Catalog rows and the preview expose the
+canonical source, validation state, selected state, and dark/light variant availability. Moving the
+selection still previews the complete live app, Enter persists through the existing user-state
+effect, and Escape restores the configured presentation.
 
 ## Authoring examples
 
@@ -270,6 +300,18 @@ Syntax grammars classify source tokens into semantic roles; the resolved Bcode t
 
 ## Color and terminal behavior
 
-`terminal`/`default` deliberately preserve the terminal backend value. Omitted fields inherit or leave the prior layer unchanged; they are not aliases for terminal defaults. Opaque `bg` values should therefore be intentional.
+`terminal`/`default` deliberately preserve the terminal backend value. The resolved `styles.canvas`
+is applied to the complete normal TUI frame before content and overlays are drawn. For
+`terminal-native`, that fill still uses the terminal's default foreground/background rather than an
+opaque Bcode color. Omitted fields inherit or leave the prior layer unchanged; they are not aliases
+for terminal defaults. Opaque `bg` values should therefore be intentional.
+
+For deterministic RGB themes, bundled-theme tests enforce WCAG-style contrast ratios of at least
+`4.5:1` for primary text and `3:1` for muted/secondary text across canvas, raised, and overlay
+surfaces. These thresholds do not apply to non-text decoration or to terminal-default, ANSI, and
+indexed values whose displayed RGB colors remain terminal-owned and therefore unknown to Bcode.
+Selection text is checked at the primary-text threshold when both foreground and background are
+explicit RGB values. Theme authors should use redundant glyphs or modifiers for semantic state even
+when color contrast passes.
 
 On reduced-color terminals, ANSI and indexed colors remain terminal-native choices throughout theme resolution, syntax highlighting, and plugin presentation; Bcode does not convert them to guessed RGB equivalents. The terminal default similarly remains the backend default. True-color RGB values are presentation inputs and may be approximated by the backend or terminal. Missing capability hints never make theme loading permissive or affect product behavior; `auto` uses the documented conservative dark fallback. For the broadest compatibility, start from `terminal-native`, retain text/glyph status cues, and avoid relying on subtle RGB differences alone.

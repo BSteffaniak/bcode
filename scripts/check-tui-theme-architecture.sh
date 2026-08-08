@@ -14,9 +14,49 @@ if rg -n -U 'pub fn set_tui_theme_selection[\s\S]{0,1200}update_writable_config'
   fail "theme state persistence must not delegate to writable config mutation"
 fi
 
+if rg -n 'surface\.base' \
+  packages/tui/src/theme.rs \
+  packages/tui/themes \
+  --glob '*.rs' \
+  --glob '*.toml'; then
+  fail "resolved canvas must consume the documented canvas semantic role"
+fi
+
+if ! rg -q 'frame\.fill\(layout\.area, " ", app\.presented_theme\(\)\.canvas\)' \
+  packages/tui/src/render.rs; then
+  fail "normal TUI rendering must fill the complete frame from resolved canvas presentation"
+fi
+
+if rg -n 'presented_theme\(\)\.background|semantic_state_theme\(\)\.background' \
+  packages/tui/src \
+  --glob '*.rs'; then
+  fail "TUI presentation must use the resolved canvas role rather than an ambiguous background field"
+fi
+
+if ! rg -q 'fn render_with_theme' plugins/loop-plugin/src/lib.rs \
+  || ! rg -q 'theme\.muted\.patch\(theme\.canvas\)' plugins/loop-plugin/src/lib.rs \
+  || ! rg -q 'focused_border: theme\.focused' plugins/loop-plugin/src/lib.rs; then
+  fail "loop plugin surface must consume renderer-owned theme presentation"
+fi
+
+if rg -n 'background\(theme\.text\)|frame\.fill\(area, " ", theme\.text\)|Style::new\(\)\.fg\(theme\.accent\)' \
+  packages/tui/src/command_palette_render.rs \
+  packages/tui/src/picker_render.rs \
+  packages/tui/src/slash_palette_render.rs \
+  packages/tui/src/thinking_dialog_render.rs; then
+  fail "raised surfaces and focused controls must consume resolved semantic surface styles"
+fi
+
+if ! rg -q 'style\("surface\.raised"\)' packages/tui/src/theme.rs \
+  || ! rg -q 'style\("surface\.overlay"\)' packages/tui/src/theme.rs \
+  || ! rg -q 'style\("control\.focused"\)' packages/tui/src/theme.rs; then
+  fail "resolved presentation must provide the bounded raised, overlay, and focused-control hierarchy"
+fi
+
 for theme in \
   packages/tui/themes/terminal-native.toml \
   packages/tui/themes/terminal-native-structured.toml \
+  packages/tui/themes/bcode.toml \
   packages/tui/themes/bcode-dark.toml \
   packages/tui/themes/bcode-light.toml \
   packages/tui/themes/monochrome.toml \
@@ -24,6 +64,24 @@ for theme in \
   packages/tui/themes/nord.toml; do
   [[ -f "$theme" ]] || fail "missing required bundled theme: $theme"
 done
+
+for required_test in \
+  explicit_rgb_bundled_themes_meet_text_contrast_thresholds \
+  reduced_color_themes_retain_modifier_redundancy \
+  opaque_picker_frame_exercises_modal_surface_and_selection_hierarchy \
+  bundled_ids_copy_parse_and_future_schemas_fail_closed \
+  external_schema_v1_theme_lifecycle_remains_compatible \
+  theme_changes_invalidate_presentation_without_mutating_session_projection; do
+  if ! rg -q "fn ${required_test}" packages/tui/src; then
+    fail "missing durable TUI theme regression: ${required_test}"
+  fi
+done
+
+if ! rg -q '"bcode:auto-dark"' packages/tui/src/render.rs \
+  || ! rg -q '"bcode:auto-light"' packages/tui/src/render.rs \
+  || ! rg -q '"nord"' packages/tui/src/render.rs; then
+  fail "cross-theme semantic matrix must cover adaptive variants and Nord"
+fi
 
 if rg -n 'PICKER_BG|Color::Black|Color::BrightBlack|Color::Yellow|Color::White|Color::Rgb\(38, 52, 64\)' \
   packages/tui/src/picker_render.rs \
@@ -90,6 +148,14 @@ if rg -n 'frame\.fill\(area, " ", Style::new\(\)\.fg\(Color::White\)\.bg\(Color:
   plugins/workflow-plugin/src/tui.rs; then
   fail "migrated plugin command surfaces must consume renderer-owned semantic themes"
 fi
+
+# Every bundled plugin surface must accept renderer-owned presentation so new
+# unthemed chrome cannot bypass the Phase 3 migration boundary.
+while IFS= read -r surface_file; do
+  if ! rg -q 'fn render_with_theme' "$surface_file"; then
+    fail "bundled plugin surface lacks renderer-owned theme presentation: $surface_file"
+  fi
+done < <(rg -l 'impl (bcode_plugin_sdk::tui::)?PluginTuiSurface for' plugins --glob '*.rs' | sort)
 
 if rg -n 'Color::|frame\.fill\(area, " ", Style::new\(\)' \
   plugins/ralph-plugin/src/lib.rs; then

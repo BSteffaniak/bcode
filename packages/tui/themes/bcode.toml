@@ -1,0 +1,39 @@
+display_name   = "Bcode"
+extends        = ["bcode-dark"]
+id             = "bcode"
+schema_version = 1
+
+# The unpatched definition is the canonical dark presentation inherited from
+# bcode-dark. An explicit empty dark patch advertises adaptive dark support.
+[variants.dark]
+
+# Light mode replaces the semantic palette. Inherited styles that reference
+# palette values resolve against this patch, while explicit dark RGB accents
+# receive focused light replacements below.
+[variants.light.palette]
+accent             = "#0369a1"
+background         = "#f8fafc"
+border             = "#94a3b8"
+error              = "#be123c"
+error_background   = "#ffe4e6"
+info               = "#0369a1"
+muted              = "#475569"
+muted_background   = "#e2e8f0"
+selection          = "#bae6fd"
+success            = "#15803d"
+success_background = "#dcfce7"
+text               = "#0f172a"
+warning            = "#a16207"
+warning_background = "#fef3c7"
+
+[variants.light.styles."surface.overlay"]
+bg = "#ffffff"
+fg = "$text"
+
+[variants.light.styles."diff.added_emphasis"]
+bg        = "#bbf7d0"
+modifiers = ["bold"]
+
+[variants.light.styles."diff.removed_emphasis"]
+bg        = "#fecdd3"
+modifiers = ["bold"]

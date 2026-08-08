@@ -267,7 +267,7 @@ fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::t
     };
     let syntax = theme.syntax;
     bcode_plugin_sdk::tui::PluginTuiTheme {
-        canvas: theme.background.patch(theme.text),
+        canvas: theme.canvas,
         text: theme.text,
         muted: theme.muted,
         border: theme.border,
@@ -322,7 +322,9 @@ use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::input::TextInput;
 use bmux_tui::prelude::{Line, Span, Style, Widget};
-use bmux_tui::style::{Color, Modifier};
+#[cfg(test)]
+use bmux_tui::style::Color;
+use bmux_tui::style::Modifier;
 use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
@@ -343,36 +345,53 @@ const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 #[derive(Debug, Clone, Copy)]
 pub struct TuiTheme {
-    pub accent: Color,
     pub text: Style,
     pub muted: Style,
     pub border: Style,
+    pub focused: Style,
+    pub raised: Style,
+    pub overlay: Style,
+    pub scrim: Option<Style>,
     pub selection: Style,
     pub info: Style,
+    pub success: Style,
+    pub warning: Style,
+    pub error: Style,
 }
 
 impl TuiTheme {
     pub const fn modal_theme(self) -> bmux_tui_components::modal_frame::ModalTheme {
-        bmux_tui_components::modal_frame::ModalTheme::new(
-            self.text,
-            self.border,
-            self.border,
-            self.text,
-            self.muted,
-            self.selection,
-        )
+        let theme = bmux_tui_components::modal_frame::ModalTheme::new(
+            self.overlay,
+            self.border.patch(self.overlay),
+            self.focused.patch(self.overlay),
+            self.text.patch(self.overlay),
+            self.muted.patch(self.overlay),
+            self.focused.patch(self.overlay),
+        );
+        if let Some(scrim) = self.scrim {
+            theme.with_scrim(scrim)
+        } else {
+            theme
+        }
     }
 
     #[must_use]
     pub const fn for_app(app: &BmuxApp) -> Self {
         let theme = app.presented_theme();
         Self {
-            accent: theme.accent,
             text: theme.text,
             muted: theme.muted,
             border: theme.border,
+            focused: theme.focused.patch(Style::new().fg(theme.accent)),
+            raised: theme.surfaces.raised,
+            overlay: theme.surfaces.overlay,
+            scrim: theme.surfaces.scrim,
             selection: theme.selection,
             info: theme.info,
+            success: theme.success,
+            warning: theme.warning,
+            error: theme.error,
         }
     }
 
@@ -385,16 +404,24 @@ impl TuiTheme {
     ) -> Self {
         let theme = super::theme::resolve_initial_theme();
         Self {
-            accent: super::theme::target_agent_accent(
-                agent_id,
-                configured_accent,
-                agent_metadata_hydrated,
-            ),
             text: theme.text,
             muted: theme.muted,
             border: theme.border,
+            focused: theme
+                .focused
+                .patch(Style::new().fg(super::theme::target_agent_accent(
+                    agent_id,
+                    configured_accent,
+                    agent_metadata_hydrated,
+                ))),
+            raised: theme.surfaces.raised,
+            overlay: theme.surfaces.overlay,
+            scrim: theme.surfaces.scrim,
             selection: theme.selection,
             info: theme.info,
+            success: theme.success,
+            warning: theme.warning,
+            error: theme.error,
         }
     }
 
@@ -412,12 +439,18 @@ impl TuiTheme {
         )
         .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
         Self {
-            accent: theme.accent,
             text: theme.text,
             muted: theme.muted,
             border: theme.border,
+            focused: theme.focused.patch(Style::new().fg(theme.accent)),
+            raised: theme.surfaces.raised,
+            overlay: theme.surfaces.overlay,
+            scrim: theme.surfaces.scrim,
             selection: theme.selection,
             info: theme.info,
+            success: theme.success,
+            warning: theme.warning,
+            error: theme.error,
         }
     }
 }
@@ -484,6 +517,7 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
         return;
     }
 
+    frame.fill(layout.area, " ", app.presented_theme().canvas);
     app.transcript_markdown_cache().retain_resident_iter(
         app.transcript().iter(),
         app.transcript_projection_revision(),
@@ -933,6 +967,35 @@ async fn explanatory_assistant_context_remains_visible_above_question_dock() {
 
 #[cfg(test)]
 #[test]
+fn resolved_canvas_fills_the_normal_frame_without_opaque_terminal_native_fallback() {
+    let area = Rect::new(0, 0, 48, 14);
+
+    let mut opaque = BmuxApp::new_with_history(None, &[], &[], false);
+    assert!(opaque.apply_theme("bcode-dark"));
+    let mut opaque_buffer = bmux_tui::buffer::Buffer::empty(area);
+    let mut opaque_frame = Frame::new(&mut opaque_buffer);
+    render(&mut opaque, &mut opaque_frame);
+    assert_eq!(
+        opaque_buffer
+            .get(bmux_tui::geometry::Point::new(47, 7))
+            .map(|cell| cell.style.bg),
+        Some(Some(Color::Rgb(11, 16, 32)))
+    );
+
+    let mut native = BmuxApp::new_with_history(None, &[], &[], false);
+    assert!(native.apply_theme("terminal-native"));
+    let mut native_buffer = bmux_tui::buffer::Buffer::empty(area);
+    let mut native_frame = Frame::new(&mut native_buffer);
+    render(&mut native, &mut native_frame);
+    assert!(
+        native_buffer
+            .get(bmux_tui::geometry::Point::new(47, 7))
+            .is_some_and(|cell| cell.style.bg.is_none_or(|color| color == Color::Default))
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn bottom_dock_handles_short_narrow_and_resized_terminals() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     for terminal in [
@@ -1161,7 +1224,7 @@ fn latest_bar_active_text_style() -> Style {
 }
 
 fn latest_bar_background_style() -> Style {
-    semantic_state_theme().background
+    semantic_state_theme().canvas
 }
 
 fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
@@ -1189,9 +1252,10 @@ const fn composer_area(area: Rect, composer_height: u16) -> Rect {
 
 fn composer_panel(theme: TuiTheme) -> Panel {
     Panel::new()
-        .border(Border::single().style(theme.border.patch(Style::new().fg(theme.accent))))
+        .border(Border::single().style(theme.focused))
         .title(" Message ")
         .padding(Insets::new(0, 1, 0, 1))
+        .background(theme.raised)
 }
 
 fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
@@ -1205,17 +1269,14 @@ fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiThe
 
 fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = theme.muted;
-    let accent = theme.text.patch(Style::new().fg(theme.accent));
+    let accent = theme.focused;
     let session_title = app
         .session_title()
         .map_or_else(|| "Untitled session".to_owned(), ToOwned::to_owned);
     let mut line = ChromeLine::new(" · ", muted)
         .required(
             "bcode".to_owned(),
-            theme
-                .text
-                .patch(Style::new().fg(theme.accent))
-                .add_modifier(Modifier::BOLD),
+            theme.focused.add_modifier(Modifier::BOLD),
             false,
         )
         .required(app.display_agent_id().to_owned(), accent, false)
@@ -1298,7 +1359,7 @@ fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>)
     if area.is_empty() {
         return;
     }
-    frame.fill(area, " ", app.presented_theme().background);
+    frame.fill(area, " ", app.presented_theme().canvas);
     let title = Line::from_spans(vec![Span::styled(
         " Mermaid source · Alt+Enter closes ",
         TuiTheme::for_app(app).info.add_modifier(Modifier::BOLD),
@@ -2807,21 +2868,39 @@ fn semantic_state_matrix_items() -> Vec<TranscriptItem> {
 }
 
 #[cfg(test)]
+const fn semantic_matrix_themes() -> [(
+    &'static str,
+    &'static str,
+    super::theme::definition::ResolvedThemeVariant,
+); 9] {
+    use super::theme::definition::ResolvedThemeVariant::{Dark, Light, Unspecified};
+
+    [
+        ("terminal-native", "terminal-native", Unspecified),
+        (
+            "terminal-native-structured",
+            "terminal-native-structured",
+            Unspecified,
+        ),
+        ("bcode-dark", "bcode-dark", Unspecified),
+        ("bcode-light", "bcode-light", Unspecified),
+        ("bcode:auto-dark", "bcode", Dark),
+        ("bcode:auto-light", "bcode", Light),
+        ("nord", "nord", Unspecified),
+        ("monochrome", "monochrome", Unspecified),
+        ("high-contrast", "high-contrast", Unspecified),
+    ]
+}
+
+#[cfg(test)]
 #[test]
 fn transcript_and_tool_state_matrix_snapshots_cross_theme_styles() {
     let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
     let mut snapshot = String::new();
-    for theme_id in [
-        "terminal-native",
-        "terminal-native-structured",
-        "bcode-dark",
-        "bcode-light",
-        "monochrome",
-        "high-contrast",
-    ] {
+    for (snapshot_id, theme_id, variant) in semantic_matrix_themes() {
         let resolved = catalog
-            .resolve(&super::theme::definition::ThemeSelection::new(theme_id))
-            .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+            .resolve(&super::theme::definition::ThemeSelection::new(theme_id).variant(variant))
+            .unwrap_or_else(|error| panic!("{snapshot_id} resolves: {error}"));
         let theme = super::theme::resolved_definition_theme(
             Some(&resolved),
             super::theme::PENDING_AGENT_METADATA_ACCENT,
@@ -2837,7 +2916,7 @@ fn transcript_and_tool_state_matrix_snapshots_cross_theme_styles() {
         if !snapshot.is_empty() {
             snapshot.push('\n');
         }
-        snapshot.push_str(&semantic_state_snapshot(theme_id, &rows));
+        snapshot.push_str(&semantic_state_snapshot(snapshot_id, &rows));
     }
     insta::assert_snapshot!("transcript_tool_state_matrix_cross_theme", snapshot);
 }
@@ -2850,17 +2929,10 @@ fn transcript_and_tool_state_matrix_is_bounded_across_bundled_themes() {
 
     let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
     let width = 32;
-    for theme_id in [
-        "terminal-native",
-        "terminal-native-structured",
-        "bcode-dark",
-        "bcode-light",
-        "monochrome",
-        "high-contrast",
-    ] {
+    for (snapshot_id, theme_id, variant) in semantic_matrix_themes() {
         let resolved = catalog
-            .resolve(&super::theme::definition::ThemeSelection::new(theme_id))
-            .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+            .resolve(&super::theme::definition::ThemeSelection::new(theme_id).variant(variant))
+            .unwrap_or_else(|error| panic!("{snapshot_id} resolves: {error}"));
         let theme = super::theme::resolved_definition_theme(
             Some(&resolved),
             super::theme::PENDING_AGENT_METADATA_ACCENT,
@@ -2911,11 +2983,11 @@ fn transcript_and_tool_state_matrix_is_bounded_across_bundled_themes() {
         for item in &messages {
             let rows =
                 transcript_item_rows_from_item(item, width, None, TuiDiffViewerConfig::default());
-            assert!(!rows.is_empty(), "{theme_id} omitted {:?}", item.kind());
+            assert!(!rows.is_empty(), "{snapshot_id} omitted {:?}", item.kind());
             assert!(
                 rows.iter()
                     .all(|line| spans_width(&line.spans) <= usize::from(width)),
-                "{theme_id} overflowed {:?}",
+                "{snapshot_id} overflowed {:?}",
                 item.kind()
             );
         }
@@ -2972,9 +3044,48 @@ fn transcript_and_tool_state_matrix_is_bounded_across_bundled_themes() {
             if timing.timed_out == Some(true) {
                 assert!(
                     visible.contains("tim") && visible.contains("out"),
-                    "{theme_id} omitted timeout cue: {visible}"
+                    "{snapshot_id} omitted timeout cue: {visible}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn reduced_color_themes_retain_modifier_redundancy() {
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    for theme_id in ["monochrome", "high-contrast"] {
+        let resolved = catalog
+            .resolve(&super::theme::definition::ThemeSelection::new(theme_id))
+            .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+        for role in [
+            "border.focused",
+            "selection.active",
+            "state.info",
+            "state.success",
+            "state.warning",
+            "state.error",
+            "tool.requested.title",
+            "tool.running.title",
+            "tool.waiting.title",
+            "tool.succeeded.title",
+            "tool.failed.title",
+            "tool.cancelled.title",
+            "tool.timed_out.title",
+            "diff.added",
+            "diff.removed",
+            "diff.hunk",
+            "diff.added_emphasis",
+            "diff.removed_emphasis",
+        ] {
+            let style = resolved
+                .style(role)
+                .unwrap_or_else(|| panic!("{theme_id} resolves {role}"));
+            assert!(
+                !style.modifiers.is_empty(),
+                "{theme_id} {role} must retain a non-color cue"
+            );
         }
     }
 }

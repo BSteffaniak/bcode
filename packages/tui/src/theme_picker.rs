@@ -62,6 +62,14 @@ impl ThemePickerState {
         self.list.offset
     }
 
+    /// Return selected catalog entry.
+    #[must_use]
+    pub fn selected_entry(&self) -> Option<&ThemeCatalogEntry> {
+        self.list
+            .selected
+            .and_then(|selected| self.entries.get(selected))
+    }
+
     /// Return selected theme id.
     #[must_use]
     pub fn selected_id(&self) -> Option<&str> {

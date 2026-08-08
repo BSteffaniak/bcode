@@ -2,7 +2,7 @@
 
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
 
@@ -113,15 +113,9 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
         Span::styled(" apply   ", theme.text),
         Span::styled("Esc", theme.selection.add_modifier(Modifier::BOLD)),
         Span::styled(" cancel   ", theme.text),
-        Span::styled(
-            "↑/↓",
-            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("↑/↓", theme.focused.add_modifier(Modifier::BOLD)),
         Span::styled(" move   ", theme.text),
-        Span::styled(
-            "Space",
-            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("Space", theme.focused.add_modifier(Modifier::BOLD)),
         Span::styled(" change", theme.text),
     ]));
     rows
@@ -140,7 +134,7 @@ fn setting_row(
 ) -> Line {
     let marker = if focused { "›" } else { " " };
     let marker_style = if focused {
-        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
+        theme.focused.add_modifier(Modifier::BOLD)
     } else {
         theme.muted
     };
@@ -148,7 +142,7 @@ fn setting_row(
         Span::styled(marker, marker_style),
         Span::styled(" ", theme.text),
         Span::styled(format!("{label}: "), theme.muted),
-        Span::styled(value.to_owned(), Style::new().fg(theme.accent)),
+        Span::styled(value.to_owned(), theme.focused),
     ];
     if let Some(help) = help {
         spans.push(Span::styled("  ", theme.text));

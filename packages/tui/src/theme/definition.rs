@@ -294,6 +294,10 @@ impl ThemeCatalog {
             include_str!("../../themes/bcode-dark.toml"),
         )?);
         catalog.insert(parse_theme_definition(
+            "builtin:bcode",
+            include_str!("../../themes/bcode.toml"),
+        )?);
+        catalog.insert(parse_theme_definition(
             "builtin:bcode-light",
             include_str!("../../themes/bcode-light.toml"),
         )?);
@@ -331,6 +335,7 @@ impl ThemeCatalog {
             "terminal-native-structured" => {
                 Some(include_str!("../../themes/terminal-native-structured.toml"))
             }
+            "bcode" => Some(include_str!("../../themes/bcode.toml")),
             "bcode-dark" => Some(include_str!("../../themes/bcode-dark.toml")),
             "bcode-light" => Some(include_str!("../../themes/bcode-light.toml")),
             "monochrome" => Some(include_str!("../../themes/monochrome.toml")),
@@ -1220,9 +1225,43 @@ indicator = "exit-code"
     }
 
     #[test]
+    fn bundled_ids_copy_parse_and_future_schemas_fail_closed() {
+        let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
+        let expected = [
+            "bcode",
+            "bcode-dark",
+            "bcode-light",
+            "high-contrast",
+            "monochrome",
+            "nord",
+            "terminal-native",
+            "terminal-native-structured",
+        ];
+        assert_eq!(
+            catalog
+                .definitions()
+                .map(super::ThemeDefinition::id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for id in expected {
+            let source = ThemeCatalog::bundled_source(id)
+                .unwrap_or_else(|| panic!("{id} has copyable bundled source"));
+            let copied = parse_theme_definition(format!("copied:{id}"), source)
+                .unwrap_or_else(|error| panic!("copied {id} parses: {error}"));
+            assert_eq!(copied.id(), id);
+        }
+        assert!(ThemeCatalog::bundled_source("unknown-theme").is_none());
+        assert!(matches!(
+            parse_theme_definition("future.toml", "schema_version = 2\nid = \"future\"\n"),
+            Err(ThemeError::UnsupportedVersion { version: 2, .. })
+        ));
+    }
+
+    #[test]
     fn bundled_themes_use_the_runtime_loader() {
         let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
-        assert_eq!(catalog.definitions.len(), 7);
+        assert_eq!(catalog.definitions.len(), 8);
         let native_definition = catalog
             .definitions
             .get("terminal-native")
@@ -1271,6 +1310,43 @@ indicator = "exit-code"
             light.style("canvas").and_then(|style| style.bg),
             Some(Color::Rgb(248, 250, 252))
         );
+
+        let adaptive_dark = catalog
+            .resolve(&ThemeSelection::new("bcode").variant(ResolvedThemeVariant::Dark))
+            .expect("adaptive dark resolves");
+        assert_eq!(
+            adaptive_dark.style("canvas"),
+            dark.style("canvas"),
+            "adaptive dark must preserve bcode-dark compatibility presentation"
+        );
+        assert_eq!(
+            adaptive_dark.styles, dark.styles,
+            "adaptive dark must preserve every compatibility semantic style"
+        );
+        assert_eq!(
+            adaptive_dark.containers, dark.containers,
+            "adaptive dark must preserve every compatibility container"
+        );
+
+        let adaptive_light = catalog
+            .resolve(&ThemeSelection::new("bcode").variant(ResolvedThemeVariant::Light))
+            .expect("adaptive light resolves");
+        assert_eq!(
+            adaptive_light.style("canvas"),
+            light.style("canvas"),
+            "adaptive light must preserve bcode-light compatibility presentation"
+        );
+        assert_eq!(
+            adaptive_light.styles, light.styles,
+            "adaptive light must preserve every compatibility semantic style"
+        );
+        assert_eq!(
+            adaptive_light.containers, light.containers,
+            "adaptive light must preserve every compatibility container"
+        );
+        assert!(catalog.definition("bcode").is_some_and(
+            |definition| definition.has_dark_variant() && definition.has_light_variant()
+        ));
 
         let monochrome = catalog
             .resolve(&ThemeSelection::new("monochrome"))

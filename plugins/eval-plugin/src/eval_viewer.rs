@@ -11,7 +11,7 @@ use bcode_eval_models::{
     EvalImprovementGeneration, EvalImprovementObjective, EvalRepetitionResult,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
-use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
+use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme};
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, MouseEventKind};
@@ -41,18 +41,67 @@ const TAB_HEIGHT: u16 = 1;
 const ACTION_HEIGHT: u16 = 1;
 const STATUS_HEIGHT: u16 = 1;
 
-const BG: Color = Color::Rgb(8, 13, 20);
-const PANEL: Color = Color::Rgb(15, 23, 34);
-const PANEL_ALT: Color = Color::Rgb(20, 31, 45);
-const BORDER: Color = Color::Rgb(51, 65, 85);
-const ACCENT: Color = Color::Rgb(56, 189, 248);
-const ACCENT_STRONG: Color = Color::Rgb(14, 165, 233);
-const TEXT: Color = Color::Rgb(226, 232, 240);
-const MUTED: Color = Color::Rgb(148, 163, 184);
-const SUCCESS: Color = Color::Rgb(34, 197, 94);
-const DANGER: Color = Color::Rgb(248, 113, 113);
-const WARNING: Color = Color::Rgb(251, 191, 36);
-const PURPLE: Color = Color::Rgb(167, 139, 250);
+thread_local! {
+    static ACTIVE_THEME: std::cell::Cell<Option<PluginTuiTheme>> = const { std::cell::Cell::new(None) };
+}
+
+fn theme_color(select: impl FnOnce(PluginTuiTheme) -> Option<Color>, fallback: Color) -> Color {
+    ACTIVE_THEME.with(|theme| theme.get().and_then(select).unwrap_or(fallback))
+}
+
+fn dashboard_bg() -> Color {
+    theme_color(|theme| theme.canvas.bg, Color::Rgb(8, 13, 20))
+}
+
+fn panel() -> Color {
+    dashboard_bg()
+}
+
+fn panel_alt() -> Color {
+    theme_color(
+        |theme| theme.selection.bg.or(theme.canvas.bg),
+        Color::Rgb(20, 31, 45),
+    )
+}
+
+fn border() -> Color {
+    theme_color(|theme| theme.border.fg, Color::Rgb(51, 65, 85))
+}
+
+fn accent() -> Color {
+    theme_color(|theme| theme.focused.fg, Color::Rgb(56, 189, 248))
+}
+
+fn accent_strong() -> Color {
+    theme_color(
+        |theme| theme.selection.bg.or(theme.focused.fg),
+        Color::Rgb(14, 165, 233),
+    )
+}
+
+fn text_color() -> Color {
+    theme_color(|theme| theme.text.fg, Color::Rgb(226, 232, 240))
+}
+
+fn muted() -> Color {
+    theme_color(|theme| theme.muted.fg, Color::Rgb(148, 163, 184))
+}
+
+fn success() -> Color {
+    theme_color(|theme| theme.diff.added.fg, Color::Rgb(34, 197, 94))
+}
+
+fn danger() -> Color {
+    theme_color(|theme| theme.diff.removed.fg, Color::Rgb(248, 113, 113))
+}
+
+fn warning() -> Color {
+    theme_color(|theme| theme.diff.hunk.fg, Color::Rgb(251, 191, 36))
+}
+
+fn purple() -> Color {
+    theme_color(|theme| theme.focused.fg, Color::Rgb(167, 139, 250))
+}
 const CARD_HEIGHT: u16 = 4;
 
 /// Eval run picker surface.
@@ -389,6 +438,20 @@ impl PluginTuiSurface for EvalRunPickerSurface {
             frame,
             "Click a row, then Open. Enter also opens; r refreshes; q closes.",
         );
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<PluginTuiTheme>,
+    ) {
+        ACTIVE_THEME.with(|active| active.set(theme));
+        if let Some(theme) = theme {
+            frame.fill(area, " ", theme.canvas);
+        }
+        self.render(area, frame);
+        ACTIVE_THEME.with(|active| active.set(None));
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -1891,8 +1954,8 @@ fn wizard_actions(primary: &'static str) -> Vec<ActionButton> {
     ]
 }
 
-const fn eval_modal_theme() -> ModalTheme {
-    ModalTheme::dark(ACCENT)
+fn eval_modal_theme() -> ModalTheme {
+    ModalTheme::dark(accent())
 }
 
 fn unique_campaign_id(root: &std::path::Path, base: &str) -> String {
@@ -2281,6 +2344,20 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
         );
     }
 
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<PluginTuiTheme>,
+    ) {
+        ACTIVE_THEME.with(|active| active.set(theme));
+        if let Some(theme) = theme {
+            frame.fill(area, " ", theme.canvas);
+        }
+        self.render(area, frame);
+        ACTIVE_THEME.with(|active| active.set(None));
+    }
+
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if let Some(wizard) = self.active_wizard.as_mut() {
             match wizard.handle_event(self.surface_area, event) {
@@ -2645,7 +2722,7 @@ impl EvalGenerationDetailSurface {
         let mut lines = vec![
             Line::from_spans(vec![Span::styled(
                 format!("Generation {}", generation.id),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             )]),
             Line::from(format!("Change: {}", generation.delta.summary)),
             Line::from(format!("Kind: {:?}", generation.delta.kind)),
@@ -2677,7 +2754,7 @@ impl EvalGenerationDetailSurface {
         let mut lines = vec![
             Line::from_spans(vec![Span::styled(
                 "What changed",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             )]),
             Line::from(format!("Summary: {}", generation.delta.summary)),
             Line::from(format!("Kind: {:?}", generation.delta.kind)),
@@ -2814,6 +2891,20 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
             frame,
             "Tab switches panes. O opens run. Esc returns.",
         );
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<PluginTuiTheme>,
+    ) {
+        ACTIVE_THEME.with(|active| active.set(theme));
+        if let Some(theme) = theme {
+            frame.fill(area, " ", theme.canvas);
+        }
+        self.render(area, frame);
+        ACTIVE_THEME.with(|active| active.set(None));
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -3096,6 +3187,20 @@ impl PluginTuiSurface for EvalRunViewerSurface {
         );
     }
 
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<PluginTuiTheme>,
+    ) {
+        ACTIVE_THEME.with(|active| active.set(theme));
+        if let Some(theme) = theme {
+            frame.fill(area, " ", theme.canvas);
+        }
+        self.render(area, frame);
+        ACTIVE_THEME.with(|active| active.set(None));
+    }
+
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
         let tabs = viewer_tabs();
         match TabBar::new(&tabs).styles(eval_tab_styles()).handle_event(
@@ -3247,9 +3352,9 @@ impl EvalRunViewerSurface {
                     metrics.passed_repetitions, metrics.total_repetitions
                 ),
                 if self.data.result.passed {
-                    SUCCESS
+                    success()
                 } else {
-                    DANGER
+                    danger()
                 },
             );
         }
@@ -3260,7 +3365,7 @@ impl EvalRunViewerSurface {
                 "Winner",
                 metrics.winner.as_deref().unwrap_or("none"),
                 "highest score / pass rate",
-                ACCENT,
+                accent(),
             );
         }
         if let Some(card) = cards.get(2).copied() {
@@ -3270,7 +3375,7 @@ impl EvalRunViewerSurface {
                 "Tokens",
                 &format_number(metrics.total_tokens),
                 &format!("avg {} / repetition", format_number(metrics.avg_tokens)),
-                PURPLE,
+                purple(),
             );
         }
         if let Some(card) = cards.get(3).copied() {
@@ -3359,7 +3464,7 @@ impl EvalRunViewerSurface {
     }
 
     fn render_recommendations(&self, area: Rect, frame: &mut Frame<'_>) {
-        frame.fill(area, " ", Style::new().bg(PANEL_ALT));
+        frame.fill(area, " ", Style::new().bg(panel_alt()));
         let lines = recommendation_lines(&self.data);
         for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
             frame.write_line_with_fallback_style(
@@ -3370,7 +3475,7 @@ impl EvalRunViewerSurface {
                     1,
                 ),
                 line,
-                Style::new().bg(PANEL_ALT),
+                Style::new().bg(panel_alt()),
             );
         }
     }
@@ -3427,7 +3532,7 @@ impl EvalRunViewerSurface {
         items: &[BarChartItem<'_>],
         max: Option<u64>,
     ) {
-        frame.fill(area, " ", Style::new().bg(PANEL));
+        frame.fill(area, " ", Style::new().bg(panel()));
         render_panel_title(area, frame, title);
         let area = inset_top(area, 1);
         BarChart::new(items)
@@ -3530,8 +3635,8 @@ impl EvalRunViewerSurface {
         if !notice.is_empty() {
             frame.write_line_with_fallback_style(
                 Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
-                &Line::from_spans(vec![Span::styled(notice, Style::new().fg(WARNING))]),
-                Style::new().bg(PANEL),
+                &Line::from_spans(vec![Span::styled(notice, Style::new().fg(warning()))]),
+                Style::new().bg(panel()),
             );
         }
         for (row, line) in text
@@ -3550,7 +3655,7 @@ impl EvalRunViewerSurface {
             frame.write_line_with_fallback_style(
                 Rect::new(area.x, y, area.width, 1),
                 &artifact_line(line),
-                Style::new().bg(PANEL),
+                Style::new().bg(panel()),
             );
         }
     }
@@ -3572,7 +3677,7 @@ impl EvalRunViewerSurface {
                     1,
                 ),
                 line,
-                Style::new().bg(PANEL),
+                Style::new().bg(panel()),
             );
         }
     }
@@ -3624,28 +3729,34 @@ fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
     let title_line = Line::from_spans(vec![
         Span::styled(
             " ◆ ",
-            Style::new().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(accent())
+                .bg(dashboard_bg())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             title,
-            Style::new().fg(TEXT).bg(BG).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(text_color())
+                .bg(dashboard_bg())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", Style::new().bg(BG)),
-        Span::styled(status, Style::new().fg(MUTED).bg(BG)),
+        Span::styled("  ", Style::new().bg(dashboard_bg())),
+        Span::styled(status, Style::new().fg(muted()).bg(dashboard_bg())),
     ]);
     frame.write_line_with_fallback_style(
         Rect::new(area.x, area.y, area.width, 1),
         &title_line,
-        Style::new().bg(BG),
+        Style::new().bg(dashboard_bg()),
     );
     if area.height > 1 {
         frame.write_line_with_fallback_style(
             Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
             &Line::from_spans(vec![Span::styled(
                 "─".repeat(usize::from(area.width)),
-                Style::new().fg(BORDER).bg(BG),
+                Style::new().fg(border()).bg(dashboard_bg()),
             )]),
-            Style::new().bg(BG),
+            Style::new().bg(dashboard_bg()),
         );
     }
 }
@@ -3654,10 +3765,10 @@ fn render_status(area: Rect, frame: &mut Frame<'_>, text: &str) {
     frame.write_line_with_fallback_style(
         area,
         &Line::from_spans(vec![
-            Span::styled("  ", Style::new().bg(BG)),
-            Span::styled(text, Style::new().fg(MUTED).bg(BG)),
+            Span::styled("  ", Style::new().bg(dashboard_bg())),
+            Span::styled(text, Style::new().fg(muted()).bg(dashboard_bg())),
         ]),
-        Style::new().bg(BG),
+        Style::new().bg(dashboard_bg()),
     );
 }
 
@@ -3671,76 +3782,79 @@ fn render_panel_title(area: Rect, frame: &mut Frame<'_>, title: &str) {
             Span::styled(
                 " ▸ ",
                 Style::new()
-                    .fg(ACCENT)
-                    .bg(PANEL)
+                    .fg(accent())
+                    .bg(panel())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 title,
-                Style::new().fg(TEXT).bg(PANEL).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(text_color())
+                    .bg(panel())
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Style::new().bg(PANEL),
+        Style::new().bg(panel()),
     );
 }
 
-const fn eval_table_styles() -> TableStyles {
+fn eval_table_styles() -> TableStyles {
     TableStyles {
         header: Style::new()
-            .fg(ACCENT)
-            .bg(PANEL)
+            .fg(accent())
+            .bg(panel())
             .add_modifier(Modifier::BOLD),
-        row: Style::new().fg(TEXT).bg(PANEL),
+        row: Style::new().fg(text_color()).bg(panel()),
         selected: Style::new()
             .fg(Color::Black)
-            .bg(ACCENT)
+            .bg(accent())
             .add_modifier(Modifier::BOLD),
-        selected_column: Style::new().fg(Color::Black).bg(ACCENT_STRONG),
+        selected_column: Style::new().fg(Color::Black).bg(accent_strong()),
         selected_cell: Style::new()
             .fg(Color::Black)
-            .bg(WARNING)
+            .bg(warning())
             .add_modifier(Modifier::BOLD),
-        hovered: Style::new().fg(Color::White).bg(PANEL_ALT),
-        disabled: Style::new().fg(MUTED).bg(PANEL),
-        separator: Style::new().fg(BORDER).bg(PANEL),
-        empty: Style::new().fg(MUTED).bg(PANEL),
+        hovered: Style::new().fg(Color::White).bg(panel_alt()),
+        disabled: Style::new().fg(muted()).bg(panel()),
+        separator: Style::new().fg(border()).bg(panel()),
+        empty: Style::new().fg(muted()).bg(panel()),
     }
 }
 
-const fn eval_tab_styles() -> TabBarStyles {
+fn eval_tab_styles() -> TabBarStyles {
     TabBarStyles {
-        normal: Style::new().fg(MUTED).bg(BG),
+        normal: Style::new().fg(muted()).bg(dashboard_bg()),
         selected: Style::new()
             .fg(Color::Black)
-            .bg(ACCENT)
+            .bg(accent())
             .add_modifier(Modifier::BOLD),
         focused: Style::new()
-            .fg(TEXT)
-            .bg(PANEL_ALT)
+            .fg(text_color())
+            .bg(panel_alt())
             .add_modifier(Modifier::UNDERLINE),
-        hovered: Style::new().fg(TEXT).bg(PANEL_ALT),
+        hovered: Style::new().fg(text_color()).bg(panel_alt()),
         pressed: Style::new()
             .fg(Color::Black)
-            .bg(ACCENT_STRONG)
+            .bg(accent_strong())
             .add_modifier(Modifier::BOLD),
-        disabled: Style::new().fg(BORDER).bg(BG),
-        separator: Style::new().fg(BORDER).bg(BG),
+        disabled: Style::new().fg(border()).bg(dashboard_bg()),
+        separator: Style::new().fg(border()).bg(dashboard_bg()),
     }
 }
 
-const fn eval_button_styles() -> ButtonStyles {
+fn eval_button_styles() -> ButtonStyles {
     ButtonStyles {
-        normal: Style::new().fg(TEXT).bg(PANEL_ALT),
+        normal: Style::new().fg(text_color()).bg(panel_alt()),
         focused: Style::new()
             .fg(Color::Black)
-            .bg(ACCENT)
+            .bg(accent())
             .add_modifier(Modifier::BOLD),
-        hovered: Style::new().fg(Color::Black).bg(ACCENT),
+        hovered: Style::new().fg(Color::Black).bg(accent()),
         pressed: Style::new()
             .fg(Color::Black)
-            .bg(ACCENT_STRONG)
+            .bg(accent_strong())
             .add_modifier(Modifier::BOLD),
-        disabled: Style::new().fg(MUTED).bg(PANEL),
+        disabled: Style::new().fg(muted()).bg(panel()),
     }
 }
 
@@ -3750,7 +3864,7 @@ fn themed_action_row(actions: &[ActionButton]) -> ActionRow<'_> {
         .spacing(2)
 }
 
-const fn eval_table<'a>(columns: &'a [TableColumn<'a>], rows: &'a [TableRow]) -> Table<'a> {
+fn eval_table<'a>(columns: &'a [TableColumn<'a>], rows: &'a [TableRow]) -> Table<'a> {
     Table::new(columns, rows).styles(eval_table_styles())
 }
 
@@ -3774,34 +3888,34 @@ fn handle_eval_table_event(
     table_action(eval_table(columns, rows).handle_event(area, state, event))
 }
 
-const fn eval_bar_chart_styles() -> BarChartStyles {
+fn eval_bar_chart_styles() -> BarChartStyles {
     BarChartStyles {
-        label: Style::new().fg(TEXT).bg(PANEL),
+        label: Style::new().fg(text_color()).bg(panel()),
         bar: Style::new()
-            .fg(ACCENT)
-            .bg(PANEL)
+            .fg(accent())
+            .bg(panel())
             .add_modifier(Modifier::BOLD),
-        empty: Style::new().fg(BORDER).bg(PANEL),
-        value: Style::new().fg(MUTED).bg(PANEL),
-        empty_message: Style::new().fg(MUTED).bg(PANEL),
+        empty: Style::new().fg(border()).bg(panel()),
+        value: Style::new().fg(muted()).bg(panel()),
+        empty_message: Style::new().fg(muted()).bg(panel()),
     }
 }
 
-const fn eval_sparkline_styles() -> SparklineStyles {
+fn eval_sparkline_styles() -> SparklineStyles {
     SparklineStyles {
-        normal: Style::new().fg(ACCENT).bg(PANEL_ALT),
+        normal: Style::new().fg(accent()).bg(panel_alt()),
         latest: Style::new()
-            .fg(WARNING)
-            .bg(PANEL_ALT)
+            .fg(warning())
+            .bg(panel_alt())
             .add_modifier(Modifier::BOLD),
-        first: Style::new().fg(PURPLE).bg(PANEL_ALT),
+        first: Style::new().fg(purple()).bg(panel_alt()),
         high: Style::new()
-            .fg(SUCCESS)
-            .bg(PANEL_ALT)
+            .fg(success())
+            .bg(panel_alt())
             .add_modifier(Modifier::BOLD),
-        low: Style::new().fg(DANGER).bg(PANEL_ALT),
-        empty: Style::new().fg(MUTED).bg(PANEL_ALT),
-        background: Style::new().bg(PANEL_ALT),
+        low: Style::new().fg(danger()).bg(panel_alt()),
+        empty: Style::new().fg(muted()).bg(panel_alt()),
+        background: Style::new().bg(panel_alt()),
     }
 }
 
@@ -3813,42 +3927,42 @@ fn render_kpi_card(
     detail: &str,
     accent: Color,
 ) {
-    frame.fill(area, " ", Style::new().bg(PANEL_ALT));
+    frame.fill(area, " ", Style::new().bg(panel_alt()));
     frame.write_line_with_fallback_style(
         Rect::new(area.x, area.y, area.width, 1),
         &Line::from_spans(vec![
-            Span::styled("  ", Style::new().bg(PANEL_ALT)),
+            Span::styled("  ", Style::new().bg(panel_alt())),
             Span::styled(
                 label,
                 Style::new()
-                    .fg(MUTED)
-                    .bg(PANEL_ALT)
+                    .fg(muted())
+                    .bg(panel_alt())
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Style::new().bg(PANEL_ALT),
+        Style::new().bg(panel_alt()),
     );
     frame.write_line_with_fallback_style(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![
-            Span::styled("  ", Style::new().bg(PANEL_ALT)),
+            Span::styled("  ", Style::new().bg(panel_alt())),
             Span::styled(
                 value,
                 Style::new()
                     .fg(accent)
-                    .bg(PANEL_ALT)
+                    .bg(panel_alt())
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Style::new().bg(PANEL_ALT),
+        Style::new().bg(panel_alt()),
     );
     frame.write_line_with_fallback_style(
         Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
         &Line::from_spans(vec![
-            Span::styled("  ", Style::new().bg(PANEL_ALT)),
-            Span::styled(detail, Style::new().fg(MUTED).bg(PANEL_ALT)),
+            Span::styled("  ", Style::new().bg(panel_alt())),
+            Span::styled(detail, Style::new().fg(muted()).bg(panel_alt())),
         ]),
-        Style::new().bg(PANEL_ALT),
+        Style::new().bg(panel_alt()),
     );
 }
 
@@ -3998,13 +4112,13 @@ fn metric_to_u64(value: f64) -> u64 {
 
 fn risk_badge(pass_rate: f64, tool_errors: f64, avg_wall_time_ms: f64) -> (String, Color) {
     if pass_rate < 1.0 {
-        ("FAILING".to_string(), DANGER)
+        ("FAILING".to_string(), danger())
     } else if tool_errors > 0.0 {
-        ("TOOL-RISK".to_string(), WARNING)
+        ("TOOL-RISK".to_string(), warning())
     } else if avg_wall_time_ms > 30_000.0 {
-        ("SLOW".to_string(), WARNING)
+        ("SLOW".to_string(), warning())
     } else {
-        ("HEALTHY".to_string(), SUCCESS)
+        ("HEALTHY".to_string(), success())
     }
 }
 
@@ -4079,12 +4193,12 @@ fn render_sparkline_block(frame: &mut Frame<'_>, area: Rect, title: &str, sample
     frame.write_line_with_fallback_style(
         Rect::new(area.x, area.y, area.width, 1),
         &Line::from_spans(vec![
-            Span::styled("  ", Style::new().bg(PANEL_ALT)),
+            Span::styled("  ", Style::new().bg(panel_alt())),
             Span::styled(
                 title,
                 Style::new()
-                    .fg(MUTED)
-                    .bg(PANEL_ALT)
+                    .fg(muted())
+                    .bg(panel_alt())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -4093,10 +4207,10 @@ fn render_sparkline_block(frame: &mut Frame<'_>, area: Rect, title: &str, sample
                     samples.last().copied().unwrap_or(0),
                     samples.iter().copied().max().unwrap_or(0)
                 ),
-                Style::new().fg(MUTED).bg(PANEL_ALT),
+                Style::new().fg(muted()).bg(panel_alt()),
             ),
         ]),
-        Style::new().bg(PANEL_ALT),
+        Style::new().bg(panel_alt()),
     );
     let mut policy = SparklinePolicy::compact();
     policy.background = true;
@@ -4175,29 +4289,35 @@ fn derivation_heading(text: &str) -> Line {
         Span::styled(
             "  ▸ ",
             Style::new()
-                .fg(ACCENT)
-                .bg(PANEL)
+                .fg(accent())
+                .bg(panel())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             text.to_string(),
-            Style::new().fg(TEXT).bg(PANEL).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(text_color())
+                .bg(panel())
+                .add_modifier(Modifier::BOLD),
         ),
     ])
 }
 
 fn derivation_line(label: &str, formula: &str, value: &str) -> Line {
     Line::from_spans(vec![
-        Span::styled("    ", Style::new().bg(PANEL)),
+        Span::styled("    ", Style::new().bg(panel())),
         Span::styled(
             format!("{label:<18}"),
             Style::new()
-                .fg(ACCENT)
-                .bg(PANEL)
+                .fg(accent())
+                .bg(panel())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("{formula:<58}"), Style::new().fg(MUTED).bg(PANEL)),
-        Span::styled(value.to_string(), Style::new().fg(TEXT).bg(PANEL)),
+        Span::styled(
+            format!("{formula:<58}"),
+            Style::new().fg(muted()).bg(panel()),
+        ),
+        Span::styled(value.to_string(), Style::new().fg(text_color()).bg(panel())),
     ])
 }
 
@@ -4212,27 +4332,27 @@ fn recommendation_lines(data: &EvalRunData) -> Vec<Line> {
             Span::styled(
                 "  ◆ Recommendation  ",
                 Style::new()
-                    .fg(ACCENT)
-                    .bg(PANEL_ALT)
+                    .fg(accent())
+                    .bg(panel_alt())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("winner={winner}"),
                 Style::new()
-                    .fg(TEXT)
-                    .bg(PANEL_ALT)
+                    .fg(text_color())
+                    .bg(panel_alt())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("  risk={}", metrics.risk_label),
                 Style::new()
                     .fg(metrics.risk_color)
-                    .bg(PANEL_ALT)
+                    .bg(panel_alt())
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from_spans(vec![
-            Span::styled("  Why: ", Style::new().fg(MUTED).bg(PANEL_ALT)),
+            Span::styled("  Why: ", Style::new().fg(muted()).bg(panel_alt())),
             Span::styled(
                 format!(
                     "pass rate {:.1}%, avg {}, {} total tokens",
@@ -4240,22 +4360,22 @@ fn recommendation_lines(data: &EvalRunData) -> Vec<Line> {
                     format_duration_ms(metrics.avg_wall_time_ms),
                     format_number(metrics.total_tokens)
                 ),
-                Style::new().fg(TEXT).bg(PANEL_ALT),
+                Style::new().fg(text_color()).bg(panel_alt()),
             ),
         ]),
         Line::from_spans(vec![
-            Span::styled("  Frontier: ", Style::new().fg(MUTED).bg(PANEL_ALT)),
+            Span::styled("  Frontier: ", Style::new().fg(muted()).bg(panel_alt())),
             Span::styled(
                 format!("cheapest={cheapest}  fastest={fastest}"),
-                Style::new().fg(TEXT).bg(PANEL_ALT),
+                Style::new().fg(text_color()).bg(panel_alt()),
             ),
         ]),
         Line::from_spans(vec![
             Span::styled(
                 "  Watch: ",
                 Style::new()
-                    .fg(WARNING)
-                    .bg(PANEL_ALT)
+                    .fg(warning())
+                    .bg(panel_alt())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -4270,7 +4390,7 @@ fn recommendation_lines(data: &EvalRunData) -> Vec<Line> {
                         )
                     },
                 ),
-                Style::new().fg(TEXT).bg(PANEL_ALT),
+                Style::new().fg(text_color()).bg(panel_alt()),
             ),
         ]),
     ]
@@ -4434,26 +4554,26 @@ fn pass_label(passed: bool) -> String {
 
 fn artifact_line(text: &str) -> Line {
     let style = if text.starts_with('+') && !text.starts_with("+++") {
-        Style::new().fg(SUCCESS).bg(PANEL)
+        Style::new().fg(success()).bg(panel())
     } else if text.starts_with('-') && !text.starts_with("---") {
-        Style::new().fg(DANGER).bg(PANEL)
+        Style::new().fg(danger()).bg(panel())
     } else if text.starts_with("@@") {
         Style::new()
-            .fg(WARNING)
-            .bg(PANEL)
+            .fg(warning())
+            .bg(panel())
             .add_modifier(Modifier::BOLD)
     } else if text.starts_with("diff ") || text.starts_with("+++") || text.starts_with("---") {
         Style::new()
-            .fg(ACCENT)
-            .bg(PANEL)
+            .fg(accent())
+            .bg(panel())
             .add_modifier(Modifier::BOLD)
     } else if text.trim().is_empty() {
-        Style::new().bg(PANEL)
+        Style::new().bg(panel())
     } else {
-        Style::new().fg(TEXT).bg(PANEL)
+        Style::new().fg(text_color()).bg(panel())
     };
     Line::from_spans(vec![
-        Span::styled("  ", Style::new().bg(PANEL)),
+        Span::styled("  ", Style::new().bg(panel())),
         Span::styled(text.to_string(), style),
     ])
 }
@@ -4993,7 +5113,7 @@ fn render_lines(area: Rect, frame: &mut Frame<'_>, lines: &[Line]) {
                 1,
             ),
             line,
-            Style::new().bg(PANEL),
+            Style::new().bg(panel()),
         );
     }
 }
@@ -5264,7 +5384,7 @@ mod interaction_tests {
     use super::{handle_input_box, input_text, text_state};
 
     #[test]
-    fn focused_wizard_input_accepts_plain_text() {
+    fn focused_wizard_input_accepts_plain_text_color() {
         let mut state = text_state("");
         let area = Rect::new(0, 0, 40, 4);
 

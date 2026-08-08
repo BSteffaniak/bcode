@@ -7,10 +7,29 @@ Terminal presentation is derived from the active versioned theme definition desc
 renderer styles; BMUX owns terminal primitives and generic component style structures. Portable
 frontend/session contracts do not contain terminal colors, viewport data, or theme selection.
 
-`terminal-native` preserves `Color::Default`: absence of an explicit fill means the terminal's
+Opaque themes apply their resolved `canvas` style to the complete normal terminal frame before
+content, overlays, and rich presentations are drawn. Existing interactive depth is renderer-owned:
+`surface.raised` covers palettes, pickers, and the composer; `surface.overlay` covers opaque modal
+panels; and `control.focused` covers focused controls. These optional schema-v1 roles fall back to
+canvas and `border.focused`, respectively, so existing external themes remain compatible.
+`terminal-native` preserves `Color::Default`: its full-frame fill therefore means the terminal's
 background, not black. Opaque themes opt into backgrounds through semantic canvas, surface,
 container, source, and diff roles. Raw terminal/program output keeps its own ANSI colors and is not
 reinterpreted as application chrome.
+
+Bcode's bundled `/loop` modal demonstrates the same boundary for plugin-owned application chrome:
+the host supplies typed canvas, text, muted, border, focus, and selection presentation through
+`PluginTuiTheme`; the plugin maps those styles into BMUX modal and input components without changing
+loop workflow semantics. Theme-less compatibility rendering remains available only when no host
+presentation is supplied.
+
+The `/theme` comparison pane follows the same renderer boundary. Its catalog metadata comes from the
+canonical discovered theme catalog, while representative transcript, tool, source, selection, and
+focus examples are bounded semantic fixtures rendered through existing presentation adapters. The
+picker never reads raw session events, reinterprets tool state, appends preview rows to live history,
+or mutates canonical session state. Responsive layout only chooses between a list and a list-plus-
+preview arrangement; keyboard preview/apply/cancel and scrolling-aware mouse hit testing continue
+through the existing picker state and user-state persistence effects.
 
 Configuration startup and reload continue through `runtime.rs` and the app's existing config
 application path. The app stores only fully resolved presentation. Markdown options include the

@@ -7,7 +7,7 @@ use bcode_metrics::dashboard::{
 };
 use bcode_metrics::{MetricsEventLogConfig, MetricsRegistry, MetricsReport};
 use bcode_plugin_sdk::path::display_from_current_dir;
-use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
+use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::frame::Frame;
@@ -30,18 +30,67 @@ const ACTION_HEIGHT: u16 = 1;
 const STATUS_HEIGHT: u16 = 1;
 const CARD_HEIGHT: u16 = 4;
 
-const BG: Color = Color::Rgb(8, 13, 20);
-const PANEL: Color = Color::Rgb(15, 23, 34);
-const PANEL_ALT: Color = Color::Rgb(20, 31, 45);
-const BORDER: Color = Color::Rgb(51, 65, 85);
-const ACCENT: Color = Color::Rgb(56, 189, 248);
-const ACCENT_STRONG: Color = Color::Rgb(14, 165, 233);
-const SUCCESS: Color = Color::Rgb(34, 197, 94);
-const WARNING: Color = Color::Rgb(250, 204, 21);
-const DANGER: Color = Color::Rgb(248, 113, 113);
-const MUTED: Color = Color::Rgb(148, 163, 184);
-const TEXT: Color = Color::Rgb(226, 232, 240);
-const PURPLE: Color = Color::Rgb(168, 85, 247);
+thread_local! {
+    static ACTIVE_THEME: std::cell::Cell<Option<PluginTuiTheme>> = const { std::cell::Cell::new(None) };
+}
+
+fn theme_color(select: impl FnOnce(PluginTuiTheme) -> Option<Color>, fallback: Color) -> Color {
+    ACTIVE_THEME.with(|theme| theme.get().and_then(select).unwrap_or(fallback))
+}
+
+fn dashboard_bg() -> Color {
+    theme_color(|theme| theme.canvas.bg, Color::Rgb(8, 13, 20))
+}
+
+fn panel() -> Color {
+    dashboard_bg()
+}
+
+fn panel_alt() -> Color {
+    theme_color(
+        |theme| theme.selection.bg.or(theme.canvas.bg),
+        Color::Rgb(20, 31, 45),
+    )
+}
+
+fn border() -> Color {
+    theme_color(|theme| theme.border.fg, Color::Rgb(51, 65, 85))
+}
+
+fn accent() -> Color {
+    theme_color(|theme| theme.focused.fg, Color::Rgb(56, 189, 248))
+}
+
+fn accent_strong() -> Color {
+    theme_color(
+        |theme| theme.selection.bg.or(theme.focused.fg),
+        Color::Rgb(14, 165, 233),
+    )
+}
+
+fn success() -> Color {
+    theme_color(|theme| theme.diff.added.fg, Color::Rgb(34, 197, 94))
+}
+
+fn warning() -> Color {
+    theme_color(|theme| theme.diff.hunk.fg, Color::Rgb(250, 204, 21))
+}
+
+fn danger() -> Color {
+    theme_color(|theme| theme.diff.removed.fg, Color::Rgb(248, 113, 113))
+}
+
+fn muted() -> Color {
+    theme_color(|theme| theme.muted.fg, Color::Rgb(148, 163, 184))
+}
+
+fn text() -> Color {
+    theme_color(|theme| theme.text.fg, Color::Rgb(226, 232, 240))
+}
+
+fn purple() -> Color {
+    theme_color(|theme| theme.focused.fg, Color::Rgb(168, 85, 247))
+}
 
 /// Persisted metrics dashboard surface.
 #[derive(Debug)]
@@ -500,7 +549,22 @@ impl PluginTuiSurface for MetricsDashboardSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        ACTIVE_THEME.with(|active| active.set(None));
         self.render_dashboard(area, frame);
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<PluginTuiTheme>,
+    ) {
+        ACTIVE_THEME.with(|active| active.set(theme));
+        if let Some(theme) = theme {
+            frame.fill(area, " ", theme.canvas);
+        }
+        self.render_dashboard(area, frame);
+        ACTIVE_THEME.with(|active| active.set(None));
     }
 
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -713,7 +777,7 @@ fn render_kpi_card(
     if area.height == 0 {
         return;
     }
-    fill_rect(frame, area, PANEL_ALT);
+    fill_rect(frame, area, panel_alt());
     frame.write_line_with_fallback_style(
         Rect::new(
             area.x.saturating_add(1),
@@ -724,11 +788,11 @@ fn render_kpi_card(
         &Line::from_spans(vec![Span::styled(
             label,
             Style::new()
-                .fg(MUTED)
-                .bg(PANEL_ALT)
+                .fg(muted())
+                .bg(panel_alt())
                 .add_modifier(Modifier::BOLD),
         )]),
-        Style::new().bg(PANEL_ALT),
+        Style::new().bg(panel_alt()),
     );
     if area.height > 1 {
         frame.write_line_with_fallback_style(
@@ -742,10 +806,10 @@ fn render_kpi_card(
                 value,
                 Style::new()
                     .fg(color)
-                    .bg(PANEL_ALT)
+                    .bg(panel_alt())
                     .add_modifier(Modifier::BOLD),
             )]),
-            Style::new().bg(PANEL_ALT),
+            Style::new().bg(panel_alt()),
         );
     }
     if area.height > 2 {
@@ -758,37 +822,40 @@ fn render_kpi_card(
             ),
             &Line::from_spans(vec![Span::styled(
                 detail,
-                Style::new().fg(TEXT).bg(PANEL_ALT),
+                Style::new().fg(text()).bg(panel_alt()),
             )]),
-            Style::new().bg(PANEL_ALT),
+            Style::new().bg(panel_alt()),
         );
     }
 }
 
 fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
-    fill_rect(frame, area, BG);
+    fill_rect(frame, area, dashboard_bg());
     let title_line = Line::from_spans(vec![
-        Span::styled("  ", Style::new().bg(BG)),
+        Span::styled("  ", Style::new().bg(dashboard_bg())),
         Span::styled(
             title,
-            Style::new().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(accent())
+                .bg(dashboard_bg())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", Style::new().bg(BG)),
-        Span::styled(status, Style::new().fg(MUTED).bg(BG)),
+        Span::styled("  ", Style::new().bg(dashboard_bg())),
+        Span::styled(status, Style::new().fg(muted()).bg(dashboard_bg())),
     ]);
     frame.write_line_with_fallback_style(
         Rect::new(area.x, area.y, area.width, 1),
         &title_line,
-        Style::new().bg(BG),
+        Style::new().bg(dashboard_bg()),
     );
     if area.height > 1 {
         frame.write_line_with_fallback_style(
             Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
             &Line::from_spans(vec![Span::styled(
                 "─".repeat(usize::from(area.width)),
-                Style::new().fg(BORDER).bg(BG),
+                Style::new().fg(border()).bg(dashboard_bg()),
             )]),
-            Style::new().bg(BG),
+            Style::new().bg(dashboard_bg()),
         );
     }
 }
@@ -797,10 +864,10 @@ fn render_status(area: Rect, frame: &mut Frame<'_>, text: &str) {
     frame.write_line_with_fallback_style(
         area,
         &Line::from_spans(vec![
-            Span::styled("  ", Style::new().bg(BG)),
-            Span::styled(text, Style::new().fg(MUTED).bg(BG)),
+            Span::styled("  ", Style::new().bg(dashboard_bg())),
+            Span::styled(text, Style::new().fg(muted()).bg(dashboard_bg())),
         ]),
-        Style::new().bg(BG),
+        Style::new().bg(dashboard_bg()),
     );
 }
 
@@ -814,16 +881,19 @@ fn render_panel_title(area: Rect, frame: &mut Frame<'_>, title: &str) {
             Span::styled(
                 " ▸ ",
                 Style::new()
-                    .fg(ACCENT)
-                    .bg(PANEL)
+                    .fg(accent())
+                    .bg(panel())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 title,
-                Style::new().fg(TEXT).bg(PANEL).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(text())
+                    .bg(panel())
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Style::new().bg(PANEL),
+        Style::new().bg(panel()),
     );
 }
 
@@ -941,95 +1011,95 @@ fn fill_rect(frame: &mut Frame<'_>, area: Rect, color: Color) {
     }
 }
 
-const fn metric_table_styles() -> TableStyles {
+fn metric_table_styles() -> TableStyles {
     TableStyles {
         header: Style::new()
-            .fg(ACCENT)
-            .bg(PANEL)
+            .fg(accent())
+            .bg(panel())
             .add_modifier(Modifier::BOLD),
-        row: Style::new().fg(TEXT).bg(PANEL),
+        row: Style::new().fg(text()).bg(panel()),
         selected: Style::new()
             .fg(Color::Black)
-            .bg(ACCENT)
+            .bg(accent())
             .add_modifier(Modifier::BOLD),
-        selected_column: Style::new().fg(Color::Black).bg(ACCENT_STRONG),
+        selected_column: Style::new().fg(Color::Black).bg(accent_strong()),
         selected_cell: Style::new()
             .fg(Color::Black)
-            .bg(WARNING)
+            .bg(warning())
             .add_modifier(Modifier::BOLD),
-        hovered: Style::new().fg(Color::White).bg(PANEL_ALT),
-        disabled: Style::new().fg(MUTED).bg(PANEL),
-        separator: Style::new().fg(BORDER).bg(PANEL),
-        empty: Style::new().fg(MUTED).bg(PANEL),
+        hovered: Style::new().fg(Color::White).bg(panel_alt()),
+        disabled: Style::new().fg(muted()).bg(panel()),
+        separator: Style::new().fg(border()).bg(panel()),
+        empty: Style::new().fg(muted()).bg(panel()),
     }
 }
 
-const fn metric_tab_styles() -> TabBarStyles {
+fn metric_tab_styles() -> TabBarStyles {
     TabBarStyles {
-        normal: Style::new().fg(MUTED).bg(BG),
+        normal: Style::new().fg(muted()).bg(dashboard_bg()),
         selected: Style::new()
             .fg(Color::Black)
-            .bg(ACCENT)
+            .bg(accent())
             .add_modifier(Modifier::BOLD),
         focused: Style::new()
-            .fg(TEXT)
-            .bg(PANEL_ALT)
+            .fg(text())
+            .bg(panel_alt())
             .add_modifier(Modifier::UNDERLINE),
-        hovered: Style::new().fg(TEXT).bg(PANEL_ALT),
+        hovered: Style::new().fg(text()).bg(panel_alt()),
         pressed: Style::new()
             .fg(Color::Black)
-            .bg(ACCENT_STRONG)
+            .bg(accent_strong())
             .add_modifier(Modifier::BOLD),
-        disabled: Style::new().fg(BORDER).bg(BG),
-        separator: Style::new().fg(BORDER).bg(BG),
+        disabled: Style::new().fg(border()).bg(dashboard_bg()),
+        separator: Style::new().fg(border()).bg(dashboard_bg()),
     }
 }
 
-const fn metric_button_styles() -> ButtonStyles {
+fn metric_button_styles() -> ButtonStyles {
     ButtonStyles {
-        normal: Style::new().fg(TEXT).bg(PANEL_ALT),
-        hovered: Style::new().fg(Color::Black).bg(ACCENT),
+        normal: Style::new().fg(text()).bg(panel_alt()),
+        hovered: Style::new().fg(Color::Black).bg(accent()),
         pressed: Style::new()
             .fg(Color::Black)
-            .bg(ACCENT_STRONG)
+            .bg(accent_strong())
             .add_modifier(Modifier::BOLD),
         focused: Style::new()
-            .fg(TEXT)
-            .bg(PANEL_ALT)
+            .fg(text())
+            .bg(panel_alt())
             .add_modifier(Modifier::UNDERLINE),
-        disabled: Style::new().fg(MUTED).bg(BG),
+        disabled: Style::new().fg(muted()).bg(dashboard_bg()),
     }
 }
 
-const fn metric_sparkline_styles() -> SparklineStyles {
+fn metric_sparkline_styles() -> SparklineStyles {
     SparklineStyles {
-        normal: Style::new().fg(ACCENT).bg(PANEL_ALT),
+        normal: Style::new().fg(accent()).bg(panel_alt()),
         latest: Style::new()
-            .fg(WARNING)
-            .bg(PANEL_ALT)
+            .fg(warning())
+            .bg(panel_alt())
             .add_modifier(Modifier::BOLD),
-        first: Style::new().fg(PURPLE).bg(PANEL_ALT),
+        first: Style::new().fg(purple()).bg(panel_alt()),
         high: Style::new()
-            .fg(SUCCESS)
-            .bg(PANEL_ALT)
+            .fg(success())
+            .bg(panel_alt())
             .add_modifier(Modifier::BOLD),
-        low: Style::new().fg(DANGER).bg(PANEL_ALT),
-        empty: Style::new().fg(MUTED).bg(PANEL_ALT),
-        background: Style::new().bg(PANEL_ALT),
+        low: Style::new().fg(danger()).bg(panel_alt()),
+        empty: Style::new().fg(muted()).bg(panel_alt()),
+        background: Style::new().bg(panel_alt()),
     }
 }
 
 #[allow(dead_code)]
-const fn metric_bar_chart_styles() -> BarChartStyles {
+fn metric_bar_chart_styles() -> BarChartStyles {
     BarChartStyles {
-        label: Style::new().fg(TEXT).bg(PANEL),
+        label: Style::new().fg(text()).bg(panel()),
         bar: Style::new()
-            .fg(ACCENT)
-            .bg(PANEL)
+            .fg(accent())
+            .bg(panel())
             .add_modifier(Modifier::BOLD),
-        empty: Style::new().fg(BORDER).bg(PANEL),
-        value: Style::new().fg(MUTED).bg(PANEL),
-        empty_message: Style::new().fg(MUTED).bg(PANEL),
+        empty: Style::new().fg(border()).bg(panel()),
+        value: Style::new().fg(muted()).bg(panel()),
+        empty_message: Style::new().fg(muted()).bg(panel()),
     }
 }
 
@@ -1041,11 +1111,11 @@ fn bar_items(rows: &[bcode_metrics::dashboard::MetricTableRow]) -> Vec<BarChartI
         .collect()
 }
 
-const fn health_color(health: MetricsHealth) -> Color {
+fn health_color(health: MetricsHealth) -> Color {
     match health {
-        MetricsHealth::Good => SUCCESS,
-        MetricsHealth::Warning => WARNING,
-        MetricsHealth::Critical => DANGER,
+        MetricsHealth::Good => success(),
+        MetricsHealth::Warning => warning(),
+        MetricsHealth::Critical => danger(),
     }
 }
 

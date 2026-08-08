@@ -26,12 +26,13 @@ pub fn render_palette(
         return;
     };
 
-    frame.fill(area, " ", theme.text);
+    frame.fill(area, " ", theme.raised);
     let panel = Panel::new()
         .border(Border::single().style(theme.border))
         .title(" Slash Commands  tab/enter accept · ↑/↓ select · esc hide ")
         .padding(Insets::new(0, 1, 0, 1))
-        .background(theme.text);
+        .background(theme.raised)
+        .content_style(theme.raised);
     panel.render(area, frame);
 
     let inner = panel.inner_area(area);

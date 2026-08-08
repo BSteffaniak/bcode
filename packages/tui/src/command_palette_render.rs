@@ -4,7 +4,7 @@ use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::palette::CommandPalette;
-use bmux_tui::prelude::{StatefulWidget, Style};
+use bmux_tui::prelude::StatefulWidget;
 
 use super::command_palette::BmuxCommandPalette;
 use super::render::TuiTheme;
@@ -16,9 +16,11 @@ pub fn render_palette(palette: &mut BmuxCommandPalette, frame: &mut Frame<'_>, t
     let widget = CommandPalette::new(&items)
         .panel(
             Panel::new()
-                .border(Border::single().style(Style::new().fg(theme.accent)))
+                .border(Border::single().style(theme.focused))
                 .title(" Commands ")
-                .padding(Insets::new(1, 1, 1, 1)),
+                .padding(Insets::new(1, 1, 1, 1))
+                .background(theme.raised)
+                .content_style(theme.raised),
         )
         .empty("No matching commands");
     widget.render(area, frame, palette.state_mut());

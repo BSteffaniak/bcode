@@ -192,6 +192,19 @@ pub struct TranscriptStyleTheme {
     pub tool_truncation: bmux_tui::style::Style,
 }
 
+/// Resolved presentation for existing raised, overlay, and focused-control surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceTheme {
+    /// Raised panels, lists, palettes, and the composer.
+    pub raised: bmux_tui::style::Style,
+    /// Opaque modal and dialog surface.
+    pub overlay: bmux_tui::style::Style,
+    /// Focused input and control presentation.
+    pub control_focused: bmux_tui::style::Style,
+    /// Optional full-frame modal scrim.
+    pub scrim: Option<bmux_tui::style::Style>,
+}
+
 /// Fully resolved target theme derived from app state and configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedTheme {
@@ -205,8 +218,10 @@ pub struct ResolvedTheme {
     pub border: bmux_tui::style::Style,
     /// Focused border/control style before dynamic accent animation.
     pub focused: bmux_tui::style::Style,
-    /// Background style used by surfaces that explicitly request a fill.
-    pub background: bmux_tui::style::Style,
+    /// Canvas style applied to the complete terminal frame.
+    pub canvas: bmux_tui::style::Style,
+    /// Raised, overlay, and focused-control surface presentation.
+    pub surfaces: SurfaceTheme,
     /// Selection style.
     pub selection: bmux_tui::style::Style,
     /// Informational state style.
@@ -241,7 +256,8 @@ impl ResolvedTheme {
             muted: self.muted,
             border: self.border,
             focused: self.focused,
-            background: self.background,
+            canvas: self.canvas,
+            surfaces: self.surfaces,
             selection: self.selection,
             info: self.info,
             success: self.success,
@@ -271,8 +287,10 @@ pub struct PresentedTheme {
     pub border: bmux_tui::style::Style,
     /// Focused border/control style before dynamic accent animation.
     pub focused: bmux_tui::style::Style,
-    /// Background style used by surfaces that explicitly request a fill.
-    pub background: bmux_tui::style::Style,
+    /// Canvas style applied to the complete terminal frame.
+    pub canvas: bmux_tui::style::Style,
+    /// Raised, overlay, and focused-control surface presentation.
+    pub surfaces: SurfaceTheme,
     /// Selection style.
     pub selection: bmux_tui::style::Style,
     /// Informational state style.
@@ -474,7 +492,15 @@ pub(crate) fn resolved_definition_theme(
     let border = style("border.default").unwrap_or(muted);
     let focused =
         style("border.focused").unwrap_or_else(|| bmux_tui::style::Style::new().fg(accent));
-    let background = style("surface.base").unwrap_or_else(bmux_tui::style::Style::new);
+    let canvas = style("canvas")
+        .unwrap_or_else(bmux_tui::style::Style::new)
+        .patch(text);
+    let surfaces = SurfaceTheme {
+        raised: style("surface.raised").unwrap_or(canvas).patch(text),
+        overlay: style("surface.overlay").unwrap_or(canvas).patch(text),
+        control_focused: style("control.focused").unwrap_or(focused),
+        scrim: style("surface.scrim"),
+    };
     let selection = style("selection.active")
         .unwrap_or_else(|| bmux_tui::style::Style::new().add_modifier(Modifier::REVERSED));
     let info = style("state.info").unwrap_or_else(|| bmux_tui::style::Style::new().fg(accent));
@@ -566,7 +592,8 @@ pub(crate) fn resolved_definition_theme(
         muted,
         border,
         focused,
-        background,
+        canvas,
+        surfaces,
         selection,
         info,
         success,
@@ -771,6 +798,124 @@ mod capability_tests {
     }
 
     #[test]
+    fn explicit_rgb_bundled_themes_meet_text_contrast_thresholds() {
+        const MIN_PRIMARY: f64 = 4.5;
+        const MIN_MUTED: f64 = 3.0;
+        let catalog = definition::ThemeCatalog::bundled().expect("bundled themes parse");
+        for (theme_id, variant) in [
+            ("bcode", definition::ResolvedThemeVariant::Dark),
+            ("bcode", definition::ResolvedThemeVariant::Light),
+            ("bcode-dark", definition::ResolvedThemeVariant::Unspecified),
+            ("bcode-light", definition::ResolvedThemeVariant::Unspecified),
+            ("nord", definition::ResolvedThemeVariant::Unspecified),
+        ] {
+            let resolved = catalog
+                .resolve(&definition::ThemeSelection::new(theme_id).variant(variant))
+                .unwrap_or_else(|error| panic!("{theme_id} resolves: {error}"));
+            for (role, background_role, minimum) in [
+                ("text.primary", "canvas", MIN_PRIMARY),
+                ("text.muted", "canvas", MIN_MUTED),
+                ("text.primary", "surface.raised", MIN_PRIMARY),
+                ("text.muted", "surface.raised", MIN_MUTED),
+                ("text.primary", "surface.overlay", MIN_PRIMARY),
+                ("text.muted", "surface.overlay", MIN_MUTED),
+                ("selection.active", "selection.active", MIN_PRIMARY),
+            ] {
+                let foreground = resolved.style(role).and_then(|style| style.fg);
+                let background = resolved.style(background_role).and_then(|style| style.bg);
+                let (
+                    Some(Color::Rgb(red, green, blue)),
+                    Some(Color::Rgb(bg_red, bg_green, bg_blue)),
+                ) = (foreground, background)
+                else {
+                    continue;
+                };
+                let ratio = contrast_ratio([red, green, blue], [bg_red, bg_green, bg_blue]);
+                assert!(
+                    ratio >= minimum,
+                    "{theme_id} {variant:?} {role} on {background_role} contrast {ratio:.2} is below {minimum:.1}"
+                );
+            }
+            for (semantic_role, background_role) in [
+                ("control.focused", "surface.raised"),
+                ("control.focused", "surface.overlay"),
+            ] {
+                assert_explicit_contrast(
+                    theme_id,
+                    variant,
+                    semantic_role,
+                    background_role,
+                    resolved.style(semantic_role).and_then(|style| style.fg),
+                    resolved.style(background_role).and_then(|style| style.bg),
+                    MIN_MUTED,
+                );
+            }
+            for (semantic_role, background_name) in [
+                ("state.success", "success_background"),
+                ("state.warning", "warning_background"),
+                ("state.error", "error_background"),
+                ("tool.succeeded.title", "success_background"),
+                ("tool.waiting.title", "warning_background"),
+                ("tool.failed.title", "error_background"),
+            ] {
+                assert_explicit_contrast(
+                    theme_id,
+                    variant,
+                    semantic_role,
+                    background_name,
+                    resolved.style(semantic_role).and_then(|style| style.fg),
+                    resolved.color(background_name),
+                    MIN_MUTED,
+                );
+            }
+        }
+    }
+
+    fn assert_explicit_contrast(
+        theme_id: &str,
+        variant: definition::ResolvedThemeVariant,
+        semantic_role: &str,
+        background_role: &str,
+        foreground: Option<Color>,
+        background: Option<Color>,
+        minimum: f64,
+    ) {
+        let (Some(Color::Rgb(red, green, blue)), Some(Color::Rgb(bg_red, bg_green, bg_blue))) =
+            (foreground, background)
+        else {
+            return;
+        };
+        let ratio = contrast_ratio([red, green, blue], [bg_red, bg_green, bg_blue]);
+        assert!(
+            ratio >= minimum,
+            "{theme_id} {variant:?} {semantic_role} on {background_role} contrast {ratio:.2} is below {minimum:.1}"
+        );
+    }
+
+    fn contrast_ratio(foreground: [u8; 3], background: [u8; 3]) -> f64 {
+        let foreground = relative_luminance(foreground);
+        let background = relative_luminance(background);
+        let lighter = foreground.max(background);
+        let darker = foreground.min(background);
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn relative_luminance(color: [u8; 3]) -> f64 {
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.040_45 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.0722_f64.mul_add(
+            channel(color[2]),
+            0.2126_f64.mul_add(channel(color[0]), 0.7152 * channel(color[1])),
+        )
+    }
+
+    #[test]
     fn bundled_theme_syntax_roles_resolve_to_declared_colors() {
         use bcode_syntax_render::SyntaxColor;
 
@@ -883,7 +1028,7 @@ mod capability_tests {
         );
         assert!(
             presented
-                .background
+                .canvas
                 .bg
                 .is_none_or(|color| color == Color::Default)
         );

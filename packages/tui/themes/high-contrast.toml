@@ -37,6 +37,10 @@ modifiers = ["bold", "underline"]
 [styles."selection.active"]
 bg        = "ansi:bright_white"
 fg        = "ansi:black"
+modifiers = ["bold", "reversed"]
+
+[styles."state.info"]
+fg        = "$info"
 modifiers = ["bold"]
 
 [styles."state.success"]
@@ -50,6 +54,34 @@ modifiers = ["bold", "underline"]
 [styles."state.error"]
 fg        = "$error"
 modifiers = ["bold", "reversed"]
+
+[styles."tool.requested.title"]
+fg        = "$muted"
+modifiers = ["dim"]
+
+[styles."tool.running.title"]
+fg        = "$info"
+modifiers = ["italic"]
+
+[styles."tool.waiting.title"]
+fg        = "$warning"
+modifiers = ["bold", "underline"]
+
+[styles."tool.succeeded.title"]
+fg        = "$success"
+modifiers = ["bold"]
+
+[styles."tool.failed.title"]
+fg        = "$error"
+modifiers = ["bold", "reversed"]
+
+[styles."tool.cancelled.title"]
+fg        = "$muted"
+modifiers = ["crossed_out"]
+
+[styles."tool.timed_out.title"]
+fg        = "$warning"
+modifiers = ["bold", "underline"]
 
 [styles."diff.added"]
 fg        = "$success"

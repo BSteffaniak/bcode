@@ -9,7 +9,8 @@ use std::{
 use bcode_agent_profile::AgentInfo;
 use bcode_client::AttachedSessionHistory;
 use bcode_config::{
-    TuiAccentTransitionCurve, TuiAccentTransitionMode, TuiConfig, TuiThemeConfig, TuiThinkingConfig,
+    TuiAccentTransitionCurve, TuiAccentTransitionMode, TuiAgentAccentPolicy, TuiConfig,
+    TuiThemeConfig, TuiThemeVariant, TuiThinkingConfig,
 };
 use bcode_session_models::{
     ClientId, RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
@@ -1463,6 +1464,56 @@ fn header_shortens_session_id_on_wide_panes() {
 
     assert!(header.contains(&format!("#{}", &session_id.to_string()[..8])));
     assert!(!header.contains(&session_id.to_string()[9..]));
+}
+
+#[test]
+fn adaptive_bcode_agent_accent_policy_is_intentional_across_variants() {
+    for variant in [TuiThemeVariant::Dark, TuiThemeVariant::Light] {
+        let configured_theme = crate::theme::definition::ThemeCatalog::bundled()
+            .expect("bundled themes parse")
+            .resolve(
+                &crate::theme::definition::ThemeSelection::new("bcode").variant(match variant {
+                    TuiThemeVariant::Dark => crate::theme::definition::ResolvedThemeVariant::Dark,
+                    TuiThemeVariant::Light => crate::theme::definition::ResolvedThemeVariant::Light,
+                    TuiThemeVariant::Auto => unreachable!("variants are explicit"),
+                }),
+            )
+            .expect("adaptive bcode resolves");
+        let configured_accent = crate::theme::resolved_accent(Some(&configured_theme));
+
+        let mut theme_only = BmuxApp::new_with_history(None, &[], &[], false);
+        theme_only.apply_tui_config(TuiConfig {
+            theme: TuiThemeConfig {
+                name: "bcode".to_owned(),
+                variant,
+                agent_accent: TuiAgentAccentPolicy::ThemeOnly,
+                accent_transition: TuiAccentTransitionMode::Immediate,
+                ..TuiThemeConfig::default()
+            },
+            ..TuiConfig::default()
+        });
+        theme_only.set_agent_metadata_hydrated(true);
+        theme_only.set_current_agent("build", Some("#22d3ee".to_owned()));
+        assert_eq!(theme_only.presented_theme().accent, configured_accent);
+
+        let mut agent_first = BmuxApp::new_with_history(None, &[], &[], false);
+        agent_first.apply_tui_config(TuiConfig {
+            theme: TuiThemeConfig {
+                name: "bcode".to_owned(),
+                variant,
+                agent_accent: TuiAgentAccentPolicy::AgentWithThemeFallback,
+                accent_transition: TuiAccentTransitionMode::Immediate,
+                ..TuiThemeConfig::default()
+            },
+            ..TuiConfig::default()
+        });
+        agent_first.set_agent_metadata_hydrated(true);
+        agent_first.set_current_agent("build", Some("#22d3ee".to_owned()));
+        assert_eq!(
+            agent_first.presented_theme().accent,
+            bmux_tui::style::Color::Rgb(34, 211, 238)
+        );
+    }
 }
 
 #[test]

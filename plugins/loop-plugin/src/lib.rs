@@ -19,7 +19,7 @@ use bcode_command::{
 use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
-    PluginTuiSurfaceFactory, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
+    PluginTuiSurfaceFactory, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest, PluginTuiTheme,
     PluginWorkflowBinding, PluginWorkflowStartRequest, PluginWorkflowStatus,
 };
 use bcode_session_models::SessionId;
@@ -32,7 +32,9 @@ use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Color;
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
-use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
+use bmux_tui_components::text_input_box::{
+    TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy, TextInputBoxStyles,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -502,6 +504,7 @@ struct LoopSurface {
     prompt_area: Rect,
     condition_area: Rect,
     limit_area: Rect,
+    theme: Option<PluginTuiTheme>,
 }
 
 impl LoopSurface {
@@ -521,6 +524,7 @@ impl LoopSurface {
             prompt_area: Rect::new(0, 0, 0, 0),
             condition_area: Rect::new(0, 0, 0, 0),
             limit_area: Rect::new(0, 0, 0, 0),
+            theme: None,
         }
     }
 
@@ -725,8 +729,22 @@ impl LoopSurface {
         state: &mut TextInputState,
         focused: bool,
         rows: u16,
+        theme: Option<PluginTuiTheme>,
     ) {
+        let styles = theme.map_or_else(TextInputBoxStyles::default, |theme| TextInputBoxStyles {
+            text: theme.text,
+            focused_text: theme.focused,
+            disabled_text: theme.muted,
+            placeholder: theme.muted,
+            selection: theme.selection,
+            border: theme.border,
+            focused_border: theme.focused,
+            background: theme.canvas,
+            focused_background: theme.canvas,
+            disabled_background: theme.canvas,
+        });
         TextInputBox::new(TextInputPolicy::chat_composer())
+            .styles(styles)
             .label(label)
             .policy(TextInputBoxPolicy {
                 field_chrome: true,
@@ -756,9 +774,22 @@ impl PluginTuiSurface for LoopSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        let modal_theme = self.theme.map_or_else(
+            || ModalTheme::dark(Color::Cyan),
+            |theme| {
+                ModalTheme::new(
+                    theme.canvas,
+                    theme.border.patch(theme.canvas),
+                    theme.focused.patch(theme.canvas),
+                    theme.text.patch(theme.canvas),
+                    theme.muted.patch(theme.canvas),
+                    theme.focused.patch(theme.canvas),
+                )
+            },
+        );
         let modal = ModalFrame::new(
             ModalSizing::new(Size::new(64, 22), Size::new(100, 32), Insets::all(2)),
-            ModalTheme::dark(Color::Cyan),
+            modal_theme,
         )
         .title(" Start deterministic loop ")
         .padding(Insets::new(1, 2, 1, 2))
@@ -788,6 +819,7 @@ impl PluginTuiSurface for LoopSurface {
             &mut self.prompt,
             self.field == Field::Prompt,
             self.prompt_area.height,
+            self.theme,
         );
         Self::render_input(
             self.condition_area,
@@ -796,6 +828,7 @@ impl PluginTuiSurface for LoopSurface {
             &mut self.condition,
             self.field == Field::Condition,
             self.condition_area.height,
+            self.theme,
         );
         Self::render_input(
             self.limit_area,
@@ -804,6 +837,7 @@ impl PluginTuiSurface for LoopSurface {
             &mut self.limit,
             self.field == Field::Limit,
             1,
+            self.theme,
         );
         let status_y = self.limit_area.bottom().saturating_add(1);
         if status_y < content.bottom() {
@@ -811,11 +845,24 @@ impl PluginTuiSurface for LoopSurface {
                 Rect::new(content.x, status_y, content.width, 1),
                 &Line::from_spans(vec![Span::styled(
                     self.status.clone(),
-                    Style::new().fg(Color::BrightBlack).bg(Color::Black),
+                    self.theme.map_or_else(
+                        || Style::new().fg(Color::BrightBlack).bg(Color::Black),
+                        |theme| theme.muted.patch(theme.canvas),
+                    ),
                 )]),
                 frame,
             );
         }
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<PluginTuiTheme>,
+    ) {
+        self.theme = theme;
+        self.render(area, frame);
     }
 
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -1622,6 +1669,65 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("loop surface did not produce an action");
+    }
+
+    #[test]
+    fn start_surface_consumes_renderer_owned_theme_presentation() {
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        let canvas = Style::new().fg(Color::White).bg(Color::Blue);
+        let focused = Style::new().fg(Color::BrightYellow).bg(Color::Blue);
+        let muted = Style::new().fg(Color::BrightBlack).bg(Color::Blue);
+        let theme = PluginTuiTheme {
+            canvas,
+            text: Style::new().fg(Color::White),
+            muted,
+            border: Style::new().fg(Color::Cyan),
+            focused,
+            selection: Style::new().fg(Color::Black).bg(Color::BrightYellow),
+            source: bcode_plugin_sdk::tui::PluginTuiSourceTheme {
+                source: Style::new(),
+                border: Style::new(),
+                gutter: Style::new(),
+                truncated: Style::new(),
+            },
+            diff: bcode_plugin_sdk::tui::PluginTuiDiffTheme {
+                text: Style::new(),
+                muted: Style::new(),
+                title: Style::new(),
+                label: Style::new(),
+                added: Style::new(),
+                removed: Style::new(),
+                hunk: Style::new(),
+                added_row: Style::new(),
+                removed_row: Style::new(),
+                added_emphasis: Style::new(),
+                removed_emphasis: Style::new(),
+            },
+            syntax: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme {
+                text: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                comment: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                keyword: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                function: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                variable: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                string: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                number: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                type_name: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                operator: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                punctuation: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+            },
+        };
+        let area = Rect::new(0, 0, 80, 28);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(theme));
+
+        assert_eq!(surface.theme, Some(theme));
+        assert!(buffer.cells().iter().any(|cell| cell.style.bg == canvas.bg));
+        assert!(
+            buffer
+                .cells()
+                .iter()
+                .any(|cell| cell.style.fg == focused.fg)
+        );
     }
 
     #[tokio::test]

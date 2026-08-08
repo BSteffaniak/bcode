@@ -4618,6 +4618,42 @@ mod tests {
     }
 
     #[test]
+    fn theme_changes_invalidate_presentation_without_mutating_session_projection() {
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "# Stable history".to_owned(),
+            },
+        }];
+        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        let transcript_revision = app.transcript_projection_revision();
+        let markdown_revision = app.markdown_presentation_revision();
+        let transcript_before = app
+            .transcript()
+            .iter()
+            .map(|item| (item.id(), item.text().to_owned()))
+            .collect::<Vec<_>>();
+        let fingerprint_before = app.presented_theme().fingerprint;
+
+        assert!(app.apply_theme("bcode-dark"));
+        assert_ne!(app.presented_theme().fingerprint, fingerprint_before);
+        assert_eq!(app.transcript_projection_revision(), transcript_revision);
+        assert_eq!(app.markdown_presentation_revision(), markdown_revision);
+        assert_eq!(
+            app.transcript()
+                .iter()
+                .map(|item| (item.id(), item.text().to_owned()))
+                .collect::<Vec<_>>(),
+            transcript_before
+        );
+    }
+
+    #[test]
     fn theme_transition_deadline_is_stable_until_the_frame_is_handled() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         let immediate = TuiConfig {
@@ -4676,6 +4712,55 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn external_schema_v1_theme_lifecycle_remains_compatible() {
+        let temp = tempfile::tempdir().expect("theme root");
+        let path = temp.path().join("external.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\nid = \"external\"\nextends = [\"terminal-native\"]\n[palette]\naccent = \"#112233\"\n[styles.\"surface.raised\"]\nbg = \"#223344\"\n",
+        )
+        .expect("external theme");
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let mut config = app.tui_config().clone();
+        config.theme.paths = vec![temp.path().to_path_buf()];
+        config.theme.accent_transition = bcode_config::TuiAccentTransitionMode::Immediate;
+        app.apply_tui_config(config);
+        let configured = app.presented_theme();
+
+        let catalog = crate::theme::catalog_view(&app);
+        let external = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "external")
+            .expect("external theme discovered");
+        assert_eq!(external.source, "explicit");
+        assert_eq!(external.validation, "valid");
+
+        assert!(app.preview_theme("external"));
+        assert_ne!(app.presented_theme().fingerprint, configured.fingerprint);
+        app.cancel_theme_preview();
+        assert_eq!(app.presented_theme().fingerprint, configured.fingerprint);
+        assert!(app.apply_theme("external"));
+        let valid = app.presented_theme();
+        assert_eq!(app.tui_config().theme.name, "external");
+
+        std::fs::write(&path, "schema_version = 1\nid = [broken").expect("invalid revision");
+        assert!(app.reload_theme_if_valid().is_none());
+        assert_eq!(app.presented_theme(), valid);
+        let diagnostics = crate::theme::catalog_view(&app).diagnostics;
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("external.toml"));
+
+        std::fs::write(
+            &path,
+            "schema_version = 1\nid = \"external\"\nextends = [\"terminal-native\"]\n[palette]\naccent = \"#445566\"\n[styles.\"surface.raised\"]\nbg = \"#334455\"\n",
+        )
+        .expect("corrected revision");
+        assert_eq!(app.reload_theme_if_valid(), Some("external"));
+        assert_ne!(app.presented_theme().fingerprint, valid.fingerprint);
     }
 
     #[test]
