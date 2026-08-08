@@ -100,17 +100,15 @@ pub enum TuiEffect {
         /// Whether this explicit open may start the daemon.
         allow_daemon_start: bool,
     },
-    /// Load user configuration.
+    /// Load declarative configuration and global interactive TUI state.
     LoadConfig,
-    /// Persist one complete TUI theme selection.
+    /// Persist one interactive TUI theme selection to user state.
     PersistThemeSelection {
         /// Stable base theme id.
         name: String,
-        /// Ordered overlay ids.
-        overlays: Vec<String>,
-        /// Configured variant behavior.
-        variant: bcode_config::TuiThemeVariant,
     },
+    /// Clear the interactive theme selection and restore the configured default.
+    ClearThemeSelection,
     /// Reconcile auth security status for a loaded config.
     ReconcileAuthSecurity {
         /// Loaded configuration.
@@ -456,12 +454,14 @@ pub enum TuiEffectResult {
     ConfigLoaded {
         /// Config load result.
         config: Box<Result<bcode_config::BcodeConfig, String>>,
+        /// Global interactive theme selection load result.
+        theme_selection: Result<Option<String>, String>,
     },
-    /// Durable TUI theme selection completed.
+    /// Durable TUI theme state update completed.
     ThemeSelectionPersisted {
-        /// Stable base theme id requested by the user.
-        name: String,
-        /// Config write result.
+        /// Stable base theme id requested by the user, or none when cleared.
+        name: Option<String>,
+        /// State write result.
         result: Result<std::path::PathBuf, String>,
     },
     /// Auth security reconciliation completed.
@@ -1108,6 +1108,7 @@ impl TuiEffect {
             },
             Self::LoadConfig
             | Self::PersistThemeSelection { .. }
+            | Self::ClearThemeSelection
             | Self::ReconcileAuthSecurity { .. }
             | Self::LoadOlderHistory { .. }
             | Self::LoadNewerHistory { .. }
@@ -1166,6 +1167,7 @@ impl TuiEffect {
             }
             | Self::LoadConfig
             | Self::PersistThemeSelection { .. }
+            | Self::ClearThemeSelection
             | Self::ReconcileAuthSecurity { .. }
             | Self::LoadSessionModelStatus { .. }
             | Self::LoadPluginStatus { .. }
@@ -1363,7 +1365,9 @@ impl TuiEffect {
         match self {
             Self::OpenSession { .. } => EffectKey::SessionOpen,
             Self::LoadConfig => EffectKey::Config,
-            Self::PersistThemeSelection { .. } => EffectKey::ThemeSelection,
+            Self::PersistThemeSelection { .. } | Self::ClearThemeSelection => {
+                EffectKey::ThemeSelection
+            }
             Self::ReconcileAuthSecurity { .. } => EffectKey::AuthSecurity,
             Self::LoadDraftStatus { .. } => EffectKey::DraftStatus,
             Self::LoadSessionStatus { .. } => EffectKey::SessionStatus,
@@ -1459,15 +1463,18 @@ impl TuiEffect {
             },
             Self::LoadConfig => TuiEffectResult::ConfigLoaded {
                 config: Box::new(bcode_config::load_config().map_err(|error| error.to_string())),
-            },
-            Self::PersistThemeSelection {
-                name,
-                overlays,
-                variant,
-            } => TuiEffectResult::ThemeSelectionPersisted {
-                result: bcode_config::set_tui_theme_selection(&name, &overlays, variant)
+                theme_selection: bcode_config::load_tui_theme_selection()
                     .map_err(|error| error.to_string()),
-                name,
+            },
+            Self::PersistThemeSelection { name } => TuiEffectResult::ThemeSelectionPersisted {
+                result: bcode_config::set_tui_theme_selection(&name)
+                    .map_err(|error| error.to_string()),
+                name: Some(name),
+            },
+            Self::ClearThemeSelection => TuiEffectResult::ThemeSelectionPersisted {
+                result: bcode_config::clear_tui_theme_selection()
+                    .map_err(|error| error.to_string()),
+                name: None,
             },
             Self::ReconcileAuthSecurity { config } => TuiEffectResult::AuthSecurityReconciled {
                 status: session_flow::auth_security_status(&config),

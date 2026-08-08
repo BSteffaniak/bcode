@@ -10,7 +10,7 @@ Bcode merges configuration in this order, with later files overriding earlier fi
 2. `<repository>/bcode.toml`;
 3. `<repository>/.bcode/bcode.toml`.
 
-Use the user file for a global selection. Use either repository file to select a project theme without changing global configuration. The interactive selector persists to the documented user layer; it never rewrites a merged configuration or project file implicitly.
+Use the user file to define a global default. Use either repository file to define a project default without changing global configuration. Interactive selection is separate: the theme picker and `/theme apply` persist only the selected theme name to global user state (`$BCODE_TUI_STATE` or the Bcode state directory's `tui.toml`). They never create or rewrite `bcode.toml`. `/theme reset` clears that state override and returns to the merged configured default.
 
 A complete selection looks like:
 
@@ -253,7 +253,7 @@ A definition may omit roles. Resolution inherits from parent themes and then use
 
 ## Reload and errors
 
-External theme roots are polled through a bounded, confined content signature. Valid revisions replace the complete resolved presentation atomically. Invalid or transient revisions retain the last valid configured theme; invalid/disappearing previews close and restore the configured selection. Interactive preview, cancel, and durable apply are available from the theme picker and `/theme` commands.
+External theme roots are polled through a bounded, confined content signature. Valid revisions replace the complete resolved presentation atomically. Invalid or transient revisions retain the last valid configured theme; invalid/disappearing previews close and restore the configured selection. Interactive preview, cancel, and state-backed apply are available from the theme picker and `/theme` commands. A globally selected custom theme must remain discoverable through globally available configured paths; when it is unavailable in a repository, Bcode retains the configured default and reports a diagnostic.
 
 Typical authoring workflow:
 
@@ -264,7 +264,7 @@ $EDITOR ~/.config/bcode/themes/my-theme.toml
 bcode theme validate ~/.config/bcode/themes/my-theme.toml
 ```
 
-Then select `my-theme` in `[tui.theme]`, `/theme apply my-theme`, or the theme picker. Saving a valid edit hot-reloads the full presentation without recompiling Rust. A parse error leaves the last valid presentation active and emits a bounded source-specific diagnostic; fixing the file permits the next poll to apply it atomically.
+Then define `my-theme` as the default in `[tui.theme]`, or select it globally with `/theme apply my-theme` or the theme picker. Interactive selection writes user state, never `bcode.toml`; `/theme reset` restores the configured default. Saving a valid edit hot-reloads the full presentation without recompiling Rust. A parse error leaves the last valid presentation active and emits a bounded source-specific diagnostic; fixing the file permits the next poll to apply it atomically.
 
 Syntax grammars classify source tokens into semantic roles; the resolved Bcode theme exclusively selects their final colors. The semantic roles are `syntax.text`, `syntax.comment`, `syntax.keyword`, `syntax.function`, `syntax.variable`, `syntax.string`, `syntax.number`, `syntax.type`, `syntax.operator`, and `syntax.punctuation`. Omitted roles derive from the resolved text, muted, info/accent, success, and warning presentation rather than from a bundled syntax theme.
 

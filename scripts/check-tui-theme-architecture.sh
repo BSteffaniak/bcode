@@ -3,6 +3,17 @@ set -euo pipefail
 
 fail() { echo "TUI theme architecture guard failed: $*" >&2; exit 1; }
 
+if rg -n 'update_writable_config|writable_config_path|BCODE_CONFIG_ENV' \
+  packages/tui/src/chat_loop.rs \
+  packages/tui/src/effects.rs; then
+  fail "interactive theme selection must persist to user state, not declarative config"
+fi
+
+if rg -n -U 'pub fn set_tui_theme_selection[\s\S]{0,1200}update_writable_config' \
+  packages/config/src/lib.rs; then
+  fail "theme state persistence must not delegate to writable config mutation"
+fi
+
 for theme in \
   packages/tui/themes/terminal-native.toml \
   packages/tui/themes/terminal-native-structured.toml \

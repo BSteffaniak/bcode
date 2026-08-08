@@ -469,12 +469,9 @@ impl ChatLoopState {
             super::theme_picker::ThemePickerOutcome::Apply(id) => {
                 self.theme_picker = None;
                 if chat.app.preview_theme(&id) {
-                    chat.replace_effect(TuiEffect::PersistThemeSelection {
-                        name: id.clone(),
-                        overlays: chat.app.tui_config().theme.overlays.clone(),
-                        variant: chat.app.tui_config().theme.variant,
-                    });
-                    chat.app.set_status(format!("saving theme {id}…"));
+                    chat.replace_effect(TuiEffect::PersistThemeSelection { name: id.clone() });
+                    chat.app
+                        .set_status(format!("saving theme {id} to user state…"));
                 }
             }
             super::theme_picker::ThemePickerOutcome::Cancel => {
@@ -1921,20 +1918,40 @@ pub fn apply_effect_result(
             loop_state.interactive_surface = None;
             loop_state.interactive_surface_queue.clear();
         }
-        TuiEffectResult::ConfigLoaded { config } => {
-            apply_config_result(settings, chat, loop_state, *config);
+        TuiEffectResult::ConfigLoaded {
+            config,
+            theme_selection,
+        } => {
+            apply_config_result(settings, chat, loop_state, *config, theme_selection);
         }
         TuiEffectResult::ThemeSelectionPersisted { name, result } => match result {
             Ok(path) => {
-                chat.app.set_status(format!(
-                    "theme {name} saved to {}; reloading configuration…",
-                    bcode_plugin_sdk::path::display_from_current_dir(&path)
-                ));
-                chat.replace_effect(TuiEffect::LoadConfig);
+                if let Some(name) = name {
+                    if chat.app.apply_theme(&name) {
+                        chat.app.set_status(format!(
+                            "theme {name} saved to user state at {}",
+                            bcode_plugin_sdk::path::display_from_current_dir(&path)
+                        ));
+                    } else {
+                        chat.app.cancel_theme_preview();
+                        chat.app.set_status(format!(
+                            "theme {name} saved, but is not available in this repository"
+                        ));
+                    }
+                } else {
+                    chat.app.set_status(format!(
+                        "theme override cleared from {}; reloading configuration…",
+                        bcode_plugin_sdk::path::display_from_current_dir(&path)
+                    ));
+                    chat.replace_effect(TuiEffect::LoadConfig);
+                }
             }
-            Err(error) => chat
-                .app
-                .set_status(format!("could not save theme {name}: {error}")),
+            Err(error) => {
+                chat.app.cancel_theme_preview();
+                let action = name.as_deref().unwrap_or("configured default");
+                chat.app
+                    .set_status(format!("could not save theme {action}: {error}"));
+            }
         },
         TuiEffectResult::AuthSecurityReconciled { status } => {
             apply_auth_security_result(chat, status);
@@ -2356,6 +2373,7 @@ pub fn apply_config_result(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     config: Result<bcode_config::BcodeConfig, String>,
+    theme_selection: Result<Option<String>, String>,
 ) {
     match config {
         Ok(config) => {
@@ -2381,6 +2399,18 @@ pub fn apply_config_result(
                     .set_status(format!("plugin presentation unavailable: {error}")),
             }
             chat.app.apply_tui_config(config.tui.clone());
+            match theme_selection {
+                Ok(Some(theme_id)) if !chat.app.apply_theme(&theme_id) => {
+                    chat.app.set_status(format!(
+                        "saved theme {theme_id} is unavailable; using configured default {}",
+                        config.tui.theme.name
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => chat
+                    .app
+                    .set_status(format!("TUI state unavailable: {error}")),
+            }
             if let Some(surface) = loop_state.interactive_surface.as_mut() {
                 surface.update_keymap(&settings.keymap);
             }
@@ -2835,14 +2865,18 @@ fn apply_root_slash_command_outcome(
             if chat.app.preview_theme(&theme_id) {
                 chat.replace_effect(TuiEffect::PersistThemeSelection {
                     name: theme_id.clone(),
-                    overlays: chat.app.tui_config().theme.overlays.clone(),
-                    variant: chat.app.tui_config().theme.variant,
                 });
-                chat.app.set_status(format!("saving theme {theme_id}…"));
+                chat.app
+                    .set_status(format!("saving theme {theme_id} to user state…"));
             } else {
                 chat.app
                     .set_status(format!("unknown bundled theme: {theme_id}"));
             }
+        }
+        SlashCommandOutcome::ResetTheme => {
+            chat.replace_effect(TuiEffect::ClearThemeSelection);
+            chat.app
+                .set_status("clearing saved theme override…".to_owned());
         }
         SlashCommandOutcome::CancelThemePreview => {
             chat.app.cancel_theme_preview();

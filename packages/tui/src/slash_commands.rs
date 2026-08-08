@@ -44,8 +44,10 @@ pub enum SlashCommandOutcome {
     PickModel,
     /// Preview a bundled theme without persistence.
     PreviewTheme { theme_id: String },
-    /// Apply a bundled theme to the in-memory configuration.
+    /// Apply a bundled theme as the global interactive selection.
     ApplyTheme { theme_id: String },
+    /// Clear the global interactive selection and restore the configured default.
+    ResetTheme,
     /// Restore the configured theme after preview.
     CancelThemePreview,
     /// Open the interactive theme picker.
@@ -791,9 +793,10 @@ fn theme_command(parts: &[&str]) -> SlashCommandOutcome {
         [_, "apply", theme_id] => SlashCommandOutcome::ApplyTheme {
             theme_id: (*theme_id).to_owned(),
         },
+        [_, "reset"] => SlashCommandOutcome::ResetTheme,
         [_, "cancel"] => SlashCommandOutcome::CancelThemePreview,
         _ => SlashCommandOutcome::Handled(
-            "usage: /theme [list|preview <builtin>|apply <builtin>|cancel]".to_owned(),
+            "usage: /theme [list|preview <theme>|apply <theme>|reset|cancel]".to_owned(),
         ),
     }
 }
@@ -1158,6 +1161,10 @@ mod tests {
             SlashCommandOutcome::ApplyTheme {
                 theme_id: "bcode-light".to_owned()
             }
+        );
+        assert_eq!(
+            theme_command(&["/theme", "reset"]),
+            SlashCommandOutcome::ResetTheme
         );
     }
 

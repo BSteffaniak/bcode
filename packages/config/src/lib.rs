@@ -4307,33 +4307,6 @@ pub fn set_bedrock_model_profile(
     })
 }
 
-/// Persist a TUI theme selection in the writable user configuration layer.
-///
-/// The selected base, ordered overlays, and variant are written together so a
-/// renderer never observes a partially updated durable selection.
-///
-/// # Errors
-///
-/// Returns an error when the writable config cannot be read, updated, or
-/// written, or when the selected base or an overlay id is empty.
-pub fn set_tui_theme_selection(
-    name: &str,
-    overlays: &[String],
-    variant: TuiThemeVariant,
-) -> Result<PathBuf, ConfigError> {
-    if name.trim().is_empty() || overlays.iter().any(|overlay| overlay.trim().is_empty()) {
-        return Err(ConfigError::Composition {
-            message: "theme names and overlay ids must not be empty".to_owned(),
-        });
-    }
-    update_writable_config(|config| {
-        name.clone_into(&mut config.tui.theme.name);
-        overlays.clone_into(&mut config.tui.theme.overlays);
-        config.tui.theme.variant = variant;
-        Ok(())
-    })
-}
-
 fn update_writable_config(
     update: impl FnOnce(&mut BcodeConfig) -> Result<(), ConfigError>,
 ) -> Result<PathBuf, ConfigError> {
@@ -4689,6 +4662,114 @@ pub fn default_permissions_state_path_with_environment(
         return PathBuf::from(path);
     }
     default_state_dir_with_environment(environment).join("permissions.toml")
+}
+
+/// Return the default runtime TUI state file path.
+///
+/// Interactive presentation choices are stored here instead of mutating
+/// declarative `bcode.toml` configuration.
+#[must_use]
+pub fn default_tui_state_path() -> PathBuf {
+    default_tui_state_path_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Return the default runtime TUI state file path for an explicit environment.
+#[must_use]
+pub fn default_tui_state_path_with_environment(environment: &impl ConfigEnvironment) -> PathBuf {
+    if let Some(path) = environment.var("BCODE_TUI_STATE") {
+        return PathBuf::from(path);
+    }
+    default_state_dir_with_environment(environment).join("tui.toml")
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TuiState {
+    #[serde(default)]
+    theme: TuiThemeState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TuiThemeState {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Load the globally selected interactive TUI theme.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_theme_selection() -> Result<Option<String>, ConfigError> {
+    load_tui_theme_selection_from(&default_tui_state_path())
+}
+
+/// Load the interactive TUI theme from a specific state path.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_theme_selection_from(path: &Path) -> Result<Option<String>, ConfigError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let state = toml::from_str::<TuiState>(&raw).map_err(|source| ConfigError::Composition {
+        message: format!(
+            "failed to parse TUI state {}: {source}",
+            display_from_current_dir(path)
+        ),
+    })?;
+    Ok(state.theme.name)
+}
+
+/// Persist the globally selected interactive TUI theme to user state.
+///
+/// # Errors
+///
+/// Returns an error when the name is empty or the state cannot be written.
+pub fn set_tui_theme_selection(name: &str) -> Result<PathBuf, ConfigError> {
+    if name.trim().is_empty() {
+        return Err(ConfigError::Composition {
+            message: "theme name must not be empty".to_owned(),
+        });
+    }
+    write_tui_state(
+        &default_tui_state_path(),
+        &TuiState {
+            theme: TuiThemeState {
+                name: Some(name.to_owned()),
+            },
+        },
+    )
+}
+
+/// Clear the globally selected interactive TUI theme.
+///
+/// # Errors
+///
+/// Returns an error when the state cannot be written.
+pub fn clear_tui_theme_selection() -> Result<PathBuf, ConfigError> {
+    write_tui_state(&default_tui_state_path(), &TuiState::default())
+}
+
+fn write_tui_state(path: &Path, state: &TuiState) -> Result<PathBuf, ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let contents = toml::to_string(state).map_err(|source| ConfigError::Composition {
+        message: format!("failed to serialize TUI state: {source}"),
+    })?;
+    fs::write(path, contents).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(path.to_path_buf())
 }
 
 /// Return the default runtime model ignores state file path.
@@ -6714,9 +6795,10 @@ mod tests {
         InvariantGuidanceMode, InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc,
         TuiAccentTransitionCurve, TuiAgentAccentPolicy, TuiInteractionOffscreenFocus,
         TuiInteractionPlacement, TuiMouseConfig, TuiRenderConfig, TuiThemeVariant,
-        TuiVisualAdapterConfig, default_config_paths_from, default_permissions_state_path,
-        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
-        load_runtime_auth_subscriptions, merge_config_values,
+        TuiVisualAdapterConfig, clear_tui_theme_selection, default_config_paths_from,
+        default_permissions_state_path, load_config_from_paths,
+        load_config_from_paths_with_overrides, load_permissions_state_from,
+        load_runtime_auth_subscriptions, load_tui_theme_selection_from, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
         register_runtime_auth_subscription, set_openai_compatible_sshenv_auth_method,
         set_tui_theme_selection, upsert_agent_permission_rule, validate_config,
@@ -7189,29 +7271,40 @@ enabled = false
     }
 
     #[test]
-    fn tui_theme_selection_write_is_atomic_and_round_trips() {
+    fn tui_theme_selection_uses_state_without_mutating_config() {
         let _guard = ENV_LOCK.lock().expect("environment lock");
         let temp = tempfile::tempdir().expect("temp dir");
-        let path = temp.path().join("bcode.toml");
-        let previous = std::env::var_os(BCODE_CONFIG_ENV);
+        let config_path = temp.path().join("bcode.toml");
+        let state_path = temp.path().join("tui.toml");
+        std::fs::write(&config_path, "[tui.theme]\nname = \"bcode-dark\"\n")
+            .expect("config should be written");
+        let original_config = std::fs::read_to_string(&config_path).expect("config should read");
+        let previous_config = std::env::var_os(BCODE_CONFIG_ENV);
+        let previous_state = std::env::var_os("BCODE_TUI_STATE");
         // SAFETY: tests that mutate process configuration are serialized by ENV_LOCK.
-        unsafe { std::env::set_var(BCODE_CONFIG_ENV, &path) };
+        unsafe {
+            std::env::set_var(BCODE_CONFIG_ENV, &config_path);
+            std::env::set_var("BCODE_TUI_STATE", &state_path);
+        }
 
-        let written = set_tui_theme_selection(
-            "bcode-light",
-            &["terminal-native-structured".to_owned()],
-            TuiThemeVariant::Light,
-        )
-        .expect("theme selection should write");
-        let loaded = super::read_config(&written).expect("written config should load");
+        let written = set_tui_theme_selection("bcode-light").expect("theme state should write");
 
-        assert_eq!(loaded.tui.theme.name, "bcode-light");
+        assert_eq!(written, state_path);
         assert_eq!(
-            loaded.tui.theme.overlays,
-            vec!["terminal-native-structured"]
+            load_tui_theme_selection_from(&written).expect("theme state should load"),
+            Some("bcode-light".to_owned())
         );
-        assert_eq!(loaded.tui.theme.variant, TuiThemeVariant::Light);
-        restore_env(BCODE_CONFIG_ENV, previous);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config should remain readable"),
+            original_config
+        );
+        clear_tui_theme_selection().expect("theme state should clear");
+        assert_eq!(
+            load_tui_theme_selection_from(&written).expect("cleared state should load"),
+            None
+        );
+        restore_env(BCODE_CONFIG_ENV, previous_config);
+        restore_env("BCODE_TUI_STATE", previous_state);
     }
 
     #[test]
