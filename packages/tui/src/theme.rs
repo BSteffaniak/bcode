@@ -38,9 +38,10 @@ pub struct ThemeCatalogView {
     pub diagnostics: Vec<String>,
 }
 
-/// Return the bounded effective theme catalog for an app.
-#[must_use]
-pub fn catalog_view(app: &BmuxApp) -> ThemeCatalogView {
+/// Discover the bounded effective theme catalog for an app.
+pub(crate) fn discover_theme_catalog(
+    app: &BmuxApp,
+) -> Result<discovery::DiscoveredThemes, definition::ThemeError> {
     let project_root = app
         .working_directory()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -49,7 +50,14 @@ pub fn catalog_view(app: &BmuxApp) -> ThemeCatalogView {
         project_root,
         &app.tui_config().theme.paths,
     );
-    let Ok(discovered) = discovery::discover_themes(&roots) else {
+    discovery::discover_themes(&roots)
+}
+
+/// Return the bounded effective theme catalog for an app.
+#[must_use]
+pub fn catalog_view(app: &mut BmuxApp) -> ThemeCatalogView {
+    let selected = app.tui_config().theme.name.clone();
+    let Some(discovered) = app.theme_catalog() else {
         return ThemeCatalogView {
             entries: Vec::new(),
             diagnostics: vec!["bundled theme catalog is invalid".to_owned()],
@@ -74,7 +82,7 @@ pub fn catalog_view(app: &BmuxApp) -> ThemeCatalogView {
                 has_dark_variant: definition.has_dark_variant(),
                 has_light_variant: definition.has_light_variant(),
                 validation: "valid".to_owned(),
-                selected: definition.id() == app.tui_config().theme.name,
+                selected: definition.id() == selected,
             }
         })
         .collect();
@@ -388,20 +396,6 @@ pub(crate) fn resolve_app_accent(app: &BmuxApp, configured_theme_accent: Color) 
     }
 }
 
-pub(crate) fn resolve_theme_selection(
-    app: &BmuxApp,
-    theme_name: &str,
-) -> Option<definition::ResolvedThemeDefinition> {
-    resolve_definition(
-        theme_name,
-        &app.tui_config().theme.overlays,
-        app.tui_config().theme.variant,
-        app.working_directory()
-            .unwrap_or_else(|| std::path::Path::new(".")),
-        &app.tui_config().theme.paths,
-    )
-}
-
 fn resolve_definition(
     theme_name: &str,
     overlays: &[String],
@@ -443,6 +437,15 @@ fn resolve_definition(
             )
         })
         .ok()
+}
+
+pub(crate) fn resolve_variant_for_config(
+    variant: TuiThemeVariant,
+) -> definition::ResolvedThemeVariant {
+    resolve_variant(
+        variant,
+        bmux_tui::capabilities::TerminalCapabilities::detect(),
+    )
 }
 
 const fn resolve_variant(

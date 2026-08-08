@@ -410,12 +410,58 @@ impl ChatLoopState {
     }
 
     pub fn open_theme_picker(&mut self, chat: &mut ActiveChat) {
-        let catalog = super::theme::catalog_view(&chat.app);
+        let variant = super::theme::resolve_variant_for_config(chat.app.tui_config().theme.variant);
+        let catalog = super::theme::catalog_view(&mut chat.app);
         self.theme_picker = Some(super::theme_picker::ThemePickerState::new(
             catalog.entries,
             catalog.diagnostics,
         ));
+        self.prepare_theme_picker_previews(chat, variant);
         chat.app.set_status("theme picker opened".to_owned());
+    }
+
+    fn prepare_theme_picker_previews(
+        &mut self,
+        chat: &mut ActiveChat,
+        variant: super::theme::definition::ResolvedThemeVariant,
+    ) {
+        let Some(picker) = self.theme_picker.as_ref() else {
+            return;
+        };
+        let ids = picker
+            .entries()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        let overlays = chat.app.tui_config().theme.overlays.clone();
+        let resolved = chat.app.theme_catalog().map(|discovered| {
+            ids.into_iter()
+                .filter_map(|id| {
+                    discovered
+                        .catalog
+                        .resolve(
+                            &super::theme::definition::ThemeSelection::new(&id)
+                                .overlays(overlays.clone())
+                                .variant(variant),
+                        )
+                        .ok()
+                        .map(|theme| {
+                            let accent = theme
+                                .style("border.focused")
+                                .and_then(|style| style.fg)
+                                .or_else(|| theme.color("accent"))
+                                .unwrap_or(super::theme::PENDING_AGENT_METADATA_ACCENT);
+                            (
+                                id,
+                                super::theme::resolved_definition_theme(Some(&theme), accent),
+                            )
+                        })
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        });
+        if let (Some(picker), Some(resolved)) = (self.theme_picker.as_mut(), resolved) {
+            picker.set_resolved_previews(resolved);
+        }
     }
 
     pub fn close_theme_picker(&mut self) {
@@ -462,13 +508,23 @@ impl ChatLoopState {
     ) {
         match outcome {
             super::theme_picker::ThemePickerOutcome::Preview(id) => {
-                if chat.app.preview_theme(&id) {
+                let resolved = self
+                    .theme_picker
+                    .as_ref()
+                    .and_then(|picker| picker.resolved_preview(&id));
+                if let Some(resolved) = resolved {
+                    chat.app.preview_resolved_theme(&id, &resolved);
                     chat.app.set_status(format!("previewing theme {id}"));
                 }
             }
             super::theme_picker::ThemePickerOutcome::Apply(id) => {
+                let resolved = self
+                    .theme_picker
+                    .as_ref()
+                    .and_then(|picker| picker.resolved_preview(&id));
                 self.theme_picker = None;
-                if chat.app.preview_theme(&id) {
+                if let Some(resolved) = resolved {
+                    chat.app.preview_resolved_theme(&id, &resolved);
                     chat.replace_effect(TuiEffect::PersistThemeSelection { name: id.clone() });
                     chat.app
                         .set_status(format!("saving theme {id} to user state…"));
@@ -2885,7 +2941,7 @@ fn apply_root_slash_command_outcome(
         SlashCommandOutcome::OpenThemePicker => loop_state.open_theme_picker(chat),
         SlashCommandOutcome::ShowThemeCatalog => {
             let markdown = super::slash_commands::format_theme_catalog_markdown(
-                &super::theme::catalog_view(&chat.app),
+                &super::theme::catalog_view(&mut chat.app),
             );
             chat.push_presentation_note(
                 "bcode.host",

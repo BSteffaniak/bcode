@@ -7,6 +7,8 @@ use bcode_markdown_render::{MarkdownRenderOptions, MarkdownRenderResult, render_
 
 use super::transcript::TranscriptItem;
 
+const MAX_PRESENTATION_VARIANTS_PER_ITEM: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedMarkdownProjection {
     item_revision: u64,
@@ -14,14 +16,69 @@ struct CachedMarkdownProjection {
     result: Arc<MarkdownRenderResult>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CachedMarkdownProjections {
+    current: Option<CachedMarkdownProjection>,
+    variants: Vec<CachedMarkdownProjection>,
+}
+
+impl CachedMarkdownProjections {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        usize::from(self.current.is_some()).saturating_add(self.variants.len())
+    }
+
+    fn get(
+        &self,
+        item_revision: u64,
+        options: &MarkdownRenderOptions,
+    ) -> Option<Arc<MarkdownRenderResult>> {
+        self.current
+            .iter()
+            .chain(&self.variants)
+            .find(|cached| cached.item_revision == item_revision && &cached.options == options)
+            .map(|cached| Arc::clone(&cached.result))
+    }
+
+    fn get_previous_compatible(
+        &self,
+        options: &MarkdownRenderOptions,
+    ) -> Option<Arc<MarkdownRenderResult>> {
+        self.current
+            .iter()
+            .chain(&self.variants)
+            .find(|cached| {
+                let mut cached_options = cached.options.clone();
+                cached_options.streaming = options.streaming;
+                &cached_options == options
+            })
+            .map(|cached| Arc::clone(&cached.result))
+    }
+
+    fn install(&mut self, projection: CachedMarkdownProjection) {
+        if let Some(current) = self.current.replace(projection) {
+            self.variants.retain(|cached| {
+                cached.item_revision != current.item_revision || cached.options != current.options
+            });
+            self.variants.push(current);
+            if self.variants.len() > MAX_PRESENTATION_VARIANTS_PER_ITEM {
+                let overflow = self
+                    .variants
+                    .len()
+                    .saturating_sub(MAX_PRESENTATION_VARIANTS_PER_ITEM);
+                self.variants.drain(..overflow);
+            }
+        }
+    }
+}
+
 /// Per-transcript-item Markdown render cache.
 ///
-/// Only the current projection for each resident item is retained. Scrolling can
-/// therefore reuse parsed Markdown and laid-out contribution geometry without
-/// growing the cache for streaming revisions or terminal resizes.
+/// Per resident item, retain the current projection plus a bounded set of recent presentation
+/// variants so cycling among themes reuses parsed and projected Markdown.
 #[derive(Debug, Default)]
 pub struct TranscriptMarkdownCache {
-    entries: RwLock<BTreeMap<u64, CachedMarkdownProjection>>,
+    entries: RwLock<BTreeMap<u64, CachedMarkdownProjections>>,
     retained_revision: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     render_count: std::sync::atomic::AtomicUsize,
@@ -54,29 +111,28 @@ impl TranscriptMarkdownCache {
         options: MarkdownRenderOptions,
     ) -> Arc<MarkdownRenderResult> {
         let item_id = item.id().get();
-        if let Some(cached) = self
-            .entries
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&item_id)
-            && cached.item_revision == item.revision()
-            && cached.options == options
-        {
-            return Arc::clone(&cached.result);
+        let cached = {
+            self.entries
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&item_id)
+                .and_then(|cached| cached.get(item.revision(), &options))
+        };
+        if let Some(cached) = cached {
+            return cached;
         }
 
         let result = Arc::new(render_markdown(item.text(), &options));
         self.entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                item_id,
-                CachedMarkdownProjection {
-                    item_revision: item.revision(),
-                    options,
-                    result: Arc::clone(&result),
-                },
-            );
+            .entry(item_id)
+            .or_default()
+            .install(CachedMarkdownProjection {
+                item_revision: item.revision(),
+                options,
+                result: Arc::clone(&result),
+            });
         #[cfg(test)]
         self.render_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -94,14 +150,13 @@ impl TranscriptMarkdownCache {
         self.entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                item_id,
-                CachedMarkdownProjection {
-                    item_revision,
-                    options,
-                    result,
-                },
-            );
+            .entry(item_id)
+            .or_default()
+            .install(CachedMarkdownProjection {
+                item_revision,
+                options,
+                result,
+            });
     }
 
     /// Return the retained projection only when the exact generation is cached.
@@ -116,8 +171,7 @@ impl TranscriptMarkdownCache {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&item_id)
-            .filter(|cached| cached.item_revision == item_revision && &cached.options == options)
-            .map(|cached| Arc::clone(&cached.result))
+            .and_then(|cached| cached.get(item_revision, options))
     }
 
     /// Return a retained older revision with compatible render options.
@@ -134,12 +188,7 @@ impl TranscriptMarkdownCache {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&item_id)
-            .filter(|cached| {
-                let mut cached_options = cached.options.clone();
-                cached_options.streaming = options.streaming;
-                &cached_options == options
-            })
-            .map(|cached| Arc::clone(&cached.result))
+            .and_then(|cached| cached.get_previous_compatible(options))
     }
 
     /// Return whether the current exact generation is already retained.
@@ -175,6 +224,15 @@ impl TranscriptMarkdownCache {
             .retain(|item_id, _cached| resident_ids.contains(item_id));
         self.retained_revision
             .store(transcript_revision, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn retained_projection_count(&self, item_id: u64) -> usize {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&item_id)
+            .map_or(0, CachedMarkdownProjections::len)
     }
 
     /// Return the number of actual Markdown renders performed by this cache.
@@ -242,11 +300,14 @@ mod tests {
             operator: color(9),
             punctuation: color(10),
         };
-        let palette_options = base.with_syntax_palette(palette);
+        let palette_options = base.clone().with_syntax_palette(palette);
         let palette_result = cache.project(&item, palette_options.clone());
         let palette_repeat = cache.project(&item, palette_options);
         assert!(!Arc::ptr_eq(&themed_result, &palette_result));
         assert!(Arc::ptr_eq(&palette_result, &palette_repeat));
+        assert_eq!(cache.render_count(), 3);
+        let original_again = cache.project(&item, base);
+        assert!(Arc::ptr_eq(&first, &original_again));
         assert_eq!(cache.render_count(), 3);
         assert_eq!(
             cache
@@ -255,6 +316,27 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn theme_variants_remain_strictly_bounded() {
+        use bmux_tui::style::{Color, Style};
+
+        let cache = TranscriptMarkdownCache::default();
+        let item =
+            TranscriptItem::with_format("Bcode", "# Heading".to_owned(), TextFormat::Markdown);
+        let base = MarkdownRenderOptions::new(80)
+            .with_document_id(format!("transcript:{}", item.id().get()));
+        for index in 0..16_u8 {
+            let mut options = base.clone();
+            options.theme.heading = Style::new().fg(Color::Rgb(index, index, index));
+            let _ = cache.project(&item, options);
+        }
+
+        assert_eq!(
+            cache.retained_projection_count(item.id().get()),
+            MAX_PRESENTATION_VARIANTS_PER_ITEM.saturating_add(1)
         );
     }
 

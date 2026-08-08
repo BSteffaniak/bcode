@@ -1440,6 +1440,7 @@ impl BcodeRuntimeModel {
                     return super::invalidation::UiInvalidation::None;
                 }
                 self.theme_input_signature = signature;
+                self.chat.app.invalidate_theme_catalog();
                 if let Some(id) = self.chat.app.reload_theme_if_valid().map(str::to_owned) {
                     self.chat.app.set_status(format!("theme {id} reloaded"));
                 } else {

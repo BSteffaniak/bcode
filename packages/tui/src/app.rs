@@ -33,6 +33,8 @@ use super::keymap::{BmuxAction, BmuxKeyActivation, BmuxKeyBinding, BmuxScope};
 use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
+use super::theme::definition::ResolvedThemeDefinition;
+use super::theme::discovery::DiscoveredThemes;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{TranscriptItem, terminal_item_from_shared};
@@ -349,6 +351,9 @@ pub struct BmuxApp {
     agent_metadata_hydration: AgentMetadataHydration,
     target_theme: ResolvedTheme,
     presented_theme: PresentedTheme,
+    theme_catalog: Option<DiscoveredThemes>,
+    #[cfg(test)]
+    theme_catalog_discovery_count: usize,
     theme_transition: ThemeTransitionState,
     theme_preview_id: Option<String>,
     thinking_label: String,
@@ -556,6 +561,9 @@ impl BmuxApp {
             agent_metadata_hydration: AgentMetadataHydration::Pending,
             target_theme: initial_theme,
             presented_theme: initial_theme.into(),
+            theme_catalog: None,
+            #[cfg(test)]
+            theme_catalog_discovery_count: 0,
             theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
             theme_preview_id: None,
             thinking_label: "reasoning output shown · unsupported".to_owned(),
@@ -634,6 +642,11 @@ impl BmuxApp {
         self.set_agent_metadata_hydrated(source.is_agent_metadata_hydrated());
         self.plugin_presentation
             .clone_from(&source.plugin_presentation);
+        self.theme_catalog.clone_from(&source.theme_catalog);
+        #[cfg(test)]
+        {
+            self.theme_catalog_discovery_count = source.theme_catalog_discovery_count;
+        }
         self.take_theme_transition_state_from(source);
     }
 
@@ -1214,11 +1227,76 @@ impl BmuxApp {
         self.apply_thinking_config(config.thinking);
         self.tui_config = config;
         self.theme_preview_id = None;
+        self.invalidate_theme_catalog();
         if markdown_changed {
             self.markdown_presentation_revision =
                 self.markdown_presentation_revision.saturating_add(1);
         }
         self.sync_theme_target(Instant::now());
+    }
+
+    /// Return the discovered theme catalog, loading it once for the current app inputs.
+    pub(crate) fn theme_catalog(&mut self) -> Option<&DiscoveredThemes> {
+        if self.theme_catalog.is_none() {
+            let discovered = super::theme::discover_theme_catalog(self).ok();
+            #[cfg(test)]
+            {
+                self.theme_catalog_discovery_count =
+                    self.theme_catalog_discovery_count.saturating_add(1);
+            }
+            self.theme_catalog = discovered;
+        }
+        self.theme_catalog.as_ref()
+    }
+
+    /// Resolve one selection from the current cached theme catalog.
+    pub(crate) fn resolve_theme_selection_cached(
+        &mut self,
+        theme_id: &str,
+    ) -> Option<ResolvedThemeDefinition> {
+        let overlays = self.tui_config.theme.overlays.clone();
+        let variant = super::theme::resolve_variant_for_config(self.tui_config.theme.variant);
+        self.theme_catalog()?
+            .catalog
+            .resolve(
+                &super::theme::definition::ThemeSelection::new(theme_id)
+                    .overlays(overlays)
+                    .variant(variant),
+            )
+            .ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn theme_catalog_discovery_count(&self) -> usize {
+        self.theme_catalog_discovery_count
+    }
+
+    /// Clear cached discovery so the next resolution observes current authorized inputs.
+    pub(crate) fn invalidate_theme_catalog(&mut self) {
+        self.theme_catalog = None;
+    }
+
+    fn install_theme_preview(&mut self, theme_id: &str, resolved: &ResolvedThemeDefinition) {
+        let accent = resolved
+            .style("border.focused")
+            .and_then(|style| style.fg)
+            .or_else(|| resolved.color("accent"))
+            .unwrap_or(super::theme::PENDING_AGENT_METADATA_ACCENT);
+        let target = super::theme::resolved_definition_theme(Some(resolved), accent);
+        self.theme_preview_id = Some(theme_id.to_owned());
+        self.target_theme = target;
+        self.theme_transition
+            .set_target(target.accent, &self.tui_config.theme, Instant::now());
+        self.update_theme_animation(Instant::now());
+    }
+
+    /// Preview one already-resolved picker theme without repeating discovery or resolution.
+    pub(crate) fn preview_resolved_theme(&mut self, theme_id: &str, target: &ResolvedTheme) {
+        self.theme_preview_id = Some(theme_id.to_owned());
+        self.target_theme = *target;
+        self.theme_transition
+            .set_target(target.accent, &self.tui_config.theme, Instant::now());
+        self.update_theme_animation(Instant::now());
     }
 
     /// Refresh the active configured or preview theme atomically from current inputs.
@@ -1227,12 +1305,13 @@ impl BmuxApp {
     /// remains untouched when discovery or resolution is invalid, providing
     /// the runtime's last-valid-theme guarantee.
     pub fn reload_theme_if_valid(&mut self) -> Option<&str> {
+        self.invalidate_theme_catalog();
         let theme_id = self
             .theme_preview_id
             .as_deref()
             .unwrap_or(&self.tui_config.theme.name)
             .to_owned();
-        let resolved = super::theme::resolve_theme_selection(self, &theme_id)?;
+        let resolved = self.resolve_theme_selection_cached(&theme_id)?;
         let configured_theme_accent = super::theme::resolved_accent(Some(&resolved));
         let accent = super::theme::resolve_app_accent(self, configured_theme_accent);
         let target = super::theme::resolved_definition_theme(Some(&resolved), accent);
@@ -1259,20 +1338,10 @@ impl BmuxApp {
     /// Returns `false` when the id is unknown or cannot resolve through the
     /// bounded bundled/user/project/explicit catalog.
     pub fn preview_theme(&mut self, theme_id: &str) -> bool {
-        let Some(resolved) = super::theme::resolve_theme_selection(self, theme_id) else {
+        let Some(resolved) = self.resolve_theme_selection_cached(theme_id) else {
             return false;
         };
-        let accent = resolved
-            .style("border.focused")
-            .and_then(|style| style.fg)
-            .or_else(|| resolved.color("accent"))
-            .unwrap_or(super::theme::PENDING_AGENT_METADATA_ACCENT);
-        let target = super::theme::resolved_definition_theme(Some(&resolved), accent);
-        self.theme_preview_id = Some(theme_id.to_owned());
-        self.target_theme = target;
-        self.theme_transition
-            .set_target(target.accent, &self.tui_config.theme, Instant::now());
-        self.update_theme_animation(Instant::now());
+        self.install_theme_preview(theme_id, &resolved);
         true
     }
 
@@ -3703,6 +3772,7 @@ impl BmuxApp {
         _event_sequence: u64,
         old_working_directory: &std::path::Path,
     ) {
+        self.invalidate_theme_catalog();
         if let Some(new_working_directory) = self.working_directory() {
             self.status = format!(
                 "working directory: {}",
@@ -4730,7 +4800,7 @@ mod tests {
         app.apply_tui_config(config);
         let configured = app.presented_theme();
 
-        let catalog = crate::theme::catalog_view(&app);
+        let catalog = crate::theme::catalog_view(&mut app);
         let external = catalog
             .entries
             .iter()
@@ -4750,7 +4820,7 @@ mod tests {
         std::fs::write(&path, "schema_version = 1\nid = [broken").expect("invalid revision");
         assert!(app.reload_theme_if_valid().is_none());
         assert_eq!(app.presented_theme(), valid);
-        let diagnostics = crate::theme::catalog_view(&app).diagnostics;
+        let diagnostics = crate::theme::catalog_view(&mut app).diagnostics;
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("external.toml"));
 
@@ -4825,7 +4895,7 @@ mod tests {
         config.theme.paths = vec![temp.path().to_path_buf()];
         app.apply_tui_config(config);
 
-        let catalog = crate::theme::catalog_view(&app);
+        let catalog = crate::theme::catalog_view(&mut app);
 
         assert!(!catalog.entries.is_empty());
         assert_eq!(catalog.diagnostics.len(), 1);
@@ -4846,7 +4916,7 @@ mod tests {
         config.theme.paths = vec![temp.path().to_path_buf()];
         app.apply_tui_config(config);
 
-        let entries = crate::theme::catalog_view(&app).entries;
+        let entries = crate::theme::catalog_view(&mut app).entries;
         let custom = entries
             .iter()
             .find(|entry| entry.id == "custom")
@@ -4855,6 +4925,17 @@ mod tests {
         assert_eq!(custom.source, "explicit");
         assert!(custom.selected);
         assert_eq!(custom.display_name, "Custom");
+    }
+
+    #[test]
+    fn repeated_theme_previews_reuse_one_discovered_catalog() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+        assert!(app.preview_theme("bcode-dark"));
+        assert!(app.preview_theme("nord"));
+        assert!(app.preview_theme("terminal-native"));
+
+        assert_eq!(app.theme_catalog_discovery_count(), 1);
     }
 
     #[test]

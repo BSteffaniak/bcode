@@ -3,7 +3,9 @@
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::list::ListState;
 
-use super::theme::ThemeCatalogEntry;
+use std::collections::BTreeMap;
+
+use super::theme::{ResolvedTheme, ThemeCatalogEntry};
 
 /// Theme picker outcome for one key event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +24,7 @@ pub enum ThemePickerOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemePickerState {
     entries: Vec<ThemeCatalogEntry>,
+    resolved_previews: BTreeMap<String, ResolvedTheme>,
     diagnostics: Vec<String>,
     list: ListState,
 }
@@ -34,6 +37,7 @@ impl ThemePickerState {
         list.select(entries.iter().position(|entry| entry.selected).or(Some(0)));
         Self {
             entries,
+            resolved_previews: BTreeMap::new(),
             diagnostics,
             list,
         }
@@ -43,6 +47,17 @@ impl ThemePickerState {
     #[must_use]
     pub fn entries(&self) -> &[ThemeCatalogEntry] {
         &self.entries
+    }
+
+    /// Install themes resolved once from the picker catalog.
+    pub fn set_resolved_previews(&mut self, resolved: BTreeMap<String, ResolvedTheme>) {
+        self.resolved_previews = resolved;
+    }
+
+    /// Return one theme resolved when the picker opened.
+    #[must_use]
+    pub fn resolved_preview(&self, id: &str) -> Option<ResolvedTheme> {
+        self.resolved_previews.get(id).copied()
     }
 
     /// Return bounded rejected-candidate diagnostics.
@@ -157,6 +172,26 @@ mod tests {
             ThemePickerOutcome::Apply("two".to_owned())
         );
         assert_eq!(picker.selected_id(), Some("two"));
+    }
+
+    #[test]
+    fn resolved_previews_are_retrieved_without_re_resolving() {
+        let mut picker = ThemePickerState::new(vec![entry("bcode-dark", true)], Vec::new());
+        let catalog =
+            super::super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+        let definition = catalog
+            .resolve(&super::super::theme::definition::ThemeSelection::new(
+                "bcode-dark",
+            ))
+            .expect("dark resolves");
+        let target = super::super::theme::resolved_definition_theme(
+            Some(&definition),
+            super::super::theme::PENDING_AGENT_METADATA_ACCENT,
+        );
+        picker.set_resolved_previews(BTreeMap::from([("bcode-dark".to_owned(), target)]));
+
+        assert_eq!(picker.resolved_preview("bcode-dark"), Some(target));
+        assert_eq!(picker.resolved_preview("missing"), None);
     }
 
     #[test]
