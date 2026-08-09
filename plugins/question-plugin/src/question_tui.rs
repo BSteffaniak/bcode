@@ -309,6 +309,49 @@ impl QuestionTerminalRenderer {
         );
     }
 
+    fn custom_vertical_input(
+        &mut self,
+        key: KeyCode,
+        snapshot: &QuestionSnapshot,
+    ) -> TerminalInteractionInput {
+        let QuestionFocusTarget::Custom { question_index } = snapshot.focus else {
+            return TerminalInteractionInput::Ignored;
+        };
+        let Some(state) = self.custom_inputs.get_mut(&question_index) else {
+            return TerminalInteractionInput::Semantic(InteractionInput::Navigate {
+                direction: if key == KeyCode::Up {
+                    InteractionNavigation::Previous
+                } else {
+                    InteractionNavigation::Next
+                },
+            });
+        };
+        let width = usize::from(state.content_area().width.max(1));
+        let layout = state.buffer().wrapped_layout(width);
+        let target_row = match key {
+            KeyCode::Up if layout.cursor.row > 0 => Some(layout.cursor.row.saturating_sub(1)),
+            KeyCode::Down if layout.cursor.row.saturating_add(1) < layout.lines.len() => {
+                Some(layout.cursor.row.saturating_add(1))
+            }
+            KeyCode::Up | KeyCode::Down => None,
+            _ => return TerminalInteractionInput::Ignored,
+        };
+        let Some(target_row) = target_row else {
+            return TerminalInteractionInput::Semantic(InteractionInput::Navigate {
+                direction: if key == KeyCode::Up {
+                    InteractionNavigation::Previous
+                } else {
+                    InteractionNavigation::Next
+                },
+            });
+        };
+        state
+            .buffer_mut()
+            .move_cursor_to_wrapped_position(width, target_row, layout.cursor.col);
+        state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
+        TerminalInteractionInput::Consumed
+    }
+
     fn custom_input(
         &mut self,
         event: &Event,
@@ -586,6 +629,13 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
             return TerminalInteractionInput::Semantic(InteractionInput::Submit);
         }
         if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. })
+            && let Event::Key(stroke) = event
+            && matches!(stroke.key, KeyCode::Up | KeyCode::Down)
+            && no_modifiers(stroke.modifiers)
+        {
+            return self.custom_vertical_input(stroke.key, snapshot);
+        }
+        if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. })
             && !matches!(
                 event,
                 Event::Key(stroke)
@@ -603,6 +653,15 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
             TerminalInteractionInput::Semantic,
         )
     }
+}
+
+const fn no_modifiers(modifiers: bmux_keyboard::Modifiers) -> bool {
+    !modifiers.shift
+        && !modifiers.ctrl
+        && !modifiers.alt
+        && !modifiers.super_key
+        && !modifiers.hyper
+        && !modifiers.meta
 }
 
 fn standard_input(
@@ -1133,6 +1192,50 @@ mod tests {
         renderer.render_slice(&focused, logical_height, 7, area, &mut frame);
         assert_ne!(rendered_text(&initial), rendered_text(&buffer));
         assert!(!rendered_text(&buffer).contains("more"));
+    }
+
+    #[test]
+    fn custom_multiline_arrows_edit_interior_rows_and_leave_at_edges() {
+        let request = NormalizedQuestionRequest {
+            questions: vec![question("Explain", &[], true, true)],
+        };
+        let mut controller = QuestionInteractionController::new(request);
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(0),
+            value: InteractionValue::String("first\nsecond\nthird".to_owned()),
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+        let snapshot = controller.snapshot();
+        let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 32, 12));
+        let state = renderer.custom_inputs.get_mut(&0).expect("custom state");
+        state
+            .buffer_mut()
+            .move_cursor(bmux_text_edit::TextMotion::Start);
+
+        assert_eq!(
+            renderer.input(&key(KeyCode::Up), &snapshot, &TEST_HOST),
+            TerminalInteractionInput::Semantic(InteractionInput::Navigate {
+                direction: InteractionNavigation::Previous,
+            })
+        );
+        assert_eq!(
+            renderer.input(&key(KeyCode::Down), &snapshot, &TEST_HOST),
+            TerminalInteractionInput::Consumed
+        );
+        assert_eq!(
+            renderer.input(&key(KeyCode::Down), &snapshot, &TEST_HOST),
+            TerminalInteractionInput::Consumed
+        );
+        assert_eq!(
+            renderer.input(&key(KeyCode::Down), &snapshot, &TEST_HOST),
+            TerminalInteractionInput::Semantic(InteractionInput::Navigate {
+                direction: InteractionNavigation::Next,
+            })
+        );
+        assert_eq!(
+            renderer.custom_inputs[&0].buffer().text(),
+            "first\nsecond\nthird"
+        );
     }
 
     #[test]
