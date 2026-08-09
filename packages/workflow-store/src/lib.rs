@@ -6500,6 +6500,27 @@ impl WorkflowStore {
                 "workflow child receipt conflicts with the canonical link".to_string(),
             ));
         }
+        let parent = self.run_summary(&request.run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow child parent run is missing".to_string())
+        })?;
+        let stored = self
+            .definition(&parent.definition_id, parent.definition_version)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow child parent definition is missing".to_string(),
+                )
+            })?;
+        let definition: WorkflowDefinition = serde_json::from_str(&stored.definition_json)?;
+        let node = definition.node(&request.node_id).ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "workflow child parent call definition is missing".to_string(),
+            )
+        })?;
+        let configuration: bcode_workflow::WorkflowCallConfiguration =
+            serde_json::from_value(node.configuration.clone())?;
+        configuration
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
         let child = self.run_summary(child_run_id)?.ok_or_else(|| {
             WorkflowStoreError::InvalidData("workflow child run is missing".to_string())
         })?;
@@ -6513,15 +6534,28 @@ impl WorkflowStore {
                             "completed workflow child has no terminal output".to_string(),
                         )
                     })?;
+                let projected_value = if let Some(mapping) = &configuration.output {
+                    mapping
+                        .evaluate(&[bcode_workflow::WorkflowTransformInput {
+                            name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                            value: &output.value,
+                        }])
+                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+                } else {
+                    output.value
+                };
                 Ok(AttemptObservation::Succeeded {
                     output: ValidatedOutput {
                         output_id: format!("{}:output", request.dispatch_identity),
                         run_id: request.run_id.clone(),
                         node_id: request.node_id.clone(),
                         activation_id: request.activation_id.clone(),
-                        schema_id: output.schema_id,
+                        schema_id: configuration
+                            .output
+                            .as_ref()
+                            .map_or(output.schema_id, |mapping| mapping.output.type_name.clone()),
                         schema_version: output.schema_version,
-                        value: output.value,
+                        value: projected_value,
                         artifact_reference: output.artifact_reference,
                         created_at_ms: observed_at_ms,
                     },
@@ -9100,6 +9134,7 @@ fn parallel_join_members(
     Ok((member("left_exits")?, member("right_exits")?))
 }
 
+#[allow(clippy::too_many_lines)]
 fn activation_input(
     transaction: &Transaction<'_>,
     definition: &WorkflowDefinition,
@@ -9113,21 +9148,48 @@ fn activation_input(
         .find(|edge| edge.from == output.node_id && edge.to == target.id)
         .and_then(|edge| edge.transform.as_ref());
     let input = if let Some(transform) = edge_transform {
-        let run_input_json: Option<String> = transaction.query_row(
-            "SELECT input_json FROM workflow_runs WHERE run_id = ?1",
-            [&output.run_id],
-            |row| row.get(0),
-        )?;
+        let (run_input_json, authored_provenance_json): (Option<String>, Option<String>) =
+            transaction.query_row(
+                "SELECT input_json, authored_provenance_json FROM workflow_runs WHERE run_id = ?1",
+                [&output.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
         let run_input = run_input_json
             .as_deref()
             .map(serde_json::from_str)
             .transpose()?
             .unwrap_or(serde_json::Value::Null);
+        let configuration = authored_provenance_json
+            .as_deref()
+            .map(serde_json::from_str::<AuthoredWorkflowRunProvenance>)
+            .transpose()?
+            .map_or(serde_json::Value::Null, |provenance| {
+                provenance.configuration
+            });
         let join_members = (target.kind == bcode_workflow::NodeKind::Parallel)
             .then(|| {
                 parallel_join_members(transaction, definition, &output.run_id, target, generation)
             })
             .transpose()?;
+        let dependency_values = definition
+            .edges
+            .iter()
+            .filter(|edge| edge.to == target.id)
+            .map(|edge| {
+                activation_output_value(transaction, &output.run_id, &edge.from, generation).map(
+                    |value| {
+                        (
+                            format!(
+                                "{}{}",
+                                bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_DEPENDENCY_PREFIX,
+                                edge.from
+                            ),
+                            value,
+                        )
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut inputs = vec![
             bcode_workflow::WorkflowTransformInput {
                 name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
@@ -9137,7 +9199,14 @@ fn activation_input(
                 name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
                 value: &run_input,
             },
+            bcode_workflow::WorkflowTransformInput {
+                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CONFIGURATION,
+                value: &configuration,
+            },
         ];
+        for (name, value) in &dependency_values {
+            inputs.push(bcode_workflow::WorkflowTransformInput { name, value });
+        }
         if let Some((left, right)) = &join_members {
             inputs.extend([
                 bcode_workflow::WorkflowTransformInput {
@@ -13579,6 +13648,8 @@ mod tests {
             configuration: serde_json::to_value(bcode_workflow::WorkflowCallConfiguration {
                 version: bcode_workflow::WORKFLOW_CALL_VERSION,
                 target: bcode_workflow::WorkflowCallTarget::Definition { identity: target },
+                input: None,
+                output: None,
             })
             .expect("call"),
         };
@@ -18948,6 +19019,100 @@ mod tests {
             })
             .expect_err("invalid activation input");
         assert!(error.to_string().contains("workflow activation input"));
+    }
+
+    #[test]
+    fn named_dependency_and_run_sources_materialize_deterministically() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = sequential_definition();
+        let second = definition.nodes.get_mut("second").expect("second");
+        second.input = bcode_workflow::ValueSchema {
+            type_name: "example.composed/v1".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["configuration", "root", "first"],
+                "properties": {
+                    "configuration": {"type": "string"},
+                    "root": {"type": "integer"},
+                    "first": {"type": "integer"}
+                }
+            }),
+        };
+        definition.edges[0].transform = Some(bcode_workflow::WorkflowTransform {
+            version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
+            expression: bcode_workflow::WorkflowTransformExpression::Object {
+                fields: BTreeMap::from([
+                    (
+                        "configuration".to_string(),
+                        bcode_workflow::WorkflowTransformExpression::Input {
+                            source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CONFIGURATION
+                                .to_string(),
+                            path: "message".to_string(),
+                        },
+                    ),
+                    (
+                        "root".to_string(),
+                        bcode_workflow::WorkflowTransformExpression::Input {
+                            source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE.to_string(),
+                            path: String::new(),
+                        },
+                    ),
+                    (
+                        "first".to_string(),
+                        bcode_workflow::WorkflowTransformExpression::Input {
+                            source: format!(
+                                "{}first",
+                                bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_DEPENDENCY_PREFIX
+                            ),
+                            path: String::new(),
+                        },
+                    ),
+                ]),
+            },
+            output: second.input.clone(),
+        });
+        store
+            .persist_definition("example", 1, &definition)
+            .expect("definition");
+        persist_authored_run_provenance_fixture(&store);
+        let mut run = new_run();
+        run.run_id = "named-sources-run".to_string();
+        run.authored_provenance = Some(AuthoredWorkflowRunProvenance::new(
+            "authored/example".to_string(),
+            3,
+            bcode_workflow::WorkflowDefinitionIdentity {
+                kind: "authored/example".to_string(),
+                definition_id: "example".to_string(),
+                definition_version: 1,
+            },
+            Some("review".to_string()),
+            Some(4),
+            serde_json::json!({"message": "review"}),
+        ));
+        store.create_run(&run).expect("run");
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "named-first-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity(&run.run_id, "first", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("first output");
+        assert_eq!(
+            result.activated[0].input,
+            Some(serde_json::json!({
+                "configuration": "review",
+                "root": 1,
+                "first": 2
+            }))
+        );
     }
 
     #[test]

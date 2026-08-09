@@ -2218,6 +2218,8 @@ fn add_node(
                 configuration: serde_json::to_value(WorkflowCallConfiguration {
                     version: WORKFLOW_CALL_VERSION,
                     target: WorkflowCallTarget::Definition { identity },
+                    input: None,
+                    output: None,
                 })
                 .map_err(|error| error.to_string())?,
             }

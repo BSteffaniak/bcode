@@ -1008,6 +1008,8 @@ struct CliWorkflowPackageMember {
     source_name: String,
     #[serde(default)]
     dependencies: Vec<String>,
+    #[serde(default)]
+    external_dependencies: Vec<String>,
 }
 
 async fn handle_workflow_package_command(
@@ -1226,6 +1228,7 @@ fn read_workflow_package_manifest(
                 format: bcode_workflow::WorkflowSourceFormat::Json,
                 source: String::new(),
                 dependencies: member.dependencies,
+                external_dependencies: member.external_dependencies,
             })
             .collect(),
     };

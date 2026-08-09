@@ -4510,6 +4510,7 @@ mod tests {
                     format: bcode_workflow::WorkflowSourceFormat::Json,
                     source: "{}".to_string(),
                     dependencies: Vec::new(),
+                    external_dependencies: Vec::new(),
                 }],
             },
             control: WorkflowComputationControl::default(),
