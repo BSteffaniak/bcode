@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "package_id": "bcode/generic-source-components",
   "exports": {
     "run-command-and-assert": "run-command-and-assert",

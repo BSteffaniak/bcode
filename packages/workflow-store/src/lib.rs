@@ -2191,6 +2191,7 @@ impl WorkflowStore {
                     .expected_lock
                     .package_source_digest_sha256
                     .clone(),
+                imports: request.expected_lock.imports.clone(),
                 members: published_lock_members,
             }),
             diagnostics: Vec::new(),
@@ -13198,6 +13199,7 @@ mod tests {
                     version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
                     package_id: "example/package".to_string(),
                     package_source_digest_sha256: "c".repeat(64),
+                    imports: Vec::new(),
                     members: locked,
                 },
             },
@@ -13283,6 +13285,7 @@ mod tests {
             version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
             package_id: "example/package".to_string(),
             package_source_digest_sha256: "a".repeat(64),
+            imports: Vec::new(),
             members: vec![bcode_workflow::WorkflowPackageLockedMember {
                 member_id: "main".to_string(),
                 source_digest_sha256: source_digest,
@@ -19092,7 +19095,7 @@ mod tests {
             serde_json::json!({"message": "review"}),
         ));
         store.create_run(&run).expect("run");
-        let result = store
+        store
             .persist_validated_output(&ValidatedOutput {
                 output_id: "named-first-output".to_string(),
                 run_id: run.run_id.clone(),
@@ -19105,13 +19108,114 @@ mod tests {
                 created_at_ms: 20,
             })
             .expect("first output");
+        drop(store);
+
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let activation = reopened
+            .pending_activations(10)
+            .expect("pending after restart")
+            .into_iter()
+            .find(|activation| activation.run_id == run.run_id && activation.node_id == "second")
+            .expect("materialized named input");
         assert_eq!(
-            result.activated[0].input,
+            activation.input,
             Some(serde_json::json!({
                 "configuration": "review",
                 "root": 1,
                 "first": 2
             }))
+        );
+    }
+
+    #[test]
+    fn named_dependency_materialization_rejects_skipped_branch_values_atomically() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let schema = bcode_workflow::ValueSchema::of::<u32>();
+        let mut definition = sequential_definition();
+        definition.nodes.insert(
+            "skipped".to_string(),
+            bcode_workflow::NodeDefinition {
+                id: "skipped".to_string(),
+                name: "skipped".to_string(),
+                kind: bcode_workflow::NodeKind::Task,
+                dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                input: schema.clone(),
+                output: schema,
+                resources: Vec::new(),
+                configuration: serde_json::Value::Null,
+            },
+        );
+        definition.entries.push("skipped".to_string());
+        definition.edges[0].transform = Some(bcode_workflow::WorkflowTransform {
+            version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
+            expression: bcode_workflow::WorkflowTransformExpression::Input {
+                source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.to_string(),
+                path: String::new(),
+            },
+            output: definition.nodes["second"].input.clone(),
+        });
+        definition.edges.push(bcode_workflow::EdgeDefinition {
+            from: "skipped".to_string(),
+            to: "second".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: Some(bcode_workflow::WorkflowTransform {
+                version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
+                expression: bcode_workflow::WorkflowTransformExpression::Input {
+                    source: format!(
+                        "{}skipped",
+                        bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_DEPENDENCY_PREFIX
+                    ),
+                    path: String::new(),
+                },
+                output: definition.nodes["second"].input.clone(),
+            }),
+        });
+        store
+            .persist_definition("skipped-dependency", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "skipped-dependency".to_string();
+        run.run_id = "skipped-dependency-run".to_string();
+        store.create_run(&run).expect("run");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'skipped' \
+                 WHERE run_id = ?1 AND node_id = 'skipped'",
+                [&run.run_id],
+            )
+            .expect("skip dependency");
+        let error = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "first-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity(&run.run_id, "first", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 3,
+            })
+            .expect_err("skipped dependency has no value");
+        assert!(!error.to_string().is_empty());
+        assert!(
+            store
+                .output_summaries(&run.run_id, 10)
+                .expect("outputs")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .pending_activations(10)
+                .expect("pending")
+                .iter()
+                .filter(
+                    |activation| activation.run_id == run.run_id && activation.node_id == "second"
+                )
+                .count(),
+            0
         );
     }
 

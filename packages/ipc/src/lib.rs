@@ -4504,6 +4504,7 @@ mod tests {
                     "main".to_string(),
                 )]),
                 external_dependencies: std::collections::BTreeMap::new(),
+                imports: Vec::new(),
                 members: vec![bcode_workflow::WorkflowPackageMember {
                     member_id: "main".to_string(),
                     source_name: "main.json".to_string(),
@@ -4529,6 +4530,7 @@ mod tests {
                 lock: bcode_workflow::WorkflowPackageLock {
                     version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
                     package_id: "example/package".to_string(),
+                    imports: Vec::new(),
                     package_source_digest_sha256: "a".repeat(64),
                     members: Vec::new(),
                 },
@@ -4552,6 +4554,7 @@ mod tests {
                     lock: bcode_workflow::WorkflowPackageLock {
                         version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
                         package_id: "example/package".to_string(),
+                        imports: Vec::new(),
                         package_source_digest_sha256: "a".repeat(64),
                         members: Vec::new(),
                     },
@@ -4573,6 +4576,7 @@ mod tests {
                 expected_lock: bcode_workflow::WorkflowPackageLock {
                     version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
                     package_id: "example/package".to_string(),
+                    imports: Vec::new(),
                     package_source_digest_sha256: "a".repeat(64),
                     members: Vec::new(),
                 },

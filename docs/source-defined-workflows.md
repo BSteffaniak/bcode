@@ -69,6 +69,8 @@ Named dependency values come from canonical persisted activation outputs. Restar
 
 Package-local calls use `package_call: {member: child}`. Exact external package exports selected by a resolver or lock use `package_call: {external: shared-name}` and the calling member must list that name in `external_dependencies`; the manifest supplies its exact immutable `WorkflowCallTarget`. Both forms lower to the same `WorkflowCallConfiguration` before compilation, so runtime scheduling never distinguishes local from imported source and never re-resolves a target after publication.
 
+`imports` records exact imported package ID, export name, immutable target, and imported lock digest; these facts are copied into the generated package lock. Planning rejects missing target definitions, duplicate import/export bindings, undeclared member use, and unsupported/cyclic definition closure. Source or imported-lock drift changes the package digest rather than silently relocking.
+
 A `workflow_call` uses the same expression contract for an optional exact child `input` mapping and an optional child-result `output` mapping. Input mappings must produce the published child input interface and may use declared predecessor, configuration, and root sources. Output mappings may use only `current`, the canonical validated child terminal result, and their declared output becomes the parent call node's exact output interface. Both mappings are embedded in the immutable compiled call configuration and therefore survive restart without re-resolution.
 
 ## Concise shell steps

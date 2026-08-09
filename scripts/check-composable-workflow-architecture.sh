@@ -133,8 +133,8 @@ fi
 for contract in \
   'WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 2' \
   'WORKFLOW_AUTHORING_DOCUMENT_VERSION: u32 = 2' \
-  'WORKFLOW_PACKAGE_MANIFEST_VERSION: u32 = 2' \
-  'WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 2' \
+  'WORKFLOW_PACKAGE_MANIFEST_VERSION: u32 = 3' \
+  'WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 3' \
   'WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2'; do
   if ! rg -q "$contract" packages/workflow/src/lib.rs; then
     echo "Composable workflow schema violation: missing clean contract $contract." >&2

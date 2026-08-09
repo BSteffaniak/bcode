@@ -4653,7 +4653,7 @@ pub struct WorkflowSourceLoweringResult {
 }
 
 /// Current portable workflow package manifest version.
-pub const WORKFLOW_PACKAGE_MANIFEST_VERSION: u32 = 2;
+pub const WORKFLOW_PACKAGE_MANIFEST_VERSION: u32 = 3;
 /// Maximum source members in one package.
 pub const MAX_WORKFLOW_PACKAGE_MEMBERS: usize = 64;
 /// Maximum direct dependencies declared by one package member.
@@ -4886,6 +4886,7 @@ pub fn preview_workflow_package(
 ///
 /// Returns an error for invalid manifests, malformed member source, missing/undeclared/forward
 /// package calls, failed canonical lowering, unavailable catalog requirements, or digest errors.
+#[allow(clippy::too_many_lines)]
 pub fn plan_workflow_package(
     manifest: &WorkflowPackageManifest,
     catalog: &WorkflowAuthoringCatalogSnapshot,
@@ -4898,7 +4899,33 @@ pub fn plan_workflow_package(
         .map(|member| (member.member_id.as_str(), member))
         .collect::<BTreeMap<_, _>>();
     let order = workflow_package_topological_order(&members)?;
+    let external_targets = manifest
+        .external_dependencies
+        .iter()
+        .map(|(name, target)| (name.clone(), target.clone()))
+        .chain(
+            manifest
+                .imports
+                .iter()
+                .map(|import| (import.import_id.clone(), import.target.clone())),
+        )
+        .collect::<BTreeMap<_, _>>();
     let mut resolved_catalog = catalog.clone();
+    for target in external_targets.values() {
+        let identity = target.definition_identity();
+        if !resolved_catalog
+            .workflow_definitions
+            .contains_key(&identity.definition_id)
+        {
+            return Err(authoring_error(
+                "package.imports.target",
+                format!(
+                    "exact imported definition '{}' is unavailable",
+                    identity.definition_id
+                ),
+            ));
+        }
+    }
     let mut identities = BTreeMap::<String, WorkflowDefinitionIdentity>::new();
     let mut planned = Vec::with_capacity(order.len());
     let mut locked = Vec::with_capacity(order.len());
@@ -4908,12 +4935,7 @@ pub fn plan_workflow_package(
             |path: &str| format!("package.members.{}.source.{path}", member.member_id);
         let mut value = decode_workflow_source_value(&member.source, member.format)
             .map_err(|error| qualify_workflow_package_member_error(member, error))?;
-        resolve_package_calls(
-            &mut value,
-            member,
-            &identities,
-            &manifest.external_dependencies,
-        )?;
+        resolve_package_calls(&mut value, member, &identities, &external_targets)?;
         let normalized = serde_json::to_string(&value).map_err(|error| {
             authoring_error(
                 member_source_path("normalized"),
@@ -4974,10 +4996,23 @@ pub fn plan_workflow_package(
         });
     }
     locked.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+    let mut locked_imports = manifest
+        .imports
+        .iter()
+        .map(|import| WorkflowPackageLockedImport {
+            import_id: import.import_id.clone(),
+            package_id: import.package_id.clone(),
+            export: import.export.clone(),
+            package_lock_digest_sha256: import.package_lock_digest_sha256.clone(),
+            target: import.target.clone(),
+        })
+        .collect::<Vec<_>>();
+    locked_imports.sort_by(|left, right| left.import_id.cmp(&right.import_id));
     let lock = WorkflowPackageLock {
         version: WORKFLOW_PACKAGE_LOCK_VERSION,
         package_id: manifest.package_id.clone(),
         package_source_digest_sha256: digest_serializable(manifest)?,
+        imports: locked_imports,
         members: locked,
     };
     lock.validate()?;
@@ -5453,7 +5488,31 @@ fn validate_workflow_package_plan(plan: &WorkflowPackagePlan) -> Result<(), Work
 }
 
 /// Current deterministic workflow package lock/result version.
-pub const WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 2;
+pub const WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 3;
+
+/// One exact imported package/export lock fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageLockedImport {
+    pub import_id: String,
+    pub package_id: String,
+    pub export: String,
+    pub package_lock_digest_sha256: String,
+    pub target: WorkflowCallTarget,
+}
+
+impl WorkflowPackageLockedImport {
+    fn validate(&self, path: &str) -> Result<(), WorkflowError> {
+        WorkflowPackageImport {
+            import_id: self.import_id.clone(),
+            package_id: self.package_id.clone(),
+            export: self.export.clone(),
+            target: self.target.clone(),
+            package_lock_digest_sha256: self.package_lock_digest_sha256.clone(),
+        }
+        .validate(path)
+    }
+}
 
 /// One exact successfully compiled/published package member result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5487,6 +5546,9 @@ pub struct WorkflowPackageLock {
     pub package_id: String,
     /// Digest of the validated package source manifest.
     pub package_source_digest_sha256: String,
+    /// Exact imported package/export bindings in deterministic local identity order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<WorkflowPackageLockedImport>,
     /// Members ordered deterministically by package-local identity.
     pub members: Vec<WorkflowPackageLockedMember>,
 }
@@ -5513,6 +5575,20 @@ impl WorkflowPackageLock {
             "package_lock.package_source_digest_sha256",
             &self.package_source_digest_sha256,
         )?;
+        let import_ids = self
+            .imports
+            .iter()
+            .map(|import| import.import_id.as_str())
+            .collect::<Vec<_>>();
+        if !import_ids.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(authoring_error(
+                "package_lock.imports",
+                "locked imports must be unique and ordered by local identity",
+            ));
+        }
+        for (index, import) in self.imports.iter().enumerate() {
+            import.validate(&format!("package_lock.imports[{index}]"))?;
+        }
         if self.members.is_empty() || self.members.len() > MAX_WORKFLOW_PACKAGE_MEMBERS {
             return Err(authoring_error(
                 "package_lock.members",
@@ -5592,6 +5668,35 @@ fn validate_sha256(path: &str, value: &str) -> Result<(), WorkflowError> {
     Ok(())
 }
 
+/// One exact imported package export made available to a source package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageImport {
+    /// Stable import-local identity referenced by member external dependency inventories.
+    pub import_id: String,
+    /// Stable imported package identity.
+    pub package_id: String,
+    /// Named imported export.
+    pub export: String,
+    /// Exact immutable target selected for that export.
+    pub target: WorkflowCallTarget,
+    /// Exact imported package lock digest used to detect stale or silently relocked imports.
+    pub package_lock_digest_sha256: String,
+}
+
+impl WorkflowPackageImport {
+    fn validate(&self, path: &str) -> Result<(), WorkflowError> {
+        validate_authoring_id(&format!("{path}.import_id"), &self.import_id)?;
+        validate_authoring_id(&format!("{path}.package_id"), &self.package_id)?;
+        validate_authoring_id(&format!("{path}.export"), &self.export)?;
+        self.target.validate()?;
+        validate_sha256(
+            &format!("{path}.package_lock_digest_sha256"),
+            &self.package_lock_digest_sha256,
+        )
+    }
+}
+
 /// One bounded package source member supplied through a portable boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -5625,6 +5730,9 @@ pub struct WorkflowPackageManifest {
     /// Optional exact immutable dependencies supplied outside this package.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub external_dependencies: BTreeMap<String, WorkflowCallTarget>,
+    /// Exact imported package exports selected by bounded source resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<WorkflowPackageImport>,
     /// Complete bounded member inventory.
     pub members: Vec<WorkflowPackageMember>,
 }
@@ -5660,7 +5768,12 @@ impl WorkflowPackageManifest {
                 "packages require a bounded non-empty export map",
             ));
         }
-        if self.external_dependencies.len() > MAX_WORKFLOW_PACKAGE_MEMBERS {
+        if self
+            .external_dependencies
+            .len()
+            .saturating_add(self.imports.len())
+            > MAX_WORKFLOW_PACKAGE_MEMBERS
+        {
             return Err(authoring_error(
                 "package.external_dependencies",
                 "package external dependencies exceed the package bound",
@@ -5670,6 +5783,25 @@ impl WorkflowPackageManifest {
             validate_authoring_id("package.external_dependencies.name", name)?;
             target.validate()?;
         }
+        let mut imported_ids = BTreeSet::new();
+        let mut imported_packages = BTreeSet::new();
+        for (index, import) in self.imports.iter().enumerate() {
+            import.validate(&format!("package.imports[{index}]"))?;
+            if !imported_ids.insert(import.import_id.as_str())
+                || !imported_packages.insert((import.package_id.as_str(), import.export.as_str()))
+                || self.external_dependencies.contains_key(&import.import_id)
+            {
+                return Err(authoring_error(
+                    format!("package.imports[{index}]"),
+                    "package imports must have unique local identities and package/export bindings",
+                ));
+            }
+        }
+        let imported_targets = self
+            .imports
+            .iter()
+            .map(|import| (import.import_id.as_str(), &import.target))
+            .collect::<BTreeMap<_, _>>();
         let mut by_id = BTreeMap::new();
         let mut source_names = BTreeSet::new();
         let mut total_bytes = 0_usize;
@@ -5734,7 +5866,9 @@ impl WorkflowPackageManifest {
                     &format!("package.members[{index}].external_dependencies"),
                     dependency,
                 )?;
-                if !self.external_dependencies.contains_key(dependency) {
+                if !self.external_dependencies.contains_key(dependency)
+                    && !imported_targets.contains_key(dependency.as_str())
+                {
                     return Err(authoring_error(
                         format!("package.members[{index}].external_dependencies"),
                         format!(
@@ -10012,7 +10146,7 @@ pub enum PromptContextTarget {
 /// Current exact child-workflow call contract version.
 pub const WORKFLOW_CALL_VERSION: u32 = 2;
 /// Maximum supported workflow-call nesting depth, including the root run.
-pub const MAX_WORKFLOW_CALL_DEPTH: u32 = 4;
+pub const MAX_WORKFLOW_CALL_DEPTH: u32 = 8;
 /// Maximum descendants admitted beneath one root run.
 pub const MAX_WORKFLOW_CALL_DESCENDANTS: u32 = 64;
 
@@ -14487,6 +14621,45 @@ mod tests {
     }
 
     #[test]
+    fn structured_source_v3_generic_dataflow_is_equivalent_across_formats() {
+        let schema = serde_json::json!({"type_name": "example.value/v1", "schema": {}});
+        let source = serde_json::json!({
+            "workflow_source_version": 3,
+            "workflow_id": "example/cross-format-dataflow",
+            "title": "Cross format dataflow",
+            "steps": [{"id": "first", "input": {"schema": schema}}, {
+                "id": "second",
+                "needs": ["first"],
+                "input_expression": {
+                    "version": WORKFLOW_TRANSFORM_VERSION,
+                    "expression": {"operation": "object", "fields": {
+                        "constant": {"operation": "constant", "value": true},
+                        "prior": {"operation": "input", "source": "dependency.first", "path": ""}
+                    }},
+                    "output": schema
+                },
+                "input": {"schema": schema}
+            }]
+        });
+        let json = serde_json::to_string(&source).expect("JSON");
+        let yaml = yaml_serde::to_string(&source).expect("YAML");
+        let toml = toml::to_string_pretty(&source).expect("TOML");
+        let lowered = [
+            (WorkflowSourceFormat::Json, json),
+            (WorkflowSourceFormat::Yaml, yaml),
+            (WorkflowSourceFormat::Toml, toml),
+        ]
+        .map(|(format, source)| {
+            lower_workflow_authoring_source(&source, format, &authoring_catalog())
+                .expect("lower source")
+        });
+        assert_eq!(lowered[0].document, lowered[1].document);
+        assert_eq!(lowered[0].document, lowered[2].document);
+        assert_eq!(lowered[0].source_map, lowered[1].source_map);
+        assert_eq!(lowered[0].source_map, lowered[2].source_map);
+    }
+
+    #[test]
     fn workflow_package_cross_format_members_lower_byte_equivalently() {
         let json = serde_json::json!({
             "workflow_source_version": 3,
@@ -14525,6 +14698,7 @@ mod tests {
                     package_id: "example/package".to_string(),
                     exports: BTreeMap::from([("main".to_string(), "member".to_string())]),
                     external_dependencies: BTreeMap::new(),
+                    imports: Vec::new(),
                     members: vec![WorkflowPackageMember {
                         member_id: "member".to_string(),
                         source_name: source_name.to_string(),
@@ -14596,12 +14770,16 @@ mod tests {
             version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
             package_id: "example/importer".to_string(),
             exports: BTreeMap::from([("main".to_string(), "parent".to_string())]),
-            external_dependencies: BTreeMap::from([(
-                "shared".to_string(),
-                WorkflowCallTarget::Definition {
+            external_dependencies: BTreeMap::new(),
+            imports: vec![WorkflowPackageImport {
+                import_id: "shared".to_string(),
+                package_id: "external/package".to_string(),
+                export: "main".to_string(),
+                target: WorkflowCallTarget::Definition {
                     identity: identity.clone(),
                 },
-            )]),
+                package_lock_digest_sha256: "a".repeat(64),
+            }],
             members: vec![WorkflowPackageMember {
                 member_id: "parent".to_string(),
                 source_name: "parent.json".to_string(),
@@ -14709,6 +14887,7 @@ mod tests {
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "member".to_string())]),
             external_dependencies: BTreeMap::new(),
+            imports: Vec::new(),
             members: vec![WorkflowPackageMember {
                 member_id: "member".to_string(),
                 source_name: "member.json".to_string(),
@@ -14743,6 +14922,7 @@ mod tests {
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "parent".to_string())]),
             external_dependencies: BTreeMap::new(),
+            imports: Vec::new(),
             members: vec![
                 WorkflowPackageMember {
                     member_id: "parent".to_string(),
@@ -14825,6 +15005,7 @@ mod tests {
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "member".to_string())]),
             external_dependencies: BTreeMap::new(),
+            imports: Vec::new(),
             members: vec![WorkflowPackageMember {
                 member_id: "member".to_string(),
                 source_name: "member.json".to_string(),
@@ -14863,6 +15044,7 @@ mod tests {
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "member".to_string())]),
             external_dependencies: BTreeMap::new(),
+            imports: Vec::new(),
             members: vec![WorkflowPackageMember {
                 member_id: "member".to_string(),
                 source_name: "member.yaml".to_string(),
@@ -14960,6 +15142,7 @@ mod tests {
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "parent".to_string())]),
             external_dependencies: BTreeMap::new(),
+            imports: Vec::new(),
             members: vec![WorkflowPackageMember {
                 member_id: "parent".to_string(),
                 source_name: "parent.json".to_string(),
@@ -15005,6 +15188,7 @@ mod tests {
         let lock = WorkflowPackageLock {
             version: WORKFLOW_PACKAGE_LOCK_VERSION,
             package_id: "example/package".to_string(),
+            imports: Vec::new(),
             package_source_digest_sha256: "a".repeat(64),
             members: vec![WorkflowPackageLockedMember {
                 member_id: "member".to_string(),
@@ -15043,6 +15227,7 @@ mod tests {
         let lock = |version, digest: String, members| WorkflowPackageLock {
             version,
             package_id: "example/package".to_string(),
+            imports: Vec::new(),
             package_source_digest_sha256: digest,
             members,
         };
@@ -15082,6 +15267,7 @@ mod tests {
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "parent".to_string())]),
             external_dependencies: BTreeMap::new(),
+            imports: Vec::new(),
             members: vec![
                 WorkflowPackageMember {
                     member_id: "child".to_string(),
@@ -15123,6 +15309,7 @@ mod tests {
             package_id: "example/package".to_string(),
             exports: BTreeMap::from([("main".to_string(), "a".to_string())]),
             external_dependencies: BTreeMap::new(),
+            imports: Vec::new(),
             members,
         };
         assert!(
@@ -16425,6 +16612,173 @@ steps:
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn structured_source_v3_rejects_future_version_and_document_size() {
+        let future = serde_json::json!({
+            "workflow_source_version": WORKFLOW_SOURCE_DOCUMENT_VERSION + 1,
+            "workflow_id": "example/future",
+            "title": "Future",
+            "steps": [{
+                "id": "gate",
+                "input": {"schema": source_interface_schema("example.interface/v1")}
+            }]
+        });
+        let error = lower_workflow_authoring_source(
+            &serde_json::to_string(&future).expect("future source"),
+            WorkflowSourceFormat::Json,
+            &authoring_catalog(),
+        )
+        .expect_err("future source version");
+        assert!(error.to_string().contains("version 4"));
+
+        let oversized = " ".repeat(MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES + 1);
+        let error = lower_workflow_authoring_source(
+            &oversized,
+            WorkflowSourceFormat::Json,
+            &authoring_catalog(),
+        )
+        .expect_err("oversized source");
+        assert!(error.to_string().contains("workflow source exceeds"));
+    }
+
+    #[test]
+    fn structured_source_v3_rejects_selector_and_transform_depth_bounds() {
+        let schema = ValueSchema {
+            type_name: "example.value/v1".to_string(),
+            schema: serde_json::json!({}),
+        };
+        let oversized_selector = WorkflowValueSelector {
+            version: WORKFLOW_VALUE_SELECTOR_VERSION,
+            segments: (0..=MAX_VALUE_SELECTOR_SEGMENTS)
+                .map(|index| WorkflowValueSelectorSegment::Field {
+                    name: format!("field-{index}"),
+                })
+                .collect(),
+        };
+        let selector_source = serde_json::json!({
+            "workflow_source_version": WORKFLOW_SOURCE_DOCUMENT_VERSION,
+            "workflow_id": "example/selector-bound",
+            "title": "Selector bound",
+            "steps": [{
+                "id": "first",
+                "input": {"schema": schema}
+            }, {
+                "id": "second",
+                "needs": ["first"],
+                "input_from": {"step": "first", "select": oversized_selector},
+                "input": {"schema": schema}
+            }]
+        });
+        let error = lower_workflow_authoring_source(
+            &serde_json::to_string(&selector_source).expect("selector source"),
+            WorkflowSourceFormat::Json,
+            &authoring_catalog(),
+        )
+        .expect_err("selector segment bound");
+        assert!(error.to_string().contains("value selector exceeds"));
+
+        let mut expression = WorkflowTransformExpression::Constant {
+            value: serde_json::Value::Null,
+        };
+        for _ in 0..=MAX_TRANSFORM_DEPTH {
+            expression = WorkflowTransformExpression::Default {
+                value: Box::new(expression),
+                default: Box::new(WorkflowTransformExpression::Constant {
+                    value: serde_json::Value::Null,
+                }),
+            };
+        }
+        let transform_source = serde_json::json!({
+            "workflow_source_version": WORKFLOW_SOURCE_DOCUMENT_VERSION,
+            "workflow_id": "example/transform-depth",
+            "title": "Transform depth",
+            "steps": [{
+                "id": "first",
+                "input": {"schema": schema}
+            }, {
+                "id": "second",
+                "needs": ["first"],
+                "input_expression": WorkflowTransform {
+                    version: WORKFLOW_TRANSFORM_VERSION,
+                    expression,
+                    output: schema.clone(),
+                },
+                "input": {"schema": schema}
+            }]
+        });
+        let error = lower_workflow_authoring_source(
+            &serde_json::to_string(&transform_source).expect("transform source"),
+            WorkflowSourceFormat::Json,
+            &authoring_catalog(),
+        )
+        .expect_err("transform depth bound");
+        assert!(error.to_string().contains("transform depth exceeds"));
+    }
+
+    #[test]
+    fn structured_source_v3_rejects_schema_mismatch_and_ambiguous_terminal_outputs() {
+        let text = ValueSchema {
+            type_name: "example.text/v1".to_string(),
+            schema: serde_json::json!({"type": "string"}),
+        };
+        let number = ValueSchema {
+            type_name: "example.number/v1".to_string(),
+            schema: serde_json::json!({"type": "integer"}),
+        };
+        let mismatched = serde_json::json!({
+            "workflow_source_version": WORKFLOW_SOURCE_DOCUMENT_VERSION,
+            "workflow_id": "example/schema-mismatch",
+            "title": "Schema mismatch",
+            "steps": [{
+                "id": "first",
+                "input": {"schema": text}
+            }, {
+                "id": "second",
+                "needs": ["first"],
+                "input_from": {"step": "first"},
+                "input": {"schema": number}
+            }]
+        });
+        let error = lower_workflow_authoring_source(
+            &serde_json::to_string(&mismatched).expect("mismatched source"),
+            WorkflowSourceFormat::Json,
+            &authoring_catalog(),
+        )
+        .expect_err("schema mismatch");
+        assert!(error.to_string().contains("must match exactly"));
+
+        let ambiguous = serde_json::json!({
+            "workflow_source_version": WORKFLOW_SOURCE_DOCUMENT_VERSION,
+            "workflow_id": "example/multiple-outputs",
+            "title": "Multiple outputs",
+            "input": text,
+            "steps": [{
+                "id": "entry",
+                "input": {"schema": text}
+            }, {
+                "id": "text",
+                "needs": ["entry"],
+                "input": {"schema": text}
+            }, {
+                "id": "number",
+                "needs": ["entry"],
+                "input_expression": {
+                    "version": WORKFLOW_TRANSFORM_VERSION,
+                    "expression": {"operation": "constant", "value": 1},
+                    "output": number
+                },
+                "input": {"schema": number}
+            }]
+        });
+        let error = lower_workflow_authoring_source(
+            &serde_json::to_string(&ambiguous).expect("multiple-output source"),
+            WorkflowSourceFormat::Json,
+            &authoring_catalog(),
+        )
+        .expect_err("ambiguous terminal interface");
+        assert!(error.to_string().contains("terminal output interface"));
     }
 
     #[test]

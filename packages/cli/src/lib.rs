@@ -998,6 +998,8 @@ struct CliWorkflowPackageManifest {
     exports: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     external_dependencies: std::collections::BTreeMap<String, bcode_workflow::WorkflowCallTarget>,
+    #[serde(default)]
+    imports: Vec<bcode_workflow::WorkflowPackageImport>,
     members: Vec<CliWorkflowPackageMember>,
 }
 
@@ -1219,6 +1221,7 @@ fn read_workflow_package_manifest(
         package_id: decoded.package_id,
         exports: decoded.exports,
         external_dependencies: decoded.external_dependencies,
+        imports: decoded.imports,
         members: decoded
             .members
             .into_iter()
