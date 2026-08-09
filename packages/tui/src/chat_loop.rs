@@ -227,6 +227,7 @@ pub struct ChatLoopState {
     ralph_start_dialog: Option<super::ralph_start_dialog::RalphStartDialog>,
     interactive_surface: Option<InteractiveSurfaceState>,
     interactive_surface_geometry: Option<InteractiveSurfaceGeometry>,
+    pinned_interaction_viewport: Option<(String, u16)>,
     session_picker: Option<super::session_picker::SessionPickerApp>,
     interactive_surface_queue: InteractiveSurfaceQueue,
     artifact_stream: ArtifactStreamCoordinator,
@@ -273,6 +274,7 @@ impl ChatLoopState {
             ralph_start_dialog: None,
             interactive_surface: None,
             interactive_surface_geometry: None,
+            pinned_interaction_viewport: None,
             session_picker: None,
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
@@ -1396,6 +1398,17 @@ impl ChatLoopState {
         &self,
     ) -> Option<InteractiveSurfaceGeometry> {
         self.interactive_surface_geometry
+    }
+
+    pub(super) fn routes_non_mouse_event_to_interactive_surface(
+        &self,
+        config: bcode_config::TuiInteractionConfig,
+    ) -> bool {
+        !self.interactive_surface_geometry.is_some_and(|geometry| {
+            geometry.placement == InteractiveSurfacePlacement::Transcript
+                && geometry.destination.is_empty()
+                && config.offscreen_focus == bcode_config::TuiInteractionOffscreenFocus::Suspend
+        })
     }
 
     pub const fn has_session_picker(&self) -> bool {
@@ -3854,6 +3867,40 @@ pub fn draw_chat_frame<W: Write>(
         .map(|surface| surface.preferred_height(full_transcript_area.width).max(1));
     let pinned = chat.app.tui_config().interactions.placement
         == bcode_config::TuiInteractionPlacement::Pinned;
+    let pinned_offset = if pinned {
+        let previous = loop_state.pinned_interaction_viewport.clone();
+        let result = loop_state.interactive_surface.as_mut().map(|surface| {
+            let interaction_id = surface.interaction_id().to_owned();
+            let viewport_height = interactive_surface_height(surface, full_transcript_area);
+            let logical_height = interaction_rows.unwrap_or(1);
+            let offset = previous
+                .filter(|(id, _)| id == &interaction_id)
+                .map_or(0, |(_, offset)| offset)
+                .min(logical_height.saturating_sub(viewport_height));
+            let focused = surface.focused_row_range(full_transcript_area.width);
+            let offset = focused.map_or(offset, |focused| {
+                if focused.start < offset {
+                    focused.start
+                } else if focused.end > offset.saturating_add(viewport_height) {
+                    focused.end.saturating_sub(viewport_height)
+                } else {
+                    offset
+                }
+            });
+            let offset = offset.min(logical_height.saturating_sub(viewport_height));
+            (interaction_id, offset)
+        });
+        if let Some((interaction_id, offset)) = result {
+            loop_state.pinned_interaction_viewport = Some((interaction_id, offset));
+            offset
+        } else {
+            loop_state.pinned_interaction_viewport = None;
+            0
+        }
+    } else {
+        loop_state.pinned_interaction_viewport = None;
+        0
+    };
     let dock_height = if pinned {
         loop_state
             .interactive_surface
@@ -4070,7 +4117,12 @@ pub fn draw_chat_frame<W: Write>(
         {
             if pinned {
                 frame.fill(surface_area, " ", bmux_tui::prelude::Style::new());
-                surface.render(surface_area, frame);
+                surface.render_slice(
+                    interaction_rows.unwrap_or(surface_area.height),
+                    pinned_offset,
+                    surface_area,
+                    frame,
+                );
             } else if let Some(placement) = inline_placement {
                 surface.render_slice(
                     placement.full_area.height,
@@ -4126,7 +4178,7 @@ pub fn draw_chat_frame<W: Write>(
             InteractiveSurfaceGeometry {
                 placement: InteractiveSurfacePlacement::Pinned,
                 logical_height: interaction_rows.unwrap_or(surface_area.height),
-                visible_logical_offset: 0,
+                visible_logical_offset: pinned_offset,
                 destination: surface_area,
             }
         } else if let Some(placement) = inline_placement {

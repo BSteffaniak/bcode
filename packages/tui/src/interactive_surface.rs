@@ -345,6 +345,7 @@ impl InteractiveSurfaceState {
     }
 
     /// Render the interactive surface.
+    #[cfg(test)]
     pub fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
         self.surface.render(area, frame);
     }

@@ -1728,7 +1728,11 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         .loop_state
                         .active_interactive_surface_geometry()
                         .is_some_and(|geometry| geometry.destination.contains(mouse.position)),
-                    _ => true,
+                    _ => self
+                        .loop_state
+                        .routes_non_mouse_event_to_interactive_surface(
+                            self.chat.app.tui_config().interactions,
+                        ),
                 };
                 if route_to_surface {
                     match self.loop_state.handle_interactive_surface_event(&event) {
@@ -2349,6 +2353,37 @@ mod tests {
         )
         .await
         .expect("question surface")
+    }
+
+    #[tokio::test]
+    async fn hidden_transcript_geometry_applies_retain_and_suspend_routing() {
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut loop_state = super::super::chat_loop::ChatLoopState::new(&client, &passive, false);
+        loop_state.set_interactive_surface_geometry_for_test(Some(
+            super::super::chat_loop::InteractiveSurfaceGeometry {
+                placement: super::super::chat_loop::InteractiveSurfacePlacement::Transcript,
+                logical_height: 20,
+                visible_logical_offset: 0,
+                destination: bmux_tui::geometry::Rect::new(0, 0, 80, 0),
+            },
+        ));
+        let mut config = bcode_config::TuiInteractionConfig::default();
+        assert!(loop_state.routes_non_mouse_event_to_interactive_surface(config));
+        config.offscreen_focus = bcode_config::TuiInteractionOffscreenFocus::Suspend;
+        assert!(!loop_state.routes_non_mouse_event_to_interactive_surface(config));
+
+        loop_state.set_interactive_surface_geometry_for_test(Some(
+            super::super::chat_loop::InteractiveSurfaceGeometry {
+                placement: super::super::chat_loop::InteractiveSurfacePlacement::Pinned,
+                logical_height: 20,
+                visible_logical_offset: 0,
+                destination: bmux_tui::geometry::Rect::new(0, 0, 80, 0),
+            },
+        ));
+        assert!(loop_state.routes_non_mouse_event_to_interactive_surface(config));
     }
 
     #[tokio::test]
