@@ -21,6 +21,7 @@ bcode_workflow             = { workspace = true }
 bmux_keyboard              = { workspace = true, optional = true }
 bmux_text_edit             = { workspace = true, optional = true }
 bmux_tui                   = { workspace = true, optional = true }
+bmux_tui_components        = { workspace = true, optional = true }
 clap                       = { workspace = true, features = ["std"] }
 schemars                   = { workspace = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
@@ -32,6 +33,12 @@ bcode_plugin_sdk = { path = ".", features = ["tui"] }
 trybuild         = { workspace = true }
 
 [features]
-default          = []
+default = []
 fail-on-warnings = []
-tui              = ["dep:bmux_keyboard", "dep:bmux_text_edit", "dep:bmux_tui", "dep:tokio"]
+tui = [
+    "dep:bmux_keyboard",
+    "dep:bmux_text_edit",
+    "dep:bmux_tui",
+    "dep:bmux_tui_components",
+    "dep:tokio",
+]

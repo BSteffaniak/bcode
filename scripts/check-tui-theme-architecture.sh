@@ -213,4 +213,24 @@ if rg -n 'frame\.fill\(area,[^\n]*Color::Black' \
   fail "code-review full-screen canvas must use renderer-owned theme presentation"
 fi
 
+if ! rg -q 'pub const fn component_theme\(self\) -> ComponentTheme' packages/tui/src/theme.rs \
+  || ! rg -q 'let components = theme\.component_theme\(\)' packages/tui/src/render.rs; then
+  fail "PresentedTheme must have one canonical BMUX ComponentTheme conversion used by plugin delivery"
+fi
+
+if rg -n 'ComponentTheme \{' packages/tui/src --glob '*.rs' \
+  | rg -v 'packages/tui/src/theme.rs'; then
+  fail "BMUX ComponentTheme construction must remain centralized at the TUI theme boundary"
+fi
+
+if ! rg -q 'component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION' \
+  packages/tui/src/render.rs; then
+  fail "plugin theme delivery must include the canonical versioned component theme"
+fi
+
+if ! rg -q 'pub const fn component_theme\(&self\).*Option<bmux_tui_components::theme::ComponentTheme>' \
+  packages/plugin-sdk/src/tui.rs; then
+  fail "plugin component-theme access must remain compatibility-version checked"
+fi
+
 echo "TUI theme architecture guard passed"

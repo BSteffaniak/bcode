@@ -8,6 +8,12 @@ use bmux_tui::prelude::{Modifier, Style};
 
 pub use bmux_tui_components::source_viewer::SourceViewerStyle;
 
+/// Derive generic source-viewer styles from a component theme.
+#[must_use]
+pub fn source_viewer_style(theme: bmux_tui_components::theme::ComponentTheme) -> SourceViewerStyle {
+    theme.into()
+}
+
 /// Input used to render a Bcode source viewer card.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceViewerInput<'a> {

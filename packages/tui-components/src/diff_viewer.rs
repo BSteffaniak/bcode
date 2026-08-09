@@ -11,6 +11,12 @@ pub use bmux_tui_components::diff_viewer::{
     DiffViewerStyle,
 };
 
+/// Derive generic diff-viewer styles from a component theme.
+#[must_use]
+pub fn diff_viewer_style(theme: bmux_tui_components::theme::ComponentTheme) -> DiffViewerStyle {
+    theme.into()
+}
+
 /// Input used to render Bcode diff viewer rows.
 #[derive(Debug, Clone, Copy)]
 pub struct DiffViewerInput<'a> {
@@ -65,13 +71,15 @@ pub fn diff_from_text_at_lines_with_palette(
     new_start_line: u32,
     #[cfg(feature = "syntax")] syntax_palette: Option<SyntaxPalette>,
 ) -> DiffDocument {
-    let mut document = bmux_tui_components::diff_viewer::diff_from_text_at_lines(
+    let document = bmux_tui_components::diff_viewer::diff_from_text_at_lines(
         label,
         old_text,
         new_text,
         old_start_line,
         new_start_line,
     );
+    #[cfg(feature = "syntax")]
+    let mut document = document;
     #[cfg(feature = "syntax")]
     apply_syntax(label, &mut document, syntax_palette);
     document

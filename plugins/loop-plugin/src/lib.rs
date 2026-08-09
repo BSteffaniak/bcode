@@ -1726,6 +1726,7 @@ mod tests {
         let focused = Style::new().fg(Color::BrightYellow).bg(Color::Blue);
         let muted = Style::new().fg(Color::BrightBlack).bg(Color::Blue);
         let theme = PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
             canvas,
             text: Style::new().fg(Color::White),
             muted,

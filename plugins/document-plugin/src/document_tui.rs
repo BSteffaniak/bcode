@@ -1,6 +1,6 @@
 //! Native TUI rendering for document extraction visuals.
 
-use bcode_tui_components::compact::header_rows;
+use bcode_tui_components::tool_card::tool_card_header_rows;
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use serde_json::Value;
 
@@ -69,7 +69,7 @@ fn extract_rows(
     ]
     .into_iter()
     .flatten();
-    let mut rows = header_rows(
+    let mut rows = tool_card_header_rows(
         Span::styled("◆ ", accent()),
         Span::styled("Document extraction", title_style()),
         metadata,

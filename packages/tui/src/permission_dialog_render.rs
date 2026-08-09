@@ -1,23 +1,18 @@
 //! TUI permission dialog rendering.
 
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 use bmux_tui::text_width::{display_width, wrap_text_with_continuation};
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowStyles};
 use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails, LabeledDetailsStyles};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
+use bmux_tui_components::modal_frame::ModalFrame;
 
 use super::permission_dialog::PermissionDialogState;
 use super::permission_present::{PermissionDetail, permission_presentation};
 use super::render::TuiTheme;
-
-const MIN_DIALOG_WIDTH: u16 = 48;
-const MAX_DIALOG_WIDTH: u16 = 100;
-const MIN_DIALOG_HEIGHT: u16 = 12;
-const MAX_DIALOG_HEIGHT: u16 = 24;
 
 /// Render a permission approval dialog.
 pub fn render_permission_dialog(
@@ -73,18 +68,9 @@ pub fn dialog_area(area: Rect, theme: TuiTheme) -> Rect {
     modal_frame(theme).panel_area(area)
 }
 
-fn modal_frame(theme: TuiTheme) -> ModalFrame {
-    ModalFrame::new(
-        ModalSizing::new(
-            Size::new(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT),
-            Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
-            Insets::all(4),
-        ),
-        theme.modal_theme(),
-    )
-    .title(" Permission requested ")
-    .padding(Insets::new(1, 2, 1, 2))
-    .placement(ModalPlacement::UpperThird)
+fn modal_frame(_theme: TuiTheme) -> ModalFrame {
+    let presented = super::render::semantic_state_theme();
+    bcode_tui_components::permission::permission_modal(presented.component_theme())
 }
 
 /// Return the permission action button hit boxes for the current dialog state.

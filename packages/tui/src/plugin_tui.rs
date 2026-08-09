@@ -1352,6 +1352,7 @@ library = "libdynamic_visual_test.dylib"
             3,
         );
         bcode_plugin_sdk::tui::PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
             canvas: style,
             text: style.fg(Color::White),
             muted: style.fg(Color::BrightBlack),

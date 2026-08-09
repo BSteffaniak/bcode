@@ -12603,6 +12603,7 @@ pub(crate) mod tests {
         let style = bmux_tui::style::Style::new();
         let syntax_color = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(red, 34, 56);
         bcode_plugin_sdk::tui::PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
             canvas: style,
             text: style,
             muted: style,

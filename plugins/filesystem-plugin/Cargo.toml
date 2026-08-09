@@ -23,6 +23,7 @@ bcode_tui_components = { workspace = true, features = [
     "source-preview",
     "source-viewer",
     "syntax",
+    "tool-card",
 ], optional = true }
 bmux_tui = { workspace = true, optional = true }
 devicons = { workspace = true, optional = true }

@@ -3731,6 +3731,7 @@ mod tests {
         let default_style = Style::new();
         let syntax_color = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(12, 34, 56);
         let theme = bcode_plugin_sdk::tui::PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
             canvas: default_style,
             text: default_style,
             muted: default_style,

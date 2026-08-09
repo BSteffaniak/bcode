@@ -8,6 +8,14 @@ provides explicit dark and independently tuned light variant patches. Existing `
 when `variant = "auto"` should follow terminal background detection. `terminal-native` remains the
 default unless selected explicitly.
 
+Bcode resolves these roles once into its terminal `PresentedTheme`. At the terminal boundary,
+`PresentedTheme::component_theme()` is the sole conversion into BMUX's generic `ComponentTheme`;
+individual components derive their states and surfaces from that palette while Bcode retains explicit
+source, diff, Markdown, and syntax overrides. Native plugin presentation carries a versioned optional
+component theme alongside the legacy source/diff fields. Plugins may use the generic palette only
+when `PluginTuiTheme::component_theme()` returns `Some`; older or incompatible contexts continue to
+use the legacy fields without changing rendering semantics.
+
 ## Configuration layers
 
 Bcode merges configuration in this order, with later files overriding earlier fields:

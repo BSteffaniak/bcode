@@ -10,38 +10,54 @@ readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
 
+[[bin]]
+name              = "bcode_terminal_grid_probe"
+path              = "src/bin/bcode_terminal_grid_probe.rs"
+required-features = ["terminal-viewer"]
+
 [dependencies]
-bcode_syntax_render = { workspace = true, optional = true }
-bmux_terminal_grid = { workspace = true, optional = true }
-bmux_tui = { workspace = true }
-bmux_tui_components = { workspace = true, features = [
-    "all",
-    "compact",
-    "diff-viewer",
-    "source-viewer",
-    "terminal-viewer",
-] }
-unicode-segmentation = { workspace = true }
-unicode-width = { workspace = true }
+bcode_syntax_render  = { workspace = true, optional = true }
+bmux_terminal_grid   = { workspace = true, optional = true }
+bmux_tui             = { workspace = true }
+bmux_tui_components  = { workspace = true }
+unicode-segmentation = { workspace = true, optional = true }
+unicode-width        = { workspace = true, optional = true }
 
 [features]
+activity = []
 all = [
+    "activity",
+    "chrome",
+    "composer",
     "compact",
     "diff-viewer",
+    "permission",
     "source-preview",
     "source-viewer",
     "terminal-viewer",
+    "tool-card",
 ]
+chrome = ["dep:unicode-segmentation"]
 compact = ["bmux_tui_components/compact"]
+composer = []
 default = []
-diff-viewer = []
+diff-viewer = ["bmux_tui_components/diff-viewer"]
 fail-on-warnings = []
-source-preview = ["source-viewer"]
-source-viewer = []
+permission = ["bmux_tui_components/modal-frame"]
+source-preview = [
+    "source-viewer",
+    "dep:unicode-segmentation",
+    "dep:unicode-width",
+]
+source-viewer = ["bmux_tui_components/source-viewer"]
 syntax = [
     "dep:bcode_syntax_render",
     "diff-viewer",
     "source-preview",
     "source-viewer",
 ]
-terminal-viewer = ["dep:bmux_terminal_grid"]
+terminal-viewer = [
+    "dep:bmux_terminal_grid",
+    "bmux_tui_components/terminal-viewer",
+]
+tool-card = ["compact"]

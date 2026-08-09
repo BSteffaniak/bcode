@@ -17,7 +17,7 @@ crate-type = ["cdylib", "rlib"]
 bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_tool = { workspace = true }
 bcode_tui_components = { workspace = true, features = [
-    "compact",
+    "tool-card",
 ], optional = true }
 bmux_tui = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "std"] }

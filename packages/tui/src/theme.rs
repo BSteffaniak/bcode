@@ -7,6 +7,7 @@ use std::num::ParseIntError;
 
 use bcode_config::{TuiAgentAccentPolicy, TuiThemeVariant};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui_components::theme::{ComponentSurfaces, ComponentTheme};
 
 use super::app::BmuxApp;
 
@@ -325,6 +326,44 @@ pub struct PresentedTheme {
     pub fingerprint: u64,
 }
 
+impl PresentedTheme {
+    /// Convert Bcode's resolved presentation into the canonical generic component theme.
+    #[must_use]
+    pub const fn component_theme(self) -> ComponentTheme {
+        ComponentTheme {
+            canvas: self.canvas,
+            surfaces: ComponentSurfaces {
+                normal: self.canvas,
+                raised: self.surfaces.raised,
+                overlay: self.surfaces.overlay,
+                scrim: self.surfaces.scrim,
+            },
+            text: self.text,
+            focused: self.focused,
+            selected: self.selection,
+            disabled: self.muted.add_modifier(Modifier::DIM),
+            muted: self.muted,
+            info: self.info,
+            success: self.success,
+            warning: self.warning,
+            error: self.error,
+            border: self.border,
+        }
+    }
+}
+
+impl From<PresentedTheme> for ComponentTheme {
+    fn from(theme: PresentedTheme) -> Self {
+        theme.component_theme()
+    }
+}
+
+impl From<&PresentedTheme> for ComponentTheme {
+    fn from(theme: &PresentedTheme) -> Self {
+        theme.component_theme()
+    }
+}
+
 impl From<ResolvedTheme> for PresentedTheme {
     fn from(theme: ResolvedTheme) -> Self {
         theme.presented(theme.accent)
@@ -512,26 +551,42 @@ pub(crate) fn resolved_definition_theme(
     let error = style("state.error").unwrap_or(text);
     let markdown = markdown_theme(theme, text, muted);
     let syntax = syntax_palette(theme, text, muted, info, success, warning);
-    let source = bcode_tui_components::source_viewer::SourceViewerStyle {
-        source: style("source.text").unwrap_or(text),
-        border: style("source.border").unwrap_or(border),
-        gutter: style("source.gutter").unwrap_or(muted),
-        truncated: style("source.truncated").unwrap_or(muted),
+    let component_theme = ComponentTheme {
+        canvas,
+        surfaces: ComponentSurfaces {
+            normal: canvas,
+            raised: surfaces.raised,
+            overlay: surfaces.overlay,
+            scrim: surfaces.scrim,
+        },
+        text,
+        focused,
+        selected: selection,
+        disabled: muted.add_modifier(Modifier::DIM),
+        muted,
+        info,
+        success,
+        warning,
+        error,
+        border,
     };
-    let default_diff = bcode_tui_components::diff_viewer::DiffViewerStyle::default();
-    let diff = bcode_tui_components::diff_viewer::DiffViewerStyle {
-        text: style("diff.text").unwrap_or(text),
-        muted: style("diff.muted").unwrap_or(muted),
-        title: style("diff.title").unwrap_or(focused),
-        label: style("diff.label").unwrap_or_else(|| text.add_modifier(Modifier::BOLD)),
-        added: style("diff.added").unwrap_or(default_diff.added),
-        removed: style("diff.removed").unwrap_or(default_diff.removed),
-        hunk: style("diff.hunk").unwrap_or(focused),
-        added_row: style("diff.added_row").unwrap_or(default_diff.added_row),
-        removed_row: style("diff.removed_row").unwrap_or(default_diff.removed_row),
-        added_emphasis: style("diff.added_emphasis").unwrap_or(default_diff.added_emphasis),
-        removed_emphasis: style("diff.removed_emphasis").unwrap_or(default_diff.removed_emphasis),
-    };
+    let mut source = bcode_tui_components::source_viewer::source_viewer_style(component_theme);
+    source.source = style("source.text").unwrap_or(source.source);
+    source.border = style("source.border").unwrap_or(source.border);
+    source.gutter = style("source.gutter").unwrap_or(source.gutter);
+    source.truncated = style("source.truncated").unwrap_or(source.truncated);
+    let mut diff = bcode_tui_components::diff_viewer::diff_viewer_style(component_theme);
+    diff.text = style("diff.text").unwrap_or(diff.text);
+    diff.muted = style("diff.muted").unwrap_or(diff.muted);
+    diff.title = style("diff.title").unwrap_or(diff.title);
+    diff.label = style("diff.label").unwrap_or(diff.label);
+    diff.added = style("diff.added").unwrap_or(diff.added);
+    diff.removed = style("diff.removed").unwrap_or(diff.removed);
+    diff.hunk = style("diff.hunk").unwrap_or(diff.hunk);
+    diff.added_row = style("diff.added_row").unwrap_or(diff.added_row);
+    diff.removed_row = style("diff.removed_row").unwrap_or(diff.removed_row);
+    diff.added_emphasis = style("diff.added_emphasis").unwrap_or(diff.added_emphasis);
+    diff.removed_emphasis = style("diff.removed_emphasis").unwrap_or(diff.removed_emphasis);
     let default_container = definition::ContainerRecipe {
         layout: definition::ContainerLayout::Plain,
         width: definition::ContainerWidth::Content,
@@ -742,6 +797,21 @@ fn fallback_agent_accent_color(agent_id: &str) -> Color {
 #[cfg(test)]
 mod capability_tests {
     use super::*;
+
+    #[test]
+    fn presented_theme_has_one_canonical_component_conversion() {
+        let presented = resolve_initial_theme().presented(PENDING_AGENT_METADATA_ACCENT);
+        let components = presented.component_theme();
+
+        assert_eq!(components.canvas, presented.canvas);
+        assert_eq!(components.surfaces.normal, presented.canvas);
+        assert_eq!(components.surfaces.raised, presented.surfaces.raised);
+        assert_eq!(components.surfaces.overlay, presented.surfaces.overlay);
+        assert_eq!(components.surfaces.scrim, presented.surfaces.scrim);
+        assert_eq!(components.text, presented.text);
+        assert_eq!(components.selected, presented.selection);
+        assert_eq!(components.border, presented.border);
+    }
 
     #[test]
     fn auto_variant_uses_detected_background_with_dark_unknown_fallback() {

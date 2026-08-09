@@ -988,12 +988,17 @@ pub struct PluginTuiDiffTheme {
     pub removed_emphasis: Style,
 }
 
+/// Current host component-theme contract version.
+pub const PLUGIN_TUI_COMPONENT_THEME_VERSION: u16 = 1;
+
 /// Renderer-owned semantic presentation passed to native TUI plugin adapters.
 ///
 /// This context contains presentation only. It must not affect plugin routing,
 /// authorization, dispatch, or persisted outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginTuiTheme {
+    /// Version of the host component-theme contract.
+    pub component_theme_version: u16,
     /// Base canvas style.
     pub canvas: Style,
     /// Primary text style.
@@ -1012,6 +1017,96 @@ pub struct PluginTuiTheme {
     pub diff: PluginTuiDiffTheme,
     /// Syntax presentation.
     pub syntax: PluginTuiSyntaxTheme,
+}
+
+impl PluginTuiTheme {
+    /// Return a compatible generic component theme when one was supplied.
+    #[must_use]
+    pub const fn component_theme(&self) -> Option<bmux_tui_components::theme::ComponentTheme> {
+        if self.component_theme_version == PLUGIN_TUI_COMPONENT_THEME_VERSION {
+            Some(bmux_tui_components::theme::ComponentTheme {
+                canvas: self.canvas,
+                surfaces: bmux_tui_components::theme::ComponentSurfaces {
+                    normal: self.canvas,
+                    raised: self.canvas,
+                    overlay: self.canvas,
+                    scrim: None,
+                },
+                text: self.text,
+                focused: self.focused,
+                selected: self.selection,
+                disabled: self.muted.add_modifier(bmux_tui::style::Modifier::DIM),
+                muted: self.muted,
+                info: self.focused,
+                success: self.focused,
+                warning: self.focused,
+                error: self.focused,
+                border: self.border,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod component_theme_tests {
+    use super::*;
+
+    fn theme(version: u16) -> PluginTuiTheme {
+        let style = Style::new();
+        let syntax = PluginTuiSyntaxTheme {
+            text: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            comment: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            keyword: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            function: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            variable: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            string: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            number: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            type_name: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            operator: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            punctuation: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+        };
+        PluginTuiTheme {
+            component_theme_version: version,
+            canvas: style,
+            text: style,
+            muted: style,
+            border: style,
+            focused: style,
+            selection: style,
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax,
+        }
+    }
+
+    #[test]
+    fn component_theme_is_available_only_for_matching_contract_version() {
+        assert!(
+            theme(PLUGIN_TUI_COMPONENT_THEME_VERSION)
+                .component_theme()
+                .is_some()
+        );
+        assert!(theme(u16::MAX).component_theme().is_none());
+    }
 }
 
 /// Host-owned presentation context for visual adapters.

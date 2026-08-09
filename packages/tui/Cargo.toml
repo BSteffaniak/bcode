@@ -39,7 +39,11 @@ bcode_skill_models = { workspace = true }
 bcode_syntax_render = { workspace = true }
 bcode_tool = { workspace = true }
 bcode_tui_components = { workspace = true, features = [
+    "activity",
+    "chrome",
+    "composer",
     "diff-viewer",
+    "permission",
     "source-preview",
     "source-viewer",
     "terminal-viewer",

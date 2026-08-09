@@ -35,7 +35,7 @@ fn semantic_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
     })
 }
 
-fn semantic_state_theme() -> super::theme::PresentedTheme {
+pub fn semantic_state_theme() -> super::theme::PresentedTheme {
     TRANSCRIPT_THEME.with(|state| {
         state.get().unwrap_or_else(|| {
             let initial = super::theme::resolve_initial_theme();
@@ -345,17 +345,19 @@ pub fn plugin_theme_for_app(app: &BmuxApp) -> bcode_plugin_sdk::tui::PluginTuiTh
 }
 
 fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::tui::PluginTuiTheme {
+    let components = theme.component_theme();
     let syntax_color = |color: bcode_syntax_render::SyntaxColor| {
         bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(color.to_tui())
     };
     let syntax = theme.syntax;
     bcode_plugin_sdk::tui::PluginTuiTheme {
-        canvas: theme.canvas,
-        text: theme.text,
-        muted: theme.muted,
-        border: theme.border,
-        focused: theme.focused,
-        selection: theme.selection,
+        component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+        canvas: components.canvas,
+        text: components.text,
+        muted: components.muted,
+        border: components.border,
+        focused: components.focused,
+        selection: components.selected,
         source: bcode_plugin_sdk::tui::PluginTuiSourceTheme {
             source: theme.source.source,
             border: theme.source.border,
@@ -399,9 +401,9 @@ use bcode_markdown_render::{
 };
 use bcode_plugin_sdk::tui::PluginTuiVisualRenderMode;
 use bcode_session_view_models::TextFormat;
-use bmux_tui::chrome::{Border, Panel};
+use bmux_tui::chrome::Panel;
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect};
+use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::input::TextInput;
 use bmux_tui::prelude::{Line, Span, Style, Widget};
@@ -420,7 +422,6 @@ use super::transcript::{
 };
 use super::transcript_layout::TranscriptLayoutSignature;
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
-use unicode_segmentation::UnicodeSegmentation;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
@@ -1202,29 +1203,16 @@ fn active_latest_bar_line(
 }
 
 fn stale_latest_bar_line(width: u16, key_label: &str) -> Line {
-    let width = usize::from(width);
-    let text = latest_bar_message(width, key_label);
-    let text = centered_bar_text(&text, width.saturating_sub(1));
-    let text_width = text_display_width(&text);
-    let left_width = width.saturating_sub(1).saturating_sub(text_width) / 2;
-    let right_width = width
-        .saturating_sub(1)
-        .saturating_sub(text_width)
-        .saturating_sub(left_width);
-    Line::from_spans(vec![
-        Span::styled(" ".repeat(left_width), latest_bar_background_style()),
-        Span::styled(
-            text,
-            latest_bar_background_style().patch(semantic_state_theme().muted),
-        ),
-        Span::styled(" ".repeat(right_width), latest_bar_background_style()),
-        Span::styled(
-            "▾",
-            latest_bar_background_style()
-                .patch(semantic_state_theme().info)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ])
+    let theme = semantic_state_theme();
+    bcode_tui_components::activity::stale_latest_activity_line(
+        width,
+        key_label,
+        bcode_tui_components::activity::LatestActivityStyle {
+            background: theme.canvas,
+            muted: theme.muted,
+            info: theme.info,
+        },
+    )
 }
 
 fn latest_bar_message(width: usize, key_label: &str) -> String {
@@ -1334,11 +1322,10 @@ const fn composer_area(area: Rect, composer_height: u16) -> Rect {
 }
 
 fn composer_panel(theme: TuiTheme) -> Panel {
-    Panel::new()
-        .border(Border::single().style(theme.focused))
-        .title(" Message ")
-        .padding(Insets::new(0, 1, 0, 1))
-        .background(theme.raised)
+    bcode_tui_components::composer::composer_panel(bcode_tui_components::composer::ComposerStyle {
+        border: theme.focused,
+        surface: theme.raised,
+    })
 }
 
 fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
@@ -4965,163 +4952,7 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiThe
     frame.write_line(area, &Line::from_spans(spans));
 }
 
-#[derive(Clone)]
-struct ChromeSegment {
-    text: String,
-    style: Style,
-    priority: u8,
-    truncatable: bool,
-}
-
-impl ChromeSegment {
-    const fn required(text: String, style: Style, truncatable: bool) -> Self {
-        Self {
-            text,
-            style,
-            priority: u8::MAX,
-            truncatable,
-        }
-    }
-
-    const fn optional(text: String, style: Style, priority: u8, truncatable: bool) -> Self {
-        Self {
-            text,
-            style,
-            priority,
-            truncatable,
-        }
-    }
-}
-
-struct ChromeLine {
-    separator: String,
-    separator_style: Style,
-    segments: Vec<ChromeSegment>,
-}
-
-impl ChromeLine {
-    fn new(separator: impl Into<String>, separator_style: Style) -> Self {
-        Self {
-            separator: separator.into(),
-            separator_style,
-            segments: Vec::new(),
-        }
-    }
-
-    fn required(mut self, text: String, style: Style, truncatable: bool) -> Self {
-        self.segments
-            .push(ChromeSegment::required(text, style, truncatable));
-        self
-    }
-
-    fn optional(mut self, text: String, style: Style, priority: u8, truncatable: bool) -> Self {
-        if !text.is_empty() {
-            self.segments
-                .push(ChromeSegment::optional(text, style, priority, truncatable));
-        }
-        self
-    }
-
-    fn spans(mut self, width: usize) -> Vec<Span> {
-        self.fit(width);
-        self.into_spans()
-    }
-
-    fn fit(&mut self, width: usize) {
-        while self.width() > width {
-            if let Some(index) = self.lowest_priority_optional_index(true) {
-                self.segments.remove(index);
-            } else {
-                break;
-            }
-        }
-
-        if self.width() <= width {
-            return;
-        }
-
-        self.truncate_segments(width);
-
-        while self.width() > width {
-            if let Some(index) = self.lowest_priority_optional_index(true) {
-                self.segments.remove(index);
-            } else {
-                break;
-            }
-        }
-
-        if self.width() > width
-            && let Some(segment) = self.segments.first_mut()
-        {
-            segment.text = truncate_chrome_part(&segment.text, width);
-        }
-    }
-
-    fn truncate_segments(&mut self, width: usize) {
-        let separators = self.separator_width();
-        let fixed_width = self
-            .segments
-            .iter()
-            .filter(|segment| !segment.truncatable)
-            .map(|segment| text_display_width(&segment.text))
-            .sum::<usize>()
-            .saturating_add(separators);
-        let truncatable_count = self
-            .segments
-            .iter()
-            .filter(|segment| segment.truncatable)
-            .count();
-        if truncatable_count == 0 {
-            return;
-        }
-        let truncatable_width = width.saturating_sub(fixed_width) / truncatable_count;
-
-        for segment in self
-            .segments
-            .iter_mut()
-            .filter(|segment| segment.truncatable)
-        {
-            segment.text = truncate_chrome_part(&segment.text, truncatable_width);
-        }
-    }
-
-    fn lowest_priority_optional_index(&self, include_truncatable: bool) -> Option<usize> {
-        self.segments
-            .iter()
-            .enumerate()
-            .filter(|(_, segment)| segment.priority < u8::MAX)
-            .filter(|(_, segment)| include_truncatable || !segment.truncatable)
-            .min_by_key(|(_, segment)| segment.priority)
-            .map(|(index, _)| index)
-    }
-
-    fn into_spans(self) -> Vec<Span> {
-        let mut spans = Vec::new();
-        for (index, segment) in self.segments.into_iter().enumerate() {
-            if index > 0 {
-                spans.push(Span::styled(self.separator.clone(), self.separator_style));
-            }
-            spans.push(Span::styled(segment.text, segment.style));
-        }
-        spans
-    }
-
-    fn width(&self) -> usize {
-        let text_width = self
-            .segments
-            .iter()
-            .map(|segment| text_display_width(&segment.text))
-            .sum::<usize>();
-        text_width.saturating_add(self.separator_width())
-    }
-
-    fn separator_width(&self) -> usize {
-        self.segments
-            .len()
-            .saturating_sub(1)
-            .saturating_mul(text_display_width(&self.separator))
-    }
-}
+use bcode_tui_components::chrome::ChromeLine;
 
 fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = theme.muted;
@@ -5223,30 +5054,6 @@ fn compact_key_hints(hints: &str) -> String {
         .replace("escape", "esc")
         .replace("ctrl+", "^")
         .replace("palette", "pal")
-}
-
-fn truncate_chrome_part(part: &str, max_width: usize) -> String {
-    if text_display_width(part) <= max_width {
-        return part.to_owned();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-    if max_width == 1 {
-        return "…".to_owned();
-    }
-
-    let mut suffix = String::new();
-    let mut width: usize = 1;
-    for grapheme in part.graphemes(true).rev() {
-        let grapheme_width = text_display_width(grapheme);
-        if width.saturating_add(grapheme_width) > max_width {
-            break;
-        }
-        suffix.insert_str(0, grapheme);
-        width = width.saturating_add(grapheme_width);
-    }
-    format!("…{suffix}")
 }
 
 fn activity_label(

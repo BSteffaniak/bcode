@@ -5,6 +5,7 @@ use bcode_tui_components::source_preview::{SourcePreviewOptions, source_preview_
 use bcode_tui_components::source_viewer::{
     SourceViewerInput, SourceViewerStyle, source_viewer_rows_with_style,
 };
+use bcode_tui_components::tool_card::{push_tool_card_detail, tool_card_header};
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use devicons::{FileIcon, Theme, icon_for_file};
 use serde_json::Value;
@@ -248,10 +249,10 @@ fn request_rows(
             context,
         );
     }
-    let mut rows = vec![Line::from_spans(vec![
+    let mut rows = vec![tool_card_header(
         Span::styled("◆ ", accent()),
         Span::styled(operation.to_owned(), title()),
-    ])];
+    )];
     push_path_kv(&mut rows, "path", text(arguments, "path"), context);
     push_kv(&mut rows, "pattern", text(arguments, "pattern"));
     push_kv(&mut rows, "glob", text(arguments, "glob"));
@@ -541,10 +542,10 @@ fn metadata_rows(
 }
 
 fn card_header(title_text: &str) -> Vec<Line> {
-    vec![Line::from_spans(vec![
+    vec![tool_card_header(
         Span::styled("◆ ", accent()),
         Span::styled(title_text.to_owned(), title()),
-    ])]
+    )]
 }
 
 fn preview_lines_with_options(contents: &str, options: &SourcePreviewOptions<'_>) -> Vec<Line> {
@@ -612,11 +613,8 @@ fn push_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>)
 where
     T: Into<String>,
 {
-    if let Some(value) = value.map(Into::into).filter(|value| !value.is_empty()) {
-        rows.push(Line::from_spans(vec![
-            Span::styled(format!("  {key}: "), label()),
-            Span::styled(value, value_style()),
-        ]));
+    if let Some(value) = value.map(Into::into) {
+        push_tool_card_detail(rows, key, Some(&value), label(), value_style());
     }
 }
 
@@ -718,6 +716,7 @@ mod tests {
 
         let style = Style::new();
         PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
             canvas: style,
             text: style,
             muted: style.fg(Color::BrightBlack),

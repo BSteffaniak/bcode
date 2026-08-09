@@ -1,6 +1,6 @@
 //! Native TUI rendering for Git tool visuals.
 
-use bcode_tui_components::compact::header_rows;
+use bcode_tui_components::tool_card::tool_card_header_rows;
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use serde_json::Value;
 
@@ -51,7 +51,7 @@ fn clone_request_rows(
     ]
     .into_iter()
     .flatten();
-    header_rows(
+    tool_card_header_rows(
         Span::styled("◆ ", accent()),
         Span::styled("Clone repository", title_style()),
         metadata,
@@ -75,7 +75,7 @@ fn clone_result_rows(
     ]
     .into_iter()
     .flatten();
-    header_rows(
+    tool_card_header_rows(
         Span::styled(if existed { "◆ " } else { "✓ " }, accent()),
         Span::styled(
             if existed {
