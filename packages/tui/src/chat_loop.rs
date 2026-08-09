@@ -610,7 +610,7 @@ impl ChatLoopState {
     ) -> Option<CommandAction> {
         let index = super::picker_mouse::command_palette_row_in_area(
             mouse,
-            super::command_palette_render::palette_area(frame_area),
+            super::command_palette_render::palette_list_area(frame_area),
         )?;
         let palette = self.palette.as_mut()?;
         let action = palette.contribution_at(index).map(|item| item.action);

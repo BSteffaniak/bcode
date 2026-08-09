@@ -8,7 +8,6 @@ use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::Modifier;
 use bmux_tui_components::scroll_area::{ScrollArea, ScrollAreaOutcome, ScrollAreaState};
 
 use super::theme::PresentedTheme;
@@ -766,36 +765,33 @@ fn spot_style(spot: &BoardSpot, state: &SetupBoardState, theme: Option<&Presente
     let fallback = super::theme::resolve_initial_theme()
         .presented(super::theme::resolve_initial_theme().accent);
     let theme = theme.unwrap_or(&fallback);
-    let base = match spot.status {
-        SetupSectionStatus::Complete | SetupSectionStatus::Secured => theme.success,
-        SetupSectionStatus::Current => theme.info.add_modifier(Modifier::BOLD),
-        SetupSectionStatus::Recommended => theme.warning,
-        SetupSectionStatus::Blocked | SetupSectionStatus::NeedsAttention => {
-            theme.error.add_modifier(Modifier::BOLD)
+    let semantic_state = match spot.status {
+        SetupSectionStatus::Complete | SetupSectionStatus::Secured => {
+            bcode_tui_components::setup::SetupSpotState::Complete
         }
-        SetupSectionStatus::Visited => theme.focused,
+        SetupSectionStatus::Current => bcode_tui_components::setup::SetupSpotState::Current,
+        SetupSectionStatus::Recommended => bcode_tui_components::setup::SetupSpotState::Recommended,
+        SetupSectionStatus::Blocked | SetupSectionStatus::NeedsAttention => {
+            bcode_tui_components::setup::SetupSpotState::Blocked
+        }
+        SetupSectionStatus::Visited => bcode_tui_components::setup::SetupSpotState::Visited,
         SetupSectionStatus::Optional
         | SetupSectionStatus::Skipped
-        | SetupSectionStatus::Unvisited => theme.muted,
+        | SetupSectionStatus::Unvisited => bcode_tui_components::setup::SetupSpotState::Inactive,
     };
-    let modifier = if state.pressed == Some(spot.id) {
-        Some(Modifier::REVERSED)
-    } else if state.focused == spot.id || state.hovered == Some(spot.id) {
-        Some(Modifier::BOLD)
-    } else {
-        None
-    };
-    modifier.map_or(base, |modifier| base.add_modifier(modifier))
+    bcode_tui_components::setup::setup_spot_style(
+        semantic_state,
+        state.focused == spot.id,
+        state.hovered == Some(spot.id),
+        state.pressed == Some(spot.id),
+        theme.component_theme(),
+    )
 }
 
 fn path_style(theme: Option<&PresentedTheme>) -> Style {
-    theme.map_or_else(
-        || {
-            let initial = super::theme::resolve_initial_theme();
-            initial.presented(initial.accent).muted
-        },
-        |theme| theme.muted,
-    )
+    let fallback = super::theme::resolve_initial_theme()
+        .presented(super::theme::resolve_initial_theme().accent);
+    bcode_tui_components::setup::setup_path_style(theme.unwrap_or(&fallback).component_theme())
 }
 
 const fn status_glyph(status: SetupSectionStatus) -> &'static str {

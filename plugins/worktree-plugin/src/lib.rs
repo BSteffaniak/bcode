@@ -17,6 +17,7 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
+use bcode_tui_components::tool_card::{push_tool_card_detail, tool_card_header};
 use bcode_worktree_models::{
     WorktreeCreateRequest, WorktreeInfo, WorktreeListRequest, WorktreeRemoveRequest,
 };
@@ -740,18 +741,24 @@ fn worktree_result_rows(
 }
 
 fn worktree_header(title: &str) -> Vec<Line> {
-    vec![Line::from_spans(vec![
+    vec![tool_card_header(
         Span::styled("◆ ", Style::new().fg(Color::Cyan)),
         Span::styled(title.to_string(), Style::new().fg(Color::White)),
-    ])]
+    )]
 }
 
-fn push_visual_kv(rows: &mut Vec<Line>, key: &str, value: Option<String>) {
-    if let Some(value) = value.filter(|value| !value.is_empty()) {
-        rows.push(Line::from_spans(vec![
-            Span::styled(format!("  {key}: "), Style::new().fg(Color::BrightBlack)),
-            Span::styled(value, Style::new().fg(Color::White)),
-        ]));
+fn push_visual_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>)
+where
+    T: Into<String>,
+{
+    if let Some(value) = value.map(Into::into) {
+        push_tool_card_detail(
+            rows,
+            key,
+            Some(&value),
+            Style::new().fg(Color::BrightBlack),
+            Style::new().fg(Color::White),
+        );
     }
 }
 

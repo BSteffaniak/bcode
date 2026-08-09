@@ -15,17 +15,20 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcode_model_provider_runtime = { workspace = true }
-bcode_plugin_sdk             = { workspace = true, features = ["tui"] }
-bcode_tesseract_ocr          = { workspace = true, optional = true }
-bcode_tool                   = { workspace = true }
-bmux_tui                     = { workspace = true, optional = true }
-image                        = { workspace = true, optional = true }
-reqwest                      = { workspace = true }
-serde                        = { workspace = true, features = ["derive", "std"] }
-serde_json                   = { workspace = true }
-tempfile                     = { workspace = true }
-thiserror                    = { workspace = true }
-tokio                        = { workspace = true, features = ["fs", "io-util", "process", "time"] }
+bcode_plugin_sdk = { workspace = true, features = ["tui"] }
+bcode_tesseract_ocr = { workspace = true, optional = true }
+bcode_tool = { workspace = true }
+bcode_tui_components = { workspace = true, features = [
+    "tool-card",
+], optional = true }
+bmux_tui = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "time"] }
 
 [features]
 _bundled-tesseract-runtime = ["dep:bcode_tesseract_ocr", "dep:image"]
@@ -52,7 +55,7 @@ bundled-tesseract-v5-5-2 = [
 default = []
 external-tesseract-cli = []
 fail-on-warnings = []
-static-bundled = ["bmux_tui"]
+static-bundled = ["bcode_tui_components", "bmux_tui"]
 system-tesseract = [
     "dep:bcode_tesseract_ocr",
     "dep:image",

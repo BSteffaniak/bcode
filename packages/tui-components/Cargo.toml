@@ -32,6 +32,7 @@ all = [
     "compact",
     "diff-viewer",
     "permission",
+    "setup",
     "source-preview",
     "source-viewer",
     "terminal-viewer",
@@ -44,6 +45,7 @@ default = []
 diff-viewer = ["bmux_tui_components/diff-viewer"]
 fail-on-warnings = []
 permission = ["bmux_tui_components/modal-frame"]
+setup = []
 source-preview = [
     "source-viewer",
     "dep:unicode-segmentation",

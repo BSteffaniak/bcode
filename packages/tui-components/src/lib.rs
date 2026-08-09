@@ -16,6 +16,8 @@ pub mod composer;
 pub mod diff_viewer;
 #[cfg(feature = "permission")]
 pub mod permission;
+#[cfg(feature = "setup")]
+pub mod setup;
 #[cfg(feature = "source-preview")]
 pub mod source_preview;
 #[cfg(feature = "source-viewer")]

@@ -2125,6 +2125,7 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_tesseract_ocr",
  "bcode_tool",
+ "bcode_tui_components",
  "bmux_tui",
  "image",
  "reqwest",
@@ -2793,6 +2794,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bcode_tui_components",
  "bcode_vim_edit",
  "bmux_tui",
  "serde",
@@ -2903,6 +2905,7 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_tool",
+ "bcode_tui_components",
  "bcode_worktree",
  "bcode_worktree_models",
  "bmux_keyboard",

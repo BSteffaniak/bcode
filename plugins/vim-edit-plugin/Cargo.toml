@@ -15,10 +15,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcode_plugin_sdk = { workspace = true, features = ["tui"] }
-bcode_tool       = { workspace = true }
-bcode_vim_edit   = { workspace = true }
-serde            = { workspace = true, features = ["derive", "std"] }
-serde_json       = { workspace = true }
+bcode_tool = { workspace = true }
+bcode_tui_components = { workspace = true, features = [
+    "tool-card",
+], optional = true }
+bcode_vim_edit = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -26,7 +29,7 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bmux_tui"]
+static-bundled   = ["bcode_tui_components", "bmux_tui"]
 
 [dependencies.bmux_tui]
 optional  = true

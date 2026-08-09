@@ -2,6 +2,7 @@
 
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::geometry::Rect;
+use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 
 /// Focusable fields in the Ralph loop start dialog.
@@ -26,6 +27,7 @@ pub struct RalphStartDialog {
     validation_commands: TextInputState,
     focused_field: RalphStartDialogField,
     status: String,
+    form: FormState,
 }
 
 impl RalphStartDialog {
@@ -44,6 +46,7 @@ impl RalphStartDialog {
             )),
             focused_field: RalphStartDialogField::LoopName,
             status: "Enter starts, Tab switches optional fields, Esc cancels".to_owned(),
+            form: FormState::new(Some(0)),
         }
     }
 
@@ -88,12 +91,31 @@ impl RalphStartDialog {
     }
 
     /// Move focus to the next field.
-    pub const fn focus_next(&mut self) {
-        self.focused_field = match self.focused_field {
-            RalphStartDialogField::LoopName => RalphStartDialogField::WorkAreaPath,
-            RalphStartDialogField::WorkAreaPath => RalphStartDialogField::Branch,
-            RalphStartDialogField::Branch => RalphStartDialogField::ValidationCommands,
-            RalphStartDialogField::ValidationCommands => RalphStartDialogField::LoopName,
+    pub fn focus_next(&mut self) {
+        let fields = form_fields();
+        let loop_name = self.loop_name.buffer().text().to_owned();
+        let work_area_path = self.work_area_path.buffer().text().to_owned();
+        let branch = self.branch.buffer().text().to_owned();
+        let validation_commands = self.validation_commands.buffer().text().to_owned();
+        let values = [
+            Some(loop_name.as_str()),
+            Some(work_area_path.as_str()),
+            Some(branch.as_str()),
+            Some(validation_commands.as_str()),
+        ];
+        if let FormOutcome::Focused(index) = Form::new(&fields, &values)
+            .handle_event(&mut self.form, &bmux_tui::event::Event::Key(tab_stroke()))
+        {
+            self.set_focused_index(index);
+        }
+    }
+
+    const fn set_focused_index(&mut self, index: usize) {
+        self.focused_field = match index {
+            1 => RalphStartDialogField::WorkAreaPath,
+            2 => RalphStartDialogField::Branch,
+            3 => RalphStartDialogField::ValidationCommands,
+            _ => RalphStartDialogField::LoopName,
         };
     }
 
@@ -223,4 +245,40 @@ pub enum RalphStartDialogOutcome {
 #[must_use]
 pub const fn input_policy() -> TextInputPolicy {
     TextInputPolicy::chat_composer()
+}
+
+fn form_fields() -> [FormFieldItem; 4] {
+    [
+        FormFieldItem::new("loop-name").required(true),
+        FormFieldItem::new("work-area-path"),
+        FormFieldItem::new("branch"),
+        FormFieldItem::new("validation-commands"),
+    ]
+}
+
+const fn tab_stroke() -> bmux_keyboard::KeyStroke {
+    bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Tab)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RalphStartDialog, RalphStartDialogField};
+
+    #[test]
+    fn form_state_drives_wrapping_tab_focus_order() {
+        let mut dialog = RalphStartDialog::new("loop", &[]);
+
+        assert_eq!(dialog.focused_field(), RalphStartDialogField::LoopName);
+        dialog.focus_next();
+        assert_eq!(dialog.focused_field(), RalphStartDialogField::WorkAreaPath);
+        dialog.focus_next();
+        assert_eq!(dialog.focused_field(), RalphStartDialogField::Branch);
+        dialog.focus_next();
+        assert_eq!(
+            dialog.focused_field(),
+            RalphStartDialogField::ValidationCommands
+        );
+        dialog.focus_next();
+        assert_eq!(dialog.focused_field(), RalphStartDialogField::LoopName);
+    }
 }

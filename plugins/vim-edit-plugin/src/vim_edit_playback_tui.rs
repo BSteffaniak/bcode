@@ -1,5 +1,6 @@
 //! Native TUI rendering for Vim edit visuals and playback interaction.
 
+use bcode_tui_components::tool_card::{push_tool_card_detail, tool_card_header};
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use serde_json::Value;
 
@@ -402,12 +403,7 @@ where
     T: Into<String>,
 {
     let value = value.into();
-    if !value.is_empty() {
-        rows.push(Line::from_spans(vec![
-            Span::styled(format!("  {key}: "), muted()),
-            Span::styled(value, value_style()),
-        ]));
-    }
+    push_tool_card_detail(rows, key, Some(&value), muted(), value_style());
 }
 
 fn text<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
@@ -422,7 +418,10 @@ fn count(payload: &Value, key: &str) -> usize {
 }
 
 fn header(title: &str) -> Line {
-    Line::from_spans(vec![Span::styled(format!("◆ {title}"), accent_bold())])
+    tool_card_header(
+        Span::styled("◆ ", accent_bold()),
+        Span::styled(title.to_owned(), accent_bold()),
+    )
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {

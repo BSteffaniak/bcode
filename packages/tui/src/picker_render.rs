@@ -1,11 +1,11 @@
 //! Shared rendering helpers for TUI pickers.
 
-use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect};
+use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::input::TextInput;
 use bmux_tui::list::{List, ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
+use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy, PickerFrameStyles};
 use bmux_tui_components::text_input::TextInputState;
 
 use super::render::TuiTheme;
@@ -78,14 +78,30 @@ pub fn render_picker_panel(
     frame: &mut Frame<'_>,
     theme: TuiTheme,
 ) -> Rect {
-    let panel = Panel::new()
-        .border(Border::single().style(theme.border))
+    PickerFrame::new()
         .title(title)
-        .padding(Insets::new(1, 1, 1, 1))
-        .background(theme.raised)
-        .content_style(theme.raised);
-    panel.render(area, frame);
-    panel.inner_area(area)
+        .policy(PickerFramePolicy {
+            chrome: true,
+            background: true,
+            header: false,
+            input: false,
+            footer: false,
+            margin: Insets::all(0),
+            padding: Insets::new(1, 1, 1, 1),
+            min_size: Size::new(area.width, area.height),
+            max_size: Size::new(area.width, area.height),
+            placement: bmux_tui_components::picker_frame::PickerFramePlacement::Center,
+        })
+        .styles(PickerFrameStyles {
+            border: theme.border,
+            background: theme.raised,
+            header: theme.text,
+            input: theme.text,
+            list: theme.raised,
+            footer: theme.text,
+        })
+        .render(area, frame)
+        .inner
 }
 
 /// Render a standard selectable list and persist scroll state.

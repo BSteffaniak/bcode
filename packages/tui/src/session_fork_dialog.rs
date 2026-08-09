@@ -2,6 +2,7 @@
 
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::geometry::Rect;
+use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 
 /// Fork/clone operation kind.
@@ -70,6 +71,7 @@ pub struct SessionForkDialog {
     install_draft: bool,
     focus: SessionForkDialogFocus,
     status: String,
+    form: FormState,
 }
 
 impl SessionForkDialog {
@@ -85,6 +87,7 @@ impl SessionForkDialog {
             install_draft: mode == SessionForkDialogMode::Fork,
             focus: SessionForkDialogFocus::Name,
             status: "Enter name, Tab changes field, ←/→ changes value, Enter creates".to_owned(),
+            form: FormState::new(Some(1)),
         }
     }
 
@@ -141,13 +144,25 @@ impl SessionForkDialog {
     }
 
     /// Move focus to the next field.
-    pub const fn focus_next(&mut self) {
-        self.focus = match self.focus {
-            SessionForkDialogFocus::Mode => SessionForkDialogFocus::Name,
-            SessionForkDialogFocus::Name => SessionForkDialogFocus::SwitchAfterCreate,
-            SessionForkDialogFocus::SwitchAfterCreate => SessionForkDialogFocus::InstallDraft,
-            SessionForkDialogFocus::InstallDraft => SessionForkDialogFocus::Mode,
-        };
+    pub fn focus_next(&mut self) {
+        let fields = form_fields();
+        let name = self.name.buffer().text().to_owned();
+        let values = [
+            Some(self.mode.label()),
+            Some(name.as_str()),
+            Some(""),
+            Some(""),
+        ];
+        if let FormOutcome::Focused(index) = Form::new(&fields, &values)
+            .handle_event(&mut self.form, &bmux_tui::event::Event::Key(tab_stroke()))
+        {
+            self.focus = match index {
+                0 => SessionForkDialogFocus::Mode,
+                2 => SessionForkDialogFocus::SwitchAfterCreate,
+                3 => SessionForkDialogFocus::InstallDraft,
+                _ => SessionForkDialogFocus::Name,
+            };
+        }
     }
 
     /// Move selected value backward for focused non-text fields.
@@ -193,6 +208,19 @@ pub const fn name_input_policy() -> TextInputPolicy {
     TextInputPolicy::chat_composer()
 }
 
+fn form_fields() -> [FormFieldItem; 4] {
+    [
+        FormFieldItem::new("mode"),
+        FormFieldItem::new("name"),
+        FormFieldItem::new("switch-after-create"),
+        FormFieldItem::new("install-draft"),
+    ]
+}
+
+const fn tab_stroke() -> bmux_keyboard::KeyStroke {
+    bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Tab)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SessionForkDialog, SessionForkDialogFocus, SessionForkDialogMode};
@@ -216,6 +244,20 @@ mod tests {
         assert_eq!(dialog.name_text(), "[clone] source");
         assert!(dialog.switch_after_create());
         assert!(!dialog.install_draft());
+    }
+
+    #[test]
+    fn form_state_drives_wrapping_focus_order() {
+        let mut dialog = SessionForkDialog::new(SessionForkDialogMode::Fork, "name");
+
+        dialog.focus_next();
+        assert_eq!(dialog.focus(), SessionForkDialogFocus::SwitchAfterCreate);
+        dialog.focus_next();
+        assert_eq!(dialog.focus(), SessionForkDialogFocus::InstallDraft);
+        dialog.focus_next();
+        assert_eq!(dialog.focus(), SessionForkDialogFocus::Mode);
+        dialog.focus_next();
+        assert_eq!(dialog.focus(), SessionForkDialogFocus::Name);
     }
 
     #[test]

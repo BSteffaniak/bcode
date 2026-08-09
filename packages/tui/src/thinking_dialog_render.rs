@@ -1,10 +1,11 @@
 //! TUI reasoning output settings dialog rendering.
 
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::geometry::{Insets, Size};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
+use bmux_tui_components::dialog::{Dialog, DialogState};
+use bmux_tui_components::modal_frame::{ModalPlacement, ModalSizing};
 
 use super::render::TuiTheme;
 use super::thinking_dialog::ThinkingDialogState;
@@ -16,40 +17,21 @@ const MAX_DIALOG_HEIGHT: u16 = 22;
 
 /// Render a reasoning output settings dialog.
 pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>, theme: TuiTheme) {
-    let modal = modal_frame(theme);
-    modal.render(frame.area(), frame);
-
-    let content = modal.content_area(frame.area());
-    let rows = rows(state, theme);
-    for (row_index, line) in rows.iter().take(usize::from(content.height)).enumerate() {
-        let Ok(row_offset) = u16::try_from(row_index) else {
-            return;
-        };
-        modal.render_line(
-            Rect::new(
-                content.x,
-                content.y.saturating_add(row_offset),
-                content.width,
-                1,
-            ),
-            line,
-            frame,
-        );
-    }
+    let body = rows(state, theme);
+    Dialog::new(&body, &[], theme.modal_theme())
+        .title(" Reasoning output settings ")
+        .sizing(dialog_sizing())
+        .padding(Insets::new(1, 2, 1, 2))
+        .placement(ModalPlacement::UpperThird)
+        .render(frame.area(), &DialogState::new(), frame);
 }
 
-fn modal_frame(theme: TuiTheme) -> ModalFrame {
-    ModalFrame::new(
-        ModalSizing::new(
-            Size::new(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT),
-            Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
-            Insets::all(4),
-        ),
-        theme.modal_theme(),
+const fn dialog_sizing() -> ModalSizing {
+    ModalSizing::new(
+        Size::new(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT),
+        Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
+        Insets::all(4),
     )
-    .title(" Reasoning output settings ")
-    .padding(Insets::new(1, 2, 1, 2))
-    .placement(ModalPlacement::UpperThird)
 }
 
 fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {

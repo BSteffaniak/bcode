@@ -44,6 +44,7 @@ bcode_tui_components = { workspace = true, features = [
     "composer",
     "diff-viewer",
     "permission",
+    "setup",
     "source-preview",
     "source-viewer",
     "terminal-viewer",
@@ -58,8 +59,11 @@ bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["crossterm"] }
 bmux_tui_components = { workspace = true, features = [
     "action-row",
+    "dialog",
+    "form",
     "labeled-details",
     "modal-frame",
+    "picker-frame",
     "scroll-area",
     "stepper",
     "text-input",

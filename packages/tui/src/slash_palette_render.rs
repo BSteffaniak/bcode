@@ -1,10 +1,10 @@
 //! TUI slash completion rendering.
 
-use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect};
-use bmux_tui::prelude::{Line, Span, Widget};
+use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
+use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy, PickerFrameStyles};
 
 use super::render::TuiTheme;
 use super::slash_palette::{SlashItem, SlashPalette};
@@ -26,16 +26,31 @@ pub fn render_palette(
         return;
     };
 
-    frame.fill(area, " ", theme.raised);
-    let panel = Panel::new()
-        .border(Border::single().style(theme.border))
+    let layout = PickerFrame::new()
         .title(" Slash Commands  tab/enter accept · ↑/↓ select · esc hide ")
-        .padding(Insets::new(0, 1, 0, 1))
-        .background(theme.raised)
-        .content_style(theme.raised);
-    panel.render(area, frame);
+        .policy(PickerFramePolicy {
+            chrome: true,
+            background: true,
+            header: false,
+            input: false,
+            footer: false,
+            margin: Insets::all(0),
+            padding: Insets::new(0, 1, 0, 1),
+            min_size: Size::new(area.width, area.height),
+            max_size: Size::new(area.width, area.height),
+            placement: bmux_tui_components::picker_frame::PickerFramePlacement::Center,
+        })
+        .styles(PickerFrameStyles {
+            border: theme.border,
+            background: theme.raised,
+            header: theme.raised,
+            input: theme.raised,
+            list: theme.raised,
+            footer: theme.raised,
+        })
+        .render(area, frame);
 
-    let inner = panel.inner_area(area);
+    let inner = layout.list;
     if inner.is_empty() {
         return;
     }

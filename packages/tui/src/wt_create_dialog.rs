@@ -2,6 +2,7 @@
 
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::geometry::Rect;
+use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 
 /// Focused field in the worktree create dialog.
@@ -24,6 +25,7 @@ pub struct WorktreeCreateDialog {
     focus: WorktreeCreateFocus,
     status: String,
     current_session_available: bool,
+    form: FormState,
 }
 
 impl WorktreeCreateDialog {
@@ -44,6 +46,7 @@ impl WorktreeCreateDialog {
             focus: WorktreeCreateFocus::Name,
             status: "Enter name, Tab changes field, ←/→ changes value, Enter creates".to_owned(),
             current_session_available,
+            form: FormState::new(Some(0)),
         }
     }
 
@@ -99,12 +102,23 @@ impl WorktreeCreateDialog {
     }
 
     /// Move focus to the next field.
-    pub const fn focus_next(&mut self) {
-        self.focus = match self.focus {
-            WorktreeCreateFocus::Name => WorktreeCreateFocus::Target,
-            WorktreeCreateFocus::Target => WorktreeCreateFocus::Base,
-            WorktreeCreateFocus::Base => WorktreeCreateFocus::Name,
-        };
+    pub fn focus_next(&mut self) {
+        let fields = form_fields();
+        let name = self.name.buffer().text().to_owned();
+        let values = [
+            Some(name.as_str()),
+            Some(self.target.label()),
+            Some(self.base.label()),
+        ];
+        if let FormOutcome::Focused(index) = Form::new(&fields, &values)
+            .handle_event(&mut self.form, &bmux_tui::event::Event::Key(tab_stroke()))
+        {
+            self.focus = match index {
+                1 => WorktreeCreateFocus::Target,
+                2 => WorktreeCreateFocus::Base,
+                _ => WorktreeCreateFocus::Name,
+            };
+        }
     }
 
     /// Move current choice backward.
@@ -146,6 +160,18 @@ impl WorktreeCreateDialog {
 #[must_use]
 pub const fn name_input_policy() -> TextInputPolicy {
     TextInputPolicy::chat_composer()
+}
+
+fn form_fields() -> [FormFieldItem; 3] {
+    [
+        FormFieldItem::new("name").required(true),
+        FormFieldItem::new("target"),
+        FormFieldItem::new("base"),
+    ]
+}
+
+const fn tab_stroke() -> bmux_keyboard::KeyStroke {
+    bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Tab)
 }
 
 /// Worktree session target in the create dialog.
@@ -228,5 +254,23 @@ impl WorktreeCreateBase {
             Self::DefaultBranch => bcode_worktree_models::WorktreeBaseRef::DefaultBranch,
             Self::Head => bcode_worktree_models::WorktreeBaseRef::Head,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorktreeCreateDialog, WorktreeCreateFocus};
+
+    #[test]
+    fn form_state_drives_wrapping_focus_order() {
+        let mut dialog = WorktreeCreateDialog::new("work", true);
+
+        assert_eq!(dialog.focus(), WorktreeCreateFocus::Name);
+        dialog.focus_next();
+        assert_eq!(dialog.focus(), WorktreeCreateFocus::Target);
+        dialog.focus_next();
+        assert_eq!(dialog.focus(), WorktreeCreateFocus::Base);
+        dialog.focus_next();
+        assert_eq!(dialog.focus(), WorktreeCreateFocus::Name);
     }
 }

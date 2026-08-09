@@ -6,6 +6,21 @@ cd "$root"
 
 violations=0
 
+if rg -n 'bcode_(workflow|workflow_models|workflow_store|loop|question|worktree)|LoopPhase|EvaluatorPhase|IterationPhase|WorkflowRun' \
+  packages/tui-components --glob '*.rs' --glob 'Cargo.toml' \
+  >/tmp/bcode-tui-components-plugin-semantics.txt; then
+  echo "Runtime architecture violation: reusable Bcode TUI recipes contain plugin workflow semantics." >&2
+  cat /tmp/bcode-tui-components-plugin-semantics.txt >&2
+  violations=1
+fi
+
+if rg -n 'features\s*=\s*\["all"\]' packages plugins --glob 'Cargo.toml' \
+  >/tmp/bcode-tui-components-all-feature-consumers.txt; then
+  echo "Runtime architecture violation: production consumers must request exact component features." >&2
+  cat /tmp/bcode-tui-components-all-feature-consumers.txt >&2
+  violations=1
+fi
+
 if ! rg -q 'AutomaticRetryFailureKind::AmbiguousMutation' packages/workflow-store/src/lib.rs \
   || ! rg -q 'schedule_automatic_retry_from_observation' packages/workflow-store/src/lib.rs \
   || ! rg -q 'schedule_automatic_retry_for_failed_attempt' packages/workflow-store/src/lib.rs \
