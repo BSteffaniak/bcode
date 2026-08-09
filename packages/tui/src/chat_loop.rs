@@ -1382,6 +1382,13 @@ impl ChatLoopState {
     ) -> bool {
         match result {
             Ok(surface) => {
+                let is_expected = self
+                    .interactive_surface_queue
+                    .front_ready(Instant::now())
+                    .is_some_and(|request| request.interaction_id() == surface.interaction_id());
+                if !is_expected || self.interactive_surface.is_some() {
+                    return false;
+                }
                 self.interactive_surface_queue.pop_front();
                 self.interactive_surface = Some(surface);
                 true
@@ -4893,4 +4900,153 @@ pub fn cycle_session_agent(chat: &mut ActiveChat) {
 }
 
 #[cfg(test)]
-mod scheduler_tests {}
+mod scheduler_tests {
+    use super::*;
+
+    struct PassiveSurface;
+
+    impl bcode_plugin_sdk::tui::PluginTuiSurface for PassiveSurface {
+        fn id(&self) -> &'static str {
+            "passive-test"
+        }
+
+        fn title(&self) -> &'static str {
+            "Passive test"
+        }
+
+        fn render(&mut self, _area: Rect, _frame: &mut bmux_tui::frame::Frame<'_>) {}
+
+        fn handle_event(
+            &mut self,
+            _event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        }
+    }
+
+    fn loop_state() -> ChatLoopState {
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        ChatLoopState::new(&client, &passive, false)
+    }
+
+    fn surface(interaction_id: &str) -> InteractiveSurfaceState {
+        InteractiveSurfaceState::from_surface_for_test(
+            interaction_id,
+            Box::new(PassiveSurface),
+            &BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        )
+    }
+
+    fn resolved_event(exchange_id: &str) -> SessionEventKind {
+        SessionEventKind::ToolExchangeResolved {
+            event: bcode_session_models::ToolExchangeResolutionEvent {
+                invocation_id: format!("call-{exchange_id}"),
+                exchange_id: exchange_id.to_owned(),
+                resolution: bcode_session_models::ToolExchangeResolution::Cancelled,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn authoritative_resolution_closes_active_surface_in_every_presentation_state() {
+        let geometries = [
+            None,
+            Some(InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Transcript,
+                logical_height: 20,
+                visible_logical_offset: 0,
+                destination: Rect::new(0, 0, 80, 10),
+            }),
+            Some(InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Transcript,
+                logical_height: 20,
+                visible_logical_offset: 5,
+                destination: Rect::new(0, 0, 80, 10),
+            }),
+            Some(InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Transcript,
+                logical_height: 20,
+                visible_logical_offset: 20,
+                destination: Rect::new(0, 0, 80, 0),
+            }),
+            Some(InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Pinned,
+                logical_height: 20,
+                visible_logical_offset: 5,
+                destination: Rect::new(0, 0, 80, 10),
+            }),
+        ];
+
+        for geometry in geometries {
+            let mut state = loop_state();
+            state.install_interactive_surface_for_test(surface("resolved"));
+            state.set_interactive_surface_geometry_for_test(geometry);
+            observe_interactive_surface_event(&mut state, &resolved_event("resolved"));
+            assert!(!state.has_interactive_surface());
+        }
+    }
+
+    #[tokio::test]
+    async fn resolution_removes_opening_and_queued_requests_and_stale_open_cannot_reopen() {
+        let mut state = loop_state();
+        assert!(state.interactive_surface_queue.enqueue(
+            InteractiveSurfaceRequest::new("opening", "surface", "{}"),
+            None,
+        ));
+        assert!(state.interactive_surface_queue.enqueue(
+            InteractiveSurfaceRequest::new("queued", "surface", "{}"),
+            None,
+        ));
+        assert!(!state.interactive_surface_queue.enqueue(
+            InteractiveSurfaceRequest::new("queued", "surface", "{}"),
+            None,
+        ));
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["opening", "queued"]
+        );
+
+        observe_interactive_surface_event(&mut state, &resolved_event("opening"));
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["queued"]
+        );
+        assert!(!state.complete_interactive_surface_open(Ok(surface("opening"))));
+        assert!(!state.has_interactive_surface());
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["queued"]
+        );
+
+        observe_interactive_surface_event(&mut state, &resolved_event("queued"));
+        assert!(state.interactive_surface_queue.interaction_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fifo_open_completion_requires_the_authoritative_queue_front() {
+        let mut state = loop_state();
+        for id in ["first", "second"] {
+            assert!(
+                state
+                    .interactive_surface_queue
+                    .enqueue(InteractiveSurfaceRequest::new(id, "surface", "{}"), None,)
+            );
+        }
+
+        assert!(!state.complete_interactive_surface_open(Ok(surface("second"))));
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["first", "second"]
+        );
+        assert!(state.complete_interactive_surface_open(Ok(surface("first"))));
+        assert_eq!(state.active_interactive_surface_id(), Some("first"));
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            ["second"]
+        );
+    }
+}

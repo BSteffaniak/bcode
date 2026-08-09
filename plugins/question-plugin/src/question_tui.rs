@@ -1048,10 +1048,19 @@ mod tests {
         let mut required = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Required", &[("Answer", None)], false, true)],
         });
-        required.handle_input(InteractionInput::Submit);
+        let initial_height =
+            QuestionTerminalRenderer::default().preferred_height(&required.snapshot(), 32);
+        assert_eq!(
+            required.handle_input(InteractionInput::Submit),
+            InteractionOutput::Redraw
+        );
+        let validation_snapshot = required.snapshot();
+        let mut validation_renderer = QuestionTerminalRenderer::default();
+        let validation_height = validation_renderer.preferred_height(&validation_snapshot, 32);
+        assert!(validation_height > initial_height);
         let validation = render_snapshot(
-            &mut QuestionTerminalRenderer::default(),
-            &required.snapshot(),
+            &mut validation_renderer,
+            &validation_snapshot,
             Rect::new(0, 0, 32, 10),
         );
         assert!(rendered_text(&validation).contains("An answer is required."));

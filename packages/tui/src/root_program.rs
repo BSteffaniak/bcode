@@ -2453,10 +2453,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_geometry_translates_clipped_mouse_and_rejects_outside_hits() {
+    async fn committed_geometry_routes_top_and_bottom_clipped_pointer_input() {
         use std::sync::{Arc, Mutex};
 
-        struct RecordingSurface(Arc<Mutex<Vec<bmux_tui::geometry::Point>>>);
+        struct RecordingSurface(
+            Arc<Mutex<Vec<(bmux_tui::event::MouseEventKind, bmux_tui::geometry::Point)>>>,
+        );
 
         impl bcode_plugin_sdk::tui::PluginTuiSurface for RecordingSurface {
             fn id(&self) -> &'static str {
@@ -2480,7 +2482,10 @@ mod tests {
                 _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
             ) -> bcode_plugin_sdk::tui::PluginTuiAction {
                 if let bmux_tui::event::Event::Mouse(mouse) = event {
-                    self.0.lock().expect("points").push(mouse.position);
+                    self.0
+                        .lock()
+                        .expect("events")
+                        .push((mouse.kind, mouse.position));
                     bcode_plugin_sdk::tui::PluginTuiAction::Redraw
                 } else {
                     bcode_plugin_sdk::tui::PluginTuiAction::None
@@ -2493,49 +2498,79 @@ mod tests {
             .clone()
             .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
         let mut loop_state = super::super::chat_loop::ChatLoopState::new(&client, &passive, false);
-        let points = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
         loop_state.install_interactive_surface_for_test(
             super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
                 "interaction",
-                Box::new(RecordingSurface(Arc::clone(&points))),
+                Box::new(RecordingSurface(Arc::clone(&events))),
                 &super::super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
             ),
         );
-        loop_state.set_interactive_surface_geometry_for_test(Some(
-            super::super::chat_loop::InteractiveSurfaceGeometry {
-                placement: super::super::chat_loop::InteractiveSurfacePlacement::Transcript,
-                logical_height: 30,
-                visible_logical_offset: 10,
-                destination: bmux_tui::geometry::Rect::new(5, 7, 20, 4),
-            },
-        ));
 
-        let inside = bmux_tui::event::Event::Mouse(bmux_tui::event::MouseEvent::new(
+        for (visible_logical_offset, destination, screen_point, expected_logical_point) in [
+            (
+                0,
+                bmux_tui::geometry::Rect::new(5, 7, 20, 4),
+                bmux_tui::geometry::Point::new(8, 10),
+                bmux_tui::geometry::Point::new(3, 3),
+            ),
+            (
+                26,
+                bmux_tui::geometry::Rect::new(5, 7, 20, 4),
+                bmux_tui::geometry::Point::new(8, 9),
+                bmux_tui::geometry::Point::new(3, 28),
+            ),
+        ] {
+            loop_state.set_interactive_surface_geometry_for_test(Some(
+                super::super::chat_loop::InteractiveSurfaceGeometry {
+                    placement: super::super::chat_loop::InteractiveSurfacePlacement::Transcript,
+                    logical_height: 30,
+                    visible_logical_offset,
+                    destination,
+                },
+            ));
+
+            for kind in [
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+            ] {
+                let event = bmux_tui::event::Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    kind,
+                    screen_point,
+                ));
+                assert!(matches!(
+                    loop_state.handle_interactive_surface_event(&event),
+                    super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
+                ));
+            }
+
+            let outside = bmux_tui::event::Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(destination.x.saturating_sub(1), screen_point.y),
+            ));
+            assert!(matches!(
+                loop_state.handle_interactive_surface_event(&outside),
+                super::super::interactive_surface::InteractiveSurfaceEventOutcome::Ignored
+            ));
+
+            let recorded = events.lock().expect("events");
+            let recent = &recorded[recorded.len().saturating_sub(3)..];
+            assert!(
+                recent
+                    .iter()
+                    .all(|(_, point)| *point == expected_logical_point)
+            );
+        }
+
+        assert_eq!(events.lock().expect("events").len(), 6);
+        loop_state.set_interactive_surface_geometry_for_test(None);
+        let event = bmux_tui::event::Event::Mouse(bmux_tui::event::MouseEvent::new(
             bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
             bmux_tui::geometry::Point::new(8, 9),
         ));
         assert!(matches!(
-            loop_state.handle_interactive_surface_event(&inside),
-            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
-        ));
-        assert_eq!(
-            *points.lock().expect("points"),
-            [bmux_tui::geometry::Point::new(3, 12)]
-        );
-
-        let outside = bmux_tui::event::Event::Mouse(bmux_tui::event::MouseEvent::new(
-            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-            bmux_tui::geometry::Point::new(4, 9),
-        ));
-        assert!(matches!(
-            loop_state.handle_interactive_surface_event(&outside),
-            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Ignored
-        ));
-        assert_eq!(points.lock().expect("points").len(), 1);
-
-        loop_state.set_interactive_surface_geometry_for_test(None);
-        assert!(matches!(
-            loop_state.handle_interactive_surface_event(&inside),
+            loop_state.handle_interactive_surface_event(&event),
             super::super::interactive_surface::InteractiveSurfaceEventOutcome::Ignored
         ));
     }
