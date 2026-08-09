@@ -350,6 +350,20 @@ reasoning_request_sent = False
 reasoning_first_before_second = False
 reasoning_second_after_first = False
 reasoning_final_after_updates = False
+command_palette_opened = False
+command_palette_closed = False
+theme_picker_opened = False
+theme_preview_changed = False
+thinking_dialog_opened = False
+thinking_dialog_changed = False
+timeline_dialog_opened = False
+timeline_dialog_navigated = False
+tiny_resize_rendered = False
+tiny_resize_recovered = False
+mouse_input_injected = False
+mouse_input_remained_responsive = False
+manual_surface_step = "waiting"
+manual_surface_next_action = 0.0
 viewport_detached = False
 viewport_anchor = None
 viewport_stable = True
@@ -370,6 +384,12 @@ assistant_suffix_marker = b"ASSISTANTSUFFIX"
 reasoning_first_marker = b"  REASONINGFIRST "
 reasoning_combined_marker = b"  REASONINGFIRSTREASONINGSECOND "
 reasoning_final_marker = b"  REASONINGFINAL "
+
+# SGR mouse reports use one-based terminal coordinates. These two events target
+# ordinary transcript space and exercise generic scroll routing without relying
+# on a theme- or content-specific hit rectangle.
+mouse_scroll_up = b"\x1b[<64;2;2M"
+mouse_scroll_down = b"\x1b[<65;2;2M"
 
 def screen_text():
     with open(capture_path, "wb") as capture_file:
@@ -625,6 +645,91 @@ while time.monotonic() < deadline:
                 reasoning_second_after_first = True
             if final_visible:
                 reasoning_final_after_updates = True
+
+        if reasoning_final_after_updates and time.monotonic() >= manual_surface_next_action:
+            if manual_surface_step == "waiting":
+                os.write(fd, b"\x15\x10")
+                manual_surface_step = "command_palette_open"
+                manual_surface_next_action = time.monotonic() + 0.25
+            elif manual_surface_step == "command_palette_open":
+                if b" Commands " in screen:
+                    command_palette_opened = True
+                    os.write(fd, b"\x1b")
+                    manual_surface_step = "command_palette_close"
+                    manual_surface_next_action = time.monotonic() + 0.25
+            elif manual_surface_step == "command_palette_close":
+                if b" Commands " not in screen:
+                    command_palette_closed = True
+                    os.write(fd, b"/theme\r")
+                    manual_surface_step = "theme_picker_open"
+                    manual_surface_next_action = time.monotonic() + 0.5
+            elif manual_surface_step == "theme_picker_open":
+                if b"Themes " in screen and b"preview" in screen.lower():
+                    theme_picker_opened = True
+                    os.write(fd, b"\x1b[B")
+                    manual_surface_step = "theme_preview_change"
+                    manual_surface_next_action = time.monotonic() + 0.25
+            elif manual_surface_step == "theme_preview_change":
+                if b"Themes " in screen:
+                    theme_preview_changed = True
+                    os.write(fd, b"\x1b")
+                    manual_surface_step = "theme_picker_close"
+                    manual_surface_next_action = time.monotonic() + 0.25
+            elif manual_surface_step == "theme_picker_close":
+                if b"Themes " not in screen:
+                    os.write(fd, b"/thinking\r")
+                    manual_surface_step = "thinking_dialog_open"
+                    manual_surface_next_action = time.monotonic() + 0.75
+            elif manual_surface_step == "thinking_dialog_open":
+                if b"Reasoning output settings" in screen:
+                    thinking_dialog_opened = True
+                    os.write(fd, b"\x1b[B")
+                    manual_surface_step = "thinking_dialog_change"
+                    manual_surface_next_action = time.monotonic() + 0.25
+            elif manual_surface_step == "thinking_dialog_change":
+                if b"Reasoning output settings" in screen:
+                    thinking_dialog_changed = True
+                    os.write(fd, b"\x1b")
+                    manual_surface_step = "thinking_dialog_close"
+                    manual_surface_next_action = time.monotonic() + 0.25
+            elif manual_surface_step == "thinking_dialog_close":
+                if b"Reasoning output settings" not in screen:
+                    os.write(fd, b"/timeline\r")
+                    manual_surface_step = "timeline_dialog_open"
+                    manual_surface_next_action = time.monotonic() + 0.5
+            elif manual_surface_step == "timeline_dialog_open":
+                if b" Timeline " in screen:
+                    timeline_dialog_opened = True
+                    os.write(fd, b"\x1b[A")
+                    manual_surface_step = "timeline_dialog_navigate"
+                    manual_surface_next_action = time.monotonic() + 0.25
+            elif manual_surface_step == "timeline_dialog_navigate":
+                if b" Timeline " in screen:
+                    timeline_dialog_navigated = True
+                    os.write(fd, b"\x1b")
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 6, 20, 0, 0))
+                    os.kill(pid, signal.SIGWINCH)
+                    manual_surface_step = "tiny_resize"
+                    manual_surface_next_action = time.monotonic() + 0.5
+            elif manual_surface_step == "tiny_resize":
+                if screen:
+                    tiny_resize_rendered = True
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+                    os.kill(pid, signal.SIGWINCH)
+                    manual_surface_step = "tiny_recover"
+                    manual_surface_next_action = time.monotonic() + 0.5
+            elif manual_surface_step == "tiny_recover":
+                if b"bcode" in screen and b"ready" in screen.lower():
+                    tiny_resize_recovered = True
+                    os.write(fd, mouse_scroll_up)
+                    os.write(fd, mouse_scroll_down)
+                    mouse_input_injected = True
+                    manual_surface_step = "mouse"
+                    manual_surface_next_action = time.monotonic() + 0.5
+            elif manual_surface_step == "mouse":
+                if b"bcode" in screen and b"ready" in screen.lower():
+                    mouse_input_remained_responsive = True
+                    manual_surface_step = "complete"
         probe_interval = (
             0.01
             if (
@@ -633,6 +738,7 @@ while time.monotonic() < deadline:
                 or (assistant_request_sent and not assistant_final_after_prefix)
                 or (cancellation_request_sent and not cancellation_responsive)
                 or (reasoning_request_sent and not reasoning_final_after_updates)
+                or (reasoning_final_after_updates and manual_surface_step != "complete")
             )
             else 0.25
         )
@@ -669,6 +775,18 @@ while time.monotonic() < deadline:
         and reasoning_first_before_second
         and reasoning_second_after_first
         and reasoning_final_after_updates
+        and command_palette_opened
+        and command_palette_closed
+        and theme_picker_opened
+        and theme_preview_changed
+        and thinking_dialog_opened
+        and thinking_dialog_changed
+        and timeline_dialog_opened
+        and timeline_dialog_navigated
+        and tiny_resize_rendered
+        and tiny_resize_recovered
+        and mouse_input_injected
+        and mouse_input_remained_responsive
         and viewport_detached
         and viewport_anchor is not None
         and viewport_stable_during_stream
@@ -772,6 +890,18 @@ checks = {
     "reasoning first update visible before second": reasoning_first_before_second,
     "reasoning second update preserves first": reasoning_second_after_first,
     "reasoning final follows ordered updates": reasoning_final_after_updates,
+    "command palette opens": command_palette_opened,
+    "command palette closes": command_palette_closed,
+    "theme picker opens": theme_picker_opened,
+    "theme preview selection responds": theme_preview_changed,
+    "thinking dialog opens": thinking_dialog_opened,
+    "thinking dialog navigation responds": thinking_dialog_changed,
+    "timeline dialog opens": timeline_dialog_opened,
+    "timeline dialog navigation responds": timeline_dialog_navigated,
+    "tiny terminal renders": tiny_resize_rendered,
+    "tiny terminal recovers": tiny_resize_recovered,
+    "mouse scroll input injected": mouse_input_injected,
+    "mouse scroll input remains responsive": mouse_input_remained_responsive,
     "viewport detached before operational updates": viewport_detached and viewport_anchor is not None,
     "detached viewport anchor remains visible": viewport_stable_during_stream,
     "usage and runtime metadata excluded from transcript": metadata_excluded,
