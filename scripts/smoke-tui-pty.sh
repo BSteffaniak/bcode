@@ -5,6 +5,28 @@ set -euo pipefail
 unset BCODE_DAEMON_LOG BCODE_IPC_ENDPOINT BCODE_IPC_ENDPOINT_NAMESPACE
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+profile="${BCODE_TUI_PTY_PROFILE:-debug}"
+case "${profile}" in
+    debug)
+        cargo_profile_args=()
+        target_profile="debug"
+        # The fake-provider acceptance sequence performs deeply nested debug-build
+        # serialization on Tokio workers. Some default worker stacks are too small
+        # for that debug-only call depth; release runs need no override.
+        export RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}"
+        ;;
+    release)
+        cargo_profile_args=(--release)
+        target_profile="release"
+        ;;
+    *)
+        echo "smoke-tui-pty: BCODE_TUI_PTY_PROFILE must be debug or release" >&2
+        exit 2
+        ;;
+esac
+bcode_binary="${root}/target/${target_profile}/bcode"
+grid_probe_binary="${root}/target/${target_profile}/bcode_terminal_grid_probe"
+
 workdir="$(cd "$(mktemp -d /tmp/bcode-smoke.XXXXXX)" && pwd -P)"
 server_pid=""
 cleanup() {
@@ -31,16 +53,16 @@ esac
 cd "${root}"
 
 if [[ "${BCODE_TUI_PTY_SKIP_BUILD:-0}" != "1" ]]; then
-    cargo build --quiet -p bcode --features distribution -p bcode_fake_provider_plugin
-    cargo build --quiet -p bcode_tui_components --bin bcode_terminal_grid_probe
+    cargo build "${cargo_profile_args[@]}" --quiet -p bcode --features distribution -p bcode_fake_provider_plugin
+    cargo build "${cargo_profile_args[@]}" --quiet -p bcode_tui_components --bin bcode_terminal_grid_probe
 fi
 
 case "$(uname -s)" in
     Darwin)
-        fake_dylib="${root}/target/debug/libbcode_fake_provider_plugin.dylib"
+        fake_dylib="${root}/target/${target_profile}/libbcode_fake_provider_plugin.dylib"
         ;;
     Linux)
-        fake_dylib="${root}/target/debug/libbcode_fake_provider_plugin.so"
+        fake_dylib="${root}/target/${target_profile}/libbcode_fake_provider_plugin.so"
         ;;
 esac
 
@@ -105,7 +127,7 @@ idle_shutdown = true
 idle_shutdown_after_secs = 1
 EOF
 
-"${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
+"${bcode_binary}" server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
 for _ in {1..600}; do
     if [[ -s "${workdir}/server.log" ]] && grep -q "server ready; accepting clients" "${workdir}/server.log"; then
@@ -119,7 +141,7 @@ if ! grep -q "server ready; accepting clients" "${workdir}/server.log"; then
     exit 1
 fi
 
-session_id="$(trap - EXIT; cd "${workdir}" && "${root}/target/debug/bcode" session create tui-pty-smoke)"
+session_id="$(trap - EXIT; cd "${workdir}" && "${bcode_binary}" session create tui-pty-smoke)"
 initial_pid="$(python3 - "${BCODE_STATE_DIR}/daemons" <<'PY'
 import glob
 import json
@@ -143,9 +165,9 @@ if kill -0 "${initial_pid}" 2>/dev/null; then
     exit 1
 fi
 
-expected_artifact_id="$("${root}/target/debug/bcode" artifact-id)"
+expected_artifact_id="$("${bcode_binary}" artifact-id)"
 
-python3 - "${root}/target/debug/bcode" "${session_id}" "${initial_pid}" "${expected_artifact_id}" <<'PY'
+python3 - "${bcode_binary}" "${session_id}" "${initial_pid}" "${expected_artifact_id}" <<'PY'
 import fcntl
 import glob
 import json
@@ -237,22 +259,37 @@ if failures:
     sys.exit(1)
 PY
 
-"${root}/target/debug/bcode" server stop >/dev/null
-"${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
+"${bcode_binary}" server stop >/dev/null
+# The one-second idle timeout above is intentionally hostile for the cold-start
+# lifecycle check. Disable it before the longer interactive acceptance phase so
+# setup time between status polling and the PTY attach cannot retire the daemon.
+python3 - "${BCODE_CONFIG}" <<'PY'
+from pathlib import Path
+import sys
+
+config_path = Path(sys.argv[1])
+config = config_path.read_text(encoding="utf-8")
+old = "idle_shutdown = true\nidle_shutdown_after_secs = 1"
+new = "idle_shutdown = false\nidle_shutdown_after_secs = 1"
+if old not in config:
+    raise SystemExit("smoke config is missing the expected idle-shutdown settings")
+config_path.write_text(config.replace(old, new, 1), encoding="utf-8")
+PY
+"${bcode_binary}" server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
 for _ in {1..100}; do
-    if "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
+    if "${bcode_binary}" server status >/dev/null 2>&1; then
         break
     fi
     sleep 0.1
 done
-if ! "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
+if ! "${bcode_binary}" server status >/dev/null 2>&1; then
     echo "replacement daemon did not become ready for PTY acceptance" >&2
     cat "${workdir}/server.log" >&2 || true
     exit 1
 fi
 
-python3 - "${root}/target/debug/bcode" "${root}/target/debug/bcode_terminal_grid_probe" "${session_id}" "${workdir}/tui.capture" <<'PY'
+python3 - "${bcode_binary}" "${grid_probe_binary}" "${session_id}" "${workdir}/tui.capture" <<'PY'
 import fcntl
 import os
 import pty
@@ -754,7 +791,7 @@ if failures:
     sys.exit(1)
 PY
 
-    "${root}/target/debug/bcode" server stop >/dev/null 2>&1 &
+    "${bcode_binary}" server stop >/dev/null 2>&1 &
     stop_pid=$!
     for _ in {1..100}; do
         if ! kill -0 "${stop_pid}" 2>/dev/null; then
