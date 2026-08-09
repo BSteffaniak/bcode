@@ -7,7 +7,7 @@ source_file="plugins/loop-plugin/src/lib.rs"
 for required in \
   'struct LoopWorkflowInput' \
   'WorkflowSpec<LoopWorkflowIteration>' \
-  'AgentExecutionTarget::SharedParentSequential' \
+  'PromptContextTarget::SharedParentSequential' \
   'PluginWorkflowStartRequest::typed' \
   'host\.start_workflow\(request\.clone\(\)\)' \
   'associated_workflow_run' \

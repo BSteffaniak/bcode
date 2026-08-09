@@ -553,6 +553,20 @@ if rg -n 'loop_role|bcode\.loop' packages/server/src/lib.rs \
 fi
 rm -f /tmp/bcode-loop-workflow-host-special-case.txt
 
+    for required in \
+        'LoopWorkflowEvaluation' \
+        'schemars(length(min = 1)' \
+        'loop_agent_configuration::<LoopWorkflowEvaluation>'; do
+  if ! grep -F "$required" plugins/loop-plugin/src/lib.rs >/dev/null; then
+    echo "Runtime architecture violation: loop evaluation semantics are not plugin-owned: $required" >&2
+    violations=1
+  fi
+done
+if rg -n 'validate_loop_evaluation_evidence|node_id != "loop\.evaluation"' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: generic workflow host hardcodes loop evaluation semantics." >&2
+  violations=1
+fi
+
 if ! grep -F 'PromptContextTarget::SharedParentSequential' plugins/loop-plugin/src/lib.rs >/dev/null \
   || ! grep -F 'admit_shared_execution_session' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: durable loop lost generic shared-parent execution." >&2

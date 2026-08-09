@@ -3461,6 +3461,7 @@ async fn run_with_static_bundled_inner(
     interrupt_stale_ralph_runs_best_effort(&state);
     let workflow_recovery_started_at = Instant::now();
     restore_workflow_runtime_work(&state).await;
+    finish_restored_terminal_workflow_runtime_work(&state).await;
     tracing::debug!(
         target: "bcode_server::startup",
         elapsed_ms = workflow_recovery_started_at.elapsed().as_millis(),
@@ -16094,6 +16095,70 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         "workflow.scheduler.drive.duration_ms",
         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
+    finish_terminal_workflow_runtime_work(state, run_id).await?;
+    Ok(())
+}
+
+fn workflow_terminal_failure_message(state: &ServerState, run_id: &str) -> Option<String> {
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .event_history(run_id, None, 1_000)
+        .ok()?
+        .into_iter()
+        .rev()
+        .find_map(|event| {
+            (event.event_type == "attempt_failed")
+                .then(|| event.payload.get("message")?.as_str().map(str::to_string))
+                .flatten()
+        })
+}
+
+async fn finish_terminal_workflow_runtime_work(
+    state: &ServerState,
+    run_id: &str,
+) -> Result<(), ServerError> {
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(run_id)?;
+    let Some(run) = run else {
+        return Ok(());
+    };
+    let Some(parent_session_id) = run
+        .parent_session_id
+        .as_deref()
+        .and_then(|value| SessionId::from_str(value).ok())
+    else {
+        return Ok(());
+    };
+    let (status, message) = match run.status {
+        bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused => {
+            return Ok(());
+        }
+        bcode_workflow_store::RunStatus::Completed => (RuntimeWorkStatus::Completed, None),
+        bcode_workflow_store::RunStatus::Failed => (
+            RuntimeWorkStatus::Failed,
+            workflow_terminal_failure_message(state, run_id).or_else(|| {
+                Some("workflow run failed; inspect the workflow run for details".to_string())
+            }),
+        ),
+        bcode_workflow_store::RunStatus::Cancelled => (RuntimeWorkStatus::Cancelled, None),
+        bcode_workflow_store::RunStatus::RepairRequired => (
+            RuntimeWorkStatus::Failed,
+            Some("workflow run requires explicit repair".to_string()),
+        ),
+    };
+    finish_registered_runtime_work(
+        state,
+        parent_session_id,
+        WorkId::new(format!("workflow:{run_id}")),
+        status,
+        message,
+    )
+    .await;
     Ok(())
 }
 
@@ -27942,9 +28007,13 @@ fn workflow_attempt_observation_from_completion(
                 )
             })?;
             let output: serde_json::Value = serde_json::from_str(&output)?;
-            if let Err(message) =
-                validate_loop_evaluation_evidence(&request.activation.node_id, &output)
-            {
+            let output_schema = workflow_prompt_output_schema(request)?;
+            if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {
+                return Ok(bcode_workflow_store::AttemptObservation::Failed {
+                    message: format!("workflow prompt output failed schema validation: {error}"),
+                });
+            }
+            if let Err(message) = validate_workflow_output_semantics(&output_schema, &output) {
                 return Ok(bcode_workflow_store::AttemptObservation::Failed { message });
             }
             Ok(bcode_workflow_store::AttemptObservation::Succeeded {
@@ -28069,28 +28138,48 @@ fn workflow_turn_output(
         })
 }
 
-fn validate_loop_evaluation_evidence(
-    node_id: &str,
+fn validate_workflow_output_semantics(
+    schema: &bcode_workflow::ValueSchema,
     output: &serde_json::Value,
 ) -> Result<(), String> {
-    if node_id != "loop.evaluation" {
+    let Some(properties) = schema
+        .schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
         return Ok(());
-    }
-    let evidence = output
-        .get("evidence")
-        .and_then(serde_json::Value::as_array)
-        .filter(|evidence| {
-            !evidence.is_empty()
-                && evidence
-                    .iter()
-                    .all(|item| item.as_str().is_some_and(|item| !item.trim().is_empty()))
-        });
-    let summary = output
-        .get("summary")
-        .and_then(serde_json::Value::as_str)
-        .filter(|summary| !summary.trim().is_empty());
-    if evidence.is_none() || summary.is_none() {
-        return Err("loop evaluation requires non-empty concrete evidence and summary".to_string());
+    };
+    for (field, field_schema) in properties {
+        let Some(value) = output.get(field) else {
+            continue;
+        };
+        let valid = match value {
+            serde_json::Value::String(value)
+                if field_schema
+                    .get("minLength")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|minimum| minimum > 0) =>
+            {
+                !value.trim().is_empty()
+            }
+            serde_json::Value::Array(values)
+                if field_schema
+                    .get("minItems")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|minimum| minimum > 0) =>
+            {
+                !values.is_empty()
+                    && values
+                        .iter()
+                        .all(|value| value.as_str().is_none_or(|value| !value.trim().is_empty()))
+            }
+            _ => true,
+        };
+        if !valid {
+            return Err(format!(
+                "workflow prompt output field '{field}' must be non-empty"
+            ));
+        }
     }
     Ok(())
 }
@@ -28303,7 +28392,44 @@ async fn observe_workflow_turn(
                 )
             })?;
             let output: serde_json::Value = serde_json::from_str(&output)?;
-            if let Err(message) = validate_loop_evaluation_evidence(&request.node_id, &output) {
+            let output_schema = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run_summary(&request.run_id)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("workflow run not found".to_string())
+                })
+                .and_then(|run| {
+                    state
+                        .workflow_store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .definition(&run.definition_id, run.definition_version)?
+                        .map(|stored| {
+                            serde_json::from_str::<bcode_workflow::WorkflowDefinition>(
+                                &stored.definition_json,
+                            )
+                        })
+                        .transpose()?
+                        .and_then(|definition| definition.node(&request.node_id).cloned())
+                        .map(|node| node.configuration)
+                        .ok_or_else(|| {
+                            WorkflowStoreError::InvalidData(
+                                "workflow prompt output configuration not found".to_string(),
+                            )
+                        })
+                })
+                .and_then(|configuration| {
+                    workflow_prompt_configuration(&configuration)
+                        .map(|configuration| configuration.structured_output.schema)
+                })?;
+            if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {
+                return Ok(bcode_workflow_store::AttemptObservation::Failed {
+                    message: format!("workflow prompt output failed schema validation: {error}"),
+                });
+            }
+            if let Err(message) = validate_workflow_output_semantics(&output_schema, &output) {
                 return Ok(bcode_workflow_store::AttemptObservation::Failed { message });
             }
             Ok(bcode_workflow_store::AttemptObservation::Succeeded {
@@ -29367,6 +29493,14 @@ fn workflow_prompt_configuration_from_intent(
     workflow_prompt_configuration(configuration)
 }
 
+fn workflow_prompt_output_schema(
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+) -> Result<bcode_workflow::ValueSchema, WorkflowStoreError> {
+    Ok(workflow_prompt_configuration_from_intent(request)?
+        .structured_output
+        .schema)
+}
+
 struct WorkflowPromptTurnOwner<'a> {
     state: &'a Arc<ServerState>,
 }
@@ -29898,15 +30032,6 @@ async fn dispatch_workflow_prompt_turn(
                 ),
             };
             drop(shared_permit);
-            let status = runtime_work_status_from_model_outcome(completion.outcome);
-            finish_registered_runtime_work(
-                &state_for_completion,
-                execution_session_id,
-                WorkId::new(dispatch_identity),
-                status,
-                completion.message.clone(),
-            )
-            .await;
             let observation = match workflow_attempt_observation_from_completion(
                 &state_for_completion,
                 &request_for_completion,
@@ -29914,10 +30039,27 @@ async fn dispatch_workflow_prompt_turn(
             ) {
                 Ok(observation) => observation,
                 Err(error) => {
+                    finish_registered_runtime_work(
+                        &state_for_completion,
+                        execution_session_id,
+                        WorkId::new(dispatch_identity),
+                        RuntimeWorkStatus::Failed,
+                        Some(error.to_string()),
+                    )
+                    .await;
                     tracing::warn!("failed to complete workflow prompt turn: {error}");
                     return;
                 }
             };
+            let (status, message) = runtime_work_outcome_from_attempt_observation(&observation);
+            finish_registered_runtime_work(
+                &state_for_completion,
+                execution_session_id,
+                WorkId::new(dispatch_identity),
+                status,
+                message,
+            )
+            .await;
             settle_workflow_prompt_observation(
                 &state_for_completion,
                 &request_for_completion,
@@ -30154,6 +30296,51 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
             CancellationHandle::WorkflowNode(cancellation),
         )
         .await;
+    }
+}
+
+async fn finish_restored_terminal_workflow_runtime_work(state: &ServerState) {
+    let runs = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .terminal_runs(1_000);
+    let runs = match runs {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::warn!("failed to discover terminal workflow runtime work: {error}");
+            return;
+        }
+    };
+    for run in runs {
+        let Some(session_id) = run
+            .parent_session_id
+            .as_deref()
+            .and_then(|value| SessionId::from_str(value).ok())
+        else {
+            continue;
+        };
+        let work_id = WorkId::new(format!("workflow:{}", run.run_id));
+        let active = match state.sessions.active_runtime_work(session_id).await {
+            Ok(active) => active.iter().any(|work| work.work_id == work_id),
+            Err(error) => {
+                tracing::warn!(%session_id, "failed to inspect restored workflow work: {error}");
+                continue;
+            }
+        };
+        if !active {
+            continue;
+        }
+        register_workflow_runtime_work(
+            state,
+            session_id,
+            &run.run_id,
+            format!("workflow {} v{}", run.definition_id, run.definition_version),
+        )
+        .await;
+        if let Err(error) = finish_terminal_workflow_runtime_work(state, &run.run_id).await {
+            tracing::warn!(run_id = %run.run_id, "failed to finish terminal workflow work: {error}");
+        }
     }
 }
 
@@ -30584,6 +30771,31 @@ const fn runtime_work_status_from_model_outcome(outcome: ModelTurnOutcome) -> Ru
         ModelTurnOutcome::Error
         | ModelTurnOutcome::ToolRoundLimitReached
         | ModelTurnOutcome::ProviderUnavailable => RuntimeWorkStatus::Failed,
+    }
+}
+
+fn runtime_work_outcome_from_attempt_observation(
+    observation: &bcode_workflow_store::AttemptObservation,
+) -> (RuntimeWorkStatus, Option<String>) {
+    match observation {
+        bcode_workflow_store::AttemptObservation::Succeeded { .. } => {
+            (RuntimeWorkStatus::Completed, None)
+        }
+        bcode_workflow_store::AttemptObservation::Cancelled => (RuntimeWorkStatus::Cancelled, None),
+        bcode_workflow_store::AttemptObservation::Failed { message }
+        | bcode_workflow_store::AttemptObservation::RetryableFailure { message }
+        | bcode_workflow_store::AttemptObservation::Paused { message, .. } => {
+            (RuntimeWorkStatus::Failed, Some(message.clone()))
+        }
+        bcode_workflow_store::AttemptObservation::Unknown => (
+            RuntimeWorkStatus::Failed,
+            Some("workflow attempt outcome is unknown and requires repair".to_string()),
+        ),
+        bcode_workflow_store::AttemptObservation::Admitted
+        | bcode_workflow_store::AttemptObservation::Running => (
+            RuntimeWorkStatus::Failed,
+            Some("workflow model turn ended without a terminal attempt outcome".to_string()),
+        ),
     }
 }
 
@@ -51532,22 +51744,31 @@ library = "test"
     }
 
     #[test]
-    fn loop_evaluation_requires_concrete_evidence_and_summary() {
+    fn workflow_output_semantics_enforces_schema_declared_non_empty_fields() {
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "test".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "evidence": {"type": "array", "minItems": 1},
+                    "summary": {"type": "string", "minLength": 1}
+                }
+            }),
+        };
         assert!(
-            validate_loop_evaluation_evidence(
-                "loop.evaluation",
-                &serde_json::json!({"condition_met": true, "evidence": ["tests pass"], "summary": "done"}),
+            validate_workflow_output_semantics(
+                &schema,
+                &serde_json::json!({"evidence": ["tests pass"], "summary": "done"}),
             )
             .is_ok()
         );
         for output in [
-            serde_json::json!({"condition_met": true, "evidence": [], "summary": "done"}),
-            serde_json::json!({"condition_met": true, "evidence": [""], "summary": "done"}),
-            serde_json::json!({"condition_met": true, "evidence": ["tests pass"], "summary": ""}),
+            serde_json::json!({"evidence": [], "summary": "done"}),
+            serde_json::json!({"evidence": [""], "summary": "done"}),
+            serde_json::json!({"evidence": ["tests pass"], "summary": ""}),
         ] {
-            assert!(validate_loop_evaluation_evidence("loop.evaluation", &output).is_err());
+            assert!(validate_workflow_output_semantics(&schema, &output).is_err());
         }
-        assert!(validate_loop_evaluation_evidence("another.node", &serde_json::json!({})).is_ok());
     }
 
     #[tokio::test]
@@ -53090,6 +53311,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 }
             }),
         };
+        let configuration = bcode_workflow::WorkflowPromptConfiguration {
+            version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
+            agent_profile: "plan".to_string(),
+            provider: None,
+            model: None,
+            structured_output: bcode_workflow::PromptStructuredOutputPolicy {
+                schema: schema.clone(),
+                strict: true,
+            },
+            read_only: true,
+            tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+            tool_allowlist: Vec::new(),
+            timeout_ms: 1_000,
+            prompt_mode: "json_input".to_string(),
+            system_prompt: "test".to_string(),
+        };
         let request = bcode_workflow_store::PreparedActivationDispatch {
             activation: bcode_workflow_store::PendingActivation {
                 run_id: "run".to_string(),
@@ -53111,7 +53349,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
             attempt: 1,
             dispatch_identity: "dispatch".to_string(),
-            intent: serde_json::json!({}),
+            intent: serde_json::json!({
+                "configuration": serde_json::to_value(configuration).expect("configuration")
+            }),
         };
         let definition = bcode_workflow::WorkflowDefinition {
             schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
@@ -53188,18 +53428,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         )
         .expect("malformed structured output observation");
-        let bcode_workflow_store::AttemptObservation::Succeeded { output } = malformed else {
-            panic!("completed model output should reach schema validation");
-        };
-        let mut store = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            store.persist_validated_output(&output).is_err(),
-            "malformed structured output must fail at the canonical durable schema boundary"
-        );
-        drop(store);
+        assert!(matches!(
+            malformed,
+            bcode_workflow_store::AttemptObservation::Failed { message }
+                if message.contains("workflow prompt output failed schema validation")
+        ));
     }
 
     #[tokio::test]
@@ -53652,6 +53885,114 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 SessionEventKind::RuntimeWorkStarted { work_id, .. } if work_id == &run_work
             )
         }));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn terminal_workflow_finishes_root_runtime_work() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("terminal workflow".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema::of::<u32>();
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "terminal-work".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "node".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "node".to_string(),
+                    name: "node".to_string(),
+                    kind: bcode_workflow::NodeKind::Task,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::Value::Null,
+                },
+            )]),
+            entries: vec!["node".to_string()],
+            exits: vec!["node".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("terminal-work", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "terminal-work-run".to_string(),
+                definition_id: "terminal-work".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(session.id.to_string()),
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let activation = store
+            .pending_activations(1)
+            .expect("pending")
+            .pop()
+            .expect("activation");
+        store
+            .persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                output_id: "terminal-work-output".to_string(),
+                run_id: "terminal-work-run".to_string(),
+                node_id: activation.node_id,
+                activation_id: activation.activation_id,
+                schema_id: definition.output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!(1),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("complete run");
+        let state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        register_workflow_runtime_work(
+            &state,
+            session.id,
+            "terminal-work-run",
+            "terminal workflow".to_string(),
+        )
+        .await;
+
+        finish_terminal_workflow_runtime_work(&state, "terminal-work-run")
+            .await
+            .expect("finish root work");
+
+        assert!(
+            state
+                .runtime_work
+                .active_for_session(session.id)
+                .await
+                .is_empty()
+        );
+        assert!(
+            state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::RuntimeWorkFinished { work_id, status, .. }
+                        if work_id == &WorkId::new("workflow:terminal-work-run")
+                            && *status == RuntimeWorkStatus::Completed
+                ))
+        );
     }
 
     #[tokio::test]

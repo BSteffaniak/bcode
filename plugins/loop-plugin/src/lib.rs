@@ -1056,6 +1056,19 @@ struct LoopWorkflowIteration {
     summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct LoopWorkflowEvaluation {
+    implementation_prompt: String,
+    stop_condition: String,
+    max_iterations: u32,
+    iteration: u32,
+    condition_met: bool,
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    evidence: Vec<String>,
+    #[schemars(length(min = 1))]
+    summary: String,
+}
+
 #[allow(dead_code)]
 const WORKFLOW_COMMIT_MESSAGE_CONTRACT_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -1195,18 +1208,19 @@ fn commit_message_agent_step(
     ))
 }
 
-fn loop_agent_configuration(
+fn loop_agent_configuration<O: JsonSchema>(
     system_prompt: &str,
+    agent_profile: &str,
     read_only: bool,
 ) -> bcode_workflow::WorkflowPromptConfiguration {
     bcode_workflow::WorkflowPromptConfiguration {
         version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
         execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
-        agent_profile: if read_only { "plan" } else { "build" }.to_string(),
+        agent_profile: agent_profile.to_string(),
         provider: None,
         model: None,
         structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-            schema: bcode_workflow::ValueSchema::of::<LoopWorkflowIteration>(),
+            schema: bcode_workflow::ValueSchema::of::<O>(),
             strict: true,
         },
         read_only,
@@ -1228,8 +1242,9 @@ fn loop_workflow_spec(
     let implementation = bcode_workflow::Step::configured_task(
         "loop.implementation",
         bcode_workflow::NodeKind::Agent,
-        serde_json::to_value(loop_agent_configuration(
+        serde_json::to_value(loop_agent_configuration::<LoopWorkflowIteration>(
             "Implement the requested work. Preserve the workflow envelope fields including iteration, set condition_met false, and provide no evaluation evidence.",
+            "build",
             false,
         ))
         .expect("loop agent configuration should serialize"),
@@ -1238,8 +1253,9 @@ fn loop_workflow_spec(
     let evaluation = bcode_workflow::Step::configured_task(
         "loop.evaluation",
         bcode_workflow::NodeKind::Agent,
-        serde_json::to_value(loop_agent_configuration(
+        serde_json::to_value(loop_agent_configuration::<LoopWorkflowEvaluation>(
             "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. Preserve implementation_prompt, stop_condition, max_iterations, and iteration. Return condition_met, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema.",
+            "plan",
             true,
         ))
         .expect("loop evaluation configuration should serialize"),
@@ -1565,6 +1581,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn workflow_definition_is_typed_read_only_and_bounded() {
         let input =
             LoopWorkflowInput::new("implement".to_string(), "done".to_string(), 3).expect("input");
@@ -1636,6 +1653,19 @@ mod tests {
             definition.nodes["loop.evaluation"].configuration["read_only"],
             serde_json::json!(true)
         );
+        assert_eq!(
+            definition.nodes["loop.evaluation"].configuration["structured_output"]["schema"]["schema"]
+                ["properties"]["evidence"]["minItems"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            definition.nodes["loop.evaluation"].configuration["structured_output"]["schema"]["schema"]
+                ["properties"]["summary"]["minLength"],
+            serde_json::json!(1)
+        );
+        assert!(definition.nodes["loop.implementation"].configuration["structured_output"]
+            ["schema"]["schema"]["properties"]["evidence"]["minItems"]
+            .is_null());
         assert!(
             definition.nodes["loop.implementation"].configuration["tools"].is_null(),
             "implementation keeps the current session's unrestricted tool policy"

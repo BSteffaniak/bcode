@@ -8484,6 +8484,35 @@ impl WorkflowStore {
         Ok(changed == 1)
     }
 
+    /// Return bounded terminal runs that belong to persisted parent sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the limit is invalid, a row is malformed, or the bounded query fails.
+    pub fn terminal_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkflowRunSummary>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
+             parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
+             single_active, authored_provenance_json, terminal_output_id, \
+             terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
+             created_at_ms, updated_at_ms FROM workflow_runs \
+             WHERE parent_session_id IS NOT NULL \
+               AND status IN ('completed', 'failed', 'cancelled', 'repair_required') \
+             ORDER BY updated_at_ms DESC, run_id LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], run_summary_from_row)?
+            .map(|row| {
+                row.map_err(WorkflowStoreError::from)
+                    .and_then(parse_run_summary)
+            })
+            .collect()
+    }
+
     /// Return bounded run IDs whose pending activations or due retries are safe to continue after
     /// startup.
     ///
@@ -14769,6 +14798,24 @@ mod tests {
             )
             .expect("activation status");
         assert_eq!(status, "running");
+    }
+
+    #[test]
+    fn terminal_runs_returns_only_bounded_parent_owned_terminal_runs() {
+        let (_temp, store) = initialized_store();
+        assert!(store.terminal_runs(10).expect("terminal runs").is_empty());
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status = 'failed', updated_at_ms = 20 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("terminal run");
+        let terminal = store.terminal_runs(10).expect("terminal runs");
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].run_id, "run-1");
+        assert_eq!(terminal[0].status, RunStatus::Failed);
+        assert!(store.terminal_runs(0).is_err());
     }
 
     #[test]
