@@ -2641,6 +2641,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_surface_open_completion_does_not_report_a_retry_failure() {
+        let mut model = root_test_model();
+        model.chat.app.set_status("steady".to_owned());
+        let surface = question_surface_for_root_test(model.settings.keymap()).await;
+
+        let _update = bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(
+                super::BcodeRuntimeMessage::InteractiveSurfaceOpened(Ok(surface)),
+            ),
+        )
+        .expect("stale open completion is handled");
+
+        assert_eq!(model.chat.app.status(), "steady");
+        assert!(!model.loop_state.has_interactive_surface());
+    }
+
+    #[tokio::test]
     async fn question_navigation_through_root_is_consumed_once_without_history_fallthrough() {
         let history = [bcode_session_models::SessionInputHistoryEntry {
             timestamp_ms: 1,
