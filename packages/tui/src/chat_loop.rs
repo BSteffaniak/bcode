@@ -1758,7 +1758,7 @@ impl ChatLoopState {
     }
 
     #[cfg(test)]
-    pub fn set_interactive_surface_geometry_for_test(
+    pub const fn set_interactive_surface_geometry_for_test(
         &mut self,
         geometry: Option<InteractiveSurfaceGeometry>,
     ) {

@@ -2453,6 +2453,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One production-route scenario exercises both clipping boundaries and the complete pointer gesture.
     async fn committed_geometry_routes_top_and_bottom_clipped_pointer_input() {
         use std::sync::{Arc, Mutex};
 
@@ -2561,6 +2562,7 @@ mod tests {
                     .iter()
                     .all(|(_, point)| *point == expected_logical_point)
             );
+            drop(recorded);
         }
 
         assert_eq!(events.lock().expect("events").len(), 6);
