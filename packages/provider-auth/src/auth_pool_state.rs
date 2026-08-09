@@ -313,6 +313,18 @@ pub fn mark_pool_selected(pool: Option<&str>, profile: Option<&str>) {
     mutate_state(|state| mark_pool_selected_in_state(state, pool, profile));
 }
 
+/// Clear the round-robin cursor so a newly preferred profile is selected next.
+pub fn clear_pool_routing_cursor(pool: Option<&str>) {
+    let Some(pool) = pool.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    mutate_state(|state| {
+        if let Some(entry) = state.pools.get_mut(pool) {
+            entry.last_selected_profile = None;
+        }
+    });
+}
+
 /// Remove cooldown entries for one profile or an entire pool.
 #[must_use]
 pub fn reset_cooldowns(pool: &str, profile: Option<&str>) -> usize {
@@ -323,7 +335,8 @@ pub fn reset_cooldowns(pool: &str, profile: Option<&str>) -> usize {
 #[must_use]
 pub fn load_state() -> AuthPoolState {
     let path = state_path();
-    let Ok(contents) = fs::read_to_string(path) else {
+    let contents = fs::read_to_string(path).or_else(|_| fs::read_to_string(legacy_state_path()));
+    let Ok(contents) = contents else {
         return AuthPoolState::default();
     };
     serde_json::from_str(&contents).unwrap_or_default()
@@ -350,6 +363,12 @@ fn state_key(pool: Option<&str>, profile: Option<&str>) -> Option<String> {
 }
 
 fn state_path() -> PathBuf {
+    bcode_config::default_state_dir()
+        .join("provider")
+        .join("auth-pool-state.json")
+}
+
+fn legacy_state_path() -> PathBuf {
     bcode_config::default_state_dir()
         .join("provider")
         .join("openai-compatible-auth-pool-state.json")

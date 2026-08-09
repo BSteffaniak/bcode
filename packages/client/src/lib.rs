@@ -467,28 +467,27 @@ fn merge_selected_auth_pool_env(
     let Some(auth_pool_name) = auth_pool else {
         return Vec::new();
     };
+    let registry = bcode_config::load_runtime_auth_subscriptions();
+    let order = bcode_config::effective_auth_pool_order(
+        config,
+        &registry,
+        auth_pool_name,
+        primary_auth_profile,
+    );
     let mut candidates = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    if let Some(primary_auth_profile) = primary_auth_profile {
-        push_config_auth_candidate(
-            config,
-            primary_auth_profile,
-            env,
-            &mut candidates,
-            &mut seen,
-        );
-    }
-    if let Some(auth_pool) = config.auth.pools.get(auth_pool_name) {
-        for auth_profile_name in &auth_pool.profiles {
+    for auth_profile_name in &order.profiles {
+        if config.auth.profiles.contains_key(auth_profile_name) {
             push_config_auth_candidate(config, auth_profile_name, env, &mut candidates, &mut seen);
+            continue;
         }
-    }
-    let registry = bcode_config::load_runtime_auth_subscriptions();
-    if let Some(pool) = registry.pools.get(auth_pool_name) {
-        for profile in &pool.profiles {
-            if seen.contains(&profile.auth_profile) {
-                continue;
-            }
+        if let Some(profile) = registry
+            .pools
+            .get(auth_pool_name)
+            .into_iter()
+            .flat_map(|pool| pool.profiles.iter())
+            .find(|profile| profile.auth_profile == *auth_profile_name)
+        {
             let auth_profile = runtime_subscription_auth_profile(profile);
             let resolved =
                 bcode_provider_auth::resolve_auth_profile(&profile.auth_profile, &auth_profile);
@@ -2158,6 +2157,39 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionModelSet => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List portable, secret-free auth-pool status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or returns an unexpected response.
+    pub async fn auth_pool_list(
+        &self,
+    ) -> Result<Vec<bcode_provider_auth_models::AuthPoolSummary>, ClientError> {
+        match self.send_request(Request::AuthPoolList).await? {
+            ResponsePayload::AuthPoolList { pools } => Ok(pools),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Persist or clear an interactive preferred profile for an auth pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the pool/profile.
+    pub async fn set_auth_pool_preference(
+        &self,
+        pool: String,
+        profile: Option<String>,
+    ) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::SetAuthPoolPreference { pool, profile })
+            .await?
+        {
+            ResponsePayload::AuthPoolPreferenceSet => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

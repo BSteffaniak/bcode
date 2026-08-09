@@ -11,26 +11,27 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_agent_profile   = { workspace = true }
-bcode_command         = { workspace = true }
-bcode_metrics         = { workspace = true }
-bcode_model           = { workspace = true }
-bcode_plugin          = { workspace = true }
-bcode_plugin_sdk      = { workspace = true }
-bcode_session_models  = { workspace = true }
-bcode_session_search  = { workspace = true }
-bcode_skill_models    = { workspace = true }
-bcode_tool            = { workspace = true }
-bcode_workflow        = { workspace = true }
-bcode_workflow_store  = { workspace = true }
-bcode_worktree_models = { workspace = true }
-bmux_codec            = { workspace = true }
-bmux_ipc              = { workspace = true }
-serde                 = { workspace = true, features = ["derive", "std"] }
-serde_json            = { workspace = true, features = ["std"] }
-sha2                  = { workspace = true }
-thiserror             = { workspace = true }
-tokio                 = { workspace = true, features = ["io-util"] }
+bcode_agent_profile        = { workspace = true }
+bcode_command              = { workspace = true }
+bcode_metrics              = { workspace = true }
+bcode_model                = { workspace = true }
+bcode_plugin               = { workspace = true }
+bcode_plugin_sdk           = { workspace = true }
+bcode_provider_auth_models = { workspace = true }
+bcode_session_models       = { workspace = true }
+bcode_session_search       = { workspace = true }
+bcode_skill_models         = { workspace = true }
+bcode_tool                 = { workspace = true }
+bcode_workflow             = { workspace = true }
+bcode_workflow_store       = { workspace = true }
+bcode_worktree_models      = { workspace = true }
+bmux_codec                 = { workspace = true }
+bmux_ipc                   = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true, features = ["std"] }
+sha2                       = { workspace = true }
+thiserror                  = { workspace = true }
+tokio                      = { workspace = true, features = ["io-util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

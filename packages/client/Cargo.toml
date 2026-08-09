@@ -11,25 +11,26 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_agent_profile    = { workspace = true }
-bcode_command          = { workspace = true }
-bcode_config           = { workspace = true }
-bcode_daemon_lifecycle = { workspace = true }
-bcode_ipc              = { workspace = true }
-bcode_metrics          = { workspace = true }
-bcode_model            = { workspace = true }
-bcode_plugin_sdk       = { workspace = true }
-bcode_provider_auth    = { workspace = true }
-bcode_session_models   = { workspace = true }
-bcode_session_search   = { workspace = true }
-bcode_skill_models     = { workspace = true }
-bcode_tool             = { workspace = true }
-bcode_workflow         = { workspace = true }
-bcode_workflow_store   = { workspace = true }
-serde_json             = { workspace = true }
-sshenv_vault           = { workspace = true }
-thiserror              = { workspace = true }
-tokio                  = { workspace = true, features = ["sync", "time"] }
+bcode_agent_profile        = { workspace = true }
+bcode_command              = { workspace = true }
+bcode_config               = { workspace = true }
+bcode_daemon_lifecycle     = { workspace = true }
+bcode_ipc                  = { workspace = true }
+bcode_metrics              = { workspace = true }
+bcode_model                = { workspace = true }
+bcode_plugin_sdk           = { workspace = true }
+bcode_provider_auth        = { workspace = true }
+bcode_provider_auth_models = { workspace = true }
+bcode_session_models       = { workspace = true }
+bcode_session_search       = { workspace = true }
+bcode_skill_models         = { workspace = true }
+bcode_tool                 = { workspace = true }
+bcode_workflow             = { workspace = true }
+bcode_workflow_store       = { workspace = true }
+serde_json                 = { workspace = true }
+sshenv_vault               = { workspace = true }
+thiserror                  = { workspace = true }
+tokio                      = { workspace = true, features = ["sync", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sshenv_vault = { workspace = true, features = [

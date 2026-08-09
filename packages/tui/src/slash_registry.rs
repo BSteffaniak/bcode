@@ -132,6 +132,14 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
         description: "Open model picker",
     },
     SlashCompletion {
+        command: "/auth-pool",
+        description: "Choose preferred provider subscription",
+    },
+    SlashCompletion {
+        command: "/subscriptions",
+        description: "Choose preferred provider subscription",
+    },
+    SlashCompletion {
         command: "/set-model ",
         description: "Set model by id",
     },

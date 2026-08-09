@@ -2834,6 +2834,9 @@ pub struct AuthPoolConfig {
     /// Pool selection strategy.
     #[serde(default)]
     pub strategy: AuthPoolStrategy,
+    /// Declarative preferred profile. The profile is moved to the front without reordering others.
+    #[serde(default)]
+    pub preferred_profile: Option<String>,
     /// Auth profile names included in this pool.
     #[config_doc(list_index = "<index>")]
     #[serde(default)]
@@ -4146,6 +4149,7 @@ pub fn add_openai_chatgpt_subscription_auth(
             .or_insert_with(|| AuthPoolConfig {
                 provider_plugin_id: Some("bcode.openai-compatible".to_string()),
                 strategy: AuthPoolStrategy::Failover,
+                preferred_profile: None,
                 profiles: Vec::new(),
                 priming: AuthPoolPrimingConfig::default(),
                 quota: AuthPoolQuotaConfig::default(),
@@ -4377,6 +4381,9 @@ pub struct RuntimeAuthSubscriptionPool {
     /// Plugin that owns the provider registration.
     #[serde(default)]
     pub owner_plugin_id: Option<String>,
+    /// Interactive preferred profile override. Secret values remain in the vault.
+    #[serde(default)]
+    pub preferred_profile: Option<String>,
     #[serde(default)]
     pub profiles: Vec<RuntimeAuthSubscriptionProfile>,
 }
@@ -4479,6 +4486,7 @@ pub fn register_runtime_auth_subscription(
                 provider_plugin_id: profile.owner_plugin_id.clone(),
                 provider_id: Some(profile.provider.clone()),
                 owner_plugin_id: profile.owner_plugin_id.clone(),
+                preferred_profile: None,
                 profiles: Vec::new(),
             });
     pool_entry
@@ -4568,6 +4576,142 @@ pub fn register_runtime_auth_profile(
     registry.profiles.insert(profile_name.to_string(), profile);
     write_runtime_auth_subscriptions(&path, &registry)?;
     Ok(path)
+}
+
+/// Persist an interactive preferred profile for an auth pool without changing declarative config.
+///
+/// # Errors
+///
+/// Returns an error when the pool/profile is unknown or runtime metadata cannot be written.
+pub fn set_runtime_auth_pool_preference(
+    pool: &str,
+    profile: Option<&str>,
+) -> Result<PathBuf, ConfigError> {
+    if pool.trim().is_empty() {
+        return Err(ConfigError::Composition {
+            message: "auth pool preference requires a non-empty pool ID".to_owned(),
+        });
+    }
+    let config = load_config()?;
+    let path = runtime_auth_subscriptions_path();
+    let mut registry = load_runtime_auth_subscriptions();
+    let mut known_profiles = config
+        .auth
+        .pools
+        .get(pool)
+        .map(|entry| entry.profiles.clone())
+        .unwrap_or_default();
+    if let Some(runtime_pool) = registry.pools.get(pool) {
+        known_profiles.extend(
+            runtime_pool
+                .profiles
+                .iter()
+                .map(|entry| entry.auth_profile.clone()),
+        );
+    }
+    known_profiles.sort();
+    known_profiles.dedup();
+    if known_profiles.is_empty() {
+        return Err(ConfigError::Composition {
+            message: format!("auth pool '{pool}' is not declared or registered"),
+        });
+    }
+    if let Some(profile) = profile
+        && !known_profiles.iter().any(|known| known == profile)
+    {
+        return Err(ConfigError::Composition {
+            message: format!("auth profile '{profile}' is not a member of pool '{pool}'"),
+        });
+    }
+    let entry = registry.pools.entry(pool.to_owned()).or_default();
+    entry.preferred_profile = profile.map(str::to_owned);
+    write_runtime_auth_subscriptions(&path, &registry)?;
+    Ok(path)
+}
+
+/// Non-secret effective auth-pool order and preference source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveAuthPoolOrder {
+    /// Profiles in effective routing order.
+    pub profiles: Vec<String>,
+    /// Effective preferred profile.
+    pub preferred_profile: Option<String>,
+    /// Preference source label: `interactive_state`, `declarative`, `selected_profile`, or `pool_order`.
+    pub preference_source: Option<String>,
+    /// Invalid persisted/configured preference surfaced without guessing.
+    pub degraded_reason: Option<String>,
+}
+
+/// Resolve an auth pool's effective profile order from config and user state.
+#[must_use]
+pub fn effective_auth_pool_order(
+    config: &BcodeConfig,
+    registry: &RuntimeAuthSubscriptions,
+    pool: &str,
+    selected_profile: Option<&str>,
+) -> EffectiveAuthPoolOrder {
+    let declared = config.auth.pools.get(pool);
+    let runtime = registry.pools.get(pool);
+    let mut profiles = Vec::new();
+    let mut seen = BTreeSet::new();
+    for profile in selected_profile
+        .into_iter()
+        .chain(
+            declared
+                .into_iter()
+                .flat_map(|entry| entry.profiles.iter().map(String::as_str)),
+        )
+        .chain(runtime.into_iter().flat_map(|entry| {
+            entry
+                .profiles
+                .iter()
+                .map(|profile| profile.auth_profile.as_str())
+        }))
+    {
+        if seen.insert(profile.to_owned()) {
+            profiles.push(profile.to_owned());
+        }
+    }
+    let preferences = [
+        (
+            runtime.and_then(|entry| entry.preferred_profile.as_deref()),
+            "interactive_state",
+        ),
+        (
+            declared.and_then(|entry| entry.preferred_profile.as_deref()),
+            "declarative",
+        ),
+        (selected_profile, "selected_profile"),
+        (profiles.first().map(String::as_str), "pool_order"),
+    ];
+    let mut degraded_reason = None;
+    let mut effective = None;
+    for (preference, source) in preferences {
+        let Some(preference) = preference else {
+            continue;
+        };
+        if profiles.iter().any(|profile| profile == preference) {
+            effective = Some((preference.to_owned(), source.to_owned()));
+            break;
+        }
+        if matches!(source, "interactive_state" | "declarative") && degraded_reason.is_none() {
+            degraded_reason = Some(format!(
+                "preferred auth profile '{preference}' is not a member of pool '{pool}'"
+            ));
+        }
+    }
+    if let Some((preferred, _)) = &effective
+        && let Some(position) = profiles.iter().position(|profile| profile == preferred)
+    {
+        let profile = profiles.remove(position);
+        profiles.insert(0, profile);
+    }
+    EffectiveAuthPoolOrder {
+        profiles,
+        preferred_profile: effective.as_ref().map(|(profile, _)| profile.clone()),
+        preference_source: effective.map(|(_, source)| source),
+        degraded_reason,
+    }
 }
 
 fn write_runtime_auth_subscriptions(
@@ -6790,14 +6934,15 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BCODE_CONFIG_ENV, BcodeConfig, CompactionBackend, CompactionMode, ConfigDocSchema,
-        ConfigEnvironmentSnapshot, ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc,
-        InvariantGuidanceMode, InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc,
-        TuiAccentTransitionCurve, TuiAgentAccentPolicy, TuiInteractionOffscreenFocus,
-        TuiInteractionPlacement, TuiMouseConfig, TuiRenderConfig, TuiThemeVariant,
-        TuiVisualAdapterConfig, clear_tui_theme_selection, default_config_paths_from,
-        default_permissions_state_path, load_config_from_paths,
-        load_config_from_paths_with_overrides, load_permissions_state_from,
+        AuthConfig, AuthPoolConfig, BCODE_CONFIG_ENV, BcodeConfig, CompactionBackend,
+        CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot, ConfigError,
+        ConfigLoadOverrides, ContextStrategyMode, FieldDoc, InvariantGuidanceMode,
+        InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc,
+        RuntimeAuthSubscriptionPool, RuntimeAuthSubscriptions, TuiAccentTransitionCurve,
+        TuiAgentAccentPolicy, TuiInteractionOffscreenFocus, TuiInteractionPlacement,
+        TuiMouseConfig, TuiRenderConfig, TuiThemeVariant, TuiVisualAdapterConfig,
+        clear_tui_theme_selection, default_config_paths_from, default_permissions_state_path,
+        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, load_tui_theme_selection_from, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
         register_runtime_auth_subscription, set_openai_compatible_sshenv_auth_method,
@@ -6954,6 +7099,43 @@ mod tests {
         );
         assert_eq!(config.model.model_id.as_deref(), Some("gpt-5"));
         restore_env("BCODE_CONFIG", previous);
+    }
+
+    #[test]
+    fn interactive_auth_pool_preference_wins_and_preserves_remaining_order() {
+        let config = BcodeConfig {
+            auth: AuthConfig {
+                pools: BTreeMap::from([(
+                    "provider".to_owned(),
+                    AuthPoolConfig {
+                        profiles: vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+                        preferred_profile: Some("two".to_owned()),
+                        ..AuthPoolConfig::default()
+                    },
+                )]),
+                ..AuthConfig::default()
+            },
+            ..BcodeConfig::default()
+        };
+        let runtime = RuntimeAuthSubscriptions {
+            pools: BTreeMap::from([(
+                "provider".to_owned(),
+                RuntimeAuthSubscriptionPool {
+                    preferred_profile: Some("three".to_owned()),
+                    ..RuntimeAuthSubscriptionPool::default()
+                },
+            )]),
+            ..RuntimeAuthSubscriptions::default()
+        };
+
+        let order = super::effective_auth_pool_order(&config, &runtime, "provider", Some("one"));
+
+        assert_eq!(order.profiles, vec!["three", "one", "two"]);
+        assert_eq!(order.preferred_profile.as_deref(), Some("three"));
+        assert_eq!(
+            order.preference_source.as_deref(),
+            Some("interactive_state")
+        );
     }
 
     #[test]

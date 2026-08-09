@@ -114,6 +114,12 @@ Legacy environment-backed profiles and conventional provider environment variabl
 
 OpenAI subscription pools are read compatibly from existing runtime state. New generic code does not invent OpenAI-specific defaults; plugin registration supplies method schemes and credential mappings.
 
+Auth pools are ordered, provider-neutral collections and may contain any number of profiles. A
+declarative `preferred_profile` moves one member to the front without reordering the others.
+Interactive CLI/TUI promotion is persisted in non-secret user state, takes precedence over the
+declarative default, and never rewrites configuration. Portable pool summaries and mutations cross
+the client/server boundary; frontends do not read auth state files directly.
+
 ## Plugin author checklist
 
 1. Depend on `bcode_provider_auth_models` and `bcode_plugin_sdk`; do not add vault dependencies for ordinary enrollment.

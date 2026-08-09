@@ -232,6 +232,13 @@ pub enum TuiEffect {
     },
     /// Load model providers before opening the root model picker.
     LoadModelProviders,
+    /// Load portable auth-pool status before opening the subscription picker.
+    LoadAuthPoolPicker,
+    /// Persist or clear an auth-pool preference.
+    SetAuthPoolPreference {
+        pool: String,
+        profile: Option<String>,
+    },
     /// Load models for the selected provider.
     LoadModelPicker {
         /// Selected provider plugin, or the default provider.
@@ -610,6 +617,20 @@ pub enum TuiEffectResult {
         /// Loaded plugin service summaries.
         result: Result<Vec<bcode_ipc::PluginServiceSummary>, ClientError>,
     },
+    /// Portable auth-pool status loaded.
+    AuthPoolPickerLoaded {
+        /// Loaded secret-free pool summaries.
+        result: Result<Vec<bcode_provider_auth_models::AuthPoolSummary>, ClientError>,
+    },
+    /// Interactive auth-pool preference mutation completed.
+    AuthPoolPreferenceSet {
+        /// Updated pool.
+        pool: String,
+        /// New preferred profile, or `None` when clearing the override.
+        profile: Option<String>,
+        /// Daemon response.
+        result: Result<(), ClientError>,
+    },
     /// Models for the root picker loaded.
     ModelPickerLoaded {
         /// Provider used for the model query.
@@ -844,6 +865,10 @@ impl TuiEffectResult {
             Self::PluginSurfaceOpened { result, .. } => DaemonObservation::from_tui_result(result),
             Self::ForkPromptsLoaded { result, .. } => DaemonObservation::from_tui_result(result),
             Self::ModelProvidersLoaded { result } => DaemonObservation::from_client_result(result),
+            Self::AuthPoolPickerLoaded { result } => DaemonObservation::from_client_result(result),
+            Self::AuthPoolPreferenceSet { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
             Self::ModelPickerLoaded { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillPickerLoaded { result } => DaemonObservation::from_client_result(result),
             Self::SkillDescribed { result, .. } => DaemonObservation::from_client_result(result),
@@ -934,6 +959,8 @@ enum EffectKey {
     ForkPrompts,
     ModelProviders,
     ModelPicker,
+    AuthPoolPicker,
+    AuthPoolPreference,
     SkillPicker,
     SkillDescription,
     ThinkingDialog,
@@ -1127,6 +1154,8 @@ impl TuiEffect {
             | Self::OpenPluginSurface { .. }
             | Self::LoadForkPrompts { .. }
             | Self::LoadModelProviders
+            | Self::LoadAuthPoolPicker
+            | Self::SetAuthPoolPreference { .. }
             | Self::LoadModelPicker { .. }
             | Self::LoadSkillPicker
             | Self::DescribeSkill { .. }
@@ -1188,6 +1217,8 @@ impl TuiEffect {
             | Self::OpenPluginSurface { .. }
             | Self::LoadForkPrompts { .. }
             | Self::LoadModelProviders
+            | Self::LoadAuthPoolPicker
+            | Self::SetAuthPoolPreference { .. }
             | Self::LoadModelPicker { .. }
             | Self::LoadSkillPicker
             | Self::DescribeSkill { .. }
@@ -1391,6 +1422,8 @@ impl TuiEffect {
             Self::OpenPluginSurface { .. } => EffectKey::PluginSurface,
             Self::LoadForkPrompts { .. } => EffectKey::ForkPrompts,
             Self::LoadModelProviders => EffectKey::ModelProviders,
+            Self::LoadAuthPoolPicker => EffectKey::AuthPoolPicker,
+            Self::SetAuthPoolPreference { .. } => EffectKey::AuthPoolPreference,
             Self::LoadModelPicker { .. } => EffectKey::ModelPicker,
             Self::LoadSkillPicker => EffectKey::SkillPicker,
             Self::DescribeSkill { .. } => EffectKey::SkillDescription,
@@ -1699,6 +1732,16 @@ impl TuiEffect {
                         .collect()
                 }),
             },
+            Self::LoadAuthPoolPicker => TuiEffectResult::AuthPoolPickerLoaded {
+                result: client.auth_pool_list().await,
+            },
+            Self::SetAuthPoolPreference { pool, profile } => {
+                TuiEffectResult::AuthPoolPreferenceSet {
+                    pool: pool.clone(),
+                    profile: profile.clone(),
+                    result: client.set_auth_pool_preference(pool, profile).await,
+                }
+            }
             Self::LoadModelPicker { provider_plugin_id } => TuiEffectResult::ModelPickerLoaded {
                 result: client.session_model_list(provider_plugin_id.clone()).await,
                 provider_plugin_id,

@@ -13,6 +13,107 @@ pub mod auth_pool_state;
 pub mod lifecycle;
 pub mod security;
 
+/// Return portable, secret-free summaries for all configured or runtime auth pools.
+#[must_use]
+pub fn auth_pool_summaries(
+    config: &bcode_config::BcodeConfig,
+) -> Vec<bcode_provider_auth_models::AuthPoolSummary> {
+    let registry = bcode_config::load_runtime_auth_subscriptions();
+    let state = auth_pool_state::load_state();
+    let selected = config.resolved_model_selection();
+    let names = config
+        .auth
+        .pools
+        .keys()
+        .chain(registry.pools.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    names
+        .into_iter()
+        .map(|pool| {
+            let order = bcode_config::effective_auth_pool_order(
+                config,
+                &registry,
+                &pool,
+                (selected.auth_pool.as_deref() == Some(pool.as_str()))
+                    .then_some(selected.auth_profile.as_deref())
+                    .flatten(),
+            );
+            let declared = config.auth.pools.get(&pool);
+            let runtime = registry.pools.get(&pool);
+            let source = match order.preference_source.as_deref() {
+                Some("interactive_state") => {
+                    Some(bcode_provider_auth_models::AuthPoolPreferenceSource::InteractiveState)
+                }
+                Some("declarative") => {
+                    Some(bcode_provider_auth_models::AuthPoolPreferenceSource::Declarative)
+                }
+                Some("selected_profile") => {
+                    Some(bcode_provider_auth_models::AuthPoolPreferenceSource::SelectedProfile)
+                }
+                Some("pool_order") => {
+                    Some(bcode_provider_auth_models::AuthPoolPreferenceSource::PoolOrder)
+                }
+                _ => None,
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            let profiles = order
+                .profiles
+                .iter()
+                .map(|profile| {
+                    let cooldown_until_unix = state
+                        .entries
+                        .get(&format!("{pool}/{profile}"))
+                        .map(|entry| entry.cooldown_until_unix)
+                        .filter(|until| *until > now);
+                    bcode_provider_auth_models::AuthPoolProfileSummary {
+                        profile: profile.clone(),
+                        preferred: order.preferred_profile.as_deref() == Some(profile.as_str()),
+                        cooldown: cooldown_until_unix.is_some(),
+                        cooldown_until_unix,
+                    }
+                })
+                .collect();
+            bcode_provider_auth_models::AuthPoolSummary {
+                schema_version: bcode_provider_auth_models::AUTH_POOL_SCHEMA_VERSION,
+                pool: pool.clone(),
+                provider_plugin_id: declared
+                    .and_then(|entry| entry.provider_plugin_id.clone())
+                    .or_else(|| runtime.and_then(|entry| entry.provider_plugin_id.clone())),
+                strategy: declared.map_or_else(
+                    || "failover".to_owned(),
+                    |entry| match entry.strategy {
+                        bcode_config::AuthPoolStrategy::Failover => "failover".to_owned(),
+                        bcode_config::AuthPoolStrategy::RoundRobin => "round_robin".to_owned(),
+                    },
+                ),
+                preferred_profile: order.preferred_profile,
+                preference_source: source,
+                profiles,
+                degraded_reason: order.degraded_reason,
+            }
+        })
+        .collect()
+}
+
+/// Persist or clear an interactive auth-pool preference.
+///
+/// # Errors
+///
+/// Returns an error when the pool/profile is unknown or user state cannot be written.
+pub fn set_auth_pool_preference(
+    pool: &str,
+    profile: Option<&str>,
+) -> Result<PathBuf, bcode_config::ConfigError> {
+    let path = bcode_config::set_runtime_auth_pool_preference(pool, profile)?;
+    auth_pool_state::clear_pool_routing_cursor(Some(pool));
+    Ok(path)
+}
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -31,6 +132,7 @@ pub struct ProviderRequestContextResolution<'a> {
 pub fn resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
 ) -> bcode_model::ProviderRequestContext {
+    let selected_profile = request.selection.auth_profile.clone();
     let mut context = bcode_model::ProviderRequestContext {
         model_profile: request.selection.model_profile,
         auth_profile: request.selection.auth_profile.clone(),
@@ -58,27 +160,30 @@ pub fn resolve_provider_request_context(
     if let Some(auth_pool_name) = request.selection.auth_pool.as_deref() {
         let mut candidates = Vec::new();
         let mut seen = BTreeSet::new();
-        if let Some(auth_profile_name) = request.selection.auth_profile.as_deref() {
-            push_config_auth_candidate(
-                request.config,
-                auth_profile_name,
-                &mut candidates,
-                &mut seen,
-            );
-        }
-        if let Some(auth_pool) = request.config.auth.pools.get(auth_pool_name) {
-            for profile_name in &auth_pool.profiles {
+        let registry = bcode_config::load_runtime_auth_subscriptions();
+        let order = bcode_config::effective_auth_pool_order(
+            request.config,
+            &registry,
+            auth_pool_name,
+            selected_profile.as_deref(),
+        );
+        for profile_name in &order.profiles {
+            if request.config.auth.profiles.contains_key(profile_name) {
                 push_config_auth_candidate(
                     request.config,
                     profile_name,
                     &mut candidates,
                     &mut seen,
                 );
+                continue;
             }
-        }
-        let registry = bcode_config::load_runtime_auth_subscriptions();
-        if let Some(pool) = registry.pools.get(auth_pool_name) {
-            for profile in &pool.profiles {
+            if let Some(profile) = registry
+                .pools
+                .get(auth_pool_name)
+                .into_iter()
+                .flat_map(|pool| pool.profiles.iter())
+                .find(|profile| profile.auth_profile == *profile_name)
+            {
                 if !seen.insert(profile.auth_profile.clone()) {
                     continue;
                 }
@@ -92,6 +197,16 @@ pub fn resolve_provider_request_context(
             }
         }
         context.auth_candidates = candidates;
+        if let Some(preferred) = order.preferred_profile
+            && let Some(candidate) = context
+                .auth_candidates
+                .iter()
+                .find(|candidate| candidate.profile.as_deref() == Some(preferred.as_str()))
+        {
+            context.auth_profile = Some(preferred);
+            context.auth = Some(candidate.auth.clone());
+            context.env = candidate.env.clone();
+        }
     }
 
     context

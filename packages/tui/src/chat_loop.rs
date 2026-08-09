@@ -146,6 +146,13 @@ struct RootModelPicker {
     picker: super::model_picker::ModelPickerApp,
 }
 
+pub enum AuthPoolPickerRootOutcome {
+    Continue,
+    Cancel,
+    Promote { pool: String, profile: String },
+    Clear { pool: String },
+}
+
 pub enum SessionForkRootOutcome {
     Handled,
     Canceled,
@@ -199,6 +206,7 @@ pub struct ChatLoopState {
     plugin_surface: Option<RootPluginSurface>,
     provider_picker: Option<super::provider_picker::ProviderPickerApp>,
     model_picker: Option<RootModelPicker>,
+    auth_pool_picker: Option<super::auth_pool_picker::AuthPoolPickerApp>,
     skill_picker: Option<super::skill_picker::SkillPickerApp>,
     worktree_create_dialog: Option<super::wt_create_dialog::WorktreeCreateDialog>,
     ralph_start_dialog: Option<super::ralph_start_dialog::RalphStartDialog>,
@@ -244,6 +252,7 @@ impl ChatLoopState {
             plugin_surface: None,
             provider_picker: None,
             model_picker: None,
+            auth_pool_picker: None,
             skill_picker: None,
             worktree_create_dialog: None,
             ralph_start_dialog: None,
@@ -958,6 +967,53 @@ impl ChatLoopState {
 
     pub const fn has_model_picker(&self) -> bool {
         self.provider_picker.is_some() || self.model_picker.is_some()
+    }
+
+    pub const fn has_auth_pool_picker(&self) -> bool {
+        self.auth_pool_picker.is_some()
+    }
+
+    pub fn handle_auth_pool_picker_event(&mut self, event: &Event) -> AuthPoolPickerRootOutcome {
+        let Some(picker) = self.auth_pool_picker.as_mut() else {
+            return AuthPoolPickerRootOutcome::Continue;
+        };
+        let action = match event {
+            Event::Key(stroke) => match stroke.key {
+                bmux_keyboard::KeyCode::Escape => AuthPoolPickerRootOutcome::Cancel,
+                bmux_keyboard::KeyCode::Enter => picker
+                    .selected()
+                    .map_or(AuthPoolPickerRootOutcome::Continue, |(pool, profile)| {
+                        AuthPoolPickerRootOutcome::Promote { pool, profile }
+                    }),
+                bmux_keyboard::KeyCode::Char('c') if stroke.modifiers.is_empty() => picker
+                    .selected_pool()
+                    .map_or(AuthPoolPickerRootOutcome::Continue, |pool| {
+                        AuthPoolPickerRootOutcome::Clear { pool }
+                    }),
+                bmux_keyboard::KeyCode::Up => {
+                    picker.select_previous();
+                    AuthPoolPickerRootOutcome::Continue
+                }
+                bmux_keyboard::KeyCode::Down => {
+                    picker.select_next();
+                    AuthPoolPickerRootOutcome::Continue
+                }
+                _ => AuthPoolPickerRootOutcome::Continue,
+            },
+            Event::Mouse(mouse) => {
+                if let Some(row) = super::picker_mouse::picker_row_from_mouse(*mouse) {
+                    picker.select_visible(row);
+                }
+                AuthPoolPickerRootOutcome::Continue
+            }
+            Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) | Event::Paste(_) => {
+                AuthPoolPickerRootOutcome::Continue
+            }
+        };
+        if !matches!(action, AuthPoolPickerRootOutcome::Continue) {
+            self.auth_pool_picker = None;
+        }
+        action
     }
 
     pub fn handle_model_picker_event(
@@ -2188,6 +2244,31 @@ pub fn apply_effect_result(
             }
             Err(error) => report_nonfatal_client_error(chat, "Model providers unavailable", &error),
         },
+        TuiEffectResult::AuthPoolPickerLoaded { result } => match result {
+            Ok(pools) if pools.iter().any(|pool| !pool.profiles.is_empty()) => {
+                loop_state.auth_pool_picker =
+                    Some(super::auth_pool_picker::AuthPoolPickerApp::new(pools));
+                chat.app
+                    .set_status("select the preferred subscription".to_owned());
+            }
+            Ok(_) => chat.app.set_status("no auth pools configured".to_owned()),
+            Err(error) => report_nonfatal_client_error(chat, "Auth pools unavailable", &error),
+        },
+        TuiEffectResult::AuthPoolPreferenceSet {
+            pool,
+            profile,
+            result,
+        } => match result {
+            Ok(()) => {
+                chat.app.set_status(profile.map_or_else(
+                    || format!("cleared interactive preference for {pool}"),
+                    |profile| format!("preferred subscription for {pool}: {profile}"),
+                ));
+            }
+            Err(error) => {
+                report_nonfatal_client_error(chat, "Auth pool preference update failed", &error);
+            }
+        },
         TuiEffectResult::ModelPickerLoaded {
             provider_plugin_id,
             result,
@@ -2764,6 +2845,11 @@ fn apply_root_slash_command_outcome(
         }
         SlashCommandOutcome::AttachWorktree { session_id, path } => {
             chat.start_effect(TuiEffect::AttachWorktree { session_id, path });
+        }
+        SlashCommandOutcome::PickAuthPool => {
+            chat.start_effect(TuiEffect::LoadAuthPoolPicker);
+            chat.app
+                .set_status("loading auth subscriptions…".to_owned());
         }
         SlashCommandOutcome::SetLocalModel {
             provider_plugin_id,
@@ -3957,6 +4043,9 @@ pub fn draw_chat_frame<W: Write>(
         }
         if let Some(model) = &mut loop_state.model_picker {
             super::model_picker_render::render_model_picker(&mut model.picker, frame, theme);
+        }
+        if let Some(picker) = &mut loop_state.auth_pool_picker {
+            super::auth_pool_picker_render::render_auth_pool_picker(picker, frame, theme);
         }
         if let Some(picker) = &mut loop_state.skill_picker {
             super::skill_picker_render::render_skill_picker(picker, frame, theme);

@@ -820,6 +820,14 @@ pub enum Request {
         /// Validated-at-ingress metric observations.
         batch: bcode_metrics::ClientMetricBatch,
     },
+    /// List portable auth-pool status.
+    AuthPoolList,
+    /// Persist or clear an interactive preferred auth-pool profile.
+    SetAuthPoolPreference {
+        pool: String,
+        #[serde(default)]
+        profile: Option<String>,
+    },
     /// Ask this daemon to release runtime ownership when the session is quiescent.
     ReleaseSessionOwnership {
         session_id: SessionId,
@@ -2715,6 +2723,12 @@ pub enum ResponsePayload {
         /// Number of observations merged into the daemon registry.
         accepted: usize,
     },
+    /// Portable auth-pool status list.
+    AuthPoolList {
+        pools: Vec<bcode_provider_auth_models::AuthPoolSummary>,
+    },
+    /// Interactive auth-pool preference was updated.
+    AuthPoolPreferenceSet,
     /// Current snapshot after preparing or waiting for session open.
     SessionOpenPrepared {
         snapshot: SessionOpenOperationSnapshot,

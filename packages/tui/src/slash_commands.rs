@@ -42,6 +42,8 @@ pub enum SlashCommandOutcome {
     PickSession,
     /// Open model picker.
     PickModel,
+    /// Open auth-pool subscription picker.
+    PickAuthPool,
     /// Preview a bundled theme without persistence.
     PreviewTheme { theme_id: String },
     /// Apply a bundled theme as the global interactive selection.
@@ -864,6 +866,7 @@ async fn execute_builtin(
         }
         "theme" => Ok(theme_command(parts)),
         "model" | "models" if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
+        "auth-pool" | "subscriptions" if parts.len() == 1 => Ok(SlashCommandOutcome::PickAuthPool),
         "model" | "set-model" if parts.len() > 1 => {
             let model_id = parts[1].to_owned();
             if let Some(session_id) = session_id {

@@ -106,6 +106,32 @@ auth_pool = "openai"
 
 Config declares the desired subscription candidates. Runtime quota/cooldown observations are stored under Bcode's state directory and do not mutate declarative config.
 
+## Preferred profile and effective order
+
+Auth pools support any number of profiles. The first profile in effective order is the preferred
+profile for failover and for `priming.include_primary` semantics. Declare a default without changing
+the underlying profile list:
+
+```toml
+[auth.pools.openai]
+provider_plugin_id = "bcode.openai-compatible"
+strategy = "failover"
+profiles = ["openai", "openai-2", "openai-3"]
+preferred_profile = "openai-2"
+```
+
+Promote any member interactively from the CLI:
+
+```sh
+bcode auth pool promote openai openai-3
+bcode auth pool clear-preference openai
+```
+
+The interactive choice is stored in user state and wins over `preferred_profile`; it never rewrites
+declarative configuration. Promotion moves only the selected profile to the front and preserves the
+relative order of every other profile. In the TUI, `/auth-pool` and `/subscriptions` open the same
+generic profile picker. Pool status reports the effective order and preference source.
+
 ## Routing strategies
 
 Auth pools default to failover routing, which tries profiles in configured order and only moves to the next profile when the active subscription reports quota or rate-limit exhaustion.

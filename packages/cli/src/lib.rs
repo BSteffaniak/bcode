@@ -3204,6 +3204,15 @@ enum AuthPoolCommand {
         pool: String,
         profile: Option<String>,
     },
+    /// Move one profile to the front of the pool using interactive user state.
+    Promote {
+        pool: String,
+        profile: String,
+    },
+    /// Clear the interactive preferred-profile override.
+    ClearPreference {
+        pool: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3686,6 +3695,22 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             }
             AuthPoolCommand::ResetCooldown { pool, profile } => {
                 auth_pool_reset_cooldown(&pool, profile.as_deref());
+                Ok(())
+            }
+            AuthPoolCommand::Promote { pool, profile } => {
+                let path = bcode_provider_auth::set_auth_pool_preference(&pool, Some(&profile))?;
+                println!(
+                    "Preferred auth profile for '{pool}' is now '{profile}' ({}).",
+                    display_from_current_dir(&path)
+                );
+                Ok(())
+            }
+            AuthPoolCommand::ClearPreference { pool } => {
+                let path = bcode_provider_auth::set_auth_pool_preference(&pool, None)?;
+                println!(
+                    "Cleared interactive auth preference for '{pool}' ({}).",
+                    display_from_current_dir(&path)
+                );
                 Ok(())
             }
         },
@@ -5457,17 +5482,26 @@ fn auth_pool_status(pool_name: &str) -> Result<(), CliError> {
                 ))
         );
     }
-    let profiles = declared_pool
-        .map(|pool| pool.profiles.clone())
-        .unwrap_or_default();
-    let runtime_profiles = runtime_pool
-        .map(|pool| {
-            pool.profiles
-                .iter()
-                .map(|profile| profile.auth_profile.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let resolved = config.resolved_model_selection();
+    let selected_profile = (resolved.auth_pool.as_deref() == Some(pool_name))
+        .then_some(resolved.auth_profile.as_deref())
+        .flatten();
+    let order =
+        bcode_config::effective_auth_pool_order(&config, &registry, pool_name, selected_profile);
+    println!(
+        "Preferred profile: {}{}",
+        order.preferred_profile.as_deref().unwrap_or("none"),
+        order
+            .preference_source
+            .as_deref()
+            .map_or_else(String::new, |source| format!(" ({source})"))
+    );
+    println!("Effective order: {}", order.profiles.join(" -> "));
+    if let Some(reason) = &order.degraded_reason {
+        println!("Degraded: {reason}");
+    }
+    let profiles = order.profiles;
+    let runtime_profiles = Vec::new();
     if profiles.is_empty() && runtime_profiles.is_empty() {
         println!("Profiles: none");
         return Ok(());

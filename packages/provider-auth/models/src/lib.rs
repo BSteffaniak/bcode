@@ -13,6 +13,61 @@ use std::fmt::{Display, Formatter};
 
 /// Current schema version for authentication provider contributions.
 pub const AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION: u16 = 1;
+/// Current schema version for portable auth-pool management contracts.
+pub const AUTH_POOL_SCHEMA_VERSION: u16 = 1;
+
+/// Source of an auth pool's effective preferred profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPoolPreferenceSource {
+    /// An interactive CLI or frontend selection stored in user state.
+    InteractiveState,
+    /// A declarative `preferred_profile` selection.
+    Declarative,
+    /// The model/provider auth profile selected outside the pool.
+    SelectedProfile,
+    /// The first available profile in effective pool order.
+    PoolOrder,
+}
+
+/// Portable, secret-free status for one auth-pool profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPoolProfileSummary {
+    /// Auth profile identifier.
+    pub profile: String,
+    /// Whether this is the effective preferred profile.
+    pub preferred: bool,
+    /// Whether the profile currently has a local cooldown.
+    pub cooldown: bool,
+    /// Optional local cooldown deadline in Unix seconds.
+    #[serde(default)]
+    pub cooldown_until_unix: Option<u64>,
+}
+
+/// Portable, secret-free auth-pool status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPoolSummary {
+    /// Contract schema version.
+    pub schema_version: u16,
+    /// Auth-pool identifier.
+    pub pool: String,
+    /// Provider plugin owning requests routed through this pool, when known.
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    /// Effective routing strategy.
+    pub strategy: String,
+    /// Effective preferred profile, when the pool is non-empty.
+    #[serde(default)]
+    pub preferred_profile: Option<String>,
+    /// Source of the effective preference.
+    #[serde(default)]
+    pub preference_source: Option<AuthPoolPreferenceSource>,
+    /// Profiles in effective routing order.
+    pub profiles: Vec<AuthPoolProfileSummary>,
+    /// Non-secret degraded-state explanation.
+    #[serde(default)]
+    pub degraded_reason: Option<String>,
+}
 /// Plugin service interface for normalized interactive authentication flows.
 pub const AUTH_INTERFACE_ID: &str = "bcode.auth/v1";
 /// Operation used to begin, continue, or cancel an interactive authentication flow.

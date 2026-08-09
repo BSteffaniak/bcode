@@ -672,6 +672,37 @@ impl BcodeRuntimeModel {
             }
             return super::invalidation::UiInvalidation::Structural;
         }
+        if self.loop_state.has_auth_pool_picker() {
+            match self.loop_state.handle_auth_pool_picker_event(&event) {
+                super::chat_loop::AuthPoolPickerRootOutcome::Continue => {}
+                super::chat_loop::AuthPoolPickerRootOutcome::Cancel => {
+                    self.chat
+                        .app
+                        .set_status("auth pool picker closed".to_owned());
+                }
+                super::chat_loop::AuthPoolPickerRootOutcome::Promote { pool, profile } => {
+                    self.chat
+                        .start_effect(super::effects::TuiEffect::SetAuthPoolPreference {
+                            pool,
+                            profile: Some(profile),
+                        });
+                    self.chat
+                        .app
+                        .set_status("updating preferred subscription…".to_owned());
+                }
+                super::chat_loop::AuthPoolPickerRootOutcome::Clear { pool } => {
+                    self.chat
+                        .start_effect(super::effects::TuiEffect::SetAuthPoolPreference {
+                            pool,
+                            profile: None,
+                        });
+                    self.chat
+                        .app
+                        .set_status("clearing subscription preference…".to_owned());
+                }
+            }
+            return super::invalidation::UiInvalidation::Structural;
+        }
         if self.loop_state.has_model_picker() {
             if let Some((provider_plugin_id, action)) = self
                 .loop_state

@@ -4004,6 +4004,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CompactSession { .. } => "compact_session",
         Request::SetSessionModel { .. } => "set_session_model",
         Request::SetSessionReasoning { .. } => "set_session_reasoning",
+        Request::AuthPoolList => "auth_pool_list",
+        Request::SetAuthPoolPreference { .. } => "set_auth_pool_preference",
         Request::AppendPresentationNote { .. } => "append_presentation_note",
         Request::SessionModelStatus { .. } => "session_model_status",
         Request::DefaultModelStatus => "default_model_status",
@@ -5195,6 +5197,40 @@ async fn handle_request_inner(
         Request::SessionModelList { provider_plugin_id } => {
             handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
                 .await
+        }
+        Request::AuthPoolList => {
+            let config = bcode_config::load_config()?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AuthPoolList {
+                    pools: bcode_provider_auth::auth_pool_summaries(&config),
+                }),
+            )
+            .await
+        }
+        Request::SetAuthPoolPreference { pool, profile } => {
+            match bcode_provider_auth::set_auth_pool_preference(&pool, profile.as_deref()) {
+                Ok(_) => {
+                    send_response(
+                        writer,
+                        request_id,
+                        Response::Ok(ResponsePayload::AuthPoolPreferenceSet),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    send_response(
+                        writer,
+                        request_id,
+                        Response::Err(ErrorResponse::new(
+                            "auth_pool_preference",
+                            error.to_string(),
+                        )),
+                    )
+                    .await
+                }
+            }
         }
         request => handle_remaining_request(request, request_id, client_id, state, writer).await,
     }
@@ -22598,11 +22634,27 @@ async fn select_host_auth_pool_candidate(
     if context.auth_candidates.is_empty() {
         return;
     }
+    if let Some(pool) = context.auth_pool.as_deref()
+        && let Some(preferred) = bcode_config::load_runtime_auth_subscriptions()
+            .pools
+            .get(pool)
+            .and_then(|entry| entry.preferred_profile.as_deref())
+        && let Some(position) = context
+            .auth_candidates
+            .iter()
+            .position(|candidate| candidate.profile.as_deref() == Some(preferred))
+    {
+        let candidate = context.auth_candidates.remove(position);
+        context.auth_candidates.insert(0, candidate);
+    }
     refresh_auth_usage_windows_for_priming(state, provider_plugin_id, context).await;
     let Some(selection) = bcode_provider_auth::auth_pool_routing::select_auth_pool_candidate(
         &bcode_provider_auth::auth_pool_routing::AuthPoolSelectionInput {
             pool: context.auth_pool.as_deref(),
-            primary_profile: context.auth_profile.as_deref(),
+            primary_profile: context
+                .auth_candidates
+                .first()
+                .and_then(|candidate| candidate.profile.as_deref()),
             routing: &context.auth_pool_routing,
             candidates: &context.auth_candidates,
         },

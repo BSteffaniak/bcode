@@ -3426,7 +3426,11 @@ fn candidate_needs_priming(request: &ModelTurnRequest, candidate: &ProviderAuthC
     if !routing.priming_enabled {
         return false;
     }
-    let primary = request.provider_context.auth_profile.as_deref();
+    let primary = request
+        .provider_context
+        .auth_candidates
+        .first()
+        .and_then(|candidate| candidate.profile.as_deref());
     if !routing.priming_include_primary && candidate.profile.as_deref() == primary {
         return false;
     }
