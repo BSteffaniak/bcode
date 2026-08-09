@@ -4831,7 +4831,7 @@ async fn handle_request_inner(
                 state,
                 request.control,
                 format!("validate-package-{request_id}"),
-                move || bcode_workflow::plan_workflow_package(&request.manifest, &catalog),
+                move || bcode_workflow::plan_workflow_package_closure(&request.closure, &catalog),
             )
             .await??;
             send_response(

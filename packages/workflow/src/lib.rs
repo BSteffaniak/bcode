@@ -4667,6 +4667,10 @@ pub const MAX_WORKFLOW_PACKAGE_EDGES: usize = 1_024;
 
 /// Current pure workflow package planning result version.
 pub const WORKFLOW_PACKAGE_PLAN_VERSION: u32 = 1;
+/// Current bounded transitive workflow package closure version.
+pub const WORKFLOW_PACKAGE_CLOSURE_VERSION: u32 = 1;
+/// Maximum packages accepted in one transitive closure.
+pub const MAX_WORKFLOW_PACKAGE_CLOSURE_PACKAGES: usize = 128;
 /// Current side-effect-free workflow package preview version.
 pub const WORKFLOW_PACKAGE_PREVIEW_VERSION: u32 = 1;
 /// Current package-member source-map envelope version.
@@ -4735,6 +4739,53 @@ pub struct WorkflowPackagePlan {
     pub members: Vec<WorkflowPackagePlannedMember>,
     /// Reproducibility result derived from this successful plan.
     pub lock: WorkflowPackageLock,
+}
+
+/// One source package supplied to bounded transitive closure planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageClosureSource {
+    /// Stable package identity; must equal the embedded manifest identity.
+    pub package_id: String,
+    /// Canonical confined source label for diagnostics and duplicate-path detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    /// Complete source manifest after local member files were confined and loaded.
+    pub manifest: WorkflowPackageManifest,
+}
+
+/// Complete portable input for recursively planning an explicit package entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageClosure {
+    /// Must equal [`WORKFLOW_PACKAGE_CLOSURE_VERSION`].
+    pub version: u32,
+    /// Stable entry package identity.
+    pub entry_package_id: String,
+    /// Exact bounded package inventory. Ordering is not semantic.
+    pub packages: Vec<WorkflowPackageClosureSource>,
+}
+
+/// One planned package in a deterministic transitive closure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageClosurePlanEntry {
+    /// Stable package identity.
+    pub package_id: String,
+    /// Complete package plan with exact imported export targets.
+    pub plan: WorkflowPackagePlan,
+}
+
+/// Pure complete transitive package plan with dependencies before importers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageClosurePlan {
+    /// Must equal [`WORKFLOW_PACKAGE_CLOSURE_VERSION`].
+    pub version: u32,
+    /// Stable entry package identity.
+    pub entry_package_id: String,
+    /// Packages in deterministic dependency-before-importer order.
+    pub packages: Vec<WorkflowPackageClosurePlanEntry>,
 }
 
 /// One child-before-parent member compilation preview.
@@ -4892,6 +4943,16 @@ pub fn plan_workflow_package(
     catalog: &WorkflowAuthoringCatalogSnapshot,
 ) -> Result<WorkflowPackagePlan, WorkflowError> {
     manifest.validate()?;
+    if manifest
+        .imports
+        .iter()
+        .any(|import| import.target.is_none())
+    {
+        return Err(authoring_error(
+            "package.imports",
+            "unresolved package imports require transitive closure planning",
+        ));
+    }
     catalog.validate()?;
     let members = manifest
         .members
@@ -4903,12 +4964,12 @@ pub fn plan_workflow_package(
         .external_dependencies
         .iter()
         .map(|(name, target)| (name.clone(), target.clone()))
-        .chain(
-            manifest
-                .imports
-                .iter()
-                .map(|import| (import.import_id.clone(), import.target.clone())),
-        )
+        .chain(manifest.imports.iter().filter_map(|import| {
+            import
+                .target
+                .as_ref()
+                .map(|target| (import.import_id.clone(), target.clone()))
+        }))
         .collect::<BTreeMap<_, _>>();
     let mut resolved_catalog = catalog.clone();
     for target in external_targets.values() {
@@ -4999,14 +5060,29 @@ pub fn plan_workflow_package(
     let mut locked_imports = manifest
         .imports
         .iter()
-        .map(|import| WorkflowPackageLockedImport {
-            import_id: import.import_id.clone(),
-            package_id: import.package_id.clone(),
-            export: import.export.clone(),
-            package_lock_digest_sha256: import.package_lock_digest_sha256.clone(),
-            target: import.target.clone(),
+        .map(|import| {
+            let target = import.target.clone().ok_or_else(|| {
+                authoring_error(
+                    "package.imports.target",
+                    "package imports must be resolved before single-package planning",
+                )
+            })?;
+            let package_lock_digest_sha256 =
+                import.package_lock_digest_sha256.clone().ok_or_else(|| {
+                    authoring_error(
+                        "package.imports.package_lock_digest_sha256",
+                        "package imports must be resolved before single-package planning",
+                    )
+                })?;
+            Ok(WorkflowPackageLockedImport {
+                import_id: import.import_id.clone(),
+                package_id: import.package_id.clone(),
+                export: import.export.clone(),
+                package_lock_digest_sha256,
+                target,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, WorkflowError>>()?;
     locked_imports.sort_by(|left, right| left.import_id.cmp(&right.import_id));
     let lock = WorkflowPackageLock {
         version: WORKFLOW_PACKAGE_LOCK_VERSION,
@@ -5021,6 +5097,268 @@ pub fn plan_workflow_package(
         package_id: manifest.package_id.clone(),
         members: planned,
         lock,
+    })
+}
+
+fn visit_workflow_package_closure(
+    package_id: &str,
+    depth: usize,
+    sources: &BTreeMap<&str, &WorkflowPackageManifest>,
+    visiting: &mut BTreeSet<String>,
+    planned: &mut BTreeMap<String, WorkflowPackagePlan>,
+    order: &mut Vec<String>,
+    catalog: &mut WorkflowAuthoringCatalogSnapshot,
+) -> Result<(), WorkflowError> {
+    if planned.contains_key(package_id) {
+        return Ok(());
+    }
+    if depth > MAX_WORKFLOW_PACKAGE_DEPTH || !visiting.insert(package_id.to_string()) {
+        return Err(authoring_error(
+            "package_closure.imports",
+            "package import graph is cyclic or exceeds its depth bound",
+        ));
+    }
+    let source = sources.get(package_id).ok_or_else(|| {
+        authoring_error(
+            "package_closure.imports",
+            format!("imported package '{package_id}' is absent from the closure"),
+        )
+    })?;
+    let dependencies = source
+        .imports
+        .iter()
+        .filter(|import| sources.contains_key(import.package_id.as_str()))
+        .map(|import| import.package_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for dependency in dependencies {
+        visit_workflow_package_closure(
+            dependency,
+            depth + 1,
+            sources,
+            visiting,
+            planned,
+            order,
+            catalog,
+        )?;
+    }
+
+    let mut resolved = (*source).clone();
+    for import in &mut resolved.imports {
+        if let Some(imported) = planned.get(&import.package_id) {
+            let imported_source = sources
+                .get(import.package_id.as_str())
+                .expect("planned package has closure source");
+            let member_id = imported_source.exports.get(&import.export).ok_or_else(|| {
+                authoring_error(
+                    "package_closure.imports.export",
+                    format!(
+                        "package '{}' has no export '{}'",
+                        import.package_id, import.export
+                    ),
+                )
+            })?;
+            let member = imported
+                .members
+                .iter()
+                .find(|member| &member.member_id == member_id)
+                .ok_or_else(|| {
+                    authoring_error(
+                        "package_closure.imports.export",
+                        "imported export member is absent from its package plan",
+                    )
+                })?;
+            let target = WorkflowCallTarget::Definition {
+                identity: member.definition_identity.clone(),
+            };
+            let digest = digest_serializable(&imported.lock)?;
+            if import
+                .target
+                .as_ref()
+                .is_some_and(|existing| existing != &target)
+                || import
+                    .package_lock_digest_sha256
+                    .as_ref()
+                    .is_some_and(|existing| existing != &digest)
+            {
+                return Err(authoring_error(
+                    "package_closure.imports",
+                    "exact imported package facts drift from the resolved source closure",
+                ));
+            }
+            import.target = Some(target);
+            import.package_lock_digest_sha256 = Some(digest);
+        } else if import.target.is_none() {
+            return Err(authoring_error(
+                "package_closure.imports",
+                format!(
+                    "imported package '{}' is absent and has no exact published target",
+                    import.package_id
+                ),
+            ));
+        }
+    }
+    let plan = plan_workflow_package(&resolved, catalog)?;
+    for member in &plan.members {
+        catalog.workflow_definitions.insert(
+            member.definition_identity.definition_id.clone(),
+            member.lowering.document.definition.clone(),
+        );
+    }
+    visiting.remove(package_id);
+    order.push(package_id.to_string());
+    planned.insert(package_id.to_string(), plan);
+    Ok(())
+}
+
+/// Resolve and plan one complete bounded transitive package closure from an explicit entry.
+///
+/// Imported packages are planned before their importers. Each source-authored import is replaced
+/// with the exact exported definition identity and imported lock digest before ordinary package
+/// planning. Exact import facts already present in source must match the resolved package and never
+/// cause silent relocking.
+///
+/// # Errors
+///
+/// Returns an error for unsupported closure versions, missing or duplicate packages, package
+/// cycles, excessive depth/bytes/package count, missing exports, stale exact import facts, or any
+/// package planning failure.
+#[allow(clippy::too_many_lines)]
+pub fn plan_workflow_package_closure(
+    closure: &WorkflowPackageClosure,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<WorkflowPackageClosurePlan, WorkflowError> {
+    if closure.version != WORKFLOW_PACKAGE_CLOSURE_VERSION {
+        return Err(authoring_error(
+            "package_closure.version",
+            format!(
+                "unsupported workflow package closure version {}; expected {WORKFLOW_PACKAGE_CLOSURE_VERSION}",
+                closure.version
+            ),
+        ));
+    }
+    validate_authoring_id(
+        "package_closure.entry_package_id",
+        &closure.entry_package_id,
+    )?;
+    if closure.packages.is_empty() || closure.packages.len() > MAX_WORKFLOW_PACKAGE_CLOSURE_PACKAGES
+    {
+        return Err(authoring_error(
+            "package_closure.packages",
+            format!(
+                "package closures require 1..={MAX_WORKFLOW_PACKAGE_CLOSURE_PACKAGES} packages"
+            ),
+        ));
+    }
+    catalog.validate()?;
+    let mut sources = BTreeMap::new();
+    let mut source_names = BTreeSet::new();
+    let mut total_bytes = 0_usize;
+    let mut total_edges = 0_usize;
+    for (index, source) in closure.packages.iter().enumerate() {
+        validate_authoring_id(
+            &format!("package_closure.packages[{index}].package_id"),
+            &source.package_id,
+        )?;
+        if source.package_id != source.manifest.package_id
+            || sources
+                .insert(source.package_id.as_str(), &source.manifest)
+                .is_some()
+            || source
+                .source_name
+                .as_ref()
+                .is_some_and(|name| !source_names.insert(name.as_str()))
+        {
+            return Err(authoring_error(
+                format!("package_closure.packages[{index}]"),
+                "closure package identities must be unique and match their manifests",
+            ));
+        }
+        source.manifest.validate()?;
+        total_edges = total_edges
+            .checked_add(
+                source.manifest.imports.len()
+                    + source
+                        .manifest
+                        .members
+                        .iter()
+                        .map(|member| {
+                            member.dependencies.len() + member.external_dependencies.len()
+                        })
+                        .sum::<usize>(),
+            )
+            .ok_or_else(|| {
+                authoring_error("package_closure.packages", "closure edge count overflow")
+            })?;
+        total_bytes = total_bytes
+            .checked_add(
+                source
+                    .manifest
+                    .members
+                    .iter()
+                    .map(|member| member.source.len())
+                    .sum::<usize>(),
+            )
+            .ok_or_else(|| {
+                authoring_error(
+                    "package_closure.packages",
+                    "closure source byte count overflow",
+                )
+            })?;
+    }
+    if total_edges > MAX_WORKFLOW_PACKAGE_EDGES {
+        return Err(authoring_error(
+            "package_closure.packages",
+            format!("transitive package graph exceeds {MAX_WORKFLOW_PACKAGE_EDGES} edges"),
+        ));
+    }
+    if total_bytes > MAX_WORKFLOW_PACKAGE_SOURCE_BYTES {
+        return Err(authoring_error(
+            "package_closure.packages",
+            format!("transitive package source exceeds {MAX_WORKFLOW_PACKAGE_SOURCE_BYTES} bytes"),
+        ));
+    }
+    if !sources.contains_key(closure.entry_package_id.as_str()) {
+        return Err(authoring_error(
+            "package_closure.entry_package_id",
+            "entry package is absent from the closure",
+        ));
+    }
+
+    let mut planned = BTreeMap::new();
+    let mut order = Vec::new();
+    let mut visiting = BTreeSet::new();
+    let mut resolved_catalog = catalog.clone();
+    visit_workflow_package_closure(
+        &closure.entry_package_id,
+        1,
+        &sources,
+        &mut visiting,
+        &mut planned,
+        &mut order,
+        &mut resolved_catalog,
+    )?;
+    if planned.len() != sources.len() {
+        return Err(authoring_error(
+            "package_closure.packages",
+            "package closure contains unreachable packages outside the entry import graph",
+        ));
+    }
+    let packages = order
+        .into_iter()
+        .map(|package_id| {
+            let plan = planned.remove(&package_id).ok_or_else(|| {
+                authoring_error(
+                    "package_closure.packages",
+                    "closure order references an absent planned package",
+                )
+            })?;
+            Ok(WorkflowPackageClosurePlanEntry { package_id, plan })
+        })
+        .collect::<Result<Vec<_>, WorkflowError>>()?;
+    Ok(WorkflowPackageClosurePlan {
+        version: WORKFLOW_PACKAGE_CLOSURE_VERSION,
+        entry_package_id: closure.entry_package_id.clone(),
+        packages,
     })
 }
 
@@ -5507,8 +5845,9 @@ impl WorkflowPackageLockedImport {
             import_id: self.import_id.clone(),
             package_id: self.package_id.clone(),
             export: self.export.clone(),
-            target: self.target.clone(),
-            package_lock_digest_sha256: self.package_lock_digest_sha256.clone(),
+            manifest: None,
+            target: Some(self.target.clone()),
+            package_lock_digest_sha256: Some(self.package_lock_digest_sha256.clone()),
         }
         .validate(path)
     }
@@ -5678,10 +6017,15 @@ pub struct WorkflowPackageImport {
     pub package_id: String,
     /// Named imported export.
     pub export: String,
-    /// Exact immutable target selected for that export.
-    pub target: WorkflowCallTarget,
+    /// Optional confined relative manifest path used by source resolvers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    /// Exact immutable target selected for that export after closure resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<WorkflowCallTarget>,
     /// Exact imported package lock digest used to detect stale or silently relocked imports.
-    pub package_lock_digest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_lock_digest_sha256: Option<String>,
 }
 
 impl WorkflowPackageImport {
@@ -5689,11 +6033,22 @@ impl WorkflowPackageImport {
         validate_authoring_id(&format!("{path}.import_id"), &self.import_id)?;
         validate_authoring_id(&format!("{path}.package_id"), &self.package_id)?;
         validate_authoring_id(&format!("{path}.export"), &self.export)?;
-        self.target.validate()?;
-        validate_sha256(
-            &format!("{path}.package_lock_digest_sha256"),
-            &self.package_lock_digest_sha256,
-        )
+        if let Some(manifest) = &self.manifest {
+            validate_package_import_source_name(path, manifest)?;
+        }
+        if self.target.is_some() != self.package_lock_digest_sha256.is_some() {
+            return Err(authoring_error(
+                path,
+                "package import target and lock digest must either both be absent or both be present",
+            ));
+        }
+        if let Some(target) = &self.target {
+            target.validate()?;
+        }
+        if let Some(digest) = &self.package_lock_digest_sha256 {
+            validate_sha256(&format!("{path}.package_lock_digest_sha256"), digest)?;
+        }
+        Ok(())
     }
 }
 
@@ -5800,7 +6155,7 @@ impl WorkflowPackageManifest {
         let imported_targets = self
             .imports
             .iter()
-            .map(|import| (import.import_id.as_str(), &import.target))
+            .map(|import| (import.import_id.as_str(), import.target.as_ref()))
             .collect::<BTreeMap<_, _>>();
         let mut by_id = BTreeMap::new();
         let mut source_names = BTreeSet::new();
@@ -5901,6 +6256,28 @@ impl WorkflowPackageManifest {
         }
         validate_workflow_package_dag(&by_id)
     }
+}
+
+fn validate_package_import_source_name(path: &str, value: &str) -> Result<(), WorkflowError> {
+    let candidate = std::path::Path::new(value);
+    let valid_extension = candidate
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| matches!(extension, "json" | "yaml" | "yml" | "toml"));
+    if value.is_empty()
+        || value.len() > 512
+        || candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || !valid_extension
+    {
+        return Err(authoring_error(
+            format!("{path}.manifest"),
+            "import manifest must be a confined relative JSON/YAML/TOML path",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_package_source_name(index: usize, value: &str) -> Result<(), WorkflowError> {
@@ -14775,10 +15152,11 @@ mod tests {
                 import_id: "shared".to_string(),
                 package_id: "external/package".to_string(),
                 export: "main".to_string(),
-                target: WorkflowCallTarget::Definition {
+                manifest: None,
+                target: Some(WorkflowCallTarget::Definition {
                     identity: identity.clone(),
-                },
-                package_lock_digest_sha256: "a".repeat(64),
+                }),
+                package_lock_digest_sha256: Some("a".repeat(64)),
             }],
             members: vec![WorkflowPackageMember {
                 member_id: "parent".to_string(),
@@ -14898,6 +15276,177 @@ mod tests {
             }],
         };
         plan_workflow_package(&manifest, &authoring_catalog()).expect("plan")
+    }
+
+    #[test]
+    fn workflow_package_closure_resolves_recursive_exports_before_importers() {
+        let source = |workflow_id: &str, title: &str, call: Option<&str>| {
+            let step = call.map_or_else(
+                || {
+                    serde_json::json!({
+                        "id": "value",
+                        "input": {"schema": {"type_name": "value/v1", "schema": {"type": "string"}}}
+                    })
+                },
+                |import| {
+                    serde_json::json!({
+                        "id": "value",
+                        "package_call": {"external": import}
+                    })
+                },
+            );
+            serde_json::to_string(&serde_json::json!({
+                "workflow_source_version": WORKFLOW_SOURCE_DOCUMENT_VERSION,
+                "workflow_id": workflow_id,
+                "title": title,
+                "steps": [step]
+            }))
+            .expect("source")
+        };
+        let package = |package_id: &str,
+                       workflow_id: &str,
+                       title: &str,
+                       import: Option<(&str, &str)>| {
+            let imports = import.map_or_else(Vec::new, |(import_id, imported_package)| {
+                vec![WorkflowPackageImport {
+                    import_id: import_id.to_string(),
+                    package_id: imported_package.to_string(),
+                    export: "main".to_string(),
+                    manifest: Some(format!("{imported_package}.workflow-package.json")),
+                    target: None,
+                    package_lock_digest_sha256: None,
+                }]
+            });
+            WorkflowPackageClosureSource {
+                package_id: package_id.to_string(),
+                source_name: Some(format!("{package_id}.workflow-package.json")),
+                manifest: WorkflowPackageManifest {
+                    version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
+                    package_id: package_id.to_string(),
+                    exports: BTreeMap::from([("main".to_string(), "main".to_string())]),
+                    external_dependencies: BTreeMap::new(),
+                    imports,
+                    members: vec![WorkflowPackageMember {
+                        member_id: "main".to_string(),
+                        source_name: "main.workflow.json".to_string(),
+                        format: WorkflowSourceFormat::Json,
+                        source: source(workflow_id, title, import.map(|(import_id, _)| import_id)),
+                        dependencies: Vec::new(),
+                        external_dependencies: import
+                            .map(|(import_id, _)| vec![import_id.to_string()])
+                            .unwrap_or_default(),
+                    }],
+                },
+            }
+        };
+        let closure = WorkflowPackageClosure {
+            version: WORKFLOW_PACKAGE_CLOSURE_VERSION,
+            entry_package_id: "root".to_string(),
+            packages: vec![
+                package("root", "example/root", "Root", Some(("middle", "middle"))),
+                package("middle", "example/middle", "Middle", Some(("leaf", "leaf"))),
+                package("leaf", "example/leaf", "Leaf", None),
+            ],
+        };
+        let plan = plan_workflow_package_closure(&closure, &authoring_catalog())
+            .expect("recursive closure plan");
+        assert_eq!(
+            plan.packages
+                .iter()
+                .map(|package| package.package_id.as_str())
+                .collect::<Vec<_>>(),
+            ["leaf", "middle", "root"]
+        );
+        for package in &plan.packages[1..] {
+            assert_eq!(package.plan.lock.imports.len(), 1);
+            assert!(
+                !package.plan.lock.imports[0]
+                    .package_lock_digest_sha256
+                    .is_empty()
+            );
+            let call: WorkflowCallConfiguration = serde_json::from_value(
+                package.plan.members[0].lowering.document.definition.nodes["value"]
+                    .configuration
+                    .clone(),
+            )
+            .expect("compiled imported call");
+            assert!(matches!(call.target, WorkflowCallTarget::Definition { .. }));
+        }
+    }
+
+    #[test]
+    fn workflow_package_closure_rejects_cycles_missing_exports_drift_and_unreachable_packages() {
+        let source = serde_json::to_string(&serde_json::json!({
+            "workflow_source_version": WORKFLOW_SOURCE_DOCUMENT_VERSION,
+            "workflow_id": "example/member",
+            "title": "Member",
+            "steps": [{
+                "id": "value",
+                "input": {"schema": {"type_name": "value/v1", "schema": {"type": "string"}}}
+            }]
+        }))
+        .expect("source");
+        let package = |id: &str, imported: Option<&str>| WorkflowPackageClosureSource {
+            package_id: id.to_string(),
+            source_name: Some(format!("{id}.workflow-package.json")),
+            manifest: WorkflowPackageManifest {
+                version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
+                package_id: id.to_string(),
+                exports: BTreeMap::from([("main".to_string(), "main".to_string())]),
+                external_dependencies: BTreeMap::new(),
+                imports: imported.map_or_else(Vec::new, |dependency| {
+                    vec![WorkflowPackageImport {
+                        import_id: dependency.to_string(),
+                        package_id: dependency.to_string(),
+                        export: "main".to_string(),
+                        manifest: None,
+                        target: None,
+                        package_lock_digest_sha256: None,
+                    }]
+                }),
+                members: vec![WorkflowPackageMember {
+                    member_id: "main".to_string(),
+                    source_name: "main.workflow.json".to_string(),
+                    format: WorkflowSourceFormat::Json,
+                    source: source.clone(),
+                    dependencies: Vec::new(),
+                    external_dependencies: Vec::new(),
+                }],
+            },
+        };
+        let cycle = WorkflowPackageClosure {
+            version: WORKFLOW_PACKAGE_CLOSURE_VERSION,
+            entry_package_id: "a".to_string(),
+            packages: vec![package("a", Some("b")), package("b", Some("a"))],
+        };
+        assert!(plan_workflow_package_closure(&cycle, &authoring_catalog()).is_err());
+
+        let mut missing = WorkflowPackageClosure {
+            version: WORKFLOW_PACKAGE_CLOSURE_VERSION,
+            entry_package_id: "a".to_string(),
+            packages: vec![package("a", Some("b")), package("b", None)],
+        };
+        missing.packages[0].manifest.imports[0].export = "missing".to_string();
+        assert!(plan_workflow_package_closure(&missing, &authoring_catalog()).is_err());
+
+        let mut drift = missing.clone();
+        drift.packages[0].manifest.imports[0].export = "main".to_string();
+        drift.packages[0].manifest.imports[0].target = Some(WorkflowCallTarget::Definition {
+            identity: WorkflowDefinitionIdentity {
+                kind: "wrong".to_string(),
+                definition_id: "wrong".to_string(),
+                definition_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            },
+        });
+        drift.packages[0].manifest.imports[0].package_lock_digest_sha256 = Some("a".repeat(64));
+        assert!(plan_workflow_package_closure(&drift, &authoring_catalog()).is_err());
+
+        let unreachable = WorkflowPackageClosure {
+            version: WORKFLOW_PACKAGE_CLOSURE_VERSION,
+            entry_package_id: "a".to_string(),
+            packages: vec![package("a", None), package("unused", None)],
+        };
+        assert!(plan_workflow_package_closure(&unreachable, &authoring_catalog()).is_err());
     }
 
     #[test]

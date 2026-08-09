@@ -135,6 +135,7 @@ for contract in \
   'WORKFLOW_AUTHORING_DOCUMENT_VERSION: u32 = 2' \
   'WORKFLOW_PACKAGE_MANIFEST_VERSION: u32 = 3' \
   'WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 3' \
+  'WORKFLOW_PACKAGE_CLOSURE_VERSION: u32 = 1' \
   'WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2'; do
   if ! rg -q "$contract" packages/workflow/src/lib.rs; then
     echo "Composable workflow schema violation: missing clean contract $contract." >&2
@@ -166,6 +167,12 @@ if ! rg -q 'WorkflowValueSelector' packages/workflow/src/lib.rs \
   || ! rg -q 'WorkflowTransformExpression' packages/workflow/src/lib.rs \
   || ! rg -q 'WorkflowStructuredSourceCondition' packages/workflow/src/lib.rs; then
   echo "Composable workflow dataflow violation: typed selectors, transforms, or conditions were removed." >&2
+  violations=1
+fi
+
+if ! rg -q 'plan_workflow_package_closure' packages/workflow/src/lib.rs packages/server/src/lib.rs \
+  || ! rg -q 'read_workflow_package_closure' packages/cli/src/lib.rs; then
+  echo "Composable workflow package violation: recursive closure resolution drifted from public package planning." >&2
   violations=1
 fi
 

@@ -391,16 +391,33 @@ pub(crate) async fn execute_command(
             let manifest: bcode_workflow::WorkflowPackageManifest =
                 serde_json::from_str(&required_arg(&request, "package_manifest")?)
                     .map_err(|error| error.to_string())?;
+            let closure = bcode_workflow::WorkflowPackageClosure {
+                version: bcode_workflow::WORKFLOW_PACKAGE_CLOSURE_VERSION,
+                entry_package_id: manifest.package_id.clone(),
+                packages: vec![bcode_workflow::WorkflowPackageClosureSource {
+                    package_id: manifest.package_id.clone(),
+                    source_name: None,
+                    manifest,
+                }],
+            };
             let validation = client
                 .validate_workflow_package(bcode_ipc::WorkflowPackageComputationRequest {
-                    manifest,
+                    closure,
                     control: bcode_ipc::WorkflowComputationControl::default(),
                 })
                 .await
                 .map_err(|error| error.to_string())?;
+            let entry_plan = validation
+                .plan
+                .packages
+                .iter()
+                .find(|package| package.package_id == validation.plan.entry_package_id)
+                .ok_or_else(|| "planned package closure has no entry package".to_string())?
+                .plan
+                .clone();
             let preview = client
                 .preview_workflow_package(bcode_ipc::WorkflowPackagePreviewRequest {
-                    plan: validation.plan.clone(),
+                    plan: entry_plan,
                     configurations: BTreeMap::new(),
                     control: bcode_ipc::WorkflowComputationControl::default(),
                 })

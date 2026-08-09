@@ -992,6 +992,20 @@ async fn handle_workflow_preset_command(
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CliWorkflowPackageImport {
+    import_id: String,
+    package_id: String,
+    export: String,
+    #[serde(default)]
+    manifest: Option<String>,
+    #[serde(default)]
+    target: Option<bcode_workflow::WorkflowCallTarget>,
+    #[serde(default)]
+    package_lock_digest_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CliWorkflowPackageManifest {
     version: u32,
     package_id: String,
@@ -999,7 +1013,7 @@ struct CliWorkflowPackageManifest {
     #[serde(default)]
     external_dependencies: std::collections::BTreeMap<String, bcode_workflow::WorkflowCallTarget>,
     #[serde(default)]
-    imports: Vec<bcode_workflow::WorkflowPackageImport>,
+    imports: Vec<CliWorkflowPackageImport>,
     members: Vec<CliWorkflowPackageMember>,
 }
 
@@ -1014,6 +1028,7 @@ struct CliWorkflowPackageMember {
     external_dependencies: Vec<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_workflow_package_command(
     client: &BcodeClient,
     command: WorkflowPackageCommand,
@@ -1078,20 +1093,32 @@ async fn handle_workflow_package_command(
         ),
         WorkflowPackageCommand::Publish { .. } => unreachable!("handled above"),
     };
-    let manifest = read_workflow_package_manifest(&manifest_path)?;
+    let closure = read_workflow_package_closure(&manifest_path)?;
     let result = client
         .validate_workflow_package(bcode_ipc::WorkflowPackageComputationRequest {
-            manifest,
+            closure,
             control: workflow_computation_control(operation_id.clone(), timeout_ms),
         })
         .await?;
     match operation {
         PackageCliOperation::Validate => print_json(&result)?,
         PackageCliOperation::Preview => {
+            let entry_plan = result
+                .plan
+                .packages
+                .iter()
+                .find(|package| package.package_id == result.plan.entry_package_id)
+                .ok_or_else(|| {
+                    CliError::InvalidArguments(
+                        "planned package closure has no entry package".to_string(),
+                    )
+                })?
+                .plan
+                .clone();
             print_json(
                 &client
                     .preview_workflow_package(bcode_ipc::WorkflowPackagePreviewRequest {
-                        plan: result.plan,
+                        plan: entry_plan,
                         configurations: std::collections::BTreeMap::new(),
                         control: workflow_computation_control(operation_id, timeout_ms),
                     })
@@ -1099,12 +1126,24 @@ async fn handle_workflow_package_command(
             )?;
         }
         PackageCliOperation::Apply(expected_generations) => {
+            let entry_plan = result
+                .plan
+                .packages
+                .iter()
+                .find(|package| package.package_id == result.plan.entry_package_id)
+                .ok_or_else(|| {
+                    CliError::InvalidArguments(
+                        "planned package closure has no entry package".to_string(),
+                    )
+                })?
+                .plan
+                .clone();
             print_json(
                 &client
                     .apply_workflow_package(bcode_ipc::ApplyWorkflowPackageRequest {
                         request: bcode_workflow::WorkflowPackageApplyRequest {
                             version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
-                            plan: result.plan,
+                            plan: entry_plan,
                             expected_generations,
                         },
                         applied_at_ms: current_unix_time_ms()?,
@@ -1173,6 +1212,7 @@ fn parse_package_expected_generations(
     Ok(parsed)
 }
 
+#[allow(clippy::too_many_lines)]
 fn read_workflow_package_manifest(
     path: &Path,
 ) -> Result<bcode_workflow::WorkflowPackageManifest, CliError> {
@@ -1221,7 +1261,18 @@ fn read_workflow_package_manifest(
         package_id: decoded.package_id,
         exports: decoded.exports,
         external_dependencies: decoded.external_dependencies,
-        imports: decoded.imports,
+        imports: decoded
+            .imports
+            .into_iter()
+            .map(|import| bcode_workflow::WorkflowPackageImport {
+                import_id: import.import_id,
+                package_id: import.package_id,
+                export: import.export,
+                manifest: import.manifest,
+                target: import.target,
+                package_lock_digest_sha256: import.package_lock_digest_sha256,
+            })
+            .collect(),
         members: decoded
             .members
             .into_iter()
@@ -1272,6 +1323,88 @@ fn read_workflow_package_manifest(
         .validate()
         .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
     Ok(manifest)
+}
+
+fn read_workflow_package_closure(
+    path: &Path,
+) -> Result<bcode_workflow::WorkflowPackageClosure, CliError> {
+    if path == Path::new("-") {
+        return Err(CliError::InvalidArguments(
+            "workflow package manifests must be local files so import paths can be confined"
+                .to_string(),
+        ));
+    }
+    let entry_path = fs::canonicalize(path)?;
+    let authorized_root = entry_path.parent().ok_or_else(|| {
+        CliError::InvalidArguments("workflow package manifest has no parent directory".to_string())
+    })?;
+    let mut pending = vec![(entry_path.clone(), 1_usize)];
+    let mut visited = std::collections::BTreeSet::new();
+    let mut packages = Vec::new();
+    while let Some((manifest_path, depth)) = pending.pop() {
+        if depth > bcode_workflow::MAX_WORKFLOW_PACKAGE_DEPTH {
+            return Err(CliError::InvalidArguments(
+                "workflow package import depth exceeds the package bound".to_string(),
+            ));
+        }
+        if !visited.insert(manifest_path.clone()) {
+            continue;
+        }
+        if packages.len() >= bcode_workflow::MAX_WORKFLOW_PACKAGE_CLOSURE_PACKAGES {
+            return Err(CliError::InvalidArguments(
+                "workflow package closure exceeds the package-count bound".to_string(),
+            ));
+        }
+        let manifest = read_workflow_package_manifest(&manifest_path)?;
+        let package_root = manifest_path.parent().ok_or_else(|| {
+            CliError::InvalidArguments(
+                "workflow package manifest has no parent directory".to_string(),
+            )
+        })?;
+        let mut import_paths = Vec::new();
+        for import in &manifest.imports {
+            if let Some(relative) = &import.manifest {
+                let import_path = fs::canonicalize(package_root.join(relative))?;
+                if !import_path.starts_with(authorized_root) || !import_path.is_file() {
+                    return Err(CliError::InvalidArguments(format!(
+                        "workflow package import '{relative}' escapes the authorized package root or is not a file"
+                    )));
+                }
+                import_paths.push(import_path);
+            }
+        }
+        import_paths.sort();
+        pending.extend(
+            import_paths
+                .into_iter()
+                .rev()
+                .map(|import_path| (import_path, depth + 1)),
+        );
+        let source_name = manifest_path
+            .strip_prefix(authorized_root)
+            .map_err(|_| {
+                CliError::InvalidArguments(
+                    "workflow package manifest escapes the authorized package root".to_string(),
+                )
+            })?
+            .to_string_lossy()
+            .into_owned();
+        packages.push(bcode_workflow::WorkflowPackageClosureSource {
+            package_id: manifest.package_id.clone(),
+            source_name: Some(source_name),
+            manifest,
+        });
+    }
+    let entry_package_id = packages
+        .first()
+        .ok_or_else(|| CliError::InvalidArguments("empty workflow package closure".to_string()))?
+        .package_id
+        .clone();
+    Ok(bcode_workflow::WorkflowPackageClosure {
+        version: bcode_workflow::WORKFLOW_PACKAGE_CLOSURE_VERSION,
+        entry_package_id,
+        packages,
+    })
 }
 
 struct WorkflowSourceFile {
@@ -13568,7 +13701,7 @@ mod workflow_source_tests {
         let manifest = temp.path().join("workflow-package.yaml");
         std::fs::write(
             &manifest,
-            "version: 2\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n",
+            "version: 3\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n",
         )
         .expect("manifest");
         let loaded = read_workflow_package_manifest(&manifest).expect("package");
@@ -13582,7 +13715,7 @@ mod workflow_source_tests {
 
         std::fs::write(
             &manifest,
-            "version: 2\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: ../outside.yaml\n",
+            "version: 3\npackage_id: example/package\nexports:\n  main: member\nmembers:\n  - member_id: member\n    source_name: ../outside.yaml\n",
         )
         .expect("escaping manifest");
         assert!(read_workflow_package_manifest(&manifest).is_err());
@@ -13659,6 +13792,84 @@ mod workflow_source_tests {
             plan.members
                 .iter()
                 .all(|member| member.lowering.validation.is_valid())
+        );
+    }
+
+    #[test]
+    fn primary_cli_resolves_recursive_confined_package_manifests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let write_package = |directory: &Path,
+                             package_id: &str,
+                             workflow_id: &str,
+                             import: Option<(&str, &str)>| {
+            std::fs::create_dir_all(directory).expect("package directory");
+            let call = import.map_or_else(
+                || {
+                    "input:\n      schema:\n        type_name: value/v1\n        schema: {type: string}"
+                        .to_string()
+                },
+                |(import_id, _)| format!("package_call: {{external: {import_id}}}"),
+            );
+            std::fs::write(
+                directory.join("main.workflow.yaml"),
+                format!(
+                    "workflow_source_version: 3\nworkflow_id: {workflow_id}\ntitle: {package_id}\nsteps:\n  - id: main\n    {call}\n"
+                ),
+            )
+            .expect("member");
+            let import_yaml = import.map_or_else(String::new, |(import_id, manifest)| {
+                format!(
+                    "imports:\n  - import_id: {import_id}\n    package_id: child\n    export: main\n    manifest: {manifest}\n"
+                )
+            });
+            let external = import.map_or_else(String::new, |(import_id, _)| {
+                format!("    external_dependencies: [{import_id}]\n")
+            });
+            std::fs::write(
+                directory.join("package.workflow-package.yaml"),
+                format!(
+                    "version: 3\npackage_id: {package_id}\nexports:\n  main: main\n{import_yaml}members:\n  - member_id: main\n    source_name: main.workflow.yaml\n{external}"
+                ),
+            )
+            .expect("manifest");
+        };
+        let child = temp.path().join("child");
+        write_package(&child, "child", "example/child", None);
+        write_package(
+            temp.path(),
+            "root",
+            "example/root",
+            Some(("child", "child/package.workflow-package.yaml")),
+        );
+        let closure =
+            read_workflow_package_closure(&temp.path().join("package.workflow-package.yaml"))
+                .expect("recursive package closure");
+        assert_eq!(closure.entry_package_id, "root");
+        assert_eq!(closure.packages.len(), 2);
+        assert!(
+            closure
+                .packages
+                .iter()
+                .any(|package| package.package_id == "child")
+        );
+
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(
+            outside.path().join("package.workflow-package.yaml"),
+            "version: 3\npackage_id: outside\nexports: {main: main}\nmembers: []\n",
+        )
+        .expect("outside manifest");
+        std::fs::write(
+            temp.path().join("package.workflow-package.yaml"),
+            format!(
+                "version: 3\npackage_id: root\nexports: {{main: main}}\nimports:\n  - import_id: outside\n    package_id: outside\n    export: main\n    manifest: {}\nmembers:\n  - member_id: main\n    source_name: main.workflow.yaml\n",
+                outside.path().join("package.workflow-package.yaml").display()
+            ),
+        )
+        .expect("escaping import");
+        assert!(
+            read_workflow_package_closure(&temp.path().join("package.workflow-package.yaml"))
+                .is_err()
         );
     }
 

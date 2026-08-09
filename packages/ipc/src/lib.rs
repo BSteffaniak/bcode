@@ -1564,7 +1564,8 @@ pub struct PublishWorkflowPackageRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowPackageComputationRequest {
-    pub manifest: bcode_workflow::WorkflowPackageManifest,
+    /// One bounded portable transitive package closure.
+    pub closure: bcode_workflow::WorkflowPackageClosure,
     #[serde(default)]
     pub control: WorkflowComputationControl,
 }
@@ -1584,7 +1585,7 @@ pub struct WorkflowPackagePreviewRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowPackageValidationResult {
-    pub plan: bcode_workflow::WorkflowPackagePlan,
+    pub plan: bcode_workflow::WorkflowPackageClosurePlan,
 }
 
 /// One bounded raw-source validation/lowering request.
@@ -4495,23 +4496,29 @@ mod tests {
 
     #[test]
     fn workflow_package_computation_contract_round_trips() {
+        let manifest = bcode_workflow::WorkflowPackageManifest {
+            version: bcode_workflow::WORKFLOW_PACKAGE_MANIFEST_VERSION,
+            package_id: "example/package".to_string(),
+            exports: std::collections::BTreeMap::from([("main".to_string(), "main".to_string())]),
+            external_dependencies: std::collections::BTreeMap::new(),
+            imports: Vec::new(),
+            members: vec![bcode_workflow::WorkflowPackageMember {
+                member_id: "main".to_string(),
+                source_name: "main.json".to_string(),
+                format: bcode_workflow::WorkflowSourceFormat::Json,
+                source: "{}".to_string(),
+                dependencies: Vec::new(),
+                external_dependencies: Vec::new(),
+            }],
+        };
         let request = Request::ValidateWorkflowPackage(WorkflowPackageComputationRequest {
-            manifest: bcode_workflow::WorkflowPackageManifest {
-                version: bcode_workflow::WORKFLOW_PACKAGE_MANIFEST_VERSION,
-                package_id: "example/package".to_string(),
-                exports: std::collections::BTreeMap::from([(
-                    "main".to_string(),
-                    "main".to_string(),
-                )]),
-                external_dependencies: std::collections::BTreeMap::new(),
-                imports: Vec::new(),
-                members: vec![bcode_workflow::WorkflowPackageMember {
-                    member_id: "main".to_string(),
-                    source_name: "main.json".to_string(),
-                    format: bcode_workflow::WorkflowSourceFormat::Json,
-                    source: "{}".to_string(),
-                    dependencies: Vec::new(),
-                    external_dependencies: Vec::new(),
+            closure: bcode_workflow::WorkflowPackageClosure {
+                version: bcode_workflow::WORKFLOW_PACKAGE_CLOSURE_VERSION,
+                entry_package_id: manifest.package_id.clone(),
+                packages: vec![bcode_workflow::WorkflowPackageClosureSource {
+                    package_id: manifest.package_id.clone(),
+                    source_name: Some("package.workflow-package.json".to_string()),
+                    manifest,
                 }],
             },
             control: WorkflowComputationControl::default(),
