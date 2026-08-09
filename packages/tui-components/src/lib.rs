@@ -26,3 +26,5 @@ pub mod source_viewer;
 pub mod terminal_viewer;
 #[cfg(feature = "tool-card")]
 pub mod tool_card;
+#[cfg(feature = "transcript")]
+pub mod transcript;

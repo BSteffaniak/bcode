@@ -103,10 +103,7 @@ impl TranscriptItemLayout {
 #[derive(Debug, Clone, Copy)]
 struct ContainerMetrics {
     left_border: usize,
-    right_border: usize,
     left_padding: usize,
-    right_padding: usize,
-    interior: usize,
     content: usize,
 }
 
@@ -129,132 +126,21 @@ fn container_metrics(
         .saturating_sub(right_padding);
     ContainerMetrics {
         left_border,
-        right_border,
         left_padding,
-        right_padding,
-        interior,
         content,
     }
 }
 
 fn apply_container_recipe(rows: &mut Vec<Line>, start: usize, layout: TranscriptItemLayout) {
-    use super::theme::definition::{ContainerBorder, ContainerWidth};
-
     let Some(presentation) = layout.container else {
         return;
     };
-    if start >= rows.len() {
-        return;
-    }
-
-    let available_width = usize::from(layout.outer_width);
-    let full_metrics = container_metrics(presentation.recipe, available_width);
-    let natural_width = rows[start..]
-        .iter()
-        .map(|line| spans_width(&line.spans))
-        .max()
-        .unwrap_or_default()
-        .saturating_add(full_metrics.left_padding)
-        .saturating_add(full_metrics.right_padding)
-        .saturating_add(full_metrics.left_border)
-        .saturating_add(full_metrics.right_border)
-        .max(1);
-    let container_width = match presentation.recipe.width {
-        ContainerWidth::Full => available_width,
-        ContainerWidth::Content => natural_width.min(available_width),
-    };
-    let metrics = container_metrics(presentation.recipe, container_width);
-
-    let mut container_rows = Vec::new();
-    if matches!(presentation.recipe.border, ContainerBorder::All) {
-        container_rows.push(container_border_line(
-            container_width,
-            '┌',
-            '─',
-            '┐',
-            presentation.style,
-        ));
-    }
-    let vertical_padding = usize::from(presentation.recipe.padding_y);
-    for _ in 0..vertical_padding {
-        container_rows.push(container_content_line(
-            &Line::new(),
-            metrics.content,
-            metrics.left_padding,
-            metrics.interior,
-            presentation,
-        ));
-    }
-    for line in rows.drain(start..) {
-        container_rows.push(container_content_line(
-            &line,
-            metrics.content,
-            metrics.left_padding,
-            metrics.interior,
-            presentation,
-        ));
-    }
-    for _ in 0..vertical_padding {
-        container_rows.push(container_content_line(
-            &Line::new(),
-            metrics.content,
-            metrics.left_padding,
-            metrics.interior,
-            presentation,
-        ));
-    }
-    if matches!(presentation.recipe.border, ContainerBorder::All) {
-        container_rows.push(container_border_line(
-            container_width,
-            '└',
-            '─',
-            '┘',
-            presentation.style,
-        ));
-    }
-    rows.extend(container_rows);
-}
-
-fn container_content_line(
-    line: &Line,
-    content: usize,
-    left_padding: usize,
-    interior: usize,
-    presentation: super::theme::ContainerPresentation,
-) -> Line {
-    use super::theme::definition::ContainerBorder;
-
-    let mut spans = Vec::new();
-    if !matches!(presentation.recipe.border, ContainerBorder::None) {
-        spans.push(Span::styled("│", presentation.style));
-    }
-    spans.push(Span::styled(" ".repeat(left_padding), presentation.style));
-    let line = line
-        .with_fallback_style(presentation.style)
-        .truncate(content);
-    let used_width = spans_width(&line.spans);
-    spans.extend(line.spans);
-    spans.push(Span::styled(
-        " ".repeat(
-            interior
-                .saturating_sub(left_padding)
-                .saturating_sub(used_width),
-        ),
-        presentation.style,
-    ));
-    if matches!(presentation.recipe.border, ContainerBorder::All) {
-        spans.push(Span::styled("│", presentation.style));
-    }
-    Line::from_spans(spans)
-}
-
-fn container_border_line(width: usize, left: char, fill: char, right: char, style: Style) -> Line {
-    let text = match width {
-        0 => String::new(),
-        1 => left.to_string(),
-        _ => format!("{left}{}{right}", fill.to_string().repeat(width - 2)),
-    };
-    Line::from_spans(vec![Span::styled(text, style)])
+    bcode_tui_components::transcript::apply_transcript_container(
+        rows,
+        start,
+        presentation.transcript_style(),
+        layout.outer_width,
+    );
 }
 
 fn transcript_item_container(

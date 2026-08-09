@@ -37,6 +37,7 @@ all = [
     "source-viewer",
     "terminal-viewer",
     "tool-card",
+    "transcript",
 ]
 chrome = ["dep:unicode-segmentation"]
 compact = ["bmux_tui_components/compact"]
@@ -63,3 +64,4 @@ terminal-viewer = [
     "bmux_tui_components/terminal-viewer",
 ]
 tool-card = ["compact"]
+transcript = []

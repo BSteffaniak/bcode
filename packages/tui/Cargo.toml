@@ -48,6 +48,7 @@ bcode_tui_components = { workspace = true, features = [
     "source-preview",
     "source-viewer",
     "terminal-viewer",
+    "transcript",
 ] }
 bcode_workflow = { workspace = true }
 bcode_workflow_store = { workspace = true }

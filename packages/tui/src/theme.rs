@@ -127,6 +127,17 @@ pub struct ContainerPresentation {
     pub style: bmux_tui::style::Style,
 }
 
+impl ContainerPresentation {
+    /// Adapt this resolved presentation into the reusable Bcode transcript recipe.
+    #[must_use]
+    pub fn transcript_style(self) -> bcode_tui_components::transcript::TranscriptContainerStyle {
+        bcode_tui_components::transcript::TranscriptContainerStyle {
+            recipe: self.recipe.into(),
+            style: self.style,
+        }
+    }
+}
+
 /// Resolved bounded transcript/container recipes used only by the TUI renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TranscriptContainerTheme {
