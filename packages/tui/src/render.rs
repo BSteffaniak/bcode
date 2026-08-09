@@ -44,44 +44,126 @@ fn semantic_state_theme() -> super::theme::PresentedTheme {
     })
 }
 
-fn apply_container_recipe(
-    rows: &mut Vec<Line>,
-    start: usize,
-    presentation: super::theme::ContainerPresentation,
-    width: u16,
-) {
-    use super::theme::definition::{ContainerBorder, ContainerLayout, ContainerWidth};
+const MARKDOWN_BODY_INDENT: u16 = 2;
 
-    if matches!(presentation.recipe.layout, ContainerLayout::Plain) || start >= rows.len() {
+#[derive(Debug, Clone, Copy)]
+struct TranscriptItemLayout {
+    outer_width: u16,
+    content_width: u16,
+    content_x: u16,
+    bottom_rows: usize,
+    container: Option<super::theme::ContainerPresentation>,
+}
+
+impl TranscriptItemLayout {
+    fn resolve(theme: &super::theme::PresentedTheme, item: &TranscriptItem, width: u16) -> Self {
+        let container = transcript_item_container(theme, item).filter(|presentation| {
+            !matches!(
+                presentation.recipe.layout,
+                super::theme::definition::ContainerLayout::Plain
+            )
+        });
+        let outer_width = width.max(1);
+        let Some(presentation) = container else {
+            return Self {
+                outer_width,
+                content_width: outer_width,
+                content_x: 0,
+                bottom_rows: 0,
+                container: None,
+            };
+        };
+        let metrics = container_metrics(presentation.recipe, usize::from(outer_width));
+        let border_rows = usize::from(matches!(
+            presentation.recipe.border,
+            super::theme::definition::ContainerBorder::All
+        ));
+        let padding_rows = usize::from(presentation.recipe.padding_y);
+        Self {
+            outer_width,
+            content_width: u16::try_from(metrics.content.max(1)).unwrap_or(u16::MAX),
+            content_x: u16::try_from(metrics.left_border.saturating_add(metrics.left_padding))
+                .unwrap_or(u16::MAX),
+            bottom_rows: border_rows.saturating_add(padding_rows),
+            container: Some(presentation),
+        }
+    }
+
+    fn markdown_width(self) -> u16 {
+        self.content_width
+            .saturating_sub(MARKDOWN_BODY_INDENT)
+            .max(1)
+    }
+
+    const fn markdown_x(self) -> u16 {
+        self.content_x.saturating_add(MARKDOWN_BODY_INDENT)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContainerMetrics {
+    left_border: usize,
+    right_border: usize,
+    left_padding: usize,
+    right_padding: usize,
+    interior: usize,
+    content: usize,
+}
+
+fn container_metrics(
+    recipe: super::theme::definition::ContainerRecipe,
+    container_width: usize,
+) -> ContainerMetrics {
+    use super::theme::definition::ContainerBorder;
+
+    let left_border = usize::from(!matches!(recipe.border, ContainerBorder::None));
+    let right_border = usize::from(matches!(recipe.border, ContainerBorder::All));
+    let interior = container_width
+        .saturating_sub(left_border)
+        .saturating_sub(right_border);
+    let horizontal_padding = usize::from(recipe.padding_x);
+    let left_padding = horizontal_padding.min(interior);
+    let right_padding = horizontal_padding.min(interior.saturating_sub(left_padding));
+    let content = interior
+        .saturating_sub(left_padding)
+        .saturating_sub(right_padding);
+    ContainerMetrics {
+        left_border,
+        right_border,
+        left_padding,
+        right_padding,
+        interior,
+        content,
+    }
+}
+
+fn apply_container_recipe(rows: &mut Vec<Line>, start: usize, layout: TranscriptItemLayout) {
+    use super::theme::definition::{ContainerBorder, ContainerWidth};
+
+    let Some(presentation) = layout.container else {
+        return;
+    };
+    if start >= rows.len() {
         return;
     }
 
-    let available_width = usize::from(width.max(1));
-    let left_border_width =
-        usize::from(!matches!(presentation.recipe.border, ContainerBorder::None));
-    let right_border_width =
-        usize::from(matches!(presentation.recipe.border, ContainerBorder::All));
-    let horizontal_padding = usize::from(presentation.recipe.padding_x);
+    let available_width = usize::from(layout.outer_width);
+    let full_metrics = container_metrics(presentation.recipe, available_width);
     let natural_width = rows[start..]
         .iter()
         .map(|line| spans_width(&line.spans))
         .max()
         .unwrap_or_default()
-        .saturating_add(horizontal_padding.saturating_mul(2))
-        .saturating_add(left_border_width)
-        .saturating_add(right_border_width)
+        .saturating_add(full_metrics.left_padding)
+        .saturating_add(full_metrics.right_padding)
+        .saturating_add(full_metrics.left_border)
+        .saturating_add(full_metrics.right_border)
         .max(1);
     let container_width = match presentation.recipe.width {
         ContainerWidth::Full => available_width,
         ContainerWidth::Content => natural_width.min(available_width),
     };
-    let interior_width = container_width
-        .saturating_sub(left_border_width)
-        .saturating_sub(right_border_width);
-    let left_padding_width = horizontal_padding.min(interior_width);
-    let content_width = interior_width
-        .saturating_sub(left_padding_width)
-        .saturating_sub(horizontal_padding.min(interior_width - left_padding_width));
+    let metrics = container_metrics(presentation.recipe, container_width);
 
     let mut container_rows = Vec::new();
     if matches!(presentation.recipe.border, ContainerBorder::All) {
@@ -97,34 +179,27 @@ fn apply_container_recipe(
     for _ in 0..vertical_padding {
         container_rows.push(container_content_line(
             &Line::new(),
-            content_width,
-            left_padding_width,
-            interior_width,
+            metrics.content,
+            metrics.left_padding,
+            metrics.interior,
             presentation,
         ));
     }
     for line in rows.drain(start..) {
-        let wrapped = if content_width == 0 {
-            vec![Line::new()]
-        } else {
-            line.wrap_character(content_width)
-        };
-        for line in wrapped {
-            container_rows.push(container_content_line(
-                &line,
-                content_width,
-                left_padding_width,
-                interior_width,
-                presentation,
-            ));
-        }
+        container_rows.push(container_content_line(
+            &line,
+            metrics.content,
+            metrics.left_padding,
+            metrics.interior,
+            presentation,
+        ));
     }
     for _ in 0..vertical_padding {
         container_rows.push(container_content_line(
             &Line::new(),
-            content_width,
-            left_padding_width,
-            interior_width,
+            metrics.content,
+            metrics.left_padding,
+            metrics.interior,
             presentation,
         ));
     }
@@ -142,9 +217,9 @@ fn apply_container_recipe(
 
 fn container_content_line(
     line: &Line,
-    content_width: usize,
-    left_padding_width: usize,
-    interior_width: usize,
+    content: usize,
+    left_padding: usize,
+    interior: usize,
     presentation: super::theme::ContainerPresentation,
 ) -> Line {
     use super::theme::definition::ContainerBorder;
@@ -153,19 +228,16 @@ fn container_content_line(
     if !matches!(presentation.recipe.border, ContainerBorder::None) {
         spans.push(Span::styled("│", presentation.style));
     }
-    spans.push(Span::styled(
-        " ".repeat(left_padding_width),
-        presentation.style,
-    ));
+    spans.push(Span::styled(" ".repeat(left_padding), presentation.style));
     let line = line
         .with_fallback_style(presentation.style)
-        .truncate(content_width);
+        .truncate(content);
     let used_width = spans_width(&line.spans);
     spans.extend(line.spans);
     spans.push(Span::styled(
         " ".repeat(
-            interior_width
-                .saturating_sub(left_padding_width)
+            interior
+                .saturating_sub(left_padding)
                 .saturating_sub(used_width),
         ),
         presentation.style,
@@ -185,12 +257,23 @@ fn container_border_line(width: usize, left: char, fill: char, right: char, styl
     Line::from_spans(vec![Span::styled(text, style)])
 }
 
+fn transcript_item_container(
+    theme: &super::theme::PresentedTheme,
+    item: &TranscriptItem,
+) -> Option<super::theme::ContainerPresentation> {
+    match item.kind() {
+        TranscriptItemKind::UserMessage => Some(theme.containers.user),
+        TranscriptItemKind::AssistantMessage => Some(theme.containers.assistant),
+        _ => tool_container_presentation(theme, item),
+    }
+}
+
 fn tool_container_presentation(
+    theme: &super::theme::PresentedTheme,
     item: &TranscriptItem,
 ) -> Option<super::theme::ContainerPresentation> {
     use bcode_session_view_models::ToolInvocationViewStatus;
 
-    let theme = semantic_state_theme();
     match item.kind() {
         TranscriptItemKind::ToolRequest { status, timing, .. } => {
             if timing.timed_out == Some(true) {
@@ -1408,7 +1491,8 @@ pub fn markdown_render_options(
     item: &TranscriptItem,
     width: u16,
 ) -> MarkdownRenderOptions {
-    let mut options = MarkdownRenderOptions::new(width)
+    let layout = TranscriptItemLayout::resolve(&app.presented_theme(), item, width);
+    let mut options = MarkdownRenderOptions::new(layout.markdown_width())
         .with_theme(app.presented_theme().markdown)
         .with_syntax_palette(app.presented_theme().syntax)
         .with_document_id(format!("transcript:{}", item.id().get()))
@@ -1627,6 +1711,7 @@ pub fn transcript_markdown_rich_regions(app: &BmuxApp, area: Rect) -> Vec<Markdo
         ) else {
             continue;
         };
+        let layout = TranscriptItemLayout::resolve(&app.presented_theme(), item, area.width);
         let content_offset = transcript_markdown_content_row_offset(app, item, index, area.width);
         let rendered = transcript_markdown_projection(app, item, area.width);
         for contribution in &rendered.contributions {
@@ -1646,14 +1731,8 @@ pub fn transcript_markdown_rich_regions(app: &BmuxApp, area: Rect) -> Vec<Markdo
                             .saturating_add(content_offset)
                             .saturating_add(usize::from(rect.y));
                         let viewport_row = global_row.checked_sub(top_row)?;
-                        let projected = Rect::new(
-                            area.x.saturating_add(2).saturating_add(rect.x),
-                            area.y
-                                .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX)),
-                            rect.width,
-                            rect.height,
-                        )
-                        .intersection(area);
+                        let projected = markdown_screen_rect(area, viewport_row, layout, *rect)
+                            .intersection(area);
                         (!projected.is_empty()).then_some(projected)
                     })
                 });
@@ -1665,6 +1744,23 @@ pub fn transcript_markdown_rich_regions(app: &BmuxApp, area: Rect) -> Vec<Markdo
         }
     }
     rich
+}
+
+fn markdown_screen_rect(
+    area: Rect,
+    viewport_row: usize,
+    layout: TranscriptItemLayout,
+    rect: bcode_markdown_render::MarkdownCellRect,
+) -> Rect {
+    Rect::new(
+        area.x
+            .saturating_add(layout.markdown_x())
+            .saturating_add(rect.x),
+        area.y
+            .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX)),
+        rect.width,
+        rect.height,
+    )
 }
 
 fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscriptRegion> {
@@ -1684,6 +1780,7 @@ fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscr
         ) else {
             continue;
         };
+        let layout = TranscriptItemLayout::resolve(&app.presented_theme(), item, area.width);
         let content_offset = transcript_markdown_content_row_offset(app, item, index, area.width);
         let rendered = transcript_markdown_projection(app, item, area.width);
         for geometry in &rendered.geometry {
@@ -1704,14 +1801,8 @@ fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscr
                 let Some(viewport_row) = global_row.checked_sub(top_row) else {
                     continue;
                 };
-                let unclipped = Rect::new(
-                    area.x.saturating_add(2).saturating_add(rect.x),
-                    area.y
-                        .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX)),
-                    rect.width,
-                    rect.height,
-                );
-                let clipped = unclipped.intersection(area);
+                let clipped =
+                    markdown_screen_rect(area, viewport_row, layout, *rect).intersection(area);
                 if clipped.is_empty() {
                     continue;
                 }
@@ -1733,7 +1824,7 @@ pub fn transcript_markdown_projection_for_layout(
     width: u16,
 ) -> Option<std::sync::Arc<bcode_markdown_render::MarkdownRenderResult>> {
     (item.text_format() == TextFormat::Markdown).then(|| {
-        let options = markdown_render_options(app, item, width.saturating_sub(2).max(1));
+        let options = markdown_render_options(app, item, width);
         app.transcript_markdown_cache()
             .get(item.id().get(), item.revision(), &options)
             .or_else(|| {
@@ -1766,8 +1857,12 @@ fn transcript_markdown_content_row_offset(
             index,
         )
         .unwrap_or_default();
+    let layout = TranscriptItemLayout::resolve(&app.presented_theme(), item, width);
     let markdown_rows = transcript_markdown_projection(app, item, width).lines.len();
-    entry_rows.saturating_sub(markdown_rows).saturating_sub(1)
+    entry_rows
+        .saturating_sub(markdown_rows)
+        .saturating_sub(1)
+        .saturating_sub(layout.bottom_rows)
 }
 
 #[cfg(test)]
@@ -1777,9 +1872,10 @@ fn markdown_hit_regions_for_item(
     top_row: usize,
     area: Rect,
 ) -> Vec<HitRegion> {
+    let layout = TranscriptItemLayout::resolve(&semantic_state_theme(), item, area.width);
     let rendered = render_markdown(
         item.text(),
-        &MarkdownRenderOptions::new(area.width.saturating_sub(2).max(1))
+        &MarkdownRenderOptions::new(layout.markdown_width())
             .with_document_id(format!("transcript:{}", item.id().get()))
             .with_streaming(item.streaming()),
     );
@@ -1794,6 +1890,7 @@ fn markdown_hit_regions_for_item(
         rows.len()
             .saturating_sub(rendered.lines.len())
             .saturating_sub(1)
+            .saturating_sub(layout.bottom_rows)
     };
     rendered
         .geometry
@@ -1816,14 +1913,8 @@ fn markdown_hit_regions_for_item(
                         .saturating_add(content_offset)
                         .saturating_add(usize::from(rect.y));
                     let viewport_row = global_row.checked_sub(top_row)?;
-                    let clipped = Rect::new(
-                        area.x.saturating_add(2).saturating_add(rect.x),
-                        area.y
-                            .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX)),
-                        rect.width,
-                        rect.height,
-                    )
-                    .intersection(area);
+                    let clipped =
+                        markdown_screen_rect(area, viewport_row, layout, *rect).intersection(area);
                     (!clipped.is_empty()).then(|| {
                         HitRegion::new(
                             format!("markdown:{}:{rect_index}", geometry.contribution_id),
@@ -2084,6 +2175,8 @@ fn push_transcript_item_rows(
     markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
 ) {
     let item_start = rows.len();
+    let layout = TranscriptItemLayout::resolve(&semantic_state_theme(), item, width);
+    let width = layout.content_width;
     if let Some(integrity) = item.stream_integrity() {
         let message = match integrity {
             TranscriptStreamIntegrity::Incomplete => {
@@ -2405,15 +2498,7 @@ fn push_transcript_item_rows(
             );
         }
     }
-    let theme = semantic_state_theme();
-    let presentation = match item.kind() {
-        TranscriptItemKind::UserMessage => Some(theme.containers.user),
-        TranscriptItemKind::AssistantMessage => Some(theme.containers.assistant),
-        _ => tool_container_presentation(item),
-    };
-    if let Some(presentation) = presentation {
-        apply_container_recipe(rows, item_start, presentation, width);
-    }
+    apply_container_recipe(rows, item_start, layout);
 }
 
 fn push_assistant_rows(
@@ -2520,7 +2605,10 @@ fn push_markdown_projection_block(
         ]));
     } else {
         for line in &rendered.lines {
-            let mut spans = vec![Span::styled("  ", muted_style())];
+            let mut spans = vec![Span::styled(
+                " ".repeat(usize::from(MARKDOWN_BODY_INDENT)),
+                muted_style(),
+            )];
             spans.extend(line.spans.iter().cloned());
             rows.push(Line::from_spans(spans));
         }
@@ -2559,13 +2647,16 @@ fn push_markdown_block_with_streaming(
     } else {
         for line in render_markdown_lines(
             body,
-            MarkdownRenderOptions::new(width.saturating_sub(2).max(1))
+            MarkdownRenderOptions::new(width.saturating_sub(MARKDOWN_BODY_INDENT).max(1))
                 .with_theme(semantic_state_theme().markdown)
                 .with_syntax_palette(semantic_state_theme().syntax)
                 .with_streaming(streaming)
                 .with_details_open(markdown_details_open()),
         ) {
-            let mut spans = vec![Span::styled("  ", muted_style())];
+            let mut spans = vec![Span::styled(
+                " ".repeat(usize::from(MARKDOWN_BODY_INDENT)),
+                muted_style(),
+            )];
             spans.extend(line.spans);
             rows.push(Line::from_spans(spans));
         }
@@ -2735,6 +2826,129 @@ fn structured_transcript_recipe_changes_chrome_without_changing_body_text() {
     assert!(text(&structured_rows).contains("same semantic body"));
     assert!(!text(&native_rows).contains('│'));
     assert!(text(&structured_rows).contains('│'));
+}
+
+#[cfg(test)]
+#[test]
+fn structured_transcript_wraps_at_resolved_content_once() {
+    let initial_theme = super::theme::resolve_initial_theme();
+    let initial_theme = initial_theme.presented(initial_theme.accent);
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let structured = catalog
+        .resolve(&super::theme::definition::ThemeSelection::new(
+            "terminal-native-structured",
+        ))
+        .expect("structured resolves");
+    let structured = super::theme::resolved_definition_theme(
+        Some(&structured),
+        super::theme::PENDING_AGENT_METADATA_ACCENT,
+    )
+    .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+    set_plugin_visual_theme(&structured);
+
+    for format in [TextFormat::PlainText, TextFormat::Markdown] {
+        let item = TranscriptItem::with_format("You", "12345678901234567890".to_owned(), format);
+        let rows = transcript_item_rows_from_item(&item, 20, None, TuiDiffViewerConfig::default());
+        let lines = rows
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(lines.iter().any(|line| line == "│   123456789012345"));
+        assert!(lines.iter().any(|line| line == "│   67890"));
+        assert!(!lines.iter().any(|line| line == "│ 678"));
+    }
+    set_plugin_visual_theme(&initial_theme);
+}
+
+#[cfg(test)]
+#[test]
+fn transcript_layout_derives_arbitrary_container_insets() {
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let structured = catalog
+        .resolve(&super::theme::definition::ThemeSelection::new(
+            "terminal-native-structured",
+        ))
+        .expect("structured resolves");
+    let mut structured = super::theme::resolved_definition_theme(
+        Some(&structured),
+        super::theme::PENDING_AGENT_METADATA_ACCENT,
+    )
+    .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+    structured.containers.user.recipe.padding_x = 3;
+    let item = TranscriptItem::with_format("You", "body".to_owned(), TextFormat::Markdown);
+
+    let layout = TranscriptItemLayout::resolve(&structured, &item, 20);
+
+    assert_eq!(layout.content_width, 13);
+    assert_eq!(layout.markdown_width(), 11);
+    assert_eq!(layout.markdown_x(), 6);
+    assert_eq!(
+        plugin_visual_context(layout.content_width, None).width(),
+        13
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn markdown_regions_follow_resolved_container_geometry() {
+    let initial_theme = super::theme::resolve_initial_theme();
+    let initial_theme = initial_theme.presented(initial_theme.accent);
+    let catalog = super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
+    let structured = catalog
+        .resolve(&super::theme::definition::ThemeSelection::new(
+            "terminal-native-structured",
+        ))
+        .expect("structured resolves");
+    let mut structured = super::theme::resolved_definition_theme(
+        Some(&structured),
+        super::theme::PENDING_AGENT_METADATA_ACCENT,
+    )
+    .presented(super::theme::PENDING_AGENT_METADATA_ACCENT);
+    structured.containers.user.recipe.border = super::theme::definition::ContainerBorder::All;
+    structured.containers.user.recipe.padding_x = 3;
+    structured.containers.user.recipe.padding_y = 2;
+    set_plugin_visual_theme(&structured);
+    let item = TranscriptItem::with_format(
+        "You",
+        "[guide](https://example.com)".to_owned(),
+        TextFormat::Markdown,
+    );
+    let width = 20;
+    let rows = transcript_item_rows_from_item(&item, width, None, TuiDiffViewerConfig::default());
+    let (row, column) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(row, line)| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            text.find("guide")
+                .map(|byte| (row, text_display_width(&text[..byte])))
+        })
+        .expect("link is rendered");
+    let area = Rect::new(3, 4, width, u16::try_from(rows.len()).unwrap_or(u16::MAX));
+    let regions = markdown_hit_regions_for_item(&item, 0, 0, area);
+    let region = regions.first().expect("link region");
+
+    assert_eq!(
+        region.area.x,
+        area.x + u16::try_from(column).unwrap_or(u16::MAX)
+    );
+    assert_eq!(
+        region.area.y,
+        area.y + u16::try_from(row).unwrap_or(u16::MAX)
+    );
+    set_plugin_visual_theme(&initial_theme);
 }
 
 #[cfg(test)]

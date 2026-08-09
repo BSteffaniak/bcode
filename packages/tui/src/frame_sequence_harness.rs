@@ -148,11 +148,7 @@ impl TranscriptFrameSequence {
             .cloned()
             .collect::<Vec<_>>();
         for item in &markdown_items {
-            let options = render::markdown_render_options(
-                &self.app,
-                item,
-                self.width.saturating_sub(2).max(1),
-            );
+            let options = render::markdown_render_options(&self.app, item, self.width);
             self.app.transcript_markdown_cache().project(item, options);
         }
         let mut buffer = Buffer::empty(Rect::new(0, 0, self.width, self.height));
@@ -168,11 +164,7 @@ impl TranscriptFrameSequence {
             .iter()
             .filter(|item| item.text_format() == bcode_session_view_models::TextFormat::Markdown)
             .all(|item| {
-                let options = render::markdown_render_options(
-                    &self.app,
-                    item,
-                    self.width.saturating_sub(2).max(1),
-                );
+                let options = render::markdown_render_options(&self.app, item, self.width);
                 self.app
                     .transcript_markdown_cache()
                     .get(item.id().get(), item.revision(), &options)

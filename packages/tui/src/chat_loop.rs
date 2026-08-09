@@ -1690,8 +1690,7 @@ impl ChatLoopState {
         else {
             return;
         };
-        let options =
-            render::markdown_render_options(&chat.app, item, width.saturating_sub(2).max(1));
+        let options = render::markdown_render_options(&chat.app, item, width);
         if chat
             .app
             .transcript_markdown_cache()
