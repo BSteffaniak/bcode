@@ -424,7 +424,6 @@ impl InteractiveSurfaceState {
     }
 
     /// Translate a mouse event from a clipped destination into full-surface coordinates.
-    #[cfg(test)]
     #[must_use]
     pub fn translate_clipped_event(
         event: Event,
@@ -659,6 +658,46 @@ mod tests {
         );
         assert!(bounded_render_destination(Rect::new(0, 0, 0, 20), 20).is_none());
         assert!(bounded_render_destination(Rect::new(0, 0, 80, 20), 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn accepted_limit_question_is_logically_bounded_and_renders_only_a_visible_slice() {
+        let options = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "label": format!("option-{index}"),
+                    "description": "description"
+                })
+            })
+            .collect::<Vec<_>>();
+        let questions = (0..32)
+            .map(|index| {
+                serde_json::json!({
+                    "question": format!("question-{index}"),
+                    "options": options,
+                    "control": "radio",
+                    "selection_mode": "single",
+                    "custom": false,
+                    "custom_mode": "additional",
+                    "required": true
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut surface = question_surface(serde_json::Value::Array(questions)).await;
+
+        assert_eq!(surface.preferred_height(8), MAX_INTERACTION_LOGICAL_ROWS);
+
+        let area = Rect::new(0, 0, 8, 600);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        frame.fill(area, ".", bmux_tui::prelude::Style::new());
+        surface.render_slice(MAX_INTERACTION_LOGICAL_ROWS, 0, area, &mut frame);
+
+        assert_ne!(buffer.row_symbols(0).as_deref(), Some("........"));
+        assert_eq!(
+            buffer.row_symbols(MAX_INTERACTION_VISIBLE_ROWS).as_deref(),
+            Some("........")
+        );
     }
 
     #[tokio::test]

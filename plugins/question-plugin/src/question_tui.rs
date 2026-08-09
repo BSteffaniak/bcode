@@ -28,8 +28,7 @@ const DESCRIPTION_INDENT: &str = "        ";
 pub struct QuestionTerminalRenderer {
     last_area: Rect,
     controls: Vec<ControlRegion>,
-    viewport_offset: u16,
-    content_height: u16,
+    logical_origin: u16,
     custom_inputs: BTreeMap<usize, TextInputState>,
     custom_areas: BTreeMap<usize, Rect>,
     pending_custom_mouse_focus: Option<usize>,
@@ -53,21 +52,21 @@ impl QuestionTerminalRenderer {
     }
 
     fn screen_y(&self, content_y: u16) -> Option<u16> {
-        let visible_y = content_y.checked_sub(self.viewport_offset)?;
+        let visible_y = content_y.checked_sub(self.logical_origin)?;
         (visible_y < self.last_area.height).then(|| self.last_area.y.saturating_add(visible_y))
     }
 
     fn control_area(&self, content_y: u16, height: u16) -> Option<Rect> {
-        let first_y = content_y.max(self.viewport_offset);
+        let first_y = content_y.max(self.logical_origin);
         let last_y = content_y
             .saturating_add(height)
-            .min(self.viewport_offset.saturating_add(self.last_area.height));
+            .min(self.logical_origin.saturating_add(self.last_area.height));
         (first_y < last_y).then(|| {
             Rect::new(
                 self.last_area.x,
                 self.last_area
                     .y
-                    .saturating_add(first_y.saturating_sub(self.viewport_offset)),
+                    .saturating_add(first_y.saturating_sub(self.logical_origin)),
                 self.last_area.width,
                 last_y.saturating_sub(first_y),
             )
@@ -355,13 +354,13 @@ impl QuestionTerminalRenderer {
             }
         }
         let text = state.buffer().text();
-        if text != before {
+        if text == before {
+            TerminalInteractionInput::Consumed
+        } else {
             TerminalInteractionInput::Semantic(InteractionInput::Change {
                 control_id: custom_control_id(question_index),
                 value: InteractionValue::String(text.to_owned()),
             })
-        } else {
-            TerminalInteractionInput::Consumed
         }
     }
 
@@ -488,23 +487,6 @@ impl QuestionTerminalRenderer {
             QuestionFocusTarget::Option { .. } | QuestionFocusTarget::Custom { .. } => (0, 1),
         }
     }
-
-    fn ensure_focus_visible(&mut self, snapshot: &QuestionSnapshot, width: u16, height: u16) {
-        self.content_height = Self::content_height(snapshot, width);
-        if height == 0 {
-            self.viewport_offset = 0;
-            return;
-        }
-        let (focus_start, focus_end) = Self::focused_content_range(snapshot, width);
-        if focus_start < self.viewport_offset {
-            self.viewport_offset = focus_start;
-        } else if focus_end > self.viewport_offset.saturating_add(height) {
-            self.viewport_offset = focus_end.saturating_sub(height);
-        }
-        self.viewport_offset = self
-            .viewport_offset
-            .min(self.content_height.saturating_sub(height));
-    }
 }
 
 impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerminalRenderer {
@@ -535,7 +517,6 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         self.last_area = area;
         self.controls.clear();
         self.custom_areas.clear();
-        self.ensure_focus_visible(snapshot, area.width, area.height);
         let mut content_y = 0;
         self.render_title(frame, &mut content_y);
         if let Some(error) = &snapshot.validation_error {
@@ -549,19 +530,6 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
             self.render_question(frame, &mut content_y, snapshot, question_index);
         }
         self.render_actions(frame, &mut content_y, snapshot);
-        if self.viewport_offset > 0 && area.height > 0 {
-            frame.write_line(
-                Rect::new(area.x, area.y, area.width, 1),
-                &Line::from_spans(vec![Span::styled("↑ more", Style::new().fg(Color::Yellow))]),
-            );
-        }
-        if self.viewport_offset.saturating_add(area.height) < self.content_height && area.height > 0
-        {
-            frame.write_line(
-                Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-                &Line::from_spans(vec![Span::styled("↓ more", Style::new().fg(Color::Yellow))]),
-            );
-        }
     }
 
     fn render_slice(
@@ -572,10 +540,9 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         destination: Rect,
         frame: &mut Frame<'_>,
     ) {
-        let previous = self.viewport_offset;
-        self.viewport_offset = logical_row_offset.min(logical_height.saturating_sub(1));
+        self.logical_origin = logical_row_offset.min(logical_height.saturating_sub(1));
         self.render(snapshot, destination, frame);
-        self.viewport_offset = previous;
+        self.logical_origin = 0;
     }
 
     fn focused_row_range(
@@ -1106,7 +1073,7 @@ mod tests {
         assert!(height > 8);
         let buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 12, 8));
         assert_eq!(buffer.area(), Rect::new(0, 0, 12, 8));
-        assert!(rendered_text(&buffer).contains("more"));
+        assert!(!rendered_text(&buffer).contains("more"));
         assert!(renderer.controls.iter().all(|control| {
             control.area.width > 0
                 && control.area.height > 0
@@ -1118,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_multi_question_form_keeps_focused_controls_visible() {
+    fn transcript_slices_use_stable_logical_coordinates_without_focus_scrolling() {
         let request = NormalizedQuestionRequest {
             questions: vec![
                 question(
@@ -1139,7 +1106,7 @@ mod tests {
         let mut renderer = QuestionTerminalRenderer::default();
         let area = Rect::new(0, 0, 24, 7);
         let initial = render_snapshot(&mut renderer, &controller.snapshot(), area);
-        assert!(rendered_text(&initial).contains("↓ more"));
+        assert!(!rendered_text(&initial).contains("more"));
 
         for _ in 0..6 {
             controller.handle_input(InteractionInput::Navigate {
@@ -1148,14 +1115,15 @@ mod tests {
         }
         let focused = controller.snapshot();
         assert_eq!(focused.focus, QuestionFocusTarget::Submit);
-        let scrolled = render_snapshot(&mut renderer, &focused, area);
-        assert!(renderer.viewport_offset > 0);
-        assert!(renderer.controls.iter().any(|control| {
-            control.control_id.as_str() == "submit"
-                && control.area.y >= area.y
-                && control.area.bottom() <= area.bottom()
-        }));
-        assert!(rendered_text(&scrolled).contains("↑ more"));
+        let repeated = render_snapshot(&mut renderer, &focused, area);
+        assert_eq!(rendered_text(&initial), rendered_text(&repeated));
+
+        let logical_height = renderer.preferred_height(&focused, area.width);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        renderer.render_slice(&focused, logical_height, 7, area, &mut frame);
+        assert_ne!(rendered_text(&initial), rendered_text(&buffer));
+        assert!(!rendered_text(&buffer).contains("more"));
     }
 
     #[test]

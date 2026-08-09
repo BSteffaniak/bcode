@@ -653,6 +653,54 @@ mod tests {
     }
 
     #[test]
+    fn transcript_viewport_reaches_before_through_and_after_logical_interaction_span() {
+        let mut cache = TranscriptLayoutCache::default();
+        cache.sync(TranscriptLayoutSpec {
+            width: 80,
+            fingerprint: TranscriptLayoutFingerprint::new("interaction-span".to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new(
+                "interaction-span-structure".to_owned(),
+            ),
+            transcript_len: 3,
+            pending_len: 0,
+            transcript_signature: |index| TranscriptLayoutSignature::new(format!("item-{index}")),
+            transcript_rows: |index| match index {
+                0 => vec![Line::from("before")].into(),
+                1 => TranscriptLayoutRows::BlankSpan(20),
+                2 => vec![Line::from("after")].into(),
+                _ => unreachable!("three transcript entries"),
+            },
+            transcript_invocation_id: |_| None,
+            pending_signature: |_| unreachable!("no pending entries"),
+            pending_rows: |_| unreachable!("no pending entries"),
+            history_banner_signature: || None,
+            history_banner_rows: || Vec::new().into(),
+            reset: || false,
+        });
+
+        let top = cache.visible_lines_from_top(0, 4);
+        assert_eq!((top[0].entry_index, top[0].row_in_entry), (0, 0));
+        assert_eq!((top[1].entry_index, top[1].row_in_entry), (1, 0));
+
+        let middle = cache.visible_lines_from_top(8, 4);
+        assert!(
+            middle
+                .iter()
+                .all(|line| line.entry_index == 1 && (7..11).contains(&line.row_in_entry))
+        );
+
+        let bottom = cache.visible_lines_from_top(19, 4);
+        assert_eq!(
+            bottom
+                .iter()
+                .map(|line| (line.entry_index, line.row_in_entry))
+                .collect::<Vec<_>>(),
+            [(1, 18), (1, 19), (2, 0)]
+        );
+        assert!(cache.visible_lines_from_top(22, 4).is_empty());
+    }
+
+    #[test]
     fn cache_hits_are_recorded_without_scanning() {
         let mut cache = TranscriptLayoutCache::default();
         cache.record_cache_hit(7);

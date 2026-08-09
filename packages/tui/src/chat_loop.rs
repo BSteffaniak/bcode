@@ -192,6 +192,20 @@ pub enum WorktreeCreateDialogRootOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractiveSurfacePlacement {
+    Transcript,
+    Pinned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractiveSurfaceGeometry {
+    pub placement: InteractiveSurfacePlacement,
+    pub logical_height: u16,
+    pub visible_logical_offset: u16,
+    pub destination: Rect,
+}
+
 pub struct ChatLoopState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
@@ -212,7 +226,7 @@ pub struct ChatLoopState {
     worktree_create_dialog: Option<super::wt_create_dialog::WorktreeCreateDialog>,
     ralph_start_dialog: Option<super::ralph_start_dialog::RalphStartDialog>,
     interactive_surface: Option<InteractiveSurfaceState>,
-    interactive_surface_area: Option<Rect>,
+    interactive_surface_geometry: Option<InteractiveSurfaceGeometry>,
     session_picker: Option<super::session_picker::SessionPickerApp>,
     interactive_surface_queue: InteractiveSurfaceQueue,
     artifact_stream: ArtifactStreamCoordinator,
@@ -258,7 +272,7 @@ impl ChatLoopState {
             worktree_create_dialog: None,
             ralph_start_dialog: None,
             interactive_surface: None,
-            interactive_surface_area: None,
+            interactive_surface_geometry: None,
             session_picker: None,
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
@@ -1378,8 +1392,10 @@ impl ChatLoopState {
         }
     }
 
-    pub const fn active_interactive_surface_area(&self) -> Option<Rect> {
-        self.interactive_surface_area
+    pub(super) const fn active_interactive_surface_geometry(
+        &self,
+    ) -> Option<InteractiveSurfaceGeometry> {
+        self.interactive_surface_geometry
     }
 
     pub const fn has_session_picker(&self) -> bool {
@@ -1676,6 +1692,26 @@ impl ChatLoopState {
         &mut self,
         event: &Event,
     ) -> InteractiveSurfaceEventOutcome {
+        let translated;
+        let event = if matches!(event, Event::Mouse(_)) {
+            let Some(geometry) = self.interactive_surface_geometry else {
+                return InteractiveSurfaceEventOutcome::Ignored;
+            };
+            if geometry.destination.is_empty()
+                || !matches!(event, Event::Mouse(mouse) if geometry.destination.contains(mouse.position))
+            {
+                return InteractiveSurfaceEventOutcome::Ignored;
+            }
+            translated = InteractiveSurfaceState::translate_clipped_event(
+                event.clone(),
+                Rect::new(0, 0, geometry.destination.width, geometry.logical_height),
+                geometry.visible_logical_offset,
+                geometry.destination,
+            );
+            &translated
+        } else {
+            event
+        };
         self.interactive_surface
             .as_mut()
             .map_or(InteractiveSurfaceEventOutcome::Ignored, |surface| {
@@ -1699,6 +1735,14 @@ impl ChatLoopState {
     #[cfg(test)]
     pub fn install_interactive_surface_for_test(&mut self, surface: InteractiveSurfaceState) {
         self.interactive_surface = Some(surface);
+    }
+
+    #[cfg(test)]
+    pub fn set_interactive_surface_geometry_for_test(
+        &mut self,
+        geometry: Option<InteractiveSurfaceGeometry>,
+    ) {
+        self.interactive_surface_geometry = geometry;
     }
 
     pub fn complete_interactive_surface_resolution(&mut self, resolved: bool) {
@@ -4077,10 +4121,30 @@ pub fn draw_chat_frame<W: Write>(
             super::wt_create_dialog_render::render_dialog(dialog, frame, theme);
         }
     })?;
-    loop_state.interactive_surface_area = loop_state
-        .interactive_surface
-        .as_ref()
-        .map(|_| surface_area);
+    loop_state.interactive_surface_geometry = loop_state.interactive_surface.as_ref().map(|_| {
+        if pinned {
+            InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Pinned,
+                logical_height: interaction_rows.unwrap_or(surface_area.height),
+                visible_logical_offset: 0,
+                destination: surface_area,
+            }
+        } else if let Some(placement) = inline_placement {
+            InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Transcript,
+                logical_height: placement.full_area.height,
+                visible_logical_offset: placement.visible_content_offset,
+                destination: placement.destination,
+            }
+        } else {
+            InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Transcript,
+                logical_height: interaction_rows.unwrap_or(0),
+                visible_logical_offset: 0,
+                destination: surface_area,
+            }
+        }
+    });
     loop_state.telemetry.record_histogram(
         "tui.frame.changed_cells",
         u64::try_from(draw_stats.changed_cells).unwrap_or(u64::MAX),

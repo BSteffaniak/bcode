@@ -1726,8 +1726,8 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 let route_to_surface = match event {
                     Event::Mouse(mouse) if self.loop_state.has_interactive_surface() => self
                         .loop_state
-                        .active_interactive_surface_area()
-                        .is_some_and(|area| area.contains(mouse.position)),
+                        .active_interactive_surface_geometry()
+                        .is_some_and(|geometry| geometry.destination.contains(mouse.position)),
                     _ => true,
                 };
                 if route_to_surface {
@@ -2349,6 +2349,94 @@ mod tests {
         )
         .await
         .expect("question surface")
+    }
+
+    #[tokio::test]
+    async fn committed_geometry_translates_clipped_mouse_and_rejects_outside_hits() {
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingSurface(Arc<Mutex<Vec<bmux_tui::geometry::Point>>>);
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for RecordingSurface {
+            fn id(&self) -> &'static str {
+                "recording"
+            }
+
+            fn title(&self) -> &'static str {
+                "recording"
+            }
+
+            fn render(
+                &mut self,
+                _area: bmux_tui::geometry::Rect,
+                _frame: &mut bmux_tui::frame::Frame<'_>,
+            ) {
+            }
+
+            fn handle_event(
+                &mut self,
+                event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                if let bmux_tui::event::Event::Mouse(mouse) = event {
+                    self.0.lock().expect("points").push(mouse.position);
+                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                } else {
+                    bcode_plugin_sdk::tui::PluginTuiAction::None
+                }
+            }
+        }
+
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut loop_state = super::super::chat_loop::ChatLoopState::new(&client, &passive, false);
+        let points = Arc::new(Mutex::new(Vec::new()));
+        loop_state.install_interactive_surface_for_test(
+            super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                "interaction",
+                Box::new(RecordingSurface(Arc::clone(&points))),
+                &super::super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+            ),
+        );
+        loop_state.set_interactive_surface_geometry_for_test(Some(
+            super::super::chat_loop::InteractiveSurfaceGeometry {
+                placement: super::super::chat_loop::InteractiveSurfacePlacement::Transcript,
+                logical_height: 30,
+                visible_logical_offset: 10,
+                destination: bmux_tui::geometry::Rect::new(5, 7, 20, 4),
+            },
+        ));
+
+        let inside = bmux_tui::event::Event::Mouse(bmux_tui::event::MouseEvent::new(
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::geometry::Point::new(8, 9),
+        ));
+        assert!(matches!(
+            loop_state.handle_interactive_surface_event(&inside),
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
+        ));
+        assert_eq!(
+            *points.lock().expect("points"),
+            [bmux_tui::geometry::Point::new(3, 12)]
+        );
+
+        let outside = bmux_tui::event::Event::Mouse(bmux_tui::event::MouseEvent::new(
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::geometry::Point::new(4, 9),
+        ));
+        assert!(matches!(
+            loop_state.handle_interactive_surface_event(&outside),
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Ignored
+        ));
+        assert_eq!(points.lock().expect("points").len(), 1);
+
+        loop_state.set_interactive_surface_geometry_for_test(None);
+        assert!(matches!(
+            loop_state.handle_interactive_surface_event(&inside),
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Ignored
+        ));
     }
 
     #[tokio::test]

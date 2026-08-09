@@ -1088,6 +1088,9 @@ fn terminal_permission_item_from_shared(
 }
 
 fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -> TranscriptItem {
+    const MAX_INTERACTION_LABEL_CHARS: usize = 256;
+    const MAX_INTERACTION_DETAIL_CHARS: usize = 2_000;
+
     let (state, detail) = match interaction.state {
         bcode_session_view_models::InteractionViewState::Pending if interaction.required => (
             "response required",
@@ -1115,18 +1118,25 @@ fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -
             ("cancelled", "The interaction is closed.")
         }
     };
-    let label = interaction.title.as_deref().unwrap_or(&interaction.kind);
+    let label = truncate_block(
+        interaction.title.as_deref().unwrap_or(&interaction.kind),
+        MAX_INTERACTION_LABEL_CHARS,
+    );
     let text = if interaction.resolved {
         interaction.resolution.as_ref().map_or_else(
             || format!("{label} ({state})"),
             |resolution| {
                 let resolution = serde_json::to_string_pretty(resolution)
                     .unwrap_or_else(|_| format!("{resolution:?}"));
+                let resolution = truncate_block(&resolution, MAX_INTERACTION_DETAIL_CHARS);
                 format!("{label} ({state})\n{resolution}")
             },
         )
     } else {
-        let detail = interaction.status_detail.as_deref().unwrap_or(detail);
+        let detail = truncate_block(
+            interaction.status_detail.as_deref().unwrap_or(detail),
+            MAX_INTERACTION_DETAIL_CHARS,
+        );
         format!("{label} ({state})\n{detail}")
     };
     TranscriptItem::with_kind(
@@ -1457,6 +1467,31 @@ mod tests {
             assert!(!item.text().contains("not"));
             assert!(!item.text().contains(&"x".repeat(64)));
         }
+    }
+
+    #[test]
+    fn hostile_unknown_interaction_metadata_degrades_to_bounded_ordinary_text() {
+        let interaction = InteractionViewSummary {
+            producer_id: Some("future.plugin".to_owned()),
+            exchange_schema: None,
+            exchange_schema_version: None,
+            interaction_id: "hostile".to_owned(),
+            kind: "k".repeat(100_000),
+            tool_call_id: None,
+            title: Some("t".repeat(100_000)),
+            required: true,
+            snapshot: Some(serde_json::json!({"ignored": "x".repeat(1_000_000)})),
+            state: bcode_session_view_models::InteractionViewState::ActionError,
+            status_detail: Some("d".repeat(100_000)),
+            resolved: false,
+            resolution: None,
+        };
+
+        let item = terminal_interaction_item_from_shared(&interaction);
+        assert!(item.text().chars().count() <= 2_300);
+        assert!(item.text().contains("action error"));
+        assert!(!item.text().contains(&"x".repeat(64)));
+        assert_eq!(item.text_format(), TextFormat::PlainText);
     }
 
     #[test]
