@@ -1285,7 +1285,9 @@ impl BcodeRuntimeModel {
             .action_for_key(super::keymap::BmuxScope::Chat, stroke)?;
         (matches!(
             action,
-            super::keymap::BmuxAction::AppExit | super::keymap::BmuxAction::AppInterrupt
+            super::keymap::BmuxAction::AppExit
+                | super::keymap::BmuxAction::AppInterrupt
+                | super::keymap::BmuxAction::InteractionFocusActive
         ) || matches!(
             action,
             super::keymap::BmuxAction::TranscriptPageUp
@@ -1698,6 +1700,18 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                 return Ok(bmux_tui_runtime::Update::redraw().with_command(command));
                             }
                             super::keymap::BmuxAction::AppExit => self.chat.app.request_exit(),
+                            super::keymap::BmuxAction::InteractionFocusActive => {
+                                if self.chat.app.tui_config().interactions.placement
+                                    == bcode_config::TuiInteractionPlacement::Transcript
+                                    && let Some(interaction_id) =
+                                        self.loop_state.active_interactive_surface_id()
+                                {
+                                    let _changed = self
+                                        .chat
+                                        .app
+                                        .focus_interaction_in_transcript(interaction_id);
+                                }
+                            }
                             action => {
                                 let _handled = super::input::handle_chat_action(
                                     &mut self.chat.app,
@@ -2353,6 +2367,58 @@ mod tests {
         )
         .await
         .expect("question surface")
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_preserves_surface_and_clears_only_pending_resolution() {
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut loop_state = super::super::chat_loop::ChatLoopState::new(&client, &passive, false);
+        loop_state.install_interactive_surface_for_test(
+            question_surface_for_root_test(settings.keymap()).await,
+        );
+        assert!(matches!(
+            loop_state.handle_interactive_surface_event(&bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Enter,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            )),
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
+        ));
+        let tab = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Tab,
+            modifiers: bmux_keyboard::Modifiers::NONE,
+        });
+        let enter = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Enter,
+            modifiers: bmux_keyboard::Modifiers::NONE,
+        });
+        let _ = loop_state.handle_interactive_surface_event(&tab);
+        let _ = loop_state.handle_interactive_surface_event(&tab);
+        assert!(matches!(
+            loop_state.handle_interactive_surface_event(&enter),
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Resolved(_)
+        ));
+        assert!(loop_state.latched_surface_outcome_for_test().is_some());
+
+        loop_state.complete_interactive_surface_resolution(false);
+        assert_eq!(
+            loop_state.active_interactive_surface_id(),
+            Some("question-root-test")
+        );
+        assert!(loop_state.latched_surface_outcome_for_test().is_none());
+
+        let _ = loop_state.handle_interactive_surface_event(&enter);
+        assert!(loop_state.latched_surface_outcome_for_test().is_some());
+        loop_state.complete_interactive_surface_resolution(true);
+        assert!(loop_state.active_interactive_surface_id().is_none());
     }
 
     #[tokio::test]

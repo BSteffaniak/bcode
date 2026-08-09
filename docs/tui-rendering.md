@@ -242,10 +242,14 @@ Placement and off-screen focus are renderer-owned and apply on configuration rel
 controller or exchange state. Interaction values and validation remain plugin-owned. Host-configured
 composer edit, selection, newline, and submit bindings are adapted through the terminal plugin host.
 
-Inline interaction rows use the existing indexed transcript layout and viewport. Partial visibility
-is rendered through a scratch frame capped at 512 rows and 131,072 cells and clipped into terminal
-coordinates, including cursor and mouse translation. Only one queued interaction is active at a
-time; authoritative resolution removes active, opening, or queued state without reopening later.
+Inline interaction rows use the existing indexed transcript layout and viewport. Their complete
+bounded logical extent is retained as a sparse span, while each frame directly renders only the
+visible logical slice. There is no interaction-owned whole-question viewport or full-height scratch
+buffer. The host caps logical extent at 4,096 rows and visible work at 512 rows and 131,072 cells.
+Committed geometry is shared by drawing, cursor projection, hit testing, and mouse translation.
+Pinned mode uses a host-owned viewport keyed by interaction identity and the renderer's focused-row
+hint. Only one queued interaction is active at a time; authoritative resolution removes active,
+opening, or queued state without reopening later.
 Question requests are bounded to 32 questions, 100 options per question, 16 KiB question text, 4 KiB
 option labels, and 64 KiB custom answers; custom inputs display at most six content rows at once.
 Unknown or disabled adapters remain bounded static transcript rows with required/optional status.

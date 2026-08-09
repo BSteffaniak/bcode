@@ -59,9 +59,10 @@ if rg -n 'payload\.get\("status"\)|resolution\.get\("status"\)' \
   violations=1
 fi
 
-if rg -n 'surface_kind' packages/session-view packages/session-view/models --glob '*.rs' \
+if rg -n 'surface_kind|viewport_offset|visible_logical_offset|interactive_surface_geometry|pinned_interaction_viewport' \
+  packages/session-view packages/session-view/models --glob '*.rs' \
   >/tmp/bcode-session-view-native-surface.txt; then
-  echo "Runtime architecture violation: shared session-view contracts contain renderer-native surface identity." >&2
+  echo "Runtime architecture violation: shared session-view contracts contain renderer-native surface identity or terminal geometry." >&2
   cat /tmp/bcode-session-view-native-surface.txt >&2
   violations=1
 fi

@@ -2076,6 +2076,23 @@ impl BmuxApp {
         })
     }
 
+    /// Restore one active interaction to the top of the transcript viewport.
+    pub fn focus_interaction_in_transcript(&mut self, interaction_id: &str) -> bool {
+        let Some(index) = self.interaction_transcript_index(interaction_id) else {
+            return false;
+        };
+        let Some(top_row) = self
+            .transcript_layout
+            .entry_start_row(VisibleTranscriptSource::Transcript, index)
+        else {
+            return false;
+        };
+        self.transcript_scroll_animation = None;
+        self.scroll_mode = TranscriptScrollMode::ManualDetached;
+        self.viewport.follow_anchor(top_row);
+        true
+    }
+
     /// Return global transcript row range for one terminal transcript item.
     #[must_use]
     pub fn transcript_item_row_range(&self, index: usize) -> Option<std::ops::Range<usize>> {

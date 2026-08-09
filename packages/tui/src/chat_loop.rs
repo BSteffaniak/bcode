@@ -1758,6 +1758,22 @@ impl ChatLoopState {
         self.interactive_surface_geometry = geometry;
     }
 
+    #[cfg(test)]
+    pub fn latched_surface_outcome_for_test(
+        &mut self,
+    ) -> Option<bcode_session_models::ToolExchangeResolution> {
+        match self
+            .interactive_surface
+            .as_mut()?
+            .handle_event_outcome(&Event::Tick)
+        {
+            InteractiveSurfaceEventOutcome::Resolved(resolution) => Some(resolution),
+            InteractiveSurfaceEventOutcome::Ignored | InteractiveSurfaceEventOutcome::Consumed => {
+                None
+            }
+        }
+    }
+
     pub fn complete_interactive_surface_resolution(&mut self, resolved: bool) {
         if resolved {
             self.interactive_surface = None;
@@ -2590,6 +2606,7 @@ pub fn apply_config_result(
 ) {
     match config {
         Ok(config) => {
+            let previous_interactions = chat.app.tui_config().interactions;
             settings.apply_tui_config(&config.tui);
             settings.set_metrics_enabled(config.metrics.enabled);
             loop_state.telemetry.set_enabled(config.metrics.enabled);
@@ -2612,6 +2629,10 @@ pub fn apply_config_result(
                     .set_status(format!("plugin presentation unavailable: {error}")),
             }
             chat.app.apply_tui_config(config.tui.clone());
+            if previous_interactions.placement != config.tui.interactions.placement {
+                loop_state.pinned_interaction_viewport = None;
+                loop_state.interactive_surface_geometry = None;
+            }
             match theme_selection {
                 Ok(Some(theme_id)) if !chat.app.apply_theme(&theme_id) => {
                     chat.app.set_status(format!(

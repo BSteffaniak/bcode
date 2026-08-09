@@ -41,14 +41,17 @@ Terminal rendering is optional and separate:
 registry.register_interactive_surface::<MyInteraction, MyTerminalRenderer>();
 ```
 
-`MyTerminalRenderer` implements `TerminalInteractionRenderer<MyInteraction>` and is only responsible
+`MyTerminalRenderer` implements `TerminalInteractionRenderer<MyInteraction>` and is responsible
 for:
 
-* calculating bounded height from a snapshot
-* rendering a snapshot
-* mapping terminal events to `InteractionInput`
+* reporting the complete logical row extent at a width
+* rendering a bounded logical row slice using stable full-content coordinates
+* optionally reporting the focused control's logical row range
+* mapping terminal events to renderer-neutral `InteractionInput`
 
-Terminal plugin surfaces may ask `PluginTuiHost` to resolve a key stroke into the host's configured
+The host preserves explicit event disposition: ignored input may continue through root routing,
+locally consumed input stops there, and semantic input is delivered once to the controller. Terminal
+plugin surfaces may ask `PluginTuiHost` to resolve a key stroke into the host's configured
 composer-like edit command, selection motion, or submit intent. This keeps configured editor
 bindings consistent without exposing Bcode keymap enums to plugin controllers or shared session
 contracts.
@@ -87,11 +90,17 @@ adaptation, and terminal painting. The same plugin controller and surface can be
   scrolling authority; or
 * pinned above the composer as an overlay that does not alter transcript layout.
 
-Inline surfaces reserve bounded transcript rows. Partially visible surfaces render through a bounded
-scratch frame and are clipped into the viewport; plugin-local coordinates remain stable. The host
-caps scratch work at 512 rows and 131,072 cells and validates width-by-height before allocation.
-Pinned surfaces are underpainted by the host before plugin rendering. Neither mode owns canonical
-answers or exchange lifecycle.
+Inline surfaces reserve their complete bounded logical extent in the indexed transcript. The host
+retains that extent as a sparse span and asks the plugin to draw only the visible slice; there is no
+question-level viewport or full-height scratch allocation. Committed TUI geometry records placement,
+logical extent, visible logical offset, and destination for drawing, cursor projection, hit testing,
+and mouse translation. The host caps logical extent at 4,096 rows and each visible render at 512
+rows and 131,072 cells.
+
+Pinned surfaces use a TUI-owned viewport keyed by interaction identity. The host reveals the
+renderer-reported focused row, clamps state across resize/replacement/shrink, and underpaints the
+complete dock before bounded slice rendering. Neither mode owns canonical answers or exchange
+lifecycle.
 
 ## Lifecycle and failure behavior
 
