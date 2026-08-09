@@ -47,8 +47,9 @@ impl bcode_plugin_sdk::tui::PluginTuiTextInputResolver for InteractiveTextInputR
 }
 
 const SURFACE_OPEN_RETRY_DELAY: Duration = Duration::from_secs(2);
-const MAX_INTERACTION_SCRATCH_ROWS: u16 = 512;
-const MAX_INTERACTION_SCRATCH_CELLS: usize = 131_072;
+const MAX_INTERACTION_LOGICAL_ROWS: u16 = 4_096;
+const MAX_INTERACTION_VISIBLE_ROWS: u16 = 512;
+const MAX_INTERACTION_VISIBLE_CELLS: usize = 131_072;
 
 /// Queued request to open one client-rendered interactive surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +172,17 @@ impl InteractiveSurfaceQueue {
     }
 }
 
+/// Host routing result for one interactive-surface terminal event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractiveSurfaceEventOutcome {
+    /// The surface ignored the event, so normal host routing may continue.
+    Ignored,
+    /// The surface consumed the event without completing the interaction.
+    Consumed,
+    /// The surface completed the interaction with a canonical resolution.
+    Resolved(ToolExchangeResolution),
+}
+
 /// Runtime state for one client-rendered interactive tool surface.
 pub struct InteractiveSurfaceState {
     interaction_id: String,
@@ -180,6 +192,25 @@ pub struct InteractiveSurfaceState {
 }
 
 impl InteractiveSurfaceState {
+    #[cfg(test)]
+    pub(crate) fn from_surface_for_test(
+        interaction_id: impl Into<String>,
+        surface: BoxedPluginTuiSurface,
+        keymap: &BmuxKeyMap,
+    ) -> Self {
+        let (redraw_sender, _redraw_receiver) = mpsc::channel(1);
+        Self {
+            interaction_id: interaction_id.into(),
+            surface,
+            host: TokioPluginTuiHost::current(redraw_sender).with_text_input_resolver(Arc::new(
+                InteractiveTextInputResolver {
+                    keymap: keymap.clone(),
+                },
+            )),
+            pending_resolution: None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn redraw_channel_is_bounded_for_test() {
         let (redraw_sender, mut redraw_receiver) = mpsc::channel(1);
@@ -272,10 +303,45 @@ impl InteractiveSurfaceState {
         user_dismissed()
     }
 
+    /// Return a bounded diagnostic identifier for the active native surface.
+    #[cfg(test)]
+    pub(crate) fn surface_id_for_test(&self) -> &'static str {
+        self.surface.id()
+    }
+
     /// Return preferred rendered height at `width`.
     #[must_use]
     pub fn preferred_height(&mut self, width: u16) -> u16 {
         bounded_surface_height(width, self.surface.preferred_height(width))
+    }
+
+    /// Render a bounded logical slice without allocating the full logical surface.
+    pub fn render_slice(
+        &mut self,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut Frame<'_>,
+    ) {
+        let logical_height = logical_height.min(MAX_INTERACTION_LOGICAL_ROWS);
+        if logical_row_offset >= logical_height {
+            return;
+        }
+        let Some(destination) = bounded_render_destination(
+            destination,
+            logical_height.saturating_sub(logical_row_offset),
+        ) else {
+            return;
+        };
+        self.surface
+            .render_slice(logical_height, logical_row_offset, destination, frame);
+    }
+
+    /// Return focused logical rows for host-owned pinned reveal behavior.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn focused_row_range(&mut self, width: u16) -> Option<std::ops::Range<u16>> {
+        self.surface.focused_row_range(width)
     }
 
     /// Render the interactive surface.
@@ -284,6 +350,7 @@ impl InteractiveSurfaceState {
     }
 
     /// Render a clipped slice of the interactive surface using full-surface coordinates.
+    #[cfg(test)]
     pub fn render_clipped(
         &mut self,
         full_area: Rect,
@@ -387,27 +454,41 @@ impl InteractiveSurfaceState {
         self.pending_resolution = None;
     }
 
-    /// Handle an input event and retain a close resolution until the host confirms delivery.
-    pub fn handle_event(&mut self, event: &Event) -> Option<ToolExchangeResolution> {
+    /// Handle an input event, report consumption, and retain close resolution until confirmation.
+    pub fn handle_event_outcome(&mut self, event: &Event) -> InteractiveSurfaceEventOutcome {
         if let Some(resolution) = &self.pending_resolution {
-            return Some(resolution.clone());
+            return InteractiveSurfaceEventOutcome::Resolved(resolution.clone());
         }
-        let resolution = match self.surface.handle_event(event, &self.host) {
-            PluginTuiAction::None
-            | PluginTuiAction::Redraw
+        let outcome = match self.surface.handle_event(event, &self.host) {
+            PluginTuiAction::None => InteractiveSurfaceEventOutcome::Ignored,
+            PluginTuiAction::Redraw
             | PluginTuiAction::OpenSession { .. }
-            | PluginTuiAction::OpenSurface { .. } => None,
-            PluginTuiAction::Close { outcome } => {
-                Some(outcome.map_or_else(user_dismissed, |payload| {
+            | PluginTuiAction::OpenSurface { .. } => InteractiveSurfaceEventOutcome::Consumed,
+            PluginTuiAction::Close { outcome } => InteractiveSurfaceEventOutcome::Resolved(
+                outcome.map_or_else(user_dismissed, |payload| {
                     ToolExchangeResolution::Responded { payload }
-                }))
+                }),
+            ),
+            PluginTuiAction::RunCommand { command } => {
+                InteractiveSurfaceEventOutcome::Resolved(ToolExchangeResolution::Responded {
+                    payload: json!({ "run_command": command }),
+                })
             }
-            PluginTuiAction::RunCommand { command } => Some(ToolExchangeResolution::Responded {
-                payload: json!({ "run_command": command }),
-            }),
         };
-        self.pending_resolution.clone_from(&resolution);
-        resolution
+        if let InteractiveSurfaceEventOutcome::Resolved(resolution) = &outcome {
+            self.pending_resolution = Some(resolution.clone());
+        }
+        outcome
+    }
+
+    #[cfg(test)]
+    fn handle_event(&mut self, event: &Event) -> Option<ToolExchangeResolution> {
+        match self.handle_event_outcome(event) {
+            InteractiveSurfaceEventOutcome::Resolved(resolution) => Some(resolution),
+            InteractiveSurfaceEventOutcome::Ignored | InteractiveSurfaceEventOutcome::Consumed => {
+                None
+            }
+        }
     }
 }
 
@@ -415,10 +496,25 @@ fn bounded_surface_height(width: u16, preferred_height: u16) -> u16 {
     if width == 0 {
         return 0;
     }
-    let row_limit = MAX_INTERACTION_SCRATCH_ROWS;
-    let cell_limit =
-        u16::try_from(MAX_INTERACTION_SCRATCH_CELLS / usize::from(width)).unwrap_or(u16::MAX);
-    preferred_height.min(row_limit).min(cell_limit)
+    preferred_height.clamp(1, MAX_INTERACTION_LOGICAL_ROWS)
+}
+
+fn bounded_render_destination(destination: Rect, remaining_rows: u16) -> Option<Rect> {
+    if destination.is_empty() || remaining_rows == 0 {
+        return None;
+    }
+    let cell_rows = u16::try_from(
+        MAX_INTERACTION_VISIBLE_CELLS
+            .checked_div(usize::from(destination.width))
+            .unwrap_or(0),
+    )
+    .unwrap_or(u16::MAX);
+    let height = destination
+        .height
+        .min(remaining_rows)
+        .min(MAX_INTERACTION_VISIBLE_ROWS)
+        .min(cell_rows);
+    (height > 0).then(|| Rect::new(destination.x, destination.y, destination.width, height))
 }
 
 async fn open_surface(
@@ -534,42 +630,35 @@ mod tests {
     }
 
     #[test]
-    fn preferred_height_is_bounded_at_every_row_and_cell_boundary() {
+    fn logical_height_and_visible_render_work_have_independent_host_limits() {
         assert_eq!(bounded_surface_height(0, u16::MAX), 0);
-        assert_eq!(bounded_surface_height(1, 511), 511);
+        assert_eq!(bounded_surface_height(1, 0), 1);
         assert_eq!(bounded_surface_height(1, 512), 512);
-        assert_eq!(bounded_surface_height(1, 513), 512);
-
-        let exact_cell_width =
-            u16::try_from(MAX_INTERACTION_SCRATCH_CELLS / 512).expect("cell boundary width");
-        assert_eq!(exact_cell_width, 256);
-        assert_eq!(bounded_surface_height(exact_cell_width, 511), 511);
-        assert_eq!(bounded_surface_height(exact_cell_width, 512), 512);
-        assert_eq!(bounded_surface_height(exact_cell_width, 513), 512);
-
-        let above_cell_width = exact_cell_width + 1;
-        let above_cell_height =
-            u16::try_from(MAX_INTERACTION_SCRATCH_CELLS / usize::from(above_cell_width))
-                .expect("bounded height");
         assert_eq!(
-            bounded_surface_height(above_cell_width, u16::MAX),
-            above_cell_height
-        );
-        assert!(
-            usize::from(above_cell_height) * usize::from(above_cell_width)
-                <= MAX_INTERACTION_SCRATCH_CELLS
-        );
-        assert!(
-            usize::from(above_cell_height + 1) * usize::from(above_cell_width)
-                > MAX_INTERACTION_SCRATCH_CELLS
+            bounded_surface_height(1, u16::MAX),
+            MAX_INTERACTION_LOGICAL_ROWS
         );
 
-        let maximum_width_height = bounded_surface_height(u16::MAX, u16::MAX);
-        assert_eq!(maximum_width_height, 2);
+        let narrow = bounded_render_destination(Rect::new(0, 0, 1, u16::MAX), u16::MAX)
+            .expect("narrow destination");
+        assert_eq!(narrow.height, MAX_INTERACTION_VISIBLE_ROWS);
+
+        let wide = bounded_render_destination(Rect::new(0, 0, u16::MAX, u16::MAX), u16::MAX)
+            .expect("wide destination");
+        assert_eq!(wide.height, 2);
         assert!(
-            usize::from(maximum_width_height) * usize::from(u16::MAX)
-                <= MAX_INTERACTION_SCRATCH_CELLS
+            usize::from(wide.width)
+                .checked_mul(usize::from(wide.height))
+                .is_some_and(|cells| cells <= MAX_INTERACTION_VISIBLE_CELLS)
         );
+        assert_eq!(
+            bounded_render_destination(Rect::new(0, 0, 80, 20), 3)
+                .expect("remaining rows")
+                .height,
+            3
+        );
+        assert!(bounded_render_destination(Rect::new(0, 0, 0, 20), 20).is_none());
+        assert!(bounded_render_destination(Rect::new(0, 0, 80, 20), 0).is_none());
     }
 
     #[tokio::test]
@@ -859,6 +948,46 @@ mod tests {
         assert!(queue.front_ready(now).is_none());
         assert_eq!(queue.next_retry_at(), Some(now + SURFACE_OPEN_RETRY_DELAY));
         assert!(queue.front_ready(now + SURFACE_OPEN_RETRY_DELAY).is_some());
+    }
+
+    #[tokio::test]
+    async fn renderer_local_question_edits_are_reported_as_consumed_redraws() {
+        let mut surface = question_surface(serde_json::json!([{
+            "header": null,
+            "question": "Explain?",
+            "options": [],
+            "control": "radio",
+            "selection_mode": "single",
+            "custom": true,
+            "custom_mode": "additional",
+            "required": true
+        }]))
+        .await;
+        let area = Rect::new(0, 0, 48, 12);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        surface.render_for_test(area, &mut Frame::new(&mut buffer));
+
+        assert!(matches!(
+            surface.handle_event_outcome(&key(KeyCode::Left)),
+            InteractiveSurfaceEventOutcome::Consumed
+        ));
+        assert!(matches!(
+            surface.handle_event_outcome(&Event::Key(KeyStroke {
+                key: KeyCode::Right,
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Modifiers::NONE
+                },
+            })),
+            InteractiveSurfaceEventOutcome::Consumed
+        ));
+        assert!(matches!(
+            surface.handle_event_outcome(&Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(2, 3),
+            ))),
+            InteractiveSurfaceEventOutcome::Consumed
+        ));
     }
 
     #[tokio::test]

@@ -5,13 +5,41 @@ use std::collections::{BTreeMap, BTreeSet};
 use bmux_tui::prelude::Line;
 
 use super::transcript_layout::{
-    TranscriptLayoutSignature, VisibleTranscriptLine, VisibleTranscriptSource,
+    TranscriptLayoutRows, TranscriptLayoutSignature, VisibleTranscriptLine, VisibleTranscriptSource,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexedEntry {
     signature: TranscriptLayoutSignature,
     rows: Vec<Line>,
+    row_count: usize,
+}
+
+impl IndexedEntry {
+    fn new(signature: TranscriptLayoutSignature, rows: TranscriptLayoutRows) -> Self {
+        let row_count = rows.len();
+        let rows = match rows {
+            TranscriptLayoutRows::Rendered(rows) => rows,
+            TranscriptLayoutRows::BlankSpan(0) => Vec::new(),
+            TranscriptLayoutRows::BlankSpan(_) => vec![Line::default()],
+        };
+        Self {
+            signature,
+            rows,
+            row_count,
+        }
+    }
+
+    fn line(&self, row: usize) -> Option<&Line> {
+        if row >= self.row_count {
+            return None;
+        }
+        if self.rows.len() == 1 && self.row_count > 1 {
+            self.rows.first()
+        } else {
+            self.rows.get(row)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -23,7 +51,7 @@ impl FenwickRows {
     fn rebuild(&mut self, entries: &[IndexedEntry]) {
         self.tree = vec![0; entries.len().saturating_add(1)];
         for (index, entry) in entries.iter().enumerate() {
-            self.add(index, entry.rows.len());
+            self.add(index, entry.row_count);
         }
     }
 
@@ -112,7 +140,7 @@ impl IndexedSection {
     fn sync<S, R>(&mut self, len: usize, signature: S, mut render_rows: R) -> (usize, usize)
     where
         S: Fn(usize) -> TranscriptLayoutSignature,
-        R: FnMut(usize) -> Vec<Line>,
+        R: FnMut(usize) -> TranscriptLayoutRows,
     {
         self.entries.truncate(len);
         let mut changed = 0_usize;
@@ -125,13 +153,13 @@ impl IndexedSection {
                     let rows = render_rows(index);
                     changed = changed.saturating_add(1);
                     rows_regenerated = rows_regenerated.saturating_add(rows.len());
-                    *entry = IndexedEntry { signature, rows };
+                    *entry = IndexedEntry::new(signature, rows);
                 }
                 None => {
                     let rows = render_rows(index);
                     changed = changed.saturating_add(1);
                     rows_regenerated = rows_regenerated.saturating_add(rows.len());
-                    self.entries.push(IndexedEntry { signature, rows });
+                    self.entries.push(IndexedEntry::new(signature, rows));
                 }
             }
         }
@@ -147,7 +175,7 @@ impl IndexedSection {
     ) -> (usize, usize)
     where
         S: Fn(usize) -> TranscriptLayoutSignature,
-        R: FnMut(usize) -> Vec<Line>,
+        R: FnMut(usize) -> TranscriptLayoutRows,
     {
         let mut changed = 0_usize;
         let mut rows_regenerated = 0_usize;
@@ -160,9 +188,9 @@ impl IndexedSection {
                 continue;
             }
             let rows = render_rows(index);
-            let old_rows = entry.rows.len();
+            let old_rows = entry.row_count;
             let new_rows = rows.len();
-            *entry = IndexedEntry { signature, rows };
+            *entry = IndexedEntry::new(signature, rows);
             self.rows.replace(index, old_rows, new_rows);
             changed = changed.saturating_add(1);
             rows_regenerated = rows_regenerated.saturating_add(new_rows);
@@ -179,7 +207,7 @@ impl IndexedSection {
     }
 
     fn line(&self, entry_index: usize, row_in_entry: usize) -> Option<&Line> {
-        self.entries.get(entry_index)?.rows.get(row_in_entry)
+        self.entries.get(entry_index)?.line(row_in_entry)
     }
 
     fn line_at_row(&self, row: usize) -> Option<(usize, usize)> {
@@ -204,9 +232,9 @@ impl IndexedSection {
         let mut row_cursor = entry_start;
         while entry_index < self.entries.len() && row_cursor < end {
             let entry = &self.entries[entry_index];
-            let entry_end = row_cursor.saturating_add(entry.rows.len());
-            let row_start = start.saturating_sub(row_cursor).min(entry.rows.len());
-            let row_end = end.saturating_sub(row_cursor).min(entry.rows.len());
+            let entry_end = row_cursor.saturating_add(entry.row_count);
+            let row_start = start.saturating_sub(row_cursor).min(entry.row_count);
+            let row_end = end.saturating_sub(row_cursor).min(entry.row_count);
             output.extend((row_start..row_end).map(|row_in_entry| {
                 VisibleTranscriptLine {
                     row_index: global_start
@@ -243,7 +271,7 @@ impl IndexedTranscriptLayout {
     pub fn sync_history<S, R>(&mut self, signature: Option<S>, rows: R) -> (usize, usize)
     where
         S: Into<TranscriptLayoutSignature>,
-        R: FnOnce() -> Vec<Line>,
+        R: FnOnce() -> TranscriptLayoutRows,
     {
         let signature = signature.map(Into::into);
         let rendered_rows = signature.as_ref().map(|_| rows()).unwrap_or_default();
@@ -263,7 +291,7 @@ impl IndexedTranscriptLayout {
     ) -> (usize, usize)
     where
         S: Fn(usize) -> TranscriptLayoutSignature,
-        R: FnMut(usize) -> Vec<Line>,
+        R: FnMut(usize) -> TranscriptLayoutRows,
         I: Fn(usize) -> Option<String>,
     {
         let result = self.transcript.sync(len, signature, rows);
@@ -282,7 +310,7 @@ impl IndexedTranscriptLayout {
     pub fn sync_pending<S, R>(&mut self, len: usize, signature: S, rows: R) -> (usize, usize)
     where
         S: Fn(usize) -> TranscriptLayoutSignature,
-        R: FnMut(usize) -> Vec<Line>,
+        R: FnMut(usize) -> TranscriptLayoutRows,
     {
         self.pending.sync(len, signature, rows)
     }
@@ -295,7 +323,7 @@ impl IndexedTranscriptLayout {
     ) -> (usize, usize, usize)
     where
         S: Fn(usize) -> TranscriptLayoutSignature,
-        R: FnMut(usize) -> Vec<Line>,
+        R: FnMut(usize) -> TranscriptLayoutRows,
     {
         let indexes = invocation_ids
             .iter()
@@ -317,7 +345,7 @@ impl IndexedTranscriptLayout {
     ) -> (usize, usize, usize)
     where
         S: Fn(usize) -> TranscriptLayoutSignature,
-        R: FnMut(usize) -> Vec<Line>,
+        R: FnMut(usize) -> TranscriptLayoutRows,
     {
         let scanned = indexes.len();
         let (changed, rows_regenerated) = self.transcript.sync_entries(indexes, signature, rows);
@@ -365,7 +393,7 @@ impl IndexedTranscriptLayout {
         self.section(source)
             .entries
             .get(entry_index)
-            .map(|entry| entry.rows.len())
+            .map(|entry| entry.row_count)
     }
 
     pub fn line(&self, visible: VisibleTranscriptLine) -> Option<&Line> {
@@ -448,5 +476,31 @@ impl IndexedTranscriptLayout {
             VisibleTranscriptSource::Transcript => &self.transcript,
             VisibleTranscriptSource::Pending => &self.pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_blank_rows_retain_logical_extent_without_materializing_each_row() {
+        let mut layout = IndexedTranscriptLayout::default();
+        layout.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("interaction".to_owned()),
+            |_| TranscriptLayoutRows::BlankSpan(100_000),
+            |_| None,
+        );
+
+        assert_eq!(layout.total_rows(), 100_000);
+        assert_eq!(
+            layout.entry_row_count(VisibleTranscriptSource::Transcript, 0),
+            Some(100_000)
+        );
+        assert_eq!(layout.transcript.entries[0].rows.len(), 1);
+        let visible = layout.visible_lines_from_top(99_995, 5);
+        assert_eq!(visible.len(), 5);
+        assert!(visible.iter().all(|line| layout.line(*line).is_some()));
     }
 }

@@ -1730,13 +1730,27 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         .is_some_and(|area| area.contains(mouse.position)),
                     _ => true,
                 };
-                if route_to_surface
-                    && let Some((interaction_id, resolution)) =
-                        self.loop_state.handle_interactive_surface_event(&event)
-                {
-                    let command =
-                        self.interactive_surface_resolution_command(interaction_id, resolution);
-                    return Ok(bmux_tui_runtime::Update::redraw().with_command(command));
+                if route_to_surface {
+                    match self.loop_state.handle_interactive_surface_event(&event) {
+                        super::interactive_surface::InteractiveSurfaceEventOutcome::Ignored => {}
+                        super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed => {
+                            return Ok(bmux_tui_runtime::Update::redraw());
+                        }
+                        super::interactive_surface::InteractiveSurfaceEventOutcome::Resolved(
+                            resolution,
+                        ) => {
+                            let Some(interaction_id) = self
+                                .loop_state
+                                .active_interactive_surface_id()
+                                .map(ToOwned::to_owned)
+                            else {
+                                return Ok(bmux_tui_runtime::Update::none());
+                            };
+                            let command = self
+                                .interactive_surface_resolution_command(interaction_id, resolution);
+                            return Ok(bmux_tui_runtime::Update::redraw().with_command(command));
+                        }
+                    }
                 }
                 self.route_terminal_event(event)
             }
@@ -2277,10 +2291,12 @@ mod tests {
         assert!(queue.take_ready().is_empty());
     }
 
-    fn root_test_chat() -> super::super::session_flow::ActiveChat {
+    fn root_test_chat_with_input_history(
+        input_history: &[bcode_session_models::SessionInputHistoryEntry],
+    ) -> super::super::session_flow::ActiveChat {
         let (event_sender, event_receiver) = super::super::history_flow::session_stream_channel();
         super::super::session_flow::ActiveChat {
-            app: super::super::app::BmuxApp::new_with_history(None, &[], &[], false),
+            app: super::super::app::BmuxApp::new_with_history(None, &[], input_history, false),
             agents: super::super::session_flow::AgentCatalog::default(),
             session_id: None,
             event_sender,
@@ -2291,6 +2307,260 @@ mod tests {
             opening_session_anchor_sequence: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
         }
+    }
+
+    fn root_test_chat() -> super::super::session_flow::ActiveChat {
+        root_test_chat_with_input_history(&[])
+    }
+
+    async fn question_surface_for_root_test(
+        keymap: &super::super::keymap::BmuxKeyMap,
+    ) -> super::super::interactive_surface::InteractiveSurfaceState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        );
+        let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &[plugin],
+        )
+        .expect("question plugin runtime");
+        super::super::interactive_surface::InteractiveSurfaceState::open(
+            &runtime,
+            "question-root-test",
+            "bcode.question.inline",
+            &serde_json::json!({
+                "questions": [{
+                    "header": null,
+                    "question": "Choose one",
+                    "options": [
+                        {"label": "One", "value": "one", "description": null},
+                        {"label": "Two", "value": "two", "description": null}
+                    ],
+                    "control": "radio",
+                    "selection_mode": "single",
+                    "custom": false,
+                    "custom_mode": "additional",
+                    "required": true
+                }]
+            })
+            .to_string(),
+            keymap,
+        )
+        .await
+        .expect("question surface")
+    }
+
+    #[tokio::test]
+    async fn interaction_host_keys_keep_application_and_transcript_precedence() {
+        let model = root_test_model();
+        let key = |key, modifiers| bmux_keyboard::KeyStroke { key, modifiers };
+        let ctrl = bmux_keyboard::Modifiers {
+            ctrl: true,
+            ..bmux_keyboard::Modifiers::NONE
+        };
+
+        for (stroke, expected) in [
+            (
+                key(
+                    bmux_keyboard::KeyCode::PageUp,
+                    bmux_keyboard::Modifiers::NONE,
+                ),
+                super::super::keymap::BmuxAction::TranscriptPageUp,
+            ),
+            (
+                key(
+                    bmux_keyboard::KeyCode::PageDown,
+                    bmux_keyboard::Modifiers::NONE,
+                ),
+                super::super::keymap::BmuxAction::TranscriptPageDown,
+            ),
+            (
+                key(bmux_keyboard::KeyCode::Home, ctrl),
+                super::super::keymap::BmuxAction::TranscriptTop,
+            ),
+            (
+                key(bmux_keyboard::KeyCode::End, ctrl),
+                super::super::keymap::BmuxAction::TranscriptBottom,
+            ),
+            (
+                key(bmux_keyboard::KeyCode::Up, ctrl),
+                super::super::keymap::BmuxAction::TranscriptLineUp,
+            ),
+            (
+                key(bmux_keyboard::KeyCode::Down, ctrl),
+                super::super::keymap::BmuxAction::TranscriptLineDown,
+            ),
+            (
+                key(bmux_keyboard::KeyCode::Char('d'), ctrl),
+                super::super::keymap::BmuxAction::AppExit,
+            ),
+        ] {
+            assert_eq!(
+                model.root_interactive_surface_host_key(stroke),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            model.root_interactive_surface_host_key(key(
+                bmux_keyboard::KeyCode::Up,
+                bmux_keyboard::Modifiers::NONE,
+            )),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn question_navigation_through_root_is_consumed_once_without_history_fallthrough() {
+        let history = [bcode_session_models::SessionInputHistoryEntry {
+            timestamp_ms: 1,
+            sequence: 1,
+            text: "previous prompt".to_owned(),
+        }];
+        let mut chat = root_test_chat_with_input_history(&history);
+        chat.app.replace_composer_with("draft prompt");
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        loop_state.install_interactive_surface_for_test(
+            question_surface_for_root_test(settings.keymap()).await,
+        );
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+
+        let down = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Down,
+            modifiers: bmux_keyboard::Modifiers::NONE,
+        });
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Terminal(down),
+        )
+        .expect("root update handles question navigation");
+
+        assert_eq!(model.chat.app.composer().text(), "draft prompt");
+        assert!(!model.chat.app.input_history_navigation_active());
+        assert_eq!(
+            model
+                .loop_state
+                .active_interactive_surface_native_id_for_test(),
+            Some("question-inline")
+        );
+
+        let key = |key| {
+            bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+                key,
+                modifiers: bmux_keyboard::Modifiers::NONE,
+            })
+        };
+        assert!(matches!(
+            model
+                .loop_state
+                .handle_interactive_surface_event(&key(bmux_keyboard::KeyCode::Enter)),
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
+        ));
+        assert!(matches!(
+            model
+                .loop_state
+                .handle_interactive_surface_event(&key(bmux_keyboard::KeyCode::Tab)),
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
+        ));
+        let outcome = model
+            .loop_state
+            .handle_interactive_surface_event(&key(bmux_keyboard::KeyCode::Enter));
+        let super::super::interactive_surface::InteractiveSurfaceEventOutcome::Resolved(
+            bcode_session_models::ToolExchangeResolution::Responded { payload },
+        ) = outcome
+        else {
+            panic!("question should submit after selecting the second option");
+        };
+        assert_eq!(payload["questions"][0]["selected"][0], "two");
+    }
+
+    #[tokio::test]
+    async fn consumed_interaction_navigation_does_not_reach_composer_history() {
+        struct ConsumingSurface;
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for ConsumingSurface {
+            fn id(&self) -> &'static str {
+                "consuming-test"
+            }
+
+            fn title(&self) -> &'static str {
+                "Consuming test"
+            }
+
+            fn render(
+                &mut self,
+                _area: bmux_tui::geometry::Rect,
+                _frame: &mut bmux_tui::frame::Frame<'_>,
+            ) {
+            }
+
+            fn handle_event(
+                &mut self,
+                event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                if matches!(
+                    event,
+                    bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+                        key: bmux_keyboard::KeyCode::Up | bmux_keyboard::KeyCode::Down,
+                        ..
+                    })
+                ) {
+                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                } else {
+                    bcode_plugin_sdk::tui::PluginTuiAction::None
+                }
+            }
+        }
+
+        let history = [bcode_session_models::SessionInputHistoryEntry {
+            timestamp_ms: 1,
+            sequence: 1,
+            text: "previous prompt".to_owned(),
+        }];
+        let mut chat = root_test_chat_with_input_history(&history);
+        chat.app.replace_composer_with("draft prompt");
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        loop_state.install_interactive_surface_for_test(
+            super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                "test-interaction",
+                Box::new(ConsumingSurface),
+                settings.keymap(),
+            ),
+        );
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+
+        let _update = bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Up,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            )),
+        )
+        .expect("root update handles consumed interaction input");
+
+        assert_eq!(model.chat.app.composer().text(), "draft prompt");
+        assert!(!model.chat.app.input_history_navigation_active());
     }
 
     #[tokio::test]

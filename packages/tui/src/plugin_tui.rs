@@ -1971,16 +1971,16 @@ library = "libdynamic_visual_test.dylib"
                         Some(&presentation),
                     )
                 },
-                transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+                transcript_rows: |index| vec![Line::from(format!("row-{index}"))].into(),
                 transcript_invocation_id: |index| Some(format!("call-{index}")),
                 pending_signature: |index| {
                     crate::transcript_layout::TranscriptLayoutSignature::new(format!(
                         "pending-{index}"
                     ))
                 },
-                pending_rows: |_| Vec::new(),
+                pending_rows: |_| Vec::new().into(),
                 history_banner_signature: || None,
-                history_banner_rows: Vec::new,
+                history_banner_rows: || Vec::new().into(),
                 reset: || false,
             });
             presentation.bump_visual_revision_for_test("call-0");
@@ -1997,7 +1997,7 @@ library = "libdynamic_visual_test.dylib"
                         Some(&presentation),
                     )
                 },
-                |index| vec![Line::from(format!("row-{index}"))],
+                |index| vec![Line::from(format!("row-{index}"))].into(),
             );
             println!(
                 "BCODE_PERF_CASE {}",
@@ -2048,16 +2048,16 @@ library = "libdynamic_visual_test.dylib"
                         Some(&presentation),
                     )
                 },
-                transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+                transcript_rows: |index| vec![Line::from(format!("row-{index}"))].into(),
                 transcript_invocation_id: |index| Some(format!("call-{index}")),
                 pending_signature: |index| {
                     crate::transcript_layout::TranscriptLayoutSignature::new(format!(
                         "pending-{index}"
                     ))
                 },
-                pending_rows: |_| Vec::new(),
+                pending_rows: |_| Vec::new().into(),
                 history_banner_signature: || None,
-                history_banner_rows: Vec::new,
+                history_banner_rows: || Vec::new().into(),
                 reset: || false,
             });
             assert_eq!(initial.entries_rebuilt, transcript_len);
@@ -2073,7 +2073,7 @@ library = "libdynamic_visual_test.dylib"
                         Some(&presentation),
                     )
                 },
-                |index| vec![Line::from(format!("row-{index}"))],
+                |index| vec![Line::from(format!("row-{index}"))].into(),
             );
             assert_eq!(updated.entries_scanned, 1);
             assert_eq!(updated.signatures_changed, 1);

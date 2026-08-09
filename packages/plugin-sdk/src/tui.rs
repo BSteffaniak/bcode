@@ -1168,6 +1168,27 @@ pub trait PluginTuiSurface: Send {
     /// Render this surface inside the host-assigned area.
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>);
 
+    /// Render one bounded logical row slice into a host-assigned destination.
+    ///
+    /// The default treats the destination as a complete standalone surface. Surfaces whose logical
+    /// extent can exceed the destination should override this method and preserve logical
+    /// coordinates across slices.
+    fn render_slice(
+        &mut self,
+        _logical_height: u16,
+        _logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut Frame<'_>,
+    ) {
+        self.render(destination, frame);
+    }
+
+    /// Return the focused control's logical row range, when the surface can provide one.
+    #[must_use]
+    fn focused_row_range(&mut self, _width: u16) -> Option<std::ops::Range<u16>> {
+        None
+    }
+
     /// Render this surface with optional renderer-owned semantic presentation.
     ///
     /// The default preserves compatibility for surfaces that do not consume themes.
@@ -1206,6 +1227,17 @@ pub trait PluginTuiSurface: Send {
     }
 }
 
+/// Result of translating one terminal event for a typed interaction renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalInteractionInput {
+    /// The renderer did not handle the event, so the host may route it elsewhere.
+    Ignored,
+    /// The renderer handled local state without producing semantic controller input.
+    Consumed,
+    /// The renderer translated the event into semantic controller input.
+    Semantic(InteractionInput),
+}
+
 /// Terminal renderer/adapter for a typed renderer-neutral interaction.
 pub trait TerminalInteractionRenderer<C>: Default + Send + 'static
 where
@@ -1227,13 +1259,36 @@ where
     /// Render the snapshot.
     fn render(&mut self, snapshot: &C::Snapshot, area: Rect, frame: &mut Frame<'_>);
 
-    /// Translate terminal input to a semantic interaction input.
+    /// Render one bounded logical row slice.
+    fn render_slice(
+        &mut self,
+        snapshot: &C::Snapshot,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut Frame<'_>,
+    ) {
+        let _ = (logical_height, logical_row_offset);
+        self.render(snapshot, destination, frame);
+    }
+
+    /// Return the focused control's logical row range, when available.
+    #[must_use]
+    fn focused_row_range(
+        &mut self,
+        _snapshot: &C::Snapshot,
+        _width: u16,
+    ) -> Option<std::ops::Range<u16>> {
+        None
+    }
+
+    /// Translate terminal input and report whether it was consumed.
     fn input(
         &mut self,
         event: &Event,
         snapshot: &C::Snapshot,
         _host: &dyn PluginTuiHost,
-    ) -> Option<InteractionInput>;
+    ) -> TerminalInteractionInput;
 }
 
 struct TypedTerminalInteractionSurface<C, R>
@@ -1281,14 +1336,38 @@ where
             .render(&self.controller.snapshot(), area, frame);
     }
 
+    fn render_slice(
+        &mut self,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut Frame<'_>,
+    ) {
+        self.renderer.render_slice(
+            &self.controller.snapshot(),
+            logical_height,
+            logical_row_offset,
+            destination,
+            frame,
+        );
+    }
+
+    fn focused_row_range(&mut self, width: u16) -> Option<std::ops::Range<u16>> {
+        self.renderer
+            .focused_row_range(&self.controller.snapshot(), width)
+    }
+
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let Some(input) = self
+        match self
             .renderer
             .input(event, &self.controller.snapshot(), host)
-        else {
-            return PluginTuiAction::None;
-        };
-        plugin_tui_action_from_interaction_output(self.controller.handle_input(input))
+        {
+            TerminalInteractionInput::Ignored => PluginTuiAction::None,
+            TerminalInteractionInput::Consumed => PluginTuiAction::Redraw,
+            TerminalInteractionInput::Semantic(input) => {
+                plugin_tui_action_from_interaction_output(self.controller.handle_input(input))
+            }
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use bcode_plugin_sdk::tui::TerminalInteractionRenderer;
+use bcode_plugin_sdk::tui::{TerminalInteractionInput, TerminalInteractionRenderer};
 use bcode_tool::{InteractionControlId, InteractionInput, InteractionNavigation, InteractionValue};
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
@@ -315,9 +315,9 @@ impl QuestionTerminalRenderer {
         event: &Event,
         snapshot: &QuestionSnapshot,
         host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
-    ) -> Option<InteractionInput> {
+    ) -> TerminalInteractionInput {
         let QuestionFocusTarget::Custom { question_index } = snapshot.focus else {
-            return None;
+            return TerminalInteractionInput::Ignored;
         };
         let value = snapshot.answers[question_index]
             .custom
@@ -350,13 +350,19 @@ impl QuestionTerminalRenderer {
                 TextInputControl::new(&TextInputPolicy::chat_composer())
                     .handle_mouse(state, *mouse);
             }
-            Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => return None,
+            Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
+                return TerminalInteractionInput::Ignored;
+            }
         }
         let text = state.buffer().text();
-        (text != before).then(|| InteractionInput::Change {
-            control_id: custom_control_id(question_index),
-            value: InteractionValue::String(text.to_owned()),
-        })
+        if text != before {
+            TerminalInteractionInput::Semantic(InteractionInput::Change {
+                control_id: custom_control_id(question_index),
+                value: InteractionValue::String(text.to_owned()),
+            })
+        } else {
+            TerminalInteractionInput::Consumed
+        }
     }
 
     fn mouse_input(&self, event: &bmux_tui::event::MouseEvent) -> Option<InteractionInput> {
@@ -558,12 +564,35 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         }
     }
 
+    fn render_slice(
+        &mut self,
+        snapshot: &QuestionSnapshot,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut Frame<'_>,
+    ) {
+        let previous = self.viewport_offset;
+        self.viewport_offset = logical_row_offset.min(logical_height.saturating_sub(1));
+        self.render(snapshot, destination, frame);
+        self.viewport_offset = previous;
+    }
+
+    fn focused_row_range(
+        &mut self,
+        snapshot: &QuestionSnapshot,
+        width: u16,
+    ) -> Option<std::ops::Range<u16>> {
+        let (start, end) = Self::focused_content_range(snapshot, width.max(1));
+        Some(start..end.max(start.saturating_add(1)))
+    }
+
     fn input(
         &mut self,
         event: &Event,
         snapshot: &QuestionSnapshot,
         host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
-    ) -> Option<InteractionInput> {
+    ) -> TerminalInteractionInput {
         if let Event::Mouse(mouse) = event
             && let Some(question_index) =
                 self.custom_areas.iter().find_map(|(question_index, area)| {
@@ -576,7 +605,7 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
                     .handle_mouse(state, *mouse);
             }
             self.pending_custom_mouse_focus = Some(question_index);
-            return Some(InteractionInput::Focus {
+            return TerminalInteractionInput::Semantic(InteractionInput::Focus {
                 control_id: custom_control_id(question_index),
             });
         }
@@ -587,7 +616,7 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
                 QuestionFocusTarget::Custom { .. } | QuestionFocusTarget::Submit
             )
         {
-            return Some(InteractionInput::Submit);
+            return TerminalInteractionInput::Semantic(InteractionInput::Submit);
         }
         if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. })
             && !matches!(
@@ -597,11 +626,15 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
                         || stroke.key == KeyCode::Escape
                         || stroke.key == KeyCode::Enter && !stroke.modifiers.shift
             )
-            && let Some(input) = self.custom_input(event, snapshot, host)
+            && let input = self.custom_input(event, snapshot, host)
+            && !matches!(input, TerminalInteractionInput::Ignored)
         {
-            return Some(input);
+            return input;
         }
-        standard_input(self, event, snapshot)
+        standard_input(self, event, snapshot).map_or(
+            TerminalInteractionInput::Ignored,
+            TerminalInteractionInput::Semantic,
+        )
     }
 }
 
@@ -865,11 +898,11 @@ mod tests {
         event: &Event,
     ) -> InteractionOutput {
         let snapshot = controller.snapshot();
-        renderer
-            .input(event, &snapshot, &TEST_HOST)
-            .map_or(InteractionOutput::None, |input| {
-                controller.handle_input(input)
-            })
+        match renderer.input(event, &snapshot, &TEST_HOST) {
+            TerminalInteractionInput::Ignored => InteractionOutput::None,
+            TerminalInteractionInput::Consumed => InteractionOutput::Redraw,
+            TerminalInteractionInput::Semantic(input) => controller.handle_input(input),
+        }
     }
 
     fn render_then_apply_event(
@@ -879,11 +912,11 @@ mod tests {
     ) -> InteractionOutput {
         let snapshot = controller.snapshot();
         let _ = render_snapshot(renderer, &snapshot, Rect::new(0, 0, 48, 12));
-        renderer
-            .input(event, &snapshot, &TEST_HOST)
-            .map_or(InteractionOutput::None, |input| {
-                controller.handle_input(input)
-            })
+        match renderer.input(event, &snapshot, &TEST_HOST) {
+            TerminalInteractionInput::Ignored => InteractionOutput::None,
+            TerminalInteractionInput::Consumed => InteractionOutput::Redraw,
+            TerminalInteractionInput::Semantic(input) => controller.handle_input(input),
+        }
     }
 
     #[test]
@@ -999,8 +1032,8 @@ mod tests {
                     &snapshot,
                     &TEST_HOST,
                 ),
-                None,
-                "{key:?} must remain unsupported until cursor-aware editing exists"
+                TerminalInteractionInput::Consumed,
+                "{key:?} must remain handled by the custom editor"
             );
         }
         assert_eq!(
@@ -1184,16 +1217,17 @@ mod tests {
         let snapshot = controller.snapshot();
         let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 40, 30));
         let area = renderer.custom_inputs[&1].content_area();
-        let input = renderer
-            .input(
-                &Event::Mouse(bmux_tui::event::MouseEvent::new(
-                    MouseEventKind::Down(MouseButton::Left),
-                    Point::new(area.x, area.y),
-                )),
-                &snapshot,
-                &TEST_HOST,
-            )
-            .expect("focus custom field");
+        let input = renderer.input(
+            &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(area.x, area.y),
+            )),
+            &snapshot,
+            &TEST_HOST,
+        );
+        let TerminalInteractionInput::Semantic(input) = input else {
+            panic!("focus custom field");
+        };
         assert_eq!(
             input,
             InteractionInput::Focus {
@@ -1231,30 +1265,30 @@ mod tests {
         let snapshot = controller.snapshot();
         let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 40, 30));
         let area = renderer.custom_inputs[&1].content_area();
-        let focus = renderer
-            .input(
-                &Event::Mouse(bmux_tui::event::MouseEvent::new(
-                    MouseEventKind::Down(MouseButton::Left),
-                    Point::new(area.x, area.y),
-                )),
-                &snapshot,
-                &TEST_HOST,
-            )
-            .expect("focus custom field");
+        let focus = renderer.input(
+            &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(area.x, area.y),
+            )),
+            &snapshot,
+            &TEST_HOST,
+        );
+        let TerminalInteractionInput::Semantic(focus) = focus else {
+            panic!("focus custom field");
+        };
         controller.handle_input(focus);
         let focused = controller.snapshot();
         let _buffer = render_snapshot(&mut renderer, &focused, Rect::new(0, 0, 40, 30));
-        assert!(
-            renderer
-                .input(
-                    &Event::Mouse(bmux_tui::event::MouseEvent::new(
-                        MouseEventKind::Drag(MouseButton::Left),
-                        Point::new(area.x.saturating_add(3), area.y),
-                    )),
-                    &focused,
-                    &TEST_HOST,
-                )
-                .is_none()
+        assert_eq!(
+            renderer.input(
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    Point::new(area.x.saturating_add(3), area.y),
+                )),
+                &focused,
+                &TEST_HOST,
+            ),
+            TerminalInteractionInput::Consumed
         );
         assert_eq!(
             renderer.custom_inputs[&1].buffer().selected_text(),
@@ -1277,16 +1311,17 @@ mod tests {
         let snapshot = controller.snapshot();
         let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 32, 10));
         let second = renderer.controls[1].area;
-        let input = renderer
-            .input(
-                &Event::Mouse(bmux_tui::event::MouseEvent::new(
-                    MouseEventKind::Down(MouseButton::Left),
-                    Point::new(second.x, second.y),
-                )),
-                &snapshot,
-                &TEST_HOST,
-            )
-            .expect("visible option click");
+        let input = renderer.input(
+            &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(second.x, second.y),
+            )),
+            &snapshot,
+            &TEST_HOST,
+        );
+        let TerminalInteractionInput::Semantic(input) = input else {
+            panic!("visible option click");
+        };
         controller.handle_input(input);
         let clicked = controller.snapshot();
         assert_eq!(clicked.answers[0].selected, ["Two"]);

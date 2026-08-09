@@ -1303,6 +1303,41 @@ mod tests {
     }
 
     #[test]
+    fn active_interaction_layout_height_changes_item_signature() {
+        let item = terminal_interaction_item_from_shared(&InteractionViewSummary {
+            producer_id: Some("example.plugin".to_owned()),
+            exchange_schema: Some("example.request".to_owned()),
+            exchange_schema_version: Some(1),
+            interaction_id: "question-1".to_owned(),
+            kind: "example.interaction".to_owned(),
+            tool_call_id: None,
+            title: Some("Question".to_owned()),
+            required: true,
+            snapshot: None,
+            state: bcode_session_view_models::InteractionViewState::Pending,
+            status_detail: None,
+            resolved: false,
+            resolution: None,
+        });
+        let fallback = crate::transcript_projection::test_layout_signature(&item, 80, None);
+        let first = crate::transcript_projection::test_layout_signature_with_interaction_height(
+            &item,
+            80,
+            "question-1",
+            5,
+        );
+        let resized = crate::transcript_projection::test_layout_signature_with_interaction_height(
+            &item,
+            80,
+            "question-1",
+            12,
+        );
+
+        assert_ne!(fallback, first);
+        assert_ne!(first, resized);
+    }
+
+    #[test]
     fn skill_and_interaction_items_remain_explicit_plain_text() {
         let skill = terminal_skill_item_from_shared(&bcode_session_view_models::SkillView {
             skill_id: "review".to_owned(),

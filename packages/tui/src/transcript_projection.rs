@@ -7,7 +7,8 @@ use super::pending_submission::PendingSubmission;
 use super::render;
 use super::transcript::TranscriptItem;
 use super::transcript_layout::{
-    TranscriptLayoutFingerprint, TranscriptLayoutSignature, TranscriptLayoutSpec,
+    TranscriptLayoutFingerprint, TranscriptLayoutRows, TranscriptLayoutSignature,
+    TranscriptLayoutSpec,
 };
 use bcode_config::TuiDiffViewerConfig;
 use std::time::Instant;
@@ -32,6 +33,11 @@ pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
     let transcript_area = render::transcript_area_for_body(app, body);
     sync_layout(app, transcript_area.width);
     sync_viewport(app, transcript_area);
+}
+
+#[cfg(test)]
+pub fn sync_layout_for_test(app: &mut BmuxApp, width: u16) {
+    sync_layout(app, width);
 }
 
 fn sync_viewport(app: &mut BmuxApp, transcript_area: Rect) {
@@ -61,7 +67,7 @@ fn transcript_item_rows(
     app: &BmuxApp,
     item: &TranscriptItem,
     input: &TranscriptLayoutInput<'_>,
-) -> Vec<bmux_tui::prelude::Line> {
+) -> TranscriptLayoutRows {
     if let Some(interaction) = item.interaction()
         && !interaction.resolved
         && let Some(height) = input
@@ -69,7 +75,7 @@ fn transcript_item_rows(
             .filter(|(id, _)| *id == interaction.interaction_id)
             .map(|(_, height)| height)
     {
-        return vec![bmux_tui::prelude::Line::default(); usize::from(height.max(1))];
+        return TranscriptLayoutRows::BlankSpan(usize::from(height.max(1)));
     }
     let markdown = render::transcript_markdown_projection_for_layout(app, item, input.width);
     render::transcript_item_rows_from_item_with_markdown(
@@ -79,6 +85,7 @@ fn transcript_item_rows(
         input.diff_viewer_config,
         markdown.as_deref(),
     )
+    .into()
 }
 
 fn sync_layout(app: &mut BmuxApp, width: u16) {
@@ -146,13 +153,13 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
         pending_signature: |index| {
             render::pending_submission_signature(&input.pending[index], width)
         },
-        pending_rows: |index| render::pending_submission_rows(&input.pending[index], width),
+        pending_rows: |index| render::pending_submission_rows(&input.pending[index], width).into(),
         history_banner_signature: || {
             render::history_banner_text(input.has_older_history, input.loading_older_history)
                 .map(|text| TranscriptLayoutSignature::new(format!("history:{width}:{text}")))
         },
         history_banner_rows: || {
-            render::history_banner_rows(input.has_older_history, input.loading_older_history)
+            render::history_banner_rows(input.has_older_history, input.loading_older_history).into()
         },
         reset: || false,
     });
@@ -207,8 +214,9 @@ impl<'a> TranscriptLayoutInput<'a> {
             },
         );
         TranscriptLayoutFingerprint::new(format!(
-            "{};elapsed-rev:{};visual-generation:{presentation}",
+            "{};transcript-rev:{};elapsed-rev:{};visual-generation:{presentation}",
             self.structural_fingerprint().as_str(),
+            self.transcript_projection_revision,
             self.elapsed_layout_revision
         ))
     }
@@ -219,13 +227,12 @@ impl<'a> TranscriptLayoutInput<'a> {
             |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
         );
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};diff:{:?};theme:{};history:{}:{};presentation:{presentation};transcript-rev:{};markdown-presentation-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
+            "width:{};diff:{:?};theme:{};history:{}:{};presentation:{presentation};markdown-presentation-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
             self.width,
             self.diff_viewer_config,
             self.theme_fingerprint,
             self.has_older_history,
             self.loading_older_history,
-            self.transcript_projection_revision,
             self.markdown_presentation_revision,
             self.transcript.len(),
             self.pending_submissions_projection_revision,
@@ -252,6 +259,34 @@ pub fn test_layout_signature(
         elapsed_layout_revision: 0,
         transcript_projection_revision: 0,
         active_interaction_layout: None,
+        markdown_presentation_revision: 0,
+        pending_submissions_projection_revision: 0,
+        theme_fingerprint: 0,
+        has_older_history: false,
+        loading_older_history: false,
+    };
+    transcript_item_signature(item, &input)
+}
+
+#[cfg(test)]
+#[must_use]
+pub fn test_layout_signature_with_interaction_height(
+    item: &TranscriptItem,
+    width: u16,
+    interaction_id: &str,
+    height: u16,
+) -> TranscriptLayoutSignature {
+    let transcript = [item.clone()];
+    let pending = [];
+    let input = TranscriptLayoutInput {
+        width,
+        transcript: TranscriptItems::new(&transcript, &[]),
+        plugin_host: None,
+        diff_viewer_config: TuiDiffViewerConfig::default(),
+        pending: &pending,
+        elapsed_layout_revision: 0,
+        transcript_projection_revision: 0,
+        active_interaction_layout: Some((interaction_id, height)),
         markdown_presentation_revision: 0,
         pending_submissions_projection_revision: 0,
         theme_fingerprint: 0,
@@ -320,9 +355,16 @@ fn transcript_item_signature(
             .plugin_host
             .map_or(0, |host| host.visual_revision(invocation_id))
     });
+    let interaction_layout = item.interaction().and_then(|interaction| {
+        input
+            .active_interaction_layout
+            .filter(|(id, _)| *id == interaction.interaction_id)
+            .map(|(id, height)| format!("{id}:{height}"))
+    });
     TranscriptLayoutSignature::new(format!(
-        "{};theme:{};presentation-generation:{presentation_generation};visual-rev:{visual_revision}",
+        "{};theme:{};presentation-generation:{presentation_generation};visual-rev:{visual_revision};interaction-layout:{}",
         base.as_str(),
-        input.theme_fingerprint
+        input.theme_fingerprint,
+        interaction_layout.as_deref().unwrap_or("none")
     ))
 }

@@ -4691,6 +4691,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 mod tests {
     use super::*;
     use crate::transcript::TranscriptItemKind;
+    use crate::transcript_layout::{TranscriptLayoutInvalidation, VisibleTranscriptSource};
 
     fn invalidation_deadline(app: &BmuxApp, key: &str, now: Instant) -> Option<Instant> {
         app.invalidation_requests(now, SystemTime::UNIX_EPOCH)
@@ -5007,6 +5008,81 @@ mod tests {
             assert!(!source.contains("Color::"));
             assert!(!source.contains("PICKER_BG"));
         }
+    }
+
+    #[test]
+    fn active_interaction_row_range_tracks_lifecycle_height_changes() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_pending_interactions(vec![interaction("first")]);
+        let index = app.interaction_transcript_index("first").expect("first");
+        crate::transcript_projection::sync_layout_for_test(&mut app, 80);
+        let fallback = app
+            .transcript_layout()
+            .entry_row_count(VisibleTranscriptSource::Transcript, index)
+            .expect("fallback rows");
+
+        for height in [9, 10, 14, 21, 7] {
+            app.set_active_interaction_layout(Some(("first".to_owned(), height)));
+            crate::transcript_projection::sync_layout_for_test(&mut app, 80);
+            assert_eq!(
+                app.transcript_item_row_range(index)
+                    .expect("interaction row range")
+                    .len(),
+                usize::from(height)
+            );
+        }
+
+        app.set_active_interaction_layout(None);
+        crate::transcript_projection::sync_layout_for_test(&mut app, 80);
+        assert_eq!(
+            app.transcript_item_row_range(index)
+                .expect("restored fallback range")
+                .len(),
+            fallback
+        );
+    }
+
+    #[test]
+    fn active_interaction_layout_replaces_cached_fallback_rows_incrementally() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_pending_interactions(vec![interaction("first"), interaction("second")]);
+        let first = app.interaction_transcript_index("first").expect("first");
+        let second = app.interaction_transcript_index("second").expect("second");
+
+        crate::transcript_projection::sync_layout_for_test(&mut app, 80);
+        let fallback_first = app
+            .transcript_layout()
+            .entry_row_count(VisibleTranscriptSource::Transcript, first)
+            .expect("fallback first rows");
+        let fallback_second = app
+            .transcript_layout()
+            .entry_row_count(VisibleTranscriptSource::Transcript, second)
+            .expect("fallback second rows");
+        app.transcript_layout_mut().drain_sync_stats();
+
+        app.set_active_interaction_layout(Some(("first".to_owned(), 17)));
+        crate::transcript_projection::sync_layout_for_test(&mut app, 80);
+
+        assert_eq!(
+            app.transcript_layout()
+                .entry_row_count(VisibleTranscriptSource::Transcript, first),
+            Some(17)
+        );
+        assert_eq!(
+            app.transcript_layout()
+                .entry_row_count(VisibleTranscriptSource::Transcript, second),
+            Some(fallback_second)
+        );
+        assert_ne!(fallback_first, 17);
+        let stats = app.transcript_layout_mut().drain_sync_stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(
+            stats[0].invalidation,
+            TranscriptLayoutInvalidation::Incremental
+        );
+        assert_eq!(stats[0].entries_scanned, 1);
+        assert_eq!(stats[0].entries_rebuilt, 1);
+        assert_eq!(stats[0].rows_regenerated, 17);
     }
 
     #[test]

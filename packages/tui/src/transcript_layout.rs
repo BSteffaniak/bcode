@@ -24,6 +24,44 @@ impl TranscriptLayoutSignature {
     }
 }
 
+/// Retained transcript rows or a sparse span of blank placeholder rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptLayoutRows {
+    /// Fully rendered ordinary transcript rows.
+    Rendered(Vec<Line>),
+    /// Logical rows rendered directly by an active terminal interaction.
+    BlankSpan(usize),
+}
+
+impl Default for TranscriptLayoutRows {
+    fn default() -> Self {
+        Self::Rendered(Vec::new())
+    }
+}
+
+impl TranscriptLayoutRows {
+    /// Return the logical row count represented by this entry.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        match self {
+            Self::Rendered(rows) => rows.len(),
+            Self::BlankSpan(len) => *len,
+        }
+    }
+
+    /// Return whether this entry has no logical rows.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl From<Vec<Line>> for TranscriptLayoutRows {
+    fn from(rows: Vec<Line>) -> Self {
+        Self::Rendered(rows)
+    }
+}
+
 /// Fingerprint for inputs used to prepare transcript layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptLayoutFingerprint(String);
@@ -154,7 +192,7 @@ impl TranscriptLayoutCache {
     ) -> TranscriptLayoutSyncStats
     where
         S: Fn(usize) -> TranscriptLayoutSignature,
-        R: FnMut(usize) -> Vec<Line>,
+        R: FnMut(usize) -> TranscriptLayoutRows,
     {
         let started = Instant::now();
         let (entries_scanned, signatures_changed, rows_regenerated) =
@@ -182,7 +220,7 @@ impl TranscriptLayoutCache {
     ) -> TranscriptLayoutSyncStats
     where
         S: Fn(usize) -> TranscriptLayoutSignature,
-        R: FnMut(usize) -> Vec<Line>,
+        R: FnMut(usize) -> TranscriptLayoutRows,
     {
         let started = Instant::now();
         let (entries_scanned, signatures_changed, rows_regenerated) = self
@@ -219,12 +257,12 @@ impl TranscriptLayoutCache {
     ) -> TranscriptLayoutSyncStats
     where
         TS: Fn(usize) -> TranscriptLayoutSignature,
-        TR: Fn(usize) -> Vec<Line>,
+        TR: Fn(usize) -> TranscriptLayoutRows,
         TI: Fn(usize) -> Option<String>,
         PS: Fn(usize) -> TranscriptLayoutSignature,
-        PR: Fn(usize) -> Vec<Line>,
+        PR: Fn(usize) -> TranscriptLayoutRows,
         HS: FnOnce() -> Option<TranscriptLayoutSignature>,
-        HR: FnOnce() -> Vec<Line>,
+        HR: FnOnce() -> TranscriptLayoutRows,
         R: FnOnce() -> bool,
     {
         let started = Instant::now();
@@ -396,12 +434,12 @@ mod tests {
         transcript_len: usize,
     ) -> TranscriptLayoutSpec<
         impl Fn(usize) -> TranscriptLayoutSignature,
-        impl Fn(usize) -> Vec<Line>,
+        impl Fn(usize) -> TranscriptLayoutRows,
         impl Fn(usize) -> Option<String>,
         impl Fn(usize) -> TranscriptLayoutSignature,
-        impl Fn(usize) -> Vec<Line>,
+        impl Fn(usize) -> TranscriptLayoutRows,
         impl FnOnce() -> Option<TranscriptLayoutSignature>,
-        impl FnOnce() -> Vec<Line>,
+        impl FnOnce() -> TranscriptLayoutRows,
         impl FnOnce() -> bool,
     > {
         TranscriptLayoutSpec {
@@ -413,12 +451,12 @@ mod tests {
             transcript_len,
             pending_len: 0,
             transcript_signature: |index| TranscriptLayoutSignature::new(format!("item-{index}")),
-            transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+            transcript_rows: |index| vec![Line::from(format!("row-{index}"))].into(),
             transcript_invocation_id: |_| None,
             pending_signature: |index| TranscriptLayoutSignature::new(format!("pending-{index}")),
-            pending_rows: |_| Vec::new(),
+            pending_rows: |_| Vec::new().into(),
             history_banner_signature: || None,
-            history_banner_rows: Vec::new,
+            history_banner_rows: || Vec::new().into(),
             reset: || false,
         }
     }
@@ -432,6 +470,7 @@ mod tests {
                 (0..row_count)
                     .map(|row| Line::from(format!("row-{row}")))
                     .collect::<Vec<_>>()
+                    .into()
             }
         };
         cache.sync(TranscriptLayoutSpec {
@@ -446,7 +485,7 @@ mod tests {
             pending_signature: |_| unreachable!("no pending"),
             pending_rows: |_| unreachable!("no pending"),
             history_banner_signature: || None,
-            history_banner_rows: Vec::new,
+            history_banner_rows: || Vec::new().into(),
             reset: || false,
         });
         assert_eq!(cache.total_rows(), 1);
@@ -463,7 +502,7 @@ mod tests {
             pending_signature: |_| unreachable!("no pending"),
             pending_rows: |_| unreachable!("no pending"),
             history_banner_signature: || None,
-            history_banner_rows: Vec::new,
+            history_banner_rows: || Vec::new().into(),
             reset: || false,
         });
 
@@ -504,19 +543,19 @@ mod tests {
             transcript_len: 3,
             pending_len: 0,
             transcript_signature: |index| TranscriptLayoutSignature::new(format!("item-{index}")),
-            transcript_rows: |_| vec![Line::from("row")],
+            transcript_rows: |_| vec![Line::from("row")].into(),
             transcript_invocation_id: |index| Some(format!("call-{index}")),
             pending_signature: |index| TranscriptLayoutSignature::new(format!("pending-{index}")),
-            pending_rows: |_| Vec::new(),
+            pending_rows: |_| Vec::new().into(),
             history_banner_signature: || None,
-            history_banner_rows: Vec::new,
+            history_banner_rows: || Vec::new().into(),
             reset: || false,
         });
         let stats = cache.sync_visuals(
             TranscriptLayoutFingerprint::new("updated".to_owned()),
             &BTreeSet::from(["call-1".to_owned()]),
             |index| TranscriptLayoutSignature::new(format!("updated-{index}")),
-            |_| vec![Line::from("one"), Line::from("two"), Line::from("three")],
+            |_| vec![Line::from("one"), Line::from("two"), Line::from("three")].into(),
         );
 
         assert_eq!(stats.entries_scanned, 1);
@@ -545,12 +584,12 @@ mod tests {
             transcript_len: 1,
             pending_len: 1,
             transcript_signature: |_| TranscriptLayoutSignature::new("item".to_owned()),
-            transcript_rows: |_| vec![Line::from("committed")],
+            transcript_rows: |_| vec![Line::from("committed")].into(),
             transcript_invocation_id: |_| None,
             pending_signature: |_| TranscriptLayoutSignature::new("pending".to_owned()),
-            pending_rows: |_| vec![Line::from("pending-one"), Line::from("pending-two")],
+            pending_rows: |_| vec![Line::from("pending-one"), Line::from("pending-two")].into(),
             history_banner_signature: || None,
-            history_banner_rows: Vec::new,
+            history_banner_rows: || Vec::new().into(),
             reset: || false,
         });
         assert_eq!(cache.total_rows(), 3);
@@ -564,12 +603,12 @@ mod tests {
             transcript_len: 1,
             pending_len: 0,
             transcript_signature: |_| TranscriptLayoutSignature::new("item".to_owned()),
-            transcript_rows: |_| vec![Line::from("committed")],
+            transcript_rows: |_| vec![Line::from("committed")].into(),
             transcript_invocation_id: |_| None,
             pending_signature: |_| unreachable!("no pending entries"),
             pending_rows: |_| unreachable!("no pending entries"),
             history_banner_signature: || None,
-            history_banner_rows: Vec::new,
+            history_banner_rows: || Vec::new().into(),
             reset: || false,
         });
 
@@ -599,12 +638,12 @@ mod tests {
             transcript_len: 1,
             pending_len: 1,
             transcript_signature: |_| TranscriptLayoutSignature::new("item".to_owned()),
-            transcript_rows: |_| vec![Line::from("a"), Line::from("b")],
+            transcript_rows: |_| vec![Line::from("a"), Line::from("b")].into(),
             transcript_invocation_id: |_| None,
             pending_signature: |_| TranscriptLayoutSignature::new("pending".to_owned()),
-            pending_rows: |_| vec![Line::from("pending")],
+            pending_rows: |_| vec![Line::from("pending")].into(),
             history_banner_signature: || Some(TranscriptLayoutSignature::new("history".to_owned())),
-            history_banner_rows: || vec![Line::from("history")],
+            history_banner_rows: || vec![Line::from("history")].into(),
             reset: || false,
         });
 

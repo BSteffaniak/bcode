@@ -22,7 +22,8 @@ use super::command_palette::BmuxCommandPalette;
 use super::daemon_issue;
 use super::effects::{DaemonObservation, TuiEffect, TuiEffectResult};
 use super::interactive_surface::{
-    InteractiveSurfaceQueue, InteractiveSurfaceRequest, InteractiveSurfaceState,
+    InteractiveSurfaceEventOutcome, InteractiveSurfaceQueue, InteractiveSurfaceRequest,
+    InteractiveSurfaceState,
 };
 use super::keymap::BmuxKeyMap;
 use super::permission_dialog::PermissionDialogState;
@@ -1674,11 +1675,30 @@ impl ChatLoopState {
     pub fn handle_interactive_surface_event(
         &mut self,
         event: &Event,
-    ) -> Option<(String, bcode_session_models::ToolExchangeResolution)> {
-        let surface = self.interactive_surface.as_mut()?;
-        surface
-            .handle_event(event)
-            .map(|resolution| (surface.interaction_id().to_owned(), resolution))
+    ) -> InteractiveSurfaceEventOutcome {
+        self.interactive_surface
+            .as_mut()
+            .map_or(InteractiveSurfaceEventOutcome::Ignored, |surface| {
+                surface.handle_event_outcome(event)
+            })
+    }
+
+    #[cfg(test)]
+    pub fn active_interactive_surface_native_id_for_test(&self) -> Option<&'static str> {
+        self.interactive_surface
+            .as_ref()
+            .map(InteractiveSurfaceState::surface_id_for_test)
+    }
+
+    pub fn active_interactive_surface_id(&self) -> Option<&str> {
+        self.interactive_surface
+            .as_ref()
+            .map(InteractiveSurfaceState::interaction_id)
+    }
+
+    #[cfg(test)]
+    pub fn install_interactive_surface_for_test(&mut self, surface: InteractiveSurfaceState) {
+        self.interactive_surface = Some(surface);
     }
 
     pub fn complete_interactive_surface_resolution(&mut self, resolved: bool) {
@@ -4008,8 +4028,8 @@ pub fn draw_chat_frame<W: Write>(
                 frame.fill(surface_area, " ", bmux_tui::prelude::Style::new());
                 surface.render(surface_area, frame);
             } else if let Some(placement) = inline_placement {
-                surface.render_clipped(
-                    placement.full_area,
+                surface.render_slice(
+                    placement.full_area.height,
                     placement.visible_content_offset,
                     placement.destination,
                     frame,
