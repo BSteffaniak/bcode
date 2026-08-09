@@ -2,11 +2,12 @@
 
 use bcode_markdown_render::markdown_to_plain_text;
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::geometry::{Insets, Size};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
 use bmux_tui::text_width::display_width;
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
+use bmux_tui_components::dialog::{Dialog, DialogState};
+use bmux_tui_components::modal_frame::{ModalPlacement, ModalSizing};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::render::TuiTheme;
@@ -24,44 +25,31 @@ pub fn render_timeline_dialog(
     frame: &mut Frame<'_>,
     theme: TuiTheme,
 ) {
-    let modal = modal_frame(theme);
-    modal.render(frame.area(), frame);
-
-    let content = modal.content_area(frame.area());
-    if content.is_empty() {
+    let sizing = dialog_sizing();
+    let layout = Dialog::new(&[], &[], theme.modal_theme())
+        .title(" Timeline ")
+        .sizing(sizing)
+        .placement(ModalPlacement::Centered)
+        .layout(frame.area());
+    if layout.body.is_empty() {
         return;
     }
-    let visible_entries = usize::from(content.height.saturating_sub(3));
+    let visible_entries = usize::from(layout.body.height.saturating_sub(3));
     state.sync_scroll(visible_entries);
-    let rows = rows(state, content.width, visible_entries, theme);
-    for (row_index, line) in rows.iter().take(usize::from(content.height)).enumerate() {
-        let Ok(row_offset) = u16::try_from(row_index) else {
-            return;
-        };
-        modal.render_line(
-            Rect::new(
-                content.x,
-                content.y.saturating_add(row_offset),
-                content.width,
-                1,
-            ),
-            line,
-            frame,
-        );
-    }
+    let body = rows(state, layout.body.width, visible_entries, theme);
+    Dialog::new(&body, &[], theme.modal_theme())
+        .title(" Timeline ")
+        .sizing(sizing)
+        .placement(ModalPlacement::Centered)
+        .render(frame.area(), &DialogState::new(), frame);
 }
 
-fn modal_frame(theme: TuiTheme) -> ModalFrame {
-    ModalFrame::new(
-        ModalSizing::new(
-            Size::new(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT),
-            Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
-            Insets::all(4),
-        ),
-        theme.modal_theme(),
+const fn dialog_sizing() -> ModalSizing {
+    ModalSizing::new(
+        Size::new(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT),
+        Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
+        Insets::all(4),
     )
-    .title(" Timeline ")
-    .placement(ModalPlacement::Centered)
 }
 
 fn rows(
