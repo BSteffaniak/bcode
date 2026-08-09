@@ -1939,16 +1939,20 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             }
             bmux_tui_runtime::RuntimeEvent::Message(
                 BcodeRuntimeMessage::InteractiveSurfaceOpened(result),
-            ) => {
-                if self.loop_state.complete_interactive_surface_open(result) {
+            ) => match self.loop_state.complete_interactive_surface_open(result) {
+                super::chat_loop::InteractiveSurfaceOpenCompletion::Opened => {
                     super::invalidation::UiInvalidation::Structural
-                } else {
+                }
+                super::chat_loop::InteractiveSurfaceOpenCompletion::Stale => {
+                    super::invalidation::UiInvalidation::None
+                }
+                super::chat_loop::InteractiveSurfaceOpenCompletion::Failed => {
                     self.chat
                         .app
                         .set_status("Interactive request unavailable; retrying".to_owned());
                     super::invalidation::UiInvalidation::Paint
                 }
-            }
+            },
             bmux_tui_runtime::RuntimeEvent::Message(
                 BcodeRuntimeMessage::InteractiveSurfaceResolved(result),
             ) => match result {

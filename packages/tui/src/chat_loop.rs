@@ -206,6 +206,13 @@ pub struct InteractiveSurfaceGeometry {
     pub destination: Rect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractiveSurfaceOpenCompletion {
+    Opened,
+    Stale,
+    Failed,
+}
+
 pub struct ChatLoopState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
@@ -1379,7 +1386,7 @@ impl ChatLoopState {
     pub fn complete_interactive_surface_open(
         &mut self,
         result: Result<InteractiveSurfaceState, String>,
-    ) -> bool {
+    ) -> InteractiveSurfaceOpenCompletion {
         match result {
             Ok(surface) => {
                 let is_expected = self
@@ -1387,16 +1394,16 @@ impl ChatLoopState {
                     .front_ready(Instant::now())
                     .is_some_and(|request| request.interaction_id() == surface.interaction_id());
                 if !is_expected || self.interactive_surface.is_some() {
-                    return false;
+                    return InteractiveSurfaceOpenCompletion::Stale;
                 }
                 self.interactive_surface_queue.pop_front();
                 self.interactive_surface = Some(surface);
-                true
+                InteractiveSurfaceOpenCompletion::Opened
             }
             Err(error) => {
                 self.interactive_surface_queue.defer_front(Instant::now());
                 tracing::warn!(%error, "failed to open interactive TUI surface");
-                false
+                InteractiveSurfaceOpenCompletion::Failed
             }
         }
     }
@@ -5015,7 +5022,10 @@ mod scheduler_tests {
             state.interactive_surface_queue.interaction_ids(),
             ["queued"]
         );
-        assert!(!state.complete_interactive_surface_open(Ok(surface("opening"))));
+        assert_eq!(
+            state.complete_interactive_surface_open(Ok(surface("opening"))),
+            InteractiveSurfaceOpenCompletion::Stale
+        );
         assert!(!state.has_interactive_surface());
         assert_eq!(
             state.interactive_surface_queue.interaction_ids(),
@@ -5024,6 +5034,23 @@ mod scheduler_tests {
 
         observe_interactive_surface_event(&mut state, &resolved_event("queued"));
         assert!(state.interactive_surface_queue.interaction_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_open_is_distinct_from_stale_completion_and_defers_retry() {
+        let mut state = loop_state();
+        assert!(state.interactive_surface_queue.enqueue(
+            InteractiveSurfaceRequest::new("first", "surface", "{}"),
+            None,
+        ));
+
+        assert_eq!(
+            state.complete_interactive_surface_open(Err("unavailable".to_owned())),
+            InteractiveSurfaceOpenCompletion::Failed
+        );
+        assert!(state.next_surface_open_request().is_none());
+        assert!(state.next_interactive_surface_retry_at().is_some());
+        assert_eq!(state.interactive_surface_queue.interaction_ids(), ["first"]);
     }
 
     #[tokio::test]
@@ -5037,12 +5064,18 @@ mod scheduler_tests {
             );
         }
 
-        assert!(!state.complete_interactive_surface_open(Ok(surface("second"))));
+        assert_eq!(
+            state.complete_interactive_surface_open(Ok(surface("second"))),
+            InteractiveSurfaceOpenCompletion::Stale
+        );
         assert_eq!(
             state.interactive_surface_queue.interaction_ids(),
             ["first", "second"]
         );
-        assert!(state.complete_interactive_surface_open(Ok(surface("first"))));
+        assert_eq!(
+            state.complete_interactive_surface_open(Ok(surface("first"))),
+            InteractiveSurfaceOpenCompletion::Opened
+        );
         assert_eq!(state.active_interactive_surface_id(), Some("first"));
         assert_eq!(
             state.interactive_surface_queue.interaction_ids(),
