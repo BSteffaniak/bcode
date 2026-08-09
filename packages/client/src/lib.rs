@@ -3306,6 +3306,25 @@ impl BcodeClient {
         }
     }
 
+    /// Resolve and start one exact published package export.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, publication facts drift, or the exact
+    /// authored revision cannot start.
+    pub async fn start_workflow_package_export(
+        &self,
+        request: bcode_ipc::StartWorkflowPackageExportRequest,
+    ) -> Result<bcode_ipc::WorkflowPackageExportRunStartResponse, ClientError> {
+        match self
+            .send_request(Request::StartWorkflowPackageExport(request))
+            .await?
+        {
+            ResponsePayload::WorkflowPackageExportRunStarted(response) => Ok(*response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Start one durable workflow from a registered exact definition.
     ///
     /// # Errors

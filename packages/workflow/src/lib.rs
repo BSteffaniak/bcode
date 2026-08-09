@@ -5084,11 +5084,34 @@ pub fn plan_workflow_package(
         })
         .collect::<Result<Vec<_>, WorkflowError>>()?;
     locked_imports.sort_by(|left, right| left.import_id.cmp(&right.import_id));
+    let locked_by_id = locked
+        .iter()
+        .map(|member| (member.member_id.as_str(), member))
+        .collect::<BTreeMap<_, _>>();
+    let exports = manifest
+        .exports
+        .iter()
+        .map(|(export, member_id)| {
+            let member = locked_by_id.get(member_id.as_str()).ok_or_else(|| {
+                authoring_error(
+                    "package.exports",
+                    "validated package export references an absent locked member",
+                )
+            })?;
+            Ok(WorkflowPackageLockedExport {
+                export: export.clone(),
+                member_id: member_id.clone(),
+                definition_identity: member.definition_identity.clone(),
+                published_revision: member.published_revision.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, WorkflowError>>()?;
     let lock = WorkflowPackageLock {
         version: WORKFLOW_PACKAGE_LOCK_VERSION,
         package_id: manifest.package_id.clone(),
         package_source_digest_sha256: digest_serializable(manifest)?,
         imports: locked_imports,
+        exports,
         members: locked,
     };
     lock.validate()?;
@@ -5826,7 +5849,9 @@ fn validate_workflow_package_plan(plan: &WorkflowPackagePlan) -> Result<(), Work
 }
 
 /// Current deterministic workflow package lock/result version.
-pub const WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 3;
+pub const WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 4;
+/// Current durable package publication receipt version.
+pub const WORKFLOW_PACKAGE_PUBLICATION_RECEIPT_VERSION: u32 = 1;
 
 /// One exact imported package/export lock fact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5873,6 +5898,114 @@ pub struct WorkflowPackageLockedMember {
     pub dependency_closure: Vec<String>,
 }
 
+/// Portable package/export identity resolved to exact publication facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageExportIdentity {
+    pub package_id: String,
+    pub export: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_lock_digest_sha256: Option<String>,
+}
+
+impl WorkflowPackageExportIdentity {
+    /// Validate portable package/export selection facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed package/export identities or lock digests.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        validate_authoring_id("package_export.package_id", &self.package_id)?;
+        validate_authoring_id("package_export.export", &self.export)?;
+        if let Some(digest) = &self.package_lock_digest_sha256 {
+            validate_sha256("package_export.package_lock_digest_sha256", digest)?;
+        }
+        Ok(())
+    }
+}
+
+/// One named exported workflow locked to an exact package member and immutable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageLockedExport {
+    pub export: String,
+    pub member_id: String,
+    pub definition_identity: WorkflowDefinitionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_revision: Option<WorkflowRevisionIdentity>,
+}
+
+/// Durable bounded publication receipt for one package and its public exports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackagePublicationReceipt {
+    pub version: u32,
+    pub package_id: String,
+    pub package_lock_digest_sha256: String,
+    pub published_at_ms: u64,
+    pub exports: Vec<WorkflowPackageLockedExport>,
+}
+
+impl WorkflowPackagePublicationReceipt {
+    /// Validate receipt identity, ordering, digests, and exact published export facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed identities/digests, absent exports,
+    /// duplicate ordering, or definition/revision identity mismatch.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_PACKAGE_PUBLICATION_RECEIPT_VERSION {
+            return Err(authoring_error(
+                "package_receipt.version",
+                "unsupported package publication receipt version",
+            ));
+        }
+        validate_authoring_id("package_receipt.package_id", &self.package_id)?;
+        validate_sha256(
+            "package_receipt.package_lock_digest_sha256",
+            &self.package_lock_digest_sha256,
+        )?;
+        if self.published_at_ms == 0
+            || self.exports.is_empty()
+            || self.exports.len() > MAX_WORKFLOW_PACKAGE_MEMBERS
+            || !self
+                .exports
+                .windows(2)
+                .all(|pair| pair[0].export < pair[1].export)
+        {
+            return Err(authoring_error(
+                "package_receipt.exports",
+                "package receipt requires bounded identity-ordered exports and a timestamp",
+            ));
+        }
+        for export in &self.exports {
+            validate_authoring_id("package_receipt.exports.export", &export.export)?;
+            validate_authoring_id("package_receipt.exports.member_id", &export.member_id)?;
+            if export.definition_identity.definition_id.trim().is_empty()
+                || export.definition_identity.definition_version == 0
+            {
+                return Err(authoring_error(
+                    "package_receipt.exports.definition_identity",
+                    "export definition identity is malformed",
+                ));
+            }
+            let revision = export.published_revision.as_ref().ok_or_else(|| {
+                authoring_error(
+                    "package_receipt.exports.published_revision",
+                    "published package exports require an exact authored revision",
+                )
+            })?;
+            if revision.revision == 0 || revision.workflow_id != export.definition_identity.kind {
+                return Err(authoring_error(
+                    "package_receipt.exports.published_revision",
+                    "export revision must match its definition logical identity",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Deterministic reproducibility result generated only from successful canonical outcomes.
 ///
 /// This contract is never runtime authority and does not authorize publication or execution.
@@ -5888,6 +6021,8 @@ pub struct WorkflowPackageLock {
     /// Exact imported package/export bindings in deterministic local identity order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub imports: Vec<WorkflowPackageLockedImport>,
+    /// Named exports locked to exact members in deterministic export-name order.
+    pub exports: Vec<WorkflowPackageLockedExport>,
     /// Members ordered deterministically by package-local identity.
     pub members: Vec<WorkflowPackageLockedMember>,
 }
@@ -5899,6 +6034,7 @@ impl WorkflowPackageLock {
     ///
     /// Returns an error for unsupported versions, malformed digests/identities, duplicate or
     /// unsorted members/closures, missing closure members, or inconsistent published revisions.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), WorkflowError> {
         if self.version != WORKFLOW_PACKAGE_LOCK_VERSION {
             return Err(authoring_error(
@@ -5928,6 +6064,18 @@ impl WorkflowPackageLock {
         for (index, import) in self.imports.iter().enumerate() {
             import.validate(&format!("package_lock.imports[{index}]"))?;
         }
+        if self.exports.is_empty()
+            || self.exports.len() > MAX_WORKFLOW_PACKAGE_MEMBERS
+            || !self
+                .exports
+                .windows(2)
+                .all(|pair| pair[0].export < pair[1].export)
+        {
+            return Err(authoring_error(
+                "package_lock.exports",
+                "locked exports must be bounded, unique, and ordered by export identity",
+            ));
+        }
         if self.members.is_empty() || self.members.len() > MAX_WORKFLOW_PACKAGE_MEMBERS {
             return Err(authoring_error(
                 "package_lock.members",
@@ -5946,6 +6094,42 @@ impl WorkflowPackageLock {
             ));
         }
         let known = ids.iter().copied().collect::<BTreeSet<_>>();
+        for (index, export) in self.exports.iter().enumerate() {
+            validate_authoring_id(
+                &format!("package_lock.exports[{index}].export"),
+                &export.export,
+            )?;
+            validate_authoring_id(
+                &format!("package_lock.exports[{index}].member_id"),
+                &export.member_id,
+            )?;
+            if export.definition_identity.definition_id.trim().is_empty()
+                || export.definition_identity.definition_version == 0
+            {
+                return Err(authoring_error(
+                    format!("package_lock.exports[{index}].definition_identity"),
+                    "locked export definition identity is malformed",
+                ));
+            }
+            let member = self
+                .members
+                .iter()
+                .find(|member| member.member_id == export.member_id)
+                .ok_or_else(|| {
+                    authoring_error(
+                        format!("package_lock.exports[{index}].member_id"),
+                        "locked export references an unknown member",
+                    )
+                })?;
+            if member.definition_identity != export.definition_identity
+                || member.published_revision != export.published_revision
+            {
+                return Err(authoring_error(
+                    format!("package_lock.exports[{index}]"),
+                    "locked export facts must exactly match their member",
+                ));
+            }
+        }
         for (index, member) in self.members.iter().enumerate() {
             validate_authoring_id(
                 &format!("package_lock.members[{index}].member_id"),
@@ -15734,22 +15918,29 @@ mod tests {
         };
         let identity = WorkflowDefinitionIdentity::for_definition("example/member", &definition)
             .expect("identity");
+        let locked_member = WorkflowPackageLockedMember {
+            member_id: "member".to_string(),
+            source_digest_sha256: "b".repeat(64),
+            executable_digest_sha256: "c".repeat(64),
+            definition_identity: identity,
+            published_revision: Some(WorkflowRevisionIdentity {
+                workflow_id: "example/member".to_string(),
+                revision: 1,
+            }),
+            dependency_closure: Vec::new(),
+        };
         let lock = WorkflowPackageLock {
             version: WORKFLOW_PACKAGE_LOCK_VERSION,
             package_id: "example/package".to_string(),
             imports: Vec::new(),
             package_source_digest_sha256: "a".repeat(64),
-            members: vec![WorkflowPackageLockedMember {
-                member_id: "member".to_string(),
-                source_digest_sha256: "b".repeat(64),
-                executable_digest_sha256: "c".repeat(64),
-                definition_identity: identity,
-                published_revision: Some(WorkflowRevisionIdentity {
-                    workflow_id: "example/member".to_string(),
-                    revision: 1,
-                }),
-                dependency_closure: Vec::new(),
+            exports: vec![WorkflowPackageLockedExport {
+                export: "main".to_string(),
+                member_id: locked_member.member_id.clone(),
+                definition_identity: locked_member.definition_identity.clone(),
+                published_revision: locked_member.published_revision.clone(),
             }],
+            members: vec![locked_member],
         };
         lock.validate().expect("package lock");
         let round_trip: WorkflowPackageLock =
@@ -15773,12 +15964,21 @@ mod tests {
             published_revision: None,
             dependency_closure: Vec::new(),
         };
-        let lock = |version, digest: String, members| WorkflowPackageLock {
-            version,
-            package_id: "example/package".to_string(),
-            imports: Vec::new(),
-            package_source_digest_sha256: digest,
-            members,
+        let lock = |version, digest: String, members: Vec<WorkflowPackageLockedMember>| {
+            let first = members.first().expect("test lock member");
+            WorkflowPackageLock {
+                version,
+                package_id: "example/package".to_string(),
+                imports: Vec::new(),
+                package_source_digest_sha256: digest,
+                exports: vec![WorkflowPackageLockedExport {
+                    export: "main".to_string(),
+                    member_id: first.member_id.clone(),
+                    definition_identity: first.definition_identity.clone(),
+                    published_revision: first.published_revision.clone(),
+                }],
+                members,
+            }
         };
         assert!(
             lock(

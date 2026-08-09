@@ -419,6 +419,35 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
                     preset_id,
                     preset_generation,
                 },
+                WorkflowStartSelection::PackageExport {
+                    package_id,
+                    export,
+                    package_lock_digest_sha256,
+                } => {
+                    let configuration = configuration
+                        .as_deref()
+                        .map(read_bounded_json)
+                        .transpose()?;
+                    print_json(
+                        &client
+                            .start_workflow_package_export(
+                                bcode_ipc::StartWorkflowPackageExportRequest {
+                                    package_export: bcode_workflow::WorkflowPackageExportIdentity {
+                                        package_id,
+                                        export,
+                                        package_lock_digest_sha256,
+                                    },
+                                    run_id,
+                                    parent_session_id,
+                                    workspace_snapshot,
+                                    parent_session_generation: None,
+                                    configuration,
+                                },
+                            )
+                            .await?,
+                    )?;
+                    return Ok(());
+                }
             };
             let configuration = configuration
                 .as_deref()
@@ -2306,6 +2335,15 @@ enum WorkflowStartSelection {
     Active {
         #[arg(long)]
         workflow_id: String,
+    },
+    /// Resolve and start one exact published package export.
+    PackageExport {
+        #[arg(long)]
+        package_id: String,
+        #[arg(long)]
+        export: String,
+        #[arg(long)]
+        package_lock_digest_sha256: Option<String>,
     },
     /// Resolve and start one exact preset generation.
     Preset {

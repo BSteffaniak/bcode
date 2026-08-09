@@ -32,7 +32,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 12;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 13;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current durable workflow execution-session link contract version.
@@ -2178,28 +2178,107 @@ impl WorkflowStore {
         fault.after_boundary(WorkflowPackageMutationBoundary::AllMembersStaged, None)?;
         results.sort_by(|left, right| left.member_id.cmp(&right.member_id));
         published_lock_members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+        let mut exports = request.expected_lock.exports.clone();
+        for export in &mut exports {
+            let member = published_lock_members
+                .iter()
+                .find(|member| member.member_id == export.member_id)
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "package export references absent published member".to_string(),
+                    )
+                })?;
+            export.definition_identity = member.definition_identity.clone();
+            export.published_revision = member.published_revision.clone();
+        }
+        exports.sort_by(|left, right| left.export.cmp(&right.export));
+        let published_lock = WorkflowPackageLock {
+            version: request.expected_lock.version,
+            package_id: request.expected_lock.package_id.clone(),
+            package_source_digest_sha256: request
+                .expected_lock
+                .package_source_digest_sha256
+                .clone(),
+            imports: request.expected_lock.imports.clone(),
+            exports,
+            members: published_lock_members,
+        };
+        let receipt = bcode_workflow::WorkflowPackagePublicationReceipt {
+            version: bcode_workflow::WORKFLOW_PACKAGE_PUBLICATION_RECEIPT_VERSION,
+            package_id: request.package_id.clone(),
+            package_lock_digest_sha256: sha256_hex(
+                bounded_json("published package lock", &published_lock)?.as_bytes(),
+            ),
+            published_at_ms,
+            exports: published_lock.exports.clone(),
+        };
+        receipt
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        transaction.execute(
+            "INSERT INTO workflow_package_publications \
+             (package_id, package_lock_digest_sha256, lock_json, receipt_json, published_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                &receipt.package_id,
+                &receipt.package_lock_digest_sha256,
+                bounded_json("published package lock", &published_lock)?,
+                bounded_json("package publication receipt", &receipt)?,
+                published_at_ms,
+            ),
+        )?;
         transaction.commit()?;
         let result = WorkflowPackageMutationResult {
             version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
             package_id: request.package_id.clone(),
             outcome: WorkflowPackageMutationOutcome::Published,
             members: results,
-            lock: Some(WorkflowPackageLock {
-                version: request.expected_lock.version,
-                package_id: request.expected_lock.package_id.clone(),
-                package_source_digest_sha256: request
-                    .expected_lock
-                    .package_source_digest_sha256
-                    .clone(),
-                imports: request.expected_lock.imports.clone(),
-                members: published_lock_members,
-            }),
+            lock: Some(published_lock),
             diagnostics: Vec::new(),
         };
         result
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
         Ok(result)
+    }
+
+    /// Read one exact or latest bounded package publication receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity/digest input, corrupt durable receipt state, or a
+    /// database query failure.
+    pub fn workflow_package_publication(
+        &self,
+        package_id: &str,
+        package_lock_digest_sha256: Option<&str>,
+    ) -> Result<Option<bcode_workflow::WorkflowPackagePublicationReceipt>, WorkflowStoreError> {
+        validate_id("package_id", package_id)?;
+        if let Some(digest) = package_lock_digest_sha256 {
+            validate_id("package_lock_digest_sha256", digest)?;
+        }
+        let receipt_json = self
+            .connection
+            .query_row(
+                "SELECT receipt_json FROM workflow_package_publications \
+                 WHERE package_id = ?1 AND (?2 IS NULL OR package_lock_digest_sha256 = ?2) \
+                 ORDER BY published_at_ms DESC LIMIT 1",
+                (package_id, package_lock_digest_sha256),
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        receipt_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?
+            .map(
+                |receipt: bcode_workflow::WorkflowPackagePublicationReceipt| {
+                    receipt
+                        .validate()
+                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                    Ok(receipt)
+                },
+            )
+            .transpose()
     }
 
     /// Create one durable mutable draft.
@@ -13023,6 +13102,16 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
              FOREIGN KEY (definition_id, definition_version)\
                  REFERENCES workflow_definitions(definition_id, version)\
          );\
+         CREATE TABLE IF NOT EXISTS workflow_package_publications (\
+             package_id TEXT NOT NULL,\
+             package_lock_digest_sha256 TEXT NOT NULL,\
+             lock_json TEXT NOT NULL,\
+             receipt_json TEXT NOT NULL,\
+             published_at_ms INTEGER NOT NULL,\
+             PRIMARY KEY (package_id, package_lock_digest_sha256)\
+         );\
+         CREATE INDEX IF NOT EXISTS idx_workflow_package_publications_latest \
+             ON workflow_package_publications(package_id, published_at_ms DESC);\
          CREATE TABLE IF NOT EXISTS workflow_presets (\
              workflow_id TEXT NOT NULL,\
              preset_id TEXT NOT NULL,\
@@ -13200,6 +13289,16 @@ mod tests {
                     package_id: "example/package".to_string(),
                     package_source_digest_sha256: "c".repeat(64),
                     imports: Vec::new(),
+                    exports: locked
+                        .first()
+                        .map(|member| bcode_workflow::WorkflowPackageLockedExport {
+                            export: "main".to_string(),
+                            member_id: member.member_id.clone(),
+                            definition_identity: member.definition_identity.clone(),
+                            published_revision: None,
+                        })
+                        .into_iter()
+                        .collect(),
                     members: locked,
                 },
             },
@@ -13281,19 +13380,26 @@ mod tests {
             .expect("executable digest");
         store.create_authored_workflow(&workflow).expect("workflow");
         store.create_workflow_draft(&draft).expect("draft");
+        let locked_member = bcode_workflow::WorkflowPackageLockedMember {
+            member_id: "main".to_string(),
+            source_digest_sha256: source_digest,
+            executable_digest_sha256: executable_digest,
+            definition_identity: identity.clone(),
+            published_revision: None,
+            dependency_closure: Vec::new(),
+        };
         let lock = WorkflowPackageLock {
             version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
             package_id: "example/package".to_string(),
             package_source_digest_sha256: "a".repeat(64),
             imports: Vec::new(),
-            members: vec![bcode_workflow::WorkflowPackageLockedMember {
-                member_id: "main".to_string(),
-                source_digest_sha256: source_digest,
-                executable_digest_sha256: executable_digest,
-                definition_identity: identity.clone(),
+            exports: vec![bcode_workflow::WorkflowPackageLockedExport {
+                export: "main".to_string(),
+                member_id: locked_member.member_id.clone(),
+                definition_identity: locked_member.definition_identity.clone(),
                 published_revision: None,
-                dependency_closure: Vec::new(),
             }],
+            members: vec![locked_member],
         };
         let request = WorkflowPackagePublishRequest {
             version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
@@ -13319,6 +13425,12 @@ mod tests {
             store
                 .workflow_revision(&workflow.workflow_id, 1)
                 .expect("rolled back revision")
+                .is_none()
+        );
+        assert!(
+            store
+                .workflow_package_publication("example/package", None)
+                .expect("rolled back receipt")
                 .is_none()
         );
         assert_eq!(
@@ -13373,6 +13485,20 @@ mod tests {
                 .revision,
             1
         );
+        assert_eq!(
+            published_lock.exports[0]
+                .published_revision
+                .as_ref()
+                .expect("export revision")
+                .revision,
+            1
+        );
+        let receipt = reopened
+            .workflow_package_publication("example/package", None)
+            .expect("receipt after restart")
+            .expect("receipt");
+        assert_eq!(receipt.exports, published_lock.exports);
+        assert_eq!(receipt.published_at_ms, 20);
         let mut store = reopened;
         let mut stale = request;
         stale.expected_generations[0].expected_generation = 2;

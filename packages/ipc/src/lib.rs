@@ -424,6 +424,8 @@ pub enum Request {
     ImportWorkflowRevision(ImportWorkflowRevisionRequest),
     /// Resolve and start one immutable authored-workflow revision.
     StartAuthoredWorkflow(StartAuthoredWorkflowRequest),
+    /// Resolve one exact published package export and start its authored revision.
+    StartWorkflowPackageExport(StartWorkflowPackageExportRequest),
     /// List bounded logical authored workflows.
     ListAuthoredWorkflows {
         #[serde(default)]
@@ -2153,6 +2155,31 @@ pub struct StartAuthoredWorkflowRequest {
     pub configuration: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartWorkflowPackageExportRequest {
+    pub package_export: bcode_workflow::WorkflowPackageExportIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub parent_session_id: bcode_session_models::SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<serde_json::Value>,
+}
+
+/// Successful package-export run start with exact publication provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageExportRunStartResponse {
+    pub package_export: bcode_workflow::WorkflowPackageExportIdentity,
+    pub package_lock_digest_sha256: String,
+    pub exported: bcode_workflow::WorkflowPackageLockedExport,
+    pub started: AuthoredWorkflowRunStartResponse,
+}
+
 /// Successful authored-workflow run start with exact durable provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2527,6 +2554,7 @@ pub enum ResponsePayload {
         result: WorkflowRevisionImportResult,
     },
     AuthoredWorkflowRunStarted(AuthoredWorkflowRunStartResponse),
+    WorkflowPackageExportRunStarted(Box<WorkflowPackageExportRunStartResponse>),
     AuthoredWorkflowList {
         page: WorkflowAuthoringPage<
             AuthoredWorkflowSnapshot,
@@ -4538,6 +4566,7 @@ mod tests {
                     version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
                     package_id: "example/package".to_string(),
                     imports: Vec::new(),
+                    exports: Vec::new(),
                     package_source_digest_sha256: "a".repeat(64),
                     members: Vec::new(),
                 },
@@ -4562,6 +4591,7 @@ mod tests {
                         version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
                         package_id: "example/package".to_string(),
                         imports: Vec::new(),
+                        exports: Vec::new(),
                         package_source_digest_sha256: "a".repeat(64),
                         members: Vec::new(),
                     },
@@ -4584,6 +4614,7 @@ mod tests {
                     version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
                     package_id: "example/package".to_string(),
                     imports: Vec::new(),
+                    exports: Vec::new(),
                     package_source_digest_sha256: "a".repeat(64),
                     members: Vec::new(),
                 },

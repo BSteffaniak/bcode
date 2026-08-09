@@ -134,7 +134,7 @@ for contract in \
   'WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 2' \
   'WORKFLOW_AUTHORING_DOCUMENT_VERSION: u32 = 2' \
   'WORKFLOW_PACKAGE_MANIFEST_VERSION: u32 = 3' \
-  'WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 3' \
+  'WORKFLOW_PACKAGE_LOCK_VERSION: u32 = 4' \
   'WORKFLOW_PACKAGE_CLOSURE_VERSION: u32 = 1' \
   'WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2'; do
   if ! rg -q "$contract" packages/workflow/src/lib.rs; then
@@ -171,7 +171,10 @@ if ! rg -q 'WorkflowValueSelector' packages/workflow/src/lib.rs \
 fi
 
 if ! rg -q 'plan_workflow_package_closure' packages/workflow/src/lib.rs packages/server/src/lib.rs \
-  || ! rg -q 'read_workflow_package_closure' packages/cli/src/lib.rs; then
+  || ! rg -q 'read_workflow_package_closure' packages/cli/src/lib.rs \
+  || ! rg -q 'workflow_package_publications' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'WorkflowPackagePublicationReceipt' packages/workflow/src/lib.rs \
+  || ! rg -q 'StartWorkflowPackageExport' packages/ipc/src/lib.rs packages/server/src/lib.rs; then
   echo "Composable workflow package violation: recursive closure resolution drifted from public package planning." >&2
   violations=1
 fi

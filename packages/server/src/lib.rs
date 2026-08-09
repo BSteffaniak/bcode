@@ -3840,6 +3840,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SubscribeRuntimeWork { session_id }
         | Request::AttachSessionProjectionWindow { session_id, .. } => Some(*session_id),
         Request::StartWorkflowRun(request) => Some(request.parent_session_id),
+        Request::StartWorkflowPackageExport(request) => Some(request.parent_session_id),
         Request::ForkSession {
             source_session_id, ..
         }
@@ -3948,6 +3949,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ImportWorkflowDraft(_) => "import_workflow_draft",
         Request::ImportWorkflowRevision(_) => "import_workflow_revision",
         Request::StartAuthoredWorkflow(_) => "start_authored_workflow",
+        Request::StartWorkflowPackageExport(_) => "start_workflow_package_export",
         Request::ListAuthoredWorkflows { .. } => "list_authored_workflows",
         Request::GetAuthoredWorkflow { .. } => "get_authored_workflow",
         Request::InspectAuthoredWorkflow { .. } => "inspect_authored_workflow",
@@ -4624,6 +4626,9 @@ async fn handle_request_inner(
         }
         Request::StartAuthoredWorkflow(request) => {
             handle_start_authored_workflow(request_id, client_id, state, writer, request).await
+        }
+        Request::StartWorkflowPackageExport(request) => {
+            handle_start_workflow_package_export(request_id, client_id, state, writer, request).await
         }
         Request::ListAuthoredWorkflows { cursor, limit } => {
             let workflows = state
@@ -14804,6 +14809,76 @@ fn resolve_authored_workflow_run(
             ))
         })?;
     Ok((workflow_id, revision_number, revision, preset))
+}
+
+async fn handle_start_workflow_package_export(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::StartWorkflowPackageExportRequest,
+) -> Result<(), ServerError> {
+    request.package_export.validate()?;
+    let receipt = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .workflow_package_publication(
+            &request.package_export.package_id,
+            request.package_export.package_lock_digest_sha256.as_deref(),
+        )?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "published workflow package not found: {}",
+                request.package_export.package_id
+            ))
+        })?;
+    let exported = receipt
+        .exports
+        .iter()
+        .find(|export| export.export == request.package_export.export)
+        .cloned()
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "published workflow package export not found: {}/{}",
+                request.package_export.package_id, request.package_export.export
+            ))
+        })?;
+    let revision = exported.published_revision.as_ref().ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "published workflow package export has no exact revision".to_string(),
+        )
+    })?;
+    let started = start_authored_workflow(
+        client_id,
+        state,
+        bcode_ipc::StartAuthoredWorkflowRequest {
+            selection: bcode_ipc::AuthoredWorkflowRunSelection::Revision {
+                workflow_id: revision.workflow_id.clone(),
+                revision: revision.revision,
+            },
+            run_id: request.run_id,
+            parent_session_id: request.parent_session_id,
+            workspace_snapshot: request.workspace_snapshot,
+            parent_session_generation: request.parent_session_generation,
+            configuration: request.configuration,
+        },
+        true,
+    )
+    .await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowPackageExportRunStarted(Box::new(
+            bcode_ipc::WorkflowPackageExportRunStartResponse {
+                package_export: request.package_export,
+                package_lock_digest_sha256: receipt.package_lock_digest_sha256,
+                exported,
+                started,
+            },
+        ))),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
