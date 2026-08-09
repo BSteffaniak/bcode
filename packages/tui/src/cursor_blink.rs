@@ -45,6 +45,12 @@ impl CursorBlink {
         )
     }
 
+    /// Return whether `key` belongs to composer cursor blinking.
+    #[must_use]
+    pub fn owns_invalidation(key: &InvalidationKey) -> bool {
+        key.as_str() == Self::INVALIDATION_KEY
+    }
+
     /// Handle a due invalidation key.
     pub fn handle_invalidation(&mut self, key: &InvalidationKey, now: Instant) -> bool {
         if key.as_str() != Self::INVALIDATION_KEY {

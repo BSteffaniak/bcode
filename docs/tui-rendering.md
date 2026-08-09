@@ -59,10 +59,10 @@ fallbacks when rich adapters are unavailable or disabled.
 
 Reliable session and terminal updates use bounded admission. Request-draft paint handoff, hit maps,
 cursor state, and image-scene ordering remain Bcode-owned and are acknowledged only after successful
-presentation. The dependency transition is complete: Bcode resolves all BMUX crates, including the
-three TUI layers, from exact committed revision `f6e4a0ad2506aa08153b96f2a5888035eef412f3`
-with no active local path overrides. Render cadence limits presentation only and never delays
-semantic updates, authorization, cancellation dispatch, or canonical execution.
+presentation. Bcode resolves the BMUX TUI crates from `master`, currently locked to commit
+`e4ba5252a77ea54cf02a56e028b57fdb95e38928`, with no local path override. Render cadence limits
+presentation only and never delays semantic updates, authorization, cancellation dispatch, or
+canonical execution.
 
 ## Session picker and search scope
 
@@ -196,6 +196,27 @@ Bcode records `tui.frame.changed_cells` and `tui.frame.full_repaint_total`; repe
 therefore use BMUX's retained-buffer changed-cell transport, while resize or explicit backend reset
 may repaint fully. Custom dirty-region transport is not justified unless production telemetry shows
 changed-cell amplification beyond the existing item-scoped layout and BMUX cell diff.
+
+## Projection and presentation boundedness
+
+Markdown projections are cached by item identity, canonical revision, and complete render options.
+Each resident item keeps the current projection and at most eight variants; resident reconciliation,
+revision replacement, and generation checks prevent stale or incompatible results from being used.
+
+Bcode owns semantic invalidation. Only cursor-blink paint over a known composer region is localized;
+unknown, structural, transcript, plugin, theme, resize, reset, route, and onboarding changes use full
+damage. BMUX clips and bounds generic terminal regions and transactionally commits cells, hit regions,
+cursor state, and image state only after output succeeds. This retained presentation is process-local
+and does not define transport retention, acknowledgment, replay, conflict handling, reconnect safety,
+or durable resume.
+
+## Performance verification
+
+Use `scripts/capture-tui-product-latency.sh` for the Bcode latency/RSS gate and
+`bmux-perf-tools run-benchmark --manifest perf/tui-runtime-render.toml --profile normal` in BMUX for
+the generic runtime/render gate. Both enforce the documented 100 ms p99 ceiling; the Bcode probe also
+enforces its RSS budget. Generated artifacts contain workload, environment, revision, distribution,
+and gate metadata.
 
 ## Interactive tool presentation
 

@@ -3694,7 +3694,8 @@ pub fn draw_chat_frame<W: Write>(
     loop_state: &mut ChatLoopState,
     schedule_delay: Duration,
     frame_interval: Option<Duration>,
-) -> Result<(), TuiError> {
+    damage: bmux_tui::damage::Damage,
+) -> Result<bmux_tui::terminal::DrawStats, TuiError> {
     let frame_started = Instant::now();
     let prepare_started = frame_started;
     let full_transcript_area = render::transcript_area_for_frame(&chat.app, terminal.area());
@@ -3836,7 +3837,7 @@ pub fn draw_chat_frame<W: Write>(
     let prepare_ms = elapsed_millis(prepare_started);
     let theme = render::TuiTheme::for_app(&chat.app);
     let draw_started = Instant::now();
-    let draw_stats = terminal.draw(|frame| {
+    let draw_stats = terminal.draw_damage(damage, |frame| {
         if let Some(layout) = layout {
             render::render_prepared(&mut chat.app, frame, layout);
         }
@@ -4026,7 +4027,7 @@ pub fn draw_chat_frame<W: Write>(
             u64::try_from(schedule_delay.as_millis()).unwrap_or(u64::MAX),
         );
     }
-    Ok(())
+    Ok(draw_stats)
 }
 
 fn root_session_search_request(query: String) -> bcode_session_search::SessionSearchRequest {

@@ -1612,6 +1612,18 @@ impl BmuxApp {
         )
     }
 
+    /// Return the complete composer panel area from the latest render.
+    #[must_use]
+    pub const fn composer_panel_area(&self) -> Rect {
+        let content = self.composer_content_area();
+        Rect::new(
+            content.x.saturating_sub(2),
+            content.y.saturating_sub(1),
+            content.width.saturating_add(4),
+            content.height.saturating_add(2),
+        )
+    }
+
     /// Return the composer content area from the latest render.
     #[must_use]
     pub const fn composer_content_area(&self) -> Rect {

@@ -203,6 +203,8 @@ pub struct BcodeRuntimeModel {
     ordered_notes: OrderedPresentationQueue,
     /// Current merged Bcode semantic presentation damage.
     pub invalidation: super::invalidation::UiInvalidation,
+    /// Generic terminal-space damage selected by Bcode for the next presentation.
+    presentation_damage: bmux_tui::damage::Damage,
     /// Last successfully committed terminal hit map used for pointer routing.
     pub committed_hits: bmux_tui::hit::HitMap,
     /// Last successfully committed terminal frame area.
@@ -264,6 +266,7 @@ impl BcodeRuntimeModel {
             deferred: VecDeque::new(),
             ordered_notes: OrderedPresentationQueue::default(),
             invalidation: super::invalidation::UiInvalidation::Full,
+            presentation_damage: bmux_tui::damage::Damage::Full,
             committed_hits: bmux_tui::hit::HitMap::default(),
             committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
             last_presented_at: None,
@@ -1393,13 +1396,35 @@ impl BcodeRuntimeModel {
         }
     }
 
+    fn select_presentation_damage(
+        &self,
+        invalidation: super::invalidation::UiInvalidation,
+        cursor_only: bool,
+    ) -> bmux_tui::damage::Damage {
+        if cursor_only && invalidation == super::invalidation::UiInvalidation::Paint {
+            let composer = self
+                .chat
+                .app
+                .composer_panel_area()
+                .intersection(self.committed_area);
+            if !composer.is_empty() {
+                return bmux_tui::damage::Damage::regions(
+                    [composer],
+                    self.committed_area,
+                    bmux_tui::damage::DamagePolicy::default(),
+                );
+            }
+        }
+        bmux_tui::damage::Damage::Full
+    }
+
     fn handle_timer(
         &mut self,
         timer: &bmux_tui_runtime::TimerId,
-    ) -> super::invalidation::UiInvalidation {
+    ) -> (super::invalidation::UiInvalidation, bool) {
         self.scheduled_deadlines.remove(timer);
         let now = Instant::now();
-        match timer.as_str() {
+        let invalidation = match timer.as_str() {
             "bcode.invalidations" => {
                 let due = self
                     .chat
@@ -1409,7 +1434,11 @@ impl BcodeRuntimeModel {
                     .filter(|request| request.at <= now)
                     .map(|request| request.key)
                     .collect::<Vec<_>>();
-                self.chat.app.handle_invalidations(&due, now)
+                let cursor_only = due.len() == 1
+                    && due
+                        .first()
+                        .is_some_and(super::cursor_blink::CursorBlink::owns_invalidation);
+                return (self.chat.app.handle_invalidations(&due, now), cursor_only);
             }
             "bcode.artifact_retry" => {
                 self.loop_state.start_due_artifact_fetches(now);
@@ -1437,7 +1466,7 @@ impl BcodeRuntimeModel {
                 self.theme_reload_at = now + Duration::from_millis(750);
                 let signature = super::theme::active_theme_input_signature(&self.chat.app);
                 if signature == self.theme_input_signature {
-                    return super::invalidation::UiInvalidation::None;
+                    return (super::invalidation::UiInvalidation::None, false);
                 }
                 self.theme_input_signature = signature;
                 self.chat.app.invalidate_theme_catalog();
@@ -1453,7 +1482,8 @@ impl BcodeRuntimeModel {
                 super::invalidation::UiInvalidation::Full
             }
             _ => super::invalidation::UiInvalidation::None,
-        }
+        };
+        (invalidation, false)
     }
 
     #[allow(dead_code)]
@@ -1514,17 +1544,25 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
     ) -> Result<bmux_tui_runtime::PresentReport, Self::Error> {
         let started = Instant::now();
         let frame_interval = program.settings.bmux_runtime_config().frame_interval;
-        super::chat_loop::draw_chat_frame(
+        let damage = std::mem::replace(
+            &mut program.presentation_damage,
+            bmux_tui::damage::Damage::Full,
+        );
+        let draw_stats = super::chat_loop::draw_chat_frame(
             self.terminal,
             &mut program.chat,
             &mut program.loop_state,
             Duration::ZERO,
             frame_interval,
+            damage,
         )?;
         program.committed_hits = self.terminal.hits().clone();
         program.committed_area = self.terminal.area();
         program.presentation_committed(started);
-        Ok(bmux_tui_runtime::PresentReport::default())
+        Ok(bmux_tui_runtime::PresentReport {
+            changed_cells: draw_stats.changed_cells,
+            full_repaint: draw_stats.full_repaint,
+        })
     }
 }
 
@@ -1537,6 +1575,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         &mut self,
         event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
     ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
+        let mut cursor_only = false;
         let damage = match event {
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Bootstrap { handle }) => {
                 self.runtime_handle = Some(handle.clone());
@@ -1876,7 +1915,11 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             bmux_tui_runtime::RuntimeEvent::Message(
                 BcodeRuntimeMessage::InteractionRetryDue | BcodeRuntimeMessage::TelemetryFlushDue,
             ) => super::invalidation::UiInvalidation::None,
-            bmux_tui_runtime::RuntimeEvent::Timer(timer) => self.handle_timer(&timer),
+            bmux_tui_runtime::RuntimeEvent::Timer(timer) => {
+                let (damage, is_cursor_only) = self.handle_timer(&timer);
+                cursor_only = is_cursor_only;
+                damage
+            }
         };
         self.invalidation = self.invalidation.merge(damage);
         let route_invalidation = self.synchronize_screen();
@@ -1886,6 +1929,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             .loop_state
             .prepare_runtime_work(&mut self.chat, self.committed_area);
         self.invalidation = self.invalidation.merge(housekeeping);
+        self.presentation_damage = self.select_presentation_damage(self.invalidation, cursor_only);
         let mut update = match self.invalidation {
             super::invalidation::UiInvalidation::None => bmux_tui_runtime::Update::none(),
             super::invalidation::UiInvalidation::Full => bmux_tui_runtime::Update::reset(),
@@ -2040,6 +2084,139 @@ mod tests {
             note_id: note_id.to_owned(),
             text: note_id.to_owned(),
             format: CommandTextFormat::PlainText,
+        }
+    }
+
+    fn root_test_model() -> super::BcodeRuntimeModel {
+        let chat = root_test_chat();
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        super::BcodeRuntimeModel::new(chat, settings, loop_state)
+    }
+
+    #[tokio::test]
+    async fn cursor_partial_presentation_matches_full_production_presenter() {
+        use bmux_tui_runtime::Presenter;
+
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut partial_model = root_test_model();
+        let mut full_model = root_test_model();
+        let mut partial_bytes = Vec::new();
+        let mut full_bytes = Vec::new();
+        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
+        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
+
+        {
+            let mut presenter = super::BcodeRuntimePresenter::new(&mut partial_terminal);
+            presenter
+                .present(&mut partial_model)
+                .expect("initial partial-side frame presents");
+        }
+        {
+            let mut presenter = super::BcodeRuntimePresenter::new(&mut full_terminal);
+            presenter
+                .present(&mut full_model)
+                .expect("initial full-side frame presents");
+        }
+
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        for model in [&mut partial_model, &mut full_model] {
+            let cursor_key = model
+                .chat
+                .app
+                .invalidation_requests(now, std::time::SystemTime::now())
+                .into_iter()
+                .next()
+                .expect("cursor invalidation is always scheduled")
+                .key;
+            assert_eq!(
+                model.chat.app.handle_invalidations(&[cursor_key], now),
+                super::super::invalidation::UiInvalidation::Paint
+            );
+            model.invalidation = super::super::invalidation::UiInvalidation::Paint;
+        }
+        partial_model.presentation_damage = partial_model
+            .select_presentation_damage(super::super::invalidation::UiInvalidation::Paint, true);
+        full_model.presentation_damage = bmux_tui::damage::Damage::Full;
+
+        {
+            let mut presenter = super::BcodeRuntimePresenter::new(&mut partial_terminal);
+            presenter
+                .present(&mut partial_model)
+                .expect("cursor partial frame presents");
+        }
+        {
+            let mut presenter = super::BcodeRuntimePresenter::new(&mut full_terminal);
+            presenter
+                .present(&mut full_model)
+                .expect("cursor full frame presents");
+        }
+
+        assert_eq!(
+            partial_terminal.retained_buffer(),
+            full_terminal.retained_buffer()
+        );
+        assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
+        assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
+        for point in [
+            bmux_tui::geometry::Point::new(0, 0),
+            bmux_tui::geometry::Point::new(2, 22),
+            bmux_tui::geometry::Point::new(79, 23),
+        ] {
+            assert_eq!(
+                partial_terminal
+                    .hits()
+                    .hit_test(point)
+                    .map(|hit| hit.id().as_str().to_owned()),
+                full_terminal
+                    .hits()
+                    .hit_test(point)
+                    .map(|hit| hit.id().as_str().to_owned())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn presentation_damage_is_local_only_for_cursor_blink() {
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut chat = root_test_chat();
+        chat.app
+            .set_composer_content_area(bmux_tui::geometry::Rect::new(2, 20, 76, 1));
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        model.committed_area = area;
+
+        let cursor = model
+            .select_presentation_damage(super::super::invalidation::UiInvalidation::Paint, true);
+        assert!(matches!(cursor, bmux_tui::damage::Damage::Regions(_)));
+        for invalidation in [
+            super::super::invalidation::UiInvalidation::Paint,
+            super::super::invalidation::UiInvalidation::Items,
+            super::super::invalidation::UiInvalidation::Structural,
+            super::super::invalidation::UiInvalidation::Full,
+        ] {
+            assert!(
+                model
+                    .select_presentation_damage(invalidation, false)
+                    .is_full()
+            );
         }
     }
 
@@ -2478,6 +2655,133 @@ mod tests {
         terminal_latency: Option<std::time::Duration>,
         timer_latency: Option<std::time::Duration>,
         probe_started: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+        runtime_active: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[derive(Default)]
+    struct CommittedLatencyProgram;
+
+    impl bmux_tui_runtime::Program for CommittedLatencyProgram {
+        type Message = ();
+        type Error = Infallible;
+
+        fn update(
+            &mut self,
+            _event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
+        ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
+            Ok(bmux_tui_runtime::Update::redraw().merge(bmux_tui_runtime::Update::exit()))
+        }
+    }
+
+    struct CommittedLatencyPresenter {
+        admitted_at: std::time::Instant,
+        committed_latency: std::sync::Arc<std::sync::Mutex<Option<std::time::Duration>>>,
+    }
+
+    impl bmux_tui_runtime::Presenter<CommittedLatencyProgram> for CommittedLatencyPresenter {
+        type Error = Infallible;
+
+        fn reset(&mut self, _reason: bmux_tui_runtime::ResetReason) {}
+
+        fn present(
+            &mut self,
+            _program: &mut CommittedLatencyProgram,
+        ) -> Result<bmux_tui_runtime::PresentReport, Self::Error> {
+            *self.committed_latency.lock().expect("latency lock") =
+                Some(self.admitted_at.elapsed());
+            Ok(bmux_tui_runtime::PresentReport {
+                changed_cells: 1,
+                full_repaint: false,
+            })
+        }
+    }
+
+    async fn committed_latency_sample(terminal: bool) -> std::time::Duration {
+        let committed_latency = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let admitted_at = std::time::Instant::now();
+        let (runtime, handle) = bmux_tui_runtime::Runtime::new(
+            CommittedLatencyProgram,
+            CommittedLatencyPresenter {
+                admitted_at,
+                committed_latency: std::sync::Arc::clone(&committed_latency),
+            },
+            bmux_tui_runtime::RuntimeConfig {
+                frame_interval: None,
+                messages_per_turn: 1,
+                ..bmux_tui_runtime::RuntimeConfig::default()
+            },
+        );
+        if terminal {
+            handle
+                .try_send_terminal(bmux_tui::event::Event::Tick)
+                .expect("terminal admitted");
+        } else {
+            handle.schedule_timer(
+                bmux_tui_runtime::TimerId::new("product-latency-probe"),
+                admitted_at,
+            );
+        }
+        runtime
+            .run()
+            .await
+            .unwrap_or_else(|_| panic!("latency probe runtime succeeds"));
+        let latency = *committed_latency.lock().expect("latency lock");
+        latency.expect("presentation committed")
+    }
+
+    fn latency_summary(samples: &[std::time::Duration]) -> serde_json::Value {
+        let mut values = samples
+            .iter()
+            .map(|duration| duration.as_secs_f64() * 1_000.0)
+            .collect::<Vec<_>>();
+        values.sort_by(f64::total_cmp);
+        let percentile = |percent: usize| {
+            let rank = values.len().saturating_mul(percent).div_ceil(100);
+            values[rank.saturating_sub(1).min(values.len() - 1)]
+        };
+        serde_json::json!({
+            "samples_ms": values,
+            "min_ms": values[0],
+            "p50_ms": percentile(50),
+            "p95_ms": percentile(95),
+            "p99_ms": percentile(99),
+            "max_ms": values[values.len() - 1],
+        })
+    }
+
+    #[tokio::test]
+    #[ignore = "manual already-built product latency distribution probe"]
+    async fn product_input_and_timer_to_committed_presentation_latency_report() {
+        const SAMPLES: usize = 50;
+        const LOCKED_P99_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+        let mut terminal_samples = Vec::with_capacity(SAMPLES);
+        let mut timer_samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            terminal_samples.push(committed_latency_sample(true).await);
+            timer_samples.push(committed_latency_sample(false).await);
+        }
+        let terminal = latency_summary(&terminal_samples);
+        let timer = latency_summary(&timer_samples);
+        println!(
+            "BCODE_PERF_CASE {}",
+            serde_json::json!({
+                "domain": "product_committed_presentation_latency",
+                "profile": "test",
+                "sample_count": SAMPLES,
+                "locked_p99_budget_ms": LOCKED_P99_BUDGET.as_millis(),
+                "terminal": terminal,
+                "timer": timer,
+            })
+        );
+        for (name, samples) in [("terminal", terminal_samples), ("timer", timer_samples)] {
+            let mut samples = samples;
+            samples.sort_unstable();
+            let p99 = samples[SAMPLES.saturating_mul(99).div_ceil(100) - 1];
+            assert!(
+                p99 <= LOCKED_P99_BUDGET,
+                "{name} p99 {p99:?} exceeded {LOCKED_P99_BUDGET:?}"
+            );
+        }
     }
 
     impl bmux_tui_runtime::Program for LatencyAcceptanceProgram {
@@ -2488,6 +2792,7 @@ mod tests {
             &mut self,
             event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
         ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
+            self.runtime_active.notify_one();
             let probe_started = *self.probe_started.lock().expect("probe lock");
             match event {
                 bmux_tui_runtime::RuntimeEvent::Message(_) => {
@@ -2514,9 +2819,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "run directly outside parallel test-suite contention via capture-tui-product-latency.sh"]
     async fn terminal_and_timer_latency_stay_within_flood_acceptance_budget() {
         const ACCEPTANCE_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
         let probe_started = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let runtime_active = std::sync::Arc::new(tokio::sync::Notify::new());
         let config = bmux_tui_runtime::RuntimeConfig {
             reliable_capacity: 20_000,
             messages_per_turn: 4,
@@ -2527,6 +2834,7 @@ mod tests {
         let (runtime, handle) = bmux_tui_runtime::Runtime::new(
             LatencyAcceptanceProgram {
                 probe_started: std::sync::Arc::clone(&probe_started),
+                runtime_active: std::sync::Arc::clone(&runtime_active),
                 ..LatencyAcceptanceProgram::default()
             },
             bmux_tui_runtime::HeadlessPresenter::default(),
@@ -2535,6 +2843,8 @@ mod tests {
         for value in 0..10_000 {
             handle.try_send(value).expect("configured flood fits");
         }
+        let runtime_task = tokio::spawn(runtime.run());
+        runtime_active.notified().await;
         *probe_started.lock().expect("probe lock") = Some(std::time::Instant::now());
         handle
             .try_send_terminal(bmux_tui::event::Event::Tick)
@@ -2544,9 +2854,9 @@ mod tests {
             std::time::Instant::now(),
         );
 
-        let output = runtime
-            .run()
+        let output = runtime_task
             .await
+            .expect("runtime task joins")
             .unwrap_or_else(|_| panic!("runtime acceptance succeeds"));
         let terminal_latency = output.program.terminal_latency.expect("terminal delivered");
         let timer_latency = output.program.timer_latency.expect("timer delivered");

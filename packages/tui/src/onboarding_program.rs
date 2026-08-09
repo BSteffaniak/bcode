@@ -3,6 +3,7 @@
 use std::io::Write;
 
 use bmux_keyboard::KeyCode;
+use bmux_tui::damage::Damage;
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
@@ -167,7 +168,7 @@ impl<W: Write> Presenter<OnboardingProgram> for OnboardingPresenter<'_, '_, W> {
     }
 
     fn present(&mut self, program: &mut OnboardingProgram) -> Result<PresentReport, Self::Error> {
-        let stats = self.terminal.draw(|frame| {
+        let stats = self.terminal.draw_damage(Damage::Full, |frame| {
             onboarding_render::render_onboarding(
                 &program.shell,
                 frame,

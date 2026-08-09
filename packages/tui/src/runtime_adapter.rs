@@ -177,6 +177,21 @@ fn record_presentation_deltas(
             previous.frames_presented,
         ),
         (
+            "tui.runtime.full_repaints_total",
+            stats.full_repaints,
+            previous.full_repaints,
+        ),
+        (
+            "tui.runtime.presented_changed_cells_total",
+            stats.presented_changed_cells,
+            previous.presented_changed_cells,
+        ),
+        (
+            "tui.runtime.updates_completed_total",
+            stats.updates_completed,
+            previous.updates_completed,
+        ),
+        (
             "tui.runtime.scheduler_budget_exhausted_total",
             stats.scheduler_budget_exhausted,
             previous.scheduler_budget_exhausted,
@@ -184,11 +199,27 @@ fn record_presentation_deltas(
     ] {
         add_delta(telemetry, name, current, prior);
     }
-    let delay = stats
-        .presentation_delay_us
-        .saturating_sub(previous.presentation_delay_us);
-    if delay > 0 {
-        telemetry.record_histogram("tui.runtime.presentation_delay_us", delay);
+    for (name, current, prior) in [
+        (
+            "tui.runtime.presentation_delay_us",
+            stats.presentation_delay_us,
+            previous.presentation_delay_us,
+        ),
+        (
+            "tui.runtime.presentation_time_us",
+            stats.presentation_time_us,
+            previous.presentation_time_us,
+        ),
+        (
+            "tui.runtime.update_time_us",
+            stats.update_time_us,
+            previous.update_time_us,
+        ),
+    ] {
+        let value = current.saturating_sub(prior);
+        if value > 0 {
+            telemetry.record_histogram(name, value);
+        }
     }
 }
 

@@ -307,10 +307,15 @@ mod tests {
                 redraw_requests: 17,
                 redraw_coalesced: 11,
                 frames_presented: 14,
+                full_repaints: 6,
+                presented_changed_cells: 42,
+                updates_completed: 18,
                 scheduler_budget_exhausted: 5,
                 commands_rejected: 2,
                 stale_command_completions: 4,
                 presentation_delay_us: 13,
+                presentation_time_us: 19,
+                update_time_us: 23,
                 ..bmux_tui_runtime::RuntimeStats::default()
             },
         );
@@ -349,9 +354,39 @@ mod tests {
             )),
             Some(&14)
         );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.full_repaints_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&6)
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.presented_changed_cells_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&42)
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.updates_completed_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&18)
+        );
         assert!(telemetry.histograms.iter().any(|((name, _), value)| {
             name == "tui.runtime.presentation_delay_us" && *value == 13
         }));
+        assert!(telemetry.histograms.iter().any(|((name, _), value)| {
+            name == "tui.runtime.presentation_time_us" && *value == 19
+        }));
+        assert!(
+            telemetry
+                .histograms
+                .iter()
+                .any(|((name, _), value)| { name == "tui.runtime.update_time_us" && *value == 23 })
+        );
 
         recorder.record(
             &mut telemetry,
@@ -361,7 +396,12 @@ mod tests {
                 latest_replaced: 12,
                 redraw_coalesced: 15,
                 frames_presented: 16,
+                full_repaints: 7,
+                presented_changed_cells: 50,
+                updates_completed: 21,
                 presentation_delay_us: 18,
+                presentation_time_us: 26,
+                update_time_us: 34,
                 ..bmux_tui_runtime::RuntimeStats::default()
             },
         );
@@ -386,9 +426,39 @@ mod tests {
             )),
             Some(&16)
         );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.full_repaints_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&7)
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.presented_changed_cells_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&50)
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.updates_completed_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&21)
+        );
         assert!(telemetry.histograms.iter().any(|((name, _), value)| {
             name == "tui.runtime.presentation_delay_us" && *value == 5
         }));
+        assert!(telemetry.histograms.iter().any(|((name, _), value)| {
+            name == "tui.runtime.presentation_time_us" && *value == 7
+        }));
+        assert!(
+            telemetry
+                .histograms
+                .iter()
+                .any(|((name, _), value)| { name == "tui.runtime.update_time_us" && *value == 11 })
+        );
     }
 
     #[tokio::test]
@@ -423,6 +493,26 @@ mod tests {
 
         assert_eq!(telemetry.observation_count(), 0);
         assert!(telemetry.next_flush_at().is_none());
+    }
+
+    #[tokio::test]
+    async fn replaced_pending_batches_are_counted_as_dropped() {
+        let client = BcodeClient::default_endpoint();
+        let mut telemetry = TuiTelemetry::new(client, true);
+        telemetry.in_flight.store(true, Ordering::Release);
+        telemetry.pending.store(true, Ordering::Release);
+        telemetry.add_counter_without_flush("test.observation", 1);
+
+        telemetry.flush(Instant::now());
+
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.telemetry.dropped_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&1)
+        );
+        assert_eq!(telemetry.observation_count(), 1);
     }
 
     #[tokio::test]
