@@ -19,6 +19,9 @@ bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_syntax_render = { workspace = true, optional = true }
 bcode_tool = { workspace = true }
 bcode_tui_components = { workspace = true, features = [
+    "diff-viewer",
+    "source-preview",
+    "source-viewer",
     "syntax",
 ], optional = true }
 bmux_tui = { workspace = true, optional = true }

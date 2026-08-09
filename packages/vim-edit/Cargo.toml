@@ -11,13 +11,16 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_plugin_sdk     = { workspace = true }
-bcode_tui_components = { workspace = true, features = ["syntax"] }
-nvim-rs              = { workspace = true, features = ["use_tokio"] }
-serde                = { workspace = true, features = ["derive", "std"] }
-tempfile             = { workspace = true }
-thiserror            = { workspace = true }
-tokio                = { workspace = true, features = ["process", "rt", "sync", "time"] }
+bcode_plugin_sdk = { workspace = true }
+bcode_tui_components = { workspace = true, features = [
+    "diff-viewer",
+    "syntax",
+] }
+nvim-rs = { workspace = true, features = ["use_tokio"] }
+serde = { workspace = true, features = ["derive", "std"] }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process", "rt", "sync", "time"] }
 
 [features]
 default          = []

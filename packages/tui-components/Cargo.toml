@@ -11,14 +11,37 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_syntax_render  = { workspace = true, optional = true }
-bmux_terminal_grid   = { workspace = true }
-bmux_tui             = { workspace = true }
-bmux_tui_components  = { workspace = true }
+bcode_syntax_render = { workspace = true, optional = true }
+bmux_terminal_grid = { workspace = true, optional = true }
+bmux_tui = { workspace = true }
+bmux_tui_components = { workspace = true, features = [
+    "all",
+    "compact",
+    "diff-viewer",
+    "source-viewer",
+    "terminal-viewer",
+] }
 unicode-segmentation = { workspace = true }
-unicode-width        = { workspace = true }
+unicode-width = { workspace = true }
 
 [features]
-default          = []
+all = [
+    "compact",
+    "diff-viewer",
+    "source-preview",
+    "source-viewer",
+    "terminal-viewer",
+]
+compact = ["bmux_tui_components/compact"]
+default = []
+diff-viewer = []
 fail-on-warnings = []
-syntax           = ["dep:bcode_syntax_render"]
+source-preview = ["source-viewer"]
+source-viewer = []
+syntax = [
+    "dep:bcode_syntax_render",
+    "diff-viewer",
+    "source-preview",
+    "source-viewer",
+]
+terminal-viewer = ["dep:bmux_terminal_grid"]
