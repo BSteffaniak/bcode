@@ -227,6 +227,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
+    pub workflows: WorkflowsConfig,
+    #[serde(default)]
     pub invariants: InvariantsConfig,
     #[serde(default)]
     pub system_prompt: SystemPromptConfig,
@@ -262,6 +264,7 @@ impl Default for BcodeConfig {
             observability: ObservabilityConfig::default(),
             metrics: MetricsConfig::default(),
             skills: SkillsConfig::default(),
+            workflows: WorkflowsConfig::default(),
             invariants: InvariantsConfig::default(),
             system_prompt: SystemPromptConfig::default(),
             presentation: PresentationConfig::default(),
@@ -313,6 +316,10 @@ impl ConfigDocSchema for BcodeConfig {
             schema_section_doc::<SkillsConfig>(
                 "skills",
                 "Skill discovery, activation, source, disabled-skill, and prompt catalog settings.",
+            ),
+            schema_section_doc::<WorkflowsConfig>(
+                "workflows",
+                "Workflow package discovery roots and source policy.",
             ),
             schema_section_doc::<InvariantsConfig>(
                 "invariants",
@@ -1386,6 +1393,31 @@ impl SkillsConfig {
             .cloned()
             .map(SkillId::new)
             .collect()
+    }
+}
+
+/// Workflow package discovery configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "workflows")]
+pub struct WorkflowsConfig {
+    /// Whether repository `.bcode/workflows` and `workflows` roots are discovered.
+    #[serde(default = "default_true")]
+    pub include_repo_workflows: bool,
+    /// Whether the user config and state workflow roots are discovered.
+    #[serde(default = "default_true")]
+    pub include_user_workflows: bool,
+    /// Additional filesystem roots scanned for workflow packages.
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+}
+
+impl Default for WorkflowsConfig {
+    fn default() -> Self {
+        Self {
+            include_repo_workflows: true,
+            include_user_workflows: true,
+            paths: Vec::new(),
+        }
     }
 }
 
@@ -5242,6 +5274,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_auth_toml(&mut output, &config.auth);
     write_observability_toml(&mut output, &config.observability);
     write_skills_toml(&mut output, &config.skills);
+    write_workflows_toml(&mut output, &config.workflows);
     write_invariants_toml(&mut output, &config.invariants);
     write_system_prompt_toml(&mut output, &config.system_prompt);
     write_presentation_toml(&mut output, config.presentation);
@@ -6386,6 +6419,30 @@ const fn skill_prompt_catalog_mode_name(mode: SkillPromptCatalogMode) -> &'stati
         SkillPromptCatalogMode::NamesOnly => "names_only",
         SkillPromptCatalogMode::Summary => "summary",
     }
+}
+
+fn write_workflows_toml(output: &mut String, workflows: &WorkflowsConfig) {
+    if workflows == &WorkflowsConfig::default() {
+        return;
+    }
+    output.push_str("[workflows]\n");
+    if !workflows.include_repo_workflows {
+        output.push_str("include_repo_workflows = false\n");
+    }
+    if !workflows.include_user_workflows {
+        output.push_str("include_user_workflows = false\n");
+    }
+    if !workflows.paths.is_empty() {
+        output.push_str("paths = [");
+        for (index, path) in workflows.paths.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&toml_string(&path.to_string_lossy()));
+        }
+        output.push_str("]\n");
+    }
+    output.push('\n');
 }
 
 fn write_observability_toml(output: &mut String, observability: &ObservabilityConfig) {

@@ -172,6 +172,8 @@ fi
 
 if ! rg -q 'plan_workflow_package_closure' packages/workflow/src/lib.rs packages/server/src/lib.rs \
   || ! rg -q 'read_workflow_package_closure' packages/cli/src/lib.rs \
+  || ! rg -q 'discover_workflow_packages' packages/cli/src/lib.rs \
+  || ! rg -q 'WorkflowsConfig' packages/config/src/lib.rs \
   || ! rg -q 'workflow_package_publications' packages/workflow-store/src/lib.rs \
   || ! rg -q 'WorkflowPackagePublicationReceipt' packages/workflow/src/lib.rs \
   || ! rg -q 'StartWorkflowPackageExport' packages/ipc/src/lib.rs packages/server/src/lib.rs; then
