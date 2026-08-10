@@ -7902,8 +7902,10 @@ impl WorkflowStore {
 
     /// Persist cancellation intent for one root and every bounded nonterminal descendant.
     ///
-    /// Descendants are selected only from durable run links. All intents commit atomically before
-    /// callers signal any external owner.
+    /// Descendants are selected only from durable run links. All intents commit before callers
+    /// signal any external owner. The returned run identities include only runs that were
+    /// nonterminal when this operation inspected them; terminal descendants are omitted because
+    /// they have no cancellation intent to authorize external signalling.
     ///
     /// # Errors
     ///
@@ -7917,22 +7919,26 @@ impl WorkflowStore {
         validate_id("run_id", run_id)?;
         let descendants =
             self.descendant_run_summaries(run_id, MAX_WORKFLOW_RUN_DESCENDANTS as usize)?;
-        let mut run_ids = Vec::with_capacity(descendants.len().saturating_add(1));
-        run_ids.push(run_id.to_string());
-        run_ids.extend(
+        let mut candidates = Vec::with_capacity(descendants.len().saturating_add(1));
+        candidates.push((
+            run_id.to_string(),
+            self.run_summary(run_id)?
+                .ok_or_else(|| WorkflowStoreError::RunNotFound {
+                    run_id: run_id.to_string(),
+                })?
+                .status,
+        ));
+        candidates.extend(
             descendants
                 .into_iter()
-                .map(|descendant| descendant.run.run_id),
+                .map(|descendant| (descendant.run.run_id, descendant.run.status)),
         );
         let mut recorded = false;
-        for target_run_id in &run_ids {
-            let summary = self.run_summary(target_run_id)?.ok_or_else(|| {
-                WorkflowStoreError::RunNotFound {
-                    run_id: target_run_id.clone(),
-                }
-            })?;
-            if matches!(summary.status, RunStatus::Running | RunStatus::Paused) {
-                recorded |= self.request_cancellation(target_run_id, requested_at_ms)?;
+        let mut run_ids = Vec::with_capacity(candidates.len());
+        for (target_run_id, status) in candidates {
+            if matches!(status, RunStatus::Running | RunStatus::Paused) {
+                recorded |= self.request_cancellation(&target_run_id, requested_at_ms)?;
+                run_ids.push(target_run_id);
             }
         }
         Ok((recorded, run_ids))
@@ -16967,6 +16973,114 @@ mod tests {
                 .run_summary(&child_run_id)
                 .expect("child")
                 .is_some()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cancellation_tree_omits_already_terminal_descendants() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let child_definition = definition("terminal-child");
+        let target = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "terminal-child",
+            &child_definition,
+        )
+        .expect("identity");
+        let parent_definition = workflow_call_definition(target.clone());
+        store
+            .persist_definition("terminal-parent", 1, &parent_definition)
+            .expect("parent definition");
+        store
+            .persist_definition(
+                &target.definition_id,
+                target.definition_version,
+                &child_definition,
+            )
+            .expect("child definition");
+        let mut parent = new_run();
+        parent.run_id = "terminal-parent-run".to_string();
+        parent.definition_id = "terminal-parent".to_string();
+        parent.input = Some(serde_json::json!(1));
+        store.create_run(&parent).expect("parent run");
+        let pending = store
+            .pending_activations_for_run(&parent.run_id, 10)
+            .expect("pending")
+            .pop()
+            .expect("parent activation");
+        store
+            .prepare_pending_activation(
+                &parent.run_id,
+                &pending.node_id,
+                &pending.activation_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"target": target}),
+                2,
+            )
+            .expect("prepare parent attempt");
+        let child_run_id = workflow_child_run_id(
+            &parent.run_id,
+            &parent.run_id,
+            &pending.activation_id,
+            1,
+            &bcode_workflow::WorkflowCallTarget::Definition {
+                identity: target.clone(),
+            },
+        );
+        let link = WorkflowRunLink {
+            version: WORKFLOW_RUN_LINK_VERSION,
+            root_run_id: parent.run_id.clone(),
+            parent_run_id: parent.run_id.clone(),
+            parent_node_id: pending.node.id.clone(),
+            parent_activation_id: pending.activation_id.clone(),
+            parent_attempt: 1,
+            child_run_id: child_run_id.clone(),
+            depth: 2,
+            target: bcode_workflow::WorkflowCallTarget::Definition {
+                identity: target.clone(),
+            },
+            created_at_ms: 2,
+        };
+        store
+            .create_child_run_idempotent(&NewChildWorkflowRun {
+                link,
+                run: NewWorkflowRun {
+                    run_id: child_run_id.clone(),
+                    definition_id: target.definition_id.clone(),
+                    definition_version: target.definition_version,
+                    workspace_snapshot: parent.workspace_snapshot.clone(),
+                    parent_session_id: parent.parent_session_id.clone(),
+                    parent_session_generation: None,
+                    binding: None,
+                    authored_provenance: None,
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 2,
+                    authorization_profile: parent.authorization_profile.clone(),
+                    authorization_ceiling: parent.authorization_ceiling,
+                    limits: parent.limits.clone(),
+                },
+            })
+            .expect("child run");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status = 'completed' WHERE run_id = ?1",
+                [&child_run_id],
+            )
+            .expect("complete child");
+
+        let (recorded, cancelled_run_ids) = store
+            .request_cancellation_tree(&parent.run_id, 3)
+            .expect("cancel parent tree");
+        assert!(recorded);
+        assert_eq!(cancelled_run_ids, [parent.run_id]);
+        assert_eq!(
+            store
+                .run_summary(&child_run_id)
+                .expect("child")
+                .expect("child")
+                .status,
+            RunStatus::Completed
         );
     }
 
