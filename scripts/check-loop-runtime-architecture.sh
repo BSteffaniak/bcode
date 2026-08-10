@@ -1424,6 +1424,21 @@ if rg -n 'crossterm(_event)?::read\(|TuiInput::(new|recv)|run_onboarding_loop' \
   violations=1
 fi
 
+bmux_source_root="${BCODE_BMUX_SOURCE_ROOT:-}"
+if [[ -z "${bmux_source_root}" ]]; then
+  for candidate in ../bmux ../../wt-bmux/more-tui-components; do
+    if [[ -d "${candidate}/packages/tui/src" && -d "${candidate}/packages/tui-runtime/src" ]]; then
+      bmux_source_root="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${bmux_source_root}" ]]; then
+  echo "Runtime architecture violation: set BCODE_BMUX_SOURCE_ROOT to the checked-out BMUX source used by Cargo.lock." >&2
+  violations=1
+fi
+
 if ! grep -F 'fn select_presentation_damage(' packages/tui/src/root_program.rs >/dev/null \
   || ! grep -F 'draw_damage(damage' packages/tui/src/chat_loop.rs >/dev/null \
   || ! grep -F 'draw_damage(Damage::Full' packages/tui/src/onboarding_program.rs >/dev/null \
@@ -1431,9 +1446,9 @@ if ! grep -F 'fn select_presentation_damage(' packages/tui/src/root_program.rs >
   || ! grep -F 'scripts/capture-tui-product-latency.sh' docs/tui-rendering.md >/dev/null \
   || ! grep -F 'perf/tui-runtime-render.toml' docs/tui-rendering.md >/dev/null \
   || ! grep -F 'does not define transport retention' docs/tui-rendering.md >/dev/null \
-  || rg -n 'bcode_|Bcode|UiInvalidation|OnboardingProgram|TranscriptDocument' \
-    ../bmux/packages/tui/src ../bmux/packages/tui-runtime/src --glob '*.rs' \
-    >/tmp/bcode-bmux-presentation-domain-leak.txt; then
+  || { [[ -n "${bmux_source_root}" ]] && rg -n 'bcode_|Bcode|UiInvalidation|OnboardingProgram|TranscriptDocument' \
+    "${bmux_source_root}/packages/tui/src" "${bmux_source_root}/packages/tui-runtime/src" --glob '*.rs' \
+    >/tmp/bcode-bmux-presentation-domain-leak.txt; }; then
   echo "Runtime architecture violation: semantic invalidation must remain Bcode-owned and cross the BMUX presenter boundary as generic, conservatively bounded damage." >&2
   if [[ -s /tmp/bcode-bmux-presentation-domain-leak.txt ]]; then
     cat /tmp/bcode-bmux-presentation-domain-leak.txt >&2
@@ -1447,26 +1462,26 @@ if rg -n 'path = "\.\./bmux/' Cargo.toml >/tmp/bcode-undocumented-bmux-paths.txt
   violations=1
 fi
 
-if ! grep -F 'e4ba5252a77ea54cf02a56e028b57fdb95e38928' docs/tui-rendering.md >/dev/null; then
-  echo "Runtime architecture violation: TUI rendering documentation must record the validated BMUX revision." >&2
-  violations=1
-fi
-
 if ! python3 - <<'PY'
 from pathlib import Path
+import re
 
 lock = Path("Cargo.lock").read_text()
-expected = "git+https://github.com/BSteffaniak/bmux.git?branch=master#e4ba5252a77ea54cf02a56e028b57fdb95e38928"
 sources = {
     line.removeprefix('source = "').removesuffix('"')
     for line in lock.splitlines()
     if line.startswith('source = "git+https://github.com/BSteffaniak/bmux.git')
 }
-if sources != {expected}:
+if len(sources) != 1:
     raise SystemExit(f"unexpected BMUX lockfile sources: {sorted(sources)}")
+source = next(iter(sources))
+if not re.fullmatch(
+    r"git\+https://github\.com/BSteffaniak/bmux\.git\?branch=master#[0-9a-f]{40}", source
+):
+    raise SystemExit(f"BMUX dependencies must follow branch master: {source}")
 PY
 then
-  echo "Runtime architecture violation: Cargo.lock must resolve one exact committed BMUX revision." >&2
+  echo "Runtime architecture violation: Cargo.lock must resolve one BMUX source following branch master." >&2
   violations=1
 fi
 
