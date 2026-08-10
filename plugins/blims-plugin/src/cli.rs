@@ -8,7 +8,6 @@ use bcode_plugin_sdk::{
 use bcode_session_models::SessionId;
 use bcode_worktree_models::{WorktreeBaseRef, WorktreeCreateRequest, WorktreeCreateResponse};
 use bmux_keyboard::KeyCode;
-use bmux_tui::layout::centered;
 use bmux_tui::prelude::{
     Border, Color, Constraint, Direction, Event, Frame, Insets, Line, Modifier, Panel, Point, Rect,
     Size, Span, Style, Terminal, Text, TextBlock, TextWrap, Widget, event_from_crossterm, split,
@@ -2226,67 +2225,25 @@ fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
 }
 
 fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let background = Color::Rgb(10, 14, 24);
     Panel::new()
         .border(Border::single().style(Style::new().fg(Color::BrightBlue)))
-        .background(Style::new().bg(Color::Rgb(10, 14, 24)))
+        .background(Style::new().bg(background))
         .render(area, frame);
-    let line = Line::from_spans(vec![
-        Span::styled(
-            " arrows/hjkl ",
-            Style::new()
-                .fg(Color::BrightCyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("walk  "),
-        Span::styled(
-            "e/enter",
-            Style::new()
-                .fg(Color::BrightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" act  "),
-        Span::styled(
-            "n/N",
-            Style::new()
-                .fg(Color::BrightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" inbox  "),
-        Span::styled(
-            "t",
-            Style::new()
-                .fg(Color::BrightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" talk  "),
-        Span::styled(
-            "esc",
-            Style::new()
-                .fg(Color::BrightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" back  "),
-        Span::styled(
-            "w",
-            Style::new()
-                .fg(Color::BrightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" worlds  "),
-        Span::styled(
-            "r/?/q",
-            Style::new()
-                .fg(Color::BrightRed)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" report/help/quit — "),
-        Span::styled(app.status.clone(), Style::new().fg(Color::BrightGreen)),
-    ]);
-    frame.write_line_with_fallback_style(
-        area.inset(Insets::new(1, 2, 0, 2)),
-        &line,
-        Style::new().bg(Color::Rgb(10, 14, 24)),
-    );
+    let status = app.status.clone();
+    let hints = [
+        KeyHint::new("arrows/hjkl", "walk"),
+        KeyHint::new("e/enter", "act"),
+        KeyHint::new("n/N", "inbox"),
+        KeyHint::new("t", "talk"),
+        KeyHint::new("Esc", "back"),
+        KeyHint::new("w", "worlds"),
+        KeyHint::new("r/?/q", "report/help/quit"),
+        KeyHint::new("", &status),
+    ];
+    KeyHintBar::new(&hints)
+        .styles(blims_hint_styles(background))
+        .render(area.inset(Insets::new(1, 2, 0, 2)), frame);
 }
 
 fn render_blims_map(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2656,13 +2613,22 @@ fn render_live_log_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
 }
 
 fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
-    let picker = centered(area, Size::new(76, 18));
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightYellow)))
-        .title(" Choose your Blims office ")
-        .background(Style::new().bg(Color::Rgb(32, 24, 42)));
-    panel.render(picker, frame);
-    let inner = panel.inner_area(picker).inset(Insets::all(1));
+    let background = Color::Rgb(32, 24, 42);
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(Size::new(76, 18), Insets::all(0)),
+        blims_modal_theme(Color::BrightYellow, background),
+    )
+    .title(" Choose your Blims office ")
+    .placement(ModalPlacement::Centered)
+    .padding(Insets::all(1));
+    modal.render(area, frame);
+    let content = modal.content_area(area);
+    let inner = Rect::new(
+        content.x,
+        content.y,
+        content.width,
+        content.height.saturating_sub(1),
+    );
     for (index, template) in app.templates.iter().enumerate() {
         let Ok(row) = u16::try_from(index.saturating_mul(4)) else {
             break;
@@ -2716,14 +2682,22 @@ fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().bg(bg),
         );
     }
-    let hint_y = picker.bottom().saturating_sub(2);
-    frame.write_line_with_fallback_style(
-        Rect::new(inner.x, hint_y, inner.width, 1),
-        &Line::raw("Enter selects · arrows move · q exits"),
-        Style::new()
-            .bg(Color::Rgb(32, 24, 42))
-            .fg(Color::BrightBlack),
-    );
+    let hints = [
+        KeyHint::new("Enter", "select"),
+        KeyHint::new("↑/↓", "move"),
+        KeyHint::new("q", "exit"),
+    ];
+    KeyHintBar::new(&hints)
+        .styles(blims_hint_styles(background))
+        .render(
+            Rect::new(
+                content.x,
+                content.bottom().saturating_sub(1),
+                content.width,
+                1,
+            ),
+            frame,
+        );
 }
 
 fn render_ceo_dashboard_modal(
@@ -2731,13 +2705,16 @@ fn render_ceo_dashboard_modal(
     area: Rect,
     frame: &mut Frame<'_>,
 ) {
-    let modal = centered(area, Size::new(96, 30));
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightYellow)))
-        .title(" CEO operating dashboard ")
-        .background(Style::new().bg(Color::Rgb(16, 17, 28)));
-    panel.render(modal, frame);
-    let inner = panel.inner_area(modal).inset(Insets::all(1));
+    let background = Color::Rgb(16, 17, 28);
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(Size::new(96, 30), Insets::all(0)),
+        blims_modal_theme(Color::BrightYellow, background),
+    )
+    .title(" CEO operating dashboard ")
+    .placement(ModalPlacement::Centered)
+    .padding(Insets::all(1));
+    modal.render(area, frame);
+    let inner = modal.content_area(area);
     let rows = split(
         inner,
         Direction::Vertical,
@@ -2751,7 +2728,7 @@ fn render_ceo_dashboard_modal(
     if rows.len() != 4 {
         return;
     }
-    TextBlock::new(Text::from_lines(vec![
+    let summary_lines = vec![
         Line::from_spans(vec![Span::styled(
             "Company inbox",
             Style::new()
@@ -2766,13 +2743,8 @@ fn render_ceo_dashboard_modal(
             dashboard.artifacts.len(),
             dashboard.guidance.len()
         )),
-    ]))
-    .style(
-        Style::new()
-            .bg(Color::Rgb(16, 17, 28))
-            .fg(Color::BrightWhite),
-    )
-    .render(rows[0], frame);
+    ];
+    render_blims_text_view(rows[0], frame, &summary_lines, background);
 
     let columns = split(
         rows[1],
@@ -2792,16 +2764,18 @@ fn render_ceo_dashboard_modal(
         render_dashboard_artifacts(dashboard, bottom_columns[0], frame);
         render_dashboard_guidance(dashboard, bottom_columns[1], frame);
     }
-    frame.write_line_with_fallback_style(
-        rows[3],
-        &Line::raw(format!(
-            "tab/←/→ sections · ↑/↓ select · a approve · x reject · f defer · r refresh · d/Esc closes · {}",
-            dashboard.status
-        )),
-        Style::new()
-            .bg(Color::Rgb(16, 17, 28))
-            .fg(Color::BrightBlack),
-    );
+    let status_label = dashboard.status.clone();
+    let hints = [
+        KeyHint::new("Tab/←/→", "section"),
+        KeyHint::new("↑/↓", "select"),
+        KeyHint::new("a/x/f", "decision"),
+        KeyHint::new("r", "refresh"),
+        KeyHint::new("d/Esc", "close"),
+        KeyHint::new("", &status_label),
+    ];
+    KeyHintBar::new(&hints)
+        .styles(blims_hint_styles(background))
+        .render(rows[3], frame);
 }
 
 fn render_dashboard_agent_work(
@@ -2835,10 +2809,7 @@ fn render_dashboard_agent_work(
                 }),
         );
     }
-    TextBlock::new(Text::from_lines(lines))
-        .wrap(TextWrap::Character)
-        .style(Style::new().bg(Color::Rgb(16, 17, 28)).fg(Color::White))
-        .render(area, frame);
+    render_blims_text_view(area, frame, &lines, Color::Rgb(16, 17, 28));
 }
 
 fn render_dashboard_proposals(
@@ -2872,10 +2843,7 @@ fn render_dashboard_proposals(
                 }),
         );
     }
-    TextBlock::new(Text::from_lines(lines))
-        .wrap(TextWrap::Character)
-        .style(Style::new().bg(Color::Rgb(16, 17, 28)).fg(Color::White))
-        .render(area, frame);
+    render_blims_text_view(area, frame, &lines, Color::Rgb(16, 17, 28));
 }
 
 fn render_dashboard_artifacts(
@@ -2909,10 +2877,7 @@ fn render_dashboard_artifacts(
                 }),
         );
     }
-    TextBlock::new(Text::from_lines(lines))
-        .wrap(TextWrap::Character)
-        .style(Style::new().bg(Color::Rgb(16, 17, 28)).fg(Color::White))
-        .render(area, frame);
+    render_blims_text_view(area, frame, &lines, Color::Rgb(16, 17, 28));
 }
 
 fn render_dashboard_guidance(
@@ -2960,10 +2925,7 @@ fn render_dashboard_guidance(
     if lines.len() == 1 {
         lines.push(Line::raw("No guidance or initiatives yet."));
     }
-    TextBlock::new(Text::from_lines(lines))
-        .wrap(TextWrap::Character)
-        .style(Style::new().bg(Color::Rgb(16, 17, 28)).fg(Color::White))
-        .render(area, frame);
+    render_blims_text_view(area, frame, &lines, Color::Rgb(16, 17, 28));
 }
 
 fn dashboard_line(selected: bool, text: String) -> Line {
@@ -2990,13 +2952,16 @@ fn render_conversation_modal(
     area: Rect,
     frame: &mut Frame<'_>,
 ) {
-    let modal = centered(area, Size::new(86, 24));
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightMagenta)))
-        .title(format!(" Talking with {} ", conversation.agent_name))
-        .background(Style::new().bg(Color::Rgb(18, 14, 28)));
-    panel.render(modal, frame);
-    let inner = panel.inner_area(modal).inset(Insets::all(1));
+    let background = Color::Rgb(18, 14, 28);
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(Size::new(86, 24), Insets::all(0)),
+        blims_modal_theme(Color::BrightMagenta, background),
+    )
+    .title(format!(" Talking with {} ", conversation.agent_name))
+    .placement(ModalPlacement::Centered)
+    .padding(Insets::all(1));
+    modal.render(area, frame);
+    let inner = modal.content_area(area);
     let rows = split(
         inner,
         Direction::Vertical,
@@ -3024,34 +2989,31 @@ fn render_conversation_modal(
     if lines.is_empty() {
         lines.push(Line::raw("Conversation is starting…"));
     }
-    TextBlock::new(Text::from_lines(lines))
-        .wrap(TextWrap::Character)
-        .style(Style::new().bg(Color::Rgb(18, 14, 28)).fg(Color::White))
-        .render(rows[0], frame);
-    TextBlock::new(Text::from_lines(vec![
+    TextView::new(&lines)
+        .policy(blims_static_text_policy())
+        .styles(blims_text_view_styles(background))
+        .render(rows[0], &TextViewState::new(), frame);
+    let input_lines = vec![
         Line::from_spans(vec![
             Span::styled("You: ", Style::new().fg(Color::BrightCyan)),
             Span::raw(conversation.input.clone()),
         ]),
         Line::raw(conversation.status.clone()),
-    ]))
-    .wrap(TextWrap::Character)
-    .style(
-        Style::new()
-            .bg(Color::Rgb(24, 18, 36))
-            .fg(Color::BrightWhite),
-    )
-    .render(rows[1], frame);
-    frame.write_line_with_fallback_style(
-        rows[2],
-        &Line::raw(format!(
-            "Enter sends · Esc returns to office · d CEO dashboard · session {}",
-            conversation.handle.session
-        )),
-        Style::new()
-            .bg(Color::Rgb(18, 14, 28))
-            .fg(Color::BrightBlack),
-    );
+    ];
+    TextView::new(&input_lines)
+        .policy(blims_static_text_policy())
+        .styles(blims_text_view_styles(Color::Rgb(24, 18, 36)))
+        .render(rows[1], &TextViewState::new(), frame);
+    let session_label = format!("session {}", conversation.handle.session);
+    let hints = [
+        KeyHint::new("Enter", "send"),
+        KeyHint::new("Esc", "office"),
+        KeyHint::new("d", "CEO dashboard"),
+        KeyHint::new("", &session_label),
+    ];
+    KeyHintBar::new(&hints)
+        .styles(blims_hint_styles(background))
+        .render(rows[2], frame);
 }
 
 fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
@@ -3098,6 +3060,13 @@ fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
             ),
             frame,
         );
+}
+
+fn render_blims_text_view(area: Rect, frame: &mut Frame<'_>, lines: &[Line], background: Color) {
+    TextView::new(lines)
+        .policy(blims_static_text_policy())
+        .styles(blims_text_view_styles(background))
+        .render(area, &TextViewState::new(), frame);
 }
 
 const fn blims_static_text_policy() -> TextViewPolicy {
