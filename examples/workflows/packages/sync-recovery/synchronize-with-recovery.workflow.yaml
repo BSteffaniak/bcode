@@ -1,23 +1,45 @@
 workflow_source_version: 3
 workflow_id: examples/sync-recovery/synchronize-with-recovery
 title: Bounded synchronization recovery
-description: Runs one normal synchronization attempt and conditionally invokes exact imported recovery from canonical typed facts.
+description: Runs one normal synchronization attempt, conditionally invokes exact imported recovery from canonical typed facts, then performs one configured post-recovery synchronization attempt.
 run_limits:
   maximum_duration_ms: 2400000
-  node_execution_cap: 8
+  node_execution_cap: 12
   concurrency_cap: 1
   cycle_cap: 2
   retry_cap: 1
 steps:
+  - id: request
+    input:
+      schema:
+        type_name: bcode.synchronization.recovery-request/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [initial, after_recovery]
+          properties:
+            initial: {type: object}
+            after_recovery: {type: object}
   - id: synchronize
+    needs: [request]
     package_call: {external: synchronize}
+    input_expression:
+      version: 2
+      expression:
+        operation: selected_input
+        source: dependency.request
+        selector:
+          version: 1
+          segments: [{kind: field, name: initial}]
+      output:
+        type_name: bcode.shell.exec/v1
+        schema: {"oneOf":[{"oneOf":[{"maxLength":65536,"minLength":1,"type":"string"},{"additionalProperties":false,"properties":{"accepted_exit_codes":{"items":{"type":"integer"},"maxItems":64,"minItems":1,"type":"array","uniqueItems":true},"continue_on_unaccepted_exit":{"type":"boolean"},"cwd":{"maxLength":1024,"minLength":1,"type":"string"},"environment":{"additionalProperties":{"maxLength":65536,"type":"string"},"maxProperties":128,"type":"object"},"output":{"additionalProperties":false,"properties":{"artifact_spill":{"type":"boolean"},"preview_bytes":{"maximum":65536,"minimum":0,"type":"integer"}},"type":"object"},"script":{"maxLength":65536,"minLength":1,"type":"string"},"shell":{"items":{"maxLength":4096,"type":"string"},"maxItems":32,"minItems":1,"type":"array"},"timeout_ms":{"maximum":300000,"minimum":1,"type":"integer"},"version":{"const":1}},"required":["script"],"type":"object"}]},{"additionalProperties":false,"properties":{"commands":{"items":{"additionalProperties":false,"properties":{"accepted_exit_codes":{"items":{"type":"integer"},"maxItems":64,"minItems":1,"type":"array","uniqueItems":true},"argv":{"items":{"maxLength":65536,"type":"string"},"maxItems":256,"minItems":1,"type":"array"},"continue_on_unaccepted_exit":{"type":"boolean"},"timeout_ms":{"maximum":300000,"minimum":1,"type":"integer"}},"required":["argv","timeout_ms"],"type":"object"},"maxItems":64,"minItems":1,"type":"array"},"cwd":{"maxLength":1024,"minLength":1,"type":"string"},"environment":{"additionalProperties":false,"properties":{"inherit":{"type":"boolean"},"set":{"additionalProperties":{"maxLength":65536,"type":"string"},"maxProperties":128,"type":"object"}},"required":["inherit","set"],"type":"object"},"output":{"additionalProperties":false,"properties":{"artifact_spill":{"type":"boolean"},"preview_bytes":{"maximum":65536,"minimum":0,"type":"integer"}},"required":["preview_bytes","artifact_spill"],"type":"object"},"version":{"const":2}},"required":["version","cwd","commands","environment","output"],"type":"object"}],"x-bcode-allow-dynamic-complete-input":false,"x-bcode-dynamic-binding-paths":["commands.*.argv.*","environment.set.*"]}
   - id: recover
     needs: [synchronize]
     package_call: {external: recover}
     input_from: {step: synchronize}
     when:
-      source:
-        step: synchronize
+      source: {step: synchronize}
       predicate:
         operation: selected_equals
         version: 3
@@ -25,3 +47,17 @@ steps:
           version: 1
           segments: [{kind: field, name: passed}]
         value: false
+  - id: synchronize_after_recovery
+    needs: [recover, request]
+    package_call: {external: synchronize}
+    input_expression:
+      version: 2
+      expression:
+        operation: selected_input
+        source: dependency.request
+        selector:
+          version: 1
+          segments: [{kind: field, name: after_recovery}]
+      output:
+        type_name: bcode.shell.exec/v1
+        schema: {"oneOf":[{"oneOf":[{"maxLength":65536,"minLength":1,"type":"string"},{"additionalProperties":false,"properties":{"accepted_exit_codes":{"items":{"type":"integer"},"maxItems":64,"minItems":1,"type":"array","uniqueItems":true},"continue_on_unaccepted_exit":{"type":"boolean"},"cwd":{"maxLength":1024,"minLength":1,"type":"string"},"environment":{"additionalProperties":{"maxLength":65536,"type":"string"},"maxProperties":128,"type":"object"},"output":{"additionalProperties":false,"properties":{"artifact_spill":{"type":"boolean"},"preview_bytes":{"maximum":65536,"minimum":0,"type":"integer"}},"type":"object"},"script":{"maxLength":65536,"minLength":1,"type":"string"},"shell":{"items":{"maxLength":4096,"type":"string"},"maxItems":32,"minItems":1,"type":"array"},"timeout_ms":{"maximum":300000,"minimum":1,"type":"integer"},"version":{"const":1}},"required":["script"],"type":"object"}]},{"additionalProperties":false,"properties":{"commands":{"items":{"additionalProperties":false,"properties":{"accepted_exit_codes":{"items":{"type":"integer"},"maxItems":64,"minItems":1,"type":"array","uniqueItems":true},"argv":{"items":{"maxLength":65536,"type":"string"},"maxItems":256,"minItems":1,"type":"array"},"continue_on_unaccepted_exit":{"type":"boolean"},"timeout_ms":{"maximum":300000,"minimum":1,"type":"integer"}},"required":["argv","timeout_ms"],"type":"object"},"maxItems":64,"minItems":1,"type":"array"},"cwd":{"maxLength":1024,"minLength":1,"type":"string"},"environment":{"additionalProperties":false,"properties":{"inherit":{"type":"boolean"},"set":{"additionalProperties":{"maxLength":65536,"type":"string"},"maxProperties":128,"type":"object"}},"required":["inherit","set"],"type":"object"},"output":{"additionalProperties":false,"properties":{"artifact_spill":{"type":"boolean"},"preview_bytes":{"maximum":65536,"minimum":0,"type":"integer"}},"required":["preview_bytes","artifact_spill"],"type":"object"},"version":{"const":2}},"required":["version","cwd","commands","environment","output"],"type":"object"}],"x-bcode-allow-dynamic-complete-input":false,"x-bcode-dynamic-binding-paths":["commands.*.argv.*","environment.set.*"]}

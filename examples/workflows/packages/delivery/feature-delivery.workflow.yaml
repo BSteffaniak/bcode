@@ -1,17 +1,124 @@
 workflow_source_version: 3
 workflow_id: examples/delivery/feature-delivery
 title: Progress-driven feature delivery
-description: Composes reusable planning, bounded implementation, review, and completion procedures from exact imported exports.
+description: Executes an ordered, configuration-driven delivery path across planning, implementation, validation, review, checkpoint, synchronization, bounded recovery, and completion.
+input:
+  type_name: bcode.delivery.request/v1
+  schema:
+    type: object
+    additionalProperties: false
+    required: [planning, validation_plan, checkpoint_plan, synchronization_plan, review_scope, stop_condition]
+    properties:
+      planning:
+        type: object
+        additionalProperties: false
+        required: [path, prompt]
+        properties:
+          path: {type: string, minLength: 1, maxLength: 1024}
+          prompt: {type: string, minLength: 1, maxLength: 16384}
+      validation_plan:
+        type: object
+        additionalProperties: false
+        required: [version, cwd, commands, environment, output]
+        properties:
+          version: {const: 2}
+          cwd: {type: string, minLength: 1, maxLength: 4096}
+          commands: {type: array, minItems: 1, maxItems: 64}
+          environment: {type: object}
+          output: {type: object}
+      checkpoint_plan:
+        type: object
+        additionalProperties: false
+        required: [version, cwd, commands, environment, output]
+        properties:
+          version: {const: 2}
+          cwd: {type: string, minLength: 1, maxLength: 4096}
+          commands: {type: array, minItems: 1, maxItems: 64}
+          environment: {type: object}
+          output: {type: object}
+      synchronization_plan:
+        type: object
+        additionalProperties: false
+        required: [initial, after_recovery]
+        properties:
+          initial: {type: object}
+          after_recovery: {type: object}
+      review_scope: {type: string, minLength: 1, maxLength: 4096}
+      stop_condition: {type: string, minLength: 1, maxLength: 16384}
+output:
+  type_name: bcode.completion.result/v1
+  schema:
+    type: object
+    additionalProperties: false
+    required: [condition_met, summary, remaining]
+    properties:
+      condition_met: {type: boolean}
+      summary: {type: string, minLength: 1, maxLength: 4096}
+      remaining: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
 run_limits:
   maximum_duration_ms: 14400000
-  node_execution_cap: 40
+  node_execution_cap: 64
   concurrency_cap: 2
   cycle_cap: 4
   retry_cap: 2
 steps:
-  - id: planning_request
+  - id: request
     input:
       schema:
+        type_name: bcode.delivery.request/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [planning, validation_plan, checkpoint_plan, synchronization_plan, review_scope, stop_condition]
+          properties:
+            planning:
+              type: object
+              additionalProperties: false
+              required: [path, prompt]
+              properties:
+                path: {type: string, minLength: 1, maxLength: 1024}
+                prompt: {type: string, minLength: 1, maxLength: 16384}
+            validation_plan:
+              type: object
+              additionalProperties: false
+              required: [version, cwd, commands, environment, output]
+              properties:
+                version: {const: 2}
+                cwd: {type: string, minLength: 1, maxLength: 4096}
+                commands: {type: array, minItems: 1, maxItems: 64}
+                environment: {type: object}
+                output: {type: object}
+            checkpoint_plan:
+              type: object
+              additionalProperties: false
+              required: [version, cwd, commands, environment, output]
+              properties:
+                version: {const: 2}
+                cwd: {type: string, minLength: 1, maxLength: 4096}
+                commands: {type: array, minItems: 1, maxItems: 64}
+                environment: {type: object}
+                output: {type: object}
+            synchronization_plan:
+              type: object
+              additionalProperties: false
+              required: [initial, after_recovery]
+              properties:
+                initial: {type: object}
+                after_recovery: {type: object}
+            review_scope: {type: string, minLength: 1, maxLength: 4096}
+            stop_condition: {type: string, minLength: 1, maxLength: 16384}
+  - id: plan
+    needs: [request]
+    package_call: {external: planning}
+    input_expression:
+      version: 2
+      expression:
+        operation: selected_input
+        source: dependency.request
+        selector:
+          version: 1
+          segments: [{kind: field, name: planning}]
+      output:
         type_name: bcode.planning.request/v1
         schema:
           type: object
@@ -20,23 +127,8 @@ steps:
           properties:
             path: {type: string, minLength: 1, maxLength: 1024}
             prompt: {type: string, minLength: 1, maxLength: 16384}
-  - id: plan
-    package_call: {external: planning}
-  - id: implementation_state
-    needs: [plan]
-    input:
-      schema:
-        type_name: bcode.planning.result/v1
-        schema:
-          type: object
-          additionalProperties: false
-          required: [status, path, summary]
-          properties:
-            status: {type: string, enum: [created, refocused, unchanged, blocked]}
-            path: {type: string, minLength: 1, maxLength: 1024}
-            summary: {type: string, minLength: 1, maxLength: 16384}
   - id: implement
-    needs: [implementation_state]
+    needs: [plan]
     package_call: {external: remediation}
     input_expression:
       version: 2
@@ -46,7 +138,7 @@ steps:
           status: {operation: constant, value: ready}
           detail:
             operation: selected_input
-            source: dependency.implementation_state
+            source: dependency.plan
             selector:
               version: 1
               segments: [{kind: field, name: summary}]
@@ -61,21 +153,22 @@ steps:
             status: {type: string, enum: [ready, needs_remediation, complete, blocked]}
             detail: {type: string, maxLength: 16384}
             iteration: {type: integer, minimum: 0, maximum: 3}
-  - id: review_request
-    needs: [implement]
-    input:
-      schema:
-        type_name: bcode.remediation.state/v1
-        schema:
-          type: object
-          additionalProperties: false
-          required: [status, detail, iteration]
-          properties:
-            status: {type: string, enum: [ready, needs_remediation, complete, blocked]}
-            detail: {type: string, maxLength: 16384}
-            iteration: {type: integer, minimum: 0, maximum: 3}
+  - id: validation
+    needs: [implement, request]
+    package_call: {external: validation}
+    input_expression:
+      version: 2
+      expression:
+        operation: selected_input
+        source: dependency.request
+        selector:
+          version: 1
+          segments: [{kind: field, name: validation_plan}]
+      output:
+        type_name: bcode.shell.exec/v1
+        schema: {"oneOf":[{"oneOf":[{"maxLength":65536,"minLength":1,"type":"string"},{"additionalProperties":false,"properties":{"accepted_exit_codes":{"items":{"type":"integer"},"maxItems":64,"minItems":1,"type":"array","uniqueItems":true},"continue_on_unaccepted_exit":{"type":"boolean"},"cwd":{"maxLength":1024,"minLength":1,"type":"string"},"environment":{"additionalProperties":{"maxLength":65536,"type":"string"},"maxProperties":128,"type":"object"},"output":{"additionalProperties":false,"properties":{"artifact_spill":{"type":"boolean"},"preview_bytes":{"maximum":65536,"minimum":0,"type":"integer"}},"type":"object"},"script":{"maxLength":65536,"minLength":1,"type":"string"},"shell":{"items":{"maxLength":4096,"type":"string"},"maxItems":32,"minItems":1,"type":"array"},"timeout_ms":{"maximum":300000,"minimum":1,"type":"integer"},"version":{"const":1}},"required":["script"],"type":"object"}]},{"additionalProperties":false,"properties":{"commands":{"items":{"additionalProperties":false,"properties":{"accepted_exit_codes":{"items":{"type":"integer"},"maxItems":64,"minItems":1,"type":"array","uniqueItems":true},"argv":{"items":{"maxLength":65536,"type":"string"},"maxItems":256,"minItems":1,"type":"array"},"continue_on_unaccepted_exit":{"type":"boolean"},"timeout_ms":{"maximum":300000,"minimum":1,"type":"integer"}},"required":["argv","timeout_ms"],"type":"object"},"maxItems":64,"minItems":1,"type":"array"},"cwd":{"maxLength":1024,"minLength":1,"type":"string"},"environment":{"additionalProperties":false,"properties":{"inherit":{"type":"boolean"},"set":{"additionalProperties":{"maxLength":65536,"type":"string"},"maxProperties":128,"type":"object"}},"required":["inherit","set"],"type":"object"},"output":{"additionalProperties":false,"properties":{"artifact_spill":{"type":"boolean"},"preview_bytes":{"maximum":65536,"minimum":0,"type":"integer"}},"required":["preview_bytes","artifact_spill"],"type":"object"},"version":{"const":2}},"required":["version","cwd","commands","environment","output"],"type":"object"}],"x-bcode-allow-dynamic-complete-input":false,"x-bcode-dynamic-binding-paths":["commands.*.argv.*","environment.set.*"]}
   - id: review
-    needs: [review_request]
+    needs: [validation, request]
     package_call: {external: review}
     input_expression:
       version: 2
@@ -84,10 +177,10 @@ steps:
         fields:
           scope:
             operation: selected_input
-            source: dependency.review_request
+            source: dependency.request
             selector:
               version: 1
-              segments: [{kind: field, name: detail}]
+              segments: [{kind: field, name: review_scope}]
       output:
         type_name: bcode.review.request/v1
         schema:
@@ -95,37 +188,48 @@ steps:
           additionalProperties: false
           required: [scope]
           properties: {scope: {type: string, minLength: 1, maxLength: 4096}}
-  - id: completion_request
-    needs: [review]
-    input:
-      schema:
-        type_name: workflow.parallel/v1<bcode.review.result/v1,bcode.review.result/v1>
-        schema:
-          type: array
-          prefixItems:
-            - type: object
-              additionalProperties: false
-              required: [verdict, findings]
-              properties:
-                verdict: {type: string, enum: [pass, changes_required, blocked]}
-                findings: {type: array, maxItems: 64, items: {type: string, maxLength: 4096}}
-            - type: object
-              additionalProperties: false
-              required: [verdict, findings]
-              properties:
-                verdict: {type: string, enum: [pass, changes_required, blocked]}
-                findings: {type: array, maxItems: 64, items: {type: string, maxLength: 4096}}
-          minItems: 2
-          maxItems: 2
+  - id: checkpoint
+    needs: [review, request]
+    package_call: {external: checkpoint}
+    input_expression:
+      version: 2
+      expression:
+        operation: selected_input
+        source: dependency.request
+        selector:
+          version: 1
+          segments: [{kind: field, name: checkpoint_plan}]
+      output:
+        type_name: bcode.shell.exec/v1
+        schema: {"oneOf":[{"oneOf":[{"maxLength":65536,"minLength":1,"type":"string"},{"additionalProperties":false,"properties":{"accepted_exit_codes":{"items":{"type":"integer"},"maxItems":64,"minItems":1,"type":"array","uniqueItems":true},"continue_on_unaccepted_exit":{"type":"boolean"},"cwd":{"maxLength":1024,"minLength":1,"type":"string"},"environment":{"additionalProperties":{"maxLength":65536,"type":"string"},"maxProperties":128,"type":"object"},"output":{"additionalProperties":false,"properties":{"artifact_spill":{"type":"boolean"},"preview_bytes":{"maximum":65536,"minimum":0,"type":"integer"}},"type":"object"},"script":{"maxLength":65536,"minLength":1,"type":"string"},"shell":{"items":{"maxLength":4096,"type":"string"},"maxItems":32,"minItems":1,"type":"array"},"timeout_ms":{"maximum":300000,"minimum":1,"type":"integer"},"version":{"const":1}},"required":["script"],"type":"object"}]},{"additionalProperties":false,"properties":{"commands":{"items":{"additionalProperties":false,"properties":{"accepted_exit_codes":{"items":{"type":"integer"},"maxItems":64,"minItems":1,"type":"array","uniqueItems":true},"argv":{"items":{"maxLength":65536,"type":"string"},"maxItems":256,"minItems":1,"type":"array"},"continue_on_unaccepted_exit":{"type":"boolean"},"timeout_ms":{"maximum":300000,"minimum":1,"type":"integer"}},"required":["argv","timeout_ms"],"type":"object"},"maxItems":64,"minItems":1,"type":"array"},"cwd":{"maxLength":1024,"minLength":1,"type":"string"},"environment":{"additionalProperties":false,"properties":{"inherit":{"type":"boolean"},"set":{"additionalProperties":{"maxLength":65536,"type":"string"},"maxProperties":128,"type":"object"}},"required":["inherit","set"],"type":"object"},"output":{"additionalProperties":false,"properties":{"artifact_spill":{"type":"boolean"},"preview_bytes":{"maximum":65536,"minimum":0,"type":"integer"}},"required":["preview_bytes","artifact_spill"],"type":"object"},"version":{"const":2}},"required":["version","cwd","commands","environment","output"],"type":"object"}],"x-bcode-allow-dynamic-complete-input":false,"x-bcode-dynamic-binding-paths":["commands.*.argv.*","environment.set.*"]}
+  - id: synchronize
+    needs: [checkpoint, request]
+    package_call: {external: synchronization}
+    input_expression:
+      version: 2
+      expression:
+        operation: selected_input
+        source: dependency.request
+        selector:
+          version: 1
+          segments: [{kind: field, name: synchronization_plan}]
+      output:
+        type_name: bcode.synchronization.recovery-request/v1
+        schema: {"additionalProperties":false,"properties":{"after_recovery":{"type":"object"},"initial":{"type":"object"}},"required":["initial","after_recovery"],"type":"object"}
   - id: completion
-    needs: [completion_request]
+    needs: [synchronize, review, request]
     package_call: {external: completion}
     input_expression:
       version: 2
       expression:
         operation: object
         fields:
-          stop_condition: {operation: constant, value: Complete only when verification and both reviews pass.}
+          stop_condition:
+            operation: selected_input
+            source: dependency.request
+            selector:
+              version: 1
+              segments: [{kind: field, name: stop_condition}]
           evidence: {operation: array, items: []}
       output:
         type_name: bcode.completion.request/v1

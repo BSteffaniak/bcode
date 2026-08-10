@@ -9433,7 +9433,7 @@ where
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-    let completed_is_exit = definition
+    let mut completed_is_exit = definition
         .exits
         .iter()
         .any(|node_id| node_id == &output.node_id);
@@ -9458,6 +9458,18 @@ where
         })
         .map(|edge| edge.to.clone())
         .collect::<Vec<_>>();
+    if targets.is_empty()
+        && definition
+            .edges
+            .iter()
+            .any(|edge| edge.from == output.node_id)
+        && definition.edges.iter().all(|edge| {
+            edge.from != output.node_id
+                || matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. })
+        })
+    {
+        completed_is_exit = true;
+    }
     for target in &targets {
         if definition
             .node(target)
@@ -20507,6 +20519,94 @@ mod tests {
             .expect("output");
         assert_eq!(result.activated.len(), 1);
         assert_eq!(result.activated[0].node_id, "other");
+    }
+
+    #[test]
+    fn unmatched_conditional_edges_complete_with_the_source_terminal_output() {
+        let schema = bcode_workflow::ValueSchema::of::<serde_json::Value>();
+        let source = bcode_workflow::NodeDefinition {
+            id: "source".to_string(),
+            name: "source".to_string(),
+            kind: bcode_workflow::NodeKind::Task,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::Value::Null,
+        };
+        let target = bcode_workflow::NodeDefinition {
+            id: "target".to_string(),
+            name: "target".to_string(),
+            kind: bcode_workflow::NodeKind::Task,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+            input: schema.clone(),
+            output: schema,
+            resources: Vec::new(),
+            configuration: serde_json::Value::Null,
+        };
+        let definition = WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "conditional-terminal".to_string(),
+            input: source.input.clone(),
+            output: source.output.clone(),
+            nodes: BTreeMap::from([
+                (source.id.clone(), source.clone()),
+                (target.id.clone(), target),
+            ]),
+            entries: vec![source.id.clone()],
+            exits: vec!["target".to_string()],
+            edges: vec![bcode_workflow::EdgeDefinition {
+                from: source.id.clone(),
+                to: "target".to_string(),
+                kind: bcode_workflow::EdgeKind::Conditional {
+                    predicate: bcode_workflow::PredicateExpression::SelectedEquals {
+                        version: bcode_workflow::WORKFLOW_PREDICATE_VERSION,
+                        selector: bcode_workflow::WorkflowValueSelector {
+                            version: bcode_workflow::WORKFLOW_VALUE_SELECTOR_VERSION,
+                            segments: vec![bcode_workflow::WorkflowValueSelectorSegment::Field {
+                                name: "status".to_string(),
+                            }],
+                        },
+                        value: serde_json::json!("continue"),
+                    },
+                    expected: true,
+                },
+                transform: None,
+            }],
+        };
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("conditional-terminal", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "conditional-terminal-run".to_string();
+        run.definition_id = "conditional-terminal".to_string();
+        store.create_run(&run).expect("run");
+        let value = serde_json::json!({"status": "done"});
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "source-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: source.id,
+                activation_id: activation_identity(&run.run_id, "source", 0),
+                schema_id: source.output.type_name,
+                schema_version: 1,
+                value: value.clone(),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("output");
+        assert!(result.activated.is_empty());
+        assert_eq!(result.run_status, RunStatus::Completed);
+        assert_eq!(
+            store
+                .canonical_terminal_output(&run.run_id)
+                .expect("terminal")
+                .expect("terminal")
+                .value,
+            value
+        );
     }
 
     #[test]

@@ -436,6 +436,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
             parent_session_id,
             run_id,
             workspace_snapshot,
+            parent_session_generation,
             configuration,
             input,
         } => {
@@ -479,6 +480,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
                                 },
                                 run_id,
                                 parent_session_id,
+                                parent_session_generation,
                                 workspace_snapshot,
                                 configuration,
                                 input,
@@ -499,7 +501,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
                         run_id,
                         parent_session_id,
                         workspace_snapshot,
-                        parent_session_generation: None,
+                        parent_session_generation,
                         configuration,
                         input,
                     })
@@ -1101,6 +1103,7 @@ const fn workflow_package_start_request(
     package_export: bcode_workflow::WorkflowPackageExportIdentity,
     run_id: Option<String>,
     parent_session_id: SessionId,
+    parent_session_generation: Option<u64>,
     workspace_snapshot: Option<String>,
     configuration: Option<serde_json::Value>,
     input: Option<serde_json::Value>,
@@ -1110,7 +1113,7 @@ const fn workflow_package_start_request(
         run_id,
         parent_session_id,
         workspace_snapshot,
-        parent_session_generation: None,
+        parent_session_generation,
         configuration,
         input,
     }
@@ -2613,6 +2616,9 @@ enum WorkflowCommand {
         run_id: Option<String>,
         #[arg(long)]
         workspace_snapshot: Option<String>,
+        /// Exact accepted parent-session generation required by fixed-generation prompt nodes.
+        #[arg(long)]
+        parent_session_generation: Option<u64>,
         #[arg(long, value_name = "FILE")]
         configuration: Option<PathBuf>,
         #[arg(long, value_name = "JSON_FILE")]
@@ -15265,6 +15271,7 @@ mod workflow_source_tests {
             },
             Some("run-1".to_string()),
             parent_session_id,
+            Some(7),
             Some("workspace".to_string()),
             Some(serde_json::json!({"mode": "safe"})),
             Some(serde_json::json!({"subject": "change"})),
@@ -15272,6 +15279,7 @@ mod workflow_source_tests {
         assert_eq!(request.package_export.package_id, "example/package");
         assert_eq!(request.package_export.export, "main");
         assert_eq!(request.parent_session_id, parent_session_id);
+        assert_eq!(request.parent_session_generation, Some(7));
         assert_eq!(request.input.expect("input")["subject"], "change");
     }
 

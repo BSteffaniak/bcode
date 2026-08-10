@@ -11,10 +11,22 @@ imports:
     package_id: bcode/examples-remediation
     export: bounded-remediation
     manifest: remediation.workflow-package.yaml
+  - import_id: validation
+    package_id: bcode/examples-validation
+    export: run-validation
+    manifest: validation.workflow-package.yaml
   - import_id: review
     package_id: bcode/examples-review
     export: review
     manifest: review.workflow-package.yaml
+  - import_id: checkpoint
+    package_id: bcode/examples-checkpoint
+    export: checkpoint
+    manifest: checkpoint.workflow-package.yaml
+  - import_id: synchronization
+    package_id: bcode/examples-sync-recovery
+    export: synchronize-with-recovery
+    manifest: sync-recovery.workflow-package.yaml
   - import_id: completion
     package_id: bcode/examples-planning
     export: evaluate-completion
@@ -22,4 +34,4 @@ imports:
 members:
   - member_id: feature-delivery
     source_name: delivery/feature-delivery.workflow.yaml
-    external_dependencies: [completion, planning, remediation, review]
+    external_dependencies: [checkpoint, completion, planning, remediation, review, synchronization, validation]

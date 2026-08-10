@@ -16958,7 +16958,7 @@ async fn handle_provide_workflow_input(
 #[allow(clippy::too_many_arguments)]
 async fn handle_resolve_workflow_approval(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     run_id: String,
     node_id: String,
@@ -16977,6 +16977,7 @@ async fn handle_resolve_workflow_approval(
             approved,
             current_unix_millis(),
         )?;
+    drive_workflow_run_and_parents(state, &run_id).await?;
     state.metrics.record_histogram_with_labels(
         "workflow.approval.resolution.duration_ms",
         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -17049,7 +17050,7 @@ async fn resolve_workflow_mutation_approval(
         bcode_workflow_store::WorkflowMutationApprovalDecision::Approve
     ) && let Some((run_id, _)) = approval_context.as_ref()
     {
-        drive_workflow_run(state, run_id).await?;
+        drive_workflow_run_and_parents(state, run_id).await?;
     }
     Ok((
         result,
@@ -55004,6 +55005,163 @@ event_symbol = "bcode_plugin_handle_event_v1"
             run.terminal_output_checksum_sha256.as_deref(),
             Some(terminal.checksum_sha256.as_str())
         );
+        assert_eq!(terminal.node_id, "terminal");
+        assert_eq!(terminal.value, serde_json::json!(true));
+        drop(stream);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn resolving_approval_drives_the_waiting_workflow_to_completion() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("approval wake".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "boolean".to_string(),
+            schema: serde_json::json!({"type": "boolean"}),
+        };
+        store
+            .persist_definition(
+                "approval-wake",
+                1,
+                &bcode_workflow::WorkflowDefinition {
+                    schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                    name: "approval-wake".to_string(),
+                    input: schema.clone(),
+                    output: schema.clone(),
+                    nodes: BTreeMap::from([
+                        (
+                            "wait".to_string(),
+                            bcode_workflow::NodeDefinition {
+                                id: "wait".to_string(),
+                                name: "wait".to_string(),
+                                kind: bcode_workflow::NodeKind::Approval,
+                                dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                                input: schema.clone(),
+                                output: schema.clone(),
+                                resources: Vec::new(),
+                                configuration: serde_json::json!({"gate_version": 1}),
+                            },
+                        ),
+                        (
+                            "terminal".to_string(),
+                            bcode_workflow::NodeDefinition {
+                                id: "terminal".to_string(),
+                                name: "terminal".to_string(),
+                                kind: bcode_workflow::NodeKind::Branch,
+                                dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                                input: schema.clone(),
+                                output: schema.clone(),
+                                resources: Vec::new(),
+                                configuration: serde_json::json!({
+                                    "predicate_version": 1,
+                                    "predicate": {
+                                        "version": 1,
+                                        "operation": "equals",
+                                        "path": "",
+                                        "value": true
+                                    },
+                                    "true_entries": [],
+                                    "false_entries": [],
+                                    "true_nodes": [],
+                                    "false_nodes": []
+                                }),
+                            },
+                        ),
+                    ]),
+                    entries: vec!["wait".to_string()],
+                    exits: vec!["terminal".to_string()],
+                    edges: vec![bcode_workflow::EdgeDefinition {
+                        from: "wait".to_string(),
+                        to: "terminal".to_string(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                        transform: None,
+                    }],
+                },
+            )
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "approval-wake-run".to_string(),
+                definition_id: "approval-wake".to_string(),
+                definition_version: 1,
+                workspace_snapshot: ".".to_string(),
+                parent_session_id: Some(session.id.to_string()),
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(true)),
+                created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+        drive_workflow_run(&state, "approval-wake-run")
+            .await
+            .expect("drive to approval wait");
+        let wait = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiting_activations("approval-wake-run", 10)
+            .expect("waits")
+            .pop()
+            .expect("wait");
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("client connection");
+            handle_client(stream, server_state)
+                .await
+                .expect("handle client");
+        });
+        let mut stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        let resolve = bcode_ipc::request_envelope(
+            1,
+            &Request::ResolveWorkflowApproval {
+                run_id: "approval-wake-run".to_string(),
+                node_id: "wait".to_string(),
+                activation_id: wait.activation_id,
+                approved: true,
+            },
+        )
+        .expect("resolve request");
+        bcode_ipc::send_envelope(&mut stream, &resolve)
+            .await
+            .expect("send approval");
+        let response = bcode_ipc::recv_envelope(&mut stream)
+            .await
+            .expect("approval response");
+        assert!(matches!(
+            bcode_ipc::decode_response(&response.payload).expect("decode response"),
+            Response::Ok(ResponsePayload::WorkflowWaitResolved { .. })
+        ));
+        let inspection = workflow_run_inspection(&state, "approval-wake-run", 10)
+            .await
+            .expect("inspection");
+        assert_eq!(
+            inspection.run.status,
+            bcode_workflow_store::RunStatus::Completed
+        );
+        let terminal = inspection.terminal_output.expect("terminal output");
         assert_eq!(terminal.node_id, "terminal");
         assert_eq!(terminal.value, serde_json::json!(true));
         drop(stream);

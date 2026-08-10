@@ -16,11 +16,11 @@ These product-facing examples are ordinary workflow package manifests and source
 
 ## Progress-driven delivery composition
 
-`delivery.workflow-package.yaml` is a product-facing multi-package composition over exact planning, bounded implementation, isolated review, and completion exports. Generic named transforms construct child inputs from typed predecessor state, and an explicit typed operator gate remains available for policy, cancellation, or repair decisions. The broader checkpoint, validation, and synchronization packages remain independently callable as the composition grows toward full release proof.
+`delivery.workflow-package.yaml` is a product-facing multi-package composition over exact planning, bounded implementation, source-defined validation, isolated review, configured checkpoint, bounded synchronization/recovery, and completion exports. The root request owns every command plan, review scope, and stop condition; named typed transforms pass them only after predecessor state exists. Checkpoint exclusions, commit messages, remotes, refs, validation commands, and synchronization postconditions therefore remain caller data rather than duplicated constants or host policy. Planning and implementation use fixed-generation prompt contexts, while review and completion use fresh isolated contexts.
 
 ## Bounded synchronization recovery
 
-`sync-recovery.workflow-package.yaml` imports exactly two named exports: normal synchronization and repository recovery. It conditionally invokes recovery from the shell owner's canonical typed `passed` fact and has no unbounded retry path.
+`sync-recovery.workflow-package.yaml` imports exactly two named exports: normal synchronization and repository recovery. It conditionally invokes recovery from the shell owner's canonical typed `passed` fact and permits exactly one caller-configured post-recovery synchronization attempt. A second failed or ambiguous attempt is terminal; the package has no hidden retry or force-push path.
 
 ## Normal synchronization
 

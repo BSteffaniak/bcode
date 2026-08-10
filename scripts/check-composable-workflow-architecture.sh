@@ -219,7 +219,12 @@ if [[ ! -f examples/workflows/packages/command/package.workflow-package.yaml ]] 
   || [[ ! -f examples/workflows/packages/synchronization.workflow-package.yaml ]] \
   || [[ ! -f examples/workflows/packages/sync-recovery.workflow-package.yaml ]] \
   || [[ ! -f examples/workflows/packages/delivery.workflow-package.yaml ]] \
-  || ! rg -q 'external_dependencies: \[completion, planning, remediation, review\]' examples/workflows/packages/delivery.workflow-package.yaml \
+  || ! rg -q 'external_dependencies: \[checkpoint, completion, planning, remediation, review, synchronization, validation\]' examples/workflows/packages/delivery.workflow-package.yaml \
+  || ! rg -q 'source: dependency\.request' examples/workflows/packages/delivery/feature-delivery.workflow.yaml \
+  || ! rg -Fq 'package_call: {external: checkpoint}' examples/workflows/packages/delivery/feature-delivery.workflow.yaml \
+  || ! rg -Fq 'package_call: {external: synchronization}' examples/workflows/packages/delivery/feature-delivery.workflow.yaml \
+  || ! rg -Fq 'package_call: {external: validation}' examples/workflows/packages/delivery/feature-delivery.workflow.yaml \
+  || ! rg -q 'fixed-generation prompt contexts' examples/workflows/README.md \
   || [[ ! -f examples/workflows/packages/data-quality.workflow-package.yaml ]] \
   || ! rg -q 'external_dependencies: \[inspect, remediate\]' examples/workflows/packages/data-quality.workflow-package.yaml \
   || ! rg -q 'primary_cli_discovers_and_plans_hermetic_external_data_quality_package' packages/cli/src/lib.rs \
@@ -227,6 +232,9 @@ if [[ ! -f examples/workflows/packages/command/package.workflow-package.yaml ]] 
   || ! rg -q 'external_dependencies: \[recover, synchronize\]' examples/workflows/packages/sync-recovery.workflow-package.yaml \
   || ! rg -q 'manifest: synchronization\.workflow-package\.yaml' examples/workflows/packages/sync-recovery.workflow-package.yaml \
   || ! rg -q 'manifest: repository-recovery\.workflow-package\.yaml' examples/workflows/packages/sync-recovery.workflow-package.yaml \
+  || ! rg -q 'synchronize_after_recovery' examples/workflows/packages/sync-recovery/synchronize-with-recovery.workflow.yaml \
+  || ! rg -q 'source: dependency\.request' examples/workflows/packages/sync-recovery/synchronize-with-recovery.workflow.yaml \
+  || ! rg -q 'post-recovery synchronization attempt' examples/workflows/README.md \
   || ! rg -q 'GIT_TERMINAL_PROMPT' examples/workflows/packages/synchronization/synchronize.workflow.yaml \
   || ! rg -q 'example-pathspec-replaced-by-typed-input' examples/workflows/packages/checkpoint/checkpoint.workflow.yaml \
   || ! rg -q 'bcode\.completion\.request/v1' examples/workflows/packages/planning/evaluate-completion.workflow.yaml \
