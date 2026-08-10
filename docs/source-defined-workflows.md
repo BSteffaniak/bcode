@@ -126,6 +126,12 @@ The exact block input schema, effects, resources, authorization, cancellation, a
 
 Omitted step IDs are generated deterministically as `step_0001`, `step_0002`, and so on. Omitted dependencies make each step depend on the immediately preceding step. `needs` may reference only earlier step IDs. Lowering emits a source map from every concise step path to its canonical node.
 
+## Package and example composition
+
+Product-facing packages live under `examples/workflows/packages`. Each package declares complete source-visible schemas, prompts, argv, limits, resources, conditions, and failure policy. The delivery example composes exact planning, remediation, review, and completion exports through named typed bindings. The data-quality example demonstrates the same architecture without repository or version-control assumptions.
+
+For discovery precedence, confinement, package locks, publication, restart, cancellation, waits, repair, and the complete public lifecycle, see [`workflow-package-lifecycle.md`](workflow-package-lifecycle.md).
+
 ## CLI lifecycle
 
 ```text

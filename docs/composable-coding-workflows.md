@@ -134,6 +134,13 @@ break, incompatible workflow state is replaced only through an explicit maintena
 writers, acquires exclusive ownership, creates and verifies a backup, initializes the new store, and
 records a bounded reset receipt. No normal read performs migration or repair.
 
+## Lifecycle documentation
+
+The complete package discovery, confinement, imports, locking, publication, waits, descendant bounds,
+cancellation, terminal-state, and repair contracts are documented in
+[`workflow-package-lifecycle.md`](workflow-package-lifecycle.md). Product-facing package examples live
+under `examples/workflows/packages`; fixtures remain test inputs rather than release procedures.
+
 ## Mechanical boundaries
 
 Architecture checks enforce that:

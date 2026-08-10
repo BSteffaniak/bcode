@@ -1,0 +1,17 @@
+version: 3
+package_id: bcode/examples-data-quality
+exports:
+  data-quality: data-quality
+imports:
+  - import_id: inspect
+    package_id: bcode/examples-command
+    export: run-and-assert
+    manifest: command/package.workflow-package.yaml
+  - import_id: remediate
+    package_id: bcode/examples-remediation
+    export: bounded-remediation
+    manifest: remediation.workflow-package.yaml
+members:
+  - member_id: data-quality
+    source_name: data-quality/data-quality.workflow.yaml
+    external_dependencies: [inspect, remediate]

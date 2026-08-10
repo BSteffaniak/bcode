@@ -3397,7 +3397,7 @@ mod tests {
     #[test]
     fn shell_tool_and_workflow_preparation_emit_identical_policy_facts() {
         let arguments = serde_json::json!({"command": "git status --short"});
-        let tool = prepare_shell_tool(&preparation_request(arguments.clone()))
+        let tool = prepare_shell_tool(&preparation_request(arguments))
             .payload_json::<bcode_tool::ToolPreparationResponse>()
             .expect("tool preparation");
         let tool_policy = bcode_agent_profile::tool_policy_authorization_metadata(

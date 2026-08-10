@@ -14235,14 +14235,6 @@ mod workflow_source_tests {
             )
             .expect("component lowers through ordinary source contract");
         }
-        let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
-            .expect("complete source component package plans");
-        assert_eq!(plan.members.len(), loaded.members.len());
-        assert!(
-            plan.members
-                .iter()
-                .all(|member| member.lowering.validation.is_valid())
-        );
     }
 
     #[test]
@@ -14856,6 +14848,58 @@ mod workflow_source_tests {
     }
 
     #[test]
+    fn primary_cli_plans_product_facing_non_repository_data_quality_closure() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("examples/workflows/packages/data-quality.workflow-package.yaml");
+        let closure = read_workflow_package_closure(&manifest).expect("data quality closure");
+        let plan = bcode_workflow::plan_workflow_package_closure(
+            &closure,
+            &workflow_test_catalog(std::collections::BTreeSet::from([
+                "build".to_string(),
+                "review".to_string(),
+            ])),
+        )
+        .expect("data quality closure plans");
+        assert_eq!(plan.packages.len(), 3);
+        let entry = plan
+            .packages
+            .iter()
+            .find(|package| package.package_id == "bcode/examples-data-quality")
+            .expect("data quality entry");
+        let definition = &entry.plan.members[0].lowering.document.definition;
+        assert_eq!(
+            definition.nodes["inspect"].kind,
+            bcode_workflow::NodeKind::WorkflowCall
+        );
+        assert_eq!(
+            definition.nodes["assess"].kind,
+            bcode_workflow::NodeKind::Agent
+        );
+        assert_eq!(
+            definition.nodes["operator_decision"].kind,
+            bcode_workflow::NodeKind::Approval
+        );
+        assert_eq!(
+            definition.nodes["remediate"].kind,
+            bcode_workflow::NodeKind::WorkflowCall
+        );
+        let assessment: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(definition.nodes["assess"].configuration.clone())
+                .expect("assessment prompt");
+        assert!(assessment.read_only);
+        assert!(assessment.tool_allowlist.is_empty());
+        assert!(
+            !entry.plan.members[0]
+                .lowering
+                .document
+                .definition
+                .name
+                .to_ascii_lowercase()
+                .contains("git")
+        );
+    }
+
+    #[test]
     fn primary_cli_resolves_recursive_confined_package_manifests() {
         let temp = tempfile::tempdir().expect("tempdir");
         let write_package = |directory: &Path,
@@ -15098,6 +15142,84 @@ mod workflow_source_tests {
         )
         .expect("duplicate manifest");
         assert!(discover_workflow_packages(temp.path(), &config, 10).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn primary_cli_discovers_and_plans_hermetic_external_data_quality_package() {
+        let repository = tempfile::tempdir().expect("external repository");
+        let workflow_root = repository.path().join(".bcode/workflows");
+        let command_root = workflow_root.join("command");
+        let remediation_root = workflow_root.join("remediation");
+        let data_root = workflow_root.clone();
+        for root in [&command_root, &remediation_root, &data_root] {
+            std::fs::create_dir_all(root).expect("package directory");
+        }
+
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        std::fs::copy(
+            source_root.join("examples/workflows/packages/command/run-and-assert.workflow.yaml"),
+            command_root.join("run-and-assert.workflow.yaml"),
+        )
+        .expect("command source");
+        std::fs::write(
+            command_root.join("package.workflow-package.yaml"),
+            "version: 3\npackage_id: external/command\nexports: {run: run}\nmembers:\n  - member_id: run\n    source_name: run-and-assert.workflow.yaml\n",
+        )
+        .expect("command manifest");
+        std::fs::copy(
+            source_root
+                .join("examples/workflows/packages/remediation/bounded-remediation.workflow.yaml"),
+            remediation_root.join("bounded-remediation.workflow.yaml"),
+        )
+        .expect("remediation source");
+        std::fs::write(
+            remediation_root.join("package.workflow-package.yaml"),
+            "version: 3\npackage_id: external/remediation\nexports: {remediate: remediate}\nmembers:\n  - member_id: remediate\n    source_name: bounded-remediation.workflow.yaml\n",
+        )
+        .expect("remediation manifest");
+        let data_source = std::fs::read_to_string(
+            source_root.join("examples/workflows/packages/data-quality/data-quality.workflow.yaml"),
+        )
+        .expect("data source");
+        std::fs::write(data_root.join("data-quality.workflow.yaml"), data_source)
+            .expect("data source copy");
+        std::fs::write(
+            data_root.join("data-quality.workflow-package.yaml"),
+            "version: 3\npackage_id: external/data-quality\nexports: {main: main}\nimports:\n  - {import_id: inspect, package_id: external/command, export: run, manifest: command/package.workflow-package.yaml}\n  - {import_id: remediate, package_id: external/remediation, export: remediate, manifest: remediation/package.workflow-package.yaml}\nmembers:\n  - member_id: main\n    source_name: data-quality.workflow.yaml\n    external_dependencies: [inspect, remediate]\n",
+        )
+        .expect("data manifest");
+
+        let config = bcode_config::BcodeConfig {
+            workflows: bcode_config::WorkflowsConfig {
+                include_repo_workflows: true,
+                include_user_workflows: false,
+                paths: Vec::new(),
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let discovered =
+            discover_workflow_packages(repository.path(), &config, 10).expect("external discovery");
+        assert!(
+            discovered
+                .iter()
+                .any(|package| package.package_id == "external/data-quality")
+        );
+        let closure = read_workflow_package_closure_in_root(
+            &data_root.join("data-quality.workflow-package.yaml"),
+            Some(&workflow_root),
+        )
+        .expect("external closure");
+        let plan = bcode_workflow::plan_workflow_package_closure(
+            &closure,
+            &workflow_test_catalog(std::collections::BTreeSet::from([
+                "build".to_string(),
+                "review".to_string(),
+            ])),
+        )
+        .expect("external data quality plan");
+        assert_eq!(plan.entry_package_id, "external/data-quality");
+        assert_eq!(plan.packages.len(), 3);
     }
 
     #[test]

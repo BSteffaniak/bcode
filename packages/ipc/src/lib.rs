@@ -4325,6 +4325,12 @@ mod tests {
                 authored_provenance: None,
                 terminal_output_id: None,
                 terminal_output_checksum_sha256: None,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 status: bcode_workflow_store::RunStatus::Running,
                 cancellation_requested_at_ms: None,

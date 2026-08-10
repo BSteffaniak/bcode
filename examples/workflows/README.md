@@ -10,6 +10,10 @@ These product-facing examples are ordinary workflow package manifests and source
 
 `prompt-verification.workflow-package.yaml` exports a bounded mutating prompt followed by a visible source-authored shell verifier. The prompt has an exact typed task input and structured result, optional skills are requested only through instruction text, and the verifier runs through the same shell-owner authorization boundary as ordinary command packages.
 
+## Non-repository data quality
+
+`data-quality.workflow-package.yaml` imports the command and bounded-remediation exports. It runs deterministic inspection before a fresh isolated, tool-free typed assessment, branches through a typed operator decision, and conditionally enters bounded remediation. The workflow contains no repository or version-control assumptions.
+
 ## Progress-driven delivery composition
 
 `delivery.workflow-package.yaml` is a product-facing multi-package composition over exact planning, bounded implementation, isolated review, and completion exports. Generic named transforms construct child inputs from typed predecessor state, and an explicit typed operator gate remains available for policy, cancellation, or repair decisions. The broader checkpoint, validation, and synchronization packages remain independently callable as the composition grows toward full release proof.

@@ -220,6 +220,9 @@ if [[ ! -f examples/workflows/packages/command/package.workflow-package.yaml ]] 
   || [[ ! -f examples/workflows/packages/sync-recovery.workflow-package.yaml ]] \
   || [[ ! -f examples/workflows/packages/delivery.workflow-package.yaml ]] \
   || ! rg -q 'external_dependencies: \[completion, planning, remediation, review\]' examples/workflows/packages/delivery.workflow-package.yaml \
+  || [[ ! -f examples/workflows/packages/data-quality.workflow-package.yaml ]] \
+  || ! rg -q 'external_dependencies: \[inspect, remediate\]' examples/workflows/packages/data-quality.workflow-package.yaml \
+  || ! rg -q 'primary_cli_discovers_and_plans_hermetic_external_data_quality_package' packages/cli/src/lib.rs \
   || ! rg -q 'bcode\.shell/exec@1' examples/workflows/packages/command/run-and-assert.workflow.yaml \
   || ! rg -q 'external_dependencies: \[recover, synchronize\]' examples/workflows/packages/sync-recovery.workflow-package.yaml \
   || ! rg -q 'manifest: synchronization\.workflow-package\.yaml' examples/workflows/packages/sync-recovery.workflow-package.yaml \
@@ -266,6 +269,15 @@ if rg -ni '(^|[^a-z])git([[:space:]]|[-_./])' fixtures/workflow-components/non-g
   violations=1
 fi
 rm -f /tmp/bcode-non-git-workflow-leaks.txt
+
+if rg -ni '(^|[^a-z])git([[:space:]]|[-_./])' examples/workflows/packages/data-quality \
+  examples/workflows/packages/data-quality.workflow-package.yaml \
+  >/tmp/bcode-product-non-git-workflow-leaks.txt 2>/dev/null; then
+  echo "Composable workflow generality violation: product-facing non-Git package acquired Git semantics." >&2
+  cat /tmp/bcode-product-non-git-workflow-leaks.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-product-non-git-workflow-leaks.txt
 
 if rg -n 'force-with-lease|force[[:space:]]+push|push[[:space:]]+--force|--force' \
   fixtures/workflow-components examples/workflows --glob '*.yaml' --glob '*.json' \
