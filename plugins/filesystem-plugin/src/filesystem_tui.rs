@@ -10,6 +10,12 @@ use bmux_tui::prelude::{Color, Line, Span, Style};
 use devicons::{FileIcon, Theme, icon_for_file};
 use serde_json::Value;
 
+thread_local! {
+    static ACTIVE_THEME: std::cell::Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
 /// Filesystem request/result TUI visual adapter.
 pub struct FilesystemTuiVisualAdapter;
 
@@ -47,8 +53,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         payload: &Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
+        ACTIVE_THEME.with(|theme| theme.set(context.theme()));
         let width = context.width();
-        match kind {
+        let rows = match kind {
             "bcode.filesystem.request" => request_rows(payload, context),
             "bcode.filesystem.request-draft.write" | "bcode.filesystem.request-draft.edit" => {
                 request_draft_rows(kind, payload, width, context)
@@ -67,7 +74,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
                 metadata_rows(kind, payload, context)
             }
             _ => Vec::new(),
-        }
+        };
+        ACTIVE_THEME.with(|theme| theme.set(None));
+        rows
     }
 }
 
@@ -680,28 +689,35 @@ fn syntax_palette(
     }
 }
 
-const fn accent() -> Style {
-    Style::new().fg(Color::Cyan)
+fn theme_style(
+    select: impl FnOnce(bcode_plugin_sdk::tui::PluginTuiTheme) -> Style,
+    fallback: Style,
+) -> Style {
+    ACTIVE_THEME.with(|theme| theme.get().map_or(fallback, select))
 }
 
-const fn title() -> Style {
-    Style::new().fg(Color::White)
+fn accent() -> Style {
+    theme_style(|theme| theme.focused, Style::new().fg(Color::Cyan))
 }
 
-const fn label() -> Style {
-    Style::new().fg(Color::BrightBlack)
+fn title() -> Style {
+    theme_style(|theme| theme.text, Style::new().fg(Color::White))
 }
 
-const fn value_style() -> Style {
-    Style::new().fg(Color::White)
+fn label() -> Style {
+    theme_style(|theme| theme.muted, Style::new().fg(Color::BrightBlack))
 }
 
-const fn path_style() -> Style {
-    Style::new().fg(Color::Blue)
+fn value_style() -> Style {
+    theme_style(|theme| theme.text, Style::new().fg(Color::White))
 }
 
-const fn muted() -> Style {
-    Style::new().fg(Color::BrightBlack)
+fn path_style() -> Style {
+    theme_style(|theme| theme.focused, Style::new().fg(Color::Blue))
+}
+
+fn muted() -> Style {
+    theme_style(|theme| theme.muted, Style::new().fg(Color::BrightBlack))
 }
 
 #[cfg(test)]
@@ -991,6 +1007,36 @@ mod tests {
             let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
             assert!(rendered.contains(icon), "{kind}: {rendered}");
         }
+    }
+
+    #[test]
+    fn adapter_uses_host_theme_for_tool_card_roles() {
+        let mut theme = terminal_native_syntax_theme();
+        theme.focused = Style::new().fg(Color::Magenta);
+        theme.text = Style::new().fg(Color::Green);
+        theme.muted = Style::new().fg(Color::Yellow);
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+            None,
+        )
+        .with_theme(theme);
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &FilesystemTuiVisualAdapter,
+            "bcode.filesystem.exists",
+            &serde_json::json!({"path": "src/lib.rs", "exists": true}),
+            &context,
+        );
+
+        assert_eq!(rows[0].spans[0].style.fg, Some(Color::Magenta));
+        assert!(rows.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("exists") && span.style.fg == Some(Color::Yellow)
+        }));
+        assert!(
+            rows.iter().flat_map(|line| &line.spans).any(|span| {
+                span.content.contains("yes") && span.style.fg == Some(Color::Green)
+            })
+        );
     }
 
     #[test]

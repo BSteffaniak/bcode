@@ -157,8 +157,8 @@ while IFS= read -r surface_file; do
   fi
 done < <(rg -l 'impl (bcode_plugin_sdk::tui::)?PluginTuiSurface for' plugins --glob '*.rs' | sort)
 
-if rg -n 'Color::|frame\.fill\(area, " ", Style::new\(\)' \
-  plugins/ralph-plugin/src/lib.rs; then
+if awk '/^#\[cfg\(test\)\]/{exit} {print}' plugins/ralph-plugin/src/lib.rs \
+  | rg -n 'Color::|frame\.fill\(area, " ", Style::new\(\)'; then
   fail "migrated Ralph home surface must consume renderer-owned semantic themes"
 fi
 

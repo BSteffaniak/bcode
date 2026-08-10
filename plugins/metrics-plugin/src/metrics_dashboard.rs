@@ -1177,9 +1177,87 @@ fn format_count(value: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use bcode_plugin_sdk::tui::{
+        PLUGIN_TUI_COMPONENT_THEME_VERSION, PluginTuiDiffTheme, PluginTuiSourceTheme,
+        PluginTuiSyntaxColor, PluginTuiSyntaxTheme, PluginTuiTheme,
+    };
     use bmux_tui::buffer::Buffer;
 
     use super::*;
+
+    fn plugin_theme() -> PluginTuiTheme {
+        let style = Style::new();
+        let syntax = PluginTuiSyntaxColor::from_tui(Color::Default);
+        PluginTuiTheme {
+            component_theme_version: PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            canvas: style.bg(Color::Blue),
+            text: style.fg(Color::White),
+            muted: style.fg(Color::Yellow),
+            border: style.fg(Color::Cyan),
+            focused: style.fg(Color::Magenta),
+            selection: style.fg(Color::Black).bg(Color::Green),
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style.fg(Color::Green),
+                removed: style.fg(Color::Red),
+                hunk: style.fg(Color::Yellow),
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: syntax,
+                comment: syntax,
+                keyword: syntax,
+                function: syntax,
+                variable: syntax,
+                string: syntax,
+                number: syntax,
+                type_name: syntax,
+                operator: syntax,
+                punctuation: syntax,
+            },
+        }
+    }
+
+    #[test]
+    fn dashboard_uses_host_theme_and_bounds_interaction_areas() {
+        let mut surface = MetricsDashboardSurface::load(
+            PathBuf::from("/definitely/missing/bcode-metrics.jsonl"),
+            MetricsDashboardQuery::default(),
+        );
+        let area = Rect::new(0, 0, 36, 14);
+        let mut buffer = Buffer::empty(area);
+        let theme = plugin_theme();
+        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(theme));
+
+        assert!(
+            buffer
+                .cells()
+                .iter()
+                .any(|cell| cell.style.bg == theme.canvas.bg)
+        );
+        for interaction_area in [
+            surface.tab_area,
+            surface.content_area,
+            surface.action_area,
+            surface.main_table_area,
+            surface.recommendation_area,
+        ] {
+            assert!(interaction_area.right() <= area.right());
+            assert!(interaction_area.bottom() <= area.bottom());
+        }
+    }
 
     #[test]
     fn status_uses_bounded_shared_key_hints() {

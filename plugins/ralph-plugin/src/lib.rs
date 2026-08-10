@@ -19,6 +19,8 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+#[cfg(test)]
+use bmux_tui::prelude::Color;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
@@ -978,6 +980,79 @@ bcode_plugin_sdk::export_plugin!(RalphPlugin, include_str!("../bcode-plugin.toml
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_plugin_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffTheme, PluginTuiSourceTheme, PluginTuiSyntaxColor, PluginTuiSyntaxTheme,
+            PluginTuiTheme,
+        };
+        let style = Style::new();
+        let syntax = PluginTuiSyntaxColor::from_tui(Color::Default);
+        PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            canvas: style.bg(Color::Blue),
+            text: style.fg(Color::White),
+            muted: style.fg(Color::Yellow),
+            border: style.fg(Color::Cyan),
+            focused: style.fg(Color::Magenta),
+            selection: style.fg(Color::Black).bg(Color::Green),
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: syntax,
+                comment: syntax,
+                keyword: syntax,
+                function: syntax,
+                variable: syntax,
+                string: syntax,
+                number: syntax,
+                type_name: syntax,
+                operator: syntax,
+                punctuation: syntax,
+            },
+        }
+    }
+
+    #[test]
+    fn ralph_surface_uses_host_theme_at_narrow_sizes() {
+        let mut surface = RalphHomeSurface::load(PathBuf::from("/tmp/repo"), None);
+        let area = Rect::new(0, 0, 20, 24);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let theme = test_plugin_theme();
+        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(theme));
+
+        assert!(
+            buffer
+                .cells()
+                .iter()
+                .any(|cell| cell.style.bg == theme.canvas.bg)
+        );
+        assert!(
+            buffer
+                .cells()
+                .iter()
+                .any(|cell| cell.style.bg == theme.selection.bg)
+        );
+        assert!(surface.action_area.width <= area.width);
+        assert!(surface.action_area.height <= area.height);
+    }
 
     #[test]
     fn ralph_action_list_supports_keyboard_and_mouse_selection() {

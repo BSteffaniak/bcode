@@ -54,7 +54,7 @@ cd "${root}"
 
 if [[ "${BCODE_TUI_PTY_SKIP_BUILD:-0}" != "1" ]]; then
     cargo build "${cargo_profile_args[@]}" --quiet -p bcode --features distribution -p bcode_fake_provider_plugin
-    cargo build "${cargo_profile_args[@]}" --quiet -p bcode_tui_components --bin bcode_terminal_grid_probe
+    cargo build "${cargo_profile_args[@]}" --quiet -p bcode_tui_components --features terminal-viewer --bin bcode_terminal_grid_probe
 fi
 
 case "$(uname -s)" in

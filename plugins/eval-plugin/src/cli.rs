@@ -31,7 +31,7 @@ enum CliError {
     EvalCheckFailed(String),
 }
 
-pub(super) fn registration() -> StaticCliRegistration {
+pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
         requires_daemon: true,
         command: EvalCli::command,
@@ -41,7 +41,7 @@ pub(super) fn registration() -> StaticCliRegistration {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = EvalCli::from_arg_matches(&matches).map_err(|e| e.to_string())?;
-        run(cli.command).await.map_err(|e| e.to_string())
+        run(cli.command).map_err(|e| e.to_string())
     })
 }
 fn surface_outcome(kind: &str, run: Option<PathBuf>) -> StaticCliOutcome {
@@ -263,7 +263,7 @@ enum EvalImproveCommand {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run(command: EvalCommand) -> Result<StaticCliOutcome, CliError> {
+fn run(command: EvalCommand) -> Result<StaticCliOutcome, CliError> {
     match command {
         EvalCommand::Validate { suite } => {
             let suite = bcode_eval::load_suite(suite)?;

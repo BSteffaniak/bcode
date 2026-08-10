@@ -1290,6 +1290,100 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    fn test_plugin_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffTheme, PluginTuiSourceTheme, PluginTuiSyntaxColor, PluginTuiSyntaxTheme,
+            PluginTuiTheme,
+        };
+        let style = Style::new();
+        let syntax = PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default);
+        PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            canvas: style.bg(bmux_tui::style::Color::Blue),
+            text: style.fg(bmux_tui::style::Color::White),
+            muted: style.fg(bmux_tui::style::Color::Yellow),
+            border: style.fg(bmux_tui::style::Color::Cyan),
+            focused: style.fg(bmux_tui::style::Color::Magenta),
+            selection: style
+                .fg(bmux_tui::style::Color::Black)
+                .bg(bmux_tui::style::Color::Green),
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: syntax,
+                comment: syntax,
+                keyword: syntax,
+                function: syntax,
+                variable: syntax,
+                string: syntax,
+                number: syntax,
+                type_name: syntax,
+                operator: syntax,
+                punctuation: syntax,
+            },
+        }
+    }
+
+    #[test]
+    fn worktree_surface_uses_host_theme_at_narrow_sizes() {
+        let worktree = WorktreeInfo {
+            path: PathBuf::from("/tmp/repo"),
+            is_main: true,
+            branch: Some("main".to_owned()),
+            commit: Some("abc123".to_owned()),
+        };
+        let mut surface = WorktreeCommandSurface {
+            id: "command.work-tree.attach",
+            title: "Attach worktree",
+            repo_path: PathBuf::from("/tmp/repo"),
+            lines: vec!["Choose a worktree".to_owned(), "main".to_owned()],
+            worktrees: vec![worktree],
+            selected: 0,
+            list_area: Rect::new(0, 0, 0, 0),
+            status: None,
+            create_name: String::new(),
+            create_input: TextInputState::new(TextEditBuffer::from_text("")),
+            input_area: Rect::new(0, 0, 0, 0),
+            session_id: None,
+        };
+        let area = Rect::new(0, 0, 18, 8);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let theme = test_plugin_theme();
+        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(theme));
+
+        assert!(
+            buffer
+                .cells()
+                .iter()
+                .any(|cell| cell.style.bg == theme.canvas.bg)
+        );
+        assert!(
+            buffer
+                .cells()
+                .iter()
+                .any(|cell| cell.style.bg == theme.selection.bg)
+        );
+        assert!(surface.list_area.width <= area.width);
+        assert!(surface.list_area.height <= area.height);
+    }
+
     #[test]
     fn worktree_selectable_list_supports_mouse_activation() {
         let items = [

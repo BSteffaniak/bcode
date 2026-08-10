@@ -16,7 +16,7 @@ struct RalphCli {
     repo: PathBuf,
 }
 
-pub(super) fn registration() -> StaticCliRegistration {
+pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
         requires_daemon: false,
         command: RalphCli::command,

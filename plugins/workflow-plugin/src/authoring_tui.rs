@@ -24,6 +24,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
@@ -1278,16 +1279,33 @@ impl WorkflowAuthorSurface {
         self.render_canvas(canvas, frame, theme);
         self.render_inspector(inspector, frame, theme);
         if footer.height > 0 {
+            let status_width = footer.width.saturating_sub(1).min(36);
             frame.write_line(
-                footer,
-                &Line::from_spans(vec![Span::styled(
-                    format!(
-                        "{} · G generate · A accept candidate · z instantiate · Tab panes · node d/x/c · edge e/E · group g · move Shift+HJKL · inspector n/a/t/+/v · R resolve conflict · p publish · s start",
-                        self.status
-                    ),
-                    theme.muted,
-                )]),
+                Rect::new(footer.x, footer.y, status_width, 1),
+                &Line::from_spans(vec![Span::styled(self.status.clone(), theme.muted)]),
             );
+            let hint_area = Rect::new(
+                footer.x.saturating_add(status_width),
+                footer.y,
+                footer.width.saturating_sub(status_width),
+                1,
+            );
+            let hints = [
+                KeyHint::new("G", "generate"),
+                KeyHint::new("A", "accept"),
+                KeyHint::new("Tab", "panes"),
+                KeyHint::new("p", "publish"),
+                KeyHint::new("s", "start"),
+            ];
+            KeyHintBar::new(&hints)
+                .styles(KeyHintBarStyles {
+                    key: theme.focused,
+                    label: theme.text,
+                    separator: theme.muted,
+                    disabled: theme.muted,
+                    background: theme.canvas,
+                })
+                .render(hint_area, frame);
         }
     }
 }

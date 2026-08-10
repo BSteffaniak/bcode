@@ -14,21 +14,25 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_client         = { workspace = true }
-bcode_command        = { workspace = true }
-bcode_ipc            = { workspace = true }
-bcode_plugin_sdk     = { workspace = true, features = ["tui"] }
+bcode_client = { workspace = true }
+bcode_command = { workspace = true }
+bcode_ipc = { workspace = true }
+bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_session_models = { workspace = true }
-bcode_workflow       = { workspace = true }
+bcode_workflow = { workspace = true }
 bcode_workflow_store = { workspace = true }
-bmux_keyboard        = { workspace = true }
-bmux_tui             = { workspace = true }
-bmux_tui_components  = { workspace = true, features = ["pane", "text-view"] }
-clap                 = { workspace = true, features = ["derive", "std"] }
-jsonschema           = { workspace = true }
-serde                = { workspace = true, features = ["derive", "std"] }
-serde_json           = { workspace = true }
-tokio                = { workspace = true }
+bmux_keyboard = { workspace = true }
+bmux_tui = { workspace = true }
+bmux_tui_components = { workspace = true, features = [
+    "key-hint-bar",
+    "pane",
+    "text-view",
+] }
+clap = { workspace = true, features = ["derive", "std"] }
+jsonschema = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 bcode_plugin = { workspace = true }

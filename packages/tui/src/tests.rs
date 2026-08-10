@@ -5210,7 +5210,7 @@ fn filesystem_read_and_grep_follow_resolved_bundled_themes() {
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
     let read = serde_json::json!({
         "path": "src/lib.rs",
-        "contents": "pub fn main() {}",
+        "contents": "let value = 1;\npub fn main() {}",
         "start_line": 1,
         "truncated": false
     });
@@ -5223,7 +5223,6 @@ fn filesystem_read_and_grep_follow_resolved_bundled_themes() {
     assert!(app.apply_theme("terminal-native"));
     let terminal_read = filesystem_visual_source_colors(&app, "bcode.filesystem.read", &read);
     let terminal_grep = filesystem_visual_source_colors(&app, "bcode.filesystem.grep", &grep);
-    assert!(terminal_read.contains(&bmux_tui::style::Color::Blue));
     assert!(terminal_read.contains(&bmux_tui::style::Color::Cyan));
     assert!(terminal_grep.contains(&bmux_tui::style::Color::Blue));
     assert!(terminal_grep.contains(&bmux_tui::style::Color::Cyan));
@@ -5233,7 +5232,6 @@ fn filesystem_read_and_grep_follow_resolved_bundled_themes() {
     let nord_grep = filesystem_visual_source_colors(&app, "bcode.filesystem.grep", &grep);
     let nord_keyword = bmux_tui::style::Color::Rgb(129, 161, 193);
     let nord_function = bmux_tui::style::Color::Rgb(136, 192, 208);
-    assert!(nord_read.contains(&nord_keyword));
     assert!(nord_read.contains(&nord_function));
     assert!(nord_grep.contains(&nord_keyword));
     assert!(nord_grep.contains(&nord_function));

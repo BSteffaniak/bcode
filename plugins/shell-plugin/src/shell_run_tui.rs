@@ -26,6 +26,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Mutex;
 
+thread_local! {
+    static ACTIVE_THEME: std::cell::Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
 #[derive(Debug, Default)]
 struct ShellTuiDiagnostics {
     decode_bytes: u64,
@@ -393,6 +399,20 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
     }
 
     fn rows(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
+        ACTIVE_THEME.with(|theme| theme.set(context.theme()));
+        let rows = self.rows_with_active_theme(kind, payload, context);
+        ACTIVE_THEME.with(|theme| theme.set(None));
+        rows
+    }
+}
+
+impl ShellRunTuiVisualAdapter {
+    fn rows_with_active_theme(
         &self,
         kind: &str,
         payload: &serde_json::Value,
@@ -1066,36 +1086,53 @@ fn shell_command_spans(command: &str) -> Vec<Span> {
     spans
 }
 
-const fn muted_style() -> Style {
-    Style::new().fg(Color::BrightBlack)
+fn theme_style(
+    select: impl FnOnce(bcode_plugin_sdk::tui::PluginTuiTheme) -> Style,
+    fallback: Style,
+) -> Style {
+    ACTIVE_THEME.with(|theme| theme.get().map_or(fallback, select))
 }
 
-const fn path_style() -> Style {
-    Style::new().fg(Color::Blue)
+fn syntax_style(
+    select: impl FnOnce(bcode_plugin_sdk::tui::PluginTuiSyntaxTheme) -> Color,
+    fallback: Color,
+) -> Style {
+    theme_style(
+        |theme| Style::new().fg(select(theme.syntax)),
+        Style::new().fg(fallback),
+    )
 }
 
-const fn prompt_style() -> Style {
-    Style::new().fg(Color::Magenta)
+fn muted_style() -> Style {
+    theme_style(|theme| theme.muted, Style::new().fg(Color::BrightBlack))
 }
 
-const fn command_style() -> Style {
-    Style::new().fg(Color::Cyan)
+fn path_style() -> Style {
+    theme_style(|theme| theme.focused, Style::new().fg(Color::Blue))
 }
 
-const fn flag_style() -> Style {
-    Style::new().fg(Color::Yellow)
+fn prompt_style() -> Style {
+    theme_style(|theme| theme.focused, Style::new().fg(Color::Magenta))
 }
 
-const fn string_style() -> Style {
-    Style::new().fg(Color::Green)
+fn command_style() -> Style {
+    syntax_style(|syntax| syntax.function.to_tui(), Color::Cyan)
 }
 
-const fn operator_style() -> Style {
-    Style::new().fg(Color::BrightBlack)
+fn flag_style() -> Style {
+    syntax_style(|syntax| syntax.keyword.to_tui(), Color::Yellow)
 }
 
-const fn argument_style() -> Style {
-    Style::new()
+fn string_style() -> Style {
+    syntax_style(|syntax| syntax.string.to_tui(), Color::Green)
+}
+
+fn operator_style() -> Style {
+    syntax_style(|syntax| syntax.operator.to_tui(), Color::BrightBlack)
+}
+
+fn argument_style() -> Style {
+    theme_style(|theme| theme.text, Style::new())
 }
 
 fn payload_exit_code(payload: &serde_json::Value) -> Option<i32> {
@@ -2634,6 +2671,90 @@ mod tests {
         .expect("repeated resize input");
         assert_eq!(repeated.invocation_id, "shell-call");
         assert_eq!(repeated.input_id, "shell-call-input-1");
+    }
+
+    #[test]
+    fn adapter_uses_host_theme_for_shell_command_roles() {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffTheme, PluginTuiSourceTheme, PluginTuiSyntaxColor, PluginTuiSyntaxTheme,
+            PluginTuiTheme,
+        };
+
+        let style = Style::new();
+        let theme = PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            canvas: style,
+            text: style.fg(Color::White),
+            muted: style.fg(Color::Yellow),
+            border: style,
+            focused: style.fg(Color::Magenta),
+            selection: style,
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: PluginTuiSyntaxColor::from_tui(Color::White),
+                comment: PluginTuiSyntaxColor::from_tui(Color::Yellow),
+                keyword: PluginTuiSyntaxColor::from_tui(Color::Blue),
+                function: PluginTuiSyntaxColor::from_tui(Color::Red),
+                variable: PluginTuiSyntaxColor::from_tui(Color::White),
+                string: PluginTuiSyntaxColor::from_tui(Color::Green),
+                number: PluginTuiSyntaxColor::from_tui(Color::White),
+                type_name: PluginTuiSyntaxColor::from_tui(Color::White),
+                operator: PluginTuiSyntaxColor::from_tui(Color::Cyan),
+                punctuation: PluginTuiSyntaxColor::from_tui(Color::White),
+            },
+        };
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            64,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        )
+        .with_theme(theme);
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &ShellRunTuiVisualAdapter::default(),
+            "bcode.tool.request.shell.run",
+            &serde_json::json!({"command": "echo --flag 'hello' && pwd", "cwd": "/tmp"}),
+            &context,
+        );
+        let spans = rows.iter().flat_map(|line| &line.spans).collect::<Vec<_>>();
+
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content.contains("echo") && span.style.fg == Some(Color::Red))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content.contains("--flag") && span.style.fg == Some(Color::Blue))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content.contains("&&") && span.style.fg == Some(Color::Cyan))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content.contains("❯") && span.style.fg == Some(Color::Magenta))
+        );
     }
 
     #[test]

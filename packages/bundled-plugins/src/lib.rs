@@ -493,29 +493,67 @@ fn workflow_plugin() -> bcode_plugin::StaticBundledPlugin {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn bundled_tui_extension_catalog_constructs_exact_registered_adapters() {
+    fn bundled_tui_extensions_cover_every_manifest_declared_visual_schema() {
+        let static_plugins = super::static_bundled_plugins();
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &static_plugins,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("static plugin manifests parse");
         let extensions = super::static_tui_extensions();
-        for (plugin_id, adapter_id, schema) in [
-            (
-                "bcode.filesystem",
-                "filesystem-request-card",
-                "bcode.filesystem.request",
-            ),
-            (
-                "bcode.shell",
-                "shell-run-request-card",
-                "bcode.tool.request.shell.run",
-            ),
-        ] {
-            if let Some(extension) = extensions
+
+        for (manifest, _) in selected
+            .iter()
+            .filter(|(manifest, _)| !manifest.visual_adapters.is_empty())
+        {
+            let extension = extensions
                 .iter()
-                .find(|extension| extension.plugin_id() == plugin_id)
-            {
+                .find(|extension| extension.plugin_id() == manifest.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} declares visual adapters without a bundled TUI extension",
+                        manifest.id
+                    )
+                });
+            let registry = extension.registry();
+            assert_eq!(
+                registry.visual_adapter_count(),
+                manifest.visual_adapters.len(),
+                "{} must register exactly its manifest-declared visual adapter IDs",
+                manifest.id
+            );
+
+            for declaration in &manifest.visual_adapters {
                 assert!(
-                    extension
-                        .registry()
-                        .supports_visual_adapter(adapter_id, schema),
-                    "{plugin_id}/{adapter_id}"
+                    declaration.surfaces.iter().any(|surface| surface == "tui"),
+                    "{}/{} does not declare TUI support",
+                    manifest.id,
+                    declaration.id
+                );
+                assert!(
+                    registry.supports_visual_adapter(&declaration.id, &declaration.schema),
+                    "{}/{} does not support manifest schema {}",
+                    manifest.id,
+                    declaration.id,
+                    declaration.schema
+                );
+                assert!(
+                    registry
+                        .visual_rows(
+                            &declaration.id,
+                            &declaration.schema,
+                            &serde_json::Value::Object(serde_json::Map::new()),
+                            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                                80,
+                                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                                None,
+                            ),
+                        )
+                        .is_some(),
+                    "{}/{} cannot route its manifest schema {} through native rendering",
+                    manifest.id,
+                    declaration.id,
+                    declaration.schema
                 );
             }
         }

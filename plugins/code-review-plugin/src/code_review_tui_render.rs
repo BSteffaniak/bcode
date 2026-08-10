@@ -9,10 +9,12 @@ use bcode_code_review_models::{
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
+use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::{display_width, truncate_to_display_width};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 
 use crate::code_review_tui::{
     ReviewApp, ReviewFile, ReviewLineKind, ReviewMouseAction, ReviewPromptKind, ReviewPublishState,
@@ -508,6 +510,9 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Revi
     } else {
         "help"
     };
+    if render_default_footer_hints(app, area, frame, theme) {
+        return;
+    }
     let text = app.status_message.as_ref().map_or_else(
         || {
             if app.comment_editor.is_some() {
@@ -570,6 +575,60 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Revi
         )]),
         theme.muted,
     );
+}
+
+fn render_default_footer_hints(
+    app: &ReviewApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: ReviewTheme,
+) -> bool {
+    if app.status_message.is_some()
+        || app.comment_editor.is_some()
+        || app.range_selection_label().is_some()
+        || matches!(
+            app.sidebar_mode,
+            ReviewSidebarMode::Threads | ReviewSidebarMode::General
+        )
+        || app.selected_suggestion_preview().is_some()
+        || app.selected_thread_preview().is_some()
+        || app.selected_draft_preview().is_some()
+        || app.ux_mode == crate::code_review_tui::ReviewUxMode::Build
+    {
+        return false;
+    }
+    let hints = [
+        KeyHint::new("h/j/k/l", "navigate"),
+        KeyHint::new("c", "comment"),
+        KeyHint::new("a", "ask"),
+        KeyHint::new(
+            "b",
+            if app.sidebar_visible {
+                "hide sidebar"
+            } else {
+                "sidebar"
+            },
+        ),
+        KeyHint::new(
+            "?",
+            if app.help_visible {
+                "hide help"
+            } else {
+                "help"
+            },
+        ),
+        KeyHint::new("q", "exit"),
+    ];
+    KeyHintBar::new(&hints)
+        .styles(KeyHintBarStyles {
+            key: theme.focused,
+            label: theme.muted,
+            separator: theme.muted,
+            disabled: theme.muted,
+            background: theme.canvas,
+        })
+        .render(area, frame);
+    true
 }
 
 fn build_footer_hint(app: &ReviewApp) -> String {
@@ -2679,6 +2738,71 @@ const DIFF_HELP_LINES: &[&str] = &[
     " ctrl+d              exit review",
 ];
 
+fn legacy_review_modal(area: Rect, width: u16, height: u16, frame: &mut Frame<'_>) -> Rect {
+    legacy_review_modal_with_background(
+        area,
+        width,
+        height,
+        frame,
+        Style::new().fg(Color::White).bg(Color::BrightBlack),
+    )
+}
+
+fn legacy_review_modal_with_background(
+    area: Rect,
+    width: u16,
+    height: u16,
+    frame: &mut Frame<'_>,
+    background: Style,
+) -> Rect {
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(
+            bmux_tui::geometry::Size::new(width.min(area.width), height.min(area.height)),
+            bmux_tui::geometry::Insets::all(0),
+        ),
+        ModalTheme::new(
+            background,
+            background,
+            background,
+            background,
+            Style::new().fg(Color::BrightBlack).bg(Color::BrightBlack),
+            background,
+        ),
+    )
+    .placement(ModalPlacement::Centered)
+    .padding(bmux_tui::geometry::Insets::all(0));
+    modal.render(area, frame);
+    modal.panel_area(area)
+}
+
+fn legacy_review_modal_at(
+    area: Rect,
+    popup: Rect,
+    frame: &mut Frame<'_>,
+    background: Style,
+) -> Rect {
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(
+            bmux_tui::geometry::Size::new(popup.width, popup.height),
+            bmux_tui::geometry::Insets::all(0),
+        ),
+        ModalTheme::new(
+            background,
+            background,
+            background,
+            background,
+            Style::new()
+                .fg(Color::BrightBlack)
+                .bg(background.bg.unwrap_or(Color::Black)),
+            background,
+        ),
+    )
+    .placement(ModalPlacement::Anchored(Point::new(popup.x, popup.y)))
+    .padding(bmux_tui::geometry::Insets::all(0));
+    modal.render(area, frame);
+    modal.panel_area(area)
+}
+
 fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let Some(state) = &app.import_state else {
         return;
@@ -2688,18 +2812,7 @@ fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if width < 30 || height < 8 {
         return;
     }
-    let popup = Rect::new(
-        area.x.saturating_add(area.width.saturating_sub(width) / 2),
-        area.y
-            .saturating_add(area.height.saturating_sub(height) / 2),
-        width,
-        height,
-    );
-    frame.fill(
-        popup,
-        " ",
-        Style::new().fg(Color::White).bg(Color::BrightBlack),
-    );
+    let popup = legacy_review_modal(area, width, height, frame);
     let header = Rect::new(
         popup.x.saturating_add(1),
         popup.y,
@@ -2771,16 +2884,7 @@ fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if width < 30 || height < 8 {
         return;
     }
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area
-        .y
-        .saturating_add(area.height.saturating_sub(height) / 2);
-    let popup = Rect::new(x, y, width, height);
-    frame.fill(
-        popup,
-        " ",
-        Style::new().fg(Color::White).bg(Color::BrightBlack),
-    );
+    let popup = legacy_review_modal(area, width, height, frame);
     match state {
         ReviewPublishState::Checklist => render_publish_checklist(app, popup, frame),
         ReviewPublishState::Picker => render_publisher_picker(app, popup, frame),
@@ -3072,8 +3176,12 @@ fn render_comment_editor(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         },
     );
     let y = comment_editor_y(app, area, height);
-    let popup = Rect::new(x, y, width, height);
-    frame.fill(popup, " ", Style::new().fg(Color::White).bg(Color::Black));
+    let popup = legacy_review_modal_at(
+        area,
+        Rect::new(x, y, width, height),
+        frame,
+        Style::new().fg(Color::White).bg(Color::Black),
+    );
     render_comment_editor_header(editor, popup, frame);
     let text_height = usize::from(height.saturating_sub(4));
     render_comment_editor_body(editor, popup, text_height, frame);
@@ -3482,12 +3590,13 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if width < 20 || height < 3 {
         return;
     }
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area
-        .y
-        .saturating_add(area.height.saturating_sub(height) / 2);
-    let popup = Rect::new(x, y, width, height);
-    frame.fill(popup, " ", Style::new().fg(Color::White).bg(Color::Black));
+    let popup = legacy_review_modal_with_background(
+        area,
+        width,
+        height,
+        frame,
+        Style::new().fg(Color::White).bg(Color::Black),
+    );
     let title = prompt_title(&prompt.kind);
     frame.write_line(
         Rect::new(popup.x, popup.y, popup.width, 1),

@@ -5392,13 +5392,90 @@ const fn table_action(outcome: TableOutcome) -> bool {
 
 #[cfg(test)]
 mod interaction_tests {
+    use bcode_plugin_sdk::tui::{
+        PLUGIN_TUI_COMPONENT_THEME_VERSION, PluginTuiDiffTheme, PluginTuiSourceTheme,
+        PluginTuiSurface, PluginTuiSyntaxColor, PluginTuiSyntaxTheme, PluginTuiTheme,
+    };
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
     use bmux_tui::event::Event;
     use bmux_tui::frame::Frame;
     use bmux_tui::prelude::Rect;
+    use bmux_tui::style::{Color, Style};
 
-    use super::{KeyHint, handle_input_box, input_text, render_status, text_state};
+    use super::{
+        EvalRunPickerSurface, KeyHint, handle_input_box, input_text, render_status, text_state,
+    };
+
+    fn plugin_theme() -> PluginTuiTheme {
+        let style = Style::new();
+        let syntax = PluginTuiSyntaxColor::from_tui(Color::Default);
+        PluginTuiTheme {
+            component_theme_version: PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            canvas: style.bg(Color::Blue),
+            text: style.fg(Color::White),
+            muted: style.fg(Color::Yellow),
+            border: style.fg(Color::Cyan),
+            focused: style.fg(Color::Magenta),
+            selection: style.fg(Color::Black).bg(Color::Green),
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style.fg(Color::Green),
+                removed: style.fg(Color::Red),
+                hunk: style.fg(Color::Yellow),
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: syntax,
+                comment: syntax,
+                keyword: syntax,
+                function: syntax,
+                variable: syntax,
+                string: syntax,
+                number: syntax,
+                type_name: syntax,
+                operator: syntax,
+                punctuation: syntax,
+            },
+        }
+    }
+
+    #[test]
+    fn picker_uses_host_theme_and_bounds_interaction_areas() {
+        let mut surface =
+            EvalRunPickerSurface::load(std::path::PathBuf::from("/definitely/missing/bcode-evals"));
+        let area = Rect::new(0, 0, 36, 12);
+        let mut buffer = Buffer::empty(area);
+        let theme = plugin_theme();
+        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(theme));
+
+        assert!(
+            buffer
+                .cells()
+                .iter()
+                .any(|cell| cell.style.bg == theme.canvas.bg)
+        );
+        for interaction_area in [
+            surface.table_area,
+            surface.action_area,
+            surface.surface_area,
+        ] {
+            assert!(interaction_area.right() <= area.right());
+            assert!(interaction_area.bottom() <= area.bottom());
+        }
+    }
 
     #[test]
     fn eval_status_uses_bounded_shared_key_hints() {
