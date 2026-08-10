@@ -5026,7 +5026,7 @@ pub fn plan_workflow_package(
         lowering.document.definition = compiled.definition.clone();
         let closure = workflow_package_member_closure(member, &members)?;
         let source_digest = lowering.document.source_digest_sha256()?;
-        let executable_digest = digest_serializable(&compiled.definition)?;
+        let executable_digest = lowering.document.executable_source_digest_sha256()?;
         identities.insert(member.member_id.clone(), identity.clone());
         resolved_catalog
             .workflow_definitions
