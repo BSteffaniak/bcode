@@ -12,9 +12,11 @@ use bcode_plugin_sdk::prelude::*;
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
+use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
+use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
+use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -226,6 +228,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for ModelCommandSurfaceFacto
                 id: surface_kind,
                 title,
                 lines: model_surface_lines(surface_kind, &request.options),
+                text_view: TextViewState::new(),
             })
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
         })
@@ -236,6 +239,7 @@ struct ModelCommandSurface {
     id: &'static str,
     title: &'static str,
     lines: Vec<String>,
+    text_view: TextViewState,
 }
 
 struct SurfaceTheme {
@@ -243,22 +247,31 @@ struct SurfaceTheme {
     text: Style,
     muted: Style,
     focused: Style,
+    component: bmux_tui_components::theme::ComponentTheme,
 }
 
 impl SurfaceTheme {
     fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
         theme.map_or_else(
-            || Self {
-                canvas: Style::new(),
-                text: Style::new(),
-                muted: Style::new().add_modifier(Modifier::DIM),
-                focused: Style::new().add_modifier(Modifier::BOLD),
+            || {
+                let component = bmux_tui_components::theme::ComponentTheme::default();
+                Self {
+                    canvas: component.canvas,
+                    text: component.text,
+                    muted: component.muted,
+                    focused: component.focused,
+                    component,
+                }
             },
-            |theme| Self {
-                canvas: theme.canvas,
-                text: theme.text,
-                muted: theme.muted,
-                focused: theme.focused,
+            |theme| {
+                let component = theme.component_theme().unwrap_or_default();
+                Self {
+                    canvas: theme.canvas,
+                    text: theme.text,
+                    muted: theme.muted,
+                    focused: theme.focused,
+                    component,
+                }
             },
         )
     }
@@ -273,30 +286,53 @@ impl ModelCommandSurface {
     ) {
         let theme = SurfaceTheme::resolve(theme);
         frame.fill(area, " ", theme.canvas);
-        write_line(
-            frame,
-            area,
-            area.y,
-            Line::from_spans(vec![Span::styled(
+        let pane = Pane::new()
+            .title(Line::from_spans(vec![Span::styled(
                 self.title,
                 theme.focused.add_modifier(Modifier::BOLD),
-            )]),
-        );
-        let mut y = area.y.saturating_add(2);
-        for line in &self.lines {
-            write_line(
-                frame,
-                area,
-                y,
-                Line::from_spans(vec![Span::styled(line.clone(), theme.text)]),
-            );
-            y = y.saturating_add(1);
+            )]))
+            .padding(Insets::new(1, 1, 1, 1))
+            .styles(PaneStyles {
+                background: Some(theme.canvas),
+                border: theme.component.border,
+                focused_border: theme.focused,
+            });
+        let pane_state = PaneState::new(area);
+        pane.render(&pane_state, frame);
+        let content = pane.inner_area(&pane_state);
+        if content.is_empty() {
+            return;
         }
-        write_line(
-            frame,
-            area,
-            area.y.saturating_add(area.height.saturating_sub(1)),
-            Line::from_spans(vec![Span::styled("Enter/Esc/q closes", theme.muted)]),
+        let footer = Rect::new(
+            content.x,
+            content.bottom().saturating_sub(1),
+            content.width,
+            1,
+        );
+        let body = Rect::new(
+            content.x,
+            content.y,
+            content.width,
+            content.height.saturating_sub(1),
+        );
+        let lines = self
+            .lines
+            .iter()
+            .map(|line| Line::from_spans(vec![Span::styled(line.clone(), theme.text)]))
+            .collect::<Vec<_>>();
+        TextView::new(&lines)
+            .policy(TextViewPolicy::bare())
+            .styles(TextViewStyles {
+                text: theme.text,
+                empty: theme.muted,
+                background: theme.canvas,
+            })
+            .empty("No model status available")
+            .render(body, &self.text_view, frame);
+        frame.write_line_with_fallback_style(
+            footer,
+            &Line::from_spans(vec![Span::styled("Enter/Esc/q closes", theme.muted)]),
+            theme.canvas,
         );
     }
 }
@@ -481,19 +517,95 @@ fn model_select_lines() -> Vec<String> {
     lines
 }
 
-fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) {
-    if y >= area.y.saturating_add(area.height) {
-        return;
-    }
-    frame.write_line(Rect::new(area.x, y, area.width, 1), &line.into());
-}
-
 #[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_plugin!(ModelPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_surface_uses_shared_pane_and_text_view_with_host_theme() {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffTheme, PluginTuiSourceTheme, PluginTuiSyntaxColor, PluginTuiSyntaxTheme,
+            PluginTuiTheme,
+        };
+        use bmux_tui::buffer::Buffer;
+        use bmux_tui::style::Color;
+
+        let style = Style::new();
+        let syntax_color = PluginTuiSyntaxColor::from_tui(Color::Default);
+        let theme = PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            canvas: style,
+            text: style.fg(Color::Green),
+            muted: style.fg(Color::BrightBlack),
+            border: style.fg(Color::Blue),
+            focused: style.fg(Color::Magenta),
+            selection: style,
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: syntax_color,
+                comment: syntax_color,
+                keyword: syntax_color,
+                function: syntax_color,
+                variable: syntax_color,
+                string: syntax_color,
+                number: syntax_color,
+                type_name: syntax_color,
+                operator: syntax_color,
+                punctuation: syntax_color,
+            },
+        };
+        let surface = ModelCommandSurface {
+            id: "model.status",
+            title: "Model Status",
+            lines: vec!["Provider: example".to_owned()],
+            text_view: TextViewState::new(),
+        };
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buffer = Buffer::empty(area);
+        surface.render_themed(area, &mut Frame::new(&mut buffer), Some(theme));
+
+        assert_eq!(
+            buffer
+                .get(bmux_tui::geometry::Point::new(0, 0))
+                .expect("top border")
+                .style
+                .fg,
+            Some(Color::Blue)
+        );
+        let rendered = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert!(rendered.contains("Provider: example"));
+        assert!(
+            buffer
+                .cells()
+                .iter()
+                .any(|cell| cell.symbol == "P" && cell.style.fg == Some(Color::Green))
+        );
+    }
 
     #[test]
     fn provider_auth_security_block_is_read_only_and_reports_missing_vault() {

@@ -2,9 +2,9 @@
 
 use bcode_tui_components::compact::truncate_width;
 use bcode_tui_components::tool_card::{
-    push_tool_card_detail, tool_card_header, tool_card_header_rows,
+    ToolCardStyle, push_tool_card_detail, tool_card_header, tool_card_header_rows,
 };
-use bmux_tui::prelude::{Color, Line, Span, Style};
+use bmux_tui::prelude::{Line, Span};
 use serde_json::Value;
 
 /// Web search/fetch TUI visual adapter.
@@ -40,75 +40,92 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for WebSearchTuiVisualAdapter
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
         let width = context.width();
+        let style = tool_card_style(context);
         match kind {
-            "bcode.web-search.search_request" => search_request_rows(payload),
-            "bcode.web-search.fetch_request" => fetch_request_rows(payload),
-            "bcode.web-search.status_request" => simple_request_rows("Web status"),
-            "bcode.web-search.inspect_request" => inspect_request_rows(payload),
-            "bcode.web-search.search_results" => search_result_rows(payload, width),
-            "bcode.web-search.fetch_result" => fetch_result_rows(payload, width),
-            "bcode.web-search.status" => status_rows(payload),
-            "bcode.web-search.inspect_result" => inspect_result_rows(payload),
+            "bcode.web-search.search_request" => search_request_rows(payload, style),
+            "bcode.web-search.fetch_request" => fetch_request_rows(payload, style),
+            "bcode.web-search.status_request" => simple_request_rows("Web status", style),
+            "bcode.web-search.inspect_request" => inspect_request_rows(payload, style),
+            "bcode.web-search.search_results" => search_result_rows(payload, width, style),
+            "bcode.web-search.fetch_result" => fetch_result_rows(payload, width, style),
+            "bcode.web-search.status" => status_rows(payload, style),
+            "bcode.web-search.inspect_result" => inspect_result_rows(payload, style),
             _ => Vec::new(),
         }
     }
 }
 
-fn search_request_rows(payload: &Value) -> Vec<Line> {
+fn search_request_rows(payload: &Value, style: ToolCardStyle) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
-    let mut rows = header("Web search");
-    push_kv(&mut rows, "query", text(arguments, "query"));
-    push_kv(&mut rows, "provider", text(arguments, "provider"));
-    push_kv(&mut rows, "site", text(arguments, "site"));
-    push_kv(&mut rows, "freshness", text(arguments, "freshness"));
-    push_kv(&mut rows, "region", text(arguments, "region"));
-    push_kv(&mut rows, "safe search", text(arguments, "safe_search"));
-    push_kv(&mut rows, "max results", number(arguments, "max_results"));
+    let mut rows = header("Web search", style);
+    push_kv(&mut rows, "query", text(arguments, "query"), style);
+    push_kv(&mut rows, "provider", text(arguments, "provider"), style);
+    push_kv(&mut rows, "site", text(arguments, "site"), style);
+    push_kv(&mut rows, "freshness", text(arguments, "freshness"), style);
+    push_kv(&mut rows, "region", text(arguments, "region"), style);
+    push_kv(
+        &mut rows,
+        "safe search",
+        text(arguments, "safe_search"),
+        style,
+    );
+    push_kv(
+        &mut rows,
+        "max results",
+        number(arguments, "max_results"),
+        style,
+    );
     push_kv(
         &mut rows,
         "provider options",
         compact_json(arguments, "provider_options"),
+        style,
     );
     rows
 }
 
-fn fetch_request_rows(payload: &Value) -> Vec<Line> {
+fn fetch_request_rows(payload: &Value, style: ToolCardStyle) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
-    let mut rows = header("Web fetch");
-    push_kv(&mut rows, "url", text(arguments, "url"));
-    push_kv(&mut rows, "rendered", bool_text(arguments, "render"));
-    push_kv(&mut rows, "provider", text(arguments, "provider"));
-    push_kv(&mut rows, "max bytes", number(arguments, "max_bytes"));
-    push_kv(&mut rows, "prompt", text(arguments, "prompt"));
+    let mut rows = header("Web fetch", style);
+    push_kv(&mut rows, "url", text(arguments, "url"), style);
+    push_kv(&mut rows, "rendered", bool_text(arguments, "render"), style);
+    push_kv(&mut rows, "provider", text(arguments, "provider"), style);
+    push_kv(
+        &mut rows,
+        "max bytes",
+        number(arguments, "max_bytes"),
+        style,
+    );
+    push_kv(&mut rows, "prompt", text(arguments, "prompt"), style);
     rows
 }
 
-fn simple_request_rows(title: &str) -> Vec<Line> {
-    header(title)
+fn simple_request_rows(title: &str, style: ToolCardStyle) -> Vec<Line> {
+    header(title, style)
 }
 
-fn inspect_request_rows(payload: &Value) -> Vec<Line> {
+fn inspect_request_rows(payload: &Value, style: ToolCardStyle) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
-    let mut rows = header("Inspect URL");
-    push_kv(&mut rows, "url", text(arguments, "url"));
+    let mut rows = header("Inspect URL", style);
+    push_kv(&mut rows, "url", text(arguments, "url"), style);
     rows
 }
 
-fn search_result_rows(payload: &Value, width: u16) -> Vec<Line> {
+fn search_result_rows(payload: &Value, width: u16, style: ToolCardStyle) -> Vec<Line> {
     let result_count = payload
         .get("results")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
     let metadata = std::iter::once(
-        text(payload, "query").map(|value| Span::styled(format!("“{value}”"), value_style())),
+        text(payload, "query").map(|value| Span::styled(format!("“{value}”"), style.value)),
     )
     .flatten();
     let mut rows = tool_card_header_rows(
-        Span::styled("◆ ", accent()),
-        Span::styled(format!("Search results ({result_count})"), title_style()),
+        Span::styled("◆ ", style.accent),
+        Span::styled(format!("Search results ({result_count})"), style.title),
         metadata,
         width,
-        muted(),
+        style.muted,
     );
     rows.push(Line::raw(""));
     if let Some(results) = payload.get("results").and_then(Value::as_array) {
@@ -121,25 +138,25 @@ fn search_result_rows(payload: &Value, width: u16) -> Vec<Line> {
                 .next()
                 .unwrap_or_default();
             rows.push(Line::from_spans(vec![
-                Span::styled(format!("  {}  ", index + 1), accent()),
+                Span::styled(format!("  {}  ", index + 1), style.accent),
                 Span::styled(
                     text(result, "title").unwrap_or("Untitled").to_owned(),
-                    title_style(),
+                    style.title,
                 ),
-                Span::styled(format!(" · {host}"), muted()),
+                Span::styled(format!(" · {host}"), style.muted),
             ]));
             if !url.is_empty() {
                 rows.push(Line::from_spans(vec![
-                    Span::styled("     ↳ ", muted()),
+                    Span::styled("     ↳ ", style.muted),
                     Span::styled(
                         truncate_width(url, usize::from(width.saturating_sub(8))),
-                        url_style(),
+                        style.link,
                     ),
                 ]));
             }
             if let Some(snippet) = text(result, "snippet") {
                 rows.push(Line::from_spans(vec![
-                    Span::styled("     │ ", muted()),
+                    Span::styled("     │ ", style.muted),
                     Span::raw(truncate_width(
                         snippet,
                         usize::from(width.saturating_sub(8)),
@@ -150,7 +167,7 @@ fn search_result_rows(payload: &Value, width: u16) -> Vec<Line> {
         if results.len() > 10 {
             rows.push(Line::from_spans(vec![Span::styled(
                 format!("  … {} more results", results.len() - 10),
-                muted(),
+                style.muted,
             )]));
         }
     }
@@ -159,89 +176,111 @@ fn search_result_rows(payload: &Value, width: u16) -> Vec<Line> {
         || text(payload, "message").is_some()
     {
         rows.push(Line::raw(""));
-        push_kv(&mut rows, "provider", text(payload, "provider"));
+        push_kv(&mut rows, "provider", text(payload, "provider"), style);
         if payload.get("partial").and_then(Value::as_bool) == Some(true) {
-            push_kv(&mut rows, "partial", Some("yes"));
+            push_kv(&mut rows, "partial", Some("yes"), style);
         }
-        push_kv(&mut rows, "note", text(payload, "message"));
+        push_kv(&mut rows, "note", text(payload, "message"), style);
     }
     rows
 }
 
-fn fetch_result_rows(payload: &Value, width: u16) -> Vec<Line> {
-    let mut rows = header("Fetched page");
-    push_kv(&mut rows, "title", text(payload, "title"));
+fn fetch_result_rows(payload: &Value, width: u16, style: ToolCardStyle) -> Vec<Line> {
+    let mut rows = header("Fetched page", style);
+    push_kv(&mut rows, "title", text(payload, "title"), style);
     push_kv(
         &mut rows,
         "url",
         text(payload, "final_url").or_else(|| text(payload, "url")),
+        style,
     );
-    push_kv(&mut rows, "status", number(payload, "status"));
-    push_kv(&mut rows, "type", text(payload, "content_type"));
-    push_kv(&mut rows, "format", text(payload, "content_format"));
-    push_kv(&mut rows, "rendered", bool_text(payload, "rendered"));
-    push_kv(&mut rows, "truncated", bool_text(payload, "truncated"));
+    push_kv(&mut rows, "status", number(payload, "status"), style);
+    push_kv(&mut rows, "type", text(payload, "content_type"), style);
+    push_kv(&mut rows, "format", text(payload, "content_format"), style);
+    push_kv(&mut rows, "rendered", bool_text(payload, "rendered"), style);
+    push_kv(
+        &mut rows,
+        "truncated",
+        bool_text(payload, "truncated"),
+        style,
+    );
     rows.push(Line::raw(""));
     if let Some(text) = text(payload, "markdown").or_else(|| text(payload, "text")) {
-        rows.extend(preview_rows(text, width));
+        rows.extend(preview_rows(text, width, style));
     }
     rows
 }
 
-fn status_rows(payload: &Value) -> Vec<Line> {
-    let mut rows = header("Web capabilities");
+fn status_rows(payload: &Value, style: ToolCardStyle) -> Vec<Line> {
+    let mut rows = header("Web capabilities", style);
     if let Some(search) = payload.get("search") {
         rows.push(Line::from_spans(vec![Span::styled(
             "  Search",
-            title_style(),
+            style.title,
         )]));
-        push_kv(&mut rows, "available", bool_text(search, "available"));
-        push_kv(&mut rows, "provider", text(search, "provider"));
-        push_kv(&mut rows, "quality", text(search, "quality"));
+        push_kv(
+            &mut rows,
+            "available",
+            bool_text(search, "available"),
+            style,
+        );
+        push_kv(&mut rows, "provider", text(search, "provider"), style);
+        push_kv(&mut rows, "quality", text(search, "quality"), style);
         push_kv(
             &mut rows,
             "configured",
             string_array(search, "configured_providers"),
+            style,
         );
         push_kv(
             &mut rows,
             "recommended",
             string_array(search, "recommended"),
+            style,
         );
     }
     if let Some(fetch) = payload.get("fetch") {
         rows.push(Line::raw(""));
-        rows.push(Line::from_spans(vec![Span::styled(
-            "  Fetch",
-            title_style(),
-        )]));
-        push_kv(&mut rows, "available", bool_text(fetch, "available"));
-        push_kv(&mut rows, "fallbacks", string_array(fetch, "fallbacks"));
+        rows.push(Line::from_spans(vec![Span::styled("  Fetch", style.title)]));
+        push_kv(&mut rows, "available", bool_text(fetch, "available"), style);
+        push_kv(
+            &mut rows,
+            "fallbacks",
+            string_array(fetch, "fallbacks"),
+            style,
+        );
         push_kv(
             &mut rows,
             "rendered fetch",
             bool_text(fetch, "rendered_fetch"),
+            style,
         );
-        push_kv(&mut rows, "max bytes", number(fetch, "max_bytes"));
+        push_kv(&mut rows, "max bytes", number(fetch, "max_bytes"), style);
     }
     rows
 }
 
-fn inspect_result_rows(payload: &Value) -> Vec<Line> {
-    let mut rows = header("URL inspection");
-    push_kv(&mut rows, "url", text(payload, "url"));
-    push_kv(&mut rows, "kind", text(payload, "kind"));
+fn inspect_result_rows(payload: &Value, style: ToolCardStyle) -> Vec<Line> {
+    let mut rows = header("URL inspection", style);
+    push_kv(&mut rows, "url", text(payload, "url"), style);
+    push_kv(&mut rows, "kind", text(payload, "kind"), style);
     push_kv(
         &mut rows,
         "recommended tool",
         text(payload, "recommended_tool"),
+        style,
     );
-    push_kv(&mut rows, "action", text(payload, "recommended_action"));
+    push_kv(
+        &mut rows,
+        "action",
+        text(payload, "recommended_action"),
+        style,
+    );
     if let Some(notes) = payload.get("notes").and_then(Value::as_array) {
         rows.push(Line::raw(""));
         for note in notes.iter().filter_map(Value::as_str) {
             rows.push(Line::from_spans(vec![
-                Span::styled("  • ", accent()),
+                Span::styled("  • ", style.accent),
                 Span::raw(note.to_owned()),
             ]));
         }
@@ -249,37 +288,37 @@ fn inspect_result_rows(payload: &Value) -> Vec<Line> {
     rows
 }
 
-fn preview_rows(text: &str, width: u16) -> Vec<Line> {
+fn preview_rows(text: &str, width: u16, style: ToolCardStyle) -> Vec<Line> {
     let max_width = usize::from(width.saturating_sub(4)).max(20);
     let mut rows = Vec::new();
     for line in text.lines().take(24) {
         rows.push(Line::from_spans(vec![
-            Span::styled("  │ ", muted()),
+            Span::styled("  │ ", style.muted),
             Span::raw(truncate(line, max_width)),
         ]));
     }
     if text.lines().count() > 24 {
         rows.push(Line::from_spans(vec![Span::styled(
             "  … preview truncated",
-            muted(),
+            style.muted,
         )]));
     }
     rows
 }
 
-fn header(title: &str) -> Vec<Line> {
+fn header(title: &str, style: ToolCardStyle) -> Vec<Line> {
     vec![tool_card_header(
-        Span::styled("◆ ", accent()),
-        Span::styled(title.to_owned(), title_style()),
+        Span::styled("◆ ", style.accent),
+        Span::styled(title.to_owned(), style.title),
     )]
 }
 
-fn push_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>)
+fn push_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>, style: ToolCardStyle)
 where
     T: Into<String>,
 {
     if let Some(value) = value.map(Into::into) {
-        push_tool_card_detail(rows, key, Some(&value), label(), value_style());
+        push_tool_card_detail(rows, key, Some(&value), style.muted, style.value);
     }
 }
 
@@ -330,28 +369,8 @@ fn truncate(value: &str, max_chars: usize) -> String {
     output
 }
 
-const fn accent() -> Style {
-    Style::new().fg(Color::Cyan)
-}
-
-const fn title_style() -> Style {
-    Style::new().fg(Color::White)
-}
-
-const fn label() -> Style {
-    Style::new().fg(Color::BrightBlack)
-}
-
-const fn value_style() -> Style {
-    Style::new().fg(Color::White)
-}
-
-const fn url_style() -> Style {
-    Style::new().fg(Color::Blue)
-}
-
-const fn muted() -> Style {
-    Style::new().fg(Color::BrightBlack)
+fn tool_card_style(context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext) -> ToolCardStyle {
+    ToolCardStyle::from_component_theme(context.theme().and_then(|theme| theme.component_theme()))
 }
 
 #[cfg(test)]

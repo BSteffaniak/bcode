@@ -17,16 +17,26 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
-use bcode_tui_components::tool_card::{push_tool_card_detail, tool_card_header};
+use bcode_tui_components::tool_card::{ToolCardStyle, push_tool_card_detail, tool_card_header};
 use bcode_worktree_models::{
     WorktreeCreateRequest, WorktreeInfo, WorktreeListRequest, WorktreeRemoveRequest,
 };
 use bmux_keyboard::KeyCode;
+use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::style::{Color, Modifier, Style};
+use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::selectable_list::{
+    SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
+    SelectableListStyles,
+};
+use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input_box::{
+    TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy, TextInputBoxStyles,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
@@ -643,11 +653,16 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for WorktreeTuiVisualAdapter 
         payload: &serde_json::Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
+        let style = worktree_tool_card_style(context);
         match kind {
-            WORKTREE_REQUEST_SCHEMA => worktree_request_rows(payload, context),
-            WORKTREE_LIST_SCHEMA => worktree_list_rows(payload, context),
-            WORKTREE_CREATE_SCHEMA => worktree_result_rows("Worktree created", payload, context),
-            WORKTREE_REMOVE_SCHEMA => worktree_result_rows("Worktree removed", payload, context),
+            WORKTREE_REQUEST_SCHEMA => worktree_request_rows(payload, context, style),
+            WORKTREE_LIST_SCHEMA => worktree_list_rows(payload, context, style),
+            WORKTREE_CREATE_SCHEMA => {
+                worktree_result_rows("Worktree created", payload, context, style)
+            }
+            WORKTREE_REMOVE_SCHEMA => {
+                worktree_result_rows("Worktree removed", payload, context, style)
+            }
             _ => Vec::new(),
         }
     }
@@ -656,9 +671,10 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for WorktreeTuiVisualAdapter 
 fn worktree_request_rows(
     payload: &serde_json::Value,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    style: ToolCardStyle,
 ) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
-    let mut rows = worktree_header("Worktree request");
+    let mut rows = worktree_header("Worktree request", style);
     for key in [
         "operation",
         "cwd",
@@ -679,6 +695,7 @@ fn worktree_request_rows(
             } else {
                 visual_value(arguments, key)
             },
+            style,
         );
     }
     rows
@@ -687,33 +704,31 @@ fn worktree_request_rows(
 fn worktree_list_rows(
     payload: &serde_json::Value,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    style: ToolCardStyle,
 ) -> Vec<Line> {
     let values = payload
         .get("worktrees")
         .or_else(|| payload.get("entries"))
         .and_then(serde_json::Value::as_array);
     let count = values.map_or(0, Vec::len);
-    let mut rows = worktree_header(&format!("Worktrees ({count})"));
+    let mut rows = worktree_header(&format!("Worktrees ({count})"), style);
     if let Some(values) = values {
         for value in values.iter().take(20) {
             let path = visual_text(value, "path").unwrap_or("<path>");
             let branch = visual_text(value, "branch").or_else(|| visual_text(value, "name"));
             rows.push(Line::from_spans(vec![
-                Span::styled("  ◆ ", Style::new().fg(Color::Cyan)),
-                Span::styled(
-                    context.display_path(path).to_string(),
-                    Style::new().fg(Color::White),
-                ),
+                Span::styled("  ◆ ", style.accent),
+                Span::styled(context.display_path(path).to_string(), style.value),
                 Span::styled(
                     branch.map_or_else(String::new, |branch| format!("  {branch}")),
-                    Style::new().fg(Color::BrightBlack),
+                    style.muted,
                 ),
             ]));
         }
         if values.len() > 20 {
             rows.push(Line::from_spans(vec![Span::styled(
                 format!("  … {} more worktrees", values.len() - 20),
-                Style::new().fg(Color::BrightBlack),
+                style.muted,
             )]));
         }
     }
@@ -724,8 +739,9 @@ fn worktree_result_rows(
     title: &str,
     payload: &serde_json::Value,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    style: ToolCardStyle,
 ) -> Vec<Line> {
-    let mut rows = worktree_header(title);
+    let mut rows = worktree_header(title, style);
     for key in ["path", "branch", "name", "session_id", "removed", "force"] {
         push_visual_kv(
             &mut rows,
@@ -735,30 +751,25 @@ fn worktree_result_rows(
             } else {
                 visual_value(payload, key)
             },
+            style,
         );
     }
     rows
 }
 
-fn worktree_header(title: &str) -> Vec<Line> {
+fn worktree_header(title: &str, style: ToolCardStyle) -> Vec<Line> {
     vec![tool_card_header(
-        Span::styled("◆ ", Style::new().fg(Color::Cyan)),
-        Span::styled(title.to_string(), Style::new().fg(Color::White)),
+        Span::styled("◆ ", style.accent),
+        Span::styled(title.to_string(), style.title),
     )]
 }
 
-fn push_visual_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>)
+fn push_visual_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>, style: ToolCardStyle)
 where
     T: Into<String>,
 {
     if let Some(value) = value.map(Into::into) {
-        push_tool_card_detail(
-            rows,
-            key,
-            Some(&value),
-            Style::new().fg(Color::BrightBlack),
-            Style::new().fg(Color::White),
-        );
+        push_tool_card_detail(rows, key, Some(&value), style.muted, style.value);
     }
 }
 
@@ -778,6 +789,12 @@ fn visual_value(payload: &serde_json::Value, key: &str) -> Option<String> {
 
 fn visual_text<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn worktree_tool_card_style(
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> ToolCardStyle {
+    ToolCardStyle::from_component_theme(context.theme().and_then(|theme| theme.component_theme()))
 }
 
 struct WorktreeCommandSurfaceFactory {
@@ -813,8 +830,11 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for WorktreeCommandSurfaceFa
                 lines,
                 worktrees,
                 selected: 0,
+                list_area: Rect::new(0, 0, 0, 0),
                 status: None,
                 create_name: "new-session".to_string(),
+                create_input: TextInputState::new(TextEditBuffer::from_text("new-session")),
+                input_area: Rect::new(0, 0, 0, 0),
                 session_id,
             })
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
@@ -829,8 +849,11 @@ struct WorktreeCommandSurface {
     lines: Vec<String>,
     worktrees: Vec<WorktreeInfo>,
     selected: usize,
+    list_area: Rect,
     status: Option<String>,
     create_name: String,
+    create_input: TextInputState,
+    input_area: Rect,
     session_id: Option<bcode_session_models::SessionId>,
 }
 
@@ -865,7 +888,7 @@ impl WorktreeSurfaceTheme {
 
 impl WorktreeCommandSurface {
     fn render_themed(
-        &self,
+        &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
         theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
@@ -891,39 +914,64 @@ impl WorktreeCommandSurface {
             )]),
         );
         let mut y = area.y.saturating_add(3);
-        for (index, line) in self.lines.iter().enumerate() {
-            let selected = self.is_selectable() && index > 0 && self.selected == index - 1;
-            let marker = if self.is_selectable() && index > 0 {
-                if selected { "› " } else { "  " }
-            } else {
-                ""
-            };
+        if self.is_selectable() {
             write_line(
                 frame,
                 area,
                 y,
-                Line::from_spans(vec![Span::styled(
-                    format!("{marker}{line}"),
-                    if selected {
-                        theme.selection
-                    } else {
-                        theme.text
-                    },
-                )]),
+                Line::from_spans(vec![Span::styled(&self.lines[0], theme.text)]),
             );
             y = y.saturating_add(1);
+            let items = self
+                .worktrees
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    SelectableListItem::new(index.to_string(), self.lines[index + 1].clone())
+                })
+                .collect::<Vec<_>>();
+            let list = SelectableList::new(&items).styles(worktree_list_styles(&theme));
+            let list_height = u16::try_from(items.len()).unwrap_or(u16::MAX);
+            self.list_area = Rect::new(
+                area.x,
+                y,
+                area.width,
+                list_height.min(area.bottom().saturating_sub(y).saturating_sub(2)),
+            );
+            let state = worktree_list_state(self.selected);
+            list.render_with_fallback_style(self.list_area, &state, frame, theme.canvas);
+        } else {
+            self.list_area = Rect::new(0, 0, 0, 0);
+            for line in &self.lines {
+                write_line(
+                    frame,
+                    area,
+                    y,
+                    Line::from_spans(vec![Span::styled(line, theme.text)]),
+                );
+                y = y.saturating_add(1);
+            }
         }
         if self.id == "command.work-tree.createSession" {
-            write_line(
-                frame,
-                area,
+            let input = TextInputBox::new(single_line_text_policy())
+                .label("Name")
+                .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)))
+                .styles(worktree_input_styles(&theme));
+            self.input_area = Rect::new(
+                area.x,
                 y,
-                Line::from_spans(vec![Span::styled(
-                    format!("Name: {}", self.create_name),
-                    theme.text,
-                )]),
+                area.width,
+                4.min(area.bottom().saturating_sub(y).saturating_sub(2)),
             );
+            input.render(self.input_area, &mut self.create_input, frame);
+            self.create_name = self.create_input.buffer().text().to_owned();
+        } else {
+            self.input_area = Rect::new(0, 0, 0, 0);
         }
+        self.render_footer(area, frame, &theme);
+    }
+
+    fn render_footer(&self, area: Rect, frame: &mut Frame<'_>, theme: &WorktreeSurfaceTheme) {
         if let Some(status) = &self.status {
             write_line(
                 frame,
@@ -932,12 +980,80 @@ impl WorktreeCommandSurface {
                 Line::from_spans(vec![Span::styled(status.clone(), theme.focused)]),
             );
         }
-        write_line(
-            frame,
-            area,
-            area.y.saturating_add(area.height.saturating_sub(1)),
-            Line::from_spans(vec![Span::styled("Enter/Esc/q closes", theme.muted)]),
-        );
+        let hints = if self.is_selectable() {
+            vec![
+                KeyHint::new("↑/↓", "select"),
+                KeyHint::new("Enter", "activate"),
+                KeyHint::new("Esc/q", "close"),
+            ]
+        } else if self.id == "command.work-tree.createSession" {
+            vec![
+                KeyHint::new("Enter", "create"),
+                KeyHint::new("Esc", "close"),
+            ]
+        } else {
+            vec![KeyHint::new("Enter/Esc/q", "close")]
+        };
+        KeyHintBar::new(&hints)
+            .styles(worktree_hint_styles(theme))
+            .render(
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(area.height.saturating_sub(1)),
+                    area.width,
+                    1,
+                ),
+                frame,
+            );
+    }
+}
+
+const fn worktree_list_styles(theme: &WorktreeSurfaceTheme) -> SelectableListStyles {
+    SelectableListStyles {
+        normal: theme.text,
+        focused: theme.selection,
+        selected: theme.selection,
+        hovered: theme.focused,
+        pressed: theme.selection.add_modifier(Modifier::BOLD),
+        disabled: theme.muted,
+    }
+}
+
+const fn worktree_list_state(selected: usize) -> SelectableListState {
+    let mut state = SelectableListState::new(None);
+    state.set_focused(Some(selected));
+    state
+}
+
+const fn single_line_text_policy() -> TextInputPolicy {
+    let mut policy = TextInputPolicy::chat_composer();
+    policy.keyboard.shift_enter = None;
+    policy.viewport.max_rows = Some(1);
+    policy
+}
+
+const fn worktree_input_styles(theme: &WorktreeSurfaceTheme) -> TextInputBoxStyles {
+    TextInputBoxStyles {
+        text: theme.text,
+        focused_text: theme.focused,
+        disabled_text: theme.muted,
+        placeholder: theme.muted,
+        selection: theme.selection,
+        border: theme.muted,
+        focused_border: theme.focused,
+        background: theme.canvas,
+        focused_background: theme.canvas,
+        disabled_background: theme.canvas,
+    }
+}
+
+const fn worktree_hint_styles(theme: &WorktreeSurfaceTheme) -> KeyHintBarStyles {
+    KeyHintBarStyles {
+        key: theme.focused,
+        label: theme.text,
+        separator: theme.muted,
+        disabled: theme.muted,
+        background: theme.canvas,
     }
 }
 
@@ -968,43 +1084,74 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
         event: &Event,
         _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        if let Event::Key(key) = event
+            && matches!(key.key, KeyCode::Escape | KeyCode::Char('q'))
+        {
+            return bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None };
+        }
+        if self.id == "command.work-tree.createSession" {
+            let input = TextInputBox::new(single_line_text_policy())
+                .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)));
+            return match input.handle_event(self.input_area, &mut self.create_input, event) {
+                TextInputBoxOutcome::Submitted => {
+                    self.create_name = self.create_input.buffer().text().to_owned();
+                    self.create_worktree()
+                }
+                TextInputBoxOutcome::Edited | TextInputBoxOutcome::Redraw => {
+                    self.create_name = self.create_input.buffer().text().to_owned();
+                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                }
+                TextInputBoxOutcome::Ignored
+                | TextInputBoxOutcome::EdgeUp
+                | TextInputBoxOutcome::EdgeDown => bcode_plugin_sdk::tui::PluginTuiAction::None,
+            };
+        }
+        if self.is_selectable() {
+            let items = self
+                .worktrees
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    SelectableListItem::new(index.to_string(), self.lines[index + 1].clone())
+                })
+                .collect::<Vec<_>>();
+            let list = SelectableList::new(&items);
+            let list_event = match event {
+                Event::Key(key) if key.key == KeyCode::Char('k') => {
+                    Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Up))
+                }
+                Event::Key(key) if key.key == KeyCode::Char('j') => {
+                    Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Down))
+                }
+                _ => event.clone(),
+            };
+            let mut state = worktree_list_state(self.selected);
+            return match list.handle_event(self.list_area, &mut state, &list_event) {
+                SelectableListOutcome::Focused(index) => {
+                    self.selected = index;
+                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                }
+                SelectableListOutcome::Redraw => {
+                    self.selected = state.focused().unwrap_or(self.selected);
+                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                }
+                SelectableListOutcome::Selected(index) => {
+                    self.selected = index;
+                    self.activate_selected()
+                }
+                SelectableListOutcome::Ignored => bcode_plugin_sdk::tui::PluginTuiAction::None,
+            };
+        }
         match event {
-            Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')) => {
+            Event::Key(key) if key.key == KeyCode::Enter => {
                 bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
             }
-            Event::Key(key) if self.id == "command.work-tree.createSession" => {
-                self.handle_create_key(key.key)
-            }
-            Event::Key(key) if matches!(key.key, KeyCode::Up | KeyCode::Char('k')) => {
-                self.select_previous();
-                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
-            }
-            Event::Key(key) if matches!(key.key, KeyCode::Down | KeyCode::Char('j')) => {
-                self.select_next();
-                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
-            }
-            Event::Key(key) if key.key == KeyCode::Enter => self.activate_selected(),
             _ => bcode_plugin_sdk::tui::PluginTuiAction::None,
         }
     }
 }
 
 impl WorktreeCommandSurface {
-    fn handle_create_key(&mut self, key: KeyCode) -> bcode_plugin_sdk::tui::PluginTuiAction {
-        match key {
-            KeyCode::Enter => self.create_worktree(),
-            KeyCode::Backspace => {
-                self.create_name.pop();
-                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
-            }
-            KeyCode::Char(value) => {
-                self.create_name.push(value);
-                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
-            }
-            _ => bcode_plugin_sdk::tui::PluginTuiAction::None,
-        }
-    }
-
     fn create_worktree(&mut self) -> bcode_plugin_sdk::tui::PluginTuiAction {
         let name = self.create_name.trim().to_string();
         if name.is_empty() {
@@ -1052,20 +1199,6 @@ impl WorktreeCommandSurface {
             self.id,
             "command.work-tree.attach" | "command.work-tree.remove"
         ) && !self.worktrees.is_empty()
-    }
-
-    fn select_previous(&mut self) {
-        if !self.is_selectable() {
-            return;
-        }
-        self.selected = self.selected.saturating_sub(1);
-    }
-
-    fn select_next(&mut self) {
-        if !self.is_selectable() {
-            return;
-        }
-        self.selected = (self.selected + 1).min(self.worktrees.len().saturating_sub(1));
     }
 
     fn activate_selected(&mut self) -> bcode_plugin_sdk::tui::PluginTuiAction {
@@ -1156,6 +1289,55 @@ bcode_plugin_sdk::export_plugin!(WorktreePlugin, include_str!("../bcode-plugin.t
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn worktree_selectable_list_supports_mouse_activation() {
+        let items = [
+            SelectableListItem::new("first", "first"),
+            SelectableListItem::new("second", "second"),
+        ];
+        let list = SelectableList::new(&items);
+        let mut state = worktree_list_state(0);
+        let area = Rect::new(4, 3, 20, 2);
+        let point = bmux_tui::geometry::Point::new(6, 4);
+
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left,),
+                    point,
+                )),
+            ),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                    point,
+                )),
+            ),
+            SelectableListOutcome::Selected(1)
+        );
+    }
+
+    #[test]
+    fn worktree_name_input_handles_unicode_editing() {
+        let mut state = TextInputState::new(TextEditBuffer::from_text("tree"));
+        let input = TextInputBox::new(single_line_text_policy())
+            .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)));
+        let area = Rect::new(0, 0, 24, 3);
+
+        assert_eq!(
+            input.handle_event(area, &mut state, &Event::Paste("-🙂".to_owned())),
+            TextInputBoxOutcome::Edited
+        );
+        assert_eq!(state.buffer().text(), "tree-🙂");
+    }
 
     #[test]
     fn worktree_requests_use_durable_generic_contributions_without_legacy_visuals() {

@@ -17,9 +17,11 @@ use bcode_skill_models::SkillSourceKind;
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
+use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
+use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
+use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use serde::Serialize;
 
 /// skills command plugin.
@@ -166,6 +168,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for SkillsCommandSurfaceFact
                 id: surface_kind,
                 title,
                 lines: skills_surface_lines(surface_kind, &request.options),
+                text_view: TextViewState::new(),
             })
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
         })
@@ -176,6 +179,7 @@ struct SkillsCommandSurface {
     id: &'static str,
     title: &'static str,
     lines: Vec<String>,
+    text_view: TextViewState,
 }
 
 struct SkillsSurfaceTheme {
@@ -183,22 +187,31 @@ struct SkillsSurfaceTheme {
     text: Style,
     muted: Style,
     focused: Style,
+    component: bmux_tui_components::theme::ComponentTheme,
 }
 
 impl SkillsSurfaceTheme {
     fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
         theme.map_or_else(
-            || Self {
-                canvas: Style::new(),
-                text: Style::new(),
-                muted: Style::new().add_modifier(Modifier::DIM),
-                focused: Style::new().add_modifier(Modifier::BOLD),
+            || {
+                let component = bmux_tui_components::theme::ComponentTheme::default();
+                Self {
+                    canvas: component.canvas,
+                    text: component.text,
+                    muted: component.muted,
+                    focused: component.focused,
+                    component,
+                }
             },
-            |theme| Self {
-                canvas: theme.canvas,
-                text: theme.text,
-                muted: theme.muted,
-                focused: theme.focused,
+            |theme| {
+                let component = theme.component_theme().unwrap_or_default();
+                Self {
+                    canvas: theme.canvas,
+                    text: theme.text,
+                    muted: theme.muted,
+                    focused: theme.focused,
+                    component,
+                }
             },
         )
     }
@@ -213,30 +226,53 @@ impl SkillsCommandSurface {
     ) {
         let theme = SkillsSurfaceTheme::resolve(theme);
         frame.fill(area, " ", theme.canvas);
-        write_line(
-            frame,
-            area,
-            area.y,
-            Line::from_spans(vec![Span::styled(
+        let pane = Pane::new()
+            .title(Line::from_spans(vec![Span::styled(
                 self.title,
                 theme.focused.add_modifier(Modifier::BOLD),
-            )]),
-        );
-        let mut y = area.y.saturating_add(2);
-        for line in &self.lines {
-            write_line(
-                frame,
-                area,
-                y,
-                Line::from_spans(vec![Span::styled(line.clone(), theme.text)]),
-            );
-            y = y.saturating_add(1);
+            )]))
+            .padding(Insets::new(1, 1, 1, 1))
+            .styles(PaneStyles {
+                background: Some(theme.canvas),
+                border: theme.component.border,
+                focused_border: theme.focused,
+            });
+        let pane_state = PaneState::new(area);
+        pane.render(&pane_state, frame);
+        let content = pane.inner_area(&pane_state);
+        if content.is_empty() {
+            return;
         }
-        write_line(
-            frame,
-            area,
-            area.y.saturating_add(area.height.saturating_sub(1)),
-            Line::from_spans(vec![Span::styled("Enter/Esc/q closes", theme.muted)]),
+        let footer = Rect::new(
+            content.x,
+            content.bottom().saturating_sub(1),
+            content.width,
+            1,
+        );
+        let body = Rect::new(
+            content.x,
+            content.y,
+            content.width,
+            content.height.saturating_sub(1),
+        );
+        let lines = self
+            .lines
+            .iter()
+            .map(|line| Line::from_spans(vec![Span::styled(line.clone(), theme.text)]))
+            .collect::<Vec<_>>();
+        TextView::new(&lines)
+            .policy(TextViewPolicy::bare())
+            .styles(TextViewStyles {
+                text: theme.text,
+                empty: theme.muted,
+                background: theme.canvas,
+            })
+            .empty("No skills available")
+            .render(body, &self.text_view, frame);
+        frame.write_line_with_fallback_style(
+            footer,
+            &Line::from_spans(vec![Span::styled("Enter/Esc/q closes", theme.muted)]),
+            theme.canvas,
         );
     }
 }
@@ -404,13 +440,6 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
         disabled_ids: config.skills.disabled_skill_ids(),
     };
     SkillRegistry::discover(&roots, options).ok()
-}
-
-fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) {
-    if y >= area.y.saturating_add(area.height) {
-        return;
-    }
-    frame.write_line(Rect::new(area.x, y, area.width, 1), &line.into());
 }
 
 #[cfg(not(feature = "static-bundled"))]

@@ -1,7 +1,7 @@
 //! Native TUI rendering for Git tool visuals.
 
-use bcode_tui_components::tool_card::tool_card_header_rows;
-use bmux_tui::prelude::{Color, Line, Span, Style};
+use bcode_tui_components::tool_card::{ToolCardStyle, tool_card_header_rows};
+use bmux_tui::prelude::{Line, Span};
 use serde_json::Value;
 
 /// Git TUI visual adapter.
@@ -27,9 +27,10 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for GitTuiVisualAdapter {
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
         let width = context.width();
+        let style = tool_card_style(context);
         match kind {
-            "bcode.git.clone_request" => clone_request_rows(payload, width, context),
-            "bcode.git.clone_result" => clone_result_rows(payload, width, context),
+            "bcode.git.clone_request" => clone_request_rows(payload, width, context, style),
+            "bcode.git.clone_result" => clone_result_rows(payload, width, context, style),
             _ => Vec::new(),
         }
     }
@@ -39,24 +40,25 @@ fn clone_request_rows(
     payload: &Value,
     width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    style: ToolCardStyle,
 ) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let metadata = [
-        text(arguments, "url").map(|value| Span::styled(value.to_owned(), value_style())),
+        text(arguments, "url").map(|value| Span::styled(value.to_owned(), style.value)),
         text(arguments, "ref")
             .or_else(|| text(arguments, "branch"))
-            .map(|value| Span::styled(value.to_owned(), value_style())),
+            .map(|value| Span::styled(value.to_owned(), style.value)),
         text(arguments, "destination")
-            .map(|value| Span::styled(format!("→ {}", context.display_path(value)), value_style())),
+            .map(|value| Span::styled(format!("→ {}", context.display_path(value)), style.value)),
     ]
     .into_iter()
     .flatten();
     tool_card_header_rows(
-        Span::styled("◆ ", accent()),
-        Span::styled("Clone repository", title_style()),
+        Span::styled("◆ ", style.accent),
+        Span::styled("Clone repository", style.title),
         metadata,
         width,
-        label(),
+        style.muted,
     )
 }
 
@@ -64,30 +66,31 @@ fn clone_result_rows(
     payload: &Value,
     width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    style: ToolCardStyle,
 ) -> Vec<Line> {
     let existed = payload.get("already_exists").and_then(Value::as_bool) == Some(true);
     let metadata = [
-        repo_name(payload).map(|value| Span::styled(value, value_style())),
+        repo_name(payload).map(|value| Span::styled(value, style.value)),
         text(payload, "path")
-            .map(|value| Span::styled(format!("→ {}", context.display_path(value)), value_style())),
-        text(payload, "git_ref").map(|value| Span::styled(value.to_owned(), value_style())),
-        text(payload, "artifact_scope").map(|value| Span::styled(value.to_owned(), value_style())),
+            .map(|value| Span::styled(format!("→ {}", context.display_path(value)), style.value)),
+        text(payload, "git_ref").map(|value| Span::styled(value.to_owned(), style.value)),
+        text(payload, "artifact_scope").map(|value| Span::styled(value.to_owned(), style.value)),
     ]
     .into_iter()
     .flatten();
     tool_card_header_rows(
-        Span::styled(if existed { "◆ " } else { "✓ " }, accent()),
+        Span::styled(if existed { "◆ " } else { "✓ " }, style.accent),
         Span::styled(
             if existed {
                 "Repository already exists"
             } else {
                 "Repository cloned"
             },
-            title_style(),
+            style.title,
         ),
         metadata,
         width,
-        label(),
+        style.muted,
     )
 }
 
@@ -100,20 +103,8 @@ fn text<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(Value::as_str)
 }
 
-const fn accent() -> Style {
-    Style::new().fg(Color::Cyan)
-}
-
-const fn title_style() -> Style {
-    Style::new().fg(Color::White)
-}
-
-const fn label() -> Style {
-    Style::new().fg(Color::BrightBlack)
-}
-
-const fn value_style() -> Style {
-    Style::new().fg(Color::White)
+fn tool_card_style(context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext) -> ToolCardStyle {
+    ToolCardStyle::from_component_theme(context.theme().and_then(|theme| theme.component_theme()))
 }
 
 #[cfg(test)]

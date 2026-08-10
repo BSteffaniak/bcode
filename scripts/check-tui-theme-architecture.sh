@@ -233,4 +233,26 @@ if ! rg -q 'pub const fn component_theme\(&self\).*Option<bmux_tui_components::t
   fail "plugin component-theme access must remain compatibility-version checked"
 fi
 
+python3 - <<'PY'
+from pathlib import Path
+
+for source_path in [
+    Path("plugins/document-plugin/src/document_tui.rs"),
+    Path("plugins/git-plugin/src/git_tui.rs"),
+    Path("plugins/ocr-plugin/src/ocr_tui.rs"),
+    Path("plugins/question-plugin/src/question_outcome_tui.rs"),
+    Path("plugins/web-search-plugin/src/web_search_tui.rs"),
+    Path("plugins/worktree-plugin/src/lib.rs"),
+    Path("plugins/model-plugin/src/lib.rs"),
+    Path("plugins/skills-plugin/src/lib.rs"),
+    Path("plugins/workflow-plugin/src/tui.rs"),
+]:
+    production = source_path.read_text().split("#[cfg(test)]", 1)[0]
+    if "Style::new().fg(Color::" in production or "Style::default().fg(Color::" in production:
+        raise SystemExit(
+            f"{source_path}: migrated plugin transcript visuals must consume "
+            "renderer-owned component theme roles"
+        )
+PY
+
 echo "TUI theme architecture guard passed"

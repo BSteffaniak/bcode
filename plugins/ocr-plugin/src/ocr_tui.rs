@@ -1,7 +1,7 @@
 //! Native TUI rendering for OCR tool visuals.
 
-use bcode_tui_components::tool_card::{push_tool_card_detail, tool_card_header};
-use bmux_tui::prelude::{Color, Line, Span, Style};
+use bcode_tui_components::tool_card::{ToolCardStyle, push_tool_card_detail, tool_card_header};
+use bmux_tui::prelude::{Line, Span};
 use serde_json::Value;
 
 /// OCR TUI visual adapter.
@@ -30,10 +30,11 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for OcrTuiVisualAdapter {
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
         let width = context.width();
+        let style = tool_card_style(context);
         match kind {
-            "bcode.ocr.request" => request_rows(payload, context),
-            "bcode.ocr.extract_result" => extract_rows(payload, width, context),
-            "bcode.ocr.status" => status_rows(payload),
+            "bcode.ocr.request" => request_rows(payload, context, style),
+            "bcode.ocr.extract_result" => extract_rows(payload, width, context, style),
+            "bcode.ocr.status" => status_rows(payload, style),
             _ => Vec::new(),
         }
     }
@@ -42,17 +43,19 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for OcrTuiVisualAdapter {
 fn request_rows(
     payload: &Value,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    style: ToolCardStyle,
 ) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
-    let mut rows = header("OCR request");
-    push_kv(&mut rows, "operation", value(arguments, "operation"));
+    let mut rows = header("OCR request", style);
+    push_kv(&mut rows, "operation", value(arguments, "operation"), style);
     push_kv(
         &mut rows,
         "path",
         text(arguments, "path").map(|path| context.display_path(path).to_string()),
+        style,
     );
     for key in ["url", "language", "engine", "max_bytes"] {
-        push_kv(&mut rows, key, value(arguments, key));
+        push_kv(&mut rows, key, value(arguments, key), style);
     }
     rows
 }
@@ -61,8 +64,9 @@ fn extract_rows(
     payload: &Value,
     width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    style: ToolCardStyle,
 ) -> Vec<Line> {
-    let mut rows = header("OCR text");
+    let mut rows = header("OCR text", style);
     push_kv(
         &mut rows,
         "source",
@@ -73,33 +77,39 @@ fn extract_rows(
                 source
             }
         }),
+        style,
     );
-    push_kv(&mut rows, "engine", text(payload, "engine"));
-    push_kv(&mut rows, "language", text(payload, "language"));
-    push_kv(&mut rows, "bytes", byte_summary(payload));
-    push_kv(&mut rows, "truncated", value(payload, "truncated"));
+    push_kv(&mut rows, "engine", text(payload, "engine"), style);
+    push_kv(&mut rows, "language", text(payload, "language"), style);
+    push_kv(&mut rows, "bytes", byte_summary(payload), style);
+    push_kv(&mut rows, "truncated", value(payload, "truncated"), style);
     if let Some(text) = text(payload, "text") {
         rows.push(Line::raw(""));
-        rows.extend(preview_rows(text, width));
+        rows.extend(preview_rows(text, width, style));
     }
     rows
 }
 
-fn status_rows(payload: &Value) -> Vec<Line> {
-    let mut rows = header("OCR status");
+fn status_rows(payload: &Value, style: ToolCardStyle) -> Vec<Line> {
+    let mut rows = header("OCR status", style);
     let Some(extract) = payload.get("extract") else {
         return rows;
     };
-    push_kv(&mut rows, "available", value(extract, "available"));
-    push_kv(&mut rows, "default engine", text(extract, "default_engine"));
+    push_kv(&mut rows, "available", value(extract, "available"), style);
+    push_kv(
+        &mut rows,
+        "default engine",
+        text(extract, "default_engine"),
+        style,
+    );
     if let Some(engines) = extract.get("engines").and_then(Value::as_array) {
         rows.push(Line::raw(""));
         for engine in engines {
             rows.push(Line::from_spans(vec![
-                Span::styled("  ◆ ", accent()),
+                Span::styled("  ◆ ", style.accent),
                 Span::styled(
                     text(engine, "name").unwrap_or("engine").to_owned(),
-                    title_style(),
+                    style.title,
                 ),
                 Span::styled(
                     format!(
@@ -107,22 +117,22 @@ fn status_rows(payload: &Value) -> Vec<Line> {
                         value(engine, "available").unwrap_or_else(|| "unknown".to_string()),
                         text(engine, "quality").unwrap_or_default()
                     ),
-                    muted(),
+                    style.muted,
                 ),
             ]));
-            push_kv(&mut rows, "version", text(engine, "version"));
+            push_kv(&mut rows, "version", text(engine, "version"), style);
         }
     }
     rows
 }
 
-fn preview_rows(text: &str, width: u16) -> Vec<Line> {
+fn preview_rows(text: &str, width: u16, style: ToolCardStyle) -> Vec<Line> {
     let max_width = usize::from(width.saturating_sub(4)).max(20);
     text.lines()
         .take(24)
         .map(|line| {
             Line::from_spans(vec![
-                Span::styled("  │ ", muted()),
+                Span::styled("  │ ", style.muted),
                 Span::raw(truncate(line, max_width)),
             ])
         })
@@ -142,19 +152,19 @@ fn byte_summary(payload: &Value) -> Option<String> {
     Some(format!("{text_bytes} of {full_text_bytes}"))
 }
 
-fn header(title: &str) -> Vec<Line> {
+fn header(title: &str, style: ToolCardStyle) -> Vec<Line> {
     vec![tool_card_header(
-        Span::styled("◆ ", accent()),
-        Span::styled(title.to_owned(), title_style()),
+        Span::styled("◆ ", style.accent),
+        Span::styled(title.to_owned(), style.title),
     )]
 }
 
-fn push_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>)
+fn push_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>, style: ToolCardStyle)
 where
     T: Into<String>,
 {
     if let Some(value) = value.map(Into::into) {
-        push_tool_card_detail(rows, key, Some(&value), label(), value_style());
+        push_tool_card_detail(rows, key, Some(&value), style.muted, style.value);
     }
 }
 
@@ -188,22 +198,6 @@ fn truncate(value: &str, max_chars: usize) -> String {
     output
 }
 
-const fn accent() -> Style {
-    Style::new().fg(Color::Cyan)
-}
-
-const fn title_style() -> Style {
-    Style::new().fg(Color::White)
-}
-
-const fn label() -> Style {
-    Style::new().fg(Color::BrightBlack)
-}
-
-const fn value_style() -> Style {
-    Style::new().fg(Color::White)
-}
-
-const fn muted() -> Style {
-    Style::new().fg(Color::BrightBlack)
+fn tool_card_style(context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext) -> ToolCardStyle {
+    ToolCardStyle::from_component_theme(context.theme().and_then(|theme| theme.component_theme()))
 }

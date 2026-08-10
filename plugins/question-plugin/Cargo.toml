@@ -16,6 +16,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bcode_plugin_sdk = { workspace = true }
 bcode_tool = { workspace = true }
+bcode_tui_components = { workspace = true, features = [
+    "tool-card",
+], optional = true }
 bmux_keyboard = { workspace = true, optional = true }
 bmux_text_edit = { workspace = true, optional = true }
 bmux_tui = { workspace = true, optional = true }
@@ -31,6 +34,7 @@ dynamic-export = []
 fail-on-warnings = []
 static-bundled = [
     "bcode_plugin_sdk/tui",
+    "bcode_tui_components",
     "bmux_keyboard",
     "bmux_text_edit",
     "bmux_tui",

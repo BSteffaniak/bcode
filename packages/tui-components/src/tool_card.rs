@@ -1,6 +1,46 @@
 //! Reusable Bcode transcript tool-card header composition.
 
 use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui_components::theme::ComponentTheme;
+
+/// Semantic presentation for a Bcode transcript tool card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolCardStyle {
+    /// Card marker/accent style.
+    pub accent: Style,
+    /// Card title style.
+    pub title: Style,
+    /// Field-label and secondary metadata style.
+    pub muted: Style,
+    /// Field-value and body style.
+    pub value: Style,
+    /// Link and external-destination style.
+    pub link: Style,
+    /// Successful change or outcome style.
+    pub success: Style,
+    /// Caution, cursor, or pending style.
+    pub warning: Style,
+    /// Failed change or outcome style.
+    pub error: Style,
+}
+
+impl ToolCardStyle {
+    /// Resolve renderer-owned component presentation with a terminal-safe fallback.
+    #[must_use]
+    pub fn from_component_theme(theme: Option<ComponentTheme>) -> Self {
+        let theme = theme.unwrap_or_default();
+        Self {
+            accent: theme.focused,
+            title: theme.text,
+            muted: theme.muted,
+            value: theme.text,
+            link: theme.info,
+            success: theme.success,
+            warning: theme.warning,
+            error: theme.error,
+        }
+    }
+}
 
 /// Render a bounded Bcode tool-card header with semantic icon, title, and metadata spans.
 #[must_use]
@@ -39,6 +79,29 @@ pub fn push_tool_card_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_card_style_uses_component_theme_roles() {
+        let theme = ComponentTheme {
+            focused: Style::new().fg(bmux_tui::style::Color::Cyan),
+            text: Style::new().fg(bmux_tui::style::Color::White),
+            muted: Style::new().fg(bmux_tui::style::Color::BrightBlack),
+            info: Style::new().fg(bmux_tui::style::Color::Blue),
+            success: Style::new().fg(bmux_tui::style::Color::Green),
+            warning: Style::new().fg(bmux_tui::style::Color::Yellow),
+            error: Style::new().fg(bmux_tui::style::Color::Red),
+            ..ComponentTheme::default()
+        };
+        let style = ToolCardStyle::from_component_theme(Some(theme));
+        assert_eq!(style.accent, theme.focused);
+        assert_eq!(style.title, theme.text);
+        assert_eq!(style.muted, theme.muted);
+        assert_eq!(style.value, theme.text);
+        assert_eq!(style.link, theme.info);
+        assert_eq!(style.success, theme.success);
+        assert_eq!(style.warning, theme.warning);
+        assert_eq!(style.error, theme.error);
+    }
 
     #[test]
     fn detail_omits_missing_values() {

@@ -21,6 +21,11 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::selectable_list::{
+    SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
+    SelectableListStyles,
+};
 
 /// Ralph home native TUI surface kind.
 pub const RALPH_HOME_SURFACE_KIND: &str = "ralph-home";
@@ -234,6 +239,7 @@ struct RalphHomeSurface {
     setup_draft: Option<bcode_ralph::RalphSetupDraft>,
     runs: Vec<bcode_ralph::RalphRunRecord>,
     selected_action: usize,
+    action_area: Rect,
     status_message: Option<String>,
     screen: RalphHomeScreen,
 }
@@ -246,6 +252,7 @@ impl RalphHomeSurface {
             setup_draft: None,
             runs: Vec::new(),
             selected_action: 0,
+            action_area: Rect::new(0, 0, 0, 0),
             status_message: flash_message,
             screen: RalphHomeScreen::Dashboard,
         };
@@ -595,8 +602,24 @@ impl RalphHomeSurface {
         y
     }
 
+    fn activate_action(&mut self, index: usize) -> PluginTuiAction {
+        self.selected_action = index;
+        let action = self.action_order()[index].kind;
+        if action == RalphActionKind::RebuildLoopContext && self.loop_summary.is_some() {
+            self.screen = RalphHomeScreen::RebuildIntro;
+            self.status_message =
+                Some("Review the rebuild flow, then press Enter to prepare the prompt.".to_owned());
+            return PluginTuiAction::Redraw;
+        }
+        PluginTuiAction::Close {
+            outcome: Some(serde_json::json!({
+                "ralph_action": action,
+            })),
+        }
+    }
+
     fn render_actions(
-        &self,
+        &mut self,
         frame: &mut Frame<'_>,
         area: Rect,
         mut y: u16,
@@ -612,31 +635,32 @@ impl RalphHomeSurface {
             )]),
         );
         y = y.saturating_add(1);
-        for (index, action) in self.action_order().iter().enumerate() {
-            let selected = index == self.selected_action;
-            let marker = if selected { "›" } else { " " };
-            let style = if selected {
-                theme.selection
-            } else {
-                theme.text
-            };
-            write_line(
-                frame,
-                area,
-                y,
-                Line::from_spans(vec![Span::styled(
+        let actions = self.action_order();
+        let items = actions
+            .iter()
+            .map(|action| {
+                SelectableListItem::new(
+                    action.kind.command_label(),
                     format!(
-                        "{marker} {:<22} /ralph {:<10} — {}",
+                        "{:<22} /ralph {:<10} — {}",
                         action.label,
                         action.kind.command_label(),
                         action.kind.description()
                     ),
-                    style,
-                )]),
-            );
-            y = y.saturating_add(1);
-        }
-        y.saturating_add(1)
+                )
+            })
+            .collect::<Vec<_>>();
+        let list = SelectableList::new(&items).styles(ralph_list_styles(theme));
+        let list_height = u16::try_from(items.len()).unwrap_or(u16::MAX);
+        self.action_area = Rect::new(
+            area.x,
+            y,
+            area.width,
+            list_height.min(area.bottom().saturating_sub(y).saturating_sub(2)),
+        );
+        let state = ralph_list_state(self.selected_action);
+        list.render_with_fallback_style(self.action_area, &state, frame, theme.canvas);
+        self.action_area.bottom().saturating_add(1)
     }
     fn render_rebuild_intro(&self, frame: &mut Frame<'_>, area: Rect, theme: &RalphSurfaceTheme) {
         let mut y = area.y;
@@ -725,7 +749,7 @@ impl RalphHomeSurface {
         }
     }
     fn render_themed(
-        &self,
+        &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
         theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
@@ -778,15 +802,15 @@ impl RalphHomeSurface {
         let _ = self.render_actions(frame, area, y, &theme);
 
         let status_y = area.y.saturating_add(area.height.saturating_sub(2));
-        write_line(
-            frame,
-            area,
-            status_y,
-            Line::from_spans(vec![Span::styled(
-                "Keys: ↑/↓ select · Enter run · r refresh · q close",
-                theme.text,
-            )]),
-        );
+        let hints = [
+            KeyHint::new("↑/↓", "select"),
+            KeyHint::new("Enter", "run"),
+            KeyHint::new("r", "refresh"),
+            KeyHint::new("q", "close"),
+        ];
+        KeyHintBar::new(&hints)
+            .styles(ralph_hint_styles(&theme))
+            .render(Rect::new(area.x, status_y, area.width, 1), frame);
         if let Some(message) = &self.status_message {
             write_line(
                 frame,
@@ -795,6 +819,33 @@ impl RalphHomeSurface {
                 Line::from_spans(vec![Span::styled(message.clone(), theme.focused)]),
             );
         }
+    }
+}
+
+const fn ralph_list_styles(theme: &RalphSurfaceTheme) -> SelectableListStyles {
+    SelectableListStyles {
+        normal: theme.text,
+        focused: theme.selection,
+        selected: theme.selection,
+        hovered: theme.focused,
+        pressed: theme.selection.add_modifier(Modifier::BOLD),
+        disabled: theme.text.add_modifier(Modifier::DIM),
+    }
+}
+
+const fn ralph_list_state(selected: usize) -> SelectableListState {
+    let mut state = SelectableListState::new(None);
+    state.set_focused(Some(selected));
+    state
+}
+
+const fn ralph_hint_styles(theme: &RalphSurfaceTheme) -> KeyHintBarStyles {
+    KeyHintBarStyles {
+        key: theme.focused,
+        label: theme.text,
+        separator: theme.text.add_modifier(Modifier::DIM),
+        disabled: theme.text.add_modifier(Modifier::DIM),
+        background: theme.canvas,
     }
 }
 
@@ -821,10 +872,10 @@ impl PluginTuiSurface for RalphHomeSurface {
     }
 
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let Event::Key(key) = event else {
-            return PluginTuiAction::None;
-        };
         if self.screen == RalphHomeScreen::RebuildIntro {
+            let Event::Key(key) = event else {
+                return PluginTuiAction::None;
+            };
             return match key.key {
                 KeyCode::Char('q') => PluginTuiAction::Close { outcome: None },
                 KeyCode::Escape => {
@@ -839,44 +890,57 @@ impl PluginTuiSurface for RalphHomeSurface {
                 _ => PluginTuiAction::None,
             };
         }
-        match key.key {
-            KeyCode::Char('q') | KeyCode::Escape => PluginTuiAction::Close { outcome: None },
-            KeyCode::Char('r') => {
-                self.refresh();
-                PluginTuiAction::Redraw
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.selected_action = self.selected_action.saturating_sub(1);
-                PluginTuiAction::Redraw
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.selected_action =
-                    (self.selected_action + 1).min(self.action_order().len() - 1);
-                PluginTuiAction::Redraw
-            }
-            KeyCode::Enter => {
-                let action = self.action_order()[self.selected_action].kind;
-                if action == RalphActionKind::RebuildLoopContext && self.loop_summary.is_some() {
-                    self.screen = RalphHomeScreen::RebuildIntro;
-                    self.status_message = Some(
-                        "Review the rebuild flow, then press Enter to prepare the prompt."
-                            .to_owned(),
-                    );
+        if let Event::Key(key) = event {
+            match key.key {
+                KeyCode::Char('q') | KeyCode::Escape => {
+                    return PluginTuiAction::Close { outcome: None };
+                }
+                KeyCode::Char('r') => {
+                    self.refresh();
                     return PluginTuiAction::Redraw;
                 }
-                PluginTuiAction::Close {
-                    outcome: Some(serde_json::json!({
-                        "ralph_action": action,
-                    })),
+                KeyCode::Char('s') => {
+                    return PluginTuiAction::Close {
+                        outcome: Some(
+                            serde_json::json!({ "ralph_action": RalphActionKind::Status }),
+                        ),
+                    };
                 }
+                KeyCode::Char('g') => {
+                    return PluginTuiAction::Close {
+                        outcome: Some(serde_json::json!({ "ralph_action": RalphActionKind::Goal })),
+                    };
+                }
+                _ => {}
             }
-            KeyCode::Char('s') => PluginTuiAction::Close {
-                outcome: Some(serde_json::json!({ "ralph_action": RalphActionKind::Status })),
-            },
-            KeyCode::Char('g') => PluginTuiAction::Close {
-                outcome: Some(serde_json::json!({ "ralph_action": RalphActionKind::Goal })),
-            },
-            _ => PluginTuiAction::None,
+        }
+        let actions = self.action_order();
+        let items = actions
+            .iter()
+            .map(|action| SelectableListItem::new(action.kind.command_label(), action.label))
+            .collect::<Vec<_>>();
+        let list = SelectableList::new(&items);
+        let list_event = match event {
+            Event::Key(key) if key.key == KeyCode::Char('k') => {
+                Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Up))
+            }
+            Event::Key(key) if key.key == KeyCode::Char('j') => {
+                Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Down))
+            }
+            _ => event.clone(),
+        };
+        let mut state = ralph_list_state(self.selected_action);
+        match list.handle_event(self.action_area, &mut state, &list_event) {
+            SelectableListOutcome::Focused(index) => {
+                self.selected_action = index;
+                PluginTuiAction::Redraw
+            }
+            SelectableListOutcome::Redraw => {
+                self.selected_action = state.focused().unwrap_or(self.selected_action);
+                PluginTuiAction::Redraw
+            }
+            SelectableListOutcome::Selected(index) => self.activate_action(index),
+            SelectableListOutcome::Ignored => PluginTuiAction::None,
         }
     }
 }
@@ -910,3 +974,51 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 
 #[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_plugin!(RalphPlugin, include_str!("../bcode-plugin.toml"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ralph_action_list_supports_keyboard_and_mouse_selection() {
+        let items = [
+            SelectableListItem::new("plan", "Plan"),
+            SelectableListItem::new("run", "Run"),
+        ];
+        let list = SelectableList::new(&items);
+        let area = Rect::new(2, 5, 30, 2);
+        let mut state = ralph_list_state(0);
+
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Down)),
+            ),
+            SelectableListOutcome::Focused(1)
+        );
+        let point = bmux_tui::geometry::Point::new(4, 5);
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left,),
+                    point,
+                )),
+            ),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                    point,
+                )),
+            ),
+            SelectableListOutcome::Selected(0)
+        );
+    }
+}

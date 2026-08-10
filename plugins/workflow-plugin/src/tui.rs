@@ -7,9 +7,11 @@ use bcode_plugin_sdk::tui::{
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
-use bmux_tui::style::Style;
+use bmux_tui::geometry::{Insets, Rect};
+use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
+use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
+use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
@@ -160,6 +162,7 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
             Ok(Box::new(WorkflowStatusSurface {
                 options: request.options,
                 selected_approval: 0,
+                text_view: TextViewState::new(),
             }) as BoxedPluginTuiSurface)
         })
     }
@@ -169,23 +172,36 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
 struct WorkflowStatusSurface {
     options: serde_json::Value,
     selected_approval: usize,
+    text_view: TextViewState,
 }
 
 struct WorkflowSurfaceTheme {
     canvas: Style,
     text: Style,
+    focused: Style,
+    component: bmux_tui_components::theme::ComponentTheme,
 }
 
 impl WorkflowSurfaceTheme {
     fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
         theme.map_or_else(
-            || Self {
-                canvas: Style::new(),
-                text: Style::new(),
+            || {
+                let component = bmux_tui_components::theme::ComponentTheme::default();
+                Self {
+                    canvas: component.canvas,
+                    text: component.text,
+                    focused: component.focused,
+                    component,
+                }
             },
-            |theme| Self {
-                canvas: theme.canvas,
-                text: theme.text,
+            |theme| {
+                let component = theme.component_theme().unwrap_or_default();
+                Self {
+                    canvas: theme.canvas,
+                    text: theme.text,
+                    focused: theme.focused,
+                    component,
+                }
             },
         )
     }
@@ -200,19 +216,33 @@ impl WorkflowStatusSurface {
     ) {
         let theme = WorkflowSurfaceTheme::resolve(theme);
         frame.fill(area, " ", theme.canvas);
-        for (offset, row) in surface_lines(&self.options, self.selected_approval)
+        let pane = Pane::new()
+            .title(Line::from_spans(vec![Span::styled(
+                "Workflow Status",
+                theme.focused.add_modifier(Modifier::BOLD),
+            )]))
+            .padding(Insets::new(1, 1, 1, 1))
+            .styles(PaneStyles {
+                background: Some(theme.canvas),
+                border: theme.component.border,
+                focused_border: theme.focused,
+            });
+        let pane_state = PaneState::new(area);
+        pane.render(&pane_state, frame);
+        let content = pane.inner_area(&pane_state);
+        let rows = surface_lines(&self.options, self.selected_approval)
             .into_iter()
-            .enumerate()
-        {
-            if offset >= usize::from(area.height) {
-                break;
-            }
-            let offset = u16::try_from(offset).expect("workflow status has fewer than u16 rows");
-            frame.write_line(
-                Rect::new(area.x, area.y.saturating_add(offset), area.width, 1),
-                &Line::from_spans(vec![Span::styled(row, theme.text)]),
-            );
-        }
+            .map(|row| Line::from_spans(vec![Span::styled(row, theme.text)]))
+            .collect::<Vec<_>>();
+        TextView::new(&rows)
+            .policy(TextViewPolicy::bare())
+            .styles(TextViewStyles {
+                text: theme.text,
+                empty: theme.component.muted,
+                background: theme.canvas,
+            })
+            .empty("Workflow status unavailable")
+            .render(content, &self.text_view, frame);
     }
 }
 
