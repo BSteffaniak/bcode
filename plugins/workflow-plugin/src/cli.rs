@@ -63,6 +63,15 @@ struct WorkflowCli {
     /// Exact pending mutation approval identity for `approve-mutation` or `deny-mutation`.
     #[arg(long)]
     approval: Option<String>,
+    /// Exact receipt-backed dispatch identity for explicit repair.
+    #[arg(long)]
+    dispatch: Option<String>,
+    /// Typed repair resolution JSON for explicit repair.
+    #[arg(long)]
+    resolution: Option<String>,
+    /// Fixed parent-session generation for package-export starts.
+    #[arg(long)]
+    parent_session_generation: Option<u64>,
     /// Caller-stable run identity for `template-start`.
     #[arg(long)]
     run: Option<String>,
@@ -236,6 +245,18 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         }
         if let Some(approval) = cli.approval {
             args.insert("approval_id".to_string(), approval);
+        }
+        if let Some(dispatch) = cli.dispatch {
+            args.insert("dispatch_identity".to_string(), dispatch);
+        }
+        if let Some(resolution) = cli.resolution {
+            args.insert("resolution".to_string(), resolution);
+        }
+        if let Some(generation) = cli.parent_session_generation {
+            args.insert(
+                "parent_session_generation".to_string(),
+                generation.to_string(),
+            );
         }
         if let Some(run) = cli.run {
             args.insert("run_id".to_string(), run);

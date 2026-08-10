@@ -287,6 +287,48 @@ if rg -ni '(^|[^a-z])git([[:space:]]|[-_./])' examples/workflows/packages/data-q
 fi
 rm -f /tmp/bcode-product-non-git-workflow-leaks.txt
 
+if rg -n 'WORKFLOW_SOURCE_V1_DOCUMENT_VERSION|WorkflowSourceDocument|WorkflowSourceStep|WorkflowSourceProfile::Concise|SHELL_COMMAND_PLAN_VERSION_1|command-plan/v1|command-plan-result/v1|continue_on_nonzero|bcode\.(git|review|progress-doc)/|GitWorkflow|ReviewWorkflow|ProgressDocumentWorkflow|workflow_(git|review|progress)' \
+  packages/workflow packages/workflow-store packages/server packages/cli plugins/workflow-plugin plugins/shell-plugin \
+  --glob '*.rs' --glob '*.toml' >/tmp/bcode-obsolete-workflow-contracts.txt 2>/dev/null; then
+  echo "Composable workflow clean-break violation: obsolete or specialized workflow contracts remain." >&2
+  cat /tmp/bcode-obsolete-workflow-contracts.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-obsolete-workflow-contracts.txt
+
+if ! rg -q 'parent_session_generation' packages/cli/src/lib.rs plugins/workflow-plugin/src/lib.rs \
+  || ! rg -q 'workflow\.doctor' plugins/workflow-plugin/src/lib.rs \
+  || ! rg -q 'workflow\.repair' plugins/workflow-plugin/src/lib.rs; then
+  echo "Composable workflow public lifecycle violation: generation pinning, doctor, or repair surface drifted." >&2
+  violations=1
+fi
+
+if ! rg -q 'restart_reconciliation_never_retries_ambiguous_mutation' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'explicit_abandonment_is_required_before_retrying_ambiguous_mutation' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'disabled_policy_has_no_opinion_even_with_unresolved_references' packages/skill/src/lib.rs \
+  || ! rg -q 'stale' plugins/shell-plugin/src/lib.rs \
+  || ! rg -q 'exhaustion' packages/workflow-store/src/lib.rs; then
+  echo "Composable workflow failure-coverage violation: required fail-closed regression coverage drifted." >&2
+  violations=1
+fi
+
+if ! rg -q 'workflow package validate' scripts/release-delivery-workflow-package.sh \
+  || ! rg -q 'workflow package preview' scripts/release-delivery-workflow-package.sh \
+  || ! rg -q 'workflow package apply' scripts/release-delivery-workflow-package.sh \
+  || ! rg -q 'workflow package publish' scripts/release-delivery-workflow-package.sh \
+  || ! rg -q 'package-export' scripts/release-delivery-workflow-package.sh \
+  || ! rg -q 'workflow provide-input' scripts/release-delivery-workflow-package.sh \
+  || ! rg -q 'workflow resolve-approval' scripts/release-delivery-workflow-package.sh \
+  || ! rg -q 'approve-mutation' scripts/release-delivery-workflow-package.sh \
+  || ! rg -q 'workflow-ui cancel' scripts/release-non-git-workflow-package.sh \
+  || ! rg -q 'workflow\.doctor' plugins/workflow-plugin/src/lib.rs \
+  || ! rg -q 'workflow\.repair' plugins/workflow-plugin/src/lib.rs \
+  || ! rg -q 'ResetStore' packages/cli/src/lib.rs \
+  || ! rg -q 'terminal_output' scripts/release-delivery-workflow-package.sh; then
+  echo "Composable workflow public lifecycle coverage violation: one required public operation is unproved." >&2
+  violations=1
+fi
+
 if rg -n 'force-with-lease|force[[:space:]]+push|push[[:space:]]+--force|--force' \
   fixtures/workflow-components examples/workflows --glob '*.yaml' --glob '*.json' \
   >/tmp/bcode-flagship-force-push.txt 2>/dev/null; then

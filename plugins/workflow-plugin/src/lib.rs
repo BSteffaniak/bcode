@@ -1087,7 +1087,16 @@ fn package_export_start_request(
             .get("workspace_snapshot")
             .filter(|value| !value.is_empty())
             .cloned(),
-        parent_session_generation: None,
+        parent_session_generation: request
+            .args
+            .get("parent_session_generation")
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|error| format!("invalid 'parent_session_generation': {error}"))
+            })
+            .transpose()?,
         configuration: optional_json_arg(request, "configuration")?,
         input: optional_json_arg(request, "input")?,
     })
@@ -1291,6 +1300,7 @@ mod tests {
                 ),
                 ("package_lock_digest_sha256".to_string(), "a".repeat(64)),
                 ("run_id".to_string(), "run-1".to_string()),
+                ("parent_session_generation".to_string(), "7".to_string()),
                 ("input".to_string(), r#"{"subject":"change"}"#.to_string()),
             ]),
         };
@@ -1298,6 +1308,7 @@ mod tests {
         assert_eq!(start.package_export.package_id, "example/package");
         assert_eq!(start.package_export.export, "main");
         assert_eq!(start.parent_session_id, parent_session_id);
+        assert_eq!(start.parent_session_generation, Some(7));
         assert_eq!(start.input.expect("input")["subject"], "change");
     }
 
