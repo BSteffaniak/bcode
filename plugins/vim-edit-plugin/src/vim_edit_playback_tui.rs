@@ -4,6 +4,12 @@ use bcode_tui_components::tool_card::{push_tool_card_detail, tool_card_header};
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use serde_json::Value;
 
+thread_local! {
+    static ACTIVE_THEME: std::cell::Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
 use super::{
     VIM_EDIT_LIVE_SCHEMA, VIM_EDIT_PLAYBACK_SCHEMA, VIM_EDIT_REQUEST_APPLY_SCHEMA,
     VIM_EDIT_REQUEST_DRAFT_APPLY_SCHEMA, VIM_EDIT_REQUEST_DRAFT_PREVIEW_SCHEMA,
@@ -41,8 +47,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for VimEditPlaybackTuiVisualA
         payload: &Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
+        ACTIVE_THEME.with(|theme| theme.set(context.theme()));
         let width = context.width();
-        match kind {
+        let rows = match kind {
             VIM_EDIT_REQUEST_PREVIEW_SCHEMA => request_rows("Vim edit preview", payload, context),
             VIM_EDIT_REQUEST_APPLY_SCHEMA => request_rows("Vim edit apply", payload, context),
             VIM_EDIT_REQUEST_DRAFT_PREVIEW_SCHEMA => {
@@ -56,7 +63,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for VimEditPlaybackTuiVisualA
                 playback_rows(payload, None, true, true, width, context)
             }
             _ => Vec::new(),
-        }
+        };
+        ACTIVE_THEME.with(|theme| theme.set(None));
+        rows
     }
 }
 
@@ -447,28 +456,36 @@ fn pad_rule(prefix: &str, width: u16, fill: char, end: char) -> String {
     value
 }
 
-const fn accent() -> Style {
-    Style::new().fg(Color::Cyan)
+fn theme_style(
+    select: impl FnOnce(bcode_plugin_sdk::tui::PluginTuiTheme) -> Style,
+    fallback: Style,
+) -> Style {
+    ACTIVE_THEME.with(|theme| theme.get().map_or(fallback, select))
 }
-const fn accent_bold() -> Style {
-    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+
+fn accent() -> Style {
+    theme_style(|theme| theme.focused, Style::new().fg(Color::Cyan))
 }
-const fn border() -> Style {
-    Style::new().fg(Color::Cyan)
+fn accent_bold() -> Style {
+    accent().add_modifier(Modifier::BOLD)
 }
-const fn muted() -> Style {
-    Style::new().fg(Color::BrightBlack)
+fn border() -> Style {
+    theme_style(|theme| theme.border, Style::new().fg(Color::Cyan))
 }
-const fn value_style() -> Style {
-    Style::new().fg(Color::White)
+fn muted() -> Style {
+    theme_style(|theme| theme.muted, Style::new().fg(Color::BrightBlack))
 }
-const fn cursor_line_style() -> Style {
-    Style::new().fg(Color::Yellow)
+fn value_style() -> Style {
+    theme_style(|theme| theme.text, Style::new().fg(Color::White))
+}
+fn cursor_line_style() -> Style {
+    theme_style(|theme| theme.selection, Style::new().fg(Color::Yellow))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
     use serde_json::json;
 
     fn row_text(rows: &[Line]) -> String {
@@ -476,6 +493,80 @@ mod tests {
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_str()))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn test_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffTheme, PluginTuiSourceTheme, PluginTuiSyntaxColor, PluginTuiSyntaxTheme,
+            PluginTuiTheme,
+        };
+        let style = Style::new();
+        let syntax = PluginTuiSyntaxColor::from_tui(Color::Default);
+        PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            canvas: style,
+            text: style.fg(Color::Blue),
+            muted: style.fg(Color::BrightBlack),
+            border: style.fg(Color::Yellow),
+            focused: style.fg(Color::Magenta),
+            selection: style.fg(Color::Green),
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: syntax,
+                comment: syntax,
+                keyword: syntax,
+                function: syntax,
+                variable: syntax,
+                string: syntax,
+                number: syntax,
+                type_name: syntax,
+                operator: syntax,
+                punctuation: syntax,
+            },
+        }
+    }
+
+    #[test]
+    fn visual_adapter_uses_host_theme_for_tool_card_roles() {
+        let payload = json!({
+            "arguments": {
+                "path": "/tmp/demo.txt",
+                "steps": [{"keys": "w"}],
+                "sandbox": "default"
+            }
+        });
+        let context = unknown_visual_context().with_theme(test_theme());
+        let rows = VimEditPlaybackTuiVisualAdapter.rows(
+            VIM_EDIT_REQUEST_PREVIEW_SCHEMA,
+            &payload,
+            &context,
+        );
+
+        assert_eq!(rows[0].spans[0].style.fg, Some(Color::Magenta));
+        assert!(rows.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("sandbox") && span.style.fg == Some(Color::BrightBlack)
+        }));
+        assert!(rows.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("default") && span.style.fg == Some(Color::Blue)
+        }));
     }
 
     #[test]
