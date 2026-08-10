@@ -1581,6 +1581,10 @@ pub struct WorkflowPackageComputationRequest {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowPackagePreviewRequest {
     pub plan: bcode_workflow::WorkflowPackagePlan,
+    /// Exact dependency-before-importer closure plans used to make immutable child definitions
+    /// available while previewing the entry package.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_plans: Vec<bcode_workflow::WorkflowPackagePlan>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub configurations: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -4591,6 +4595,7 @@ mod tests {
                     members: Vec::new(),
                 },
             },
+            dependency_plans: Vec::new(),
             configurations: std::collections::BTreeMap::new(),
             control: WorkflowComputationControl::default(),
         });

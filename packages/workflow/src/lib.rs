@@ -5025,12 +5025,7 @@ pub fn plan_workflow_package(
         let identity = compiled.definition_identity;
         lowering.document.definition = compiled.definition.clone();
         let closure = workflow_package_member_closure(member, &members)?;
-        let source_digest = digest_serializable(&serde_json::json!({
-            "source_name": member.source_name,
-            "format": member.format,
-            "source": member.source,
-            "dependencies": member.dependencies,
-        }))?;
+        let source_digest = lowering.document.source_digest_sha256()?;
         let executable_digest = digest_serializable(&compiled.definition)?;
         identities.insert(member.member_id.clone(), identity.clone());
         resolved_catalog

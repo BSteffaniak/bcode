@@ -4871,7 +4871,15 @@ async fn handle_request_inner(
             .await
         }
         Request::PreviewWorkflowPackage(request) => {
-            let catalog = workflow_authoring_catalog_snapshot(state).await?;
+            let mut catalog = workflow_authoring_catalog_snapshot(state).await?;
+            for dependency in &request.dependency_plans {
+                for member in &dependency.members {
+                    catalog.workflow_definitions.insert(
+                        member.definition_identity.definition_id.clone(),
+                        member.lowering.document.definition.clone(),
+                    );
+                }
+            }
             let result = run_workflow_computation(
                 state,
                 request.control,
@@ -16729,8 +16737,16 @@ async fn handle_cancel_workflow_run(
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let recorded = store.request_cancellation(&run_id, current_unix_millis())?;
-        let attempts = store.active_attempt_cancellations(&run_id, 1_000)?;
+        let (recorded, cancelled_run_ids) =
+            store.request_cancellation_tree(&run_id, current_unix_millis())?;
+        let mut attempts = Vec::new();
+        for cancelled_run_id in cancelled_run_ids {
+            let remaining = 1_000_usize.saturating_sub(attempts.len());
+            if remaining == 0 {
+                break;
+            }
+            attempts.extend(store.active_attempt_cancellations(&cancelled_run_id, remaining)?);
+        }
         drop(store);
         (recorded, attempts)
     };

@@ -1133,19 +1133,24 @@ async fn handle_workflow_package_command(
                     control: bcode_ipc::WorkflowComputationControl::default(),
                 })
                 .await?;
-            let entry = validation
+            let entry_index = validation
                 .plan
                 .packages
                 .iter()
-                .find(|entry| entry.package_id == validation.plan.entry_package_id)
+                .position(|entry| entry.package_id == validation.plan.entry_package_id)
                 .ok_or_else(|| {
                     CliError::InvalidArguments(
                         "planned package closure has no entry package".to_string(),
                     )
                 })?;
+            let entry = &validation.plan.packages[entry_index];
             let preview = client
                 .preview_workflow_package(bcode_ipc::WorkflowPackagePreviewRequest {
                     plan: entry.plan.clone(),
+                    dependency_plans: validation.plan.packages[..entry_index]
+                        .iter()
+                        .map(|package| package.plan.clone())
+                        .collect(),
                     configurations: std::collections::BTreeMap::new(),
                     control: bcode_ipc::WorkflowComputationControl::default(),
                 })
@@ -1234,22 +1239,26 @@ async fn handle_workflow_package_command(
     match operation {
         PackageCliOperation::Validate => print_json(&result)?,
         PackageCliOperation::Preview => {
-            let entry_plan = result
+            let entry_index = result
                 .plan
                 .packages
                 .iter()
-                .find(|package| package.package_id == result.plan.entry_package_id)
+                .position(|package| package.package_id == result.plan.entry_package_id)
                 .ok_or_else(|| {
                     CliError::InvalidArguments(
                         "planned package closure has no entry package".to_string(),
                     )
-                })?
-                .plan
-                .clone();
+                })?;
+            let entry_plan = result.plan.packages[entry_index].plan.clone();
+            let dependency_plans = result.plan.packages[..entry_index]
+                .iter()
+                .map(|package| package.plan.clone())
+                .collect();
             print_json(
                 &client
                     .preview_workflow_package(bcode_ipc::WorkflowPackagePreviewRequest {
                         plan: entry_plan,
+                        dependency_plans,
                         configurations: std::collections::BTreeMap::new(),
                         control: workflow_computation_control(operation_id, timeout_ms),
                     })
@@ -1257,30 +1266,28 @@ async fn handle_workflow_package_command(
             )?;
         }
         PackageCliOperation::Apply(expected_generations) => {
-            let entry_plan = result
-                .plan
-                .packages
-                .iter()
-                .find(|package| package.package_id == result.plan.entry_package_id)
-                .ok_or_else(|| {
-                    CliError::InvalidArguments(
-                        "planned package closure has no entry package".to_string(),
-                    )
-                })?
-                .plan
-                .clone();
-            print_json(
-                &client
-                    .apply_workflow_package(bcode_ipc::ApplyWorkflowPackageRequest {
-                        request: bcode_workflow::WorkflowPackageApplyRequest {
-                            version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
-                            plan: entry_plan,
-                            expected_generations,
-                        },
-                        applied_at_ms: current_unix_time_ms()?,
-                    })
-                    .await?,
-            )?;
+            let mut applied = Vec::with_capacity(result.plan.packages.len());
+            for package in &result.plan.packages {
+                let package_expected_generations =
+                    if package.package_id == result.plan.entry_package_id {
+                        expected_generations.clone()
+                    } else {
+                        Vec::new()
+                    };
+                applied.push(
+                    client
+                        .apply_workflow_package(bcode_ipc::ApplyWorkflowPackageRequest {
+                            request: bcode_workflow::WorkflowPackageApplyRequest {
+                                version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+                                plan: package.plan.clone(),
+                                expected_generations: package_expected_generations,
+                            },
+                            applied_at_ms: current_unix_time_ms()?,
+                        })
+                        .await?,
+                );
+            }
+            print_json(&applied)?;
         }
     }
     Ok(())
@@ -14824,6 +14831,7 @@ mod workflow_source_tests {
             &closure,
             &workflow_test_catalog(std::collections::BTreeSet::from([
                 "build".to_string(),
+                "plan".to_string(),
                 "review".to_string(),
             ])),
         )

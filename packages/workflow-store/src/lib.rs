@@ -7900,6 +7900,44 @@ impl WorkflowStore {
         Ok(changed == 1)
     }
 
+    /// Persist cancellation intent for one root and every bounded nonterminal descendant.
+    ///
+    /// Descendants are selected only from durable run links. All intents commit atomically before
+    /// callers signal any external owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, a missing/terminal root, excessive descendants,
+    /// or database failure.
+    pub fn request_cancellation_tree(
+        &mut self,
+        run_id: &str,
+        requested_at_ms: u64,
+    ) -> Result<(bool, Vec<String>), WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let descendants =
+            self.descendant_run_summaries(run_id, MAX_WORKFLOW_RUN_DESCENDANTS as usize)?;
+        let mut run_ids = Vec::with_capacity(descendants.len().saturating_add(1));
+        run_ids.push(run_id.to_string());
+        run_ids.extend(
+            descendants
+                .into_iter()
+                .map(|descendant| descendant.run.run_id),
+        );
+        let mut recorded = false;
+        for target_run_id in &run_ids {
+            let summary = self.run_summary(target_run_id)?.ok_or_else(|| {
+                WorkflowStoreError::RunNotFound {
+                    run_id: target_run_id.clone(),
+                }
+            })?;
+            if matches!(summary.status, RunStatus::Running | RunStatus::Paused) {
+                recorded |= self.request_cancellation(target_run_id, requested_at_ms)?;
+            }
+        }
+        Ok((recorded, run_ids))
+    }
+
     /// Return bounded active attempts only after cancellation intent is durable.
     ///
     /// Receipts are included when present so the owner can route cancellation to the exact turn or
@@ -16886,34 +16924,16 @@ mod tests {
             .expect("attempt")
             .pop()
             .expect("attempt");
-        store
-            .request_cancellation("parent-run", 4)
-            .expect("cancel parent");
+        let (recorded, cancelled_run_ids) = store
+            .request_cancellation_tree("parent-run", 4)
+            .expect("cancel parent tree");
+        assert!(recorded);
+        assert_eq!(cancelled_run_ids, ["parent-run", child_run_id.as_str()]);
         let running = store
             .observe_child_attempt(&receipt, 5)
-            .expect("observe running child");
-        let summary = store
-            .apply_attempt_observation(&receipt.dispatch_identity, running, 5)
-            .expect("parent remains cancelling");
-        assert_eq!(
-            summary.running,
-            std::slice::from_ref(&receipt.dispatch_identity)
-        );
-        assert_eq!(
-            store
-                .attempt_history("parent-run", None, 10)
-                .expect("attempts")[0]
-                .status,
-            "cancelling"
-        );
-        store
-            .request_cancellation(&child_run_id, 6)
-            .expect("cancel child");
-        let cancelled = store
-            .observe_child_attempt(&receipt, 7)
             .expect("observe cancelled child");
         let summary = store
-            .apply_attempt_observation(&receipt.dispatch_identity, cancelled, 7)
+            .apply_attempt_observation(&receipt.dispatch_identity, running, 5)
             .expect("settle parent cancellation");
         assert_eq!(summary.cancelled, [receipt.dispatch_identity]);
         assert_eq!(

@@ -66,7 +66,7 @@ steps:
             status: {type: string, enum: [ready, needs_remediation, complete, blocked]}
             detail: {type: string, maxLength: 16384}
             iteration: {type: integer, minimum: 0, maximum: 3}
-      agent_profile: review
+      agent_profile: plan
       execution_target: fresh_isolated
       read_only: true
       tool_allowlist: []

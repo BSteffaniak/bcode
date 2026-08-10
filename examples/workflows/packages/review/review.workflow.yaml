@@ -39,7 +39,7 @@ steps:
           properties:
             verdict: {type: string, enum: [pass, changes_required, blocked]}
             findings: {type: array, maxItems: 64, items: {type: string, maxLength: 4096}}
-      agent_profile: review
+      agent_profile: plan
       execution_target: fresh_isolated
       read_only: true
       tool_allowlist: [filesystem.read, filesystem.grep]
@@ -65,7 +65,7 @@ steps:
           properties:
             verdict: {type: string, enum: [pass, changes_required, blocked]}
             findings: {type: array, maxItems: 64, items: {type: string, maxLength: 4096}}
-      agent_profile: review
+      agent_profile: plan
       execution_target: fresh_isolated
       read_only: true
       tool_allowlist: [filesystem.read, filesystem.grep]

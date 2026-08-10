@@ -33,7 +33,7 @@ steps:
             condition_met: {type: boolean}
             summary: {type: string, minLength: 1, maxLength: 4096}
             remaining: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
-      agent_profile: review
+      agent_profile: plan
       execution_target: fresh_isolated
       read_only: true
       tool_allowlist: [filesystem.read, filesystem.grep]

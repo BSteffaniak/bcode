@@ -422,17 +422,21 @@ pub(crate) async fn execute_command(
                 })
                 .await
                 .map_err(|error| error.to_string())?;
-            let entry_plan = validation
+            let entry_index = validation
                 .plan
                 .packages
                 .iter()
-                .find(|package| package.package_id == validation.plan.entry_package_id)
-                .ok_or_else(|| "planned package closure has no entry package".to_string())?
-                .plan
-                .clone();
+                .position(|package| package.package_id == validation.plan.entry_package_id)
+                .ok_or_else(|| "planned package closure has no entry package".to_string())?;
+            let entry_plan = validation.plan.packages[entry_index].plan.clone();
+            let dependency_plans = validation.plan.packages[..entry_index]
+                .iter()
+                .map(|package| package.plan.clone())
+                .collect();
             let preview = client
                 .preview_workflow_package(bcode_ipc::WorkflowPackagePreviewRequest {
                     plan: entry_plan,
+                    dependency_plans,
                     configurations: BTreeMap::new(),
                     control: bcode_ipc::WorkflowComputationControl::default(),
                 })
