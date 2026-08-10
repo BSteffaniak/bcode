@@ -28957,12 +28957,16 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
                 .and_then(serde_json::Value::as_str)
                 == Some("bcode.server.workflow-child/v1")
             {
-                return self
-                    .state
-                    .workflow_store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .observe_child_attempt(request, current_unix_millis());
+                // Scope the blocking guard so it cannot be held across a later await point.
+                let observation = {
+                    let store = self
+                        .state
+                        .workflow_store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    store.observe_child_attempt(request, current_unix_millis())
+                };
+                return observation;
             }
             if request
                 .receipt
@@ -29146,38 +29150,40 @@ async fn observe_workflow_turn(
                 )
             })?;
             let output: serde_json::Value = serde_json::from_str(&output)?;
-            let output_schema = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .run_summary(&request.run_id)?
+            // Each store access takes and releases the lock in its own scope. Chaining the lookups
+            // through combinators would keep the first guard alive while the closure locks the same
+            // non-reentrant mutex again, which self-deadlocks.
+            let run = {
+                let store = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                store.run_summary(&request.run_id)?
+            }
+            .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".to_string()))?;
+            let stored_definition = {
+                let store = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                store.definition(&run.definition_id, run.definition_version)?
+            };
+            let configuration = stored_definition
+                .map(|stored| {
+                    serde_json::from_str::<bcode_workflow::WorkflowDefinition>(
+                        &stored.definition_json,
+                    )
+                })
+                .transpose()?
+                .and_then(|definition| definition.node(&request.node_id).cloned())
+                .map(|node| node.configuration)
                 .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData("workflow run not found".to_string())
-                })
-                .and_then(|run| {
-                    state
-                        .workflow_store
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .definition(&run.definition_id, run.definition_version)?
-                        .map(|stored| {
-                            serde_json::from_str::<bcode_workflow::WorkflowDefinition>(
-                                &stored.definition_json,
-                            )
-                        })
-                        .transpose()?
-                        .and_then(|definition| definition.node(&request.node_id).cloned())
-                        .map(|node| node.configuration)
-                        .ok_or_else(|| {
-                            WorkflowStoreError::InvalidData(
-                                "workflow prompt output configuration not found".to_string(),
-                            )
-                        })
-                })
-                .and_then(|configuration| {
-                    workflow_prompt_configuration(&configuration)
-                        .map(|configuration| configuration.structured_output.schema)
+                    WorkflowStoreError::InvalidData(
+                        "workflow prompt output configuration not found".to_string(),
+                    )
                 })?;
+            let output_schema = workflow_prompt_configuration(&configuration)
+                .map(|configuration| configuration.structured_output.schema)?;
             if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {
                 return Ok(bcode_workflow_store::AttemptObservation::Failed {
                     message: format!("workflow prompt output failed schema validation: {error}"),
@@ -34405,7 +34411,7 @@ mod tests {
             .expect("publish package");
         let published_lock = published.lock.expect("published lock");
         let lock_digest = published_lock.digest_sha256().expect("lock digest");
-        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+        let state = Arc::new(test_server_state_with_workflow_authorization(
             sessions, store,
         ));
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
@@ -35476,7 +35482,7 @@ mod tests {
         let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
             .expect("workflow store");
         let path = store.path().to_path_buf();
-        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+        let state = Arc::new(test_server_state_with_workflow_authorization(
             sessions, store,
         ));
         let now = current_time_ms();
@@ -51297,13 +51303,40 @@ library = "test"
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
     ) -> ServerState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+            bcode_fake_provider_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.fake-provider".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load fake provider");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state.workflow_store = StdMutex::new(workflow_store);
+        state
+    }
+
+    /// Like [`test_server_state_with_fake_provider_and_workflow_store`], plus a plugin serving
+    /// `bcode.agent-profile/v1`.
+    ///
+    /// Starting a workflow resolves its authorization profile and fails closed when that interface
+    /// is unavailable. Only tests that start workflows need it: loading the agents plugin makes
+    /// agent nodes resolve real profiles and dispatch turns, which changes behaviour for tests that
+    /// drive node execution themselves.
+    fn test_server_state_with_workflow_authorization(
+        sessions: SessionManager,
+        workflow_store: bcode_workflow_store::WorkflowStore,
+    ) -> ServerState {
         let provider = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
             bcode_fake_provider_plugin::static_plugin(),
         );
-        // Starting an authored workflow resolves its authorization profile and fails closed when no
-        // plugin serves `bcode.agent-profile/v1`, so the default agents plugin has to be loaded
-        // alongside the provider.
         let agents = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
             bcode_default_agents_plugin::static_plugin(),
@@ -54165,7 +54198,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
             .expect("workflow store");
-        let mut state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        let mut state = test_server_state_with_workflow_authorization(sessions, store);
         state.selected_provider_plugin_id = Some("bcode.fake-provider".to_string());
         state.selected_model_id = Some("fake-echo".to_string());
         state.selected_provider_context.settings.insert(
@@ -54342,7 +54375,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
             .expect("workflow store");
-        let mut state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        let mut state = test_server_state_with_workflow_authorization(sessions, store);
         state.selected_provider_plugin_id = Some("bcode.fake-provider".to_string());
         state.selected_model_id = Some("fake-echo".to_string());
         state.selected_provider_context.settings.insert(
@@ -54595,7 +54628,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
             .expect("workflow store");
-        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+        let state = Arc::new(test_server_state_with_workflow_authorization(
             sessions, store,
         ));
         let schema = bcode_workflow::ValueSchema {
@@ -56613,7 +56646,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .create_session(Some("workflow".to_string()), PathBuf::from("."))
             .await
             .expect("session");
-        let state = Arc::new(test_server_state(sessions));
+        let state = Arc::new(test_server_state_with_default_agents(sessions));
         let definition = bcode_workflow::WorkflowBuilder::new(
             "stable-start",
             bcode_workflow::Step::<u32, u32>::input("node"),
