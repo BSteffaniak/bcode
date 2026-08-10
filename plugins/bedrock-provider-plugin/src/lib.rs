@@ -1708,6 +1708,12 @@ fn anthropic_cache_control() -> serde_json::Value {
     serde_json::json!({"type": "ephemeral"})
 }
 
+/// Placeholder text used when a failed tool result carries no model-visible content.
+///
+/// The Anthropic Messages schema rejects a `tool_result` block whose `content` is
+/// empty while `is_error` is `true`, so failed results must always carry text.
+const EMPTY_ERROR_TOOL_RESULT_PLACEHOLDER: &str = "Tool call failed without producing any output.";
+
 fn anthropic_content_blocks(
     message: &ModelMessage,
 ) -> Result<Vec<serde_json::Value>, ProviderError> {
@@ -1749,6 +1755,11 @@ fn anthropic_content_blocks(
                         "text": format!("[image reference: {} {}]", image.path, image.mime_type),
                     }),
                 }));
+                if content.is_empty() && result.is_error {
+                    content.push(serde_json::json!({
+                        "type": "text", "text": EMPTY_ERROR_TOOL_RESULT_PLACEHOLDER,
+                    }));
+                }
                 blocks.push(serde_json::json!({
                     "type": "tool_result", "tool_use_id": result.call_id,
                     "content": content, "is_error": result.is_error,
@@ -4901,6 +4912,68 @@ mod tests {
                 "type": "tool_result",
                 "tool_use_id": "toolu_1",
                 "content": [{"type": "text", "text": "useful tool output"}],
+                "is_error": false,
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_request_substitutes_placeholder_for_empty_error_tool_result() {
+        let mut request = test_model_turn_request();
+        request.messages = vec![ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "toolu_err".to_string(),
+                    output: String::new(),
+                    is_error: true,
+                    content: Vec::new(),
+                },
+            }],
+        }];
+
+        let value: serde_json::Value = serde_json::from_slice(
+            &build_anthropic_messages_request(&request).expect("request should serialize"),
+        )
+        .expect("request should be JSON");
+
+        assert_eq!(
+            value["messages"][0]["content"][0],
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_err",
+                "content": [{"type": "text", "text": EMPTY_ERROR_TOOL_RESULT_PLACEHOLDER}],
+                "is_error": true,
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_request_keeps_empty_content_for_successful_tool_result() {
+        let mut request = test_model_turn_request();
+        request.messages = vec![ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "toolu_ok".to_string(),
+                    output: String::new(),
+                    is_error: false,
+                    content: Vec::new(),
+                },
+            }],
+        }];
+
+        let value: serde_json::Value = serde_json::from_slice(
+            &build_anthropic_messages_request(&request).expect("request should serialize"),
+        )
+        .expect("request should be JSON");
+
+        assert_eq!(
+            value["messages"][0]["content"][0],
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_ok",
+                "content": [],
                 "is_error": false,
             })
         );
