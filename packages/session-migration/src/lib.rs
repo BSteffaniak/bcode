@@ -63,6 +63,7 @@ pub use bcode_session_migration_target::{
 };
 
 pub use classification::HistoricalEventMetadata;
+pub use codec::HistoricalEnvelope;
 pub use diagnosis::{
     SessionDiagnosisClassification, SessionDiagnosisCompatibility, SessionMigrationDiagnosis,
     SessionMigrationOwnerDiagnosis, classify_session_diagnosis,
@@ -76,18 +77,18 @@ pub use inventory::{
     CURRENT_EVENT_SCHEMA, CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor,
     RELEASED_EVENT_VARIANTS, RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_ROOTS,
     RELEASED_HISTORICAL_WRITER_EPOCHS, RELEASED_MIGRATION_IDS, RELEASED_PERSISTED_TABLES,
-    RELEASED_RECORD_TREATMENTS, RELEASED_WRITER_SCHEMA_COMBINATIONS, ReleasedEventTreatment,
-    ReleasedEventVariantDescriptor, ReleasedFixtureClassificationCounts,
-    ReleasedFixtureCoverageGaps, ReleasedFixtureDescriptor, ReleasedFixtureInventoryError,
-    ReleasedFixtureManifest, ReleasedFixtureRootWriterPair, ReleasedFixtureSchemaEventPair,
-    ReleasedFixtureTableTreatment, ReleasedFixtureWriterSchemaPair,
+    RELEASED_RECORD_TREATMENTS, RELEASED_WRITER_SCHEMA_COMBINATIONS,
+    ReleasedEventKindClassification, ReleasedEventTreatment, ReleasedEventVariantDescriptor,
+    ReleasedFixtureClassificationCounts, ReleasedFixtureCoverageGaps, ReleasedFixtureDescriptor,
+    ReleasedFixtureInventoryError, ReleasedFixtureManifest, ReleasedFixtureRootWriterPair,
+    ReleasedFixtureSchemaEventPair, ReleasedFixtureTableTreatment, ReleasedFixtureWriterSchemaPair,
     ReleasedLedgerPrefixFixtureCase, ReleasedMigrationDescriptor, ReleasedMigrationDomain,
     ReleasedMigrationTreatment, ReleasedRecordDescriptor, ReleasedRecordTreatment,
     ReleasedRootDescriptor, ReleasedRootTreatment, ReleasedWriterSchemaDescriptor,
-    is_released_historical_event_schema, load_released_fixture_manifest,
-    released_fixture_authoritative_record_coverage, released_fixture_coverage_gaps,
-    released_fixture_schema_coverage, released_fixture_writer_coverage,
-    released_session_ledger_prefix_fixture_cases,
+    classify_event_kind_schema, is_released_event_kind_schema, is_released_historical_event_schema,
+    load_released_fixture_manifest, released_fixture_authoritative_record_coverage,
+    released_fixture_coverage_gaps, released_fixture_schema_coverage,
+    released_fixture_writer_coverage, released_session_ledger_prefix_fixture_cases,
 };
 pub use planning::{
     MigrationPlan, MigrationPlanError, MigrationPlanService, ReleasedEventTreatmentRow,

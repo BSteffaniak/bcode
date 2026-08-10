@@ -300,6 +300,12 @@ pub fn bundled_host_palette_commands() -> Vec<CommandContribution> {
             "session",
         ),
         CommandContribution::host_palette(
+            "session.search",
+            "Search Sessions",
+            "Search local session transcripts",
+            "session",
+        ),
+        CommandContribution::host_palette(
             "session.fork",
             "Fork Session",
             "Create a new session from an earlier prompt",
@@ -363,6 +369,17 @@ pub enum CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_palette_exposes_session_search_route() {
+        assert!(bundled_host_palette_commands().iter().any(|contribution| {
+            contribution.id == "session.search"
+                && contribution.action
+                    == CommandAction::Host {
+                        route: "session.search".to_owned(),
+                    }
+        }));
+    }
 
     #[test]
     fn bundled_palette_exposes_theme_selection_route() {

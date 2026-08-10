@@ -1,11 +1,12 @@
 use crate::RELEASED_HISTORICAL_ROOTS;
 use bcode_session_models::SessionId;
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Outcome of scanning and recovering the removed historical writer-epoch root.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct HistoricalStorageRecoveryReport {
     /// Sessions atomically relocated into canonical storage.
     pub relocated: Vec<SessionId>,
@@ -16,7 +17,7 @@ pub struct HistoricalStorageRecoveryReport {
 }
 
 /// Non-mutating diagnosis of the removed historical writer-epoch root.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct HistoricalStorageInspectionReport {
     /// Sessions that can be relocated when recovery next runs.
     pub pending_relocation: Vec<SessionId>,
@@ -27,7 +28,8 @@ pub struct HistoricalStorageInspectionReport {
 }
 
 /// Classification of the removed historical storage root for doctor output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HistoricalStorageDiagnosisStatus {
     /// No historical sessions require action.
     Ok,
@@ -40,7 +42,7 @@ pub enum HistoricalStorageDiagnosisStatus {
 }
 
 /// Migration-owned diagnosis of the removed historical storage root.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HistoricalStorageDiagnosis {
     /// Exact removed historical root.
     pub root: PathBuf,

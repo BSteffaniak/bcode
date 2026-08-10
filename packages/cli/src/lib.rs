@@ -3257,6 +3257,58 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Inventory compatibility without mutating canonical sessions.
+    MigrateInventory {
+        /// Restrict inventory to canonical session IDs.
+        #[arg(long = "session")]
+        sessions: Vec<SessionId>,
+        #[arg(long)]
+        after_timestamp_ms: Option<u64>,
+        #[arg(long)]
+        before_timestamp_ms: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start explicit bulk canonical migration.
+    MigrateStart {
+        /// Restrict migration to canonical session IDs.
+        #[arg(long = "session")]
+        sessions: Vec<SessionId>,
+        #[arg(long)]
+        after_timestamp_ms: Option<u64>,
+        #[arg(long)]
+        before_timestamp_ms: Option<u64>,
+        /// Exact destructive-operation confirmation token.
+        #[arg(long)]
+        confirm: String,
+        /// Wait until the transient aggregate operation terminates.
+        #[arg(long)]
+        foreground: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read transient aggregate bulk migration status.
+    MigrateStatus {
+        operation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait for newer transient aggregate bulk migration status.
+    MigrateWait {
+        operation_id: String,
+        #[arg(long, default_value_t = 0)]
+        after_revision: u64,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Request cooperative cancellation between per-session migrations.
+    MigrateCancel {
+        operation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// List discovered provider capabilities, versions, quota, and coverage.
     SearchStatus {
         #[arg(long)]
@@ -4058,6 +4110,7 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_session_command(command: SessionCommand) -> Result<(), CliError> {
     match command {
         SessionCommand::Create { name } => create_session(name).await?,
@@ -4086,6 +4139,13 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             limit,
             json,
         } => session_inspect(session_id, category, after, before, limit, json).await?,
+        command @ (SessionCommand::MigrateInventory { .. }
+        | SessionCommand::MigrateStart { .. }
+        | SessionCommand::MigrateStatus { .. }
+        | SessionCommand::MigrateWait { .. }
+        | SessionCommand::MigrateCancel { .. }) => {
+            handle_session_migration_subcommand(command).await?;
+        }
         command @ (SessionCommand::Search { .. }
         | SessionCommand::SearchStatus { .. }
         | SessionCommand::SearchPurge { .. }
@@ -10048,6 +10108,130 @@ async fn session_search(command: SessionSearchCliCommand) -> Result<(), CliError
     Ok(())
 }
 
+async fn handle_session_migration_subcommand(command: SessionCommand) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let (status, json, foreground) = match command {
+        SessionCommand::MigrateInventory {
+            sessions,
+            after_timestamp_ms,
+            before_timestamp_ms,
+            json,
+        } => (
+            client
+                .start_session_bulk_migration(bcode_ipc::SessionBulkMigrationStartRequest {
+                    mode: bcode_ipc::SessionBulkMigrationMode::Inventory,
+                    session_ids: sessions.into_iter().collect(),
+                    after_timestamp_ms,
+                    before_timestamp_ms,
+                    confirmation: None,
+                })
+                .await?,
+            json,
+            true,
+        ),
+        SessionCommand::MigrateStart {
+            sessions,
+            after_timestamp_ms,
+            before_timestamp_ms,
+            confirm,
+            foreground,
+            json,
+        } => (
+            client
+                .start_session_bulk_migration(bcode_ipc::SessionBulkMigrationStartRequest {
+                    mode: bcode_ipc::SessionBulkMigrationMode::Migrate,
+                    session_ids: sessions.into_iter().collect(),
+                    after_timestamp_ms,
+                    before_timestamp_ms,
+                    confirmation: Some(confirm),
+                })
+                .await?,
+            json,
+            foreground,
+        ),
+        SessionCommand::MigrateStatus { operation_id, json } => (
+            client.session_bulk_migration_status(operation_id).await?,
+            json,
+            false,
+        ),
+        SessionCommand::MigrateWait {
+            operation_id,
+            after_revision,
+            timeout_ms,
+            json,
+        } => (
+            client
+                .wait_session_bulk_migration(operation_id, after_revision, timeout_ms)
+                .await?,
+            json,
+            false,
+        ),
+        SessionCommand::MigrateCancel { operation_id, json } => (
+            client.cancel_session_bulk_migration(operation_id).await?,
+            json,
+            false,
+        ),
+        _ => unreachable!("session migration handler received another command"),
+    };
+    let status = if foreground {
+        wait_for_session_bulk_migration(&client, status).await?
+    } else {
+        status
+    };
+    print_session_bulk_migration_status(&status, json)
+}
+
+async fn wait_for_session_bulk_migration(
+    client: &BcodeClient,
+    mut status: bcode_ipc::SessionBulkMigrationOperationStatus,
+) -> Result<bcode_ipc::SessionBulkMigrationOperationStatus, CliError> {
+    while matches!(
+        status.state,
+        bcode_ipc::SessionBulkMigrationState::Running
+            | bcode_ipc::SessionBulkMigrationState::CancellationRequested
+    ) {
+        status = client
+            .wait_session_bulk_migration(status.operation_id.clone(), status.revision, 30_000)
+            .await?;
+    }
+    Ok(status)
+}
+
+fn print_session_bulk_migration_status(
+    status: &bcode_ipc::SessionBulkMigrationOperationStatus,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(status)?);
+        return Ok(());
+    }
+    println!(
+        "{}: {:?} mode={:?} revision={} selected={} visited={} migrated={} blocked={} failed={}",
+        status.operation_id,
+        status.state,
+        status.mode,
+        status.revision,
+        status.selected,
+        status.visited,
+        status.migrated,
+        status.blocked,
+        status.failed
+    );
+    for outcome in &status.outcomes {
+        println!(
+            "  {}: {:?}, action={:?}{}",
+            outcome.session_id,
+            outcome.category,
+            outcome.action,
+            outcome
+                .message
+                .as_deref()
+                .map_or_else(String::new, |message| format!(": {message}"))
+        );
+    }
+    Ok(())
+}
+
 async fn session_search_status(json: bool) -> Result<(), CliError> {
     let response = BcodeClient::default_endpoint()
         .session_search_providers()
@@ -10350,6 +10534,63 @@ fn complete_backfill_terminal_result(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBackfillWaitRecovery {
+    ReturnWait,
+    ReadStatus,
+    ReinvokeAfterRestart,
+}
+
+fn classify_session_backfill_wait_recovery(
+    result: &Result<bcode_session_search::SessionSearchBackfillOperationStatus, ClientError>,
+    daemon_instance_id: &str,
+    current_daemon_instance_id: Option<&str>,
+) -> SessionBackfillWaitRecovery {
+    if result.is_ok() {
+        return SessionBackfillWaitRecovery::ReturnWait;
+    }
+    if !matches!(result, Err(ClientError::RequestTimeout { .. })) {
+        return SessionBackfillWaitRecovery::ReturnWait;
+    }
+    if current_daemon_instance_id == Some(daemon_instance_id) {
+        SessionBackfillWaitRecovery::ReadStatus
+    } else {
+        SessionBackfillWaitRecovery::ReinvokeAfterRestart
+    }
+}
+
+async fn session_search_backfill_wait_recovering(
+    client: &BcodeClient,
+    operation_id: &str,
+    after_revision: u64,
+    timeout_ms: u64,
+    daemon_instance_id: &str,
+) -> Result<bcode_session_search::SessionSearchBackfillOperationStatus, ClientError> {
+    let wait = client
+        .session_search_backfill_wait(operation_id.to_owned(), after_revision, timeout_ms)
+        .await;
+    if !matches!(wait, Err(ClientError::RequestTimeout { .. })) {
+        return wait;
+    }
+    let status = client.server_status().await?;
+    match classify_session_backfill_wait_recovery(
+        &wait,
+        daemon_instance_id,
+        Some(&status.daemon.instance_id),
+    ) {
+        SessionBackfillWaitRecovery::ReadStatus => {
+            client
+                .session_search_backfill_status(operation_id.to_owned())
+                .await
+        }
+        SessionBackfillWaitRecovery::ReinvokeAfterRestart => Err(ClientError::Protocol(
+            "session-search backfill operation state was lost with the prior daemon; explicitly re-invoke backfill to continue from provider checkpoints"
+                .to_owned(),
+        )),
+        SessionBackfillWaitRecovery::ReturnWait => wait,
+    }
+}
+
 async fn session_search_backfill(
     provider: Option<String>,
     sessions: Vec<SessionId>,
@@ -10360,6 +10601,7 @@ async fn session_search_backfill(
     json: bool,
 ) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
+    let daemon_instance_id = client.server_status().await?.daemon.instance_id;
     let started = client
         .session_search_complete_backfill_start(
             bcode_session_search::CompleteSessionSearchBackfillRequest {
@@ -10373,8 +10615,13 @@ async fn session_search_backfill(
         .await?;
     let mut revision = 0;
     loop {
-        let wait =
-            client.session_search_backfill_wait(started.operation_id.clone(), revision, 30_000);
+        let wait = session_search_backfill_wait_recovering(
+            &client,
+            &started.operation_id,
+            revision,
+            30_000,
+            &daemon_instance_id,
+        );
         let status = tokio::select! {
             result = wait => result?,
             signal = tokio::signal::ctrl_c() => {
@@ -10392,6 +10639,7 @@ async fn session_search_backfill(
         if matches!(
             status.state,
             bcode_session_search::SessionSearchBackfillOperationState::Completed
+                | bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention
                 | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
                 | bcode_session_search::SessionSearchBackfillOperationState::Failed
         ) {
@@ -10535,6 +10783,8 @@ struct SessionDiagnosis {
     canonical_event_count: u64,
     event_schema_counts: BTreeMap<u16, u64>,
     event_kind_counts: BTreeMap<String, u64>,
+    first_unknown_event_schema: Option<u16>,
+    first_unknown_event_kind: Option<String>,
     strict_history_error: Option<String>,
     classification: String,
     migration_source_writer_epoch: Option<u64>,
@@ -10607,6 +10857,9 @@ async fn collect_session_diagnosis(
     });
     let (canonical_event_count, inventory_tail, event_schema_counts, event_kind_counts) =
         db.canonical_event_inventory().await?;
+    let first_unknown_event = db.first_unknown_event_envelope().await?;
+    let (first_unknown_event_schema, first_unknown_event_kind) =
+        first_unknown_event.map_or((None, None), |(schema, kind)| (Some(schema), Some(kind)));
     let canonical_tail = inventory_tail;
     let write_readiness = db
         .validate_write_readiness()
@@ -10694,6 +10947,8 @@ async fn collect_session_diagnosis(
             canonical_event_count,
             event_schema_counts,
             event_kind_counts,
+            first_unknown_event_schema,
+            first_unknown_event_kind,
             strict_history_error,
             classification: classification.as_str().to_owned(),
             migration_source_writer_epoch: migration_plan
@@ -10879,13 +11134,43 @@ async fn retired_catalogs(apply: bool, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct SessionDoctorScanReport {
+    historical_storage: bcode_session_migration::HistoricalStorageDiagnosis,
+    reports: Vec<bcode_session::repair::RepairReport>,
+}
+
+fn write_json_line<W: std::io::Write, T: Serialize>(
+    output: &mut W,
+    value: &T,
+) -> Result<(), serde_json::Error> {
+    serde_json::to_writer_pretty(&mut *output, value)?;
+    serde_json::to_writer(output, "\n")
+}
+
+fn write_json_stdout<T: Serialize>(value: &T) -> Result<(), CliError> {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    match write_json_line(&mut output, value) {
+        Ok(()) => Ok(()),
+        Err(error) if error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<(), CliError> {
     let root = bcode_config::default_session_store_dir();
     let dry_run = matches!(options.mode, SessionRepairCliMode::DryRun);
+    let json = matches!(options.output, SessionRepairCliOutput::Json);
+    let mut historical_storage = None;
     let mut reports = Vec::new();
     match options.target {
         SessionRepairCliTarget::Scan => {
-            print_historical_storage_diagnosis(root.parent().unwrap_or(&root))?;
+            let historical = collect_historical_storage_diagnosis(root.parent().unwrap_or(&root))?;
+            if !json {
+                print_historical_storage_diagnosis(&historical);
+            }
+            historical_storage = Some(historical);
             reports.push(repair_catalog_report(&root, dry_run).await?);
             for session_id in discover_session_ids(&root)? {
                 reports.push(repair_session_report(&root, session_id, dry_run).await?);
@@ -10908,8 +11193,15 @@ async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<
             "provide a session id, --catalog, or --scan".to_string(),
         ));
     }
-    if matches!(options.output, SessionRepairCliOutput::Json) {
-        println!("{}", serde_json::to_string_pretty(&reports)?);
+    if json {
+        if let Some(historical_storage) = historical_storage {
+            write_json_stdout(&SessionDoctorScanReport {
+                historical_storage,
+                reports,
+            })?;
+        } else {
+            write_json_stdout(&reports)?;
+        }
     } else {
         for report in &reports {
             print_repair_report(report);
@@ -10918,16 +11210,22 @@ async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<
     Ok(())
 }
 
-fn print_historical_storage_diagnosis(state_dir: &Path) -> Result<(), CliError> {
-    let diagnosis = session_migration_adapter::diagnose_historical_session_storage(state_dir)?;
+fn collect_historical_storage_diagnosis(
+    state_dir: &Path,
+) -> Result<bcode_session_migration::HistoricalStorageDiagnosis, CliError> {
+    Ok(session_migration_adapter::diagnose_historical_session_storage(state_dir)?)
+}
+
+fn print_historical_storage_diagnosis(
+    diagnosis: &bcode_session_migration::HistoricalStorageDiagnosis,
+) {
     println!("target: historical storage");
     println!("path: {}", display_from_current_dir(&diagnosis.root));
     println!("status: {:?}", diagnosis.status);
-    for note in diagnosis.notes {
+    for note in &diagnosis.notes {
         println!("note: {note}");
     }
     println!();
-    Ok(())
 }
 
 async fn repair_session_report(
@@ -11022,6 +11320,8 @@ struct SessionStorageDiagnosis {
     canonical_event_count: u64,
     event_schema_counts: BTreeMap<u16, u64>,
     event_kind_counts: BTreeMap<String, u64>,
+    first_unknown_event_schema: Option<u16>,
+    first_unknown_event_kind: Option<String>,
     strict_history_error: Option<String>,
     classification: String,
     migration_source_writer_epoch: Option<u64>,
@@ -11083,6 +11383,8 @@ impl SessionDiagnosis {
             canonical_event_count: storage.canonical_event_count,
             event_schema_counts: storage.event_schema_counts,
             event_kind_counts: storage.event_kind_counts,
+            first_unknown_event_schema: storage.first_unknown_event_schema,
+            first_unknown_event_kind: storage.first_unknown_event_kind,
             strict_history_error: storage.strict_history_error,
             classification: storage.classification,
             migration_source_writer_epoch: storage.migration_source_writer_epoch,
@@ -11140,6 +11442,12 @@ fn print_session_diagnosis(diagnosis: &SessionDiagnosis) {
     println!("canonical events: {}", diagnosis.canonical_event_count);
     println!("event schemas: {:?}", diagnosis.event_schema_counts);
     println!("event kinds: {:?}", diagnosis.event_kind_counts);
+    if let (Some(schema), Some(kind)) = (
+        diagnosis.first_unknown_event_schema,
+        diagnosis.first_unknown_event_kind.as_deref(),
+    ) {
+        println!("first unknown event: schema={schema} kind={kind}");
+    }
     if let Some(error) = &diagnosis.strict_history_error {
         println!("strict history: unavailable ({error})");
     }
@@ -13260,6 +13568,79 @@ mod theme_command_tests {
 }
 
 #[cfg(test)]
+mod session_migration_cli_tests {
+    use super::*;
+
+    fn parse_session_command(arguments: &[&str]) -> SessionCommand {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let matches = Cli::command()
+            .try_get_matches_from(arguments)
+            .expect("session command parses");
+        let cli = Cli::from_arg_matches(&matches).expect("session command decodes");
+        let Some(Commands::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        command
+    }
+
+    #[test]
+    fn bulk_migration_cli_exposes_inventory_confirmed_start_and_lifecycle_commands() {
+        assert!(matches!(
+            parse_session_command(&[
+                "bcode",
+                "session",
+                "migrate-inventory",
+                "--after-timestamp-ms",
+                "10",
+                "--json",
+            ]),
+            SessionCommand::MigrateInventory {
+                after_timestamp_ms: Some(10),
+                json: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_session_command(&[
+                "bcode",
+                "session",
+                "migrate-start",
+                "--confirm",
+                "migrate-supported-sessions",
+                "--foreground",
+            ]),
+            SessionCommand::MigrateStart {
+                confirm,
+                foreground: true,
+                ..
+            } if confirm == bcode_ipc::SESSION_BULK_MIGRATION_CONFIRMATION
+        ));
+        assert!(matches!(
+            parse_session_command(&["bcode", "session", "migrate-status", "operation-1"]),
+            SessionCommand::MigrateStatus { operation_id, .. } if operation_id == "operation-1"
+        ));
+        assert!(matches!(
+            parse_session_command(&[
+                "bcode",
+                "session",
+                "migrate-wait",
+                "operation-1",
+                "--after-revision",
+                "4",
+            ]),
+            SessionCommand::MigrateWait {
+                after_revision: 4,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_session_command(&["bcode", "session", "migrate-cancel", "operation-1"]),
+            SessionCommand::MigrateCancel { operation_id, .. } if operation_id == "operation-1"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod web_command_tests {
     use super::*;
 
@@ -13383,6 +13764,54 @@ mod web_command_tests {
     }
 
     #[test]
+    fn json_writer_treats_broken_downstream_pipe_as_clean_termination_signal() {
+        struct BrokenPipe;
+
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_json_line(&mut BrokenPipe, &serde_json::json!({ "ok": true }))
+            .expect_err("closed pipe");
+        assert_eq!(error.io_error_kind(), Some(std::io::ErrorKind::BrokenPipe));
+    }
+
+    #[test]
+    fn backfill_wait_recovery_reads_status_only_for_the_same_daemon() {
+        let timeout = Err(ClientError::RequestTimeout {
+            timeout: Duration::from_secs(35),
+        });
+        assert_eq!(
+            classify_session_backfill_wait_recovery(&timeout, "daemon-a", Some("daemon-a")),
+            SessionBackfillWaitRecovery::ReadStatus
+        );
+        assert_eq!(
+            classify_session_backfill_wait_recovery(&timeout, "daemon-a", Some("daemon-b")),
+            SessionBackfillWaitRecovery::ReinvokeAfterRestart
+        );
+        let completed = Ok(bcode_session_search::SessionSearchBackfillOperationStatus {
+            operation_id: "operation".to_owned(),
+            provider_id: "provider".to_owned(),
+            revision: 1,
+            state: bcode_session_search::SessionSearchBackfillOperationState::Completed,
+            response: None,
+            complete_progress: None,
+            complete_response: None,
+            error: None,
+        });
+        assert_eq!(
+            classify_session_backfill_wait_recovery(&completed, "daemon-a", Some("daemon-b")),
+            SessionBackfillWaitRecovery::ReturnWait
+        );
+    }
+
+    #[test]
     fn session_search_maintenance_commands_require_provider_confirmation() {
         let purge = Cli::try_parse_from([
             "bcode",
@@ -13464,6 +13893,7 @@ mod web_command_tests {
                     incomplete_sessions: 1,
                     failed_sessions: 0,
                     catalog_pages: 1,
+                    issues: Vec::new(),
                     error: None,
                 },
             ],

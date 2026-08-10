@@ -1594,6 +1594,92 @@ impl SessionDb {
         &**self.db
     }
 
+    /// Return the first non-current canonical event envelope, if any.
+    ///
+    /// This bounded scalar query does not decode payloads, replay history, or mutate storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or its row is malformed.
+    pub async fn first_non_current_event_envelope(&self) -> SessionDbResult<Option<(u16, String)>> {
+        let current = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
+        let query = format!(
+            "SELECT schema_version, event_type FROM events WHERE schema_version != {current} ORDER BY event_seq ASC LIMIT 1"
+        );
+        let row = self.db.query_raw(&query).await?.into_iter().next();
+        row.as_ref()
+            .map(|row| {
+                Ok((
+                    u16::try_from(required_non_negative_u64(row, "schema_version")?).map_err(
+                        |_| SessionDbError::InvalidRow {
+                            column: "events.schema_version".to_owned(),
+                        },
+                    )?,
+                    required_string(row, "event_type")?,
+                ))
+            })
+            .transpose()
+    }
+
+    /// Return a bounded inventory of distinct canonical event envelopes.
+    ///
+    /// The boolean is true when more distinct envelopes exist than the returned portable bound.
+    /// This query does not decode payloads, replay history, or mutate storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or a row is malformed.
+    pub async fn event_envelope_inventory(&self) -> SessionDbResult<(Vec<(u16, String)>, bool)> {
+        const MAX_ENVELOPES: usize = 256;
+        let query = format!(
+            "SELECT event_type, schema_version, MIN(event_seq) AS first_event_seq \
+             FROM events GROUP BY event_type, schema_version \
+             ORDER BY first_event_seq ASC LIMIT {}",
+            MAX_ENVELOPES + 1
+        );
+        let rows = self.db.query_raw(&query).await?;
+        let truncated = rows.len() > MAX_ENVELOPES;
+        let mut envelopes = Vec::with_capacity(rows.len().min(MAX_ENVELOPES));
+        for row in rows.into_iter().take(MAX_ENVELOPES) {
+            let event_kind = required_string(&row, "event_type")?;
+            let event_schema = u16::try_from(required_non_negative_u64(&row, "schema_version")?)
+                .map_err(|_| SessionDbError::InvalidRow {
+                    column: "events.schema_version".to_owned(),
+                })?;
+            envelopes.push((event_schema, event_kind));
+        }
+        Ok((envelopes, truncated))
+    }
+
+    /// Return the first canonical event envelope outside current/released migration inventory.
+    ///
+    /// This bounded scalar query does not decode payloads, replay history, or mutate storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or a row is malformed.
+    pub async fn first_unknown_event_envelope(&self) -> SessionDbResult<Option<(u16, String)>> {
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["event_type", "schema_version"])
+            .sort("event_seq", SortDirection::Asc)
+            .limit(256)
+            .execute(&**self.db)
+            .await?;
+        for row in rows {
+            let event_kind = required_string(&row, "event_type")?;
+            let event_schema = u16::try_from(required_non_negative_u64(&row, "schema_version")?)
+                .map_err(|_| SessionDbError::InvalidRow {
+                    column: "events.schema_version".to_owned(),
+                })?;
+            if event_schema > bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION {
+                return Ok(Some((event_schema, event_kind)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Return the oldest non-current canonical event schema, if any.
     ///
     /// This bounded scalar query does not decode payloads, replay history, or mutate storage.
@@ -4369,11 +4455,12 @@ mod tests {
         assert!(catalog.is_closed().await.expect("closed probe"));
     }
 
-    async fn insert_raw_history_event(
+    async fn insert_raw_history_event_with_schema(
         db: &SessionDb,
         session_id: SessionId,
         sequence: u64,
         event_type: &str,
+        schema_version: u16,
         kind: serde_json::Value,
     ) {
         db.database()
@@ -4382,13 +4469,13 @@ mod tests {
             .value("event_type", event_type)
             .value(
                 "schema_version",
-                DatabaseValue::Int32(i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION)),
+                DatabaseValue::Int32(i32::from(schema_version)),
             )
             .value("created_at_ms", seq_to_value(sequence))
             .value(
                 "payload",
                 serde_json::json!({
-                    "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    "schema_version": schema_version,
                     "sequence": sequence,
                     "session_id": session_id,
                     "kind": kind,
@@ -4398,6 +4485,24 @@ mod tests {
             .execute(db.database())
             .await
             .expect("insert raw history event");
+    }
+
+    async fn insert_raw_history_event(
+        db: &SessionDb,
+        session_id: SessionId,
+        sequence: u64,
+        event_type: &str,
+        kind: serde_json::Value,
+    ) {
+        insert_raw_history_event_with_schema(
+            db,
+            session_id,
+            sequence,
+            event_type,
+            CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            kind,
+        )
+        .await;
     }
 
     async fn reindex_model_context_for_test(
@@ -4469,6 +4574,34 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn first_unknown_event_envelope_is_bounded_and_fails_closed_for_future_schema() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open db");
+        insert_raw_history_event_with_schema(
+            &db,
+            session_id,
+            0,
+            "future_event_kind",
+            CURRENT_SESSION_EVENT_SCHEMA_VERSION + 1,
+            serde_json::json!({"future_event_kind": {}}),
+        )
+        .await;
+
+        assert_eq!(
+            db.first_unknown_event_envelope()
+                .await
+                .expect("bounded classification"),
+            Some((
+                CURRENT_SESSION_EVENT_SCHEMA_VERSION + 1,
+                "future_event_kind".to_owned()
+            ))
+        );
     }
 
     #[tokio::test]

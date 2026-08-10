@@ -72,7 +72,7 @@ fn header_line(mode: SessionPickerMode) -> Line {
         SessionPickerMode::Rename => "  Enter saves rename  Esc cancels",
         SessionPickerMode::DeleteConfirm => "  Y confirms delete  N/Esc cancels",
         SessionPickerMode::TranscriptSearch => {
-            "  Enter opens canonical result  Up/Down select  Esc returns to sessions"
+            "  Enter searches/opens selected canonical result  Up/Down select  Esc returns to sessions"
         }
     };
     Line::from_spans(vec![

@@ -150,6 +150,15 @@ impl SessionPickerApp {
         self.refresh_filter();
     }
 
+    /// Enter transcript-search query mode.
+    pub fn start_transcript_search(&mut self) {
+        self.search_results.clear();
+        self.mode = SessionPickerMode::TranscriptSearch;
+        self.list = FilteredListState::new(0);
+        "Type a transcript query, then press Enter".clone_into(&mut self.status);
+        "No transcript search results".clone_into(&mut self.empty_message);
+    }
+
     /// Install one bounded terminal transcript-search result set.
     pub fn set_search_results(
         &mut self,
@@ -490,6 +499,16 @@ mod tests {
             ),
             message: None,
         }
+    }
+
+    #[test]
+    fn transcript_search_mode_accepts_query_before_results_exist() {
+        let mut app = SessionPickerApp::new(Vec::new());
+        app.start_transcript_search();
+
+        assert_eq!(app.mode(), SessionPickerMode::TranscriptSearch);
+        assert!(app.selected_search_result().is_none());
+        assert!(app.status().contains("press Enter"));
     }
 
     #[test]

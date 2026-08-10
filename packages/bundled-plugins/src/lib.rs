@@ -434,7 +434,6 @@ fn compressed_session_search_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"),
         bcode_compressed_session_search_plugin::static_plugin(),
     )
-    .with_default_activation(bcode_plugin::PluginDefaultActivation::Disabled)
 }
 
 #[cfg(feature = "static-bundled-tantivy-session-search-plugin")]
@@ -826,7 +825,7 @@ mod tests {
         assert!(
             default_ids
                 .iter()
-                .all(|id| id != "bcode.compressed-session-search")
+                .any(|id| id == "bcode.compressed-session-search")
         );
 
         let default_selection = bcode_config::plugin_selection_with_default_plugin_ids(
@@ -834,11 +833,11 @@ mod tests {
             &default_ids,
         );
         assert!(default_selection.is_enabled("bcode.tantivy-session-search"));
-        assert!(!default_selection.is_enabled("bcode.compressed-session-search"));
+        assert!(default_selection.is_enabled("bcode.compressed-session-search"));
 
         let compressed_config = bcode_config::BcodeConfig {
             plugins: bcode_config::PluginConfig {
-                enabled: std::collections::BTreeSet::from([
+                disabled: std::collections::BTreeSet::from([
                     "bcode.compressed-session-search".to_owned()
                 ]),
                 ..bcode_config::PluginConfig::default()
@@ -849,7 +848,7 @@ mod tests {
             &compressed_config,
             &default_ids,
         );
-        assert!(compressed_selection.is_enabled("bcode.compressed-session-search"));
+        assert!(!compressed_selection.is_enabled("bcode.compressed-session-search"));
 
         let disabled_config = bcode_config::BcodeConfig {
             plugins: bcode_config::PluginConfig {

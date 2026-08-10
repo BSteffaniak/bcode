@@ -14,7 +14,9 @@ use bcode_ipc::{
     RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
     RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
     RalphRunStatusResponse, RalphStatusRequest, RalphStatusResponse, Request, Response,
-    ResponsePayload, ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus,
+    ResponsePayload, ServerStopMode, SessionBulkMigrationOperationStatus,
+    SessionBulkMigrationStartRequest, SessionCatalogSourceStatus, SessionCatalogStatus,
+    SessionCompatibilityInventoryRequest, SessionCompatibilityInventoryResponse,
     SessionImportWarning, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
     WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory,
     decode_event, decode_response, default_endpoint, recv_envelope, request_envelope,
@@ -35,6 +37,7 @@ use thiserror::Error;
 const DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CLIENT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
+const LONG_POLL_TRANSPORT_GRACE: Duration = Duration::from_secs(5);
 
 /// Bounded generic session artifact byte range.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1331,6 +1334,104 @@ impl BcodeClient {
         }
     }
 
+    /// Read one bounded, non-mutating session compatibility inventory page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_compatibility_inventory(
+        &self,
+        request: SessionCompatibilityInventoryRequest,
+    ) -> Result<SessionCompatibilityInventoryResponse, ClientError> {
+        match self
+            .send_request(Request::SessionCompatibilityInventory { request })
+            .await?
+        {
+            ResponsePayload::SessionCompatibilityInventory { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Start explicit bounded bulk canonical migration or its inventory mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn start_session_bulk_migration(
+        &self,
+        request: SessionBulkMigrationStartRequest,
+    ) -> Result<SessionBulkMigrationOperationStatus, ClientError> {
+        match self
+            .send_request(Request::SessionBulkMigrationStart { request })
+            .await?
+        {
+            ResponsePayload::SessionBulkMigrationOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read transient bulk migration operation status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the operation is unavailable.
+    pub async fn session_bulk_migration_status(
+        &self,
+        operation_id: String,
+    ) -> Result<SessionBulkMigrationOperationStatus, ClientError> {
+        match self
+            .send_request(Request::SessionBulkMigrationStatus { operation_id })
+            .await?
+        {
+            ResponsePayload::SessionBulkMigrationOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Wait for a newer transient bulk migration operation revision.
+    ///
+    /// Aggregate operation state is daemon-local and is not durable across restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the operation is unavailable.
+    pub async fn wait_session_bulk_migration(
+        &self,
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    ) -> Result<SessionBulkMigrationOperationStatus, ClientError> {
+        match self
+            .send_request(Request::SessionBulkMigrationWait {
+                operation_id,
+                after_revision,
+                timeout_ms,
+            })
+            .await?
+        {
+            ResponsePayload::SessionBulkMigrationOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Request cooperative bulk migration cancellation between sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the operation is unavailable.
+    pub async fn cancel_session_bulk_migration(
+        &self,
+        operation_id: String,
+    ) -> Result<SessionBulkMigrationOperationStatus, ClientError> {
+        match self
+            .send_request(Request::SessionBulkMigrationCancel { operation_id })
+            .await?
+        {
+            ResponsePayload::SessionBulkMigrationOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Import an external session and return the native Bcode session plus one-time warnings.
     ///
     /// # Errors
@@ -2004,12 +2105,20 @@ impl BcodeClient {
         after_revision: u64,
         timeout_ms: u64,
     ) -> Result<bcode_session_search::SessionSearchBackfillOperationStatus, ClientError> {
+        validate_session_search_backfill_wait_timeout(timeout_ms)?;
+        let server_wait = Duration::from_millis(timeout_ms);
+        let response_timeout = self
+            .request_timeout
+            .max(server_wait.saturating_add(LONG_POLL_TRANSPORT_GRACE));
         match self
-            .send_request(Request::SessionSearchBackfillWait {
-                operation_id,
-                after_revision,
-                timeout_ms,
-            })
+            .send_request_with_timeout(
+                Request::SessionSearchBackfillWait {
+                    operation_id,
+                    after_revision,
+                    timeout_ms,
+                },
+                response_timeout,
+            )
             .await?
         {
             ResponsePayload::SessionSearchBackfillOperation { status } => Ok(status),
@@ -4326,6 +4435,16 @@ impl BcodeClient {
         self.send_request_once(request).await
     }
 
+    async fn send_request_with_timeout(
+        &self,
+        request: Request,
+        request_timeout: Duration,
+    ) -> Result<ResponsePayload, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        connection.request_timeout = request_timeout;
+        connection.send_request(request).await
+    }
+
     async fn send_request_once(&self, request: Request) -> Result<ResponsePayload, ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
         connection.send_request(request).await
@@ -4521,6 +4640,24 @@ impl ClientConnection {
                 catalog_sources,
                 catalog_revision,
             }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read one bounded, non-mutating session compatibility inventory page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_compatibility_inventory(
+        &mut self,
+        request: SessionCompatibilityInventoryRequest,
+    ) -> Result<SessionCompatibilityInventoryResponse, ClientError> {
+        match self
+            .send_request(Request::SessionCompatibilityInventory { request })
+            .await?
+        {
+            ResponsePayload::SessionCompatibilityInventory { response } => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -4976,6 +5113,15 @@ fn session_open_attach_readiness(
         }),
         None => Err(ClientError::UnexpectedResponse),
     }
+}
+
+fn validate_session_search_backfill_wait_timeout(timeout_ms: u64) -> Result<(), ClientError> {
+    if timeout_ms == 0 || timeout_ms > 30_000 {
+        return Err(ClientError::Protocol(
+            "backfill wait timeout must be between 1 and 30000 milliseconds".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn terminal_session_open_error_message(
@@ -5661,6 +5807,23 @@ mod client_timeout_tests {
 
         assert_eq!(client.request_timeout(), Duration::from_secs(23));
         drop(guard);
+    }
+
+    #[test]
+    fn backfill_wait_timeout_uses_server_bound_plus_transport_grace() {
+        let client =
+            BcodeClient::default_endpoint().with_request_timeout(Duration::from_millis(10));
+        let response_timeout = client
+            .request_timeout()
+            .max(Duration::from_secs(30).saturating_add(super::LONG_POLL_TRANSPORT_GRACE));
+
+        assert_eq!(response_timeout, Duration::from_secs(35));
+        assert!(super::validate_session_search_backfill_wait_timeout(1).is_ok());
+        assert!(super::validate_session_search_backfill_wait_timeout(30_000).is_ok());
+        assert!(matches!(
+            super::validate_session_search_backfill_wait_timeout(30_001),
+            Err(ClientError::Protocol(_))
+        ));
     }
 
     #[test]

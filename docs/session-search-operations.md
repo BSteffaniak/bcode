@@ -19,16 +19,20 @@ Set `enabled = false` to suppress provider inventory, queries, maintenance, dirt
 and ingestion-worker startup while preserving canonical investigation commands. Disabling search or
 a provider does not delete retained derived data.
 
-The standard distribution enables the bundled Tantivy transcript provider by default. Its disposable
-state root is host-managed beneath the artifact-isolated Bcode state directory, so ordinary local
-search requires no plugin selection or `storage_root` setting. The compressed deep-output provider is
-bundled but disabled by default because it copies high-volume shell/tool output into derived state.
-Enable it explicitly when that coverage is wanted:
+The standard distribution enables both bundled local providers by default. Their disposable state
+roots are host-managed beneath the artifact-isolated Bcode state directory, so local search requires
+no plugin selection or `storage_root` setting. Tantivy indexes ordinary transcript content. The
+compressed provider separately copies eligible high-volume shell/tool output into quota-bounded
+derived state for explicit deep queries. Disable either provider independently when that retained
+coverage is not wanted:
 
 ```toml
 [plugins]
-enabled = ["bcode.compressed-session-search"]
+disabled = ["bcode.compressed-session-search"]
 ```
+
+Disabling compressed search stops its ingestion and query I/O without deleting retained derived
+state; explicit deep query intent is still required even while the provider is enabled.
 
 Plugin settings remain provider-owned overrides. An explicit `storage_root` replaces the host-managed
 root and is not automatically retired with stale daemon artifacts:
@@ -226,11 +230,12 @@ may be enabled, implementation and tests must enforce:
 These are provider-owned derived-state limits. They do not expand canonical read bounds or permit the
 provider to open canonical storage.
 
-The optional compressed deep-output provider stores only approved normalized `shell_output` and
+The default compressed deep-output provider stores only approved normalized `shell_output` and
 `tool_output` records delivered through the session-search service. It owns a versioned manifest and
 independently checksummed Zstd chunks under its confined `storage_root`; it never opens canonical
 session storage. The provider is separately compiled, selected, configured, and disableable from
-Tantivy. It advertises scan execution with literal terms, phrase, and bounded Rust-regex semantics.
+Tantivy. Although default-enabled for bounded ingestion, it advertises scan execution only for
+literal terms, phrase, and bounded Rust-regex semantics reached through explicit deep query intent.
 
 Provider defaults and hard bounds are 256 KiB/64 records per chunk, 128 chunks per invocation,
 256 MiB normalized bytes per session, 8 GiB compressed provider quota, 64 MiB cache, 200 hits, and

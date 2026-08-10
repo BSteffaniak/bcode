@@ -29,6 +29,7 @@ pub enum BmuxAction {
     AppInterrupt,
     ClipboardPasteImage,
     CommandPaletteOpen,
+    SessionSearchOpen,
     AgentCycle,
     ThinkingEffortCycle,
     DiffViewerLayoutCycle,
@@ -88,6 +89,7 @@ impl BmuxAction {
             "app.interrupt" => Self::AppInterrupt,
             "app.clipboard.pasteImage" => Self::ClipboardPasteImage,
             "app.command_palette" => Self::CommandPaletteOpen,
+            "tui.session.search" => Self::SessionSearchOpen,
             "tui.agent.cycle" => Self::AgentCycle,
             "tui.thinking.effort.cycle" => Self::ThinkingEffortCycle,
             "tui.diff_viewer.layout_cycle" => Self::DiffViewerLayoutCycle,
@@ -279,6 +281,7 @@ impl BmuxKeyMap {
             | BmuxAction::AppInterrupt
             | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
+            | BmuxAction::SessionSearchOpen
             | BmuxAction::AgentCycle
             | BmuxAction::ThinkingEffortCycle
             | BmuxAction::DiffViewerLayoutCycle
@@ -338,6 +341,7 @@ impl BmuxKeyMap {
             | BmuxAction::AppInterrupt
             | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
+            | BmuxAction::SessionSearchOpen
             | BmuxAction::AgentCycle
             | BmuxAction::ThinkingEffortCycle
             | BmuxAction::DiffViewerLayoutCycle
@@ -410,6 +414,7 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<BmuxKeyBinding>> {
                 ),
                 bind("ctrl+v", BmuxAction::ClipboardPasteImage),
                 bind("ctrl+p", BmuxAction::CommandPaletteOpen),
+                bind("ctrl+g", BmuxAction::SessionSearchOpen),
                 bind("tab", BmuxAction::AgentCycle),
                 bind("shift+tab", BmuxAction::ThinkingEffortCycle),
                 bind("ctrl+tab", BmuxAction::MarkdownFocusNext),
@@ -541,6 +546,46 @@ mod tests {
 
     fn default_keymap() -> BmuxKeyMap {
         BmuxKeyMap::from_config(&TuiConfig::default())
+    }
+
+    #[test]
+    fn global_session_search_binding_is_discoverable_and_configurable() {
+        let keymap = default_keymap();
+        let default_stroke = KeyStroke::with_modifiers(
+            KeyCode::Char('g'),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(
+            keymap.action_for_key(BmuxScope::Chat, default_stroke),
+            Some(BmuxAction::SessionSearchOpen)
+        );
+
+        let mut config = TuiConfig::default();
+        config
+            .keybindings
+            .chat
+            .insert("ctrl+s".to_owned(), "tui.session.search".to_owned());
+        let configured = BmuxKeyMap::from_config(&config);
+        assert_eq!(
+            configured.action_for_key(
+                BmuxScope::Chat,
+                KeyStroke::with_modifiers(
+                    KeyCode::Char('s'),
+                    Modifiers {
+                        ctrl: true,
+                        ..Modifiers::NONE
+                    }
+                )
+            ),
+            Some(BmuxAction::SessionSearchOpen)
+        );
+        assert_eq!(
+            configured.action_for_key(BmuxScope::Chat, default_stroke),
+            None
+        );
     }
 
     #[test]

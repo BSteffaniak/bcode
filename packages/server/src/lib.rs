@@ -14,6 +14,7 @@ pub(crate) mod context_compaction;
 mod invariant_guidance;
 mod model_ignores;
 mod runtime_work;
+mod session_bulk_migration;
 mod session_migration_adapter;
 mod session_migration_execution;
 
@@ -87,7 +88,7 @@ use bcode_session_models::ExecutionSessionProvenance;
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
-    SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionLiveEventKind,
+    SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionLiveEventKind, SessionSummary,
     SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
     ToolInvocationResult, TraceBlobRef, TraceRedaction, TurnExecutionCorrelation,
     TurnExecutionOptions, TurnOrigin, TurnPriority, TurnStructuredOutputRequest, TurnToolPolicy,
@@ -328,6 +329,13 @@ struct SessionSearchBackfillOperation {
 }
 
 #[derive(Debug)]
+struct SessionBulkMigrationOperation {
+    status: bcode_ipc::SessionBulkMigrationOperationStatus,
+    cancellation_requested: bool,
+    changed: Arc<Notify>,
+}
+
+#[derive(Debug)]
 pub struct ServerState {
     pub sessions: SessionManager,
     session_migrations: bcode_session_migration::SessionMigrationService,
@@ -337,6 +345,7 @@ pub struct ServerState {
     session_search_dirty: session_search::SessionSearchDirtyQueue,
     session_search_work: session_search::SessionSearchWorkScheduler,
     session_search_backfills: Mutex<BTreeMap<String, SessionSearchBackfillOperation>>,
+    session_bulk_migrations: Mutex<BTreeMap<String, SessionBulkMigrationOperation>>,
     next_session_search_backfill_id: std::sync::atomic::AtomicU64,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
     selected_provider_plugin_id: Option<String>,
@@ -1549,6 +1558,7 @@ impl ServerState {
             session_search_dirty: session_search::SessionSearchDirtyQueue::default(),
             session_search_work: session_search::SessionSearchWorkScheduler::default(),
             session_search_backfills: Mutex::default(),
+            session_bulk_migrations: Mutex::default(),
             next_session_search_backfill_id: std::sync::atomic::AtomicU64::new(1),
             model_catalog: init
                 .model_catalog
@@ -3872,6 +3882,11 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ReleaseSessionOwnership { .. } => "release_session_ownership",
         Request::CreateSession { .. } => "create_session",
         Request::ListSessions { .. } => "list_sessions",
+        Request::SessionBulkMigrationStart { .. } => "session_bulk_migration_start",
+        Request::SessionBulkMigrationStatus { .. } => "session_bulk_migration_status",
+        Request::SessionBulkMigrationWait { .. } => "session_bulk_migration_wait",
+        Request::SessionBulkMigrationCancel { .. } => "session_bulk_migration_cancel",
+        Request::SessionCompatibilityInventory { .. } => "session_compatibility_inventory",
         Request::RenameSession { .. } => "rename_session",
         Request::DeleteSession { .. } => "delete_session",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
@@ -4135,6 +4150,48 @@ async fn handle_request_inner(
         } => handle_create_session(request_id, state, writer, name, working_directory).await,
         Request::ListSessions { working_directory } => {
             handle_list_sessions(request_id, state, writer, &working_directory).await
+        }
+        Request::SessionCompatibilityInventory { request } => {
+            handle_session_compatibility_inventory(request_id, state, writer, request).await
+        }
+        Request::SessionBulkMigrationStart { request } => {
+            session_bulk_migration::handle_session_bulk_migration_start(
+                request_id, state, writer, request,
+            )
+            .await
+        }
+        Request::SessionBulkMigrationStatus { operation_id } => {
+            session_bulk_migration::handle_session_bulk_migration_status(
+                request_id,
+                state,
+                writer,
+                &operation_id,
+            )
+            .await
+        }
+        Request::SessionBulkMigrationWait {
+            operation_id,
+            after_revision,
+            timeout_ms,
+        } => {
+            session_bulk_migration::handle_session_bulk_migration_wait(
+                request_id,
+                state,
+                writer,
+                &operation_id,
+                after_revision,
+                timeout_ms,
+            )
+            .await
+        }
+        Request::SessionBulkMigrationCancel { operation_id } => {
+            session_bulk_migration::handle_session_bulk_migration_cancel(
+                request_id,
+                state,
+                writer,
+                &operation_id,
+            )
+            .await
         }
         Request::SubscribeCatalogUpdates => {
             handle_subscribe_catalog_updates(request_id, client_id, state, writer).await
@@ -6180,6 +6237,324 @@ async fn handle_list_sessions(
         }),
     )
     .await
+}
+
+fn summarize_session_compatibility_entries(
+    entries: &[bcode_ipc::SessionCompatibilityEntry],
+) -> (
+    BTreeMap<bcode_ipc::SessionCompatibilityCategory, usize>,
+    BTreeMap<
+        bcode_ipc::SessionCompatibilityCategory,
+        bcode_ipc::SessionCompatibilityCategorySummary,
+    >,
+) {
+    let mut counts = BTreeMap::new();
+    let mut category_summaries = BTreeMap::new();
+    for entry in entries {
+        *counts.entry(entry.category).or_insert(0) += 1;
+        let summary = category_summaries.entry(entry.category).or_insert_with(|| {
+            bcode_ipc::SessionCompatibilityCategorySummary {
+                count: 0,
+                action: entry.action,
+                retryable: entry.retryable,
+                samples: Vec::new(),
+            }
+        });
+        summary.count += 1;
+        if summary.samples.len() < bcode_ipc::MAX_SESSION_COMPATIBILITY_SAMPLES_PER_CATEGORY {
+            summary.samples.push(bcode_ipc::SessionCompatibilitySample {
+                session_id: entry.session_id,
+                message: entry.message.clone(),
+            });
+        }
+    }
+    (counts, category_summaries)
+}
+
+async fn handle_session_compatibility_inventory(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::SessionCompatibilityInventoryRequest,
+) -> Result<(), ServerError> {
+    if request.limit == 0 || request.limit > bcode_ipc::MAX_SESSION_COMPATIBILITY_INVENTORY_ENTRIES
+    {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "session_compatibility_inventory_limit",
+                "compatibility inventory limit is outside portable bounds",
+            )),
+        )
+        .await;
+    }
+    if request
+        .after_timestamp_ms
+        .zip(request.before_timestamp_ms)
+        .is_some_and(|(after, before)| after > before)
+    {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "session_compatibility_inventory_range",
+                "after timestamp must not exceed before timestamp",
+            )),
+        )
+        .await;
+    }
+    state
+        .sessions
+        .wait_catalog_loaded()
+        .await
+        .map_err(ServerError::SessionStore)?;
+    let mut summaries = state
+        .sessions
+        .session_summaries_page(
+            &request.session_ids,
+            request.after_timestamp_ms,
+            request.before_timestamp_ms,
+            request
+                .cursor
+                .map(|cursor| (cursor.updated_at_ms, cursor.session_id)),
+            request.limit,
+        )
+        .await;
+    let truncated = summaries.len() > request.limit;
+    summaries.truncate(request.limit);
+    let next_cursor = truncated
+        .then(|| summaries.last())
+        .flatten()
+        .map(|summary| bcode_ipc::SessionCompatibilityCursor {
+            updated_at_ms: summary.updated_at_ms,
+            session_id: summary.id,
+        });
+    let root = state.sessions.session_store_root();
+    let mut entries = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        entries.push(classify_session_compatibility(root.as_deref(), &summary).await);
+    }
+    let (counts, category_summaries) = summarize_session_compatibility_entries(&entries);
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionCompatibilityInventory {
+            response: bcode_ipc::SessionCompatibilityInventoryResponse {
+                entries,
+                counts,
+                category_summaries,
+                next_cursor,
+            },
+        }),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn classify_session_compatibility(
+    root: Option<&Path>,
+    summary: &SessionSummary,
+) -> bcode_ipc::SessionCompatibilityEntry {
+    use bcode_ipc::{
+        SessionCompatibilityAction as Action, SessionCompatibilityCategory as Category,
+    };
+
+    let Some(root) = root else {
+        return bcode_ipc::SessionCompatibilityEntry {
+            session_id: summary.id,
+            updated_at_ms: summary.updated_at_ms,
+            category: Category::Ready,
+            action: Action::None,
+            retryable: false,
+            source_writer_epoch: None,
+            first_historical_event_schema: None,
+            message: None,
+        };
+    };
+    let message = |text: &str| {
+        let mut end = text
+            .len()
+            .min(bcode_ipc::MAX_SESSION_COMPATIBILITY_MESSAGE_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        Some(text[..end].to_owned())
+    };
+    if !bcode_session::db::session_db_path(root, summary.id).exists() {
+        return bcode_ipc::SessionCompatibilityEntry {
+            session_id: summary.id,
+            updated_at_ms: summary.updated_at_ms,
+            category: Category::Missing,
+            action: Action::Locate,
+            retryable: false,
+            source_writer_epoch: None,
+            first_historical_event_schema: None,
+            message: message("canonical session database is missing"),
+        };
+    }
+    let result = async {
+        let owners = bcode_session::lease::active_session_owners(root, summary.id)?;
+        let maintenance = bcode_session::lease::session_maintenance_is_active(root, summary.id)?;
+        let db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(summary.id, root).await?;
+        let compatibility = db.storage_compatibility().await?;
+        let historical_schema = db.first_non_current_event_schema().await?;
+        let envelope_inventory = db.event_envelope_inventory().await?;
+        Ok::<_, bcode_session::SessionError>((
+            owners,
+            maintenance,
+            compatibility,
+            historical_schema,
+            envelope_inventory,
+        ))
+    }
+    .await;
+    let result = result.map(
+        |(owners, maintenance, compatibility, historical_schema, (envelopes, truncated))| {
+            let unknown = envelopes.into_iter().find(|(schema, kind)| {
+                matches!(
+                    bcode_session_migration::classify_event_kind_schema(kind, *schema),
+                    bcode_session_migration::ReleasedEventKindClassification::Unknown
+                )
+            });
+            (
+                owners,
+                maintenance,
+                compatibility,
+                historical_schema,
+                unknown,
+                truncated,
+            )
+        },
+    );
+    match result {
+        Ok((_, _, _, _, Some((schema, kind)), _)) => bcode_ipc::SessionCompatibilityEntry {
+            session_id: summary.id,
+            updated_at_ms: summary.updated_at_ms,
+            category: Category::FormatIncompatible,
+            action: Action::Upgrade,
+            retryable: false,
+            source_writer_epoch: None,
+            first_historical_event_schema: Some(schema),
+            message: message(&format!(
+                "unsupported future event kind {kind} at schema {schema}"
+            )),
+        },
+        Ok((_, _, _, _, None, true)) => bcode_ipc::SessionCompatibilityEntry {
+            session_id: summary.id,
+            updated_at_ms: summary.updated_at_ms,
+            category: Category::FormatIncompatible,
+            action: Action::Upgrade,
+            retryable: false,
+            source_writer_epoch: None,
+            first_historical_event_schema: None,
+            message: message("event envelope inventory exceeds the portable compatibility bound"),
+        },
+        Ok((owners, _, compatibility, schema, None, false)) if !owners.is_empty() => {
+            bcode_ipc::SessionCompatibilityEntry {
+                session_id: summary.id,
+                updated_at_ms: summary.updated_at_ms,
+                category: Category::OwnerBlocked,
+                action: Action::Retry,
+                retryable: true,
+                source_writer_epoch: match compatibility {
+                    bcode_session::db::SessionStorageCompatibility::KnownLegacy {
+                        writer_epoch,
+                    }
+                    | bcode_session::db::SessionStorageCompatibility::Current { writer_epoch } => {
+                        u32::try_from(writer_epoch).ok()
+                    }
+                },
+                first_historical_event_schema: schema,
+                message: message("a live daemon owner currently holds this session"),
+            }
+        }
+        Ok((_, true, compatibility, schema, None, false)) => bcode_ipc::SessionCompatibilityEntry {
+            session_id: summary.id,
+            updated_at_ms: summary.updated_at_ms,
+            category: Category::TemporarilyLocked,
+            action: Action::Retry,
+            retryable: true,
+            source_writer_epoch: match compatibility {
+                bcode_session::db::SessionStorageCompatibility::KnownLegacy { writer_epoch }
+                | bcode_session::db::SessionStorageCompatibility::Current { writer_epoch } => {
+                    u32::try_from(writer_epoch).ok()
+                }
+            },
+            first_historical_event_schema: schema,
+            message: message("exclusive session maintenance is currently active"),
+        },
+        Ok(
+            (
+                _,
+                _,
+                bcode_session::db::SessionStorageCompatibility::KnownLegacy { writer_epoch },
+                schema,
+                None,
+                false,
+            )
+            | (
+                _,
+                _,
+                bcode_session::db::SessionStorageCompatibility::Current { writer_epoch },
+                schema @ Some(_),
+                None,
+                false,
+            ),
+        ) => bcode_ipc::SessionCompatibilityEntry {
+            session_id: summary.id,
+            updated_at_ms: summary.updated_at_ms,
+            category: Category::MigrationRequired,
+            action: Action::Migrate,
+            retryable: false,
+            source_writer_epoch: u32::try_from(writer_epoch).ok(),
+            first_historical_event_schema: schema,
+            message: message("released historical session format requires explicit migration"),
+        },
+        Ok((
+            _,
+            _,
+            bcode_session::db::SessionStorageCompatibility::Current { writer_epoch },
+            None,
+            None,
+            false,
+        )) => bcode_ipc::SessionCompatibilityEntry {
+            session_id: summary.id,
+            updated_at_ms: summary.updated_at_ms,
+            category: Category::Ready,
+            action: Action::None,
+            retryable: false,
+            source_writer_epoch: u32::try_from(writer_epoch).ok(),
+            first_historical_event_schema: None,
+            message: None,
+        },
+        Err(error) => {
+            let text = error.to_string();
+            let (category, action, retryable) = match &error {
+                bcode_session::SessionError::NotFound(_) => {
+                    (Category::Missing, Action::Locate, false)
+                }
+                bcode_session::SessionError::Db(database) if database.is_lock_error() => {
+                    (Category::TemporarilyLocked, Action::Retry, true)
+                }
+                bcode_session::SessionError::Db(
+                    bcode_session::db::SessionDbError::WriterIncompatible { .. },
+                ) => (Category::FormatIncompatible, Action::Upgrade, false),
+                _ => (Category::RepairRequired, Action::Repair, false),
+            };
+            bcode_ipc::SessionCompatibilityEntry {
+                session_id: summary.id,
+                updated_at_ms: summary.updated_at_ms,
+                category,
+                action,
+                retryable,
+                source_writer_epoch: None,
+                first_historical_event_schema: None,
+                message: message(&text),
+            }
+        }
+    }
 }
 
 async fn handle_refresh_session_catalog(
@@ -9610,7 +9985,7 @@ async fn start_complete_session_search_backfill(
                             || provider.failed_sessions > 0
                             || provider.incomplete_sessions > 0
                     }) {
-                        bcode_session_search::SessionSearchBackfillOperationState::Failed
+                        bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention
                     } else {
                         bcode_session_search::SessionSearchBackfillOperationState::Completed
                     };
@@ -9645,6 +10020,7 @@ fn admit_session_search_backfill_operation(
         matches!(
             operation.status.state,
             bcode_session_search::SessionSearchBackfillOperationState::Completed
+                | bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention
                 | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
                 | bcode_session_search::SessionSearchBackfillOperationState::Failed
         )
@@ -9822,6 +10198,7 @@ async fn wait_session_search_backfill(
         || matches!(
             status.state,
             bcode_session_search::SessionSearchBackfillOperationState::Completed
+                | bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention
                 | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
                 | bcode_session_search::SessionSearchBackfillOperationState::Failed
         )
@@ -33221,6 +33598,348 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 mod tests {
     use super::*;
     static WORKFLOW_RUNTIME_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn bulk_migration_operation_not_found_requires_explicit_reinvocation() {
+        let operation_id = "lost-after-restart";
+        let Response::Err(error) = session_bulk_migration::operation_not_found(operation_id) else {
+            panic!("expected transient operation error");
+        };
+        assert_eq!(error.code, "session_bulk_migration_operation_not_found");
+        assert!(error.message.contains("transient"));
+        assert!(error.message.contains("explicit re-invocation"));
+        assert!(!error.message.contains("resume"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn bulk_migration_inventory_crosses_catalog_pages_and_cancels_cooperatively() {
+        let root = tempfile::tempdir().expect("session root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let total = session_bulk_migration::BULK_MIGRATION_PAGE_SIZE + 3;
+        for index in 0..total {
+            sessions
+                .create_session(
+                    Some(format!("bulk inventory {index}")),
+                    workspace.path().to_path_buf(),
+                )
+                .await
+                .expect("session");
+        }
+        let state = Arc::new(test_server_state(sessions));
+        let operation_id = "bulk-page-test".to_owned();
+        state.session_bulk_migrations.lock().await.insert(
+            operation_id.clone(),
+            SessionBulkMigrationOperation {
+                status: bcode_ipc::SessionBulkMigrationOperationStatus {
+                    operation_id: operation_id.clone(),
+                    revision: 0,
+                    state: bcode_ipc::SessionBulkMigrationState::Running,
+                    mode: bcode_ipc::SessionBulkMigrationMode::Inventory,
+                    selected: 0,
+                    visited: 0,
+                    migrated: 0,
+                    blocked: 0,
+                    failed: 0,
+                    current_session_id: None,
+                    outcomes: Vec::new(),
+                },
+                cancellation_requested: false,
+                changed: Arc::new(Notify::new()),
+            },
+        );
+        session_bulk_migration::run_session_bulk_migration(
+            Arc::clone(&state),
+            operation_id.clone(),
+            bcode_ipc::SessionBulkMigrationStartRequest {
+                mode: bcode_ipc::SessionBulkMigrationMode::Inventory,
+                session_ids: BTreeSet::new(),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                confirmation: None,
+            },
+        )
+        .await;
+        let status = state
+            .session_bulk_migrations
+            .lock()
+            .await
+            .get(&operation_id)
+            .expect("operation")
+            .status
+            .clone();
+        assert_eq!(
+            status.state,
+            bcode_ipc::SessionBulkMigrationState::Completed
+        );
+        assert_eq!(status.visited, u64::try_from(total).expect("count"));
+
+        let cancelled_id = "bulk-cancel-test".to_owned();
+        state.session_bulk_migrations.lock().await.insert(
+            cancelled_id.clone(),
+            SessionBulkMigrationOperation {
+                status: bcode_ipc::SessionBulkMigrationOperationStatus {
+                    operation_id: cancelled_id.clone(),
+                    revision: 0,
+                    state: bcode_ipc::SessionBulkMigrationState::CancellationRequested,
+                    mode: bcode_ipc::SessionBulkMigrationMode::Inventory,
+                    selected: 0,
+                    visited: 0,
+                    migrated: 0,
+                    blocked: 0,
+                    failed: 0,
+                    current_session_id: None,
+                    outcomes: Vec::new(),
+                },
+                cancellation_requested: true,
+                changed: Arc::new(Notify::new()),
+            },
+        );
+        session_bulk_migration::run_session_bulk_migration(
+            Arc::clone(&state),
+            cancelled_id.clone(),
+            bcode_ipc::SessionBulkMigrationStartRequest {
+                mode: bcode_ipc::SessionBulkMigrationMode::Inventory,
+                session_ids: BTreeSet::new(),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                confirmation: None,
+            },
+        )
+        .await;
+        let status = state
+            .session_bulk_migrations
+            .lock()
+            .await
+            .get(&cancelled_id)
+            .expect("cancelled operation")
+            .status
+            .clone();
+        assert_eq!(
+            status.state,
+            bcode_ipc::SessionBulkMigrationState::Cancelled
+        );
+        assert_eq!(status.visited, 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn compatibility_inventory_classifies_released_schemas_and_typed_failure_modes() {
+        use bcode_ipc::SessionCompatibilityCategory as Category;
+
+        let root = tempfile::tempdir().expect("session root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let current = sessions
+            .create_session(Some("current".to_owned()), workspace.path().to_path_buf())
+            .await
+            .expect("current session");
+        let current_summary = sessions
+            .session_summary(current.id)
+            .await
+            .expect("current summary");
+        assert_eq!(
+            classify_session_compatibility(Some(root.path()), &current_summary)
+                .await
+                .category,
+            Category::Ready
+        );
+
+        for schema in bcode_session_migration::RELEASED_HISTORICAL_EVENT_SCHEMAS {
+            let session = sessions
+                .create_session(
+                    Some(format!("schema {schema}")),
+                    workspace.path().to_path_buf(),
+                )
+                .await
+                .expect("historical session");
+            let db =
+                bcode_session::db::SessionDb::open_existing_turso_in_root(session.id, root.path())
+                    .await
+                    .expect("historical DB");
+            db.database()
+                .update("events")
+                .value("schema_version", DatabaseValue::Int64(i64::from(*schema)))
+                .execute(db.database())
+                .await
+                .expect("historical event schema");
+            drop(db);
+            assert_eq!(
+                classify_session_compatibility(Some(root.path()), &session)
+                    .await
+                    .category,
+                Category::MigrationRequired,
+                "schema {schema}"
+            );
+        }
+
+        let owner = bcode_session::lease::acquire_session_lease(
+            root.path(),
+            current.id,
+            &bcode_session::lease::SessionLeaseOwnerContext {
+                daemon_instance_id: Some("compatibility-test-owner".to_owned()),
+                ..Default::default()
+            },
+        )
+        .expect("owner lease");
+        assert_eq!(
+            classify_session_compatibility(Some(root.path()), &current_summary)
+                .await
+                .category,
+            Category::OwnerBlocked
+        );
+        drop(owner);
+
+        let maintenance =
+            bcode_session::lease::acquire_session_maintenance_guard(root.path(), current.id)
+                .expect("maintenance guard");
+        assert_eq!(
+            classify_session_compatibility(Some(root.path()), &current_summary)
+                .await
+                .category,
+            Category::TemporarilyLocked
+        );
+        drop(maintenance);
+
+        let damaged = sessions
+            .create_session(Some("damaged".to_owned()), workspace.path().to_path_buf())
+            .await
+            .expect("damaged session");
+        let damaged_db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(damaged.id, root.path())
+                .await
+                .expect("damaged DB");
+        damaged_db
+            .database()
+            .delete("session_storage_contract")
+            .execute(damaged_db.database())
+            .await
+            .expect("remove contract");
+        drop(damaged_db);
+        assert_eq!(
+            classify_session_compatibility(Some(root.path()), &damaged)
+                .await
+                .category,
+            Category::RepairRequired
+        );
+
+        let future = sessions
+            .create_session(Some("future".to_owned()), workspace.path().to_path_buf())
+            .await
+            .expect("future session");
+        let future_db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(future.id, root.path())
+                .await
+                .expect("future DB");
+        future_db
+            .database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::from(
+                    bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH + 1,
+                )),
+            )
+            .execute(future_db.database())
+            .await
+            .expect("future writer");
+        drop(future_db);
+        assert_eq!(
+            classify_session_compatibility(Some(root.path()), &future)
+                .await
+                .category,
+            Category::FormatIncompatible
+        );
+
+        let missing = SessionSummary {
+            id: SessionId::new(),
+            name: Some("missing".to_owned()),
+            explicit_name: None,
+            derived_title: None,
+            title_source: bcode_session_models::SessionTitleSource::default(),
+            client_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            working_directory: workspace.path().to_path_buf(),
+            import: None,
+            fork: None,
+            execution: None,
+        };
+        assert_eq!(
+            classify_session_compatibility(Some(root.path()), &missing)
+                .await
+                .category,
+            Category::Missing
+        );
+    }
+
+    #[test]
+    fn complete_backfill_issue_summaries_are_categorized_and_bounded() {
+        let mut issues = Vec::new();
+        let sessions = (0..12)
+            .map(
+                |index| bcode_session_search::SessionSearchBackfillSessionResult {
+                    session_id: SessionId::new(),
+                    outcome: bcode_session_search::SessionSearchBackfillOutcome::Failed,
+                    batches_applied: 0,
+                    indexed_through_sequence: None,
+                    canonical_tail_sequence: None,
+                    error: Some(bcode_session_search::SessionSearchServiceError {
+                        code: bcode_session_search::SearchErrorCode::QuotaExceeded,
+                        message: format!("quota sample {index}"),
+                        retryable: true,
+                    }),
+                },
+            )
+            .collect::<Vec<_>>();
+        session_search::merge_complete_backfill_issues(&mut issues, &sessions);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].count, 12);
+        assert!(issues[0].retryable);
+        assert_eq!(
+            issues[0].sample_session_ids.len(),
+            bcode_session_search::MAX_COMPLETE_BACKFILL_ISSUE_SAMPLES
+        );
+        assert_eq!(issues[0].sample_message.as_deref(), Some("quota sample 0"));
+    }
+
+    #[test]
+    fn compatibility_aggregate_samples_are_capped_and_actionable() {
+        use bcode_ipc::{
+            SessionCompatibilityAction as Action, SessionCompatibilityCategory as Category,
+            SessionCompatibilityEntry,
+        };
+
+        let entries = (0..5)
+            .map(|index| SessionCompatibilityEntry {
+                session_id: SessionId::new(),
+                updated_at_ms: index,
+                category: Category::MigrationRequired,
+                action: Action::Migrate,
+                retryable: false,
+                source_writer_epoch: Some(5),
+                first_historical_event_schema: Some(41),
+                message: Some(format!("migration sample {index}")),
+            })
+            .collect::<Vec<_>>();
+        let (counts, summaries) = summarize_session_compatibility_entries(&entries);
+        assert_eq!(counts.get(&Category::MigrationRequired), Some(&5));
+        let summary = summaries
+            .get(&Category::MigrationRequired)
+            .expect("migration summary");
+        assert_eq!(summary.count, 5);
+        assert_eq!(summary.action, Action::Migrate);
+        assert!(!summary.retryable);
+        assert_eq!(
+            summary.samples.len(),
+            bcode_ipc::MAX_SESSION_COMPATIBILITY_SAMPLES_PER_CATEGORY
+        );
+        assert_eq!(
+            summary.samples[0].message.as_deref(),
+            Some("migration sample 0")
+        );
+    }
     #[allow(clippy::wildcard_imports)]
     use crate::context_compaction::*;
     use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};

@@ -42,6 +42,7 @@ impl SlashCompletion {
 const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "version" },
     BuiltinSlashCommand { name: "sessions" },
+    BuiltinSlashCommand { name: "search" },
     BuiltinSlashCommand { name: "resync" },
     BuiltinSlashCommand {
         name: "rescan-imports",
@@ -98,6 +99,10 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     SlashCompletion {
         command: "/sessions",
         description: "Open session picker",
+    },
+    SlashCompletion {
+        command: "/search",
+        description: "Search session transcripts",
     },
     SlashCompletion {
         command: "/new",
@@ -391,6 +396,16 @@ pub async fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_is_discoverable_and_reserved_as_a_builtin() {
+        assert!(static_completions().iter().any(|completion| {
+            completion.command() == "/search"
+                && completion.description().contains("session transcripts")
+        }));
+        assert!(is_builtin_command_name("search"));
+        assert!(!is_non_conflicting_skill_alias(&SkillId::new("search")));
+    }
 
     #[test]
     fn version_is_discoverable() {

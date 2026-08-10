@@ -1302,11 +1302,27 @@ impl ChatLoopState {
     }
 
     pub fn open_session_picker(&mut self, chat: &mut ActiveChat) {
+        self.open_session_picker_with_mode(chat, false);
+    }
+
+    pub fn open_session_search(&mut self, chat: &mut ActiveChat) {
+        self.open_session_picker_with_mode(chat, true);
+    }
+
+    fn open_session_picker_with_mode(&mut self, chat: &mut ActiveChat, search: bool) {
         let mut picker = super::session_picker::SessionPickerApp::new(Vec::new());
-        picker.set_loading_status("Loading sessions…".to_owned());
+        if search {
+            picker.start_transcript_search();
+        } else {
+            picker.set_loading_status("Loading sessions…".to_owned());
+        }
         self.session_picker = Some(picker);
         chat.replace_effect(TuiEffect::LoadSessionPicker);
-        chat.app.set_status("session picker".to_owned());
+        chat.app.set_status(if search {
+            "session search".to_owned()
+        } else {
+            "session picker".to_owned()
+        });
     }
 
     pub fn apply_session_picker_result(
@@ -1381,7 +1397,17 @@ impl ChatLoopState {
         };
         match result {
             Ok((response, _)) if response.hits.is_empty() => {
-                picker.set_status("No transcript matches".to_owned());
+                picker.set_search_results(&response, Vec::new());
+                let status = if !response.query_complete {
+                    "Search incomplete; inspect provider failures and retry"
+                } else if !response.coverage_complete {
+                    "No matches in searched data; corpus coverage is incomplete"
+                } else if !response.failures.is_empty() {
+                    "No matches; one or more providers failed"
+                } else {
+                    "No transcript matches in complete searchable coverage"
+                };
+                picker.set_status(status.to_owned());
             }
             Ok((response, hydrated)) => picker.set_search_results(&response, hydrated),
             Err(error) => picker.set_status(format!("Transcript search failed: {error}")),
@@ -1512,10 +1538,27 @@ impl ChatLoopState {
                             self.session_picker = None;
                             return SessionPickerRootOutcome::SearchHit(hit);
                         }
+                        let query = picker.filter().buffer().text().trim().to_owned();
+                        if query.is_empty() {
+                            picker
+                                .set_status("Type a transcript query, then press Enter".to_owned());
+                        } else {
+                            picker.set_status("Searching transcripts…".to_owned());
+                            chat.replace_effect(TuiEffect::SearchSessions {
+                                request: Box::new(root_session_search_request(query)),
+                                policy: bcode_session_search::SessionSearchPlanPolicy::default(),
+                            });
+                        }
                     }
                     bmux_keyboard::KeyCode::Up => picker.select_previous(),
                     bmux_keyboard::KeyCode::Down => picker.select_next(),
-                    _ => {}
+                    _ => {
+                        let _ = super::text_input_flow::handle_key(
+                            picker.filter_mut(),
+                            keymap,
+                            *stroke,
+                        );
+                    }
                 },
             },
             Event::Mouse(mouse) => {
@@ -3060,6 +3103,9 @@ fn apply_root_slash_command_outcome(
         }
         SlashCommandOutcome::PickSession => {
             loop_state.open_session_picker(chat);
+        }
+        SlashCommandOutcome::SearchSessions => {
+            loop_state.open_session_search(chat);
         }
         SlashCommandOutcome::OpenRalphHome => {
             chat.replace_effect(TuiEffect::OpenPluginSurface {

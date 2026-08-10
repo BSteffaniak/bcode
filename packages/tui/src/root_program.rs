@@ -950,6 +950,15 @@ impl BcodeRuntimeModel {
                     self.loop_state.open_command_palette(&mut self.chat);
                     return super::invalidation::UiInvalidation::Structural;
                 }
+                if self
+                    .settings
+                    .keymap()
+                    .action_for_key(super::keymap::BmuxScope::Chat, stroke)
+                    == Some(super::keymap::BmuxAction::SessionSearchOpen)
+                {
+                    self.loop_state.open_session_search(&mut self.chat);
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 let outcome =
                     super::input::handle_key(&mut self.chat.app, self.settings.keymap(), stroke);
                 match outcome.request {
@@ -1180,6 +1189,7 @@ impl BcodeRuntimeModel {
                 "session.switch" | "session.rename" | "session.delete" => {
                     self.loop_state.open_session_picker(&mut self.chat);
                 }
+                "session.search" => self.loop_state.open_session_search(&mut self.chat),
                 "session.fork" => self.loop_state.open_session_fork_dialog(&mut self.chat),
                 "session.clone" => {
                     if let Some(session_id) = self.chat.session_id {

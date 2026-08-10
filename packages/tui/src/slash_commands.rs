@@ -40,6 +40,8 @@ pub enum SlashCommandOutcome {
     },
     /// Open the session picker.
     PickSession,
+    /// Open the session picker focused on transcript search.
+    SearchSessions,
     /// Open model picker.
     PickModel,
     /// Open auth-pool subscription picker.
@@ -845,6 +847,7 @@ async fn execute_builtin(
             format_build_info_markdown(&super::build_info()),
         )),
         "sessions" => Ok(SlashCommandOutcome::PickSession),
+        "search" => Ok(SlashCommandOutcome::SearchSessions),
         "resync" => resync_command(client, parts).await,
         "rescan-imports" => client.refresh_session_catalog(None).await.map(|list| {
             SlashCommandOutcome::Handled(format!(

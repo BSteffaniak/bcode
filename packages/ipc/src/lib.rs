@@ -20,7 +20,7 @@ pub use bcode_worktree_models::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -274,6 +274,171 @@ pub enum ComposerDraftScope {
     DraftSession { launch_working_directory: PathBuf },
 }
 
+/// Maximum per-session outcomes retained in one bulk migration operation response.
+pub const MAX_SESSION_BULK_MIGRATION_OUTCOMES: usize = 256;
+/// Confirmation required before bulk canonical mutation starts.
+pub const SESSION_BULK_MIGRATION_CONFIRMATION: &str = "migrate-supported-sessions";
+
+/// Explicit bulk migration execution mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBulkMigrationMode {
+    Inventory,
+    Migrate,
+}
+
+/// Bounded selection and execution request for bulk canonical migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBulkMigrationStartRequest {
+    pub mode: SessionBulkMigrationMode,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub session_ids: BTreeSet<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<String>,
+}
+
+/// Transient aggregate bulk migration state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBulkMigrationState {
+    Running,
+    CancellationRequested,
+    Completed,
+    NeedsAttention,
+    Cancelled,
+}
+
+/// Bounded terminal result for one selected session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBulkMigrationOutcome {
+    pub session_id: SessionId,
+    pub category: SessionCompatibilityCategory,
+    pub action: SessionCompatibilityAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Addressable but transient aggregate bulk migration operation snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBulkMigrationOperationStatus {
+    pub operation_id: String,
+    pub revision: u64,
+    pub state: SessionBulkMigrationState,
+    pub mode: SessionBulkMigrationMode,
+    pub selected: u64,
+    pub visited: u64,
+    pub migrated: u64,
+    pub blocked: u64,
+    pub failed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outcomes: Vec<SessionBulkMigrationOutcome>,
+}
+
+/// Maximum entries returned by one bounded compatibility inventory page.
+pub const MAX_SESSION_COMPATIBILITY_INVENTORY_ENTRIES: usize = 256;
+/// Maximum sample entries retained for one compatibility category.
+pub const MAX_SESSION_COMPATIBILITY_SAMPLES_PER_CATEGORY: usize = 3;
+/// Maximum byte length for one portable compatibility diagnostic.
+pub const MAX_SESSION_COMPATIBILITY_MESSAGE_BYTES: usize = 1_024;
+
+/// Stable compatibility category for one canonical session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCompatibilityCategory {
+    Ready,
+    MigrationRequired,
+    OwnerBlocked,
+    TemporarilyLocked,
+    RepairRequired,
+    FormatIncompatible,
+    Missing,
+}
+
+/// Stable action associated with a compatibility category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCompatibilityAction {
+    None,
+    Retry,
+    Migrate,
+    Repair,
+    Upgrade,
+    Locate,
+}
+
+/// Exclusive cursor for compatibility inventory pagination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompatibilityCursor {
+    pub updated_at_ms: u64,
+    pub session_id: SessionId,
+}
+
+/// Bounded compatibility inventory request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompatibilityInventoryRequest {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub session_ids: BTreeSet<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<SessionCompatibilityCursor>,
+    pub limit: usize,
+}
+
+/// One compatibility inventory result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompatibilityEntry {
+    pub session_id: SessionId,
+    pub updated_at_ms: u64,
+    pub category: SessionCompatibilityCategory,
+    pub action: SessionCompatibilityAction,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_writer_epoch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_historical_event_schema: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Bounded aggregate for one compatibility category in this page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompatibilityCategorySummary {
+    pub count: usize,
+    pub action: SessionCompatibilityAction,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<SessionCompatibilitySample>,
+}
+
+/// Capped portable sample explaining one aggregate compatibility category.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompatibilitySample {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Bounded compatibility inventory page and aggregate counts for that page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompatibilityInventoryResponse {
+    pub entries: Vec<SessionCompatibilityEntry>,
+    pub counts: BTreeMap<SessionCompatibilityCategory, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub category_summaries:
+        BTreeMap<SessionCompatibilityCategory, SessionCompatibilityCategorySummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<SessionCompatibilityCursor>,
+}
+
 /// Request payload variants for Bcode client/server IPC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -305,6 +470,10 @@ pub enum Request {
     },
     ListSessions {
         working_directory: PathBuf,
+    },
+    /// Read one bounded non-mutating compatibility inventory page.
+    SessionCompatibilityInventory {
+        request: SessionCompatibilityInventoryRequest,
     },
     RenameSession {
         session_id: SessionId,
@@ -894,6 +1063,24 @@ pub enum Request {
     /// Explicitly backfill selected or bounded catalog sessions into one provider.
     SessionSearchBackfill {
         request: bcode_session_search::BackfillSessionSearchRequest,
+    },
+    /// Explicitly inventory or start bounded canonical migration for selected sessions.
+    SessionBulkMigrationStart {
+        request: SessionBulkMigrationStartRequest,
+    },
+    /// Read transient aggregate migration operation state.
+    SessionBulkMigrationStatus {
+        operation_id: String,
+    },
+    /// Wait for a newer transient aggregate migration operation revision.
+    SessionBulkMigrationWait {
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    },
+    /// Request cooperative cancellation between per-session migration units.
+    SessionBulkMigrationCancel {
+        operation_id: String,
     },
     /// Append one durable, presentation-only note at the current session sequence.
     AppendPresentationNote {
@@ -2370,6 +2557,9 @@ pub enum ResponsePayload {
         #[serde(default)]
         catalog_revision: u64,
     },
+    SessionCompatibilityInventory {
+        response: SessionCompatibilityInventoryResponse,
+    },
     SessionRenamed {
         session: SessionSummary,
     },
@@ -2810,6 +3000,9 @@ pub enum ResponsePayload {
     },
     SessionSearchBackfill {
         response: bcode_session_search::SessionSearchBackfillResponse,
+    },
+    SessionBulkMigrationOperation {
+        status: SessionBulkMigrationOperationStatus,
     },
     PresentationNoteAppended,
 }
@@ -4429,6 +4622,113 @@ mod tests {
         });
         let decoded: Response =
             decode_typed_stable(&encode_typed_stable(&response).expect("encode")).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn session_compatibility_inventory_contract_round_trips_portably() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let session_id = SessionId::new();
+        let request = Request::SessionCompatibilityInventory {
+            request: SessionCompatibilityInventoryRequest {
+                session_ids: BTreeSet::from([session_id]),
+                after_timestamp_ms: Some(10),
+                before_timestamp_ms: Some(20),
+                cursor: Some(SessionCompatibilityCursor {
+                    updated_at_ms: 12,
+                    session_id,
+                }),
+                limit: 25,
+            },
+        };
+        let decoded: Request =
+            decode_typed_stable(&encode_typed_stable(&request).expect("encode inventory request"))
+                .expect("decode inventory request");
+        assert_eq!(decoded, request);
+
+        let response = Response::Ok(ResponsePayload::SessionCompatibilityInventory {
+            response: SessionCompatibilityInventoryResponse {
+                entries: vec![SessionCompatibilityEntry {
+                    session_id,
+                    updated_at_ms: 12,
+                    category: SessionCompatibilityCategory::MigrationRequired,
+                    action: SessionCompatibilityAction::Migrate,
+                    retryable: false,
+                    source_writer_epoch: Some(5),
+                    first_historical_event_schema: Some(1),
+                    message: Some("explicit migration required".to_owned()),
+                }],
+                counts: BTreeMap::from([(SessionCompatibilityCategory::MigrationRequired, 1)]),
+                category_summaries: BTreeMap::from([(
+                    SessionCompatibilityCategory::MigrationRequired,
+                    SessionCompatibilityCategorySummary {
+                        count: 1,
+                        action: SessionCompatibilityAction::Migrate,
+                        retryable: false,
+                        samples: vec![SessionCompatibilitySample {
+                            session_id,
+                            message: Some("explicit migration required".to_owned()),
+                        }],
+                    },
+                )]),
+                next_cursor: Some(SessionCompatibilityCursor {
+                    updated_at_ms: 12,
+                    session_id,
+                }),
+            },
+        });
+        let decoded: Response = decode_typed_stable(
+            &encode_typed_stable(&response).expect("encode inventory response"),
+        )
+        .expect("decode inventory response");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn session_bulk_migration_contract_round_trips_portably() {
+        use std::collections::BTreeSet;
+
+        let session_id = SessionId::new();
+        let request = Request::SessionBulkMigrationStart {
+            request: SessionBulkMigrationStartRequest {
+                mode: SessionBulkMigrationMode::Migrate,
+                session_ids: BTreeSet::from([session_id]),
+                after_timestamp_ms: Some(10),
+                before_timestamp_ms: Some(20),
+                confirmation: Some(SESSION_BULK_MIGRATION_CONFIRMATION.to_owned()),
+            },
+        };
+        let decoded: Request = decode_typed_stable(
+            &encode_typed_stable(&request).expect("encode bulk migration request"),
+        )
+        .expect("decode bulk migration request");
+        assert_eq!(decoded, request);
+
+        let response = Response::Ok(ResponsePayload::SessionBulkMigrationOperation {
+            status: SessionBulkMigrationOperationStatus {
+                operation_id: "transient-operation".to_owned(),
+                revision: 2,
+                state: SessionBulkMigrationState::NeedsAttention,
+                mode: SessionBulkMigrationMode::Migrate,
+                selected: 2,
+                visited: 3,
+                migrated: 1,
+                blocked: 1,
+                failed: 0,
+                current_session_id: None,
+                outcomes: vec![SessionBulkMigrationOutcome {
+                    session_id,
+                    category: SessionCompatibilityCategory::OwnerBlocked,
+                    action: SessionCompatibilityAction::Retry,
+                    message: Some("owner blocked".to_owned()),
+                }],
+            },
+        });
+        let decoded: Response = decode_typed_stable(
+            &encode_typed_stable(&response).expect("encode bulk migration response"),
+        )
+        .expect("decode bulk migration response");
         assert_eq!(decoded, response);
     }
 

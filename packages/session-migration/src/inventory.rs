@@ -1423,6 +1423,38 @@ impl ReleasedEventVariantDescriptor {
     }
 }
 
+/// Classify one persisted event kind/schema pair against released migration inventory.
+#[must_use]
+pub fn classify_event_kind_schema(kind: &str, schema: u16) -> ReleasedEventKindClassification {
+    if schema == CURRENT_EVENT_SCHEMA
+        && RELEASED_EVENT_VARIANTS
+            .iter()
+            .any(|descriptor| descriptor.kind == kind)
+    {
+        return ReleasedEventKindClassification::Current;
+    }
+    if is_released_event_kind_schema(kind, schema) {
+        return ReleasedEventKindClassification::ReleasedHistorical;
+    }
+    ReleasedEventKindClassification::Unknown
+}
+
+/// Classification for a scalar persisted event envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasedEventKindClassification {
+    Current,
+    ReleasedHistorical,
+    Unknown,
+}
+
+/// Return whether an event kind/schema pair belongs to the released persistence inventory.
+#[must_use]
+pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
+    RELEASED_EVENT_VARIANTS
+        .iter()
+        .any(|descriptor| descriptor.kind == kind && descriptor.supports_schema(schema))
+}
+
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     match kind {
         "assistant_reasoning_activity" => (40, 41),

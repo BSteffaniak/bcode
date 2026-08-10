@@ -109,6 +109,7 @@ fn handle_skill_picker_action(
         | BmuxAction::AppInterrupt
         | BmuxAction::ClipboardPasteImage
         | BmuxAction::CommandPaletteOpen
+        | BmuxAction::SessionSearchOpen
         | BmuxAction::AgentCycle
         | BmuxAction::DiffViewerLayoutCycle
         | BmuxAction::MarkdownFocusNext

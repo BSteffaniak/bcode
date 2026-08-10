@@ -117,6 +117,38 @@ pub async fn rebuild_provider(
     .await
 }
 
+pub(crate) fn merge_complete_backfill_issues(
+    aggregate: &mut Vec<bcode_session_search::CompleteSessionSearchBackfillIssueSummary>,
+    sessions: &[bcode_session_search::SessionSearchBackfillSessionResult],
+) {
+    for session in sessions {
+        let Some(error) = &session.error else {
+            continue;
+        };
+        if let Some(issue) = aggregate.iter_mut().find(|issue| issue.code == error.code) {
+            issue.count = issue.count.saturating_add(1);
+            if issue.sample_session_ids.len()
+                < bcode_session_search::MAX_COMPLETE_BACKFILL_ISSUE_SAMPLES
+            {
+                issue.sample_session_ids.push(session.session_id);
+            }
+            continue;
+        }
+        if aggregate.len() >= bcode_session_search::MAX_COMPLETE_BACKFILL_ISSUE_SAMPLES {
+            continue;
+        }
+        aggregate.push(
+            bcode_session_search::CompleteSessionSearchBackfillIssueSummary {
+                code: error.code,
+                count: 1,
+                retryable: error.retryable,
+                sample_session_ids: vec![session.session_id],
+                sample_message: Some(bounded_message(&error.message)),
+            },
+        );
+    }
+}
+
 const MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES: usize =
     bcode_session_search::MAX_COMPLETE_BACKFILL_CONVERGENCE_PASSES;
 
@@ -159,6 +191,34 @@ fn complete_backfill_progress(
         failed_sessions,
         providers,
     }
+}
+
+fn backfill_continuation_cursor(
+    starting_cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
+    summaries: &[bcode_session_models::SessionSummary],
+    sessions: &[SessionSearchBackfillSessionResult],
+    deadline_reached: bool,
+    catalog_cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
+) -> Option<bcode_session_search::SessionSearchBackfillCursor> {
+    if !deadline_reached {
+        return catalog_cursor;
+    }
+    sessions
+        .iter()
+        .rev()
+        .find(|result| result.outcome == SessionSearchBackfillOutcome::Complete)
+        .and_then(|result| {
+            summaries
+                .iter()
+                .find(|summary| summary.id == result.session_id)
+        })
+        .map(
+            |summary| bcode_session_search::SessionSearchBackfillCursor {
+                updated_at_ms: summary.updated_at_ms,
+                session_id: summary.id,
+            },
+        )
+        .or(starting_cursor)
 }
 
 /// Run explicit complete historical backfill across every selected provider.
@@ -277,6 +337,7 @@ pub async fn complete_backfill(
                 incomplete_sessions: 0,
                 failed_sessions: 0,
                 catalog_pages: 0,
+                issues: Vec::new(),
                 error: None,
             };
             loop {
@@ -305,18 +366,33 @@ pub async fn complete_backfill(
                     Ok(response) => {
                         aggregate.selected_sessions = aggregate
                             .selected_sessions
-                            .saturating_add(response.selected_sessions);
+                            .saturating_add(response.completed_sessions)
+                            .saturating_add(response.failed_sessions);
                         aggregate.completed_sessions = aggregate
                             .completed_sessions
                             .saturating_add(response.completed_sessions);
-                        aggregate.incomplete_sessions = aggregate
-                            .incomplete_sessions
-                            .saturating_add(response.incomplete_sessions);
                         aggregate.failed_sessions = aggregate
                             .failed_sessions
                             .saturating_add(response.failed_sessions);
+                        aggregate.incomplete_sessions = response.incomplete_sessions;
+                        merge_complete_backfill_issues(&mut aggregate.issues, &response.sessions);
                         aggregate.catalog_pages = aggregate.catalog_pages.saturating_add(1);
+                        let needs_continuation = response.next_cursor.is_some()
+                            || response.deadline_reached
+                            || response.incomplete_sessions > 0;
+                        let made_progress = response.sessions.iter().any(|session| {
+                            session.outcome != SessionSearchBackfillOutcome::Incomplete
+                                || session.batches_applied > 0
+                        });
                         cursor = response.next_cursor;
+                        if needs_continuation && !made_progress {
+                            aggregate.error = Some(SessionSearchServiceError {
+                                code: SearchErrorCode::DeadlineExceeded,
+                                message: "backfill slice reached its deadline before making progress; increase the per-slice deadline and explicitly re-invoke backfill"
+                                    .to_owned(),
+                                retryable: true,
+                            });
+                        }
                         if let Some(progress) = progress {
                             progress(complete_backfill_progress(
                                 &provider_ids,
@@ -327,7 +403,7 @@ pub async fn complete_backfill(
                                 Some(&aggregate),
                             ));
                         }
-                        if cursor.is_none() || response.deadline_reached {
+                        if !needs_continuation || aggregate.error.is_some() {
                             break;
                         }
                         for _ in 0..MAINTENANCE_PROVIDER_SLICES_BEFORE_YIELD {
@@ -489,6 +565,7 @@ pub async fn backfill_provider_with_cancellation(
             message: bounded_message(&error.to_string()),
             retryable: true,
         })?;
+    let starting_cursor = request.cursor.clone();
     let mut summaries = state
         .sessions
         .session_summaries_page(
@@ -518,7 +595,7 @@ pub async fn backfill_provider_with_cancellation(
     let deadline = started + Duration::from_millis(request.deadline_ms);
     let selected_sessions = summaries.len();
     let mut sessions = Vec::with_capacity(selected_sessions);
-    for summary in summaries {
+    for summary in &summaries {
         if cancellation.is_some_and(bcode_plugin_sdk::ServiceCancellation::is_cancelled)
             || Instant::now() >= deadline
         {
@@ -576,7 +653,7 @@ pub async fn backfill_provider_with_cancellation(
         let result = ingest_provider_pages(
             state,
             session_id,
-            &summary,
+            summary,
             &provider,
             MAX_BACKFILL_BATCHES_PER_SESSION,
             Some(deadline),
@@ -584,7 +661,7 @@ pub async fn backfill_provider_with_cancellation(
             cancellation,
         )
         .await;
-        sessions.push(match result {
+        let session_result = match result {
             Ok(progress) => SessionSearchBackfillSessionResult {
                 session_id,
                 outcome: if progress.complete {
@@ -618,9 +695,22 @@ pub async fn backfill_provider_with_cancellation(
                     retryable: error.retryable,
                 }),
             },
-        });
+        };
+        let incomplete = session_result.outcome == SessionSearchBackfillOutcome::Incomplete;
+        sessions.push(session_result);
+        if incomplete {
+            break;
+        }
     }
     let deadline_reached = sessions.len() < selected_sessions || Instant::now() >= deadline;
+    let continuation_cursor = backfill_continuation_cursor(
+        starting_cursor,
+        &summaries,
+        &sessions,
+        deadline_reached,
+        next_cursor,
+    );
+    let next_cursor = continuation_cursor;
     let completed_sessions = sessions
         .iter()
         .filter(|result| result.outcome == SessionSearchBackfillOutcome::Complete)
@@ -3719,6 +3809,64 @@ pub(crate) mod tests {
             indexed_through_sequence: 1,
         };
         assert!(validate_apply_batch_response(&request, wrong_batch).is_err());
+    }
+
+    #[test]
+    fn deadline_continuation_resumes_after_last_complete_session() {
+        let first = bcode_session_models::SessionSummary {
+            id: SessionId::new(),
+            name: Some("first".to_owned()),
+            explicit_name: None,
+            derived_title: None,
+            title_source: bcode_session_models::SessionTitleSource::Explicit,
+            client_count: 0,
+            created_at_ms: 1,
+            updated_at_ms: 10,
+            working_directory: "/tmp".into(),
+            import: None,
+            fork: None,
+            execution: None,
+        };
+        let second = bcode_session_models::SessionSummary {
+            id: SessionId::new(),
+            name: Some("second".to_owned()),
+            explicit_name: None,
+            derived_title: None,
+            title_source: bcode_session_models::SessionTitleSource::Explicit,
+            client_count: 0,
+            created_at_ms: 2,
+            updated_at_ms: 20,
+            working_directory: "/tmp".into(),
+            import: None,
+            fork: None,
+            execution: None,
+        };
+        let results = vec![
+            SessionSearchBackfillSessionResult {
+                session_id: first.id,
+                outcome: SessionSearchBackfillOutcome::Complete,
+                batches_applied: 1,
+                indexed_through_sequence: Some(1),
+                canonical_tail_sequence: Some(1),
+                error: None,
+            },
+            SessionSearchBackfillSessionResult {
+                session_id: second.id,
+                outcome: SessionSearchBackfillOutcome::Incomplete,
+                batches_applied: 1,
+                indexed_through_sequence: Some(1),
+                canonical_tail_sequence: Some(2),
+                error: None,
+            },
+        ];
+
+        assert_eq!(
+            backfill_continuation_cursor(None, &[first.clone(), second], &results, true, None),
+            Some(bcode_session_search::SessionSearchBackfillCursor {
+                updated_at_ms: first.updated_at_ms,
+                session_id: first.id,
+            })
+        );
     }
 
     #[tokio::test]

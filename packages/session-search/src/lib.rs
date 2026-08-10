@@ -1862,6 +1862,21 @@ impl CompleteSessionSearchBackfillProgress {
     }
 }
 
+/// Maximum categorized issue samples retained by complete backfill aggregates.
+pub const MAX_COMPLETE_BACKFILL_ISSUE_SAMPLES: usize = 8;
+
+/// Stable categorized issue summary retained by aggregate backfill state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteSessionSearchBackfillIssueSummary {
+    pub code: SearchErrorCode,
+    pub count: usize,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_session_ids: Vec<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_message: Option<String>,
+}
+
 /// Terminal aggregate for one provider in complete historical backfill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompleteSessionSearchBackfillProviderResult {
@@ -1871,6 +1886,8 @@ pub struct CompleteSessionSearchBackfillProviderResult {
     pub incomplete_sessions: usize,
     pub failed_sessions: usize,
     pub catalog_pages: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<CompleteSessionSearchBackfillIssueSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<SessionSearchServiceError>,
 }
@@ -1893,6 +1910,26 @@ impl CompleteSessionSearchBackfillProviderResult {
             return Err(ContractValidationError::InvalidFilter(
                 "complete backfill provider counts are inconsistent",
             ));
+        }
+        if self.issues.len() > MAX_COMPLETE_BACKFILL_ISSUE_SAMPLES {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "provider_issue_summaries",
+                actual: self.issues.len(),
+                maximum: MAX_COMPLETE_BACKFILL_ISSUE_SAMPLES,
+            });
+        }
+        for issue in &self.issues {
+            if issue.count == 0
+                || issue.sample_session_ids.len() > MAX_COMPLETE_BACKFILL_ISSUE_SAMPLES
+                || issue
+                    .sample_message
+                    .as_ref()
+                    .is_some_and(|message| message.len() > MAX_HIT_PREVIEW_BYTES)
+            {
+                return Err(ContractValidationError::InvalidFilter(
+                    "complete backfill issue summary exceeds portable bounds",
+                ));
+            }
         }
         if let Some(error) = &self.error
             && error.message.len() > MAX_HIT_PREVIEW_BYTES
@@ -1995,6 +2032,7 @@ pub enum SessionSearchBackfillOperationState {
     Running,
     CancellationRequested,
     Completed,
+    NeedsAttention,
     Cancelled,
     Failed,
 }
@@ -2196,6 +2234,7 @@ mod tests {
                     incomplete_sessions: 0,
                     failed_sessions: 0,
                     catalog_pages: 1,
+                    issues: Vec::new(),
                     error: None,
                 },
                 CompleteSessionSearchBackfillProviderResult {
@@ -2205,6 +2244,7 @@ mod tests {
                     incomplete_sessions: 1,
                     failed_sessions: 0,
                     catalog_pages: 1,
+                    issues: Vec::new(),
                     error: None,
                 },
             ],
@@ -2235,6 +2275,7 @@ mod tests {
                 incomplete_sessions: 0,
                 failed_sessions: 0,
                 catalog_pages: 1,
+                issues: Vec::new(),
                 error: None,
             }],
         };

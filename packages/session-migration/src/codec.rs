@@ -24,14 +24,38 @@ pub struct HistoricalEnvelope {
 }
 
 impl HistoricalEnvelope {
+    /// Return the persisted event schema.
+    #[must_use]
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
     }
 
+    /// Return the single persisted event-kind name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the kind envelope is not an object with exactly one variant.
     pub fn source_kind_name(&self) -> Result<&str, HistoricalSessionEventError> {
         source_kind(self).map(|(kind, _)| kind)
     }
 
+    /// Return whether this envelope belongs to a released event kind/schema pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the persisted kind envelope is structurally malformed.
+    pub fn is_released(&self) -> Result<bool, HistoricalSessionEventError> {
+        Ok(crate::is_released_event_kind_schema(
+            self.source_kind_name()?,
+            self.schema_version,
+        ))
+    }
+
+    /// Decode a recognized retired event as inert current history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the historical envelope kind is malformed.
     pub fn decode_retired_known(&self) -> Result<HistoricalDecode, HistoricalSessionEventError> {
         let (event_kind, payload) = source_kind(self)?;
         Ok(HistoricalDecode::RetiredKnown {
