@@ -13,6 +13,9 @@ use bmux_tui::prelude::{
     Border, Color, Constraint, Direction, Event, Frame, Insets, Line, Modifier, Panel, Point, Rect,
     Size, Span, Style, Terminal, Text, TextBlock, TextWrap, Widget, event_from_crossterm, split,
 };
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use clap::Subcommand;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
@@ -964,13 +967,15 @@ async fn run_blims_tui() -> Result<(), CliError> {
 fn render_blims_loading(frame: &mut Frame<'_>) {
     let area = frame.area();
     frame.fill(area, " ", Style::new().bg(Color::Rgb(12, 10, 18)));
-    let modal = centered(area, Size::new(52, 7));
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightMagenta)))
-        .title(" Blims ")
-        .background(Style::new().bg(Color::Rgb(19, 16, 30)));
-    panel.render(modal, frame);
-    TextBlock::new(Text::from_lines(vec![
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(Size::new(52, 7), Insets::all(0)),
+        blims_modal_theme(Color::BrightMagenta, Color::Rgb(19, 16, 30)),
+    )
+    .title(" Blims ")
+    .placement(ModalPlacement::Centered)
+    .padding(Insets::all(1));
+    modal.render(area, frame);
+    let lines = vec![
         Line::from_spans(vec![Span::styled(
             "✨ Opening the office…",
             Style::new()
@@ -978,13 +983,11 @@ fn render_blims_loading(frame: &mut Frame<'_>) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::raw("Loading world, agents, and reports."),
-    ]))
-    .style(
-        Style::new()
-            .bg(Color::Rgb(19, 16, 30))
-            .fg(Color::BrightWhite),
-    )
-    .render(panel.inner_area(modal).inset(Insets::all(1)), frame);
+    ];
+    TextView::new(&lines)
+        .policy(blims_static_text_policy())
+        .styles(blims_text_view_styles(Color::Rgb(19, 16, 30)))
+        .render(modal.content_area(area), &TextViewState::new(), frame);
 }
 
 async fn should_show_world_picker() -> Result<bool, CliError> {
@@ -3052,29 +3055,91 @@ fn render_conversation_modal(
 }
 
 fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
-    let modal = centered(area, Size::new(70, 10));
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightBlue)))
-        .title(" Blims controls ")
-        .background(Style::new().bg(Color::Rgb(18, 20, 38)));
-    panel.render(modal, frame);
-    let text = Text::from_lines(vec![
+    let background = Color::Rgb(18, 20, 38);
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(Size::new(70, 10), Insets::all(0)),
+        blims_modal_theme(Color::BrightBlue, background),
+    )
+    .title(" Blims controls ")
+    .placement(ModalPlacement::Centered)
+    .padding(Insets::all(1));
+    modal.render(area, frame);
+    let lines = vec![
         Line::raw("arrows/hjkl walk one tile around the top-down office"),
         Line::raw("e/enter uses the selected nearby interaction"),
         Line::raw("t opens native in-game coworker chat; tab cycles interactions"),
         Line::raw("d opens CEO dashboard with initiatives, tasks, proposals, artifacts"),
         Line::raw("w opens starter office picker; escape closes modals"),
         Line::raw("r refreshes the morning report"),
-        Line::raw("?/q toggle help / exit the office"),
-    ]);
-    TextBlock::new(text)
-        .wrap(TextWrap::Character)
-        .style(
-            Style::new()
-                .bg(Color::Rgb(18, 20, 38))
-                .fg(Color::BrightWhite),
-        )
-        .render(panel.inner_area(modal).inset(Insets::all(1)), frame);
+    ];
+    let content = modal.content_area(area);
+    let help_area = Rect::new(
+        content.x,
+        content.y,
+        content.width,
+        content.height.saturating_sub(1),
+    );
+    TextView::new(&lines)
+        .policy(blims_static_text_policy())
+        .styles(blims_text_view_styles(background))
+        .render(help_area, &TextViewState::new(), frame);
+    let hints = [
+        KeyHint::new("?", "close help"),
+        KeyHint::new("q", "exit office"),
+    ];
+    KeyHintBar::new(&hints)
+        .styles(blims_hint_styles(background))
+        .render(
+            Rect::new(
+                content.x,
+                content.bottom().saturating_sub(1),
+                content.width,
+                1,
+            ),
+            frame,
+        );
+}
+
+const fn blims_static_text_policy() -> TextViewPolicy {
+    let mut policy = TextViewPolicy::scrollable();
+    policy.keyboard = false;
+    policy.mouse_wheel = false;
+    policy
+}
+
+const fn blims_modal_theme(accent: Color, background: Color) -> ModalTheme {
+    ModalTheme::new(
+        Style::new().bg(background),
+        Style::new().fg(accent).bg(background),
+        Style::new()
+            .fg(accent)
+            .bg(background)
+            .add_modifier(Modifier::BOLD),
+        Style::new().fg(Color::BrightWhite).bg(background),
+        Style::new().fg(Color::BrightBlack).bg(background),
+        Style::new().fg(accent).bg(background),
+    )
+}
+
+const fn blims_text_view_styles(background: Color) -> TextViewStyles {
+    TextViewStyles {
+        text: Style::new().fg(Color::BrightWhite).bg(background),
+        empty: Style::new().fg(Color::BrightBlack).bg(background),
+        background: Style::new().bg(background),
+    }
+}
+
+const fn blims_hint_styles(background: Color) -> KeyHintBarStyles {
+    KeyHintBarStyles {
+        key: Style::new()
+            .fg(Color::BrightBlue)
+            .bg(background)
+            .add_modifier(Modifier::BOLD),
+        label: Style::new().fg(Color::BrightWhite).bg(background),
+        separator: Style::new().fg(Color::BrightBlack).bg(background),
+        disabled: Style::new().fg(Color::BrightBlack).bg(background),
+        background: Style::new().bg(background),
+    }
 }
 
 fn color_from_name(name: &str) -> Color {

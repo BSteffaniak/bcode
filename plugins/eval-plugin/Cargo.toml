@@ -28,6 +28,7 @@ bmux_tui_components = { workspace = true, features = [
     "action-row",
     "bar-chart",
     "dialog",
+    "key-hint-bar",
     "sparkline",
     "tab-bar",
     "table",

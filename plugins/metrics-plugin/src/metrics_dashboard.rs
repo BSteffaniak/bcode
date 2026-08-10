@@ -17,6 +17,7 @@ use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
 use bmux_tui_components::bar_chart::{BarChartItem, BarChartStyles};
 use bmux_tui_components::button::ButtonStyles;
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
 use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy, SparklineStyles};
 use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
 use bmux_tui_components::table::{
@@ -242,11 +243,7 @@ impl MetricsDashboardSurface {
             &self.action_state,
             frame,
         );
-        render_status(
-            status_area,
-            frame,
-            "Mouse: click tabs/rows/buttons. Keys: r refresh, s sort, d direction, g group, f filter row, c clear, 1-8 tabs, q close.",
-        );
+        render_status(status_area, frame);
     }
 
     fn render_domain(&mut self, area: Rect, frame: &mut Frame<'_>) {
@@ -860,15 +857,18 @@ fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
     }
 }
 
-fn render_status(area: Rect, frame: &mut Frame<'_>, text: &str) {
-    frame.write_line_with_fallback_style(
-        area,
-        &Line::from_spans(vec![
-            Span::styled("  ", Style::new().bg(dashboard_bg())),
-            Span::styled(text, Style::new().fg(muted()).bg(dashboard_bg())),
-        ]),
-        Style::new().bg(dashboard_bg()),
-    );
+fn render_status(area: Rect, frame: &mut Frame<'_>) {
+    let hints = [
+        KeyHint::new("r", "refresh"),
+        KeyHint::new("s/d", "sort"),
+        KeyHint::new("g", "group"),
+        KeyHint::new("f/c", "filter"),
+        KeyHint::new("1-8", "tab"),
+        KeyHint::new("q", "close"),
+    ];
+    KeyHintBar::new(&hints)
+        .styles(metric_hint_styles())
+        .render(area, frame);
 }
 
 fn render_panel_title(area: Rect, frame: &mut Frame<'_>, title: &str) {
@@ -1055,6 +1055,19 @@ fn metric_tab_styles() -> TabBarStyles {
     }
 }
 
+fn metric_hint_styles() -> KeyHintBarStyles {
+    KeyHintBarStyles {
+        key: Style::new()
+            .fg(accent())
+            .bg(dashboard_bg())
+            .add_modifier(Modifier::BOLD),
+        label: Style::new().fg(text()).bg(dashboard_bg()),
+        separator: Style::new().fg(border()).bg(dashboard_bg()),
+        disabled: Style::new().fg(muted()).bg(dashboard_bg()),
+        background: Style::new().bg(dashboard_bg()),
+    }
+}
+
 fn metric_button_styles() -> ButtonStyles {
     ButtonStyles {
         normal: Style::new().fg(text()).bg(panel_alt()),
@@ -1159,5 +1172,23 @@ fn format_count(value: u64) -> String {
         format!("{}.{}k", value / 1_000, (value % 1_000) / 100)
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bmux_tui::buffer::Buffer;
+
+    use super::*;
+
+    #[test]
+    fn status_uses_bounded_shared_key_hints() {
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buffer = Buffer::empty(area);
+        render_status(area, &mut Frame::new(&mut buffer));
+
+        let text = buffer.row_symbols(0).expect("status row");
+        assert!(text.starts_with("r refresh"));
+        assert_eq!(text.chars().count(), usize::from(area.width));
     }
 }

@@ -1407,6 +1407,19 @@ where
         None
     }
 
+    /// Render the snapshot with optional renderer-owned semantic presentation.
+    ///
+    /// The default preserves compatibility for renderers that do not consume themes.
+    fn render_with_theme(
+        &mut self,
+        snapshot: &C::Snapshot,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        _theme: Option<PluginTuiTheme>,
+    ) {
+        self.render(snapshot, area, frame);
+    }
+
     /// Translate terminal input and report whether it was consumed.
     fn input(
         &mut self,
@@ -1480,6 +1493,16 @@ where
     fn focused_row_range(&mut self, width: u16) -> Option<std::ops::Range<u16>> {
         self.renderer
             .focused_row_range(&self.controller.snapshot(), width)
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<PluginTuiTheme>,
+    ) {
+        self.renderer
+            .render_with_theme(&self.controller.snapshot(), area, frame, theme);
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {

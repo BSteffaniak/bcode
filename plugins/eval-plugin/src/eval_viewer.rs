@@ -25,6 +25,7 @@ use bmux_tui_components::bar_chart::{
 };
 use bmux_tui_components::button::ButtonStyles;
 use bmux_tui_components::dialog::{Dialog, DialogOutcome, DialogState};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalSizing, ModalTheme};
 use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy, SparklineStyles};
 use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
@@ -433,11 +434,12 @@ impl PluginTuiSurface for EvalRunPickerSurface {
         render_eval_table(frame, self.table_area, &columns, &rows, &self.table_state);
         let actions = picker_actions();
         themed_action_row(&actions).render_state(action_area, &self.action_state, frame);
-        render_status(
-            status_area,
-            frame,
-            "Click a row, then Open. Enter also opens; r refreshes; q closes.",
-        );
+        let hints = [
+            KeyHint::new("Click/Enter", "open"),
+            KeyHint::new("r", "refresh"),
+            KeyHint::new("q", "close"),
+        ];
+        render_status(status_area, frame, &hints);
     }
 
     fn render_with_theme(
@@ -2337,11 +2339,13 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
             &self.generation_state,
         );
         themed_action_row(&campaign_actions()).render_state(action_area, &self.action_state, frame);
-        render_status(
-            status_area,
-            frame,
-            "Enter details. O opens run. V cycles progression/comparison view. Esc returns.",
-        );
+        let hints = [
+            KeyHint::new("Enter", "details"),
+            KeyHint::new("O", "open run"),
+            KeyHint::new("V", "cycle view"),
+            KeyHint::new("Esc", "back"),
+        ];
+        render_status(status_area, frame, &hints);
     }
 
     fn render_with_theme(
@@ -2886,11 +2890,12 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
             &self.action_state,
             frame,
         );
-        render_status(
-            status_area,
-            frame,
-            "Tab switches panes. O opens run. Esc returns.",
-        );
+        let hints = [
+            KeyHint::new("Tab", "pane"),
+            KeyHint::new("O", "open run"),
+            KeyHint::new("Esc", "back"),
+        ];
+        render_status(status_area, frame, &hints);
     }
 
     fn render_with_theme(
@@ -3180,11 +3185,13 @@ impl PluginTuiSurface for EvalRunViewerSurface {
         }
         let actions = viewer_actions(self.selected_tab());
         themed_action_row(&actions).render_state(action_area, &self.action_state, frame);
-        render_status(
-            status_area,
-            frame,
-            "Mouse: click tabs/rows/buttons, wheel scroll artifacts. Keys: Tab, d diff, t transcript, c tools, r refresh, q close.",
-        );
+        let hints = [
+            KeyHint::new("Tab", "pane"),
+            KeyHint::new("d/t/c", "artifact"),
+            KeyHint::new("r", "refresh"),
+            KeyHint::new("q", "close"),
+        ];
+        render_status(status_area, frame, &hints);
     }
 
     fn render_with_theme(
@@ -3617,11 +3624,11 @@ impl EvalRunViewerSurface {
     fn render_artifact(&self, area: Rect, frame: &mut Frame<'_>) {
         let Some((title, text, truncated, binary)) = &self.artifact else {
             render_panel_title(area, frame, "Artifact viewer");
-            render_status(
-                inset_top(area, 1),
-                frame,
-                "Select a repetition, then use Diff, Transcript, or Tool Calls.",
-            );
+            let hints = [KeyHint::new(
+                "Select repetition",
+                "then Diff/Transcript/Tool Calls",
+            )];
+            render_status(inset_top(area, 1), frame, &hints);
             return;
         };
         render_panel_title(area, frame, title);
@@ -3761,15 +3768,10 @@ fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
     }
 }
 
-fn render_status(area: Rect, frame: &mut Frame<'_>, text: &str) {
-    frame.write_line_with_fallback_style(
-        area,
-        &Line::from_spans(vec![
-            Span::styled("  ", Style::new().bg(dashboard_bg())),
-            Span::styled(text, Style::new().fg(muted()).bg(dashboard_bg())),
-        ]),
-        Style::new().bg(dashboard_bg()),
-    );
+fn render_status(area: Rect, frame: &mut Frame<'_>, hints: &[KeyHint<'_>]) {
+    KeyHintBar::new(hints)
+        .styles(eval_hint_styles())
+        .render(area, frame);
 }
 
 fn render_panel_title(area: Rect, frame: &mut Frame<'_>, title: &str) {
@@ -3796,6 +3798,19 @@ fn render_panel_title(area: Rect, frame: &mut Frame<'_>, title: &str) {
         ]),
         Style::new().bg(panel()),
     );
+}
+
+fn eval_hint_styles() -> KeyHintBarStyles {
+    KeyHintBarStyles {
+        key: Style::new()
+            .fg(accent())
+            .bg(dashboard_bg())
+            .add_modifier(Modifier::BOLD),
+        label: Style::new().fg(text_color()).bg(dashboard_bg()),
+        separator: Style::new().fg(border()).bg(dashboard_bg()),
+        disabled: Style::new().fg(muted()).bg(dashboard_bg()),
+        background: Style::new().bg(dashboard_bg()),
+    }
 }
 
 fn eval_table_styles() -> TableStyles {
@@ -5378,10 +5393,24 @@ const fn table_action(outcome: TableOutcome) -> bool {
 #[cfg(test)]
 mod interaction_tests {
     use bmux_keyboard::{KeyCode, KeyStroke};
+    use bmux_tui::buffer::Buffer;
     use bmux_tui::event::Event;
+    use bmux_tui::frame::Frame;
     use bmux_tui::prelude::Rect;
 
-    use super::{handle_input_box, input_text, text_state};
+    use super::{KeyHint, handle_input_box, input_text, render_status, text_state};
+
+    #[test]
+    fn eval_status_uses_bounded_shared_key_hints() {
+        let hints = [KeyHint::new("Tab", "pane"), KeyHint::new("q", "close")];
+        let area = Rect::new(0, 0, 14, 1);
+        let mut buffer = Buffer::empty(area);
+        render_status(area, &mut Frame::new(&mut buffer), &hints);
+
+        let text = buffer.row_symbols(0).expect("status row");
+        assert!(text.starts_with("Tab pane"));
+        assert_eq!(text.chars().count(), usize::from(area.width));
+    }
 
     #[test]
     fn focused_wizard_input_accepts_plain_text_color() {

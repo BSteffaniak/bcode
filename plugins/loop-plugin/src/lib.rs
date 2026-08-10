@@ -28,9 +28,11 @@ use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::prelude::Style;
 use bmux_tui::style::Color;
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::status_bar::{StatusBar, StatusBarStyles, StatusSegment, StatusSeverity};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{
     TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy, TextInputBoxStyles,
@@ -841,17 +843,22 @@ impl PluginTuiSurface for LoopSurface {
         );
         let status_y = self.limit_area.bottom().saturating_add(1);
         if status_y < content.bottom() {
-            modal.render_line(
-                Rect::new(content.x, status_y, content.width, 1),
-                &Line::from_spans(vec![Span::styled(
-                    self.status.clone(),
-                    self.theme.map_or_else(
-                        || Style::new().fg(Color::BrightBlack).bg(Color::Black),
-                        |theme| theme.muted.patch(theme.canvas),
-                    ),
-                )]),
-                frame,
-            );
+            let status = [StatusSegment::new(&self.status).severity(StatusSeverity::Muted)];
+            StatusBar::new()
+                .left(&status)
+                .styles(loop_status_styles(self.theme))
+                .render(Rect::new(content.x, status_y, content.width, 1), frame);
+        }
+        let hints_y = status_y.saturating_add(1);
+        if hints_y < content.bottom() {
+            let hints = [
+                KeyHint::new("Tab/Shift-Tab", "field"),
+                KeyHint::new("Ctrl-Enter", "start"),
+                KeyHint::new("Esc", "close"),
+            ];
+            KeyHintBar::new(&hints)
+                .styles(loop_hint_styles(self.theme))
+                .render(Rect::new(content.x, hints_y, content.width, 1), frame);
         }
     }
 
@@ -932,6 +939,50 @@ impl PluginTuiSurface for LoopSurface {
             | TextInputBoxOutcome::EdgeUp
             | TextInputBoxOutcome::EdgeDown => PluginTuiAction::None,
         }
+    }
+}
+
+const fn loop_status_styles(theme: Option<PluginTuiTheme>) -> StatusBarStyles {
+    match theme {
+        Some(theme) => StatusBarStyles {
+            default: theme.text,
+            muted: theme.muted,
+            info: theme.focused,
+            success: theme.focused,
+            warning: theme.focused,
+            error: theme.focused,
+            separator: theme.border,
+            background: theme.canvas,
+        },
+        None => StatusBarStyles {
+            default: Style::new().fg(Color::White),
+            muted: Style::new().fg(Color::BrightBlack),
+            info: Style::new().fg(Color::Cyan),
+            success: Style::new().fg(Color::Green),
+            warning: Style::new().fg(Color::Yellow),
+            error: Style::new().fg(Color::Red),
+            separator: Style::new().fg(Color::BrightBlack),
+            background: Style::new().bg(Color::Black),
+        },
+    }
+}
+
+const fn loop_hint_styles(theme: Option<PluginTuiTheme>) -> KeyHintBarStyles {
+    match theme {
+        Some(theme) => KeyHintBarStyles {
+            key: theme.focused,
+            label: theme.text,
+            separator: theme.muted,
+            disabled: theme.muted,
+            background: theme.canvas,
+        },
+        None => KeyHintBarStyles {
+            key: Style::new().fg(Color::Cyan),
+            label: Style::new().fg(Color::White),
+            separator: Style::new().fg(Color::BrightBlack),
+            disabled: Style::new().fg(Color::BrightBlack),
+            background: Style::new().bg(Color::Black),
+        },
     }
 }
 

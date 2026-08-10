@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use bcode_plugin_sdk::tui::{TerminalInteractionInput, TerminalInteractionRenderer};
+use bcode_plugin_sdk::tui::{
+    PluginTuiTheme, TerminalInteractionInput, TerminalInteractionRenderer,
+};
 use bcode_tool::{InteractionControlId, InteractionInput, InteractionNavigation, InteractionValue};
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
@@ -12,6 +14,8 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::wrap_text_with_continuation;
+use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowStyles};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
 use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
 
@@ -32,6 +36,48 @@ pub struct QuestionTerminalRenderer {
     custom_inputs: BTreeMap<usize, TextInputState>,
     custom_areas: BTreeMap<usize, Rect>,
     pending_custom_mouse_focus: Option<usize>,
+    theme: QuestionSurfaceTheme,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuestionSurfaceTheme {
+    text: Style,
+    muted: Style,
+    focused: Style,
+    selection: Style,
+    error: Style,
+    warning: Style,
+    canvas: Style,
+}
+
+impl Default for QuestionSurfaceTheme {
+    fn default() -> Self {
+        Self {
+            text: Style::new(),
+            muted: Style::new().fg(Color::BrightBlack),
+            focused: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            selection: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            error: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            warning: Style::new().fg(Color::Yellow),
+            canvas: Style::new(),
+        }
+    }
+}
+
+impl QuestionSurfaceTheme {
+    fn resolve(theme: Option<PluginTuiTheme>) -> Self {
+        theme
+            .and_then(|theme| theme.component_theme())
+            .map_or_else(Self::default, |theme| Self {
+                text: theme.text,
+                muted: theme.muted,
+                focused: theme.focused,
+                selection: theme.selected,
+                error: theme.error,
+                warning: theme.warning,
+                canvas: theme.canvas,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,7 +160,7 @@ impl QuestionTerminalRenderer {
             content_y,
             &Line::from_spans(vec![Span::styled(
                 "Question",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                self.theme.focused.add_modifier(Modifier::BOLD),
             )]),
         );
     }
@@ -132,7 +178,7 @@ impl QuestionTerminalRenderer {
             || format!("{}{required}", question.text),
             |header| format!("{header}{required}: {}", question.text),
         );
-        self.render_wrapped(frame, content_y, &prompt, "", "", Style::default());
+        self.render_wrapped(frame, content_y, &prompt, "", "", self.theme.text);
         for (option_index, option) in question.options.iter().enumerate() {
             let start_y = *content_y;
             let option_id = option_control_id(question_index, option_index);
@@ -165,7 +211,7 @@ impl QuestionTerminalRenderer {
                 &option.label,
                 &prefix,
                 &continuation,
-                option_style(focused, selected),
+                option_style(&self.theme, focused, selected),
             );
             if let Some(description) = option.description.as_deref() {
                 self.render_wrapped(
@@ -174,7 +220,7 @@ impl QuestionTerminalRenderer {
                     description,
                     DESCRIPTION_INDENT,
                     DESCRIPTION_INDENT,
-                    Style::new().fg(Color::BrightBlack),
+                    self.theme.muted,
                 );
             }
             if let Some(area) = self.control_area(start_y, content_y.saturating_sub(start_y)) {
@@ -192,7 +238,7 @@ impl QuestionTerminalRenderer {
                 "An answer is required.",
                 "  ",
                 "  ",
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                self.theme.error.add_modifier(Modifier::BOLD),
             );
         }
         self.render_line(frame, content_y, &Line::from(""));
@@ -256,6 +302,7 @@ impl QuestionTerminalRenderer {
                     min_rows: area.height,
                     max_rows: Some(area.height),
                 })
+                .styles(question_input_styles(&self.theme))
                 .render(area, state, frame);
             self.custom_areas.insert(question_index, area);
             self.controls.push(ControlRegion { area, control_id });
@@ -268,45 +315,77 @@ impl QuestionTerminalRenderer {
         content_y: &mut u16,
         snapshot: &QuestionSnapshot,
     ) {
-        let action_y = *content_y;
-        if let Some(area) = self.control_area(action_y, 1) {
-            self.controls.push(ControlRegion {
-                area: Rect::new(area.x, area.y, area.width.min(10), 1),
-                control_id: InteractionControlId::new("submit"),
-            });
-            self.controls.push(ControlRegion {
-                area: Rect::new(
-                    area.x.saturating_add(11),
-                    area.y,
-                    area.width.saturating_sub(11).min(10),
-                    1,
-                ),
-                control_id: InteractionControlId::new("cancel"),
-            });
+        let actions = [
+            ActionButton::new("submit", "Submit"),
+            ActionButton::new("cancel", "Cancel"),
+        ];
+        let focused = usize::from(snapshot.focus == QuestionFocusTarget::Cancel);
+        if let Some(area) = self.control_area(*content_y, 1) {
+            let row = ActionRow::new(&actions)
+                .focused(focused)
+                .styles(question_action_styles(&self.theme));
+            for (index, action_area) in row.action_areas(area).into_iter().enumerate() {
+                self.controls.push(ControlRegion {
+                    area: action_area,
+                    control_id: InteractionControlId::new(actions[index].id.clone()),
+                });
+            }
+            row.render_with_fallback_style(area, frame, self.theme.canvas);
         }
-        self.render_line(
-            frame,
-            content_y,
-            &Line::from_spans(vec![
-                Span::styled(
-                    "[ Submit ]",
-                    focus_style(snapshot.focus == QuestionFocusTarget::Submit),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    "[ Cancel ]",
-                    focus_style(snapshot.focus == QuestionFocusTarget::Cancel),
-                ),
-            ]),
-        );
-        self.render_wrapped(
-            frame,
-            content_y,
-            "Tab/Shift-Tab or arrows move · Enter/Space selects · Esc dismisses · transcript scroll keys remain available",
-            "",
-            "",
-            Style::new().fg(Color::BrightBlack),
-        );
+        *content_y = content_y.saturating_add(1);
+        let hints = [
+            KeyHint::new("Tab/Shift-Tab or arrows", "move"),
+            KeyHint::new("Enter/Space", "select"),
+            KeyHint::new("Esc", "dismiss"),
+        ];
+        if let Some(area) = self.control_area(*content_y, 1) {
+            KeyHintBar::new(&hints)
+                .styles(question_hint_styles(&self.theme))
+                .render(area, frame);
+        }
+        *content_y = content_y.saturating_add(1);
+    }
+
+    fn render_snapshot(&mut self, snapshot: &QuestionSnapshot, area: Rect, frame: &mut Frame<'_>) {
+        if let Some(question_index) = self.pending_custom_mouse_focus
+            && matches!(
+                snapshot.focus,
+                QuestionFocusTarget::Custom { question_index: focused }
+                    if focused == question_index
+            )
+        {
+            self.pending_custom_mouse_focus = None;
+        }
+        self.last_area = area;
+        self.controls.clear();
+        self.custom_areas.clear();
+        self.ensure_focus_visible(snapshot, area.width, area.height);
+        let mut content_y = 0;
+        self.render_title(frame, &mut content_y);
+        if let Some(error) = &snapshot.validation_error {
+            self.render_line(
+                frame,
+                &mut content_y,
+                &Line::from_spans(vec![Span::styled(error, self.theme.error)]),
+            );
+        }
+        for question_index in 0..snapshot.request.questions.len() {
+            self.render_question(frame, &mut content_y, snapshot, question_index);
+        }
+        self.render_actions(frame, &mut content_y, snapshot);
+        if self.viewport_offset > 0 && area.height > 0 {
+            frame.write_line(
+                Rect::new(area.x, area.y, area.width, 1),
+                &Line::from_spans(vec![Span::styled("↑ more", self.theme.warning)]),
+            );
+        }
+        if self.viewport_offset.saturating_add(area.height) < self.content_height && area.height > 0
+        {
+            frame.write_line(
+                Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+                &Line::from_spans(vec![Span::styled("↓ more", self.theme.warning)]),
+            );
+        }
     }
 
     fn custom_vertical_input(
@@ -548,31 +627,8 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
     }
 
     fn render(&mut self, snapshot: &QuestionSnapshot, area: Rect, frame: &mut Frame<'_>) {
-        if let Some(question_index) = self.pending_custom_mouse_focus
-            && matches!(
-                snapshot.focus,
-                QuestionFocusTarget::Custom { question_index: focused }
-                    if focused == question_index
-            )
-        {
-            self.pending_custom_mouse_focus = None;
-        }
-        self.last_area = area;
-        self.controls.clear();
-        self.custom_areas.clear();
-        let mut content_y = 0;
-        self.render_title(frame, &mut content_y);
-        if let Some(error) = &snapshot.validation_error {
-            self.render_line(
-                frame,
-                &mut content_y,
-                &Line::from_spans(vec![Span::styled(error, Style::default().fg(Color::Red))]),
-            );
-        }
-        for question_index in 0..snapshot.request.questions.len() {
-            self.render_question(frame, &mut content_y, snapshot, question_index);
-        }
-        self.render_actions(frame, &mut content_y, snapshot);
+        self.theme = QuestionSurfaceTheme::default();
+        self.render_snapshot(snapshot, area, frame);
     }
 
     fn render_slice(
@@ -595,6 +651,17 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
     ) -> Option<std::ops::Range<u16>> {
         let (start, end) = Self::focused_content_range(snapshot, width.max(1));
         Some(start..end.max(start.saturating_add(1)))
+    }
+
+    fn render_with_theme(
+        &mut self,
+        snapshot: &QuestionSnapshot,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<PluginTuiTheme>,
+    ) {
+        self.theme = QuestionSurfaceTheme::resolve(theme);
+        self.render_snapshot(snapshot, area, frame);
     }
 
     fn input(
@@ -800,19 +867,11 @@ fn wrapped_height(text: &str, first_width: usize, continuation_width: usize) -> 
     .max(1)
 }
 
-const fn focus_style(focused: bool) -> Style {
-    if focused {
-        Style::new().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::new()
-    }
-}
-
-const fn option_style(focused: bool, selected: bool) -> Style {
+const fn option_style(theme: &QuestionSurfaceTheme, focused: bool, selected: bool) -> Style {
     let style = if selected {
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        theme.selection.add_modifier(Modifier::BOLD)
     } else {
-        Style::new()
+        theme.text
     };
     if focused {
         style.add_modifier(Modifier::REVERSED)
@@ -821,11 +880,51 @@ const fn option_style(focused: bool, selected: bool) -> Style {
     }
 }
 
+const fn question_action_styles(theme: &QuestionSurfaceTheme) -> ActionRowStyles {
+    ActionRowStyles {
+        normal: theme.text,
+        focused: theme.focused,
+        hovered: theme.focused,
+        pressed: theme.selection,
+        disabled: theme.muted,
+    }
+}
+
+const fn question_hint_styles(theme: &QuestionSurfaceTheme) -> KeyHintBarStyles {
+    KeyHintBarStyles {
+        key: theme.focused,
+        label: theme.text,
+        separator: theme.muted,
+        disabled: theme.muted,
+        background: theme.canvas,
+    }
+}
+
+const fn question_input_styles(
+    theme: &QuestionSurfaceTheme,
+) -> bmux_tui_components::text_input_box::TextInputBoxStyles {
+    bmux_tui_components::text_input_box::TextInputBoxStyles {
+        text: theme.text,
+        focused_text: theme.focused,
+        disabled_text: theme.muted,
+        placeholder: theme.muted,
+        selection: theme.selection,
+        border: theme.muted,
+        focused_border: theme.focused,
+        background: theme.canvas,
+        focused_background: theme.canvas,
+        disabled_background: theme.canvas,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bcode_plugin_sdk::interaction::PluginInteraction;
-    use bcode_plugin_sdk::tui::{PluginTask, PluginTuiHost};
+    use bcode_plugin_sdk::tui::{
+        PluginTask, PluginTuiDiffTheme, PluginTuiHost, PluginTuiSourceTheme, PluginTuiSyntaxColor,
+        PluginTuiSyntaxTheme,
+    };
     use bcode_tool::{InteractionInput, InteractionOutput};
     use bmux_keyboard::{KeyStroke, Modifiers};
     use bmux_tui::buffer::Buffer;
@@ -881,6 +980,18 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let mut frame = Frame::new(&mut buffer);
         renderer.render(snapshot, area, &mut frame);
+        buffer
+    }
+
+    fn render_snapshot_with_theme(
+        renderer: &mut QuestionTerminalRenderer,
+        snapshot: &QuestionSnapshot,
+        area: Rect,
+        theme: PluginTuiTheme,
+    ) -> Buffer {
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        renderer.render_with_theme(snapshot, area, &mut frame, Some(theme));
         buffer
     }
 
@@ -1065,6 +1176,79 @@ mod tests {
         assert_eq!(
             controller.snapshot().answers[0].custom.as_deref(),
             Some("answer")
+        );
+    }
+
+    #[test]
+    fn renderer_uses_host_theme_for_options_actions_and_hints() {
+        let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question("Choose", &[("Yes", None)], false, true)],
+        });
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 0),
+        });
+        let snapshot = controller.snapshot();
+        let mut renderer = QuestionTerminalRenderer::default();
+        let style = Style::new();
+        let syntax_color = PluginTuiSyntaxColor::from_tui(Color::Default);
+        let theme = PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            canvas: style,
+            text: style.fg(Color::Blue),
+            muted: style.fg(Color::BrightBlack),
+            border: style,
+            focused: style.fg(Color::Magenta),
+            selection: style.fg(Color::Green),
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: syntax_color,
+                comment: syntax_color,
+                keyword: syntax_color,
+                function: syntax_color,
+                variable: syntax_color,
+                string: syntax_color,
+                number: syntax_color,
+                type_name: syntax_color,
+                operator: syntax_color,
+                punctuation: syntax_color,
+            },
+        };
+        let buffer =
+            render_snapshot_with_theme(&mut renderer, &snapshot, Rect::new(0, 0, 48, 12), theme);
+        let text = rendered_text(&buffer);
+
+        assert!(text.contains("[ Submit ]"));
+        assert!(text.contains("Tab/Shift-Tab or arrows"));
+        let selected_row = (0..buffer.area().height)
+            .find(|row| {
+                buffer
+                    .row_symbols(*row)
+                    .is_some_and(|line| line.contains("(*) Yes"))
+            })
+            .expect("selected option row");
+        assert_eq!(
+            buffer
+                .get(Point::new(9, selected_row))
+                .and_then(|cell| cell.style.fg),
+            Some(Color::Green)
         );
     }
 
