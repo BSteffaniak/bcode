@@ -14,16 +14,23 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_client        = { workspace = true }
-bcode_command       = { workspace = true }
-bcode_metrics       = { workspace = true }
-bcode_plugin_sdk    = { workspace = true, features = ["tui"] }
-bmux_keyboard       = { workspace = true }
-bmux_tui            = { workspace = true }
-bmux_tui_components = { workspace = true }
-clap                = { workspace = true, features = ["derive", "std"] }
-serde               = { workspace = true }
-serde_json          = { workspace = true }
+bcode_client = { workspace = true }
+bcode_command = { workspace = true }
+bcode_metrics = { workspace = true }
+bcode_plugin_sdk = { workspace = true, features = ["tui"] }
+bmux_keyboard = { workspace = true }
+bmux_tui = { workspace = true }
+bmux_tui_components = { workspace = true, features = [
+    "action-row",
+    "bar-chart",
+    "button",
+    "sparkline",
+    "tab-bar",
+    "table",
+] }
+clap = { workspace = true, features = ["derive", "std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default          = []

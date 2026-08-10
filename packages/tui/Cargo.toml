@@ -11,59 +11,66 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-arboard                    = { workspace = true }
-bcode_agent_profile        = { workspace = true }
-bcode_build_info           = { workspace = true }
-bcode_bundled_plugins      = { workspace = true }
-bcode_client               = { workspace = true }
-bcode_code_review_models   = { workspace = true }
-bcode_command              = { workspace = true }
-bcode_config               = { workspace = true }
-bcode_ipc                  = { workspace = true }
-bcode_markdown_render      = { workspace = true }
-bcode_mermaid_render       = { workspace = true }
-bcode_metrics              = { workspace = true }
-bcode_model                = { workspace = true }
-bcode_plugin               = { workspace = true }
-bcode_plugin_sdk           = { workspace = true, features = ["tui"] }
-bcode_provider_auth        = { workspace = true }
+arboard = { workspace = true }
+bcode_agent_profile = { workspace = true }
+bcode_build_info = { workspace = true }
+bcode_bundled_plugins = { workspace = true }
+bcode_client = { workspace = true }
+bcode_code_review_models = { workspace = true }
+bcode_command = { workspace = true }
+bcode_config = { workspace = true }
+bcode_ipc = { workspace = true }
+bcode_markdown_render = { workspace = true }
+bcode_mermaid_render = { workspace = true }
+bcode_metrics = { workspace = true }
+bcode_model = { workspace = true }
+bcode_plugin = { workspace = true }
+bcode_plugin_sdk = { workspace = true, features = ["tui"] }
+bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
-bcode_ralph                = { workspace = true }
-bcode_server               = { workspace = true }
-bcode_session_models       = { workspace = true }
-bcode_session_search       = { workspace = true }
-bcode_session_view         = { workspace = true }
-bcode_session_view_models  = { workspace = true }
-bcode_settings             = { workspace = true }
-bcode_skill_models         = { workspace = true }
-bcode_syntax_render        = { workspace = true }
-bcode_tool                 = { workspace = true }
-bcode_tui_components       = { workspace = true }
-bcode_workflow             = { workspace = true }
-bcode_workflow_store       = { workspace = true }
-bcode_worktree_models      = { workspace = true }
-bmux_image                 = { workspace = true, features = ["iterm2", "kitty", "sixel"] }
-bmux_keyboard              = { workspace = true }
-bmux_terminal_grid         = { workspace = true }
-bmux_text_edit             = { workspace = true }
-bmux_tui                   = { workspace = true, features = ["crossterm"] }
-bmux_tui_components        = { workspace = true, features = ["text-input"] }
-bmux_tui_runtime           = { workspace = true, features = ["crossterm"] }
-crossterm                  = { workspace = true, features = ["bracketed-paste", "events"] }
-image                      = { workspace = true }
-open                       = { workspace = true }
-png                        = { workspace = true }
-reqwest                    = { workspace = true, features = ["rustls-tls", "stream"] }
-resvg                      = { workspace = true }
-serde                      = { workspace = true, features = ["derive", "std"] }
-serde_json                 = { workspace = true }
-thiserror                  = { workspace = true }
-tokio                      = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-toml                       = { workspace = true }
-tracing                    = { workspace = true }
-unicode-segmentation       = { workspace = true }
-url                        = { workspace = true }
-uuid                       = { workspace = true, features = ["v4"] }
+bcode_ralph = { workspace = true }
+bcode_server = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_session_search = { workspace = true }
+bcode_session_view = { workspace = true }
+bcode_session_view_models = { workspace = true }
+bcode_settings = { workspace = true }
+bcode_skill_models = { workspace = true }
+bcode_syntax_render = { workspace = true }
+bcode_tool = { workspace = true }
+bcode_tui_components = { workspace = true }
+bcode_workflow = { workspace = true }
+bcode_workflow_store = { workspace = true }
+bcode_worktree_models = { workspace = true }
+bmux_image = { workspace = true, features = ["iterm2", "kitty", "sixel"] }
+bmux_keyboard = { workspace = true }
+bmux_terminal_grid = { workspace = true }
+bmux_text_edit = { workspace = true }
+bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_tui_components = { workspace = true, features = [
+    "action-row",
+    "labeled-details",
+    "modal-frame",
+    "scroll-area",
+    "stepper",
+    "text-input",
+] }
+bmux_tui_runtime = { workspace = true, features = ["crossterm"] }
+crossterm = { workspace = true, features = ["bracketed-paste", "events"] }
+image = { workspace = true }
+open = { workspace = true }
+png = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
+resvg = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+unicode-segmentation = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 bcode_default_agents_plugin = { workspace = true, features = [
