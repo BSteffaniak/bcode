@@ -26,6 +26,7 @@ bmux_tui = { workspace = true, features = ["crossterm"] }
 bmux_tui_components = { workspace = true, features = [
     "key-hint-bar",
     "modal-frame",
+    "pane",
     "text-view",
 ] }
 clap = { workspace = true, features = ["derive", "std"] }

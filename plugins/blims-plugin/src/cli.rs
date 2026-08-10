@@ -9,11 +9,12 @@ use bcode_session_models::SessionId;
 use bcode_worktree_models::{WorktreeBaseRef, WorktreeCreateRequest, WorktreeCreateResponse};
 use bmux_keyboard::KeyCode;
 use bmux_tui::prelude::{
-    Border, Color, Constraint, Direction, Event, Frame, Insets, Line, Modifier, Panel, Point, Rect,
-    Size, Span, Style, Terminal, Text, TextBlock, TextWrap, Widget, event_from_crossterm, split,
+    Color, Constraint, Direction, Event, Frame, Insets, Line, Modifier, Point, Rect, Size, Span,
+    Style, Terminal, event_from_crossterm, split,
 };
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
 use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use clap::Subcommand;
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -2195,10 +2196,13 @@ fn conversation_line_from_session_event(
 }
 
 fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
-    Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightMagenta)))
-        .background(Style::new().bg(Color::Rgb(19, 16, 30)))
-        .render(area, frame);
+    let background = Color::Rgb(19, 16, 30);
+    let pane = Pane::new()
+        .border(true)
+        .padding(Insets::new(1, 2, 0, 2))
+        .styles(blims_pane_styles(Color::BrightMagenta, background));
+    let state = PaneState::new(area);
+    pane.render(&state, frame);
     let title = Line::from_spans(vec![
         Span::styled(
             " ✨ BLIMS ",
@@ -2218,18 +2222,20 @@ fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
         ),
     ]);
     frame.write_line_with_fallback_style(
-        area.inset(Insets::new(1, 2, 0, 2)),
+        pane.inner_area(&state),
         &title,
-        Style::new().bg(Color::Rgb(19, 16, 30)),
+        Style::new().bg(background),
     );
 }
 
 fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     let background = Color::Rgb(10, 14, 24);
-    Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightBlue)))
-        .background(Style::new().bg(background))
-        .render(area, frame);
+    let pane = Pane::new()
+        .border(true)
+        .padding(Insets::new(1, 2, 0, 2))
+        .styles(blims_pane_styles(Color::BrightBlue, background));
+    let state = PaneState::new(area);
+    pane.render(&state, frame);
     let status = app.status.clone();
     let hints = [
         KeyHint::new("arrows/hjkl", "walk"),
@@ -2243,17 +2249,18 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     ];
     KeyHintBar::new(&hints)
         .styles(blims_hint_styles(background))
-        .render(area.inset(Insets::new(1, 2, 0, 2)), frame);
+        .render(pane.inner_area(&state), frame);
 }
 
 fn render_blims_map(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightCyan)))
+    let background = Color::Rgb(8, 18, 24);
+    let pane = Pane::new()
         .title(" Pixel office ")
-        .background(Style::new().bg(Color::Rgb(8, 18, 24)));
-    panel.render(area, frame);
-    let inner = panel.inner_area(area).inset(Insets::all(1));
-    render_pixel_world(app, inner, frame);
+        .padding(Insets::all(1))
+        .styles(blims_pane_styles(Color::BrightCyan, background));
+    let state = PaneState::new(area);
+    pane.render(&state, frame);
+    render_pixel_world(app, pane.inner_area(&state), frame);
 }
 
 fn render_pixel_world(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2418,12 +2425,14 @@ fn room_symbol(room: &BlimsRoomSnapshot) -> &'static str {
 }
 
 fn render_blims_sidebar(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightGreen)))
+    let background = Color::Rgb(13, 20, 18);
+    let pane = Pane::new()
         .title(" CEO console ")
-        .background(Style::new().bg(Color::Rgb(13, 20, 18)));
-    panel.render(area, frame);
-    let inner = panel.inner_area(area).inset(Insets::all(1));
+        .padding(Insets::all(1))
+        .styles(blims_pane_styles(Color::BrightGreen, background));
+    let state = PaneState::new(area);
+    pane.render(&state, frame);
+    let inner = pane.inner_area(&state);
     let rows = split(
         inner,
         Direction::Vertical,
@@ -2451,10 +2460,10 @@ fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_
         .rooms
         .iter()
         .find(|room| room.id == app.interactions.room_id);
-    let text = room.map_or_else(
-        || Text::raw("Between rooms"),
+    let lines = room.map_or_else(
+        || vec![Line::raw("Between rooms")],
         |room| {
-            Text::from_lines(vec![
+            vec![
                 Line::from_spans(vec![Span::styled(
                     room.name.clone(),
                     Style::new()
@@ -2473,17 +2482,10 @@ fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_
                     room_anchor(room).x,
                     room_anchor(room).y
                 )),
-            ])
+            ]
         },
     );
-    TextBlock::new(text)
-        .wrap(TextWrap::Character)
-        .style(
-            Style::new()
-                .bg(Color::Rgb(13, 20, 18))
-                .fg(Color::BrightWhite),
-        )
-        .render(area, frame);
+    render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
 fn render_activity_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2510,10 +2512,7 @@ fn render_activity_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
             Line::raw(format!("{marker} {actor}{}", item.title))
         }));
     }
-    TextBlock::new(Text::from_lines(lines))
-        .wrap(TextWrap::Character)
-        .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
-        .render(area, frame);
+    render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
 fn render_inbox_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2540,10 +2539,7 @@ fn render_inbox_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
             Line::raw(format!("{prefix}{}{}", actor, item.title))
         }));
     }
-    TextBlock::new(Text::from_lines(lines))
-        .wrap(TextWrap::Character)
-        .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
-        .render(area, frame);
+    render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
 fn render_interactions_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2587,10 +2583,7 @@ fn render_interactions_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_
                 }),
         );
     }
-    TextBlock::new(Text::from_lines(lines))
-        .wrap(TextWrap::Character)
-        .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
-        .render(area, frame);
+    render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
 fn render_live_log_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2606,10 +2599,7 @@ fn render_live_log_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
             .take(5)
             .map(|message| Line::raw(format!("• {message}"))),
     );
-    TextBlock::new(Text::from_lines(lines))
-        .wrap(TextWrap::Character)
-        .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
-        .render(area, frame);
+    render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
 fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -3067,6 +3057,17 @@ fn render_blims_text_view(area: Rect, frame: &mut Frame<'_>, lines: &[Line], bac
         .policy(blims_static_text_policy())
         .styles(blims_text_view_styles(background))
         .render(area, &TextViewState::new(), frame);
+}
+
+const fn blims_pane_styles(accent: Color, background: Color) -> PaneStyles {
+    PaneStyles {
+        background: Some(Style::new().bg(background)),
+        border: Style::new().fg(accent).bg(background),
+        focused_border: Style::new()
+            .fg(accent)
+            .bg(background)
+            .add_modifier(Modifier::BOLD),
+    }
 }
 
 const fn blims_static_text_policy() -> TextViewPolicy {
