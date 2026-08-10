@@ -733,6 +733,62 @@ mod tests {
     }
 
     #[test]
+    fn string_only_options_produce_model_visible_labels_and_values() {
+        let request = parse_question_request(json!({
+            "question": "Which approach?",
+            "options": ["Use SQLite", "Use Postgres"]
+        }))
+        .expect("string-only options");
+        let outcome = answered_outcome(
+            &request,
+            vec![QuestionAnswerPayload {
+                question_index: 0,
+                selected: vec!["Use SQLite".to_owned()],
+                custom: None,
+            }],
+        )
+        .expect("answered outcome");
+
+        assert_eq!(outcome.questions[0].question, "Which approach?");
+        assert_eq!(
+            outcome.questions[0].selected,
+            [SelectedAnswer {
+                label: "Use SQLite".to_owned(),
+                value: "Use SQLite".to_owned(),
+            }]
+        );
+        let output = format_question_outcome_output(&outcome);
+        assert!(output.contains("Which approach?"));
+        assert!(output.contains("selected=[Use SQLite]"));
+    }
+
+    #[test]
+    fn explicit_option_value_remains_distinct_from_model_visible_label() {
+        let request = parse_question_request(json!({
+            "question": "Which database?",
+            "options": [{"label": "Use SQLite", "value": "sqlite"}]
+        }))
+        .expect("valued option");
+        let outcome = answered_outcome(
+            &request,
+            vec![QuestionAnswerPayload {
+                question_index: 0,
+                selected: vec!["sqlite".to_owned()],
+                custom: None,
+            }],
+        )
+        .expect("answered outcome");
+
+        assert_eq!(
+            outcome.questions[0].selected,
+            [SelectedAnswer {
+                label: "Use SQLite".to_owned(),
+                value: "sqlite".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn question_request_bounds_reject_oversized_collections_and_text() {
         let too_many = (0..=MAX_QUESTIONS)
             .map(|index| json!({"question": format!("Question {index}")}))

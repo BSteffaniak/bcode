@@ -193,10 +193,7 @@ impl QuestionInteractionController {
         let Some(answer) = self.answers.get_mut(question_index) else {
             return;
         };
-        let value = option
-            .value
-            .clone()
-            .unwrap_or_else(|| option_index.to_string());
+        let value = option.value.clone().unwrap_or_else(|| option.label.clone());
         if question.selection_mode == QuestionSelectionMode::Multiple {
             if let Some(index) = answer
                 .selected
@@ -456,6 +453,25 @@ mod tests {
         }
     }
 
+    fn question_with_labels(labels: &[&str], selection_mode: QuestionSelectionMode) -> Question {
+        let mut question = question(
+            &[],
+            selection_mode,
+            false,
+            QuestionCustomMode::Additional,
+            false,
+        );
+        question.options = labels
+            .iter()
+            .map(|label| QuestionOption {
+                label: (*label).to_owned(),
+                value: None,
+                description: None,
+            })
+            .collect();
+        question
+    }
+
     fn request(question: Question) -> NormalizedQuestionRequest {
         NormalizedQuestionRequest {
             questions: vec![question],
@@ -524,6 +540,47 @@ mod tests {
             InteractionOutput::Submitted {
                 payload: json!({"status": "dismissed"}),
             }
+        );
+    }
+
+    #[test]
+    fn string_only_single_selection_submits_the_option_label() {
+        let mut controller = QuestionInteractionController::new(request(question_with_labels(
+            &["Use SQLite", "Use Postgres"],
+            QuestionSelectionMode::Single,
+        )));
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 1),
+        });
+
+        let InteractionOutput::Submitted { payload } =
+            controller.handle_input(InteractionInput::Submit)
+        else {
+            panic!("expected submitted output");
+        };
+        assert_eq!(payload["questions"][0]["selected"], json!(["Use Postgres"]));
+    }
+
+    #[test]
+    fn string_only_multiple_selection_submits_each_option_label() {
+        let mut controller = QuestionInteractionController::new(request(question_with_labels(
+            &["Tests", "Documentation", "Release notes"],
+            QuestionSelectionMode::Multiple,
+        )));
+        for option_index in [0, 2] {
+            controller.handle_input(InteractionInput::Activate {
+                control_id: option_control_id(0, option_index),
+            });
+        }
+
+        let InteractionOutput::Submitted { payload } =
+            controller.handle_input(InteractionInput::Submit)
+        else {
+            panic!("expected submitted output");
+        };
+        assert_eq!(
+            payload["questions"][0]["selected"],
+            json!(["Tests", "Release notes"])
         );
     }
 
