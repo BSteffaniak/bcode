@@ -17825,6 +17825,12 @@ const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
 const MODEL_NO_PROGRESS_TIMEOUT_CODE: &str = "model_no_progress_timeout";
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
 const MAX_TOKENS_CONTINUATION_INSTRUCTION: &str = "Continue exactly where the previous response stopped. Do not repeat completed content. Finish the pending task, including any required tool calls.";
+/// Continuation instruction for a turn truncated part-way through a tool call.
+///
+/// The generic continuation instruction tells the model not to repeat completed content, which is
+/// wrong here: the interrupted tool call never ran, so it must be reissued rather than treated as
+/// already done.
+const MAX_TOKENS_INCOMPLETE_TOOL_CALL_INSTRUCTION: &str = "The previous model turn ran out of output tokens while emitting a tool call, so that tool call was discarded and never ran. Reissue the intended tool call. Do not repeat narration that already appeared, and do not assume the tool produced any result.";
 const MAX_TOKENS_CONTINUATION_LIMIT: u32 = 8;
 
 #[derive(Debug, Clone, Default)]
@@ -17836,6 +17842,11 @@ struct ModelPollOutcome {
     pending_managed_compaction: Option<PendingManagedCompaction>,
     pending_provider_response_id: Option<String>,
     pending_tool_calls: Vec<bcode_model::ToolCall>,
+    /// Tool calls the provider started streaming but never completed.
+    ///
+    /// A truncated turn leaves these behind. They are not executable, but they tell the runtime
+    /// that continuation must ask for the tool call to be reissued.
+    incomplete_tool_calls: Vec<String>,
     reasoning_activities: BTreeMap<String, ReasoningActivityAccumulator>,
     tool_output_positions: BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>,
     reasoning_text_streams: BTreeMap<(String, String), (u64, usize)>,
@@ -18865,9 +18876,15 @@ async fn run_model_turn_inner(
         match outcome.stop_reason {
             Some(bcode_model::StopReason::ToolCall) => {
                 if outcome.pending_tool_calls.is_empty() {
-                    let message =
+                    let message = if outcome.incomplete_tool_calls.is_empty() {
                         "model stopped for tool calls without emitting a complete tool call"
-                            .to_string();
+                            .to_string()
+                    } else {
+                        format!(
+                            "model stopped for tool calls but {} tool call(s) never finished streaming, so none could run",
+                            outcome.incomplete_tool_calls.len()
+                        )
+                    };
                     append_system_event(state, session_id, message.clone()).await;
                     return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
                 }
@@ -18894,8 +18911,13 @@ async fn run_model_turn_inner(
                     recovery.retried_after_context_pressure,
                 ) =>
             {
+                let had_incomplete_tool_call = !outcome.incomplete_tool_calls.is_empty();
                 recovery.retried_after_context_pressure = true;
-                recovery.retry_instruction = Some(MAX_TOKENS_CONTINUATION_INSTRUCTION);
+                recovery.retry_instruction = Some(if had_incomplete_tool_call {
+                    MAX_TOKENS_INCOMPLETE_TOOL_CALL_INSTRUCTION
+                } else {
+                    MAX_TOKENS_CONTINUATION_INSTRUCTION
+                });
                 set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
                 let result = compact_session_after_max_tokens(
                     state,
@@ -18913,6 +18935,7 @@ async fn run_model_turn_inner(
                             session_id,
                             &request.turn_id,
                             &mut recovery,
+                            had_incomplete_tool_call,
                         )
                         .await;
                     }
@@ -18924,6 +18947,7 @@ async fn run_model_turn_inner(
                             session_id,
                             &request.turn_id,
                             &mut recovery,
+                            had_incomplete_tool_call,
                         )
                         .await;
                     }
@@ -18936,8 +18960,15 @@ async fn run_model_turn_inner(
             Some(bcode_model::StopReason::MaxTokens)
                 if should_continue_after_max_tokens(recovery.max_tokens_continuations) =>
             {
-                record_max_tokens_continuation(state, session_id, &request.turn_id, &mut recovery)
-                    .await;
+                let had_incomplete_tool_call = !outcome.incomplete_tool_calls.is_empty();
+                record_max_tokens_continuation(
+                    state,
+                    session_id,
+                    &request.turn_id,
+                    &mut recovery,
+                    had_incomplete_tool_call,
+                )
+                .await;
             }
             Some(bcode_model::StopReason::MaxTokens) => {
                 return max_tokens_continuation_limit_completion(state, session_id).await;
@@ -18986,16 +19017,26 @@ async fn record_max_tokens_continuation(
     session_id: SessionId,
     turn_id: &str,
     recovery: &mut ModelTurnRecoveryState,
+    had_incomplete_tool_call: bool,
 ) {
     recovery.max_tokens_continuations = recovery.max_tokens_continuations.saturating_add(1);
-    recovery.retry_instruction = Some(MAX_TOKENS_CONTINUATION_INSTRUCTION);
+    recovery.retry_instruction = Some(if had_incomplete_tool_call {
+        MAX_TOKENS_INCOMPLETE_TOOL_CALL_INSTRUCTION
+    } else {
+        MAX_TOKENS_CONTINUATION_INSTRUCTION
+    });
     append_provider_event_trace(
         state,
         session_id,
         turn_id,
         "max_tokens_continuation",
         Some(format!(
-            "model exhausted its output token budget; continuing ({}/{MAX_TOKENS_CONTINUATION_LIMIT})",
+            "model exhausted its output token budget{}; continuing ({}/{MAX_TOKENS_CONTINUATION_LIMIT})",
+            if had_incomplete_tool_call {
+                " while emitting a tool call"
+            } else {
+                ""
+            },
             recovery.max_tokens_continuations
         )),
     )
@@ -20810,6 +20851,9 @@ async fn handle_provider_turn_event(
                 )
                 .await;
                 outcome.pending_tool_calls.push(call);
+                outcome
+                    .incomplete_tool_calls
+                    .retain(|pending| *pending != call_id);
                 stream_progress.finish_tool_call(&call_id);
             }
         },
@@ -20885,6 +20929,9 @@ async fn handle_provider_turn_event(
             )
             .await;
             outcome.pending_tool_calls.push(call);
+            outcome
+                .incomplete_tool_calls
+                .retain(|pending| *pending != call_id);
             stream_progress.finish_tool_call(&call_id);
         }
         ProviderTurnEvent::Warning { message } => {
@@ -21072,11 +21119,12 @@ async fn handle_provider_turn_event(
                 session_id,
                 turn_id,
                 ProviderStreamEvent::ToolCallStarted {
-                    tool_call_id: call_id,
+                    tool_call_id: call_id.clone(),
                     tool_name: name,
                 },
             )
             .await;
+            outcome.incomplete_tool_calls.push(call_id);
         }
         ProviderTurnEvent::ReasoningDelta { text } => {
             outcome.saw_reasoning_evidence = true;
@@ -22686,7 +22734,18 @@ async fn build_model_turn_request(
     )
     .await;
     let parameters_timer = state.metrics.timer();
-    let parameters = resolve_model_reasoning_parameters(selection, reasoning_capabilities.as_ref());
+    let resolved_max_output_tokens = resolve_model_max_output_tokens(
+        state,
+        provider_plugin_id,
+        selected_model_id,
+        &selection.provider_context,
+    )
+    .await;
+    let parameters = resolve_model_reasoning_parameters(
+        selection,
+        reasoning_capabilities.as_ref(),
+        resolved_max_output_tokens,
+    );
     state.metrics.record_histogram_with_labels(
         "model.request_build.parameters_duration_ms",
         parameters_timer.elapsed_ms(),
@@ -23168,11 +23227,20 @@ fn requested_reasoning_summary<'a>(
 /// The provider-native control shape is independent of the requested effort value: a model that
 /// only accepts adaptive thinking must advertise that control even when the requested effort is
 /// unsupported or absent, otherwise the provider falls back to a request shape the model rejects.
+///
+/// `max_output_tokens` carries the resolved model output limit so providers request the limit the
+/// selected model actually supports instead of applying a provider-local default. Leaving it unset
+/// lets a provider default cap output far below the model's capability, which truncates long
+/// responses mid-tool-call.
 fn resolve_model_reasoning_parameters(
     selection: &SessionModelSelection,
     reasoning_capabilities: Option<&bcode_model::ModelReasoningInfo>,
+    max_output_tokens: Option<u32>,
 ) -> ModelParameters {
-    let mut parameters = ModelParameters::default();
+    let mut parameters = ModelParameters {
+        max_output_tokens,
+        ..ModelParameters::default()
+    };
     if let Some(level) = &selection.thinking_level {
         parameters.reasoning_effort = Some(*level);
     }
@@ -23302,6 +23370,38 @@ fn catalog_provider_id_for_policy(policy: &bcode_model::ModelCatalogPolicy) -> O
         | bcode_model::ModelCatalogPolicy::ExpandSupported { provider_id, .. }
         | bcode_model::ModelCatalogPolicy::ExpandAll { provider_id } => Some(provider_id.clone()),
     }
+}
+
+/// Resolve the output token limit for the selected model.
+///
+/// Precedence matches [`model_status_for_selection`] so request construction and context
+/// accounting agree on one limit: an explicit `model_metadata` override wins, then the
+/// provider-reported model limit.
+async fn resolve_model_max_output_tokens(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+    provider_context: &bcode_model::ProviderRequestContext,
+) -> Option<u32> {
+    let model_id = selected_model_id?;
+    if let Some(max_output_tokens) =
+        model_metadata_override(provider_context, model_id).max_output_tokens
+    {
+        return Some(max_output_tokens);
+    }
+    let models = resolved_provider_models(
+        state,
+        provider_plugin_id.map(ToOwned::to_owned),
+        bcode_model::ModelListRequest {
+            provider_context: provider_context.clone(),
+            selected_model_id: Some(model_id.to_owned()),
+        },
+    )
+    .await
+    .ok()?;
+    select_model_info(&models.models, Some(model_id))
+        .and_then(|model| model.max_output_tokens)
+        .filter(|max_output_tokens| *max_output_tokens > 0)
 }
 
 async fn resolve_model_reasoning_info(
@@ -62116,7 +62216,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 reasoning_effort: Some(effort.to_owned()),
                 ..SessionModelSelection::default()
             };
-            let parameters = resolve_model_reasoning_parameters(&selection, Some(&reasoning));
+            let parameters = resolve_model_reasoning_parameters(&selection, Some(&reasoning), None);
             assert_eq!(
                 parameters.reasoning_control,
                 Some(bcode_model::ReasoningControl::Adaptive),
@@ -62145,7 +62245,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             reasoning_effort: Some("minimal".to_owned()),
             ..SessionModelSelection::default()
         };
-        let parameters = resolve_model_reasoning_parameters(&unsupported, Some(&reasoning));
+        let parameters = resolve_model_reasoning_parameters(&unsupported, Some(&reasoning), None);
         assert_eq!(
             parameters.reasoning_control,
             Some(bcode_model::ReasoningControl::Adaptive)
@@ -62153,7 +62253,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(parameters.reasoning_effort_value, None);
 
         let absent = SessionModelSelection::default();
-        let parameters = resolve_model_reasoning_parameters(&absent, Some(&reasoning));
+        let parameters = resolve_model_reasoning_parameters(&absent, Some(&reasoning), None);
         assert_eq!(
             parameters.reasoning_control,
             Some(bcode_model::ReasoningControl::Adaptive)
@@ -62166,9 +62266,41 @@ event_symbol = "bcode_plugin_handle_event_v1"
             reasoning_effort: Some("low".to_owned()),
             ..SessionModelSelection::default()
         };
-        let parameters = resolve_model_reasoning_parameters(&selection, None);
+        let parameters = resolve_model_reasoning_parameters(&selection, None, None);
         assert_eq!(parameters.reasoning_control, None);
         assert_eq!(parameters.reasoning_effort_value, None);
+    }
+
+    #[test]
+    fn resolved_output_limit_reaches_request_parameters() {
+        let selection = SessionModelSelection::default();
+        let parameters = resolve_model_reasoning_parameters(&selection, None, Some(64_000));
+        assert_eq!(parameters.max_output_tokens, Some(64_000));
+    }
+
+    #[test]
+    fn request_output_reserve_follows_resolved_output_limit() {
+        // The reserve default is `context_window / 8`, which is what an unset request limit fell
+        // back to. Once the model's real limit is plumbed through, accounting must follow it so
+        // request construction and context accounting agree on one number.
+        let context_window = 800_000;
+        let default_reserve =
+            context_compaction::request_output_reserve_tokens(context_window, None, Some(128_000));
+        assert_eq!(default_reserve, context_window / 8);
+
+        let resolved_reserve = context_compaction::request_output_reserve_tokens(
+            context_window,
+            Some(128_000),
+            Some(128_000),
+        );
+        assert_eq!(resolved_reserve, 128_000);
+    }
+
+    #[test]
+    fn request_output_reserve_clamps_resolved_limit_to_provider_maximum() {
+        let reserve =
+            context_compaction::request_output_reserve_tokens(200_000, Some(128_000), Some(32_000));
+        assert_eq!(reserve, 32_000);
     }
 
     #[tokio::test]
@@ -62204,7 +62336,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             reasoning_effort: Some("low".to_owned()),
             ..SessionModelSelection::default()
         };
-        let parameters = resolve_model_reasoning_parameters(&selection, Some(&reasoning));
+        let parameters = resolve_model_reasoning_parameters(&selection, Some(&reasoning), None);
         assert_eq!(
             parameters.reasoning_control,
             Some(bcode_model::ReasoningControl::Adaptive),

@@ -30,6 +30,11 @@ pub enum StreamOutcome {
     Finished,
     /// The model requested one or more tool calls.
     ToolCall,
+    /// The model exhausted its output token budget before finishing.
+    ///
+    /// Distinct from [`Self::ToolCall`] because a truncated turn may have started a tool call
+    /// without completing it, so no complete tool call is available to execute.
+    MaxTokens,
     /// The turn was cancelled by the host.
     Cancelled,
 }

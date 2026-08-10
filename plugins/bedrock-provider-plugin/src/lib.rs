@@ -268,6 +268,9 @@ async fn stream_bedrock_turn(
         Ok(StreamOutcome::ToolCall) => turn.push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::ToolCall,
         }),
+        Ok(StreamOutcome::MaxTokens) => turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::MaxTokens,
+        }),
         Ok(StreamOutcome::Cancelled) => {
             turn.push(ProviderTurnEvent::Cancelled);
             turn.push(ProviderTurnEvent::TurnFinished {
@@ -1032,6 +1035,11 @@ struct AnthropicMessagesAccumulator {
     tool_calls: BTreeMap<u32, ToolCallAccumulator>,
     reasoning_blocks: BTreeMap<u32, String>,
     saw_tool_call: bool,
+    /// Normalized stop reason reported by the provider on `message_delta`.
+    ///
+    /// Anthropic reports `max_tokens` here when the output budget is exhausted. Without it a
+    /// truncated turn is indistinguishable from a completed one.
+    stop_reason: Option<StopReason>,
     name_map: BTreeMap<String, String>,
 }
 
@@ -1041,6 +1049,7 @@ impl AnthropicMessagesAccumulator {
             tool_calls: BTreeMap::new(),
             reasoning_blocks: BTreeMap::new(),
             saw_tool_call: false,
+            stop_reason: None,
             name_map,
         }
     }
@@ -1062,7 +1071,10 @@ impl AnthropicMessagesAccumulator {
             Some("content_block_start") => self.start_content_block(event, turn)?,
             Some("content_block_delta") => self.content_block_delta(event, turn),
             Some("content_block_stop") => self.finish_content_block(event, turn)?,
-            Some("message_delta") => Self::emit_usage(event.get("usage"), turn, false),
+            Some("message_delta") => {
+                self.record_message_delta_stop_reason(event);
+                Self::emit_usage(event.get("usage"), turn, false);
+            }
             Some("message_stop") => return Ok(Some(self.finish())),
             _ => {}
         }
@@ -1225,6 +1237,18 @@ impl AnthropicMessagesAccumulator {
         Ok(())
     }
 
+    /// Record the normalized stop reason carried by an Anthropic `message_delta` event.
+    fn record_message_delta_stop_reason(&mut self, event: &serde_json::Value) {
+        if let Some(stop_reason) = event
+            .get("delta")
+            .and_then(|delta| delta.get("stop_reason"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(map_anthropic_stop_reason)
+        {
+            self.stop_reason = Some(stop_reason);
+        }
+    }
+
     fn emit_usage(usage: Option<&serde_json::Value>, turn: &TurnState, exact_input: bool) {
         let Some(usage) = usage else {
             return;
@@ -1253,7 +1277,15 @@ impl AnthropicMessagesAccumulator {
         }
     }
 
+    /// Choose the stream outcome for a finished Anthropic Messages turn.
+    ///
+    /// A truncated turn must not be reported as a completed tool call: the model may have started
+    /// a `tool_use` block that never closed, so no complete tool call was emitted. Reporting
+    /// truncation lets the host continue the turn instead of failing it.
     const fn finish(&self) -> StreamOutcome {
+        if matches!(self.stop_reason, Some(StopReason::MaxTokens)) {
+            return StreamOutcome::MaxTokens;
+        }
         if self.saw_tool_call {
             StreamOutcome::ToolCall
         } else {
@@ -1557,7 +1589,14 @@ impl StreamAccumulator {
         Ok(())
     }
 
+    /// Choose the stream outcome for a finished Converse turn.
+    ///
+    /// Mirrors [`AnthropicMessagesAccumulator::finish`]: a turn truncated by the output budget is
+    /// reported as truncation rather than a completed tool call.
     const fn finish_outcome(&self) -> StreamOutcome {
+        if matches!(self.stop_reason, Some(StopReason::MaxTokens)) {
+            return StreamOutcome::MaxTokens;
+        }
         if self.saw_tool_call {
             StreamOutcome::ToolCall
         } else {
@@ -3890,6 +3929,20 @@ fn document_to_json_value(document: &Document) -> serde_json::Value {
     }
 }
 
+/// Map an Anthropic Messages wire stop reason onto normalized model semantics.
+///
+/// Returns `None` for unrecognized values so an unknown future stop reason is not silently
+/// interpreted as a known one.
+fn map_anthropic_stop_reason(reason: &str) -> Option<StopReason> {
+    match reason {
+        "end_turn" => Some(StopReason::EndTurn),
+        "tool_use" => Some(StopReason::ToolCall),
+        "max_tokens" => Some(StopReason::MaxTokens),
+        "stop_sequence" => Some(StopReason::StopSequence),
+        _ => None,
+    }
+}
+
 const fn map_stop_reason(reason: &BedrockStopReason) -> StopReason {
     match reason {
         BedrockStopReason::ToolUse => StopReason::ToolCall,
@@ -5146,6 +5199,138 @@ mod tests {
             event,
             ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 47
         )));
+    }
+
+    #[test]
+    fn anthropic_messages_truncated_tool_call_reports_max_tokens() {
+        // Reproduces the observed failure: the model starts a `tool_use` block, runs out of output
+        // tokens mid-JSON, and Anthropic reports `max_tokens`. Reporting `ToolCall` here would
+        // claim a tool call that was never completed, which the runtime cannot execute.
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::from([(
+            "shell_run".to_string(),
+            "shell.run".to_string(),
+        )]));
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "id": "toolu_trunc", "name": "shell_run"},
+                }),
+                &turn,
+            )
+            .expect("tool use start should process");
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"echo "},
+                }),
+                &turn,
+            )
+            .expect("partial arguments should process");
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "max_tokens"},
+                    "usage": {"output_tokens": 4096},
+                }),
+                &turn,
+            )
+            .expect("message delta should process");
+        let outcome = accumulator
+            .process(&serde_json::json!({"type": "message_stop"}), &turn)
+            .expect("message stop should process")
+            .expect("message stop should terminate the stream");
+
+        assert_eq!(outcome, StreamOutcome::MaxTokens);
+        let events = turn.drain();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { .. })),
+            "a truncated tool call must not be reported as finished"
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_completed_tool_call_still_reports_tool_call() {
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::from([(
+            "shell_run".to_string(),
+            "shell.run".to_string(),
+        )]));
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "id": "toolu_ok", "name": "shell_run"},
+                }),
+                &turn,
+            )
+            .expect("tool use start should process");
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"ls\"}"},
+                }),
+                &turn,
+            )
+            .expect("arguments should process");
+        accumulator
+            .process(
+                &serde_json::json!({"type": "content_block_stop", "index": 0}),
+                &turn,
+            )
+            .expect("content block stop should process");
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "tool_use"},
+                }),
+                &turn,
+            )
+            .expect("message delta should process");
+        let outcome = accumulator
+            .process(&serde_json::json!({"type": "message_stop"}), &turn)
+            .expect("message stop should process")
+            .expect("message stop should terminate the stream");
+
+        assert_eq!(outcome, StreamOutcome::ToolCall);
+        let events = turn.drain();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_unknown_stop_reason_is_not_interpreted() {
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new());
+        accumulator.record_message_delta_stop_reason(&serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "some_future_reason"},
+        }));
+        assert_eq!(accumulator.stop_reason, None);
+        assert_eq!(accumulator.finish(), StreamOutcome::Finished);
+    }
+
+    #[test]
+    fn converse_truncated_tool_call_reports_max_tokens() {
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+        accumulator.saw_tool_call = true;
+        accumulator.stop_reason = Some(StopReason::MaxTokens);
+        assert_eq!(accumulator.finish_outcome(), StreamOutcome::MaxTokens);
     }
 
     #[test]
