@@ -773,8 +773,8 @@ fn details_state_survives_reconstruction_resize_and_cache_reuse_then_drops_on_re
 
 #[cfg(test)]
 #[test]
-fn github_fixture_retry_details_expand_and_collapse() {
-    let source = include_str!("../../../github-markdown-example.md");
+fn markdown_details_expand_and_collapse() {
+    let source = include_str!("../tests/fixtures/details_interaction.md");
     let item = TranscriptItem::with_format("System", source.to_owned(), TextFormat::Markdown);
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     let initial = render_markdown(source, &markdown_render_options(&app, &item, 80));
@@ -785,7 +785,7 @@ fn github_fixture_retry_details_expand_and_collapse() {
             matches!(
                 &contribution.kind,
                 MarkdownContributionKind::Details { summary, .. }
-                    if summary.contains("retry algorithm")
+                    if summary.contains("Retry algorithm")
             )
         })
         .expect("retry details contribution");
@@ -796,7 +796,7 @@ fn github_fixture_retry_details_expand_and_collapse() {
         .flat_map(|line| &line.spans)
         .map(|span| span.content.as_str())
         .collect::<String>();
-    assert!(initial_text.contains("▶ View the retry algorithm"));
+    assert!(initial_text.contains("▶ Retry algorithm"));
     assert!(!initial_text.contains("delay(n)"));
 
     app.reconcile_markdown_interactions(vec![
@@ -813,9 +813,9 @@ fn github_fixture_retry_details_expand_and_collapse() {
         .flat_map(|line| &line.spans)
         .map(|span| span.content.as_str())
         .collect::<String>();
-    assert!(expanded_text.contains("▼ View the retry algorithm"));
+    assert!(expanded_text.contains("▼ Retry algorithm"));
     assert!(expanded_text.contains("delay(n)"));
-    assert!(expanded_text.contains("Example with Jitter"));
+    assert!(expanded_text.contains("Attempt"));
 
     assert!(app.activate_markdown_contribution(&details_id));
     let collapsed = render_markdown(source, &markdown_render_options(&app, &item, 80));
@@ -825,7 +825,7 @@ fn github_fixture_retry_details_expand_and_collapse() {
         .flat_map(|line| &line.spans)
         .map(|span| span.content.as_str())
         .collect::<String>();
-    assert!(collapsed_text.contains("▶ View the retry algorithm"));
+    assert!(collapsed_text.contains("▶ Retry algorithm"));
     assert!(!collapsed_text.contains("delay(n)"));
 }
 
