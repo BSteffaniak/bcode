@@ -51297,19 +51297,29 @@ library = "test"
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
     ) -> ServerState {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let provider = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
             bcode_fake_provider_plugin::static_plugin(),
+        );
+        // Starting an authored workflow resolves its authorization profile and fails closed when no
+        // plugin serves `bcode.agent-profile/v1`, so the default agents plugin has to be loaded
+        // alongside the provider.
+        let agents = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+            bcode_default_agents_plugin::static_plugin(),
         );
         let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from(["bcode.fake-provider".to_string()]),
+                enabled: BTreeSet::from([
+                    "bcode.fake-provider".to_string(),
+                    "bcode.default-agents".to_string(),
+                ]),
                 disabled: BTreeSet::new(),
             },
-            &[plugin],
+            &[provider, agents],
         )
-        .expect("load fake provider");
+        .expect("load fake provider and default agents");
         let mut state = test_server_state(sessions);
         state.plugins = plugins;
         state.workflow_store = StdMutex::new(workflow_store);
@@ -51473,6 +51483,30 @@ library = "test"
             plugins,
             bcode_ralph::RalphStateStore::default(),
         )
+    }
+
+    /// Server state whose plugin host serves `bcode.agent-profile/v1`.
+    ///
+    /// Starting a workflow resolves its authorization profile and fails closed when no plugin serves
+    /// that interface, so workflow-start tests need the default agents plugin loaded. The base
+    /// fixture deliberately loads no plugins, so this keeps that default intact.
+    fn test_server_state_with_default_agents(sessions: SessionManager) -> ServerState {
+        let agents = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+            bcode_default_agents_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.default-agents".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[agents],
+        )
+        .expect("load default agents plugin");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state
     }
 
     fn test_server_state_with_ralph_store(
@@ -56423,7 +56457,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .current_session_generation(parent.id)
             .await
             .expect("generation");
-        let state = Arc::new(test_server_state(sessions));
+        let state = Arc::new(test_server_state_with_default_agents(sessions));
         let schema = bcode_workflow::ValueSchema {
             type_name: "example.fixed/v1".to_string(),
             schema: serde_json::json!({"type": "integer"}),
@@ -56494,7 +56528,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .create_session(Some("workflow".to_string()), PathBuf::from("/repo"))
             .await
             .expect("session");
-        let state = Arc::new(test_server_state(sessions));
+        let state = Arc::new(test_server_state_with_default_agents(sessions));
         let workflow = bcode_workflow::WorkflowBuilder::new(
             "bound-start",
             bcode_workflow::Step::<u32, u32>::input("node"),
