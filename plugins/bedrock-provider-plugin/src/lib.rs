@@ -1734,7 +1734,11 @@ fn anthropic_content_blocks(
                 "type": "tool_use", "id": call.id, "name": bedrock_tool_name(&call.name), "input": call.arguments,
             })),
             ContentBlock::ToolResult { result } => {
-                let content = result.content.iter().map(|item| match item {
+                let mut content = Vec::with_capacity(result.content.len() + 1);
+                if !result.output.is_empty() {
+                    content.push(serde_json::json!({"type": "text", "text": result.output}));
+                }
+                content.extend(result.content.iter().map(|item| match item {
                     bcode_model::ToolResultContent::Text { text } => serde_json::json!({"type": "text", "text": text}),
                     bcode_model::ToolResultContent::Image { image } => serde_json::json!({
                         "type": "image",
@@ -1744,7 +1748,7 @@ fn anthropic_content_blocks(
                         "type": "text",
                         "text": format!("[image reference: {} {}]", image.path, image.mime_type),
                     }),
-                }).collect::<Vec<_>>();
+                }));
                 blocks.push(serde_json::json!({
                     "type": "tool_result", "tool_use_id": result.call_id,
                     "content": content, "is_error": result.is_error,
@@ -4868,6 +4872,38 @@ mod tests {
         assert_eq!(value["tools"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(value["thinking"]["type"], "adaptive");
         assert_eq!(value["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn anthropic_messages_request_serializes_tool_result_output() {
+        let mut request = test_model_turn_request();
+        request.messages = vec![ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "toolu_1".to_string(),
+                    output: "useful tool output".to_string(),
+                    is_error: false,
+                    content: Vec::new(),
+                },
+            }],
+        }];
+
+        let value: serde_json::Value = serde_json::from_slice(
+            &build_anthropic_messages_request(&request).expect("request should serialize"),
+        )
+        .expect("request should be JSON");
+
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(
+            value["messages"][0]["content"][0],
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [{"type": "text", "text": "useful tool output"}],
+                "is_error": false,
+            })
+        );
     }
 
     #[test]
