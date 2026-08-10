@@ -1120,6 +1120,12 @@ fn insert_fake_error_turn(state: &Mutex<FakeProviderState>, error: ProviderError
     provider_turn_id
 }
 
+/// Detect model parameters this provider does not implement.
+///
+/// The guard exists to catch the host sending sampling parameters the provider never advertised.
+/// Fields the provider does advertise are cleared before comparison: reasoning controls, and
+/// `max_output_tokens`, which this provider reports in its model list and therefore must accept
+/// when the host resolves it into a request.
 fn unsupported_fake_sampling_parameters(
     parameters: &bcode_model::ModelParameters,
 ) -> Option<(&'static str, &'static str)> {
@@ -1127,6 +1133,7 @@ fn unsupported_fake_sampling_parameters(
     supported_parameters.reasoning_effort = None;
     supported_parameters.reasoning_effort_value = None;
     supported_parameters.reasoning_summary = None;
+    supported_parameters.max_output_tokens = None;
     (supported_parameters != bcode_model::ModelParameters::default()).then_some((
         "fake_model_parameters_unsupported",
         "fake provider does not implement model sampling parameters",
@@ -1680,7 +1687,12 @@ fn fake_feature_support() -> bcode_model::ModelFeatureSupport {
         .map(|key| {
             let support = if matches!(
                 key,
-                ModelParameterKey::ReasoningEffortValue | ModelParameterKey::ReasoningSummary
+                ModelParameterKey::ReasoningEffortValue
+                    | ModelParameterKey::ReasoningSummary
+                    // This provider reports `max_output_tokens` in its model list, so it must
+                    // also declare the parameter supported: the host resolves the advertised
+                    // limit into every request.
+                    | ModelParameterKey::MaxOutputTokens
             ) {
                 supported()
             } else {
