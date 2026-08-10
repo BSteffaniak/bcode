@@ -376,6 +376,45 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         WorkflowCommand::Package { command } => {
             handle_workflow_package_command(&client, command).await?;
         }
+        WorkflowCommand::InspectRun { run_id, limit } => {
+            print_json(&client.inspect_workflow_run(run_id, limit).await?)?;
+        }
+        WorkflowCommand::ProvideInput {
+            run_id,
+            node_id,
+            activation_id,
+            value,
+        } => {
+            let value = Path::new(&value);
+            let value = if value.is_file() {
+                read_bounded_json(value)?
+            } else {
+                serde_json::from_str(value.to_string_lossy().as_ref())?
+            };
+            print_json(
+                &client
+                    .provide_workflow_input(run_id, node_id, activation_id, value)
+                    .await?,
+            )?;
+        }
+        WorkflowCommand::ResolveApproval {
+            run_id,
+            node_id,
+            activation_id,
+            approve,
+            deny,
+        } => {
+            if approve == deny {
+                return Err(CliError::InvalidArguments(
+                    "exactly one of --approve or --deny is required".to_string(),
+                ));
+            }
+            print_json(
+                &client
+                    .resolve_workflow_approval(run_id, node_id, activation_id, approve)
+                    .await?,
+            )?;
+        }
         WorkflowCommand::CancelComputation { operation_id } => {
             print_json(&client.cancel_workflow_computation(operation_id).await?)?;
         }
@@ -398,7 +437,9 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
             run_id,
             workspace_snapshot,
             configuration,
+            input,
         } => {
+            let input = input.as_deref().map(read_bounded_json).transpose()?;
             let selection = match selection {
                 WorkflowStartSelection::Revision {
                     workflow_id,
@@ -430,20 +471,18 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
                         .transpose()?;
                     print_json(
                         &client
-                            .start_workflow_package_export(
-                                bcode_ipc::StartWorkflowPackageExportRequest {
-                                    package_export: bcode_workflow::WorkflowPackageExportIdentity {
-                                        package_id,
-                                        export,
-                                        package_lock_digest_sha256,
-                                    },
-                                    run_id,
-                                    parent_session_id,
-                                    workspace_snapshot,
-                                    parent_session_generation: None,
-                                    configuration,
+                            .start_workflow_package_export(workflow_package_start_request(
+                                bcode_workflow::WorkflowPackageExportIdentity {
+                                    package_id,
+                                    export,
+                                    package_lock_digest_sha256,
                                 },
-                            )
+                                run_id,
+                                parent_session_id,
+                                workspace_snapshot,
+                                configuration,
+                                input,
+                            ))
                             .await?,
                     )?;
                     return Ok(());
@@ -462,6 +501,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
                         workspace_snapshot,
                         parent_session_generation: None,
                         configuration,
+                        input,
                     })
                     .await?,
             )?;
@@ -1057,6 +1097,25 @@ struct CliWorkflowPackageMember {
     external_dependencies: Vec<String>,
 }
 
+const fn workflow_package_start_request(
+    package_export: bcode_workflow::WorkflowPackageExportIdentity,
+    run_id: Option<String>,
+    parent_session_id: SessionId,
+    workspace_snapshot: Option<String>,
+    configuration: Option<serde_json::Value>,
+    input: Option<serde_json::Value>,
+) -> bcode_ipc::StartWorkflowPackageExportRequest {
+    bcode_ipc::StartWorkflowPackageExportRequest {
+        package_export,
+        run_id,
+        parent_session_id,
+        workspace_snapshot,
+        parent_session_generation: None,
+        configuration,
+        input,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_workflow_package_command(
     client: &BcodeClient,
@@ -1065,7 +1124,42 @@ async fn handle_workflow_package_command(
     if let WorkflowPackageCommand::Discover { workspace, limit } = command {
         let workspace = workspace.map_or_else(std::env::current_dir, fs::canonicalize)?;
         let config = bcode_config::load_config()?;
-        print_json(&discover_workflow_packages(&workspace, &config, limit)?)?;
+        let mut snapshots = Vec::new();
+        for package in discover_workflow_packages(&workspace, &config, limit)? {
+            let closure = read_workflow_package_closure(&package.manifest)?;
+            let validation = client
+                .validate_workflow_package(bcode_ipc::WorkflowPackageComputationRequest {
+                    closure,
+                    control: bcode_ipc::WorkflowComputationControl::default(),
+                })
+                .await?;
+            let entry = validation
+                .plan
+                .packages
+                .iter()
+                .find(|entry| entry.package_id == validation.plan.entry_package_id)
+                .ok_or_else(|| {
+                    CliError::InvalidArguments(
+                        "planned package closure has no entry package".to_string(),
+                    )
+                })?;
+            let preview = client
+                .preview_workflow_package(bcode_ipc::WorkflowPackagePreviewRequest {
+                    plan: entry.plan.clone(),
+                    configurations: std::collections::BTreeMap::new(),
+                    control: bcode_ipc::WorkflowComputationControl::default(),
+                })
+                .await?;
+            let receipt = client
+                .workflow_package_publication(package.package_id.clone())
+                .await?;
+            snapshots.push(workflow_package_discovery_snapshot(
+                package,
+                &preview,
+                receipt.as_ref(),
+            )?);
+        }
+        print_json(&snapshots)?;
         return Ok(());
     }
     if let WorkflowPackageCommand::Publish {
@@ -1362,12 +1456,119 @@ fn read_workflow_package_manifest(
     Ok(manifest)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPackageLockState {
+    Unpublished,
+    Published,
+    Drifted,
+}
+
+/// Portable package discovery and preview details exposed without private store access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPackageDiscoverySnapshot {
+    pub package_id: String,
+    pub source: String,
+    pub manifest: PathBuf,
+    pub precedence: u32,
+    pub package_lock_digest_sha256: String,
+    pub lock_state: WorkflowPackageLockState,
+    pub requirements: bcode_workflow::WorkflowRequirementSummary,
+    pub effects: bcode_workflow::WorkflowEffectSummary,
+    pub permissions: bcode_workflow::WorkflowPermissionPreview,
+    pub diagnostics: Vec<bcode_workflow::WorkflowValidationDiagnostic>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct DiscoveredWorkflowPackage {
     package_id: String,
     source: String,
     manifest: PathBuf,
     precedence: u32,
+}
+
+fn workflow_package_lock_state(
+    receipt: Option<&bcode_workflow::WorkflowPackagePublicationReceipt>,
+    package_lock_digest_sha256: &str,
+) -> WorkflowPackageLockState {
+    receipt.map_or(WorkflowPackageLockState::Unpublished, |receipt| {
+        if receipt.package_lock_digest_sha256 == package_lock_digest_sha256 {
+            WorkflowPackageLockState::Published
+        } else {
+            WorkflowPackageLockState::Drifted
+        }
+    })
+}
+
+fn workflow_package_discovery_snapshot(
+    package: DiscoveredWorkflowPackage,
+    preview: &bcode_workflow::WorkflowPackagePreview,
+    receipt: Option<&bcode_workflow::WorkflowPackagePublicationReceipt>,
+) -> Result<WorkflowPackageDiscoverySnapshot, CliError> {
+    let package_lock_digest_sha256 = preview
+        .lock
+        .digest_sha256()
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    let mut requirements = bcode_workflow::WorkflowRequirementSummary::default();
+    let mut effects = bcode_workflow::WorkflowEffectSummary::default();
+    let mut permissions = bcode_workflow::WorkflowPermissionPreview::default();
+    let mut diagnostics = Vec::new();
+    for member in &preview.members {
+        diagnostics.extend(member.compilation.validation.diagnostics.clone());
+        if let Some(compiled) = &member.compilation.compiled {
+            requirements
+                .capabilities
+                .extend(compiled.requirements.capabilities.iter().cloned());
+            requirements
+                .plugins
+                .extend(compiled.requirements.plugins.iter().cloned());
+            requirements
+                .blocks
+                .extend(compiled.requirements.blocks.iter().cloned());
+            requirements
+                .agents
+                .extend(compiled.requirements.agents.iter().cloned());
+            effects.maximum_capability = effects
+                .maximum_capability
+                .max(compiled.effects.maximum_capability);
+            effects
+                .block_effects
+                .extend(compiled.effects.block_effects.iter().copied());
+            effects
+                .reconciliation
+                .extend(compiled.effects.reconciliation.iter().copied());
+            effects.resources.extend(compiled.effects.resources.clone());
+            permissions.maximum_capability = permissions
+                .maximum_capability
+                .max(compiled.permissions.maximum_capability);
+            permissions
+                .explicit_grant_nodes
+                .extend(compiled.permissions.explicit_grant_nodes.clone());
+            permissions
+                .mutation_approval_nodes
+                .extend(compiled.permissions.mutation_approval_nodes.clone());
+        }
+    }
+    effects.resources.sort();
+    effects.resources.dedup();
+    permissions.explicit_grant_nodes.sort();
+    permissions.explicit_grant_nodes.dedup();
+    permissions.mutation_approval_nodes.sort();
+    permissions.mutation_approval_nodes.dedup();
+    let lock_state = workflow_package_lock_state(receipt, &package_lock_digest_sha256);
+    Ok(WorkflowPackageDiscoverySnapshot {
+        package_id: package.package_id,
+        source: package.source,
+        manifest: package.manifest,
+        precedence: package.precedence,
+        package_lock_digest_sha256,
+        lock_state,
+        requirements,
+        effects,
+        permissions,
+        diagnostics,
+    })
 }
 
 fn workflow_manifest_paths(root: &Path, limit: usize) -> Result<Vec<PathBuf>, CliError> {
@@ -2407,6 +2608,39 @@ enum WorkflowCommand {
         workspace_snapshot: Option<String>,
         #[arg(long, value_name = "FILE")]
         configuration: Option<PathBuf>,
+        #[arg(long, value_name = "JSON_FILE")]
+        input: Option<PathBuf>,
+    },
+    /// Return one bounded public run inspection including canonical output and descendants.
+    InspectRun {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Resolve one exact durable typed input wait.
+    ProvideInput {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        activation_id: String,
+        #[arg(long, value_name = "JSON_OR_FILE")]
+        value: String,
+    },
+    /// Resolve one exact durable approval wait.
+    ResolveApproval {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        activation_id: String,
+        #[arg(long, conflicts_with = "deny")]
+        approve: bool,
+        #[arg(long, conflicts_with = "approve")]
+        deny: bool,
     },
     /// Cancel one exact in-flight validation or compilation operation.
     CancelComputation {
@@ -13854,6 +14088,42 @@ mod web_command_tests {
 mod workflow_source_tests {
     use super::*;
 
+    fn workflow_test_catalog(
+        agent_profiles: std::collections::BTreeSet<String>,
+    ) -> bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+        let shell_manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/shell-plugin/bcode-plugin.toml"
+        ))
+        .expect("shell plugin manifest");
+        let shell = shell_manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("shell workflow service");
+        bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::from(["bcode.shell".to_string()]),
+            blocks: shell
+                .workflow_blocks
+                .iter()
+                .cloned()
+                .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+                .collect(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles,
+            authoring_actions: shell
+                .workflow_authoring_actions
+                .iter()
+                .cloned()
+                .map(|action| (action.catalog_key(), action))
+                .collect(),
+        }
+    }
+
     #[test]
     fn primary_cli_apply_loader_preserves_source_v3_shorthand_and_infers_yaml() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -13972,6 +14242,616 @@ mod workflow_source_tests {
             plan.members
                 .iter()
                 .all(|member| member.lowering.validation.is_valid())
+        );
+    }
+
+    #[test]
+    fn primary_cli_loads_and_plans_product_facing_typed_command_package() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            root.join("examples/workflows/packages/command/package.workflow-package.yaml");
+        let loaded = read_workflow_package_manifest(&manifest).expect("command package");
+        loaded.validate().expect("valid command package manifest");
+        assert_eq!(loaded.package_id, "bcode/examples-command");
+        assert_eq!(loaded.exports["run-and-assert"], "run-and-assert");
+
+        let shell_manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/shell-plugin/bcode-plugin.toml"
+        ))
+        .expect("shell plugin manifest");
+        let service = shell_manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("shell workflow service");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::from(["bcode.shell".to_string()]),
+            blocks: service
+                .workflow_blocks
+                .iter()
+                .cloned()
+                .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+                .collect(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::new(),
+            authoring_actions: service
+                .workflow_authoring_actions
+                .iter()
+                .cloned()
+                .map(|action| (action.catalog_key(), action))
+                .collect(),
+        };
+        let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
+            .expect("typed command package plans");
+        assert_eq!(plan.members.len(), 1);
+        let compiled = plan.members[0]
+            .lowering
+            .document
+            .compilation_preview(&catalog, None)
+            .compiled
+            .expect("typed command package compiles");
+        assert_eq!(compiled.definition.input.type_name, "bcode.shell.exec/v1");
+        assert_eq!(
+            compiled.definition.output.type_name,
+            "bcode.shell.exec-result/v1"
+        );
+    }
+
+    #[test]
+    fn primary_cli_resolves_product_facing_recursive_package_import() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("examples/workflows/packages/validation.workflow-package.yaml");
+        let closure = read_workflow_package_closure(&manifest).expect("validation closure");
+        assert_eq!(closure.entry_package_id, "bcode/examples-validation");
+        assert_eq!(closure.packages.len(), 2);
+        assert!(closure.packages.iter().any(|package| {
+            package.manifest.package_id == "bcode/examples-command"
+                && package.manifest.imports.is_empty()
+        }));
+        let validation = closure
+            .packages
+            .iter()
+            .find(|package| package.manifest.package_id == "bcode/examples-validation")
+            .expect("validation package");
+        assert_eq!(validation.manifest.imports.len(), 1);
+        assert_eq!(validation.manifest.imports[0].import_id, "command");
+        assert_eq!(
+            validation.manifest.members[0].external_dependencies,
+            ["command"]
+        );
+
+        let shell_manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/shell-plugin/bcode-plugin.toml"
+        ))
+        .expect("shell plugin manifest");
+        let service = shell_manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("shell workflow service");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::from(["bcode.shell".to_string()]),
+            blocks: service
+                .workflow_blocks
+                .iter()
+                .cloned()
+                .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+                .collect(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::new(),
+            authoring_actions: service
+                .workflow_authoring_actions
+                .iter()
+                .cloned()
+                .map(|action| (action.catalog_key(), action))
+                .collect(),
+        };
+        let plan = bcode_workflow::plan_workflow_package_closure(&closure, &catalog)
+            .expect("recursive product package plans");
+        assert_eq!(plan.packages.len(), 2);
+        let validation_plan = plan
+            .packages
+            .iter()
+            .find(|package| package.package_id == "bcode/examples-validation")
+            .expect("validation plan");
+        let call: bcode_workflow::WorkflowCallConfiguration = serde_json::from_value(
+            validation_plan.plan.members[0]
+                .lowering
+                .document
+                .definition
+                .nodes["commands"]
+                .configuration
+                .clone(),
+        )
+        .expect("resolved imported export call");
+        let command_plan = plan
+            .packages
+            .iter()
+            .find(|package| package.package_id == "bcode/examples-command")
+            .expect("command plan");
+        assert_eq!(
+            call.target.definition_identity(),
+            &command_plan.plan.members[0].definition_identity
+        );
+    }
+
+    #[test]
+    fn primary_cli_plans_product_facing_prompt_verification_package() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            root.join("examples/workflows/packages/prompt-verification.workflow-package.yaml");
+        let loaded = read_workflow_package_manifest(&manifest).expect("prompt package");
+        assert_eq!(loaded.members.len(), 1);
+
+        let shell_manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/shell-plugin/bcode-plugin.toml"
+        ))
+        .expect("shell plugin manifest");
+        let shell = shell_manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("shell workflow service");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::from(["bcode.shell".to_string()]),
+            blocks: shell
+                .workflow_blocks
+                .iter()
+                .cloned()
+                .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+                .collect(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::from(["build".to_string()]),
+            authoring_actions: shell
+                .workflow_authoring_actions
+                .iter()
+                .cloned()
+                .map(|action| (action.catalog_key(), action))
+                .collect(),
+        };
+        let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
+            .expect("prompt verification package plans");
+        let member = &plan.members[0].lowering.document.definition;
+        assert_eq!(
+            member.input.type_name,
+            "bcode.prompt-verification.request/v1"
+        );
+        assert_eq!(member.output.type_name, "bcode.shell.exec-result/v1");
+        assert_eq!(
+            member.nodes["implement"].kind,
+            bcode_workflow::NodeKind::Agent
+        );
+        assert_eq!(
+            member.nodes["verify"].kind,
+            bcode_workflow::NodeKind::PluginBlock
+        );
+        assert!(
+            member
+                .edges
+                .iter()
+                .any(|edge| edge.from == "implement" && edge.to == "verify")
+        );
+    }
+
+    #[test]
+    fn primary_cli_plans_product_facing_isolated_review_package() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("examples/workflows/packages/review.workflow-package.yaml");
+        let loaded = read_workflow_package_manifest(&manifest).expect("review package");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::new(),
+            blocks: std::collections::BTreeMap::new(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::from(["review".to_string()]),
+            authoring_actions: std::collections::BTreeMap::new(),
+        };
+        let plan =
+            bcode_workflow::plan_workflow_package(&loaded, &catalog).expect("review package plans");
+        let definition = &plan.members[0].lowering.document.definition;
+        assert_eq!(
+            definition.nodes["correctness"].kind,
+            bcode_workflow::NodeKind::Agent
+        );
+        assert_eq!(
+            definition.nodes["security"].kind,
+            bcode_workflow::NodeKind::Agent
+        );
+        assert_eq!(
+            definition.nodes["aggregate"].kind,
+            bcode_workflow::NodeKind::Parallel
+        );
+        for node_id in ["correctness", "security"] {
+            let prompt: bcode_workflow::WorkflowPromptConfiguration =
+                serde_json::from_value(definition.nodes[node_id].configuration.clone())
+                    .expect("prompt configuration");
+            assert_eq!(
+                prompt.execution_target,
+                bcode_workflow::PromptContextTarget::FreshIsolated
+            );
+            assert!(prompt.read_only);
+        }
+    }
+
+    #[test]
+    fn primary_cli_plans_product_facing_bounded_remediation_package() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("examples/workflows/packages/remediation.workflow-package.yaml");
+        let loaded = read_workflow_package_manifest(&manifest).expect("remediation package");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::new(),
+            blocks: std::collections::BTreeMap::new(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::from(["build".to_string()]),
+            authoring_actions: std::collections::BTreeMap::new(),
+        };
+        let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
+            .expect("bounded remediation package plans");
+        let definition = &plan.members[0].lowering.document.definition;
+        assert_eq!(
+            definition.nodes["remediate"].kind,
+            bcode_workflow::NodeKind::Agent
+        );
+        assert_eq!(
+            definition.nodes["remediate__repeat"].kind,
+            bcode_workflow::NodeKind::Repeat
+        );
+        assert!(definition.edges.iter().any(|edge| {
+            edge.from == "remediate__repeat"
+                && edge.to == "remediate"
+                && matches!(
+                    edge.kind,
+                    bcode_workflow::EdgeKind::Back {
+                        max_iterations: 3,
+                        ..
+                    }
+                )
+        }));
+        assert_eq!(definition.output.type_name, "bcode.remediation.state/v1");
+    }
+
+    #[test]
+    fn primary_cli_plans_product_facing_repository_recovery_package() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            root.join("examples/workflows/packages/repository-recovery.workflow-package.yaml");
+        let loaded = read_workflow_package_manifest(&manifest).expect("conflict package");
+        let shell_manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/shell-plugin/bcode-plugin.toml"
+        ))
+        .expect("shell plugin manifest");
+        let shell = shell_manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("shell workflow service");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::from(["bcode.shell".to_string()]),
+            blocks: shell
+                .workflow_blocks
+                .iter()
+                .cloned()
+                .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+                .collect(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::from(["build".to_string()]),
+            authoring_actions: shell
+                .workflow_authoring_actions
+                .iter()
+                .cloned()
+                .map(|action| (action.catalog_key(), action))
+                .collect(),
+        };
+        let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
+            .expect("conflict package plans");
+        let definition = &plan.members[0].lowering.document.definition;
+        let prompt: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(definition.nodes["resolve"].configuration.clone())
+                .expect("prompt");
+        assert!(prompt.system_prompt.contains("resolve-conflicts"));
+        assert_eq!(
+            definition.nodes["verify"].kind,
+            bcode_workflow::NodeKind::PluginBlock
+        );
+        assert!(loaded.members[0].source.contains("git ls-files --unmerged"));
+    }
+
+    #[test]
+    fn primary_cli_plans_product_facing_planning_and_completion_exports() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("examples/workflows/packages/planning.workflow-package.yaml");
+        let loaded = read_workflow_package_manifest(&manifest).expect("planning package");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::new(),
+            blocks: std::collections::BTreeMap::new(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::from([
+                "build".to_string(),
+                "review".to_string(),
+            ]),
+            authoring_actions: std::collections::BTreeMap::new(),
+        };
+        let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
+            .expect("planning package plans");
+        assert_eq!(plan.members.len(), 2);
+        let planning = plan
+            .members
+            .iter()
+            .find(|member| member.member_id == "plan-or-refocus")
+            .expect("planning member");
+        let planning_definition = &planning.lowering.document.definition;
+        assert_eq!(
+            planning_definition.input.type_name,
+            "bcode.planning.request/v1"
+        );
+        let planning_prompt: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(planning_definition.nodes["plan"].configuration.clone())
+                .expect("planning prompt");
+        assert!(planning_prompt.system_prompt.contains("local-progress-doc"));
+        assert!(
+            planning_prompt
+                .system_prompt
+                .contains("refocus-progress-doc")
+        );
+
+        let completion = plan
+            .members
+            .iter()
+            .find(|member| member.member_id == "evaluate-completion")
+            .expect("completion member");
+        let completion_definition = &completion.lowering.document.definition;
+        assert_eq!(
+            completion_definition.input.type_name,
+            "bcode.completion.request/v1"
+        );
+        let completion_prompt: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(
+                completion_definition.nodes["evaluate"]
+                    .configuration
+                    .clone(),
+            )
+            .expect("completion prompt");
+        assert_eq!(
+            completion_prompt.execution_target,
+            bcode_workflow::PromptContextTarget::FreshIsolated
+        );
+        assert!(completion_prompt.read_only);
+    }
+
+    #[test]
+    fn primary_cli_plans_product_facing_configured_checkpoint_package() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("examples/workflows/packages/checkpoint.workflow-package.yaml");
+        let loaded = read_workflow_package_manifest(&manifest).expect("checkpoint package");
+        let shell_manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/shell-plugin/bcode-plugin.toml"
+        ))
+        .expect("shell plugin manifest");
+        let shell = shell_manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("shell workflow service");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::from(["bcode.shell".to_string()]),
+            blocks: shell
+                .workflow_blocks
+                .iter()
+                .cloned()
+                .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+                .collect(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::new(),
+            authoring_actions: shell
+                .workflow_authoring_actions
+                .iter()
+                .cloned()
+                .map(|action| (action.catalog_key(), action))
+                .collect(),
+        };
+        let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
+            .expect("checkpoint package plans");
+        assert_eq!(
+            plan.members[0].lowering.document.definition.input.type_name,
+            "bcode.shell.exec/v1"
+        );
+        assert!(
+            loaded.members[0]
+                .source
+                .contains("example-message-replaced-by-typed-input")
+        );
+        assert!(
+            loaded.members[0]
+                .source
+                .contains("example-pathspec-replaced-by-typed-input")
+        );
+        assert!(
+            !loaded.members[0]
+                .source
+                .contains("local-composable-workflows-progress.md")
+        );
+    }
+
+    #[test]
+    fn primary_cli_plans_product_facing_normal_synchronization_package() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            root.join("examples/workflows/packages/synchronization.workflow-package.yaml");
+        let loaded = read_workflow_package_manifest(&manifest).expect("synchronization package");
+        let shell_manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/shell-plugin/bcode-plugin.toml"
+        ))
+        .expect("shell plugin manifest");
+        let shell = shell_manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("shell workflow service");
+        let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: std::collections::BTreeSet::from(["bcode.shell".to_string()]),
+            blocks: shell
+                .workflow_blocks
+                .iter()
+                .cloned()
+                .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+                .collect(),
+            node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
+            workflow_definitions: std::collections::BTreeMap::new(),
+            agent_profiles: std::collections::BTreeSet::new(),
+            authoring_actions: shell
+                .workflow_authoring_actions
+                .iter()
+                .cloned()
+                .map(|action| (action.catalog_key(), action))
+                .collect(),
+        };
+        let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
+            .expect("synchronization package plans");
+        assert_eq!(
+            plan.members[0].lowering.document.definition.input.type_name,
+            "bcode.shell.exec/v1"
+        );
+        assert!(loaded.members[0].source.contains("GIT_TERMINAL_PROMPT"));
+        assert!(!loaded.members[0].source.contains("--force"));
+        assert!(!loaded.members[0].source.contains("force-with-lease"));
+    }
+
+    #[test]
+    fn primary_cli_plans_bounded_sync_recovery_from_narrow_imports() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("examples/workflows/packages/sync-recovery.workflow-package.yaml");
+        let closure = read_workflow_package_closure(&manifest).expect("recovery closure");
+        let plan = bcode_workflow::plan_workflow_package_closure(
+            &closure,
+            &workflow_test_catalog(std::collections::BTreeSet::from(["build".to_string()])),
+        )
+        .expect("recovery closure plans");
+        assert_eq!(plan.packages.len(), 3);
+        let mut preview_catalog =
+            workflow_test_catalog(std::collections::BTreeSet::from(["build".to_string()]));
+        for package in &plan.packages {
+            for member in &package.plan.members {
+                preview_catalog.workflow_definitions.insert(
+                    member.definition_identity.definition_id.clone(),
+                    member.lowering.document.definition.clone(),
+                );
+            }
+        }
+        for package in &plan.packages {
+            let preview = bcode_workflow::preview_workflow_package(
+                &package.plan,
+                &preview_catalog,
+                &std::collections::BTreeMap::new(),
+            )
+            .expect("every recovery package independently previews");
+            assert!(preview.is_compiled());
+        }
+        let entry = plan
+            .packages
+            .iter()
+            .find(|package| package.package_id == "bcode/examples-sync-recovery")
+            .expect("entry package");
+        let definition = &entry.plan.members[0].lowering.document.definition;
+        assert_eq!(
+            definition.nodes["synchronize"].kind,
+            bcode_workflow::NodeKind::WorkflowCall
+        );
+        assert_eq!(
+            definition.nodes["recover"].kind,
+            bcode_workflow::NodeKind::WorkflowCall
+        );
+        assert!(definition.edges.iter().any(|edge| {
+            edge.from == "synchronize"
+                && edge.to == "recover"
+                && matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. })
+        }));
+        let entry_source = closure
+            .packages
+            .iter()
+            .find(|package| package.package_id == "bcode/examples-sync-recovery")
+            .expect("entry source");
+        assert_eq!(entry_source.manifest.imports.len(), 2);
+        assert!(
+            entry_source
+                .manifest
+                .imports
+                .iter()
+                .all(|import| import.export == "synchronize" || import.export == "resolve")
+        );
+    }
+
+    #[test]
+    fn primary_cli_plans_product_facing_delivery_import_closure() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("examples/workflows/packages/delivery.workflow-package.yaml");
+        let closure = read_workflow_package_closure(&manifest).expect("delivery closure");
+        let plan = bcode_workflow::plan_workflow_package_closure(
+            &closure,
+            &workflow_test_catalog(std::collections::BTreeSet::from([
+                "build".to_string(),
+                "review".to_string(),
+            ])),
+        )
+        .expect("delivery closure plans");
+        assert_eq!(plan.packages.len(), 4);
+        let entry = plan
+            .packages
+            .iter()
+            .find(|package| package.package_id == "bcode/examples-delivery")
+            .expect("delivery entry");
+        let definition = &entry.plan.members[0].lowering.document.definition;
+        for node_id in ["plan", "implement", "review", "completion"] {
+            assert_eq!(
+                definition.nodes[node_id].kind,
+                bcode_workflow::NodeKind::WorkflowCall
+            );
+        }
+        assert_eq!(
+            definition.nodes["operator_decision"].kind,
+            bcode_workflow::NodeKind::Approval
         );
     }
 
@@ -14218,6 +15098,51 @@ mod workflow_source_tests {
         )
         .expect("duplicate manifest");
         assert!(discover_workflow_packages(temp.path(), &config, 10).is_err());
+    }
+
+    #[test]
+    fn package_discovery_reports_publication_lock_state_without_mutation() {
+        let digest = "a".repeat(64);
+        let receipt = bcode_workflow::WorkflowPackagePublicationReceipt {
+            version: bcode_workflow::WORKFLOW_PACKAGE_PUBLICATION_RECEIPT_VERSION,
+            package_id: "package".to_string(),
+            package_lock_digest_sha256: digest.clone(),
+            published_at_ms: 1,
+            exports: Vec::new(),
+        };
+        assert_eq!(
+            workflow_package_lock_state(None, &digest),
+            WorkflowPackageLockState::Unpublished
+        );
+        assert_eq!(
+            workflow_package_lock_state(Some(&receipt), &digest),
+            WorkflowPackageLockState::Published
+        );
+        assert_eq!(
+            workflow_package_lock_state(Some(&receipt), &"b".repeat(64)),
+            WorkflowPackageLockState::Drifted
+        );
+    }
+
+    #[test]
+    fn primary_cli_builds_exact_portable_package_export_start() {
+        let parent_session_id = SessionId::new();
+        let request = workflow_package_start_request(
+            bcode_workflow::WorkflowPackageExportIdentity {
+                package_id: "example/package".to_string(),
+                export: "main".to_string(),
+                package_lock_digest_sha256: Some("a".repeat(64)),
+            },
+            Some("run-1".to_string()),
+            parent_session_id,
+            Some("workspace".to_string()),
+            Some(serde_json::json!({"mode": "safe"})),
+            Some(serde_json::json!({"subject": "change"})),
+        );
+        assert_eq!(request.package_export.package_id, "example/package");
+        assert_eq!(request.package_export.export, "main");
+        assert_eq!(request.parent_session_id, parent_session_id);
+        assert_eq!(request.input.expect("input")["subject"], "change");
     }
 
     #[test]

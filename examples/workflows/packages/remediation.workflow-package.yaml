@@ -1,0 +1,7 @@
+version: 3
+package_id: bcode/examples-remediation
+exports:
+  bounded-remediation: bounded-remediation
+members:
+  - member_id: bounded-remediation
+    source_name: remediation/bounded-remediation.workflow.yaml

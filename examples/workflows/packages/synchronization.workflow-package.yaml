@@ -1,0 +1,7 @@
+version: 3
+package_id: bcode/examples-synchronization
+exports:
+  synchronize: synchronize
+members:
+  - member_id: synchronize
+    source_name: synchronization/synchronize.workflow.yaml

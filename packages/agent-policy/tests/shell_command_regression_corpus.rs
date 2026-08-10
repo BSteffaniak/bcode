@@ -273,6 +273,7 @@ fn evaluate(case: &Case) -> AgentDecision {
         },
         aliases: Vec::new(),
         requires_permission: true,
+        policy_profile: None,
         cwd: Some("/tmp/project".to_owned()),
     };
     evaluate_tool_call(&config, &request, Path::new("/tmp/project"))

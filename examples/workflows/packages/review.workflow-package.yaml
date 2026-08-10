@@ -1,0 +1,7 @@
+version: 3
+package_id: bcode/examples-review
+exports:
+  review: review
+members:
+  - member_id: review
+    source_name: review/review.workflow.yaml

@@ -1,0 +1,13 @@
+version: 3
+package_id: bcode/examples-validation
+exports:
+  run-validation: run-validation
+imports:
+  - import_id: command
+    package_id: bcode/examples-command
+    export: run-and-assert
+    manifest: command/package.workflow-package.yaml
+members:
+  - member_id: run-validation
+    source_name: validation/run-validation.workflow.yaml
+    external_dependencies: [command]

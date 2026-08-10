@@ -1,0 +1,10 @@
+version: 3
+package_id: bcode/examples-planning
+exports:
+  plan-or-refocus: plan-or-refocus
+  evaluate-completion: evaluate-completion
+members:
+  - member_id: plan-or-refocus
+    source_name: planning/plan-or-refocus.workflow.yaml
+  - member_id: evaluate-completion
+    source_name: planning/evaluate-completion.workflow.yaml

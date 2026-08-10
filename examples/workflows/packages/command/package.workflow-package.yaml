@@ -1,0 +1,7 @@
+version: 3
+package_id: bcode/examples-command
+exports:
+  run-and-assert: run-and-assert
+members:
+  - member_id: run-and-assert
+    source_name: run-and-assert.workflow.yaml

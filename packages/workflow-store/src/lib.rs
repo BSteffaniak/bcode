@@ -32,7 +32,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 13;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 14;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current durable workflow execution-session link contract version.
@@ -222,6 +222,8 @@ pub struct WorkflowRunSummary {
     /// Checksum of the canonical successful terminal output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_output_checksum_sha256: Option<String>,
+    /// Persisted immutable normalized policy/profile identity for this run and descendants.
+    pub authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity,
     /// Persisted immutable pinned authorization profile for this run and its descendants.
     #[serde(default)]
     pub authorization_ceiling: bcode_workflow::WorkflowToolCapability,
@@ -473,6 +475,8 @@ pub struct NewWorkflowRun {
     pub input: Option<serde_json::Value>,
     /// Creation timestamp supplied by the host clock.
     pub created_at_ms: u64,
+    /// Exact normalized non-secret policy/profile identity pinned before any run side effect.
+    pub authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity,
     /// Maximum capability inherited from the initiating context for this run and descendants.
     /// This immutable value is the run's pinned authorization profile: every attempt still requires
     /// normalized operation authorization, while no retry, restart, or child may exceed this ceiling.
@@ -3683,13 +3687,14 @@ impl WorkflowStore {
         run: &NewWorkflowRun,
     ) -> Result<bool, WorkflowStoreError> {
         validate_run(run)?;
+        let authorization_profile_json = serde_json::to_string(&run.authorization_profile)?;
         let existing = self
             .connection
             .query_row(
                 "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, parent_session_generation, \
                  input_json, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
                  owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
-                 authored_provenance_json, authorization_ceiling \
+                 authored_provenance_json, authorization_profile_json, authorization_ceiling \
                  FROM workflow_runs WHERE run_id = ?1",
                 [&run.run_id],
                 |row| {
@@ -3712,6 +3717,7 @@ impl WorkflowStore {
                         row.get::<_, bool>(15)?,
                         row.get::<_, Option<String>>(16)?,
                         row.get::<_, String>(17)?,
+                        row.get::<_, String>(18)?,
                     ))
                 },
             )
@@ -3734,6 +3740,7 @@ impl WorkflowStore {
             display_label,
             single_active,
             authored_provenance_json,
+            existing_authorization_profile_json,
             authorization_ceiling,
         )) = existing
         else {
@@ -3777,6 +3784,7 @@ impl WorkflowStore {
             && parent_session_generation == run.parent_session_generation
             && existing_binding == run.binding
             && authored_provenance == run.authored_provenance
+            && existing_authorization_profile_json == authorization_profile_json
             && parse_workflow_capability(&authorization_ceiling)? == run.authorization_ceiling
             && input == run.input
             && limits == run.limits
@@ -3828,7 +3836,7 @@ impl WorkflowStore {
         let parent = transaction
             .query_row(
                 "SELECT run.workspace_snapshot, activation.status, definition.definition_json, \
-                        run.authorization_ceiling \
+                        run.authorization_ceiling, run.authorization_profile_json \
                  FROM workflow_runs run \
                  JOIN workflow_activations activation ON activation.run_id = run.run_id \
                  JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
@@ -3846,6 +3854,7 @@ impl WorkflowStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
@@ -3861,6 +3870,13 @@ impl WorkflowStore {
             ));
         }
         let parent_authorization_ceiling = parse_workflow_capability(&parent.3)?;
+        let parent_authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity =
+            serde_json::from_str(&parent.4)?;
+        if request.run.authorization_profile != parent_authorization_profile {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child authorization profile differs from its parent".to_string(),
+            ));
+        }
         let parent_definition: WorkflowDefinition = serde_json::from_str(&parent.2)?;
         let parent_definition_identity =
             bcode_workflow::WorkflowDefinitionIdentity::for_definition(
@@ -4130,7 +4146,7 @@ impl WorkflowStore {
              r.run_id, r.definition_id, r.definition_version, r.workspace_snapshot, \
              r.parent_session_id, r.parent_session_generation, r.owner_plugin_id, r.workflow_kind, r.scope_key, r.display_label, \
              r.single_active, r.authored_provenance_json, r.terminal_output_id, \
-             r.terminal_output_checksum_sha256, r.authorization_ceiling, r.status, \
+             r.terminal_output_checksum_sha256, r.authorization_profile_json, r.authorization_ceiling, r.status, \
              r.cancellation_requested_at_ms, r.created_at_ms, r.updated_at_ms \
              FROM workflow_run_links l JOIN workflow_runs r ON r.run_id = l.child_run_id \
              WHERE l.root_run_id = ?1 ORDER BY l.created_at_ms, l.child_run_id LIMIT ?2",
@@ -6287,6 +6303,31 @@ impl WorkflowStore {
         )
     }
 
+    /// Return bounded execution-session links for one run without opening session history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, invalid bound, damaged stored state, or query
+    /// failure.
+    pub fn execution_session_links_for_run(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowExecutionSessionLink>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT version, run_id, node_id, activation_id, attempt, session_id, \
+                    workspace_snapshot, created_at_ms \
+             FROM workflow_execution_sessions WHERE run_id = ?1 \
+             ORDER BY node_id, activation_id, attempt LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), decode_execution_session_link)?
+            .map(|row| row.map_err(WorkflowStoreError::from))
+            .collect()
+    }
+
     /// Persist an external admission/service receipt after dispatch.
     ///
     /// # Errors
@@ -8158,7 +8199,7 @@ impl WorkflowStore {
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
                  parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
                  single_active, authored_provenance_json, terminal_output_id, \
-                 terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
+                 terminal_output_checksum_sha256, authorization_profile_json, authorization_ceiling, status, cancellation_requested_at_ms, \
                  created_at_ms, updated_at_ms \
                  FROM workflow_runs WHERE run_id = ?1",
                 [run_id],
@@ -8488,7 +8529,7 @@ impl WorkflowStore {
             "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
              parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
              single_active, authored_provenance_json, terminal_output_id, \
-             terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
+             terminal_output_checksum_sha256, authorization_profile_json, authorization_ceiling, status, cancellation_requested_at_ms, \
              created_at_ms, updated_at_ms \
              FROM workflow_runs ORDER BY updated_at_ms DESC, run_id LIMIT ?1",
         )?;
@@ -8521,7 +8562,7 @@ impl WorkflowStore {
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
                  parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
                  single_active, authored_provenance_json, terminal_output_id, \
-                 terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
+                 terminal_output_checksum_sha256, authorization_profile_json, authorization_ceiling, status, cancellation_requested_at_ms, \
                  created_at_ms, updated_at_ms \
                  FROM workflow_runs WHERE owner_plugin_id = ?1 AND workflow_kind = ?2 \
                  AND scope_key = ?3 ORDER BY updated_at_ms DESC, run_id LIMIT 1",
@@ -8612,7 +8653,7 @@ impl WorkflowStore {
             "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
              parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
              single_active, authored_provenance_json, terminal_output_id, \
-             terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
+             terminal_output_checksum_sha256, authorization_profile_json, authorization_ceiling, status, cancellation_requested_at_ms, \
              created_at_ms, updated_at_ms FROM workflow_runs \
              WHERE parent_session_id IS NOT NULL \
                AND status IN ('completed', 'failed', 'cancelled', 'repair_required') \
@@ -10885,6 +10926,7 @@ type RawRunSummary = (
     Option<String>,
     String,
     String,
+    String,
     Option<u64>,
     u64,
     u64,
@@ -10918,6 +10960,7 @@ fn run_summary_from_row_offset(
         row.get(offset + 16)?,
         row.get(offset + 17)?,
         row.get(offset + 18)?,
+        row.get(offset + 19)?,
     ))
 }
 
@@ -10937,6 +10980,7 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         authored_provenance_json,
         terminal_output_id,
         terminal_output_checksum_sha256,
+        authorization_profile_json,
         authorization_ceiling,
         status,
         cancellation_requested_at_ms,
@@ -10988,6 +11032,7 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         authored_provenance,
         terminal_output_id,
         terminal_output_checksum_sha256,
+        authorization_profile: serde_json::from_str(&authorization_profile_json)?,
         authorization_ceiling: parse_workflow_capability(&authorization_ceiling)?,
         status: parse_run_status(&status)?,
         cancellation_requested_at_ms,
@@ -11876,10 +11921,10 @@ fn create_run_in_transaction(
         "INSERT INTO workflow_runs \
              (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
               parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
-              authored_provenance_json, input_json, authorization_ceiling, status, deadline_at_ms, \
+              authored_provenance_json, input_json, authorization_profile_json, authorization_ceiling, status, deadline_at_ms, \
               node_execution_cap, concurrency_cap, cycle_cap, retry_cap, created_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                     ?17, ?18, ?19, ?20, ?21, ?21)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+                     ?18, ?19, ?20, ?21, ?22, ?22)",
         rusqlite::params![
             &run.run_id,
             &run.definition_id,
@@ -11894,6 +11939,7 @@ fn create_run_in_transaction(
             single_active,
             &authored_provenance_json,
             &input_json,
+            serde_json::to_string(&run.authorization_profile)?,
             workflow_capability_name(run.authorization_ceiling),
             RunStatus::Running.as_str(),
             run.limits.deadline_at_ms,
@@ -12135,6 +12181,9 @@ fn validate_run(run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
     validate_id("run_id", &run.run_id)?;
     validate_id("definition_id", &run.definition_id)?;
     validate_id("workspace_snapshot", &run.workspace_snapshot)?;
+    run.authorization_profile
+        .validate()
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     validate_run_limits(&run.limits)?;
     if run.definition_version == 0 {
         return Err(WorkflowStoreError::InvalidData(
@@ -12869,6 +12918,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
              single_active INTEGER NOT NULL DEFAULT 0,\
              authored_provenance_json TEXT,\
              input_json TEXT,\
+             authorization_profile_json TEXT NOT NULL,\
              authorization_ceiling TEXT NOT NULL DEFAULT 'disabled',\
              terminal_output_id TEXT,\
              terminal_output_checksum_sha256 TEXT,\
@@ -13986,6 +14036,12 @@ mod tests {
                     authored_provenance: None,
                     input: Some(input),
                     created_at_ms: 10,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 })
@@ -14065,6 +14121,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(input),
                 created_at_ms: 10,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -14168,6 +14230,12 @@ mod tests {
                     authored_provenance: None,
                     input: Some(input),
                     created_at_ms: 10,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 })
@@ -14271,6 +14339,12 @@ mod tests {
                     authored_provenance: None,
                     input: Some(input),
                     created_at_ms: 10,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 })
@@ -14320,6 +14394,12 @@ mod tests {
                     authored_provenance: None,
                     input: Some(input.clone()),
                     created_at_ms: 10,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 })
@@ -14376,6 +14456,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(input.clone()),
                 created_at_ms: 10,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -14419,6 +14505,12 @@ mod tests {
             authored_provenance: None,
             input: Some(serde_json::json!(1)),
             created_at_ms: 10,
+            authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                version: 1,
+                provider_id: "test-policy".to_string(),
+                profile_id: "build".to_string(),
+                policy_digest_sha256: "a".repeat(64),
+            },
             authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
             limits: WorkflowRunLimits::default(),
         }
@@ -14470,6 +14562,37 @@ mod tests {
                 [],
             )
             .expect("authored preset");
+    }
+
+    #[test]
+    fn authorization_profile_is_atomic_idempotent_and_restart_safe() {
+        let temp = tempfile::tempdir().expect("temp");
+        let run = new_run();
+        {
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("example", 1, &definition("example"))
+                .expect("definition");
+            assert!(store.create_run_idempotent(&run).expect("create"));
+            assert!(!store.create_run_idempotent(&run).expect("repeat"));
+        }
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .authorization_profile,
+            run.authorization_profile
+        );
+        let conflicting = NewWorkflowRun {
+            authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                policy_digest_sha256: "b".repeat(64),
+                ..run.authorization_profile.clone()
+            },
+            ..run
+        };
+        assert!(store.create_run_idempotent(&conflicting).is_err());
     }
 
     #[test]
@@ -14651,6 +14774,12 @@ mod tests {
                 ..run.clone()
             },
             NewWorkflowRun {
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     retry_cap: run.limits.retry_cap + 1,
@@ -15192,6 +15321,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -15280,6 +15415,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -15367,6 +15508,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     cycle_cap: 1,
@@ -15445,6 +15592,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     cycle_cap: 2,
@@ -15536,6 +15689,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     cycle_cap: 1,
@@ -16601,6 +16760,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -16654,10 +16819,33 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 3,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             },
         };
+        let mut mismatched_profile = request.clone();
+        mismatched_profile.run.run_id = workflow_child_run_id(
+            "parent-run",
+            "parent-run",
+            &mismatched_profile.link.parent_activation_id,
+            1,
+            &mismatched_profile.link.target,
+        );
+        mismatched_profile
+            .run
+            .authorization_profile
+            .policy_digest_sha256 = "b".repeat(64);
+        assert!(
+            store
+                .create_child_run_idempotent(&mismatched_profile)
+                .is_err()
+        );
         assert!(
             store
                 .create_child_run_idempotent(&request)
@@ -16796,6 +16984,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -16865,6 +17059,12 @@ mod tests {
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 2,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 },
@@ -16883,6 +17083,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn child_run_failure_rolls_back_child_and_link() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -16909,6 +17110,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -16962,6 +17169,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 3,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             },
@@ -17019,6 +17232,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::ReadOnly,
                 limits: WorkflowRunLimits::default(),
             })
@@ -17090,6 +17309,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 3,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             },
@@ -18096,6 +18321,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(3)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -18105,6 +18336,14 @@ mod tests {
             .expect("waits")
             .pop()
             .expect("wait");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert_eq!(
+            store
+                .waiting_activations("approval-run", 10)
+                .expect("reopened wait"),
+            std::slice::from_ref(&wait)
+        );
         let result = store
             .resolve_approval("approval-run", "approve", &wait.activation_id, false, 20)
             .expect("deny");
@@ -18625,6 +18864,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     concurrency_cap: 2,
@@ -18857,6 +19102,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -19070,6 +19321,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -19479,6 +19736,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
@@ -19583,6 +19846,12 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     concurrency_cap: 2,
@@ -19866,6 +20135,12 @@ mod tests {
                     authored_provenance: None,
                     input: Some(value.clone()),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 })
@@ -20442,6 +20717,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn execution_session_links_are_exact_idempotent_and_conflict_safe() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -20467,6 +20743,12 @@ mod tests {
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Disabled,
             })
             .expect("run");
@@ -20511,6 +20793,17 @@ mod tests {
                 )
                 .expect("load link"),
             Some(link.clone())
+        );
+        assert_eq!(
+            store
+                .execution_session_links_for_run(&link.run_id, 10)
+                .expect("bounded links"),
+            vec![link.clone()]
+        );
+        assert!(
+            store
+                .execution_session_links_for_run(&link.run_id, 0)
+                .is_err()
         );
         let mut conflict = link.clone();
         conflict.session_id = "session-2".to_string();

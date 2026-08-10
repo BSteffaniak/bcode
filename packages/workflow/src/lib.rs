@@ -5003,7 +5003,7 @@ pub fn plan_workflow_package(
                 format!("normalized member source cannot be serialized: {error}"),
             )
         })?;
-        let lowering = lower_workflow_authoring_source(
+        let mut lowering = lower_workflow_authoring_source(
             &normalized,
             WorkflowSourceFormat::Json,
             &resolved_catalog,
@@ -5023,6 +5023,7 @@ pub fn plan_workflow_package(
             qualify_workflow_package_member_error(member, authoring_error("compilation", message))
         })?;
         let identity = compiled.definition_identity;
+        lowering.document.definition = compiled.definition.clone();
         let closure = workflow_package_member_closure(member, &members)?;
         let source_digest = digest_serializable(&serde_json::json!({
             "source_name": member.source_name,
@@ -6028,6 +6029,15 @@ pub struct WorkflowPackageLock {
 }
 
 impl WorkflowPackageLock {
+    /// Return the deterministic canonical SHA-256 identity of this exact lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock cannot be canonically encoded.
+    pub fn digest_sha256(&self) -> Result<String, WorkflowError> {
+        digest_serializable(self)
+    }
+
     /// Validate lock identity, digests, exact definition/revision facts, and dependency closure.
     ///
     /// # Errors
@@ -10199,6 +10209,44 @@ fn canonical_sha256<T: Serialize>(value: &T, path: &str) -> Result<String, Workf
         write!(&mut result, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(result)
+}
+
+/// Exact normalized non-secret authorization policy/profile identity pinned by one run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthorizationProfileIdentity {
+    pub version: u32,
+    pub provider_id: String,
+    pub profile_id: String,
+    pub policy_digest_sha256: String,
+}
+
+impl WorkflowAuthorizationProfileIdentity {
+    /// Validate bounded normalized identity facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed identities, or malformed digest.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != 1 {
+            return Err(authoring_error(
+                "workflow.authorization_profile.version",
+                "unsupported workflow authorization profile identity version",
+            ));
+        }
+        validate_authoring_id(
+            "workflow.authorization_profile.provider_id",
+            &self.provider_id,
+        )?;
+        validate_authoring_id(
+            "workflow.authorization_profile.profile_id",
+            &self.profile_id,
+        )?;
+        validate_sha256(
+            "workflow.authorization_profile.policy_digest_sha256",
+            &self.policy_digest_sha256,
+        )
+    }
 }
 
 /// Maximum tool capability a workflow node may request.
@@ -15363,6 +15411,50 @@ mod tests {
         let mut undeclared = manifest;
         undeclared.members[0].external_dependencies.clear();
         assert!(plan_workflow_package(&undeclared, &catalog).is_err());
+    }
+
+    #[test]
+    fn package_plan_persists_the_exact_compiled_definition_used_by_its_identity() {
+        let schema = ValueSchema {
+            type_name: "example.value/v1".to_string(),
+            schema: serde_json::json!({"type": "string"}),
+        };
+        let source = serde_json::json!({
+            "workflow_source_version": 3,
+            "workflow_id": "example/compiled-plan",
+            "title": "Compiled plan",
+            "input": schema,
+            "output": schema,
+            "steps": [{
+                "id": "gate",
+                "input": {"schema": schema}
+            }]
+        });
+        let manifest = WorkflowPackageManifest {
+            version: WORKFLOW_PACKAGE_MANIFEST_VERSION,
+            package_id: "example/compiled-plan-package".to_string(),
+            exports: BTreeMap::from([("main".to_string(), "main".to_string())]),
+            external_dependencies: BTreeMap::new(),
+            imports: Vec::new(),
+            members: vec![WorkflowPackageMember {
+                member_id: "main".to_string(),
+                source_name: "main.json".to_string(),
+                format: WorkflowSourceFormat::Json,
+                source: serde_json::to_string(&source).expect("source"),
+                dependencies: Vec::new(),
+                external_dependencies: Vec::new(),
+            }],
+        };
+        let plan = plan_workflow_package(&manifest, &authoring_catalog()).expect("plan");
+        let member = &plan.members[0];
+        assert_eq!(
+            member.definition_identity,
+            WorkflowDefinitionIdentity::for_definition(
+                &member.definition_identity.kind,
+                &member.lowering.document.definition,
+            )
+            .expect("exact identity")
+        );
     }
 
     #[test]

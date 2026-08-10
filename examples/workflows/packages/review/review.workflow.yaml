@@ -1,0 +1,79 @@
+workflow_source_version: 3
+workflow_id: examples/review/review
+title: Isolated adversarial review
+description: Runs correctness and security reviews in fresh read-only contexts and aggregates both typed results deterministically.
+run_limits:
+  maximum_duration_ms: 900000
+  node_execution_cap: 4
+  concurrency_cap: 2
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: request
+    input:
+      schema:
+        type_name: bcode.review.request/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [scope]
+          properties:
+            scope: {type: string, minLength: 1, maxLength: 4096}
+  - id: correctness
+    needs: [request]
+    prompt:
+      text: Review the supplied scope adversarially for correctness, durability, cancellation, and duplicate delivery. Return only typed findings.
+      input:
+        type_name: bcode.review.request/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [scope]
+          properties: {scope: {type: string, minLength: 1, maxLength: 4096}}
+      output:
+        type_name: bcode.review.result/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [verdict, findings]
+          properties:
+            verdict: {type: string, enum: [pass, changes_required, blocked]}
+            findings: {type: array, maxItems: 64, items: {type: string, maxLength: 4096}}
+      agent_profile: review
+      execution_target: fresh_isolated
+      read_only: true
+      tool_allowlist: [filesystem.read, filesystem.grep]
+      timeout_ms: 300000
+      resources: [{resource: repository, access: read}]
+  - id: security
+    needs: [request]
+    prompt:
+      text: Review the supplied scope adversarially for authorization, confinement, secrets, and untrusted input. Return only typed findings.
+      input:
+        type_name: bcode.review.request/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [scope]
+          properties: {scope: {type: string, minLength: 1, maxLength: 4096}}
+      output:
+        type_name: bcode.review.result/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [verdict, findings]
+          properties:
+            verdict: {type: string, enum: [pass, changes_required, blocked]}
+            findings: {type: array, maxItems: 64, items: {type: string, maxLength: 4096}}
+      agent_profile: review
+      execution_target: fresh_isolated
+      read_only: true
+      tool_allowlist: [filesystem.read, filesystem.grep]
+      timeout_ms: 300000
+      resources: [{resource: repository, access: read}]
+  - id: aggregate
+    needs: [correctness, security]
+    parallel:
+      left: correctness
+      right: security
+      failure_policy: wait_all

@@ -414,6 +414,7 @@ fn prepare_workflow_block_contract(request: &ServiceRequest) -> ServiceResponse 
         block_id: request.block.block_id,
         input_sha256: input_sha256.clone(),
     };
+    let policy_identity = shell_policy_identity();
     match ServiceResponse::json(&bcode_workflow::WorkflowBlockPreparationResponse {
         version: bcode_workflow::WORKFLOW_BLOCK_PREPARATION_VERSION,
         input_sha256,
@@ -421,10 +422,10 @@ fn prepare_workflow_block_contract(request: &ServiceRequest) -> ServiceResponse 
         operation_facts: serde_json::to_value(
             bcode_agent_profile::ToolPolicyAuthorizationMetadata {
                 requires_permission: true,
-                aliases: vec![SHELL_RUN_TOOL_NAME.to_string()],
-                compatibility_aliases: Vec::new(),
-                capabilities: shell_policy_identity().capabilities,
-                permission_category: Some("command".to_string()),
+                aliases: policy_identity.aliases,
+                compatibility_aliases: policy_identity.compatibility_aliases,
+                capabilities: policy_identity.capabilities,
+                permission_category: policy_identity.permission_category,
                 operation,
             },
         )
@@ -3391,6 +3392,43 @@ mod tests {
                 .timeout_ms,
             1_234
         );
+    }
+
+    #[test]
+    fn shell_tool_and_workflow_preparation_emit_identical_policy_facts() {
+        let arguments = serde_json::json!({"command": "git status --short"});
+        let tool = prepare_shell_tool(&preparation_request(arguments.clone()))
+            .payload_json::<bcode_tool::ToolPreparationResponse>()
+            .expect("tool preparation");
+        let tool_policy = bcode_agent_profile::tool_policy_authorization_metadata(
+            &tool.authorization,
+            SHELL_RUN_TOOL_NAME,
+        )
+        .expect("tool policy");
+        let block = shell_workflow_block_definition("exec");
+        let workflow = prepare_workflow_block_contract(&ServiceRequest {
+            interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
+            operation: bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION.to_string(),
+            payload: serde_json::to_vec(&bcode_workflow::WorkflowBlockPreparationRequest {
+                version: bcode_workflow::WORKFLOW_BLOCK_PREPARATION_VERSION,
+                block,
+                context: bcode_workflow::WorkflowBlockPreparationContext {
+                    run_id: "run".to_string(),
+                    node_id: "node".to_string(),
+                    activation_id: "activation".to_string(),
+                    attempt: 0,
+                    preparation_identity: "workflow-preparation:run:node:activation".to_string(),
+                    workspace_root: PathBuf::from("/tmp/workspace"),
+                },
+                input: serde_json::json!("git status --short"),
+            })
+            .expect("workflow preparation request"),
+        })
+        .payload_json::<bcode_workflow::WorkflowBlockPreparationResponse>()
+        .expect("workflow preparation");
+        let workflow_policy: bcode_agent_profile::ToolPolicyAuthorizationMetadata =
+            serde_json::from_value(workflow.operation_facts).expect("workflow policy");
+        assert_eq!(workflow_policy, tool_policy);
     }
 
     #[test]

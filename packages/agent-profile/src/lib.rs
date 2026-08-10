@@ -29,6 +29,9 @@ pub const OP_EVALUATE_TOOL_CALL: &str = "evaluate_tool_call";
 /// Operation for reporting the active policy config source/status.
 pub const OP_POLICY_STATUS: &str = "policy_status";
 
+/// Operation for resolving one exact normalized policy/profile identity.
+pub const OP_RESOLVE_POLICY_PROFILE_IDENTITY: &str = "resolve_policy_profile_identity";
+
 /// Agent profile metadata shown in the TUI and command palette.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -342,6 +345,10 @@ pub struct EvaluateToolCallRequest {
     /// Whether the tool owner requires explicit permission absent a stronger decision.
     #[serde(default)]
     pub requires_permission: bool,
+    /// Exact pinned policy/profile identity for workflow execution. Providers must evaluate the
+    /// supplied normalized operation against this identity rather than ambient later policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_profile: Option<AgentPolicyProfileIdentity>,
     /// Host current working directory for path-boundary policy checks.
     #[serde(default)]
     pub cwd: Option<String>,
@@ -412,6 +419,53 @@ pub struct EvaluateToolCallResponse {
     pub shell: Option<ShellPolicyDiagnostic>,
 }
 
+/// Current normalized non-secret agent policy profile identity version.
+pub const AGENT_POLICY_PROFILE_IDENTITY_VERSION: u32 = 1;
+
+/// Exact normalized policy/profile identity suitable for durable workflow pinning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPolicyProfileIdentity {
+    pub version: u32,
+    pub provider_id: String,
+    pub profile_id: String,
+    pub policy_digest_sha256: String,
+}
+
+/// Request for resolving one exact normalized policy/profile identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveAgentPolicyProfileIdentityRequest {
+    pub profile_id: String,
+}
+
+/// Construct and validate one normalized policy/profile identity.
+///
+/// # Errors
+///
+/// Returns an error for empty provider/profile identities or a malformed SHA-256 digest.
+pub fn agent_policy_profile_identity(
+    provider_id: &str,
+    profile_id: &str,
+    policy_digest_sha256: String,
+) -> Result<AgentPolicyProfileIdentity, String> {
+    if provider_id.trim().is_empty()
+        || profile_id.trim().is_empty()
+        || policy_digest_sha256.len() != 64
+        || !policy_digest_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err("agent policy profile identity is malformed".to_string());
+    }
+    Ok(AgentPolicyProfileIdentity {
+        version: AGENT_POLICY_PROFILE_IDENTITY_VERSION,
+        provider_id: provider_id.to_string(),
+        profile_id: profile_id.to_string(),
+        policy_digest_sha256,
+    })
+}
+
 /// Agent policy provider status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyStatusResponse {
@@ -433,6 +487,14 @@ pub struct PolicyStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_policy_profile_identity_rejects_malformed_facts() {
+        assert!(agent_policy_profile_identity("provider", "build", "a".repeat(64)).is_ok());
+        assert!(agent_policy_profile_identity("", "build", "a".repeat(64)).is_err());
+        assert!(agent_policy_profile_identity("provider", "", "a".repeat(64)).is_err());
+        assert!(agent_policy_profile_identity("provider", "build", "A".repeat(64)).is_err());
+    }
 
     #[test]
     fn standard_policy_preparation_preserves_owner_descriptor() {

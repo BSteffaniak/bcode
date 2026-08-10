@@ -1,0 +1,152 @@
+workflow_source_version: 3
+workflow_id: examples/delivery/feature-delivery
+title: Progress-driven feature delivery
+description: Composes reusable planning, bounded implementation, review, and completion procedures from exact imported exports.
+run_limits:
+  maximum_duration_ms: 14400000
+  node_execution_cap: 40
+  concurrency_cap: 2
+  cycle_cap: 4
+  retry_cap: 2
+steps:
+  - id: planning_request
+    input:
+      schema:
+        type_name: bcode.planning.request/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [path, prompt]
+          properties:
+            path: {type: string, minLength: 1, maxLength: 1024}
+            prompt: {type: string, minLength: 1, maxLength: 16384}
+  - id: plan
+    package_call: {external: planning}
+  - id: implementation_state
+    needs: [plan]
+    input:
+      schema:
+        type_name: bcode.planning.result/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [status, path, summary]
+          properties:
+            status: {type: string, enum: [created, refocused, unchanged, blocked]}
+            path: {type: string, minLength: 1, maxLength: 1024}
+            summary: {type: string, minLength: 1, maxLength: 16384}
+  - id: implement
+    needs: [implementation_state]
+    package_call: {external: remediation}
+    input_expression:
+      version: 2
+      expression:
+        operation: object
+        fields:
+          status: {operation: constant, value: ready}
+          detail:
+            operation: selected_input
+            source: dependency.implementation_state
+            selector:
+              version: 1
+              segments: [{kind: field, name: summary}]
+          iteration: {operation: constant, value: 0}
+      output:
+        type_name: bcode.remediation.state/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [status, detail, iteration]
+          properties:
+            status: {type: string, enum: [ready, needs_remediation, complete, blocked]}
+            detail: {type: string, maxLength: 16384}
+            iteration: {type: integer, minimum: 0, maximum: 3}
+  - id: review_request
+    needs: [implement]
+    input:
+      schema:
+        type_name: bcode.remediation.state/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [status, detail, iteration]
+          properties:
+            status: {type: string, enum: [ready, needs_remediation, complete, blocked]}
+            detail: {type: string, maxLength: 16384}
+            iteration: {type: integer, minimum: 0, maximum: 3}
+  - id: review
+    needs: [review_request]
+    package_call: {external: review}
+    input_expression:
+      version: 2
+      expression:
+        operation: object
+        fields:
+          scope:
+            operation: selected_input
+            source: dependency.review_request
+            selector:
+              version: 1
+              segments: [{kind: field, name: detail}]
+      output:
+        type_name: bcode.review.request/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [scope]
+          properties: {scope: {type: string, minLength: 1, maxLength: 4096}}
+  - id: completion_request
+    needs: [review]
+    input:
+      schema:
+        type_name: workflow.parallel/v1<bcode.review.result/v1,bcode.review.result/v1>
+        schema:
+          type: array
+          prefixItems:
+            - type: object
+              additionalProperties: false
+              required: [verdict, findings]
+              properties:
+                verdict: {type: string, enum: [pass, changes_required, blocked]}
+                findings: {type: array, maxItems: 64, items: {type: string, maxLength: 4096}}
+            - type: object
+              additionalProperties: false
+              required: [verdict, findings]
+              properties:
+                verdict: {type: string, enum: [pass, changes_required, blocked]}
+                findings: {type: array, maxItems: 64, items: {type: string, maxLength: 4096}}
+          minItems: 2
+          maxItems: 2
+  - id: completion
+    needs: [completion_request]
+    package_call: {external: completion}
+    input_expression:
+      version: 2
+      expression:
+        operation: object
+        fields:
+          stop_condition: {operation: constant, value: Complete only when verification and both reviews pass.}
+          evidence: {operation: array, items: []}
+      output:
+        type_name: bcode.completion.request/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [stop_condition, evidence]
+          properties:
+            stop_condition: {type: string, minLength: 1, maxLength: 16384}
+            evidence: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+  - id: operator_decision
+    needs: [completion]
+    approval:
+      schema:
+        type_name: bcode.completion.result/v1
+        schema:
+          type: object
+          additionalProperties: false
+          required: [condition_met, summary, remaining]
+          properties:
+            condition_met: {type: boolean}
+            summary: {type: string, minLength: 1, maxLength: 4096}
+            remaining: {type: array, maxItems: 128, items: {type: string, maxLength: 4096}}
+      resources: [{resource: operator, access: read}]

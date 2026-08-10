@@ -95,6 +95,11 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Validate and compile-preview one bounded workflow package",
         ),
         (
+            "workflow.package-start",
+            "Workflow: Start Package Export",
+            "Start one exact published workflow package export",
+        ),
+        (
             "workflow.author-create",
             "Workflow: Create From Source",
             "Create one durable workflow draft from authored source",
@@ -164,6 +169,16 @@ fn command_contributions() -> Vec<CommandContribution> {
             "workflow.retry-node",
             "Workflow: Retry Node",
             "Retry one exact latest failed node attempt",
+        ),
+        (
+            "workflow.approve",
+            "Workflow: Approve",
+            "Resolve one waiting typed approval",
+        ),
+        (
+            "workflow.deny",
+            "Workflow: Deny",
+            "Deny one waiting typed approval",
         ),
         (
             "workflow.provide-input",
@@ -433,6 +448,17 @@ pub(crate) async fn execute_command(
             );
             "workflow package validated".to_string()
         }
+        "workflow.package-start" => {
+            let started = client
+                .start_workflow_package_export(package_export_start_request(&request)?)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "package_export_start".to_string(),
+                serde_json::to_value(started).map_err(|error| error.to_string())?,
+            );
+            "workflow package export started".to_string()
+        }
         "workflow.author-create" => {
             let source_format: bcode_workflow::WorkflowSourceFormat =
                 serde_json::from_str(&required_arg(&request, "source_format")?)
@@ -696,6 +722,22 @@ pub(crate) async fn execute_command(
                 .map_err(|error| error.to_string())?;
             options.insert("retry".to_string(), serde_json::json!(result));
             "workflow node retry admitted".to_string()
+        }
+        "workflow.approve" | "workflow.deny" => {
+            let run_id = required_arg(&request, "run_id")?;
+            let node_id = required_arg(&request, "node_id")?;
+            let activation_id = required_arg(&request, "activation_id")?;
+            let approved = request.command_id == "workflow.approve";
+            let result = client
+                .resolve_workflow_approval(run_id, node_id, activation_id, approved)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert("approval_resolution".to_string(), serde_json::json!(result));
+            if approved {
+                "workflow approval recorded".to_string()
+            } else {
+                "workflow approval denied".to_string()
+            }
         }
         "workflow.provide-input" => {
             let run_id = required_arg(&request, "run_id")?;
@@ -1012,6 +1054,58 @@ fn validate_template_configuration(
     Ok(configuration)
 }
 
+fn package_export_start_request(
+    request: &InvokeCommandRequest,
+) -> Result<bcode_ipc::StartWorkflowPackageExportRequest, String> {
+    let package_id = required_arg(request, "package_id")?;
+    let export = required_arg(request, "export")?;
+    let parent_session_id = required_arg(request, "parent_session_id")?
+        .parse()
+        .map_err(|error| format!("invalid 'parent_session_id': {error}"))?;
+    Ok(bcode_ipc::StartWorkflowPackageExportRequest {
+        package_export: bcode_workflow::WorkflowPackageExportIdentity {
+            package_id,
+            export,
+            package_lock_digest_sha256: request
+                .args
+                .get("package_lock_digest_sha256")
+                .filter(|value| !value.is_empty())
+                .cloned(),
+        },
+        run_id: request
+            .args
+            .get("run_id")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        parent_session_id,
+        workspace_snapshot: request
+            .args
+            .get("workspace_snapshot")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        parent_session_generation: None,
+        configuration: optional_json_arg(request, "configuration")?,
+        input: optional_json_arg(request, "input")?,
+    })
+}
+
+fn optional_json_arg(
+    request: &InvokeCommandRequest,
+    name: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    request
+        .args
+        .get(name)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.len() > bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
+                return Err(format!("'{name}' exceeds the workflow input byte limit"));
+            }
+            serde_json::from_str(value).map_err(|error| format!("invalid '{name}' JSON: {error}"))
+        })
+        .transpose()
+}
+
 fn required_arg(request: &InvokeCommandRequest, name: &str) -> Result<String, String> {
     request
         .args
@@ -1081,6 +1175,8 @@ mod tests {
             "workflow.templates",
             "workflow.template-describe",
             "workflow.template-start",
+            "workflow.package-check",
+            "workflow.package-start",
             "workflow.register",
             "workflow.run",
             "workflow.status",
@@ -1175,6 +1271,69 @@ mod tests {
         );
         assert!(validate_template_configuration(&schema, "not-json").is_err());
         assert!(validate_template_configuration(&schema, &"x".repeat(1_048_577)).is_err());
+    }
+
+    #[test]
+    fn package_start_builds_exact_portable_request() {
+        let parent_session_id = bcode_session_models::SessionId::new();
+        let request = InvokeCommandRequest {
+            command_id: "workflow.package-start".to_string(),
+            args: BTreeMap::from([
+                ("package_id".to_string(), "example/package".to_string()),
+                ("export".to_string(), "main".to_string()),
+                (
+                    "parent_session_id".to_string(),
+                    parent_session_id.to_string(),
+                ),
+                ("package_lock_digest_sha256".to_string(), "a".repeat(64)),
+                ("run_id".to_string(), "run-1".to_string()),
+                ("input".to_string(), r#"{"subject":"change"}"#.to_string()),
+            ]),
+        };
+        let start = package_export_start_request(&request).expect("start request");
+        assert_eq!(start.package_export.package_id, "example/package");
+        assert_eq!(start.package_export.export, "main");
+        assert_eq!(start.parent_session_id, parent_session_id);
+        assert_eq!(start.input.expect("input")["subject"], "change");
+    }
+
+    #[test]
+    fn package_start_json_arguments_are_bounded_and_typed() {
+        let request = InvokeCommandRequest {
+            command_id: "workflow.package-start".to_string(),
+            args: BTreeMap::from([
+                (
+                    "configuration".to_string(),
+                    r#"{"mode":"safe"}"#.to_string(),
+                ),
+                ("input".to_string(), r#"{"subject":"change"}"#.to_string()),
+            ]),
+        };
+        assert_eq!(
+            optional_json_arg(&request, "configuration")
+                .expect("configuration")
+                .expect("value")["mode"],
+            "safe"
+        );
+        assert_eq!(
+            optional_json_arg(&request, "input")
+                .expect("input")
+                .expect("value")["subject"],
+            "change"
+        );
+        let invalid = InvokeCommandRequest {
+            command_id: "workflow.package-start".to_string(),
+            args: BTreeMap::from([("input".to_string(), "not-json".to_string())]),
+        };
+        assert!(optional_json_arg(&invalid, "input").is_err());
+        let oversized = InvokeCommandRequest {
+            command_id: "workflow.package-start".to_string(),
+            args: BTreeMap::from([(
+                "input".to_string(),
+                "x".repeat(bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES + 1),
+            )]),
+        };
+        assert!(optional_json_arg(&oversized, "input").is_err());
     }
 
     #[test]

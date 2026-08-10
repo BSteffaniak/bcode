@@ -25,6 +25,24 @@ if rg -n 'CodingWorkflowState|ProgressWorkState|ProgressDocument|RepositorySnaps
 fi
 rm -f /tmp/bcode-composable-product-leaks.txt
 
+if rg -n -i 'progress[-_ ]document|conflict[-_ ]resolution|feature[-_ ]delivery|adversarial[-_ ]review|checkpoint_message|synchronization[-_ ]and[-_ ]push' \
+  packages/workflow packages/workflow-store packages/server packages/client packages/cli --glob '*.rs' \
+  >/tmp/bcode-composable-procedure-leaks.txt 2>/dev/null; then
+  echo "Composable workflow ownership violation: source-authored procedures leaked into generic workflow hosts." >&2
+  cat /tmp/bcode-composable-procedure-leaks.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-composable-procedure-leaks.txt
+
+if rg -n 'local-composable-workflows-progress\.md|git add --all -- .*local-composable' \
+  examples/workflows --glob '*.rs' \
+  >/tmp/bcode-composable-example-host-leaks.txt 2>/dev/null; then
+  echo "Composable workflow ownership violation: product-facing example policy leaked into Rust." >&2
+  cat /tmp/bcode-composable-example-host-leaks.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-composable-example-host-leaks.txt
+
 if rg -n 'std::process::Command|tokio::process::Command|git2::|pulldown_cmark|AGENTS\.md' \
   packages/workflow packages/workflow-store --glob '*.rs' \
   >/tmp/bcode-composable-io-leaks.txt 2>/dev/null; then
@@ -183,10 +201,52 @@ fi
 
 if ! rg -q 'WorkflowCallConfiguration' packages/workflow/src/lib.rs \
   || ! rg -q 'workflow_run_links' packages/workflow-store/src/lib.rs \
-  || ! rg -q 'WorkflowTerminalOutputInspection' packages/ipc/src/lib.rs packages/server/src/lib.rs; then
+  || ! rg -q 'WorkflowTerminalOutputInspection' packages/ipc/src/lib.rs packages/server/src/lib.rs \
+  || ! rg -q 'ResolveApproval' packages/cli/src/lib.rs \
+  || ! rg -q 'workflow.approve' plugins/workflow-plugin/src/lib.rs; then
   echo "Composable workflow lifecycle violation: exact child calls or canonical terminal output were removed." >&2
   violations=1
 fi
+
+if [[ ! -f examples/workflows/packages/command/package.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/validation.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/prompt-verification.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/review.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/remediation.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/repository-recovery.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/planning.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/checkpoint.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/synchronization.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/sync-recovery.workflow-package.yaml ]] \
+  || [[ ! -f examples/workflows/packages/delivery.workflow-package.yaml ]] \
+  || ! rg -q 'external_dependencies: \[completion, planning, remediation, review\]' examples/workflows/packages/delivery.workflow-package.yaml \
+  || ! rg -q 'bcode\.shell/exec@1' examples/workflows/packages/command/run-and-assert.workflow.yaml \
+  || ! rg -q 'external_dependencies: \[recover, synchronize\]' examples/workflows/packages/sync-recovery.workflow-package.yaml \
+  || ! rg -q 'manifest: synchronization\.workflow-package\.yaml' examples/workflows/packages/sync-recovery.workflow-package.yaml \
+  || ! rg -q 'manifest: repository-recovery\.workflow-package\.yaml' examples/workflows/packages/sync-recovery.workflow-package.yaml \
+  || ! rg -q 'GIT_TERMINAL_PROMPT' examples/workflows/packages/synchronization/synchronize.workflow.yaml \
+  || ! rg -q 'example-pathspec-replaced-by-typed-input' examples/workflows/packages/checkpoint/checkpoint.workflow.yaml \
+  || ! rg -q 'bcode\.completion\.request/v1' examples/workflows/packages/planning/evaluate-completion.workflow.yaml \
+  || ! rg -q 'resolve-conflicts' examples/workflows/packages/repository-recovery/resolve.workflow.yaml \
+  || ! rg -q 'max_iterations: 3' examples/workflows/packages/remediation/bounded-remediation.workflow.yaml \
+  || ! rg -q 'failure_policy: wait_all' examples/workflows/packages/review/review.workflow.yaml \
+  || ! rg -q 'bcode\.prompt-verification\.prompt-result/v1' examples/workflows/packages/prompt-verification/prompt-and-verify.workflow.yaml \
+  || ! rg -q '^    run:$' examples/workflows/packages/prompt-verification/prompt-and-verify.workflow.yaml \
+  || ! rg -q 'bcode\.shell\.exec/v1' examples/workflows/README.md \
+  || ! rg -q 'bcode\.shell\.exec-result/v1' examples/workflows/README.md \
+  || ! rg -q 'manifest: command/package\.workflow-package\.yaml' examples/workflows/packages/validation.workflow-package.yaml \
+  || ! rg -q 'external_dependencies: \[command\]' examples/workflows/packages/validation.workflow-package.yaml; then
+  echo "Composable workflow source-package violation: product-facing typed command/validation packages drifted." >&2
+  violations=1
+fi
+
+if rg -n 'local-composable-workflows-progress\.md' fixtures/workflow-components/checkpoint.workflow.yaml \
+  >/tmp/bcode-checkpoint-hardcoded-exclusion.txt 2>/dev/null; then
+  echo "Composable workflow checkpoint violation: generic checkpoint fixture hardcodes a progress-document path." >&2
+  cat /tmp/bcode-checkpoint-hardcoded-exclusion.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-checkpoint-hardcoded-exclusion.txt
 
 if [[ ! -f fixtures/workflow-components/package.workflow-package.yaml ]] \
   || ! rg -q 'run-command-and-assert' fixtures/workflow-components/package.workflow-package.yaml \
@@ -207,8 +267,8 @@ if rg -ni '(^|[^a-z])git([[:space:]]|[-_./])' fixtures/workflow-components/non-g
 fi
 rm -f /tmp/bcode-non-git-workflow-leaks.txt
 
-if rg -n 'force-with-lease|force[[:space:]]+push|push[[:space:]]+--force' \
-  fixtures/workflow-components --glob '*.yaml' --glob '*.md' \
+if rg -n 'force-with-lease|force[[:space:]]+push|push[[:space:]]+--force|--force' \
+  fixtures/workflow-components examples/workflows --glob '*.yaml' --glob '*.json' \
   >/tmp/bcode-flagship-force-push.txt 2>/dev/null; then
   echo "Composable workflow flagship violation: source package contains force-push behavior." >&2
   cat /tmp/bcode-flagship-force-push.txt >&2

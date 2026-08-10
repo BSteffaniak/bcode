@@ -1,0 +1,31 @@
+workflow_source_version: 3
+workflow_id: examples/synchronization/synchronize
+title: Normal non-force synchronization
+description: Executes caller-supplied remote and ref policy as a typed argv plan and requires a deterministic postcondition command.
+run_limits:
+  maximum_duration_ms: 900000
+  node_execution_cap: 1
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: synchronize
+    uses: bcode.shell/exec@1
+    with:
+      version: 2
+      cwd: .
+      commands:
+        - argv: [git, pull, --rebase, --autostash, example-remote, example-ref]
+          timeout_ms: 300000
+          accepted_exit_codes: [0]
+          continue_on_unaccepted_exit: false
+        - argv: [git, push, example-remote, example-ref]
+          timeout_ms: 300000
+          accepted_exit_codes: [0]
+          continue_on_unaccepted_exit: false
+        - argv: [git, rev-list, --left-right, --count, HEAD...example-remote/example-ref]
+          timeout_ms: 60000
+          accepted_exit_codes: [0]
+          continue_on_unaccepted_exit: false
+      environment: {inherit: true, set: {GIT_TERMINAL_PROMPT: '0'}}
+      output: {preview_bytes: 16384, artifact_spill: true}

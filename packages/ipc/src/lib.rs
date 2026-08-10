@@ -484,6 +484,10 @@ pub enum Request {
     },
     /// Return the portable runtime-workflow authoring catalog.
     WorkflowAuthoringCatalog,
+    /// Read one bounded derived package publication receipt without mutation.
+    GetWorkflowPackagePublication {
+        package_id: String,
+    },
     /// Atomically apply one previously validated package plan as canonical package drafts.
     ApplyWorkflowPackage(ApplyWorkflowPackageRequest),
     /// Atomically publish every exact package draft generation.
@@ -2153,6 +2157,9 @@ pub struct StartAuthoredWorkflowRequest {
     pub parent_session_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration: Option<serde_json::Value>,
+    /// Optional invocation-specific typed run input validated against the published interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2168,6 +2175,8 @@ pub struct StartWorkflowPackageExportRequest {
     pub parent_session_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
 }
 
 /// Successful package-export run start with exact publication provenance.
@@ -2599,6 +2608,9 @@ pub enum ResponsePayload {
     },
     WorkflowAuthoringCatalog {
         catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    },
+    WorkflowPackagePublication {
+        receipt: Option<bcode_workflow::WorkflowPackagePublicationReceipt>,
     },
     WorkflowPackageApplied {
         result: Box<bcode_workflow::WorkflowPackageMutationResult>,
@@ -4062,6 +4074,7 @@ mod tests {
                 workspace_snapshot: Some("snapshot".to_string()),
                 parent_session_generation: None,
                 configuration: Some(serde_json::json!({})),
+                input: Some(serde_json::json!({"subject": "typed"})),
             }),
             Request::ListAuthoredWorkflows {
                 cursor: None,
@@ -4523,6 +4536,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn workflow_package_computation_contract_round_trips() {
         let manifest = bcode_workflow::WorkflowPackageManifest {
             version: bcode_workflow::WORKFLOW_PACKAGE_MANIFEST_VERSION,
@@ -4626,6 +4640,48 @@ mod tests {
         assert_eq!(
             decode_request(&encoded).expect("decode package publish"),
             publish
+        );
+        let publication = Request::GetWorkflowPackagePublication {
+            package_id: "example/package".to_string(),
+        };
+        let encoded = encode_request(&publication).expect("encode package publication read");
+        assert_eq!(
+            decode_request(&encoded).expect("decode package publication read"),
+            publication
+        );
+        let receipt = bcode_workflow::WorkflowPackagePublicationReceipt {
+            version: bcode_workflow::WORKFLOW_PACKAGE_PUBLICATION_RECEIPT_VERSION,
+            package_id: "example/package".to_string(),
+            package_lock_digest_sha256: "a".repeat(64),
+            published_at_ms: 11,
+            exports: Vec::new(),
+        };
+        let response = Response::Ok(ResponsePayload::WorkflowPackagePublication {
+            receipt: Some(receipt),
+        });
+        let encoded = encode_response(&response).expect("encode package publication response");
+        assert_eq!(
+            decode_response(&encoded).expect("decode package publication response"),
+            response
+        );
+
+        let start = Request::StartWorkflowPackageExport(StartWorkflowPackageExportRequest {
+            package_export: bcode_workflow::WorkflowPackageExportIdentity {
+                package_id: "example/package".to_string(),
+                export: "main".to_string(),
+                package_lock_digest_sha256: Some("a".repeat(64)),
+            },
+            run_id: Some("package-run".to_string()),
+            parent_session_id: SessionId::new(),
+            workspace_snapshot: Some("workspace".to_string()),
+            parent_session_generation: Some(1),
+            configuration: Some(serde_json::json!({"mode": "safe"})),
+            input: Some(serde_json::json!({"subject": "change"})),
+        });
+        let encoded = encode_request(&start).expect("encode package export start");
+        assert_eq!(
+            decode_request(&encoded).expect("decode package export start"),
+            start
         );
     }
 

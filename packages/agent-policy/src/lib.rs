@@ -792,6 +792,7 @@ mod tests {
             },
             aliases: vec!["command".to_string()],
             requires_permission: true,
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         }
     }
@@ -1152,6 +1153,7 @@ mod tests {
             },
             aliases: vec!["write".to_string()],
             requires_permission: true,
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1186,6 +1188,7 @@ mod tests {
                     .to_string(),
             ],
             requires_permission: tool_name != "filesystem.read",
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         }
     }
@@ -1342,6 +1345,7 @@ mod tests {
             },
             aliases: vec!["command".to_string()],
             requires_permission: true,
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1370,6 +1374,7 @@ mod tests {
             },
             aliases: vec!["web".to_string()],
             requires_permission: false,
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1402,6 +1407,7 @@ mod tests {
             },
             aliases: vec!["write".to_string()],
             requires_permission: true,
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1431,6 +1437,7 @@ mod tests {
             },
             aliases: vec!["edit".to_string()],
             requires_permission: true,
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1460,6 +1467,7 @@ mod tests {
             },
             aliases: vec!["write".to_string()],
             requires_permission: true,
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         };
 
@@ -1482,6 +1490,7 @@ mod tests {
             operation: ToolPolicyOperation::Mutating,
             aliases: vec!["custom-category".to_string()],
             requires_permission: true,
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         };
 

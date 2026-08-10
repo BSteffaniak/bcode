@@ -1,0 +1,24 @@
+workflow_source_version: 3
+workflow_id: examples/command/run-and-assert
+title: Run typed command plan and assert
+description: Executes a caller-supplied argv command plan and returns the shell owner's typed result.
+run_limits:
+  maximum_duration_ms: 600000
+  node_execution_cap: 1
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: execute
+    name: Execute typed command plan
+    uses: bcode.shell/exec@1
+    with:
+      version: 2
+      cwd: .
+      commands:
+        - argv: [printf, source default is replaced by typed run input]
+          timeout_ms: 60000
+          accepted_exit_codes: [0]
+          continue_on_unaccepted_exit: false
+      environment: {inherit: true, set: {}}
+      output: {preview_bytes: 8192, artifact_spill: true}

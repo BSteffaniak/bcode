@@ -1,0 +1,7 @@
+version: 3
+package_id: bcode/examples-prompt-verification
+exports:
+  prompt-and-verify: prompt-and-verify
+members:
+  - member_id: prompt-and-verify
+    source_name: prompt-verification/prompt-and-verify.workflow.yaml

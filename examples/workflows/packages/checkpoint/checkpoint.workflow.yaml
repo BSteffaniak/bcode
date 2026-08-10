@@ -1,0 +1,31 @@
+workflow_source_version: 3
+workflow_id: examples/checkpoint/checkpoint
+title: Create a configured repository checkpoint
+description: Creates a normal commit using caller-supplied message and exclusion pathspecs encoded as a typed argv plan.
+run_limits:
+  maximum_duration_ms: 600000
+  node_execution_cap: 1
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: checkpoint
+    uses: bcode.shell/exec@1
+    with:
+      version: 2
+      cwd: .
+      commands:
+        - argv: [git, diff, --check]
+          timeout_ms: 60000
+          accepted_exit_codes: [0]
+          continue_on_unaccepted_exit: false
+        - argv: [git, add, --all, --, example-pathspec-replaced-by-typed-input]
+          timeout_ms: 60000
+          accepted_exit_codes: [0]
+          continue_on_unaccepted_exit: false
+        - argv: [git, commit, -m, example-message-replaced-by-typed-input]
+          timeout_ms: 240000
+          accepted_exit_codes: [0]
+          continue_on_unaccepted_exit: false
+      environment: {inherit: true, set: {}}
+      output: {preview_bytes: 16384, artifact_spill: true}

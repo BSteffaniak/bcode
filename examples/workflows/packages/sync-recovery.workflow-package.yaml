@@ -1,0 +1,17 @@
+version: 3
+package_id: bcode/examples-sync-recovery
+exports:
+  synchronize-with-recovery: synchronize-with-recovery
+imports:
+  - import_id: synchronize
+    package_id: bcode/examples-synchronization
+    export: synchronize
+    manifest: synchronization.workflow-package.yaml
+  - import_id: recover
+    package_id: bcode/examples-repository-recovery
+    export: resolve
+    manifest: repository-recovery.workflow-package.yaml
+members:
+  - member_id: synchronize-with-recovery
+    source_name: sync-recovery/synchronize-with-recovery.workflow.yaml
+    external_dependencies: [recover, synchronize]

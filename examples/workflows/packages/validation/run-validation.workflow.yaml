@@ -1,0 +1,13 @@
+workflow_source_version: 3
+workflow_id: examples/validation/run-validation
+title: Run source-defined validation plan
+description: Delegates an exact typed argv plan to the narrower command package.
+run_limits:
+  maximum_duration_ms: 1800000
+  node_execution_cap: 2
+  concurrency_cap: 1
+  cycle_cap: 1
+  retry_cap: 1
+steps:
+  - id: commands
+    package_call: {external: command}

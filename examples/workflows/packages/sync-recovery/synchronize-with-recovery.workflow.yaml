@@ -1,0 +1,27 @@
+workflow_source_version: 3
+workflow_id: examples/sync-recovery/synchronize-with-recovery
+title: Bounded synchronization recovery
+description: Runs one normal synchronization attempt and conditionally invokes exact imported recovery from canonical typed facts.
+run_limits:
+  maximum_duration_ms: 2400000
+  node_execution_cap: 8
+  concurrency_cap: 1
+  cycle_cap: 2
+  retry_cap: 1
+steps:
+  - id: synchronize
+    package_call: {external: synchronize}
+  - id: recover
+    needs: [synchronize]
+    package_call: {external: recover}
+    input_from: {step: synchronize}
+    when:
+      source:
+        step: synchronize
+      predicate:
+        operation: selected_equals
+        version: 3
+        selector:
+          version: 1
+          segments: [{kind: field, name: passed}]
+        value: false

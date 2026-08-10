@@ -22,6 +22,7 @@ fn request(source: &str) -> EvaluateToolCallRequest {
         },
         aliases: Vec::new(),
         requires_permission: true,
+        policy_profile: None,
         cwd: Some("/tmp/project".to_owned()),
     }
 }

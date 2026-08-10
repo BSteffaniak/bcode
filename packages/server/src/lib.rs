@@ -37,9 +37,11 @@ pub mod session_search;
 
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
-    AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
-    OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, PolicyStatusResponse,
-    ToolPolicyAuthorizationMetadata, tool_policy_authorization_metadata,
+    AgentInfo, AgentList, AgentPolicyProfileIdentity, EvaluateToolCallRequest,
+    EvaluateToolCallResponse, OP_AGENT_CONTEXT, OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS,
+    OP_POLICY_STATUS, OP_RESOLVE_POLICY_PROFILE_IDENTITY, PolicyStatusResponse,
+    ResolveAgentPolicyProfileIdentityRequest, ToolPolicyAuthorizationMetadata,
+    tool_policy_authorization_metadata,
 };
 use bcode_agent_runtime::{
     AgentRuntime, ArtifactCommitGuard, CancellationToken, InvocationArtifactSink,
@@ -94,8 +96,8 @@ use bcode_session_models::{
 use bcode_settings::SettingsStore;
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
-    evaluate_skill_tool_call, format_skill_catalog_for_prompt, resolve_skill_permission_policy,
-    skill_source_roots_from_config,
+    anchor_skill_source_roots, evaluate_skill_tool_call, format_skill_catalog_for_prompt,
+    resolve_skill_permission_policy, skill_source_roots_from_config,
 };
 use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillDiagnosticSeverity, SkillId, SkillList,
@@ -3388,7 +3390,13 @@ async fn run_with_static_bundled_inner(
         "model selection resolved"
     );
     let configured_agent_ids: Vec<String> = config.agent.keys().cloned().collect();
-    let skills = build_skill_registry(&config, &plugins);
+    let skills = build_skill_registry(
+        &config,
+        &plugins,
+        &std::env::current_dir()
+            .and_then(fs::canonicalize)
+            .unwrap_or_else(|_| PathBuf::from(".")),
+    );
     let invariant_selector_model = resolve_invariant_selector_model(&config, &resolved_model);
     let selected_provider_context = bcode_provider_auth::resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
@@ -3963,6 +3971,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowPresets { .. } => "list_workflow_presets",
         Request::GetWorkflowPreset { .. } => "get_workflow_preset",
         Request::WorkflowAuthoringCatalog => "workflow_authoring_catalog",
+        Request::GetWorkflowPackagePublication { .. } => "get_workflow_package_publication",
         Request::ApplyWorkflowPackage(_) => "apply_workflow_package",
         Request::PublishWorkflowPackage(_) => "publish_workflow_package",
         Request::ValidateWorkflowPackage(_) => "validate_workflow_package",
@@ -4799,6 +4808,19 @@ async fn handle_request_inner(
         }
         Request::WorkflowAuthoringCatalog => {
             handle_workflow_authoring_catalog(request_id, state, writer).await
+        }
+        Request::GetWorkflowPackagePublication { package_id } => {
+            let receipt = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .workflow_package_publication(&package_id, None)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPackagePublication { receipt }),
+            )
+            .await
         }
         Request::ApplyWorkflowPackage(request) => {
             let result = state
@@ -13946,6 +13968,7 @@ async fn publish_and_start_workflow(
                     workspace_snapshot,
                     parent_session_generation: None,
                     configuration,
+                    input: None,
                 },
                 false,
             )
@@ -14811,13 +14834,17 @@ fn resolve_authored_workflow_run(
     Ok((workflow_id, revision_number, revision, preset))
 }
 
-async fn handle_start_workflow_package_export(
-    request_id: u64,
+/// Resolve and start one exact published package export without renderer coupling.
+///
+/// # Errors
+///
+/// Returns an error for malformed selection, missing or drifted publication facts, an unpublished
+/// export, or authored-workflow admission failure.
+async fn start_workflow_package_export(
     client_id: ClientId,
     state: &Arc<ServerState>,
-    writer: &SharedWriter,
     request: bcode_ipc::StartWorkflowPackageExportRequest,
-) -> Result<(), ServerError> {
+) -> Result<bcode_ipc::WorkflowPackageExportRunStartResponse, ServerError> {
     request.package_export.validate()?;
     let receipt = state
         .workflow_store
@@ -14862,20 +14889,32 @@ async fn handle_start_workflow_package_export(
             workspace_snapshot: request.workspace_snapshot,
             parent_session_generation: request.parent_session_generation,
             configuration: request.configuration,
+            input: request.input,
         },
         true,
     )
     .await?;
+    Ok(bcode_ipc::WorkflowPackageExportRunStartResponse {
+        package_export: request.package_export,
+        package_lock_digest_sha256: receipt.package_lock_digest_sha256,
+        exported,
+        started,
+    })
+}
+
+async fn handle_start_workflow_package_export(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::StartWorkflowPackageExportRequest,
+) -> Result<(), ServerError> {
+    let started = start_workflow_package_export(client_id, state, request).await?;
     send_response(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowPackageExportRunStarted(Box::new(
-            bcode_ipc::WorkflowPackageExportRunStartResponse {
-                package_export: request.package_export,
-                package_lock_digest_sha256: receipt.package_lock_digest_sha256,
-                exported,
-                started,
-            },
+            started,
         ))),
     )
     .await
@@ -14967,6 +15006,17 @@ async fn start_authored_workflow(
         preset.as_ref().map(|preset| preset.generation),
         configuration.clone(),
     );
+    let run_input = request
+        .input
+        .unwrap_or_else(|| compiled.input_defaults.clone());
+    jsonschema::validator_for(&compiled.definition.input.schema)
+        .map_err(|error| ServerError::WorkflowDefinitionUnsupported(error.to_string()))?
+        .validate(&run_input)
+        .map_err(|error| {
+            ServerError::WorkflowDefinitionUnsupported(format!(
+                "workflow run input does not match published interface: {error}"
+            ))
+        })?;
     let started = start_workflow_run(
         state,
         bcode_ipc::WorkflowRunStartRequest {
@@ -14983,7 +15033,7 @@ async fn start_authored_workflow(
                 display_label: Some(revision.document.metadata.title.clone()),
                 single_active: false,
             }),
-            input: Some(compiled.input_defaults.clone()),
+            input: Some(run_input),
             limits: bcode_workflow_store::WorkflowRunLimits {
                 deadline_at_ms,
                 node_execution_cap: limits.node_execution_cap,
@@ -16102,6 +16152,30 @@ async fn start_workflow_run(
     } else {
         request.workspace_snapshot
     };
+    let authorization_profile = state
+        .plugins
+        .invoke_service_by_interface_json::<_, AgentPolicyProfileIdentity>(
+            AGENT_PROFILE_INTERFACE_ID,
+            OP_RESOLVE_POLICY_PROFILE_IDENTITY,
+            &ResolveAgentPolicyProfileIdentityRequest {
+                profile_id: session_agent_selection(state, parent_session.id).await,
+            },
+        )
+        .await
+        .map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow authorization profile resolution failed closed: {error}"
+            ))
+        })?;
+    let authorization_profile = bcode_workflow::WorkflowAuthorizationProfileIdentity {
+        version: authorization_profile.version,
+        provider_id: authorization_profile.provider_id,
+        profile_id: authorization_profile.profile_id,
+        policy_digest_sha256: authorization_profile.policy_digest_sha256,
+    };
+    authorization_profile
+        .validate()
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     let new_run = bcode_workflow_store::NewWorkflowRun {
         run_id: run_id.clone(),
         definition_id: request.definition_id.clone(),
@@ -16113,6 +16187,7 @@ async fn start_workflow_run(
         authored_provenance,
         input: request.input,
         created_at_ms,
+        authorization_profile,
         authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
         limits: request.limits,
     };
@@ -16357,6 +16432,7 @@ async fn workflow_run_inspection(
         child_run_links,
         descendant_runs,
         repeat_outcomes,
+        execution_session_links,
     ) = {
         let store = state
             .workflow_store
@@ -16399,6 +16475,7 @@ async fn workflow_run_inspection(
             }
             repeat_outcomes.extend(store.repeat_outcomes(&descendant.run.run_id, remaining)?);
         }
+        let execution_session_links = store.execution_session_links_for_run(run_id, limit)?;
         (
             run,
             definition,
@@ -16415,21 +16492,34 @@ async fn workflow_run_inspection(
             store.child_run_links(run_id, limit)?,
             descendant_runs,
             repeat_outcomes,
+            execution_session_links,
         )
     };
-    let child_sessions = state
-        .sessions
-        .all_session_summaries()
-        .await
-        .into_iter()
-        .filter(|session| {
-            session
-                .execution
-                .as_ref()
-                .is_some_and(|execution| execution.provenance.run_id == run_id)
-        })
-        .take(limit)
-        .collect();
+    let mut child_sessions = Vec::with_capacity(execution_session_links.len());
+    for link in execution_session_links {
+        if child_sessions.len() >= limit {
+            break;
+        }
+        let session_id = link.session_id.parse().map_err(|_| {
+            WorkflowStoreError::InvalidData(
+                "workflow execution-session link has invalid session identity".to_string(),
+            )
+        })?;
+        let summary = state.sessions.session_summary(session_id).await?;
+        if summary.execution.as_ref().is_none_or(|execution| {
+            execution.provenance.run_id != run_id
+                || execution.provenance.node_id != link.node_id
+                || execution.provenance.activation_id.as_deref()
+                    != Some(link.activation_id.as_str())
+                || execution.provenance.attempt != link.attempt
+        }) {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow execution-session link conflicts with session provenance".to_string(),
+            )
+            .into());
+        }
+        child_sessions.push(summary);
+    }
     Ok(bcode_ipc::WorkflowRunInspection {
         run,
         definition,
@@ -24362,6 +24452,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             self.agent_id,
             &request.call,
             &policy_metadata,
+            None,
         )
         .await;
         append_trace_event(
@@ -26607,6 +26698,7 @@ async fn evaluate_agent_tool_policy_with_metadata(
     agent_id: &str,
     call: &bcode_model::ToolCall,
     metadata: &ToolPolicyAuthorizationMetadata,
+    policy_profile: Option<AgentPolicyProfileIdentity>,
 ) -> EvaluateToolCallResponse {
     let cwd = state
         .sessions
@@ -26625,6 +26717,7 @@ async fn evaluate_agent_tool_policy_with_metadata(
         operation: metadata.operation.clone(),
         aliases,
         requires_permission: metadata.requires_permission,
+        policy_profile,
         cwd,
     };
     state
@@ -28633,6 +28726,7 @@ fn workflow_policy_metadata(
 async fn evaluate_workflow_plugin_block_policy(
     state: &ServerState,
     session_id: SessionId,
+    run_id: &str,
     block: &bcode_workflow::WorkflowBlockDefinition,
     preparation: &bcode_workflow::WorkflowBlockPreparationResponse,
 ) -> Result<EvaluateToolCallResponse, WorkflowStoreError> {
@@ -28647,10 +28741,26 @@ async fn evaluate_workflow_plugin_block_policy(
         arguments: serde_json::Value::Null,
     };
     let agent_id = session_agent_selection(state, session_id).await;
-    Ok(
-        evaluate_agent_tool_policy_with_metadata(state, session_id, &agent_id, &call, &metadata)
-            .await,
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(run_id)?
+        .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".to_string()))?;
+    Ok(evaluate_agent_tool_policy_with_metadata(
+        state,
+        session_id,
+        &agent_id,
+        &call,
+        &metadata,
+        Some(AgentPolicyProfileIdentity {
+            version: run.authorization_profile.version,
+            provider_id: run.authorization_profile.provider_id,
+            profile_id: run.authorization_profile.profile_id,
+            policy_digest_sha256: run.authorization_profile.policy_digest_sha256,
+        }),
     )
+    .await)
 }
 
 fn workflow_policy_decision(
@@ -28992,6 +29102,7 @@ impl WorkflowActivationOwner<'_> {
             let decision = evaluate_workflow_plugin_block_policy(
                 self.state,
                 parent_session_id,
+                &activation.run_id,
                 &block,
                 preparation,
             )
@@ -29317,6 +29428,7 @@ async fn dispatch_workflow_child(
             authored_provenance,
             input: request.activation.input.clone(),
             created_at_ms: now,
+            authorization_profile: parent.authorization_profile,
             authorization_ceiling: parent.authorization_ceiling,
             limits: child_limits,
         },
@@ -32176,11 +32288,13 @@ const fn response_payload_kind(response: &Response) -> &'static str {
 fn build_skill_registry(
     config: &bcode_config::BcodeConfig,
     _plugins: &bcode_plugin::PluginRuntimeHost,
+    canonical_workspace: &Path,
 ) -> Option<SkillRegistry> {
     if !config.skills.enabled {
         return None;
     }
-    let roots = skill_source_roots_from_config(config);
+    let roots =
+        anchor_skill_source_roots(&skill_source_roots_from_config(config), canonical_workspace);
     let options = SkillRegistryOptions {
         max_skill_file_bytes: config.skills.max_skill_file_bytes.get(),
         max_context_bytes: config
@@ -33657,6 +33771,162 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn published_package_export_starts_through_public_application_contract() {
+        let thread = std::thread::Builder::new()
+            .name("package-export-lifecycle".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(published_package_export_lifecycle());
+            })
+            .expect("test thread");
+        thread.join().expect("package export lifecycle");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn published_package_export_lifecycle() {
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(Some("package parent".to_string()), std::env::temp_dir())
+            .await
+            .expect("parent session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let document = test_workflow_authoring_document();
+        let now = current_time_ms();
+        let workflow = bcode_workflow_store::AuthoredWorkflow {
+            workflow_id: document.workflow_id.clone(),
+            title: document.metadata.title.clone(),
+            description: document.metadata.description.clone(),
+            archived: false,
+            active_revision: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let mut draft = bcode_workflow_store::WorkflowDraft {
+            workflow_id: document.workflow_id.clone(),
+            draft_id: "package".to_string(),
+            base_revision: None,
+            generation: 1,
+            checksum_sha256: document.source_digest_sha256().expect("document digest"),
+            document: document.clone(),
+            producer: document.producer.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        draft.draft_id = "package".to_string();
+        let definition_identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            draft.document.workflow_id.clone(),
+            &draft.document.definition,
+        )
+        .expect("definition identity");
+        store.create_authored_workflow(&workflow).expect("workflow");
+        store.create_workflow_draft(&draft).expect("draft");
+        let member = bcode_workflow::WorkflowPackageLockedMember {
+            member_id: "main".to_string(),
+            source_digest_sha256: draft
+                .document
+                .source_digest_sha256()
+                .expect("source digest"),
+            executable_digest_sha256: draft
+                .document
+                .executable_source_digest_sha256()
+                .expect("executable digest"),
+            definition_identity: definition_identity.clone(),
+            published_revision: None,
+            dependency_closure: Vec::new(),
+        };
+        let lock = bcode_workflow::WorkflowPackageLock {
+            version: bcode_workflow::WORKFLOW_PACKAGE_LOCK_VERSION,
+            package_id: "example/package".to_string(),
+            package_source_digest_sha256: "a".repeat(64),
+            imports: Vec::new(),
+            exports: vec![bcode_workflow::WorkflowPackageLockedExport {
+                export: "main".to_string(),
+                member_id: member.member_id.clone(),
+                definition_identity: member.definition_identity.clone(),
+                published_revision: None,
+            }],
+            members: vec![member],
+        };
+        let published = store
+            .publish_workflow_package(
+                &bcode_workflow::WorkflowPackagePublishRequest {
+                    version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+                    package_id: lock.package_id.clone(),
+                    expected_lock: lock,
+                    expected_generations: vec![bcode_workflow::WorkflowPackageExpectedGeneration {
+                        member_id: "main".to_string(),
+                        expected_generation: 1,
+                    }],
+                },
+                10,
+            )
+            .expect("publish package");
+        let published_lock = published.lock.expect("published lock");
+        let lock_digest = published_lock.digest_sha256().expect("lock digest");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let receipt = client
+            .workflow_package_publication("example/package".to_string())
+            .await
+            .expect("publication read")
+            .expect("publication receipt");
+        assert_eq!(receipt.package_lock_digest_sha256, lock_digest);
+        let started = client
+            .start_workflow_package_export(bcode_ipc::StartWorkflowPackageExportRequest {
+                package_export: bcode_workflow::WorkflowPackageExportIdentity {
+                    package_id: "example/package".to_string(),
+                    export: "main".to_string(),
+                    package_lock_digest_sha256: Some(lock_digest.clone()),
+                },
+                run_id: Some("package-export-run".to_string()),
+                parent_session_id: parent.id,
+                workspace_snapshot: None,
+                parent_session_generation: None,
+                configuration: None,
+                input: Some(serde_json::json!({})),
+            })
+            .await
+            .expect("start package export");
+        assert_eq!(started.package_lock_digest_sha256, lock_digest);
+        assert_eq!(started.package_export.export, "main");
+        assert_eq!(started.started.started.run.run_id, "package-export-run");
+        assert!(started.exported.published_revision.is_some());
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run_summary("package-export-run")
+                .expect("run summary")
+                .is_some()
+        );
+        server.abort();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn typed_client_completes_authored_workflow_lifecycle_over_ipc() {
@@ -34743,6 +35013,7 @@ mod tests {
                 workspace_snapshot: None,
                 parent_session_generation: None,
                 configuration: None,
+                input: None,
             },
             true,
         )
@@ -34781,6 +35052,7 @@ mod tests {
                 workspace_snapshot: None,
                 parent_session_generation: None,
                 configuration: None,
+                input: None,
             },
             true,
         )
@@ -34844,6 +35116,7 @@ mod tests {
                 workspace_snapshot: None,
                 parent_session_generation: None,
                 configuration: None,
+                input: None,
             },
             true,
         )
@@ -34863,6 +35136,7 @@ mod tests {
                 workspace_snapshot: None,
                 parent_session_generation: None,
                 configuration: None,
+                input: None,
             },
             true,
         )
@@ -34929,6 +35203,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn authored_run_revalidates_configuration_and_requirements_without_mutating_revision() {
         let sessions = SessionManager::default();
         let workflow_root = tempfile::tempdir().expect("workflow root");
@@ -35006,6 +35281,7 @@ mod tests {
             workspace_snapshot: None,
             parent_session_generation: None,
             configuration: Some(serde_json::json!({"mode": 7})),
+            input: None,
         };
         assert!(
             start_authored_workflow(ClientId::new(), &state, request, true)
@@ -35020,6 +35296,33 @@ mod tests {
             .expect("revision")
             .expect("revision");
         assert_eq!(before, after);
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .list_runs(10)
+                .expect("runs")
+                .is_empty()
+        );
+
+        let request = bcode_ipc::StartAuthoredWorkflowRequest {
+            selection: bcode_ipc::AuthoredWorkflowRunSelection::Revision {
+                workflow_id: workflow.workflow_id.clone(),
+                revision: 1,
+            },
+            run_id: Some("invalid-input".to_string()),
+            parent_session_id: SessionId::new(),
+            workspace_snapshot: None,
+            parent_session_generation: None,
+            configuration: None,
+            input: Some(serde_json::json!([])),
+        };
+        assert!(
+            start_authored_workflow(ClientId::new(), &state, request, true)
+                .await
+                .is_err()
+        );
         assert!(
             state
                 .workflow_store
@@ -50516,6 +50819,12 @@ library = "test"
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -50700,6 +51009,12 @@ library = "test"
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -50877,6 +51192,12 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Disabled,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -51034,6 +51355,12 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -51165,6 +51492,12 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -51327,6 +51660,12 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!({"condition_met": false})),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -51442,6 +51781,86 @@ library = "test"
     }
 
     #[test]
+    fn shell_owner_disablement_rejects_only_shell_dependent_workflows() {
+        let state = test_server_state(SessionManager::default());
+        let shell_block = bcode_workflow::WorkflowBlockDefinition {
+            plugin_id: "bcode.shell".to_string(),
+            block_id: "exec".to_string(),
+            block_version: 1,
+            operation: "exec".to_string(),
+            input: bcode_workflow::ValueSchema {
+                type_name: "shell.exec.input/v1".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            },
+            output: bcode_workflow::ValueSchema {
+                type_name: "shell.exec.output/v1".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            },
+            effect: bcode_workflow::WorkflowBlockEffect::ReadOnly,
+            resources: Vec::new(),
+            authorization: bcode_workflow::WorkflowBlockAuthorization {
+                capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                explicit_grant_required: false,
+            },
+            reconciliation: bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay,
+            timeout_ms: 1_000,
+            cancellation_supported: true,
+            automatic_retry: None,
+            preparation_required: true,
+        };
+        let shell_definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "shell-dependent".to_string(),
+            input: shell_block.input.clone(),
+            output: shell_block.output.clone(),
+            nodes: BTreeMap::from([(
+                "shell".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "shell".to_string(),
+                    name: "shell".to_string(),
+                    kind: bcode_workflow::NodeKind::PluginBlock,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                    input: shell_block.input.clone(),
+                    output: shell_block.output.clone(),
+                    resources: Vec::new(),
+                    configuration: serde_json::to_value(shell_block).expect("block"),
+                },
+            )]),
+            entries: vec!["shell".to_string()],
+            exits: vec!["shell".to_string()],
+            edges: Vec::new(),
+        };
+        assert!(validate_workflow_definition_for_production(&state, &shell_definition).is_err());
+        let generic_schema = bcode_workflow::ValueSchema {
+            type_name: "generic.input/v1".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        let generic = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "generic".to_string(),
+            input: generic_schema.clone(),
+            output: generic_schema.clone(),
+            nodes: BTreeMap::from([(
+                "input".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "input".to_string(),
+                    name: "input".to_string(),
+                    kind: bcode_workflow::NodeKind::Input,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                    input: generic_schema.clone(),
+                    output: generic_schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::json!({}),
+                },
+            )]),
+            entries: vec!["input".to_string()],
+            exits: vec!["input".to_string()],
+            edges: Vec::new(),
+        };
+        assert!(validate_workflow_definition_for_production(&state, &generic).is_ok());
+    }
+
+    #[test]
     fn workflow_prompt_catalog_omits_disabled_and_model_disabled_skills() {
         let root = tempfile::tempdir().expect("skills root");
         for (id, disable_model_invocation) in [
@@ -51473,9 +51892,13 @@ library = "test"
         )
         .expect("registry");
         let mut state = test_server_state(SessionManager::default());
+        state.system_prompt.sections.skill_catalog = false;
         state.skills = Some(registry);
         let catalog = workflow_skill_catalog_instruction(&state);
-        assert!(catalog.contains("enabled-skill"));
+        assert!(
+            catalog.contains("enabled-skill"),
+            "workflow prompt catalogs remain available when ordinary system-prompt presentation is disabled"
+        );
         assert!(!catalog.contains("model-disabled-skill"));
         assert!(!catalog.contains("config-disabled-skill"));
     }
@@ -51809,6 +52232,12 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -52026,6 +52455,12 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!({"condition_met": false})),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -52271,6 +52706,12 @@ library = "test"
                 authored_provenance: None,
                 input: Some(serde_json::json!({"value": true})),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::ReadOnly,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -52410,6 +52851,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -52571,6 +53018,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -53513,6 +53966,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::Value::Null),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -53618,6 +54077,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -53759,6 +54224,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -53946,6 +54417,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -54064,6 +54541,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -54162,6 +54645,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -54251,6 +54740,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(false)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -54413,6 +54908,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -54551,6 +55052,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -54647,6 +55154,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -54732,6 +55245,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
@@ -54829,6 +55348,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(false)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -55155,6 +55680,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -55178,6 +55709,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn workflow_runtime_work_registers_parent_and_node_relationships() {
         let sessions = SessionManager::default();
         let session = sessions
@@ -55214,6 +55746,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
@@ -55315,6 +55853,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })

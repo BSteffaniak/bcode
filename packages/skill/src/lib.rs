@@ -103,6 +103,24 @@ impl SkillSourceRoot {
     }
 }
 
+/// Resolve repository-relative skill roots against one canonical workflow workspace.
+#[must_use]
+pub fn anchor_skill_source_roots(
+    roots: &[SkillSourceRoot],
+    workspace: &Path,
+) -> Vec<SkillSourceRoot> {
+    roots
+        .iter()
+        .cloned()
+        .map(|mut root| {
+            if matches!(root.kind, SkillSourceKind::Repository) && root.path.is_relative() {
+                root.path = workspace.join(root.path);
+            }
+            root
+        })
+        .collect()
+}
+
 /// Build configured skill source roots from the Bcode configuration.
 #[must_use]
 pub fn skill_source_roots_from_config(config: &bcode_config::BcodeConfig) -> Vec<SkillSourceRoot> {
@@ -1377,6 +1395,23 @@ mod tests {
 
     fn is_ask(outcome: &SkillToolPolicyOutcome) -> bool {
         matches!(outcome, SkillToolPolicyOutcome::Ask { .. })
+    }
+
+    #[test]
+    fn repository_roots_anchor_to_canonical_workflow_workspace() {
+        let workspace = Path::new("/canonical/workspace");
+        let roots = vec![
+            SkillSourceRoot::new(".bcode/skills", SkillSourceKind::Repository, "repo", 10),
+            SkillSourceRoot::new(
+                "/configured/skills",
+                SkillSourceKind::Configured,
+                "configured",
+                20,
+            ),
+        ];
+        let anchored = anchor_skill_source_roots(&roots, workspace);
+        assert_eq!(anchored[0].path, workspace.join(".bcode/skills"));
+        assert_eq!(anchored[1].path, PathBuf::from("/configured/skills"));
     }
 
     #[test]

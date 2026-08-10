@@ -7,7 +7,7 @@ host-owned template or specialized workflow service.
 ## Configuration
 
 The source declares bounded configuration for the progress-document path, implementation prompt,
-validation-command inventory, checkpoint message, and optional model/provider selection. Defaults
+validation-command inventory, checkpoint message, checkpoint exclusion paths, and optional model/provider selection. Defaults
 are visible in `feature-delivery.workflow.yaml`. Dynamic values are not interpolated into shell
 source; the shipped commands use fixed source text and bounded environment values.
 
@@ -51,7 +51,7 @@ normal reads never migrate or rebuild history.
 
 ## Checkpoint and synchronization safety
 
-`checkpoint.workflow.yaml` excludes `local-composable-workflows-progress.md` from staging.
+`checkpoint.workflow.yaml` is a legacy test fixture for a concrete no-exclusion checkpoint. Product-facing checkpoint composition receives its complete argv inventory, including exclusion pathspecs, through typed input; the generic runtime does not select or interpret any progress-document path.
 `synchronization-and-push.workflow.yaml` uses normal `git pull --rebase --autostash` and `git push`;
 it contains no history-rewriting push mode. Command failures return through typed shell results and
 require a later bounded conflict/synchronization decision rather than unbounded retry.

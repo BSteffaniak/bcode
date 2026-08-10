@@ -1,0 +1,25 @@
+version: 3
+package_id: bcode/examples-delivery
+exports:
+  feature-delivery: feature-delivery
+imports:
+  - import_id: planning
+    package_id: bcode/examples-planning
+    export: plan-or-refocus
+    manifest: planning.workflow-package.yaml
+  - import_id: remediation
+    package_id: bcode/examples-remediation
+    export: bounded-remediation
+    manifest: remediation.workflow-package.yaml
+  - import_id: review
+    package_id: bcode/examples-review
+    export: review
+    manifest: review.workflow-package.yaml
+  - import_id: completion
+    package_id: bcode/examples-planning
+    export: evaluate-completion
+    manifest: planning.workflow-package.yaml
+members:
+  - member_id: feature-delivery
+    source_name: delivery/feature-delivery.workflow.yaml
+    external_dependencies: [completion, planning, remediation, review]

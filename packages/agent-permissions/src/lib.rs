@@ -158,6 +158,7 @@ pub fn runtime_permission_request_to_profile_request(
         operation: metadata.operation,
         aliases,
         requires_permission: metadata.requires_permission,
+        policy_profile: None,
         cwd: Some(cwd.to_string_lossy().into_owned()),
     })
 }

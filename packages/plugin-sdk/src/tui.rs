@@ -377,6 +377,24 @@ pub type PluginWorkflowAuthoringPublishFuture = Pin<
     >,
 >;
 
+/// Renderer-neutral request to start one exact published workflow-package export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkflowPackageExportStartRequest {
+    pub package_export: bcode_workflow::WorkflowPackageExportIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub parent_session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+}
+
 /// Async workflow-authoring start result.
 pub type PluginWorkflowAuthoringStartFuture = Pin<
     Box<
@@ -708,6 +726,18 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Start one exact immutable published package export through the portable application contract.
+    fn start_workflow_package_export(
+        &self,
+        _request: PluginWorkflowPackageExportStartRequest,
+    ) -> PluginWorkflowAuthoringStartFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow package export start is not available from this host".to_string(),
             ))
         })
     }
@@ -1801,5 +1831,31 @@ impl PluginTuiHost for TokioPluginTuiHost {
         self.text_input
             .as_ref()
             .is_some_and(|resolver| resolver.submits(stroke))
+    }
+}
+
+#[cfg(test)]
+mod workflow_package_tests {
+    use super::*;
+
+    #[test]
+    fn portable_package_export_start_round_trips() {
+        let request = PluginWorkflowPackageExportStartRequest {
+            package_export: bcode_workflow::WorkflowPackageExportIdentity {
+                package_id: "example/package".to_string(),
+                export: "main".to_string(),
+                package_lock_digest_sha256: Some("a".repeat(64)),
+            },
+            run_id: Some("run-1".to_string()),
+            parent_session_id: SessionId::new(),
+            workspace_snapshot: Some("workspace".to_string()),
+            parent_session_generation: Some(1),
+            configuration: Some(serde_json::json!({"mode": "safe"})),
+            input: Some(serde_json::json!({"subject": "change"})),
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode request");
+        let decoded: PluginWorkflowPackageExportStartRequest =
+            serde_json::from_slice(&encoded).expect("decode request");
+        assert_eq!(decoded, request);
     }
 }

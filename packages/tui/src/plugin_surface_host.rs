@@ -18,9 +18,9 @@ use bcode_plugin_sdk::tui::{
     PluginWorkflowGeneratedCandidate, PluginWorkflowGeneratedCandidateAcceptance,
     PluginWorkflowGeneratedCandidateAcceptanceFuture, PluginWorkflowInspection,
     PluginWorkflowInspectionFuture, PluginWorkflowLookup, PluginWorkflowLookupFuture,
-    PluginWorkflowStartFuture, PluginWorkflowStartRequest, PluginWorkflowStartResponse,
-    PluginWorkflowStatus, PluginWorkflowSummary, PluginWorkflowTemplateInstantiationFuture,
-    PluginWorkflowTemplateInstantiationRequest,
+    PluginWorkflowPackageExportStartRequest, PluginWorkflowStartFuture, PluginWorkflowStartRequest,
+    PluginWorkflowStartResponse, PluginWorkflowStatus, PluginWorkflowSummary,
+    PluginWorkflowTemplateInstantiationFuture, PluginWorkflowTemplateInstantiationRequest,
 };
 use bcode_session_models::SessionId;
 use bcode_session_view::SessionView;
@@ -83,6 +83,20 @@ fn workflow_start_request(
         },
         limits: bcode_workflow_store::WorkflowRunLimits::default(),
     })
+}
+
+fn workflow_package_export_start_request(
+    request: PluginWorkflowPackageExportStartRequest,
+) -> bcode_ipc::StartWorkflowPackageExportRequest {
+    bcode_ipc::StartWorkflowPackageExportRequest {
+        package_export: request.package_export,
+        run_id: request.run_id,
+        parent_session_id: request.parent_session_id,
+        workspace_snapshot: request.workspace_snapshot,
+        parent_session_generation: request.parent_session_generation,
+        configuration: request.configuration,
+        input: request.input,
+    }
 }
 
 impl PluginTuiHost for BcodePluginTuiHost {
@@ -491,11 +505,29 @@ impl PluginTuiHost for BcodePluginTuiHost {
                     workspace_snapshot,
                     parent_session_generation: None,
                     configuration,
+                    input: None,
                 })
                 .await
                 .map(|started| PluginWorkflowStartResponse {
                     run_id: started.started.run.run_id,
                     runtime_work_id: started.started.runtime_work_id.to_string(),
+                })
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn start_workflow_package_export(
+        &self,
+        request: PluginWorkflowPackageExportStartRequest,
+    ) -> PluginWorkflowAuthoringStartFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .start_workflow_package_export(workflow_package_export_start_request(request))
+                .await
+                .map(|started| PluginWorkflowStartResponse {
+                    run_id: started.started.started.run.run_id,
+                    runtime_work_id: started.started.started.runtime_work_id.to_string(),
                 })
                 .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
         })
@@ -875,6 +907,9 @@ async fn stream_plugin_session_view_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        PluginWorkflowPackageExportStartRequest, SessionId, workflow_package_export_start_request,
+    };
 
     #[test]
     fn bmux_invalidation_signal_coalesces_plugin_redraw_requests() {
@@ -895,6 +930,28 @@ mod tests {
     }
 
     #[test]
+    fn plugin_surface_host_adapts_portable_package_export_start() {
+        let parent_session_id = SessionId::new();
+        let request =
+            workflow_package_export_start_request(PluginWorkflowPackageExportStartRequest {
+                package_export: bcode_workflow::WorkflowPackageExportIdentity {
+                    package_id: "example/package".to_string(),
+                    export: "main".to_string(),
+                    package_lock_digest_sha256: Some("a".repeat(64)),
+                },
+                run_id: Some("run-1".to_string()),
+                parent_session_id,
+                workspace_snapshot: Some("workspace".to_string()),
+                parent_session_generation: Some(1),
+                configuration: None,
+                input: Some(serde_json::json!({"subject": "change"})),
+            });
+        assert_eq!(request.package_export.package_id, "example/package");
+        assert_eq!(request.parent_session_id, parent_session_id);
+        assert_eq!(request.input.expect("input")["subject"], "change");
+    }
+
+    #[test]
     fn plugin_surface_host_exposes_portable_workflow_authoring_services() {
         let source = include_str!("plugin_surface_host.rs");
         for service in [
@@ -909,6 +966,7 @@ mod tests {
             "preview_workflow_authoring",
             "publish_workflow_authoring_draft",
             "start_authored_workflow_revision",
+            "start_workflow_package_export",
         ] {
             assert!(
                 source.contains(service),

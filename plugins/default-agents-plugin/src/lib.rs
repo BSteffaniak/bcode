@@ -12,11 +12,14 @@ use bcode_agent_policy::{
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
     AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
-    OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, PolicyStatusResponse,
+    OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, OP_RESOLVE_POLICY_PROFILE_IDENTITY,
+    PolicyStatusResponse, ResolveAgentPolicyProfileIdentityRequest,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use toml::{Table, Value};
 
@@ -93,6 +96,7 @@ impl RustPlugin for DefaultAgentsPlugin {
             OP_AGENT_CONTEXT => agent_context(&context.request),
             OP_EVALUATE_TOOL_CALL => evaluate_tool(&context.request),
             OP_POLICY_STATUS => json_response(&policy_status()),
+            OP_RESOLVE_POLICY_PROFILE_IDENTITY => resolve_policy_profile_identity(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported agent profile operation",
@@ -222,24 +226,79 @@ fn apply_tool_selection_for_evaluation(
     }
 }
 
+fn evaluate_tool_request(
+    request: &EvaluateToolCallRequest,
+) -> Result<EvaluateToolCallResponse, String> {
+    let cwd =
+        request.cwd.as_deref().map(PathBuf::from).ok_or_else(|| {
+            "tool policy requires an explicit session working directory".to_string()
+        })?;
+    let (config, _) = load_config();
+    let mut agent = agent_config(&config, &request.agent_id);
+    let tools_config = load_tools_config();
+    apply_tool_selection_for_evaluation(&mut agent, &tools_config, &request.tool_name);
+    if let Some(pinned) = &request.policy_profile {
+        let current = policy_profile_identity(&request.agent_id)?;
+        if current != *pinned {
+            return Ok(EvaluateToolCallResponse {
+                decision: AgentDecision::Deny,
+                reason: Some(
+                    "the pinned workflow authorization profile is no longer available exactly"
+                        .to_string(),
+                ),
+                shell: None,
+            });
+        }
+    }
+    Ok(evaluate_profile_tool_call(&agent, request, &cwd))
+}
+
 fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {
     let request = match request.payload_json::<EvaluateToolCallRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    let Some(cwd) = request.cwd.as_deref().map(PathBuf::from) else {
-        return json_response(&EvaluateToolCallResponse {
+    match evaluate_tool_request(&request) {
+        Ok(evaluation) => json_response(&evaluation),
+        Err(error) => json_response(&EvaluateToolCallResponse {
             decision: AgentDecision::Ask,
-            reason: Some("tool policy requires an explicit session working directory".to_string()),
+            reason: Some(error),
             shell: None,
-        });
-    };
+        }),
+    }
+}
+
+fn policy_profile_identity(
+    profile_id: &str,
+) -> Result<bcode_agent_profile::AgentPolicyProfileIdentity, String> {
     let (config, _) = load_config();
-    let mut agent = agent_config(&config, &request.agent_id);
+    let mut profile = agent_config(&config, profile_id);
     let tools_config = load_tools_config();
-    apply_tool_selection_for_evaluation(&mut agent, &tools_config, &request.tool_name);
-    let evaluation = evaluate_profile_tool_call(&agent, &request, &cwd);
-    json_response(&evaluation)
+    apply_tool_selection(&mut profile, &tools_config, &[]);
+    let encoded = serde_json::to_vec(&profile).map_err(|error| error.to_string())?;
+    let digest = Sha256::digest(encoded);
+    let mut policy_digest_sha256 = String::with_capacity(64);
+    for byte in digest {
+        write!(policy_digest_sha256, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    bcode_agent_profile::agent_policy_profile_identity(
+        "bcode.default-agents",
+        profile_id,
+        policy_digest_sha256,
+    )
+}
+
+fn resolve_policy_profile_identity(request: &ServiceRequest) -> ServiceResponse {
+    let request: ResolveAgentPolicyProfileIdentityRequest = match request.payload_json() {
+        Ok(request) => request,
+        Err(error) => {
+            return ServiceResponse::error("invalid_request", error.to_string());
+        }
+    };
+    match policy_profile_identity(&request.profile_id) {
+        Ok(identity) => json_response(&identity),
+        Err(error) => ServiceResponse::error("encode_failed", error),
+    }
 }
 
 fn policy_status() -> PolicyStatusResponse {
@@ -417,6 +476,79 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn later_policy_changes_fail_closed_for_pinned_workflow_identity() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let config_path = root.join("bcode.toml");
+        let previous_config = std::env::var_os("BCODE_CONFIG");
+        unsafe { std::env::set_var("BCODE_CONFIG", &config_path) };
+        std::fs::write(
+            &config_path,
+            "[agent.build.permission]\ncommand = { \"*\" = \"allow\" }\n",
+        )
+        .expect("config");
+        let pinned = policy_profile_identity("build").expect("pinned identity");
+        std::fs::write(
+            &config_path,
+            "[agent.build.permission]\ncommand = { \"*\" = \"deny\" }\n",
+        )
+        .expect("changed config");
+        let evaluation = evaluate_tool_request(&EvaluateToolCallRequest {
+            session_id: SessionId::new(),
+            agent_id: "build".to_string(),
+            tool_name: "shell.run".to_string(),
+            operation: bcode_agent_profile::ToolPolicyOperation::Command {
+                command: Some("cargo check".to_string()),
+                analysis: None,
+                analysis_error: None,
+            },
+            aliases: vec!["command".to_string()],
+            requires_permission: true,
+            policy_profile: Some(pinned),
+            cwd: Some(root.to_string_lossy().into_owned()),
+        })
+        .expect("evaluation");
+        assert_eq!(evaluation.decision, AgentDecision::Deny);
+        assert!(evaluation.reason.expect("reason").contains("pinned"));
+        match previous_config {
+            Some(value) => unsafe { std::env::set_var("BCODE_CONFIG", value) },
+            None => unsafe { std::env::remove_var("BCODE_CONFIG") },
+        }
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn policy_profile_identity_is_exact_and_changes_with_policy() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let config_path = root.join("bcode.toml");
+        let previous_config = std::env::var_os("BCODE_CONFIG");
+        unsafe { std::env::set_var("BCODE_CONFIG", &config_path) };
+        std::fs::write(
+            &config_path,
+            "[agent.build.permission]\ncommand = { \"*\" = \"ask\" }\n",
+        )
+        .expect("config");
+        let first = policy_profile_identity("build").expect("first identity");
+        let repeated = policy_profile_identity("build").expect("repeat identity");
+        assert_eq!(first, repeated);
+        std::fs::write(
+            &config_path,
+            "[agent.build.permission]\ncommand = { \"*\" = \"deny\" }\n",
+        )
+        .expect("updated config");
+        let changed = policy_profile_identity("build").expect("changed identity");
+        assert_ne!(first.policy_digest_sha256, changed.policy_digest_sha256);
+        match previous_config {
+            Some(value) => unsafe { std::env::set_var("BCODE_CONFIG", value) },
+            None => unsafe { std::env::remove_var("BCODE_CONFIG") },
+        }
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn list_agents_contains_plan_and_build() {
         let agents = agent_list().agents;
 
@@ -452,6 +584,7 @@ mod tests {
             },
             aliases: vec!["command".to_string()],
             requires_permission: true,
+            policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
         };
 

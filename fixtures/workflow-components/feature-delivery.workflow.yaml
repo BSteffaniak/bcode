@@ -22,6 +22,10 @@ configuration_schema:
         maxItems: 32
         items: {type: string, minLength: 1, maxLength: 4096}
       checkpoint_message: {type: string, minLength: 1, maxLength: 512}
+      checkpoint_exclusions:
+        type: array
+        maxItems: 64
+        items: {type: string, minLength: 1, maxLength: 1024}
       provider: {type: [string, 'null'], maxLength: 256}
       model: {type: [string, 'null'], maxLength: 256}
 configuration_defaults:
@@ -29,6 +33,7 @@ configuration_defaults:
   implementation_prompt: Implement the next incomplete progress-document item without shortcuts.
   validation_commands: [cargo fmt, cargo check --workspace]
   checkpoint_message: Progress-driven feature checkpoint
+  checkpoint_exclusions: [local-composable-workflows-progress.md]
 run_limits:
   maximum_duration_ms: 14400000
   node_execution_cap: 80

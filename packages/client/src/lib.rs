@@ -2950,6 +2950,24 @@ impl BcodeClient {
         }
     }
 
+    /// Read one bounded derived package publication receipt without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the package identity is invalid.
+    pub async fn workflow_package_publication(
+        &self,
+        package_id: String,
+    ) -> Result<Option<bcode_workflow::WorkflowPackagePublicationReceipt>, ClientError> {
+        match self
+            .send_request(Request::GetWorkflowPackagePublication { package_id })
+            .await?
+        {
+            ResponsePayload::WorkflowPackagePublication { receipt } => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Atomically apply one validated package plan through the daemon-owned workflow store.
     ///
     /// # Errors
