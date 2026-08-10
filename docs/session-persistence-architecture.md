@@ -200,6 +200,11 @@ planning, historical classification, and conversion belong to the dedicated
 `bcode_session_migration` domain crate. Historical DTOs must not leak into session models, client
 protocols, or runtime APIs.
 
+Transitional exception: `bcode_session` still contains historical compatibility and migration
+implementation while extraction into `bcode_session_migration` is completed. This exception is
+limited to existing migration paths; new historical policy or legacy-format handling must not be
+added to `bcode_session` or `bcode_session_models`.
+
 The intended dependency graph is one-way:
 
 ```text

@@ -586,10 +586,12 @@ if rg -n '\*\.events|sessions/index/' docs/session-persistence-architecture.md >
 fi
 
 if ! rg -q '^## Current runtime and migration boundaries$' docs/session-persistence-architecture.md \
+  || ! rg -q '^\* \*\*Historical session behavior is migration-owned\.\*\*' INVARIANTS.md \
+  || ! rg -q '^Transitional exception: `bcode_session` still contains historical compatibility and migration$' docs/session-persistence-architecture.md \
   || ! rg -q '`bcode_session` must not depend on `bcode_session_migration`' docs/session-persistence-architecture.md \
   || ! rg -q 'advance the writer epoch as the final transactional mutation' docs/session-persistence-architecture.md \
   || ! rg -q 'one daemon instance per session' docs/session-persistence-architecture.md; then
-  echo "Session migration architecture documentation violation: current-only boundaries, dependency direction, epoch ordering, and ownership handoff must remain explicit." >&2
+  echo "Session migration architecture documentation violation: the migration-owned invariant, explicit transition exception, current-only boundaries, dependency direction, epoch ordering, and ownership handoff must remain explicit." >&2
   violations=1
 fi
 

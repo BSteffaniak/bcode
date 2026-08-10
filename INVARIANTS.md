@@ -44,6 +44,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Normal session reads are bounded and non-mutating.** Catalog, open, attach, history, renderer, and model-context paths must not migrate, repair, reindex, or full-replay session history.
 * **Damage is surfaced rather than concealed.** Missing, stale, corrupt, ambiguous, future, or inconsistent derived state produces a degraded or repair-required result unless trustworthy sidecars permit bounded incremental catch-up.
 * **Repair is explicit.** Full replay, reconstruction, reindexing, migration, and repair occur only through explicit maintenance operations with their required ownership and safety checks.
+* **Historical session behavior is migration-owned.** The session runtime and session models contain only current-format behavior. Historical classification, legacy payload handling, migration planning, and conversion belong to the session-migration domain. The session domain may expose narrowly scoped current-format migration-target capabilities without owning historical policy.
 * **Canonical history is never silently merged.** Duplicate or historical session roots must not be merged automatically.
 
 ## Runtime, tools, and permissions
