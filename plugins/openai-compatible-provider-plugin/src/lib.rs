@@ -1457,6 +1457,10 @@ impl OpenAiCompatibleDialect {
         matches!(self, Self::ChatGptCodex)
     }
 
+    const fn allows_missing_stream_content_type(self) -> bool {
+        matches!(self, Self::ChatGptCodex)
+    }
+
     const fn metadata_value(self) -> &'static str {
         match self {
             Self::ChatCompletions => "chat_completions",
@@ -4170,7 +4174,9 @@ async fn send_responses_request(
             &body,
         ));
     }
-    if let Err(mut error) = validate_stream_response_headers(status.as_u16(), &headers) {
+    if let Err(mut error) =
+        validate_stream_response_headers(status.as_u16(), &headers, settings.dialect)
+    {
         enrich_unexpected_stream_response_error(&mut error, response).await;
         return Err(error);
     }
@@ -4298,12 +4304,19 @@ fn classify_unexpected_html_response(body: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn validate_stream_response_headers(status: u16, headers: &HeaderMap) -> Result<(), ProviderError> {
+fn validate_stream_response_headers(
+    status: u16,
+    headers: &HeaderMap,
+    dialect: OpenAiCompatibleDialect,
+) -> Result<(), ProviderError> {
     let content_type = headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .unwrap_or_default();
+    if content_type.is_empty() && dialect.allows_missing_stream_content_type() {
+        return Ok(());
+    }
     if content_type
         .split(';')
         .next()
@@ -12437,7 +12450,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_response_requires_event_stream_content_type() {
+    fn stream_response_content_type_policy_is_surface_specific() {
         let mut valid = HeaderMap::new();
         valid.insert(
             reqwest::header::CONTENT_TYPE,
@@ -12445,25 +12458,49 @@ mod tests {
                 .parse()
                 .expect("content type"),
         );
-        assert!(validate_stream_response_headers(200, &valid).is_ok());
+        assert!(
+            validate_stream_response_headers(200, &valid, OpenAiCompatibleDialect::ResponsesApi)
+                .is_ok()
+        );
+
+        let missing = HeaderMap::new();
+        assert!(
+            validate_stream_response_headers(200, &missing, OpenAiCompatibleDialect::ChatGptCodex)
+                .is_ok()
+        );
+        let missing_error =
+            validate_stream_response_headers(200, &missing, OpenAiCompatibleDialect::ResponsesApi)
+                .expect_err("the public Responses API must advertise its stream content type");
+        assert_eq!(
+            missing_error
+                .diagnostic_context
+                .get("content_type")
+                .map(String::as_str),
+            Some("missing")
+        );
 
         let mut invalid = HeaderMap::new();
         invalid.insert(
             reqwest::header::CONTENT_TYPE,
             "text/html".parse().expect("content type"),
         );
-        let error = validate_stream_response_headers(200, &invalid)
-            .expect_err("non-SSE success must not be treated as a completed turn");
-        assert_eq!(error.code, "unexpected_stream_response");
-        assert_eq!(error.category, ProviderErrorCategory::ProviderInternal);
-        assert!(!error.retryable);
-        assert_eq!(
-            error
-                .diagnostic_context
-                .get("content_type")
-                .map(String::as_str),
-            Some("text/html")
-        );
+        for dialect in [
+            OpenAiCompatibleDialect::ResponsesApi,
+            OpenAiCompatibleDialect::ChatGptCodex,
+        ] {
+            let error = validate_stream_response_headers(200, &invalid, dialect)
+                .expect_err("an explicit non-SSE type must not be treated as a stream");
+            assert_eq!(error.code, "unexpected_stream_response");
+            assert_eq!(error.category, ProviderErrorCategory::ProviderInternal);
+            assert!(!error.retryable);
+            assert_eq!(
+                error
+                    .diagnostic_context
+                    .get("content_type")
+                    .map(String::as_str),
+                Some("text/html")
+            );
+        }
     }
 
     #[test]
