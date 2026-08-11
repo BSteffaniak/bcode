@@ -1625,6 +1625,9 @@ if ! python3 - <<'PY'
 from pathlib import Path
 import re
 
+# The lockfile must resolve BMUX to exactly one committed revision with no local path override, so
+# every crate in the graph agrees. The specific revision is deliberately not asserted here: pinning
+# it in a guard (and mirroring it in prose) made routine BMUX upgrades fail an unrelated check.
 lock = Path("Cargo.lock").read_text()
 sources = {
     line.removeprefix('source = "').removesuffix('"')
@@ -1632,12 +1635,12 @@ sources = {
     if line.startswith('source = "git+https://github.com/BSteffaniak/bmux.git')
 }
 if len(sources) != 1:
-    raise SystemExit(f"unexpected BMUX lockfile sources: {sorted(sources)}")
-source = next(iter(sources))
+    raise SystemExit(f"expected exactly one BMUX source revision, found: {sorted(sources)}")
+only = next(iter(sources))
 if not re.fullmatch(
-    r"git\+https://github\.com/BSteffaniak/bmux\.git\?branch=master#[0-9a-f]{40}", source
+    r"git\+https://github\.com/BSteffaniak/bmux\.git\?branch=master#[0-9a-f]{40}", only
 ):
-    raise SystemExit(f"BMUX dependencies must follow branch master: {source}")
+    raise SystemExit(f"BMUX source must be a full master revision, found: {only}")
 PY
 then
   echo "Runtime architecture violation: Cargo.lock must resolve one BMUX source following branch master." >&2

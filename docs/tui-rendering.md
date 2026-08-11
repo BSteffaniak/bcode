@@ -80,9 +80,9 @@ fallbacks when rich adapters are unavailable or disabled.
 
 Reliable session and terminal updates use bounded admission. Request-draft paint handoff, hit maps,
 cursor state, and image-scene ordering remain Bcode-owned and are acknowledged only after successful
-presentation. Bcode resolves the BMUX TUI crates from `master`, currently locked to commit
-`e4ba5252a77ea54cf02a56e028b57fdb95e38928`, with no local path override. Render cadence limits
-presentation only and never delays semantic updates, authorization, cancellation dispatch, or
+presentation. Bcode resolves the BMUX TUI crates from `master` with no local path override, so the
+exact revision is whatever `Cargo.lock` records rather than a value duplicated here. Render cadence
+limits presentation only and never delays semantic updates, authorization, cancellation dispatch, or
 canonical execution.
 
 ## Session picker and search scope

@@ -4082,6 +4082,176 @@ async fn handle_request(
 /// Dispatch client, session-lifecycle, history, search, and attach requests.
 ///
 /// Later request domains are handled by boxed sub-dispatchers so this frame stays bounded.
+/// Domain that owns a request, used to route directly to its dispatcher.
+///
+/// Dispatchers are chained by fall-through, so without this a permission request would traverse the
+/// session-search, turn/model, and three workflow dispatchers before reaching its own. Each is an
+/// `async fn` whose future stays live for the whole call, so those unrelated frames dominated the
+/// stack: measured at ~1.24 MiB for one fall-through hop. Classifying first means a request
+/// instantiates only its own domain's dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestDomain {
+    /// Handled directly by [`handle_request_inner`].
+    Primary,
+    SessionSearchAttach,
+    TurnWorkflowModel,
+    WorkflowMutation,
+    WorkflowAuthoring,
+    WorkflowValidation,
+    WorkflowRun,
+    Remaining,
+}
+
+/// Classify a request without consuming it, so routing costs no frame of its own.
+#[allow(clippy::too_many_lines)]
+const fn request_domain(request: &Request) -> RequestDomain {
+    match request {
+        Request::Hello { .. }
+        | Request::UpdateClientRuntimeContext { .. }
+        | Request::Ping
+        | Request::IngestClientMetrics { .. }
+        | Request::ServerStatus { .. }
+        | Request::ModelCatalogDiagnostics
+        | Request::ServerStop { .. }
+        | Request::ReleaseSessionOwnership { .. }
+        | Request::SetComposerDraft { .. }
+        | Request::ComposerDraft { .. }
+        | Request::CreateSession { .. }
+        | Request::ListSessions { .. }
+        | Request::SubscribeCatalogUpdates
+        | Request::ChangeSessionWorkingDirectory { .. }
+        | Request::ListWorktrees(_)
+        | Request::CreateWorktree(_)
+        | Request::RemoveWorktree(_)
+        | Request::RalphStatus(_)
+        | Request::RunRalphLoop(_)
+        | Request::ApproveRalphRun(_)
+        | Request::CancelRalphLoop(_)
+        | Request::ListRalphRuns(_)
+        | Request::ListRalphIterations(_)
+        | Request::ResumeRalphRun(_)
+        | Request::RalphRunStatus(_)
+        | Request::RecordRalphLifecycle(_)
+        | Request::RenameSession { .. }
+        | Request::DeleteSession { .. }
+        | Request::ReadSessionArtifact { .. }
+        | Request::InvocationInput { .. }
+        | Request::ForkSession { .. }
+        | Request::CloneSession { .. }
+        | Request::SessionHistory { .. }
+        | Request::SessionHistoryPage { .. }
+        | Request::SessionHistoryAround { .. }
+        | Request::SessionInspection { .. } => RequestDomain::Primary,
+        Request::SessionSearch { .. }
+        | Request::SessionSearchProviders
+        | Request::SessionSearchExplain { .. }
+        | Request::SessionSearchPurge { .. }
+        | Request::SessionSearchRebuild { .. }
+        | Request::SessionSearchCompleteBackfillStart { .. }
+        | Request::SessionSearchBackfillStart { .. }
+        | Request::SessionSearchBackfillStatus { .. }
+        | Request::SessionSearchBackfillWait { .. }
+        | Request::SessionSearchBackfillCancel { .. }
+        | Request::SessionSearchBackfill { .. }
+        | Request::PrepareSessionOpen { .. }
+        | Request::WaitSessionOpenProgress { .. }
+        | Request::AttachSession { .. }
+        | Request::AttachSessionRecent { .. }
+        | Request::AttachSessionProjectionWindow { .. }
+        | Request::ImportExternalSession { .. }
+        | Request::RefreshSessionCatalog { .. } => RequestDomain::SessionSearchAttach,
+        Request::SendUserMessage { .. }
+        | Request::SendUserMessageWithPlacement { .. }
+        | Request::SendUserMessageWithExecution { .. }
+        | Request::SubmitTurn { .. }
+        | Request::InvokeSkill { .. }
+        | Request::InvokeSkillWithExecution { .. }
+        | Request::CancelSessionTurn { .. }
+        | Request::CancelRuntimeWork { .. }
+        | Request::ApplyWorkflowSource(_)
+        | Request::ResetIncompatibleWorkflowStore { .. }
+        | Request::CancelWorkflowComputation { .. }
+        | Request::ApplyWorkflowDraftEdits(_) => RequestDomain::TurnWorkflowModel,
+        Request::CreateAuthoredWorkflow(_)
+        | Request::UpdateWorkflowDraft(_)
+        | Request::PublishWorkflowDraft(_)
+        | Request::PublishAndStartWorkflow(_)
+        | Request::ActivateWorkflowRevision(_)
+        | Request::SetAuthoredWorkflowArchived(_)
+        | Request::DiscardWorkflowDraft(_)
+        | Request::ForkWorkflowDraft(_)
+        | Request::CreateWorkflowPreset(_)
+        | Request::UpdateWorkflowPreset(_)
+        | Request::DeleteWorkflowPreset(_)
+        | Request::ExportWorkflowRevision(_)
+        | Request::PreviewWorkflowImport(_)
+        | Request::ImportWorkflow(_)
+        | Request::ImportWorkflowDraft(_)
+        | Request::ImportWorkflowRevision(_)
+        | Request::StartAuthoredWorkflow(_)
+        | Request::StartWorkflowPackageExport(_) => RequestDomain::WorkflowMutation,
+        Request::ListAuthoredWorkflows { .. }
+        | Request::GetAuthoredWorkflow { .. }
+        | Request::InspectAuthoredWorkflow { .. }
+        | Request::ListWorkflowDrafts { .. }
+        | Request::GetWorkflowDraft { .. }
+        | Request::ListWorkflowRevisions { .. }
+        | Request::GetWorkflowRevision { .. }
+        | Request::InspectWorkflowRevisionRequirements { .. }
+        | Request::ListWorkflowPresets { .. }
+        | Request::GetWorkflowPreset { .. } => RequestDomain::WorkflowAuthoring,
+        Request::WorkflowAuthoringCatalog
+        | Request::GetWorkflowPackagePublication { .. }
+        | Request::ApplyWorkflowPackage(_)
+        | Request::PublishWorkflowPackage(_)
+        | Request::ValidateWorkflowPackage(_)
+        | Request::PreviewWorkflowPackage(_)
+        | Request::ValidateWorkflowSource(_)
+        | Request::PreviewWorkflowSource(_)
+        | Request::ValidateWorkflowAuthoring { .. }
+        | Request::PreviewWorkflowCompilation { .. }
+        | Request::ListWorkflowTemplates { .. }
+        | Request::DescribeWorkflowTemplate { .. }
+        | Request::InstantiateWorkflowTemplate(_)
+        | Request::StartWorkflowTemplate(_)
+        | Request::RegisterWorkflowDefinition(_)
+        | Request::StartWorkflow(_)
+        | Request::StartWorkflowRun(_)
+        | Request::ListWorkflowDefinitions { .. }
+        | Request::DescribeWorkflowDefinition { .. } => RequestDomain::WorkflowValidation,
+        Request::InspectWorkflowRun { .. }
+        | Request::WorkflowRunStatus { .. }
+        | Request::AssociatedWorkflowRun { .. }
+        | Request::InspectAssociatedWorkflowRun { .. }
+        | Request::ControlAssociatedWorkflowRun { .. }
+        | Request::ListWorkflowRuns { .. }
+        | Request::CancelWorkflowRun { .. }
+        | Request::PauseWorkflowRun { .. }
+        | Request::ResumeWorkflowRun { .. }
+        | Request::DoctorWorkflowRun { .. }
+        | Request::RepairWorkflowAttempt { .. }
+        | Request::RetryWorkflowNode { .. }
+        | Request::ListWorkflowWaits { .. }
+        | Request::ProvideWorkflowInput { .. }
+        | Request::ResolveWorkflowApproval { .. }
+        | Request::ListWorkflowMutationApprovals { .. }
+        | Request::ResolveWorkflowMutationApproval { .. }
+        | Request::WorkflowAttemptHistory { .. }
+        | Request::WorkflowEventHistory { .. }
+        | Request::ListRuntimeWork { .. }
+        | Request::RuntimeWorkHistory { .. }
+        | Request::SubscribeRuntimeWork { .. }
+        | Request::CompactSession { .. }
+        | Request::SetSessionModel { .. }
+        | Request::SetSessionReasoning { .. }
+        | Request::AppendPresentationNote { .. }
+        | Request::SessionModelStatus { .. }
+        | Request::DefaultModelStatus
+        | Request::SessionModelList { .. } => RequestDomain::WorkflowRun,
+        _ => RequestDomain::Remaining,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_request_inner(
     request: Request,
@@ -4091,6 +4261,58 @@ async fn handle_request_inner(
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
+    // Route directly to the owning dispatcher. Dispatchers are chained by fall-through, so entering
+    // the chain would keep every intermediate dispatcher's future live for the whole call.
+    match request_domain(&request) {
+        RequestDomain::Primary => {}
+        RequestDomain::SessionSearchAttach => {
+            return Box::pin(handle_session_search_attach_request(
+                request,
+                request_id,
+                client_id,
+                state,
+                writer,
+                attached_session,
+            ))
+            .await;
+        }
+        RequestDomain::TurnWorkflowModel => {
+            return Box::pin(handle_turn_workflow_model_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await;
+        }
+        RequestDomain::WorkflowMutation => {
+            return Box::pin(handle_workflow_mutation_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await;
+        }
+        RequestDomain::WorkflowAuthoring => {
+            return Box::pin(handle_workflow_authoring_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await;
+        }
+        RequestDomain::WorkflowValidation => {
+            return Box::pin(handle_workflow_validation_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await;
+        }
+        RequestDomain::WorkflowRun => {
+            return Box::pin(handle_workflow_run_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await;
+        }
+        RequestDomain::Remaining => {
+            return Box::pin(handle_remaining_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await;
+        }
+    }
     match request {
         Request::Hello {
             client_name,
@@ -5244,6 +5466,29 @@ async fn handle_workflow_runtime_request(
             handle_describe_workflow_definition(request_id, state, writer, definition_id, version)
                 .await
         }
+        request => {
+            Box::pin(handle_workflow_run_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+    }
+}
+
+/// Dispatch workflow run inspection, control, wait, approval, and runtime-work requests.
+///
+/// Split from [`handle_workflow_validation_request`] so neither function's future holds the other's
+/// locals. Both are reached by direct routing from [`handle_request_inner`], so this split adds no
+/// frame to any other domain's path.
+#[allow(clippy::too_many_lines)]
+async fn handle_workflow_run_request(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
         Request::InspectWorkflowRun { run_id, limit } => {
             handle_inspect_workflow_run(request_id, state, writer, run_id, limit).await
         }
