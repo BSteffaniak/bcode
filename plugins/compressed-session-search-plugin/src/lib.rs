@@ -1663,6 +1663,23 @@ mod tests {
     }
 
     #[test]
+    fn disabled_status_opens_no_chunk_or_manifest_resources() {
+        let plugin = CompressedSessionSearchPlugin::default();
+        let config = ProviderConfig::default();
+
+        let status = plugin.status(&config);
+
+        assert_eq!(status.state, SearchProviderState::Disabled);
+        assert!(
+            plugin
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn scan_limiter_allows_two_and_bounds_a_waiting_third() {
         let limiter = Arc::new(ScanLimiter::default());
         let first = limiter

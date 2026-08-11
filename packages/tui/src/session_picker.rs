@@ -636,6 +636,45 @@ mod tests {
         }
     }
 
+    use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::geometry::Point;
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent::new(kind, Point::new(x, y))
+    }
+
+    #[test]
+    fn transcript_search_mouse_row_selects_result_and_refreshes_preview() {
+        let mut app = SessionPickerApp::new(Vec::new());
+        let first = sample_search_result(bcode_session_search::SearchHitHydrationOutcome::Hydrated);
+        let mut second =
+            sample_search_result(bcode_session_search::SearchHitHydrationOutcome::Hydrated);
+        second.hit.provider_rank = 2;
+        second.hit.preview = Some("second preview".to_owned());
+        let response = bcode_session_search::FederatedSessionSearchResponse {
+            hits: vec![first.hit.clone(), second.hit.clone()],
+            query_complete: true,
+            coverage_complete: true,
+            providers: Vec::new(),
+            failures: Vec::new(),
+        };
+        app.set_search_results(&response, vec![first, second]);
+        let row = super::super::picker_mouse::picker_row_from_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            4,
+            6,
+        ))
+        .expect("second visible row");
+
+        assert!(app.select_visible(row));
+        assert_eq!(
+            app.selected_search_result()
+                .map(|result| result.hit.provider_rank),
+            Some(2)
+        );
+        assert!(app.search_preview().contains("second preview"));
+    }
+
     #[test]
     fn transcript_search_mode_accepts_query_before_results_exist() {
         let mut app = SessionPickerApp::new(Vec::new());
