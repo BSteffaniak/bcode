@@ -227,8 +227,32 @@ if rg -n 'frame\.fill\(area,[^\n]*Color::Black' \
 fi
 
 if rg -n 'ReviewDisplayRowSource::Added => Style::new|ReviewDisplayRowSource::Removed => Style::new|ReviewDisplayTextRole::HunkHeader => Style::new' \
-  plugins/code-review-plugin/src/code_review_tui_render.rs; then
-  fail "code-review diff rows must consume renderer-owned semantic diff presentation"
+  plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n 'rendered\.style\.bg\(Color::BrightBlack\)|rendered\.style\.bg\(Color::Blue\)' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_omitted_context_row[\s\S]{0,1800}Color::' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_inline_thread_header[\s\S]{0,1800}Color::' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_inline_comment_line[\s\S]{0,8000}Color::' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_file_view_row[\s\S]{0,7000}fn highlighted_source_spans' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+    | rg 'Color::(Black|White|BrightBlack|Blue)' \
+  || rg -n -U 'fn file_viewer_row_style[\s\S]{0,900}Color::' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_build_workspace[\s\S]{0,2600}Color::(Black|White|Yellow)' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_separator[\s\S]{0,4200}const fn source_kind_short_label' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+    | rg 'Color::(Black|White|BrightBlack|Cyan|Yellow)' \
+  || rg -n -U 'fn render_review_summary[\s\S]{0,13500}fn render_thread_toolbar' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+    | rg 'Color::(Black|White|BrightBlack|Cyan|Yellow)' \
+  || rg -n -U 'fn render_files[\s\S]{0,9000}fn render_review_summary' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+    | rg 'Color::(Black|White|BrightBlack|Cyan|Yellow|Green|Red)'; then
+  fail "code-review diff rows, inline review states, and selections must consume renderer-owned semantic presentation"
 fi
 
 if ! rg -q 'surfaces\.overlay\.patch\(theme\.text\)' \
@@ -236,6 +260,12 @@ if ! rg -q 'surfaces\.overlay\.patch\(theme\.text\)' \
   || rg -n -U 'fn render_help[\s\S]{0,1200}Color::BrightBlack' \
     plugins/code-review-plugin/src/code_review_tui_render.rs \
   || rg -n -U 'fn render_prompt[\s\S]{0,2400}Color::(Black|White|Yellow)' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_import_modal[\s\S]{0,2800}Color::(Black|White|BrightBlack|Cyan)' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_publish_modal[\s\S]{0,8000}Color::(Black|White|BrightBlack|Cyan|Yellow|Green)' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_comment_editor[\s\S]{0,9000}Color::(Black|White|BrightBlack|Yellow)' \
     plugins/code-review-plugin/src/code_review_tui_render.rs; then
   fail "code-review overlays must derive their surface and control states from renderer-owned component presentation"
 fi
