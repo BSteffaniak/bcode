@@ -27,11 +27,14 @@ bmux_tui = { workspace = true }
 bmux_tui_components = { workspace = true, features = [
     "action-row",
     "bar-chart",
+    "button",
     "dialog",
     "key-hint-bar",
+    "modal-frame",
     "sparkline",
     "tab-bar",
     "table",
+    "text-input",
     "text-input-box",
 ] }
 clap = { workspace = true, features = ["derive", "std"] }
