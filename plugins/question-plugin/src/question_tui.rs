@@ -46,7 +46,6 @@ struct QuestionSurfaceTheme {
     focused: Style,
     selection: Style,
     error: Style,
-    warning: Style,
     canvas: Style,
 }
 
@@ -58,7 +57,6 @@ impl Default for QuestionSurfaceTheme {
             focused: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             selection: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             error: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-            warning: Style::new().fg(Color::Yellow),
             canvas: Style::new(),
         }
     }
@@ -74,7 +72,6 @@ impl QuestionSurfaceTheme {
                 focused: theme.focused,
                 selection: theme.selected,
                 error: theme.error,
-                warning: theme.warning,
                 canvas: theme.canvas,
             })
     }
@@ -359,7 +356,6 @@ impl QuestionTerminalRenderer {
         self.last_area = area;
         self.controls.clear();
         self.custom_areas.clear();
-        self.ensure_focus_visible(snapshot, area.width, area.height);
         let mut content_y = 0;
         self.render_title(frame, &mut content_y);
         if let Some(error) = &snapshot.validation_error {
@@ -373,19 +369,6 @@ impl QuestionTerminalRenderer {
             self.render_question(frame, &mut content_y, snapshot, question_index);
         }
         self.render_actions(frame, &mut content_y, snapshot);
-        if self.viewport_offset > 0 && area.height > 0 {
-            frame.write_line(
-                Rect::new(area.x, area.y, area.width, 1),
-                &Line::from_spans(vec![Span::styled("↑ more", self.theme.warning)]),
-            );
-        }
-        if self.viewport_offset.saturating_add(area.height) < self.content_height && area.height > 0
-        {
-            frame.write_line(
-                Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-                &Line::from_spans(vec![Span::styled("↓ more", self.theme.warning)]),
-            );
-        }
     }
 
     fn custom_vertical_input(

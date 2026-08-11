@@ -5121,6 +5121,28 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
+        request => {
+            Box::pin(handle_workflow_runtime_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+    }
+}
+
+/// Dispatch workflow template, execution, runtime-work, and model-setting requests.
+///
+/// This second boxed dispatcher keeps large authoring/package computation futures out of the
+/// runtime request frame.
+#[allow(clippy::too_many_lines)]
+async fn handle_workflow_runtime_request(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
         Request::ListWorkflowTemplates { limit } => {
             handle_list_workflow_templates(request_id, state, writer, limit).await
         }
@@ -5287,6 +5309,25 @@ async fn handle_workflow_validation_request(
             handle_workflow_event_history(request_id, state, writer, run_id, after_sequence, limit)
                 .await
         }
+        request => {
+            Box::pin(handle_runtime_session_configuration_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+    }
+}
+
+/// Dispatch runtime-work, session-model, and provider-auth configuration requests.
+#[allow(clippy::too_many_lines)]
+async fn handle_runtime_session_configuration_request(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
         Request::ListRuntimeWork { session_id } => {
             handle_list_runtime_work(request_id, state, writer, session_id).await
         }
