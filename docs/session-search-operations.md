@@ -17,8 +17,11 @@ bcode session migrate-inventory --session <session-id> --after-timestamp-ms <ms>
 
 The inventory categorizes ready, migration-required, owner-blocked, temporarily locked,
 repair-required, format-incompatible, and missing sessions with bounded counts and capped examples.
-Use the reported action: retry transient ownership/locks, repair damaged storage explicitly, or
-upgrade Bcode for future formats. Inventory never migrates or backfills search.
+`bcode session doctor --scan --json` reports the same actionable categories alongside its
+non-mutating repair reports; its JSON is stdout-only and is safe to pipe to `jq` or a consumer that
+closes early. Use the reported action: retry transient ownership/locks, repair damaged storage
+explicitly, or upgrade Bcode for future formats. Inventory and doctor never migrate or backfill
+search.
 
 Start confirmed canonical migration for all eligible sessions, or add `--session`/timestamp filters:
 

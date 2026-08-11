@@ -1401,12 +1401,20 @@ impl BcodeClient {
         after_revision: u64,
         timeout_ms: u64,
     ) -> Result<SessionBulkMigrationOperationStatus, ClientError> {
+        validate_session_bulk_migration_wait_timeout(timeout_ms)?;
+        let server_wait = Duration::from_millis(timeout_ms);
+        let response_timeout = self
+            .request_timeout
+            .max(server_wait.saturating_add(LONG_POLL_TRANSPORT_GRACE));
         match self
-            .send_request(Request::SessionBulkMigrationWait {
-                operation_id,
-                after_revision,
-                timeout_ms,
-            })
+            .send_request_with_timeout(
+                Request::SessionBulkMigrationWait {
+                    operation_id,
+                    after_revision,
+                    timeout_ms,
+                },
+                response_timeout,
+            )
             .await?
         {
             ResponsePayload::SessionBulkMigrationOperation { status } => Ok(status),
@@ -5130,13 +5138,24 @@ fn session_open_attach_readiness(
     }
 }
 
-fn validate_session_search_backfill_wait_timeout(timeout_ms: u64) -> Result<(), ClientError> {
+fn validate_bounded_long_poll_timeout(
+    operation: &'static str,
+    timeout_ms: u64,
+) -> Result<(), ClientError> {
     if timeout_ms == 0 || timeout_ms > 30_000 {
-        return Err(ClientError::Protocol(
-            "backfill wait timeout must be between 1 and 30000 milliseconds".to_owned(),
-        ));
+        return Err(ClientError::Protocol(format!(
+            "{operation} wait timeout must be between 1 and 30000 milliseconds"
+        )));
     }
     Ok(())
+}
+
+fn validate_session_search_backfill_wait_timeout(timeout_ms: u64) -> Result<(), ClientError> {
+    validate_bounded_long_poll_timeout("backfill", timeout_ms)
+}
+
+fn validate_session_bulk_migration_wait_timeout(timeout_ms: u64) -> Result<(), ClientError> {
+    validate_bounded_long_poll_timeout("bulk migration", timeout_ms)
 }
 
 fn terminal_session_open_error_message(
@@ -5182,6 +5201,9 @@ mod client_timeout_tests {
     use bcode_session_models::{
         SessionId, SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
         SessionOpenOperationSnapshot, SessionOpenTerminalOutcome,
+    };
+    use bcode_session_search::{
+        SessionSearchBackfillOperationState, SessionSearchBackfillOperationStatus,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -5825,7 +5847,7 @@ mod client_timeout_tests {
     }
 
     #[test]
-    fn backfill_wait_timeout_uses_server_bound_plus_transport_grace() {
+    fn bounded_long_poll_timeouts_use_server_bound_plus_transport_grace() {
         let client =
             BcodeClient::default_endpoint().with_request_timeout(Duration::from_millis(10));
         let response_timeout = client
@@ -5839,6 +5861,159 @@ mod client_timeout_tests {
             super::validate_session_search_backfill_wait_timeout(30_001),
             Err(ClientError::Protocol(_))
         ));
+        assert!(super::validate_session_bulk_migration_wait_timeout(1).is_ok());
+        assert!(super::validate_session_bulk_migration_wait_timeout(30_000).is_ok());
+        assert!(matches!(
+            super::validate_session_bulk_migration_wait_timeout(30_001),
+            Err(ClientError::Protocol(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_wait_longer_than_default_request_timeout_receives_quiet_response() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcl-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("long-poll.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let operation_id = "quiet-backfill".to_owned();
+        let expected_operation_id = operation_id.clone();
+        let daemon = matching_daemon_status();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion::current(),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon,
+            });
+            let envelope =
+                bcode_ipc::response_envelope(hello.request_id, &response).expect("hello response");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send hello");
+
+            let request = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("wait request");
+            assert!(matches!(
+                bcode_ipc::decode_request(&request.payload).expect("decode wait request"),
+                bcode_ipc::Request::SessionSearchBackfillWait {
+                    operation_id,
+                    after_revision: 1,
+                    timeout_ms: 80,
+                } if operation_id == expected_operation_id
+            ));
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let response = bcode_ipc::Response::Ok(
+                bcode_ipc::ResponsePayload::SessionSearchBackfillOperation {
+                    status: SessionSearchBackfillOperationStatus {
+                        operation_id: expected_operation_id,
+                        provider_id: "bcode.test-search".to_owned(),
+                        revision: 1,
+                        state: SessionSearchBackfillOperationState::Running,
+                        response: None,
+                        complete_progress: None,
+                        complete_response: None,
+                        error: None,
+                    },
+                },
+            );
+            let envelope =
+                bcode_ipc::response_envelope(request.request_id, &response).expect("wait response");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send wait response");
+        });
+        let client = BcodeClient::new(endpoint)
+            .with_daemon_availability(super::DaemonAvailability::RequireRunning)
+            .with_request_timeout(Duration::from_millis(10));
+
+        let status = client
+            .session_search_backfill_wait(operation_id, 1, 80)
+            .await
+            .expect("long poll must outlive generic request timeout");
+
+        assert_eq!(status.revision, 1);
+        assert_eq!(status.state, SessionSearchBackfillOperationState::Running);
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bulk_migration_wait_longer_than_default_request_timeout_receives_quiet_response() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcmw-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("migration-wait.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let operation_id = "quiet-migration".to_owned();
+        let expected_operation_id = operation_id.clone();
+        let daemon = matching_daemon_status();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion::current(),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon,
+            });
+            let envelope =
+                bcode_ipc::response_envelope(hello.request_id, &response).expect("hello response");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send hello");
+
+            let request = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("wait request");
+            assert!(matches!(
+                bcode_ipc::decode_request(&request.payload).expect("decode wait request"),
+                bcode_ipc::Request::SessionBulkMigrationWait {
+                    operation_id,
+                    after_revision: 2,
+                    timeout_ms: 80,
+                } if operation_id == expected_operation_id
+            ));
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let response = bcode_ipc::Response::Ok(
+                bcode_ipc::ResponsePayload::SessionBulkMigrationOperation {
+                    status: bcode_ipc::SessionBulkMigrationOperationStatus {
+                        operation_id: expected_operation_id,
+                        revision: 2,
+                        state: bcode_ipc::SessionBulkMigrationState::Running,
+                        mode: bcode_ipc::SessionBulkMigrationMode::Inventory,
+                        selected: 0,
+                        visited: 0,
+                        migrated: 0,
+                        blocked: 0,
+                        failed: 0,
+                        current_session_id: None,
+                        outcomes: Vec::new(),
+                    },
+                },
+            );
+            let envelope =
+                bcode_ipc::response_envelope(request.request_id, &response).expect("wait response");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send wait response");
+        });
+        let client = BcodeClient::new(endpoint)
+            .with_daemon_availability(super::DaemonAvailability::RequireRunning)
+            .with_request_timeout(Duration::from_millis(10));
+
+        let status = client
+            .wait_session_bulk_migration(operation_id, 2, 80)
+            .await
+            .expect("long poll must outlive generic request timeout");
+
+        assert_eq!(status.revision, 2);
+        assert_eq!(status.state, bcode_ipc::SessionBulkMigrationState::Running);
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
     }
 
     #[test]

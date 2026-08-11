@@ -11134,10 +11134,207 @@ async fn retired_catalogs(apply: bool, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionDoctorCategory {
+    Ready,
+    MigrationRequired,
+    OwnerBlocked,
+    TemporarilyLocked,
+    RepairRequired,
+    FormatIncompatible,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionDoctorAction {
+    None,
+    Retry,
+    Migrate,
+    Repair,
+    Upgrade,
+    Locate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SessionDoctorCategorySummary {
+    count: usize,
+    action: SessionDoctorAction,
+    retryable: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    samples: Vec<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SessionDoctorFinding {
+    session_id: SessionId,
+    category: SessionDoctorCategory,
+    action: SessionDoctorAction,
+    retryable: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct SessionDoctorScanReport {
     historical_storage: bcode_session_migration::HistoricalStorageDiagnosis,
+    category_counts: BTreeMap<SessionDoctorCategory, usize>,
+    category_summaries: BTreeMap<SessionDoctorCategory, SessionDoctorCategorySummary>,
+    findings: Vec<SessionDoctorFinding>,
     reports: Vec<bcode_session::repair::RepairReport>,
+}
+
+const MAX_SESSION_DOCTOR_SAMPLES_PER_CATEGORY: usize = 3;
+
+#[allow(clippy::too_many_lines)]
+async fn classify_session_doctor_report(
+    root: &Path,
+    report: &bcode_session::repair::RepairReport,
+) -> (SessionDoctorCategory, SessionDoctorAction, bool) {
+    use bcode_session::repair::RepairStatus;
+
+    let bcode_session::repair::RepairTarget::Session { session_id } = report.target else {
+        return match report.status {
+            RepairStatus::Ok => (
+                SessionDoctorCategory::Ready,
+                SessionDoctorAction::None,
+                false,
+            ),
+            RepairStatus::RefusedOwnedElsewhere => (
+                SessionDoctorCategory::OwnerBlocked,
+                SessionDoctorAction::Retry,
+                true,
+            ),
+            RepairStatus::WouldRepair | RepairStatus::Repaired | RepairStatus::ManualRequired => (
+                SessionDoctorCategory::RepairRequired,
+                SessionDoctorAction::Repair,
+                false,
+            ),
+        };
+    };
+    if !report.db_path.exists() {
+        return (
+            SessionDoctorCategory::Missing,
+            SessionDoctorAction::Locate,
+            false,
+        );
+    }
+    if report.status == RepairStatus::RefusedOwnedElsewhere {
+        return (
+            SessionDoctorCategory::OwnerBlocked,
+            SessionDoctorAction::Retry,
+            true,
+        );
+    }
+    match bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, root).await {
+        Ok(db) => {
+            if let Ok((envelopes, truncated)) = db.event_envelope_inventory().await {
+                if truncated
+                    || envelopes.iter().any(|(schema, kind)| {
+                        matches!(
+                            bcode_session_migration::classify_event_kind_schema(kind, *schema),
+                            bcode_session_migration::ReleasedEventKindClassification::Unknown
+                        )
+                    })
+                {
+                    return (
+                        SessionDoctorCategory::FormatIncompatible,
+                        SessionDoctorAction::Upgrade,
+                        false,
+                    );
+                }
+                if envelopes.iter().any(|(schema, kind)| {
+                    matches!(
+                        bcode_session_migration::classify_event_kind_schema(kind, *schema),
+                        bcode_session_migration::ReleasedEventKindClassification::ReleasedHistorical
+                    )
+                }) {
+                    return (
+                        SessionDoctorCategory::MigrationRequired,
+                        SessionDoctorAction::Migrate,
+                        false,
+                    );
+                }
+            }
+            match report.status {
+                RepairStatus::Ok => (
+                    SessionDoctorCategory::Ready,
+                    SessionDoctorAction::None,
+                    false,
+                ),
+                RepairStatus::WouldRepair
+                | RepairStatus::Repaired
+                | RepairStatus::ManualRequired => (
+                    SessionDoctorCategory::RepairRequired,
+                    SessionDoctorAction::Repair,
+                    false,
+                ),
+                RepairStatus::RefusedOwnedElsewhere => unreachable!("handled before database open"),
+            }
+        }
+        Err(error) if error.is_lock_error() => (
+            SessionDoctorCategory::TemporarilyLocked,
+            SessionDoctorAction::Retry,
+            true,
+        ),
+        Err(bcode_session::db::SessionDbError::WriterIncompatible { actual, expected }) => {
+            if actual.is_some_and(|actual| actual < expected) {
+                (
+                    SessionDoctorCategory::MigrationRequired,
+                    SessionDoctorAction::Migrate,
+                    false,
+                )
+            } else {
+                (
+                    SessionDoctorCategory::FormatIncompatible,
+                    SessionDoctorAction::Upgrade,
+                    false,
+                )
+            }
+        }
+        Err(_) => (
+            SessionDoctorCategory::RepairRequired,
+            SessionDoctorAction::Repair,
+            false,
+        ),
+    }
+}
+
+async fn summarize_session_doctor_reports(
+    root: &Path,
+    reports: &[bcode_session::repair::RepairReport],
+) -> (
+    BTreeMap<SessionDoctorCategory, usize>,
+    BTreeMap<SessionDoctorCategory, SessionDoctorCategorySummary>,
+    Vec<SessionDoctorFinding>,
+) {
+    let mut counts = BTreeMap::new();
+    let mut summaries = BTreeMap::new();
+    let mut findings = Vec::new();
+    for report in reports {
+        let (category, action, retryable) = classify_session_doctor_report(root, report).await;
+        *counts.entry(category).or_insert(0) += 1;
+        let summary = summaries
+            .entry(category)
+            .or_insert_with(|| SessionDoctorCategorySummary {
+                count: 0,
+                action,
+                retryable,
+                samples: Vec::new(),
+            });
+        summary.count += 1;
+        if let bcode_session::repair::RepairTarget::Session { session_id } = report.target {
+            findings.push(SessionDoctorFinding {
+                session_id,
+                category,
+                action,
+                retryable,
+            });
+            if summary.samples.len() < MAX_SESSION_DOCTOR_SAMPLES_PER_CATEGORY {
+                summary.samples.push(session_id);
+            }
+        }
+    }
+    (counts, summaries, findings)
 }
 
 fn write_json_line<W: std::io::Write, T: Serialize>(
@@ -11145,7 +11342,7 @@ fn write_json_line<W: std::io::Write, T: Serialize>(
     value: &T,
 ) -> Result<(), serde_json::Error> {
     serde_json::to_writer_pretty(&mut *output, value)?;
-    serde_json::to_writer(output, "\n")
+    output.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
 fn write_json_stdout<T: Serialize>(value: &T) -> Result<(), CliError> {
@@ -11162,6 +11359,7 @@ async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<
     let root = bcode_config::default_session_store_dir();
     let dry_run = matches!(options.mode, SessionRepairCliMode::DryRun);
     let json = matches!(options.output, SessionRepairCliOutput::Json);
+    let scan = matches!(&options.target, SessionRepairCliTarget::Scan);
     let mut historical_storage = None;
     let mut reports = Vec::new();
     match options.target {
@@ -11193,16 +11391,31 @@ async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<
             "provide a session id, --catalog, or --scan".to_string(),
         ));
     }
+    let (category_counts, category_summaries, findings) =
+        summarize_session_doctor_reports(&root, &reports).await;
     if json {
         if let Some(historical_storage) = historical_storage {
             write_json_stdout(&SessionDoctorScanReport {
                 historical_storage,
+                category_counts,
+                category_summaries,
+                findings,
                 reports,
             })?;
         } else {
             write_json_stdout(&reports)?;
         }
     } else {
+        if scan {
+            println!("compatibility summary:");
+            for (category, summary) in &category_summaries {
+                println!(
+                    "  {category:?}: count={}, action={:?}, retryable={}",
+                    summary.count, summary.action, summary.retryable
+                );
+            }
+            println!();
+        }
         for report in &reports {
             print_repair_report(report);
         }
@@ -13677,6 +13890,64 @@ mod web_command_tests {
         );
     }
 
+    #[tokio::test]
+    async fn doctor_summary_categories_are_actionable_and_capped() {
+        use bcode_session::repair::{RepairReport, RepairStatus, RepairTarget};
+
+        let session_id = SessionId::new();
+        let missing = RepairReport {
+            target: RepairTarget::Session { session_id },
+            db_path: std::path::PathBuf::from("/definitely/missing/session.db"),
+            status: RepairStatus::ManualRequired,
+            backup_path: None,
+            initial_error: Some("session database does not exist".to_owned()),
+            final_error: None,
+            actions: Vec::new(),
+            notes: Vec::new(),
+        };
+        let (category, action, retryable) =
+            classify_session_doctor_report(std::path::Path::new("/definitely/missing"), &missing)
+                .await;
+        assert_eq!(category, SessionDoctorCategory::Missing);
+        assert_eq!(action, SessionDoctorAction::Locate);
+        assert!(!retryable);
+    }
+
+    #[tokio::test]
+    async fn session_doctor_summaries_are_actionable_and_capped() {
+        let session_ids = (0..5).map(|_| SessionId::new()).collect::<Vec<_>>();
+        let reports = session_ids
+            .iter()
+            .map(|session_id| bcode_session::repair::RepairReport {
+                target: bcode_session::repair::RepairTarget::Session {
+                    session_id: *session_id,
+                },
+                db_path: std::path::PathBuf::from("/missing/session.db"),
+                status: bcode_session::repair::RepairStatus::ManualRequired,
+                backup_path: None,
+                initial_error: Some("session database does not exist".to_owned()),
+                final_error: None,
+                actions: Vec::new(),
+                notes: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let root = tempfile::tempdir().expect("doctor root");
+
+        let (counts, summaries, findings) =
+            summarize_session_doctor_reports(root.path(), &reports).await;
+
+        assert_eq!(counts[&SessionDoctorCategory::Missing], 5);
+        let missing = &summaries[&SessionDoctorCategory::Missing];
+        assert_eq!(missing.count, 5);
+        assert_eq!(missing.action, SessionDoctorAction::Locate);
+        assert!(!missing.retryable);
+        assert_eq!(
+            missing.samples.len(),
+            MAX_SESSION_DOCTOR_SAMPLES_PER_CATEGORY
+        );
+        assert_eq!(findings.len(), 5);
+    }
+
     #[test]
     fn compatibility_issue_format_is_actionable_and_specific() {
         for (compatibility, expected_classification) in [
@@ -13761,6 +14032,40 @@ mod web_command_tests {
                 }
             )
         ));
+    }
+
+    #[test]
+    fn doctor_scan_report_serializes_machine_clean_actionable_json() {
+        let report = SessionDoctorScanReport {
+            historical_storage: bcode_session_migration::HistoricalStorageDiagnosis {
+                root: std::path::PathBuf::from("/state/sessions-v5"),
+                status: bcode_session_migration::HistoricalStorageDiagnosisStatus::Ok,
+                inspection: bcode_session_migration::HistoricalStorageInspectionReport::default(),
+                notes: Vec::new(),
+            },
+            category_counts: BTreeMap::from([(SessionDoctorCategory::MigrationRequired, 1)]),
+            category_summaries: BTreeMap::from([(
+                SessionDoctorCategory::MigrationRequired,
+                SessionDoctorCategorySummary {
+                    count: 1,
+                    action: SessionDoctorAction::Migrate,
+                    retryable: false,
+                    samples: Vec::new(),
+                },
+            )]),
+            findings: Vec::new(),
+            reports: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        write_json_line(&mut output, &report).expect("doctor JSON");
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("machine-clean JSON");
+
+        assert_eq!(value["category_counts"]["migration_required"], 1);
+        assert_eq!(
+            value["category_summaries"]["migration_required"]["action"],
+            "migrate"
+        );
     }
 
     #[test]
