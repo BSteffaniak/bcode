@@ -4,7 +4,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::prelude::{Line, Span};
 
 use super::auth_pool_picker::AuthPoolPickerApp;
-use super::picker_render::{picker_list_area, render_picker_chrome, render_picker_list};
+use super::picker_render::{picker_list_area, render_picker_chrome};
 use super::render::TuiTheme;
 
 /// Render the auth-pool profile picker.
@@ -30,5 +30,5 @@ pub fn render_auth_pool_picker(
         return;
     };
     let items = app.list_items(theme.muted, theme.focused);
-    render_picker_list(&items, app.list_state_mut(), list_area, frame, theme);
+    app.render_list(&items, list_area, frame, theme);
 }

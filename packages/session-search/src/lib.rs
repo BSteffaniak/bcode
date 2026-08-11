@@ -930,6 +930,32 @@ pub fn plan_session_search_with_policy_and_routes(
         };
     }
     discovery = filter_discovery_for_policy(discovery, policy);
+    if let Some(cursor) = &request.cursor {
+        let provider = discovery
+            .providers
+            .iter()
+            .find(|provider| provider.plugin_id == cursor.provider_id)
+            .cloned();
+        if let Some(provider) = provider
+            && provider_is_eligible(request, &provider, &request.filters.content_kinds)
+        {
+            return SessionSearchPlan {
+                providers: vec![provider],
+                failures: discovery.failures,
+                per_provider_deadline_ms: policy.per_provider_deadline_ms,
+            };
+        }
+        discovery.failures.push(planning_failure(
+            cursor.provider_id.clone(),
+            SearchErrorCode::ProviderUnavailable,
+            "cursor provider is unavailable or no longer eligible",
+        ));
+        return SessionSearchPlan {
+            providers: Vec::new(),
+            failures: discovery.failures,
+            per_provider_deadline_ms: policy.per_provider_deadline_ms,
+        };
+    }
     let mut plan = if routes.is_empty() {
         plan_session_search_default(request, discovery)
     } else {
@@ -1052,6 +1078,7 @@ fn provider_is_eligible(
         return false;
     }
     let mut provider_request = request.clone();
+    provider_request.cursor = None;
     provider_request.filters.content_kinds.clone_from(content);
     provider
         .capabilities
@@ -2927,6 +2954,80 @@ mod tests {
             ..deep
         };
         let plan = plan_session_search_with_policy_and_routes(&request, discovery, &remote, &[]);
+        assert!(plan.failures.is_empty());
+    }
+
+    #[test]
+    fn cursor_plan_targets_only_its_provider() {
+        let session_id = SessionId::new();
+        let request = SessionSearchRequest {
+            query: text_query("needle"),
+            filters: SessionSearchFilters {
+                content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+                ..SessionSearchFilters::default()
+            },
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 10,
+            cursor: Some(SearchCursor {
+                provider_id: "second".to_owned(),
+                query_fingerprint: "fingerprint".to_owned(),
+                value: "20".to_owned(),
+            }),
+            deadline_ms: Some(5_000),
+        };
+        let provider = |id: &str| SessionSearchProviderInfo {
+            plugin_id: id.to_owned(),
+            capabilities: SessionSearchCapabilities {
+                provider_id: id.to_owned(),
+                execution: SearchExecutionKind::Indexed,
+                content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+                features: BTreeSet::from([
+                    SearchFeature::Terms,
+                    SearchFeature::StructuredFilters,
+                    SearchFeature::RelevanceSort,
+                ]),
+                max_hits: 20,
+                max_batch_records: 20,
+                max_batch_text_bytes: 1024,
+            },
+            status: SessionSearchStatus {
+                provider_id: id.to_owned(),
+                state: SearchProviderState::Ready,
+                record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+                normalization_version: CURRENT_NORMALIZATION_VERSION,
+                policy_version: CURRENT_SEARCH_POLICY_VERSION,
+                index_bytes: 0,
+                quota_bytes: 1024,
+                document_count: 0,
+                pending_sessions: 0,
+                coverage: vec![SessionSearchCoverage {
+                    generation: SearchCanonicalGeneration {
+                        session_id,
+                        fingerprint: "generation".to_owned(),
+                        last_sequence: Some(1),
+                    },
+                    content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+                    indexed_through_sequence: Some(1),
+                    complete: true,
+                    indexed_text_bytes: 0,
+                    skipped_records: 0,
+                    truncated_records: 0,
+                    exclusions: Vec::new(),
+                }],
+                degraded_reason: None,
+            },
+        };
+        let plan = plan_session_search_with_policy_and_routes(
+            &request,
+            ListSessionSearchProvidersResponse {
+                providers: vec![provider("first"), provider("second")],
+                failures: Vec::new(),
+            },
+            &SessionSearchPlanPolicy::default(),
+            &[],
+        );
+        assert_eq!(plan.providers.len(), 1);
+        assert_eq!(plan.providers[0].plugin_id, "second");
         assert!(plan.failures.is_empty());
     }
 

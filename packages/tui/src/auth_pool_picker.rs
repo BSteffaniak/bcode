@@ -1,7 +1,7 @@
 //! TUI auth-pool profile picker state.
 
 use bcode_provider_auth_models::AuthPoolSummary;
-use bmux_tui::list::{ListItem, ListState};
+use bmux_tui::list::ListItem;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -10,7 +10,7 @@ use bmux_tui::style::Modifier;
 pub struct AuthPoolPickerApp {
     pools: Vec<AuthPoolSummary>,
     rows: Vec<(usize, usize)>,
-    list: ListState,
+    list: super::filtered_list::FilteredListState,
 }
 
 impl AuthPoolPickerApp {
@@ -24,16 +24,25 @@ impl AuthPoolPickerApp {
                 (0..pool.profiles.len()).map(move |profile_index| (pool_index, profile_index))
             })
             .collect::<Vec<_>>();
-        let mut list = ListState::default();
-        if !rows.is_empty() {
-            list.select(Some(0));
-        }
+        let list = super::filtered_list::FilteredListState::new(rows.len());
         Self { pools, rows, list }
     }
 
-    /// Return mutable list state.
-    pub const fn list_state_mut(&mut self) -> &mut ListState {
-        &mut self.list
+    /// Render this picker's rows through the shared filtered-list owner.
+    pub fn render_list(
+        &mut self,
+        items: &[ListItem],
+        area: bmux_tui::geometry::Rect,
+        frame: &mut bmux_tui::frame::Frame<'_>,
+        theme: super::render::TuiTheme,
+    ) {
+        super::picker_render::render_picker_list(
+            items,
+            self.list.render_state(area.height),
+            area,
+            frame,
+            theme,
+        );
     }
 
     /// Renderable profile rows.
@@ -71,11 +80,7 @@ impl AuthPoolPickerApp {
         if self.rows.is_empty() {
             return;
         }
-        let next = self
-            .list
-            .selected
-            .map_or(0, |index| (index + 1) % self.rows.len());
-        self.list.select(Some(next));
+        self.list.select_next();
     }
 
     /// Move selection up.
@@ -83,14 +88,7 @@ impl AuthPoolPickerApp {
         if self.rows.is_empty() {
             return;
         }
-        let previous = self.list.selected.map_or(0, |index| {
-            if index == 0 {
-                self.rows.len() - 1
-            } else {
-                index - 1
-            }
-        });
-        self.list.select(Some(previous));
+        self.list.select_previous();
     }
 
     /// Select a visible row.
@@ -98,14 +96,13 @@ impl AuthPoolPickerApp {
         if row >= self.rows.len() {
             return false;
         }
-        self.list.select(Some(row));
-        true
+        self.list.select_visible(row)
     }
 
     /// Return selected pool and profile.
     #[must_use]
     pub fn selected(&self) -> Option<(String, String)> {
-        let (pool_index, profile_index) = *self.rows.get(self.list.selected?)?;
+        let (pool_index, profile_index) = *self.rows.get(self.list.selected_source_index()?)?;
         let pool = &self.pools[pool_index];
         Some((
             pool.pool.clone(),

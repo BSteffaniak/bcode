@@ -16,12 +16,13 @@ use bcode_session_search::{
     CURRENT_SEARCH_RECORD_VERSION, OP_APPLY_BATCH, OP_CAPABILITIES, OP_PURGE, OP_REBUILD,
     OP_REMOVE_SESSION, OP_SEARCH, OP_STATUS, ProviderSearchOutcome, PurgeSessionSearchRequest,
     RebuildSessionSearchRequest, RebuildSessionSearchResponse, RemoveSessionSearchRequest,
-    SESSION_SEARCH_INTERFACE_ID, SearchContentKind, SearchExecutionKind, SearchFeature,
-    SearchField, SearchProviderState, SessionSearchCapabilities, SessionSearchHit,
+    SESSION_SEARCH_INTERFACE_ID, SearchContentKind, SearchCursor, SearchExecutionKind,
+    SearchFeature, SearchField, SearchProviderState, SessionSearchCapabilities, SessionSearchHit,
     SessionSearchLocator, SessionSearchRequest, SessionSearchResponse, SessionSearchSort,
     SessionSearchStatus, TextMatchMode, classify_batch_delivery,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -35,7 +36,7 @@ use tantivy::schema::{
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
 const PLUGIN_ID: &str = "bcode.tantivy-session-search";
-const INDEX_SCHEMA_VERSION: u16 = 1;
+const INDEX_SCHEMA_VERSION: u16 = 2;
 const TOKENIZER_VERSION: u16 = 1;
 const DEFAULT_WRITER_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 const MIN_WRITER_MEMORY_BYTES: usize = 15 * 1024 * 1024;
@@ -324,6 +325,13 @@ impl ProviderError {
         }
     }
 
+    const fn invalid_request(message: String) -> Self {
+        Self {
+            code: "invalid_request",
+            message,
+        }
+    }
+
     fn index(error: impl std::fmt::Display) -> Self {
         Self {
             code: "index_error",
@@ -489,12 +497,10 @@ impl TantivySessionSearchPlugin {
         if let Err(error) = capabilities(config).supports_request(request) {
             return ServiceResponse::error("unsupported_query", error.to_string());
         }
-        if request.cursor.is_some() {
-            return ServiceResponse::error(
-                "unsupported_cursor",
-                "Tantivy provider cursors are not implemented in v1",
-            );
-        }
+        let offset = match decode_search_offset(request) {
+            Ok(offset) => offset,
+            Err(error) => return error_response(&error),
+        };
         if cancellation.is_cancelled() {
             return ServiceResponse::error("cancelled", "search cancelled before execution");
         }
@@ -508,13 +514,16 @@ impl TantivySessionSearchPlugin {
         };
         let searcher = engine.reader.searcher();
         let fields = engine.fields;
-        let collector = TopDocs::with_limit(request.limit).order_by_score();
+        let collector = TopDocs::with_limit(request.limit.saturating_add(1))
+            .and_offset(offset)
+            .order_by_score();
         let results = match searcher.search(&query, &collector) {
             Ok(results) => results,
             Err(error) => return error_response(&ProviderError::index(error)),
         };
-        let mut hits = Vec::with_capacity(results.len());
-        for (rank, (score, address)) in results.into_iter().enumerate() {
+        let has_more = results.len() > request.limit;
+        let mut hits = Vec::with_capacity(results.len().min(request.limit));
+        for (rank, (score, address)) in results.into_iter().take(request.limit).enumerate() {
             if cancellation.is_cancelled() {
                 return ServiceResponse::error("cancelled", "search cancelled during result load");
             }
@@ -543,11 +552,16 @@ impl TantivySessionSearchPlugin {
         for (index, hit) in hits.iter_mut().enumerate() {
             hit.provider_rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
         }
+        let next_cursor = has_more.then(|| SearchCursor {
+            provider_id: PLUGIN_ID.to_owned(),
+            query_fingerprint: search_query_fingerprint(request),
+            value: offset.saturating_add(request.limit).to_string(),
+        });
         json_response(&SessionSearchResponse {
             provider_id: PLUGIN_ID.to_owned(),
             outcome: ProviderSearchOutcome::Complete,
             hits,
-            next_cursor: None,
+            next_cursor,
             query_complete: true,
             coverage_complete: coverage_complete_for_request(engine.as_ref(), request),
             searched_content: requested_content(request, config),
@@ -682,7 +696,7 @@ impl TantivySessionSearchPlugin {
             }
             writer.delete_term(Term::from_field_text(
                 engine.fields.record_id,
-                &record.record_id,
+                &provider_document_id(record.locator.session_id, &record.record_id),
             ));
             let document = record_document(engine.fields, record);
             if let Err(error) = writer.add_document(document) {
@@ -1047,12 +1061,19 @@ fn build_schema() -> Schema {
     builder.build()
 }
 
+fn provider_document_id(session_id: SessionId, record_id: &str) -> String {
+    format!("{session_id}:{record_id}")
+}
+
 fn record_document(
     fields: Fields,
     record: &bcode_session_search::SessionSearchRecord,
 ) -> TantivyDocument {
     let mut document = TantivyDocument::default();
-    document.add_text(fields.record_id, &record.record_id);
+    document.add_text(
+        fields.record_id,
+        provider_document_id(record.locator.session_id, &record.record_id),
+    );
     document.add_text(fields.session_id, record.locator.session_id.to_string());
     document.add_u64(fields.sequence, record.locator.sequence);
     document.add_u64(fields.timestamp_ms, record.timestamp_ms);
@@ -1255,11 +1276,16 @@ fn document_hit(
     let session_id = string(fields.session_id, "session_id")?
         .parse::<SessionId>()
         .map_err(ProviderError::index)?;
+    let stored_record_id = string(fields.record_id, "record_id")?;
+    let record_id = stored_record_id
+        .strip_prefix(&format!("{session_id}:"))
+        .unwrap_or(&stored_record_id)
+        .to_owned();
     Ok(SessionSearchHit {
         locator: SessionSearchLocator {
             session_id,
             sequence: u64_value(fields.sequence, "sequence")?,
-            record_id: Some(string(fields.record_id, "record_id")?),
+            record_id: Some(record_id),
         },
         content_kind: parse_content_kind(&string(fields.content_kind, "content_kind")?)?,
         matched_field: parse_field(&string(fields.matched_field, "matched_field")?)?,
@@ -1490,6 +1516,29 @@ fn directory_size(root: &Path) -> u64 {
             Err(_) => total,
         }
     })
+}
+
+fn search_query_fingerprint(request: &SessionSearchRequest) -> String {
+    let mut stable = request.clone();
+    stable.cursor = None;
+    let bytes = serde_json::to_vec(&stable).expect("validated search request serializes");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn decode_search_offset(request: &SessionSearchRequest) -> Result<usize, ProviderError> {
+    let Some(cursor) = &request.cursor else {
+        return Ok(0);
+    };
+    let expected = search_query_fingerprint(request);
+    if cursor.query_fingerprint != expected {
+        return Err(ProviderError::invalid_request(
+            "search cursor does not match this query".to_owned(),
+        ));
+    }
+    cursor
+        .value
+        .parse::<usize>()
+        .map_err(|_| ProviderError::invalid_request("search cursor is invalid".to_owned()))
 }
 
 fn bounded_preview(text: &str) -> (&str, bool) {
@@ -1960,7 +2009,7 @@ mod tests {
         for record in &request.records {
             writer.delete_term(Term::from_field_text(
                 engine.fields.record_id,
-                &record.record_id,
+                &provider_document_id(record.locator.session_id, &record.record_id),
             ));
             writer
                 .add_document(record_document(engine.fields, record))
@@ -2295,6 +2344,111 @@ mod tests {
         assert_eq!(status.document_count, 1);
         assert_eq!(status.coverage[0].indexed_through_sequence, Some(1));
         assert!(!status.coverage[0].complete);
+    }
+
+    #[test]
+    fn prior_document_identity_schema_requires_explicit_rebuild() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        let mut state = PersistedProviderState::new(&config);
+        state.index_schema_version = INDEX_SCHEMA_VERSION - 1;
+        persist_state(root.path(), &state).expect("legacy provider state");
+        let plugin = TantivySessionSearchPlugin::default();
+
+        let status = plugin.status(&config);
+        assert_eq!(status.state, SearchProviderState::Degraded);
+        assert!(
+            status
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|message| message.contains("unsupported schema"))
+        );
+    }
+
+    #[test]
+    fn repeated_canonical_record_ids_remain_isolated_by_session() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        let plugin = TantivySessionSearchPlugin::default();
+        let first_session = SessionId::new();
+        let second_session = SessionId::new();
+        let first = apply_batch_request(first_session, "first-batch", 1, "shared marker first");
+        let second = apply_batch_request(second_session, "second-batch", 1, "shared marker second");
+        assert!(
+            plugin
+                .apply_batch(&config, &first, &ServiceCancellation::default())
+                .error
+                .is_none()
+        );
+        assert!(
+            plugin
+                .apply_batch(&config, &second, &ServiceCancellation::default())
+                .error
+                .is_none()
+        );
+
+        let response: SessionSearchResponse = plugin
+            .search(&config, &request("marker"), &ServiceCancellation::default())
+            .payload_json()
+            .expect("search response");
+        assert_eq!(response.hits.len(), 2);
+        assert_eq!(
+            response
+                .hits
+                .iter()
+                .map(|hit| hit.locator.session_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_session, second_session])
+        );
+    }
+
+    #[test]
+    fn search_cursor_pages_without_duplicates_and_rejects_query_mismatch() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        let plugin = TantivySessionSearchPlugin::default();
+        let session_id = SessionId::new();
+        let engine = plugin.ready_engine(&config).expect("engine");
+        index_records(
+            &engine,
+            &(1..=5)
+                .map(|sequence| record(session_id, sequence, "pagination needle"))
+                .collect::<Vec<_>>(),
+        );
+        drop(engine);
+
+        let mut first_request = request("needle");
+        first_request.limit = 2;
+        let first: SessionSearchResponse = plugin
+            .search(&config, &first_request, &ServiceCancellation::default())
+            .payload_json()
+            .expect("first page");
+        assert_eq!(first.hits.len(), 2);
+        let cursor = first.next_cursor.expect("next cursor");
+
+        let mut second_request = first_request;
+        second_request.cursor = Some(cursor.clone());
+        let second: SessionSearchResponse = plugin
+            .search(&config, &second_request, &ServiceCancellation::default())
+            .payload_json()
+            .expect("second page");
+        assert_eq!(second.hits.len(), 2);
+        assert!(second.next_cursor.is_some());
+        assert!(first.hits.iter().all(|first_hit| {
+            second
+                .hits
+                .iter()
+                .all(|second_hit| second_hit.locator != first_hit.locator)
+        }));
+
+        let mut mismatched = request("different");
+        mismatched.limit = 2;
+        mismatched.cursor = Some(cursor);
+        let error = plugin.search(&config, &mismatched, &ServiceCancellation::default());
+        assert_eq!(
+            error.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid_request")
+        );
     }
 
     #[test]

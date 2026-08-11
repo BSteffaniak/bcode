@@ -83,9 +83,26 @@ if ! grep -q "server ready; accepting clients" "${workdir}/server.log" 2>/dev/nu
     exit 1
 fi
 
-marker="PTYSESSIONSEARCHMARKER"
-session_id="$(cd "${workdir}" && "${bcode_binary}" session create session-search-pty)"
-"${bcode_binary}" send "${session_id}" "${marker} canonical transcript" >/dev/null
+marker="${BCODE_SESSION_SEARCH_PTY_MARKER:-PTYSESSIONSEARCHMARKER}"
+fixture_sessions="${BCODE_SESSION_SEARCH_PTY_FIXTURE_SESSIONS:-1}"
+if [[ ! "${fixture_sessions}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "smoke-session-search-pty: fixture session count must be a positive integer" >&2
+    exit 2
+fi
+session_id=""
+for index in $(seq 1 "${fixture_sessions}"); do
+    session_name="session-search-pty"
+    message="${marker} canonical transcript"
+    if (( fixture_sessions > 1 )); then
+        session_name="${marker} page-${index}"
+        message="pagination fixture ${index}"
+    fi
+    created="$(cd "${workdir}" && "${bcode_binary}" session create "${session_name}")"
+    if [[ -z "${session_id}" ]]; then
+        session_id="${created}"
+    fi
+    "${bcode_binary}" send "${created}" "${message}" >/dev/null
+done
 for _ in {1..100}; do
     if "${bcode_binary}" session search "${marker}" --json \
         | python3 -c 'import json, sys; raise SystemExit(0 if json.load(sys.stdin)["hits"] else 1)' 2>/dev/null; then
@@ -112,6 +129,7 @@ import termios
 import time
 
 binary, probe_binary, session_id, marker, capture_path = sys.argv[1:]
+fixture_sessions = int(os.environ.get("BCODE_SESSION_SEARCH_PTY_FIXTURE_SESSIONS", "1"))
 marker_bytes = marker.encode()
 session_marker = f"#{session_id[:8]}".encode()
 pid, fd = pty.fork()
@@ -124,6 +142,8 @@ opened_search = False
 search_attempted_at = None
 submitted_query = False
 result_visible = False
+next_page_started = False
+next_page_completed = fixture_sessions == 1
 inventory_started = False
 inventory_completed = False
 backfill_started = False
@@ -174,13 +194,24 @@ while time.monotonic() < deadline:
             search_attempted_at = time.monotonic()
         continue
     if opened_search and not submitted_query and b"transcript query" in lower:
-        os.write(fd, marker_bytes + b"\r")
+        query = marker_bytes
+        if fixture_sessions > 1:
+            query = b"content:title " + marker_bytes
+        os.write(fd, query + b"\r")
         submitted_query = True
         continue
-    if submitted_query and not inventory_started and marker_bytes in last_screen:
+    if submitted_query and not next_page_started and marker_bytes in last_screen:
         if b"query complete" not in lower or b"results from" not in lower:
             continue
         result_visible = True
+        if fixture_sessions > 1:
+            os.write(fd, b"\x1b[110;3u")
+            next_page_started = True
+            continue
+        next_page_started = True
+    if next_page_started and not next_page_completed and b"1 results from" in lower:
+        next_page_completed = True
+    if submitted_query and next_page_completed and not inventory_started:
         os.write(fd, b"\x1b[105;3u")
         inventory_started = True
         continue
@@ -256,6 +287,7 @@ if exit_status is None:
 checks = {
     "search route opened": opened_search and submitted_query,
     "ordinary result rendered": result_visible,
+    "next result page completed from TUI": next_page_completed,
     "compatibility inventory completed from TUI": inventory_completed,
     "all-provider backfill completed from TUI": backfill_completed,
     "selected result navigated to canonical transcript": navigated,
@@ -263,7 +295,7 @@ checks = {
 failures = [name for name, passed in checks.items() if not passed]
 if failures:
     print("session-search PTY acceptance failed: " + ", ".join(failures), file=sys.stderr)
-    print(f"state: opened={opened_search} submitted={submitted_query} result={result_visible} inventory={inventory_completed} backfill={backfill_completed} selected={selected_result} navigated={navigated}", file=sys.stderr)
+    print(f"state: opened={opened_search} submitted={submitted_query} result={result_visible} next_page={next_page_completed} inventory={inventory_completed} backfill={backfill_completed} selected={selected_result} navigated={navigated}", file=sys.stderr)
     print(last_screen.decode(errors="replace"), file=sys.stderr)
     sys.exit(1)
 PY
