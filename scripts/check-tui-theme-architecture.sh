@@ -14,6 +14,15 @@ if rg -n -U 'pub fn set_tui_theme_selection[\s\S]{0,1200}update_writable_config'
   fail "theme state persistence must not delegate to writable config mutation"
 fi
 
+if ! rg -q 'permission_modal\(theme\.modal_theme\(\)\)' \
+  packages/tui/src/permission_dialog_render.rs; then
+  fail "permission dialog must derive its component recipe from the renderer-passed resolved theme"
+fi
+
+if rg -n 'semantic_state_theme\(' packages/tui/src --glob '*_render.rs'; then
+  fail "component renderers must consume their passed resolved TuiTheme rather than thread-local theme state"
+fi
+
 if rg -n 'surface\.base' \
   packages/tui/src/theme.rs \
   packages/tui/themes \

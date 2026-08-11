@@ -1,9 +1,10 @@
 //! TUI session fork/clone dialog state.
 
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
+use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
-use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
 
 /// Fork/clone operation kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,17 @@ pub struct SessionForkDialogSubmission {
     pub install_draft: bool,
 }
 
+/// Outcome from one session fork/clone dialog event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionForkDialogOutcome {
+    /// Dialog state changed and remains open.
+    Handled,
+    /// Submit the current dialog values.
+    Submit(SessionForkDialogSubmission),
+    /// Close without submitting.
+    Canceled,
+}
+
 /// Session fork/clone dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionForkDialog {
@@ -113,11 +125,6 @@ impl SessionForkDialog {
     #[must_use]
     pub const fn name(&self) -> &TextInputState {
         &self.name
-    }
-
-    /// Return mutable name input state.
-    pub const fn name_mut(&mut self) -> &mut TextInputState {
-        &mut self.name
     }
 
     /// Update latest name input content area.
@@ -189,6 +196,55 @@ impl SessionForkDialog {
         }
     }
 
+    /// Handle one terminal event through the dialog's component policies.
+    pub fn handle_event(
+        &mut self,
+        event: &Event,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> SessionForkDialogOutcome {
+        match event {
+            Event::Paste(text) if self.focus == SessionForkDialogFocus::Name => {
+                let _ =
+                    TextInputControl::new(&name_input_policy()).handle_paste(&mut self.name, text);
+            }
+            Event::Key(stroke) => match stroke.key {
+                bmux_keyboard::KeyCode::Escape => return SessionForkDialogOutcome::Canceled,
+                bmux_keyboard::KeyCode::Tab => self.focus_next(),
+                bmux_keyboard::KeyCode::Enter => {
+                    return SessionForkDialogOutcome::Submit(self.submission());
+                }
+                bmux_keyboard::KeyCode::Left => self.value_previous(),
+                bmux_keyboard::KeyCode::Right => self.value_next(),
+                _ if self.focus == SessionForkDialogFocus::Name => {
+                    if let Some(motion) = keymap.editor_selection_motion_for_key(*stroke) {
+                        self.name
+                            .buffer_mut()
+                            .move_cursor_with_selection(motion, SelectionMode::Extend);
+                        self.name.sync_scroll_to_cursor(&name_input_policy());
+                    } else if let Some(command) = keymap.editor_command_for_key(*stroke) {
+                        self.name.buffer_mut().apply_command(command);
+                        self.name.sync_scroll_to_cursor(&name_input_policy());
+                    } else {
+                        let _ = TextInputControl::new(&name_input_policy())
+                            .handle_key(&mut self.name, *stroke);
+                    }
+                }
+                _ => {}
+            },
+            Event::Mouse(mouse) if self.focus == SessionForkDialogFocus::Name => {
+                let _ = TextInputControl::new(&name_input_policy())
+                    .handle_mouse(&mut self.name, *mouse);
+            }
+            Event::Focus(_)
+            | Event::Resize(_)
+            | Event::Tick
+            | Event::User(_)
+            | Event::Paste(_)
+            | Event::Mouse(_) => {}
+        }
+        SessionForkDialogOutcome::Handled
+    }
+
     /// Convert current state into a submission.
     #[must_use]
     pub fn submission(&self) -> SessionForkDialogSubmission {
@@ -223,7 +279,15 @@ const fn tab_stroke() -> bmux_keyboard::KeyStroke {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionForkDialog, SessionForkDialogFocus, SessionForkDialogMode};
+    use super::{
+        SessionForkDialog, SessionForkDialogFocus, SessionForkDialogMode, SessionForkDialogOutcome,
+    };
+    use bmux_keyboard::{KeyCode, KeyStroke};
+    use bmux_tui::event::Event;
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyStroke::simple(code))
+    }
 
     #[test]
     fn fork_dialog_defaults_switch_and_install_draft() {
@@ -276,5 +340,31 @@ mod tests {
         assert_eq!(submission.name.as_deref(), Some("custom"));
         assert!(!submission.switch_after_create);
         assert!(!submission.install_draft);
+    }
+
+    #[test]
+    fn event_policy_owns_focus_choice_submission_and_cancel() {
+        let mut dialog = SessionForkDialog::new(SessionForkDialogMode::Fork, "custom");
+        let keymap =
+            super::super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+        assert_eq!(
+            dialog.handle_event(&key(KeyCode::Tab), &keymap),
+            SessionForkDialogOutcome::Handled
+        );
+        assert_eq!(dialog.focus(), SessionForkDialogFocus::SwitchAfterCreate);
+        assert_eq!(
+            dialog.handle_event(&key(KeyCode::Right), &keymap),
+            SessionForkDialogOutcome::Handled
+        );
+        assert!(!dialog.switch_after_create());
+        assert!(matches!(
+            dialog.handle_event(&key(KeyCode::Enter), &keymap),
+            SessionForkDialogOutcome::Submit(_)
+        ));
+        assert_eq!(
+            dialog.handle_event(&key(KeyCode::Escape), &keymap),
+            SessionForkDialogOutcome::Canceled
+        );
     }
 }

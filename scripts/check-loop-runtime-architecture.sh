@@ -1553,6 +1553,13 @@ if ! rg -q 'TextInputControl::new\(&composer_policy\(\)\)\.handle_key\(app\.comp
   violations=1
 fi
 
+if ! rg -q 'match dialog\.handle_event\(event, keymap\)' packages/tui/src/chat_loop.rs \
+  || ! rg -q 'pub fn handle_event\(' packages/tui/src/session_fork_dialog.rs \
+  || ! rg -q 'pub fn handle_event\(' packages/tui/src/wt_create_dialog.rs; then
+  echo "Runtime architecture violation: session-fork and worktree-create dialog state must own terminal event policy." >&2
+  violations=1
+fi
+
 for dialog_state in timeline thinking; do
   if ! rg -q 'pub fn handle_key\(' "packages/tui/src/${dialog_state}_dialog.rs" \
     || ! rg -q 'match dialog\.handle_key\(stroke\)' packages/tui/src/chat_loop.rs; then

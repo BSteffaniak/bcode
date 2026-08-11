@@ -588,10 +588,11 @@ impl BcodeRuntimeModel {
             return super::invalidation::UiInvalidation::Structural;
         }
         if self.loop_state.has_session_fork_flow() {
-            match self
-                .loop_state
-                .handle_session_fork_event(&self.chat, &event)
-            {
+            match self.loop_state.handle_session_fork_event(
+                &self.chat,
+                &event,
+                self.settings.keymap(),
+            ) {
                 super::chat_loop::SessionForkRootOutcome::Handled => {}
                 super::chat_loop::SessionForkRootOutcome::Canceled => {
                     self.chat.app.set_status("fork canceled".to_owned());

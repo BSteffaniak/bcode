@@ -1,9 +1,10 @@
 //! TUI worktree create dialog state.
 
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
+use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
-use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
 
 /// Focused field in the worktree create dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +15,28 @@ pub enum WorktreeCreateFocus {
     Target,
     /// Base ref strategy field.
     Base,
+}
+
+/// Validated worktree-create submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeCreateSubmission {
+    /// Requested worktree name.
+    pub name: String,
+    /// Session placement target.
+    pub target: WorktreeCreateTarget,
+    /// Base-ref strategy.
+    pub base: WorktreeCreateBase,
+}
+
+/// Outcome from one worktree-create dialog event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeCreateDialogOutcome {
+    /// Dialog state changed and remains open.
+    Handled,
+    /// Submit the validated worktree request.
+    Create(WorktreeCreateSubmission),
+    /// Close without creating a worktree.
+    Canceled,
 }
 
 /// Worktree create dialog state.
@@ -62,11 +85,6 @@ impl WorktreeCreateDialog {
         &self.name
     }
 
-    /// Return name input state mutably.
-    pub const fn name_mut(&mut self) -> &mut TextInputState {
-        &mut self.name
-    }
-
     /// Update the latest name input content area.
     pub fn set_name_content_area(&mut self, area: Rect) {
         self.name.set_content_area(area, &name_input_policy());
@@ -99,6 +117,68 @@ impl WorktreeCreateDialog {
     #[must_use]
     pub fn name_text(&self) -> String {
         self.name.buffer().text().trim().to_owned()
+    }
+
+    /// Handle one terminal event through the dialog's component policies.
+    pub fn handle_event(
+        &mut self,
+        event: &Event,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> WorktreeCreateDialogOutcome {
+        match event {
+            Event::Paste(text) if self.focus == WorktreeCreateFocus::Name => {
+                let _ =
+                    TextInputControl::new(&name_input_policy()).handle_paste(&mut self.name, text);
+            }
+            Event::Key(stroke) => match stroke.key {
+                bmux_keyboard::KeyCode::Escape => return WorktreeCreateDialogOutcome::Canceled,
+                bmux_keyboard::KeyCode::Tab => self.focus_next(),
+                bmux_keyboard::KeyCode::Enter => {
+                    let name = self.name_text();
+                    if name.is_empty() {
+                        self.set_status("worktree name is required".to_owned());
+                    } else {
+                        return WorktreeCreateDialogOutcome::Create(WorktreeCreateSubmission {
+                            name,
+                            target: self.target,
+                            base: self.base,
+                        });
+                    }
+                }
+                bmux_keyboard::KeyCode::Left if self.focus != WorktreeCreateFocus::Name => {
+                    self.previous_choice();
+                }
+                bmux_keyboard::KeyCode::Right if self.focus != WorktreeCreateFocus::Name => {
+                    self.next_choice();
+                }
+                _ if self.focus == WorktreeCreateFocus::Name => {
+                    if let Some(motion) = keymap.editor_selection_motion_for_key(*stroke) {
+                        self.name
+                            .buffer_mut()
+                            .move_cursor_with_selection(motion, SelectionMode::Extend);
+                        self.name.sync_scroll_to_cursor(&name_input_policy());
+                    } else if let Some(command) = keymap.editor_command_for_key(*stroke) {
+                        self.name.buffer_mut().apply_command(command);
+                        self.name.sync_scroll_to_cursor(&name_input_policy());
+                    } else {
+                        let _ = TextInputControl::new(&name_input_policy())
+                            .handle_key(&mut self.name, *stroke);
+                    }
+                }
+                _ => {}
+            },
+            Event::Mouse(mouse) if self.focus == WorktreeCreateFocus::Name => {
+                let _ = TextInputControl::new(&name_input_policy())
+                    .handle_mouse(&mut self.name, *mouse);
+            }
+            Event::Focus(_)
+            | Event::Resize(_)
+            | Event::Tick
+            | Event::User(_)
+            | Event::Paste(_)
+            | Event::Mouse(_) => {}
+        }
+        WorktreeCreateDialogOutcome::Handled
     }
 
     /// Move focus to the next field.
@@ -259,7 +339,13 @@ impl WorktreeCreateBase {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorktreeCreateDialog, WorktreeCreateFocus};
+    use super::{WorktreeCreateDialog, WorktreeCreateDialogOutcome, WorktreeCreateFocus};
+    use bmux_keyboard::{KeyCode, KeyStroke};
+    use bmux_tui::event::Event;
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyStroke::simple(code))
+    }
 
     #[test]
     fn form_state_drives_wrapping_focus_order() {
@@ -272,5 +358,36 @@ mod tests {
         assert_eq!(dialog.focus(), WorktreeCreateFocus::Base);
         dialog.focus_next();
         assert_eq!(dialog.focus(), WorktreeCreateFocus::Name);
+    }
+
+    #[test]
+    fn event_policy_owns_validation_focus_choices_submission_and_cancel() {
+        let keymap =
+            super::super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut empty = WorktreeCreateDialog::new("", true);
+        assert_eq!(
+            empty.handle_event(&key(KeyCode::Enter), &keymap),
+            WorktreeCreateDialogOutcome::Handled
+        );
+        assert_eq!(empty.status(), "worktree name is required");
+
+        let mut dialog = WorktreeCreateDialog::new("work", true);
+        assert_eq!(
+            dialog.handle_event(&key(KeyCode::Tab), &keymap),
+            WorktreeCreateDialogOutcome::Handled
+        );
+        assert_eq!(dialog.focus(), WorktreeCreateFocus::Target);
+        assert_eq!(
+            dialog.handle_event(&key(KeyCode::Right), &keymap),
+            WorktreeCreateDialogOutcome::Handled
+        );
+        assert!(matches!(
+            dialog.handle_event(&key(KeyCode::Enter), &keymap),
+            WorktreeCreateDialogOutcome::Create(_)
+        ));
+        assert_eq!(
+            dialog.handle_event(&key(KeyCode::Escape), &keymap),
+            WorktreeCreateDialogOutcome::Canceled
+        );
     }
 }

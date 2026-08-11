@@ -68,9 +68,8 @@ pub fn dialog_area(area: Rect, theme: TuiTheme) -> Rect {
     modal_frame(theme).panel_area(area)
 }
 
-fn modal_frame(_theme: TuiTheme) -> ModalFrame {
-    let presented = super::render::semantic_state_theme();
-    bcode_tui_components::permission::permission_modal(presented.component_theme())
+fn modal_frame(theme: TuiTheme) -> ModalFrame {
+    bcode_tui_components::permission::permission_modal(theme.modal_theme())
 }
 
 /// Return the permission action button hit boxes for the current dialog state.

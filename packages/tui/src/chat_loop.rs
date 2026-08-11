@@ -898,60 +898,32 @@ impl ChatLoopState {
         &mut self,
         chat: &ActiveChat,
         event: &Event,
+        keymap: &super::keymap::BmuxKeyMap,
     ) -> SessionForkRootOutcome {
-        use bmux_tui_components::text_input::TextInputControl;
-
         if let Some(dialog) = self.session_fork_dialog.as_mut() {
-            match event {
-                Event::Paste(text)
-                    if dialog.focus()
-                        == super::session_fork_dialog::SessionForkDialogFocus::Name =>
-                {
-                    let _ = TextInputControl::new(&super::session_fork_dialog::name_input_policy())
-                        .handle_paste(dialog.name_mut(), text);
+            match dialog.handle_event(event, keymap) {
+                super::session_fork_dialog::SessionForkDialogOutcome::Handled => {
+                    return SessionForkRootOutcome::Handled;
                 }
-                Event::Key(stroke) => match stroke.key {
-                    bmux_keyboard::KeyCode::Escape => {
-                        self.session_fork_dialog = None;
-                        return SessionForkRootOutcome::Canceled;
-                    }
-                    bmux_keyboard::KeyCode::Tab => dialog.focus_next(),
-                    bmux_keyboard::KeyCode::Enter => {
-                        let submission = dialog.submission();
-                        self.session_fork_dialog = None;
-                        let session_id = chat.session_id.expect("fork dialog has active session");
-                        if submission.mode
-                            == super::session_fork_dialog::SessionForkDialogMode::Clone
-                        {
-                            return SessionForkRootOutcome::CreateClone {
-                                session_id,
-                                submission,
-                            };
-                        }
-                        return SessionForkRootOutcome::LoadPrompts {
+                super::session_fork_dialog::SessionForkDialogOutcome::Canceled => {
+                    self.session_fork_dialog = None;
+                    return SessionForkRootOutcome::Canceled;
+                }
+                super::session_fork_dialog::SessionForkDialogOutcome::Submit(submission) => {
+                    self.session_fork_dialog = None;
+                    let session_id = chat.session_id.expect("fork dialog has active session");
+                    if submission.mode == super::session_fork_dialog::SessionForkDialogMode::Clone {
+                        return SessionForkRootOutcome::CreateClone {
                             session_id,
                             submission,
                         };
                     }
-                    bmux_keyboard::KeyCode::Left => dialog.value_previous(),
-                    bmux_keyboard::KeyCode::Right => dialog.value_next(),
-                    _ if dialog.focus()
-                        == super::session_fork_dialog::SessionForkDialogFocus::Name =>
-                    {
-                        let _ =
-                            TextInputControl::new(&super::session_fork_dialog::name_input_policy())
-                                .handle_key(dialog.name_mut(), *stroke);
-                    }
-                    _ => {}
-                },
-                Event::Focus(_)
-                | Event::Resize(_)
-                | Event::Tick
-                | Event::User(_)
-                | Event::Paste(_)
-                | Event::Mouse(_) => {}
+                    return SessionForkRootOutcome::LoadPrompts {
+                        session_id,
+                        submission,
+                    };
+                }
             }
-            return SessionForkRootOutcome::Handled;
         }
         let picker = self
             .fork_prompt_picker
@@ -1187,84 +1159,26 @@ impl ChatLoopState {
         keymap: &super::keymap::BmuxKeyMap,
         event: &Event,
     ) -> WorktreeCreateDialogRootOutcome {
-        use bmux_tui_components::text_input::TextInputControl;
-
         let Some(dialog) = self.worktree_create_dialog.as_mut() else {
             return WorktreeCreateDialogRootOutcome::Unhandled;
         };
-        match event {
-            Event::Paste(text)
-                if dialog.focus() == super::wt_create_dialog::WorktreeCreateFocus::Name =>
-            {
-                let _ = TextInputControl::new(&super::wt_create_dialog::name_input_policy())
-                    .handle_paste(dialog.name_mut(), text);
+        match dialog.handle_event(event, keymap) {
+            super::wt_create_dialog::WorktreeCreateDialogOutcome::Handled => {
+                WorktreeCreateDialogRootOutcome::Handled
             }
-            Event::Key(stroke) => match stroke.key {
-                bmux_keyboard::KeyCode::Escape => {
-                    self.worktree_create_dialog = None;
-                    return WorktreeCreateDialogRootOutcome::Canceled;
-                }
-                bmux_keyboard::KeyCode::Tab => dialog.focus_next(),
-                bmux_keyboard::KeyCode::Enter => {
-                    let name = dialog.name_text();
-                    if name.is_empty() {
-                        dialog.set_status("worktree name is required".to_owned());
-                        return WorktreeCreateDialogRootOutcome::Handled;
-                    }
-                    let outcome = WorktreeCreateDialogRootOutcome::Create {
-                        name,
-                        target: dialog.target(),
-                        base: dialog.base(),
-                    };
-                    self.worktree_create_dialog = None;
-                    return outcome;
-                }
-                bmux_keyboard::KeyCode::Left
-                    if dialog.focus() != super::wt_create_dialog::WorktreeCreateFocus::Name =>
-                {
-                    dialog.previous_choice();
-                }
-                bmux_keyboard::KeyCode::Right
-                    if dialog.focus() != super::wt_create_dialog::WorktreeCreateFocus::Name =>
-                {
-                    dialog.next_choice();
-                }
-                _ if dialog.focus() == super::wt_create_dialog::WorktreeCreateFocus::Name => {
-                    if let Some(motion) = keymap.editor_selection_motion_for_key(*stroke) {
-                        dialog.name_mut().buffer_mut().move_cursor_with_selection(
-                            motion,
-                            bmux_text_edit::SelectionMode::Extend,
-                        );
-                        dialog
-                            .name_mut()
-                            .sync_scroll_to_cursor(&super::wt_create_dialog::name_input_policy());
-                    } else if let Some(command) = keymap.editor_command_for_key(*stroke) {
-                        dialog.name_mut().buffer_mut().apply_command(command);
-                        dialog
-                            .name_mut()
-                            .sync_scroll_to_cursor(&super::wt_create_dialog::name_input_policy());
-                    } else {
-                        let _ =
-                            TextInputControl::new(&super::wt_create_dialog::name_input_policy())
-                                .handle_key(dialog.name_mut(), *stroke);
-                    }
-                }
-                _ => {}
-            },
-            Event::Mouse(mouse)
-                if dialog.focus() == super::wt_create_dialog::WorktreeCreateFocus::Name =>
-            {
-                let _ = TextInputControl::new(&super::wt_create_dialog::name_input_policy())
-                    .handle_mouse(dialog.name_mut(), *mouse);
+            super::wt_create_dialog::WorktreeCreateDialogOutcome::Canceled => {
+                self.worktree_create_dialog = None;
+                WorktreeCreateDialogRootOutcome::Canceled
             }
-            Event::Focus(_)
-            | Event::Resize(_)
-            | Event::Tick
-            | Event::User(_)
-            | Event::Paste(_)
-            | Event::Mouse(_) => {}
+            super::wt_create_dialog::WorktreeCreateDialogOutcome::Create(submission) => {
+                self.worktree_create_dialog = None;
+                WorktreeCreateDialogRootOutcome::Create {
+                    name: submission.name,
+                    target: submission.target,
+                    base: submission.base,
+                }
+            }
         }
-        WorktreeCreateDialogRootOutcome::Handled
     }
 
     pub fn handle_timeline_dialog_key(
