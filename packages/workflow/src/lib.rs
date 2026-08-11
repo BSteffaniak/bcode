@@ -12826,6 +12826,41 @@ where
         }
     }
 
+    /// Create a daemon-hosted agent step from its typed prompt configuration.
+    ///
+    /// Prefer this over [`Step::configured_task`] with [`NodeKind::Agent`]: the configuration is
+    /// validated here, so an invalid prompt contract is reported at construction rather than
+    /// surfacing later as a receipt-reconciliation failure.
+    ///
+    /// The step's own operation is an identity pass-through. The daemon executes the agent turn and
+    /// materializes its validated output; the closure exists only so the node participates in typed
+    /// composition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `configuration` is not a valid prompt contract or cannot be
+    /// serialized.
+    pub fn agent(
+        name: impl Into<String>,
+        configuration: &WorkflowPromptConfiguration,
+    ) -> Result<Self, WorkflowError>
+    where
+        I: Into<O>,
+    {
+        configuration.validate()?;
+        let configuration =
+            serde_json::to_value(configuration).map_err(|error| WorkflowError::Build {
+                path: "prompt.configuration".to_string(),
+                message: format!("agent configuration cannot be serialized: {error}"),
+            })?;
+        Ok(Self::configured_task(
+            name,
+            NodeKind::Agent,
+            configuration,
+            |input: I, _context| async move { Ok(input.into()) },
+        ))
+    }
+
     /// Select where a daemon-hosted agent leaf executes.
     ///
     /// # Panics
@@ -14897,6 +14932,58 @@ fn ensure_acyclic(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    fn valid_prompt_configuration() -> WorkflowPromptConfiguration {
+        WorkflowPromptConfiguration {
+            version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_target: PromptContextTarget::FreshIsolated,
+            agent_profile: "build".to_string(),
+            provider: None,
+            model: None,
+            structured_output: PromptStructuredOutputPolicy {
+                schema: ValueSchema::of::<u32>(),
+                strict: true,
+            },
+            read_only: true,
+            tool_capability: WorkflowToolCapability::ReadOnly,
+            tool_allowlist: Vec::new(),
+            timeout_ms: 30_000,
+            prompt_mode: "json_input".to_string(),
+            system_prompt: String::new(),
+        }
+    }
+
+    #[test]
+    fn agent_step_builds_an_agent_node_carrying_its_prompt_contract() {
+        let configuration = valid_prompt_configuration();
+        let step =
+            Step::<u32, u32>::agent("agent", &configuration).expect("valid prompt configuration");
+        let flow = WorkflowBuilder::new("agent-flow", step)
+            .build()
+            .expect("workflow builds");
+        let definition = flow.definition();
+        let node = definition.nodes.get("agent").expect("agent node");
+        assert_eq!(node.kind, NodeKind::Agent);
+        // The stored configuration must round-trip as the typed contract, which is what receipt
+        // reconciliation later requires.
+        let stored: WorkflowPromptConfiguration =
+            serde_json::from_value(node.configuration.clone()).expect("typed prompt contract");
+        assert_eq!(stored, configuration);
+    }
+
+    #[test]
+    fn agent_step_rejects_an_invalid_prompt_contract_at_construction() {
+        // An unsupported contract version is exactly the class of error that previously escaped
+        // construction and only surfaced as a receipt-reconciliation failure at runtime.
+        let mut configuration = valid_prompt_configuration();
+        configuration.version = WORKFLOW_PROMPT_CONFIGURATION_VERSION + 1;
+        let error = Step::<u32, u32>::agent("agent", &configuration)
+            .expect_err("invalid prompt configuration must be rejected");
+        assert!(
+            matches!(error, WorkflowError::Build { .. }),
+            "expected a build error, got {error:?}"
+        );
+    }
 
     #[allow(clippy::too_many_lines)]
     fn authored_document() -> WorkflowAuthoringDocument {
