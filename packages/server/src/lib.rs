@@ -52244,17 +52244,38 @@ library = "test"
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let definition = bcode_workflow::WorkflowBuilder::new(
-                "restore",
-                bcode_workflow::Step::task(
-                    "agent",
-                    |value: u32, _context| async move { Ok(value) },
-                ),
-            )
-            .build()
-            .expect("workflow")
-            .definition()
-            .clone();
+            // The receipt reconciled below is a workflow prompt receipt, so the node must carry
+            // prompt configuration. A plain task node has `null` configuration, which reconciliation
+            // rejects, leaving the run stuck in `Running`.
+            let value_schema = bcode_workflow::ValueSchema {
+                type_name: "u32".to_string(),
+                schema: serde_json::json!({"type": "integer", "minimum": 0}),
+            };
+            let definition = bcode_workflow::WorkflowDefinition {
+                schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: "restore".to_string(),
+                input: value_schema.clone(),
+                output: value_schema.clone(),
+                nodes: BTreeMap::from([(
+                    "agent".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "agent".to_string(),
+                        name: "agent".to_string(),
+                        kind: bcode_workflow::NodeKind::Agent,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                        input: value_schema.clone(),
+                        output: value_schema.clone(),
+                        resources: Vec::new(),
+                        configuration: test_workflow_prompt_configuration(
+                            value_schema.clone(),
+                            bcode_workflow::PromptContextTarget::FreshIsolated,
+                        ),
+                    },
+                )]),
+                entries: vec!["agent".to_string()],
+                exits: vec!["agent".to_string()],
+                edges: Vec::new(),
+            };
             store
                 .persist_definition("restore", 1, &definition)
                 .expect("definition");
@@ -53121,17 +53142,38 @@ library = "test"
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let definition = bcode_workflow::WorkflowBuilder::new(
-                "observe",
-                bcode_workflow::Step::task(
-                    "agent",
-                    |value: u32, _context| async move { Ok(value) },
-                ),
-            )
-            .build()
-            .expect("workflow")
-            .definition()
-            .clone();
+            // The receipt below is a workflow prompt receipt, so the node must carry prompt
+            // configuration. A plain task node has `null` configuration and reconciliation rejects
+            // it as invalid.
+            let value_schema = bcode_workflow::ValueSchema {
+                type_name: "u32".to_string(),
+                schema: serde_json::json!({"type": "integer", "minimum": 0}),
+            };
+            let definition = bcode_workflow::WorkflowDefinition {
+                schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: "observe".to_string(),
+                input: value_schema.clone(),
+                output: value_schema.clone(),
+                nodes: BTreeMap::from([(
+                    "agent".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "agent".to_string(),
+                        name: "agent".to_string(),
+                        kind: bcode_workflow::NodeKind::Agent,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                        input: value_schema.clone(),
+                        output: value_schema.clone(),
+                        resources: Vec::new(),
+                        configuration: test_workflow_prompt_configuration(
+                            value_schema.clone(),
+                            bcode_workflow::PromptContextTarget::FreshIsolated,
+                        ),
+                    },
+                )]),
+                entries: vec!["agent".to_string()],
+                exits: vec!["agent".to_string()],
+                edges: Vec::new(),
+            };
             store
                 .persist_definition("observe", 1, &definition)
                 .expect("definition");
@@ -53341,14 +53383,14 @@ library = "test"
                         kind: bcode_workflow::NodeKind::Agent,
                         dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
-                        output: schema,
+                        output: schema.clone(),
                         resources: Vec::new(),
-                        configuration: serde_json::json!({
-                            "prompt_mode": "json_input",
-                            "loop_role": "implementation",
-                            "system_prompt": "test",
-                            "read_only": true,
-                        }),
+                        // Reconciliation parses this as a versioned `WorkflowPromptConfiguration`,
+                        // so it must be the real contract rather than an ad-hoc object.
+                        configuration: test_workflow_prompt_configuration(
+                            schema,
+                            bcode_workflow::PromptContextTarget::FreshIsolated,
+                        ),
                     },
                 )]),
                 entries: vec!["loop.implementation".to_string()],
