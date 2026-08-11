@@ -1963,6 +1963,13 @@ struct OpenAiErrorBody {
     r#type: Option<String>,
 }
 
+#[derive(Debug)]
+struct ParsedHttpError {
+    message: String,
+    code: Option<String>,
+    error_type: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
     Finished,
@@ -5619,7 +5626,9 @@ fn build_responses_request(
             .uses_codex_request_shape()
             .then(|| request.session_id.to_string()),
         temperature: request.parameters.temperature,
-        max_output_tokens: request.parameters.max_output_tokens,
+        max_output_tokens: (!settings.dialect.uses_codex_request_shape())
+            .then_some(request.parameters.max_output_tokens)
+            .flatten(),
         top_p: request.parameters.top_p,
     };
     let mut body = serde_json::to_value(typed_request).map_err(|error| {
@@ -9036,23 +9045,20 @@ fn error_from_status_and_headers(
     headers: Option<&HeaderMap>,
     body: &str,
 ) -> ProviderError {
-    let parsed = serde_json::from_str::<ErrorResponseBody>(body).ok();
+    let parsed = parse_http_error(body);
     let provider_detail = parsed
         .as_ref()
-        .and_then(|body| body.error.as_ref())
         .map(|error| sanitize_provider_diagnostic(&error.message));
     let message = provider_detail
         .clone()
         .unwrap_or_else(|| format!("provider request failed with HTTP status {status}"));
     let code = parsed
         .as_ref()
-        .and_then(|body| body.error.as_ref())
-        .and_then(|error| error.code.clone().or_else(|| error.r#type.clone()))
+        .and_then(|error| error.code.clone().or_else(|| error.error_type.clone()))
         .unwrap_or_else(|| format!("http_{status}"));
     let error_type = parsed
         .as_ref()
-        .and_then(|body| body.error.as_ref())
-        .and_then(|error| error.r#type.as_deref());
+        .and_then(|error| error.error_type.as_deref());
     let category = category_from_openai_error(status, &code, error_type, &message);
     let mut error = provider_error(code.clone(), category, message);
     if matches!(category, ProviderErrorCategory::Auth) {
@@ -9086,6 +9092,33 @@ fn error_from_status_and_headers(
         error.retry = retry_hint_from_response(headers, body).map(Box::new);
     }
     error
+}
+
+fn parse_http_error(body: &str) -> Option<ParsedHttpError> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.get("detail").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("detail").and_then(serde_json::Value::as_str))?;
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("code").and_then(serde_json::Value::as_str))
+        .map(str::to_string);
+    let error_type = error
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("type").and_then(serde_json::Value::as_str))
+        .map(str::to_string);
+    Some(ParsedHttpError {
+        message: message.to_string(),
+        code,
+        error_type,
+    })
 }
 
 fn openai_request_id(headers: &HeaderMap) -> Option<String> {
@@ -11616,6 +11649,33 @@ mod tests {
     }
 
     #[test]
+    fn responses_output_limit_respects_surface_capability() {
+        let mut request = test_request(Vec::new());
+        request.parameters.max_output_tokens = Some(64_000);
+
+        let public_body = build_responses_request(
+            &test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi),
+            &request,
+            "model",
+        )
+        .expect("public Responses request should build");
+        assert_eq!(
+            public_body
+                .get("max_output_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(64_000)
+        );
+
+        let codex_body = build_responses_request(
+            &test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex),
+            &request,
+            "model",
+        )
+        .expect("ChatGPT Codex request should build");
+        assert!(codex_body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
     fn responses_api_request_maps_typed_parallel_tool_policy() {
         let request = test_request_with_tool(vec![text_message(MessageRole::User, "hello")]);
         let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
@@ -12314,6 +12374,49 @@ mod tests {
                     && value.contains("rs_1")
                     && value.contains("encrypted")
         )));
+    }
+
+    #[test]
+    fn alternate_json_http_error_shapes_preserve_sanitized_provider_detail() {
+        for (body, expected_message, expected_code, expected_type) in [
+            (
+                r#"{"detail":"Unsupported parameter: reasoning.summary","code":"invalid_parameter","type":"invalid_request_error"}"#,
+                "Unsupported parameter: reasoning.summary",
+                "invalid_parameter",
+                Some("invalid_request_error"),
+            ),
+            (
+                r#"{"error":"model is unavailable","code":"model_not_found"}"#,
+                "model is unavailable",
+                "model_not_found",
+                None,
+            ),
+            (
+                r#"{"error":{"detail":"invalid secret=do-not-expose","type":"invalid_request_error"}}"#,
+                "invalid secret=[REDACTED]",
+                "invalid_request_error",
+                Some("invalid_request_error"),
+            ),
+        ] {
+            let error = error_from_status_and_headers(400, None, body);
+
+            assert_eq!(error.message, expected_message);
+            assert_eq!(error.provider_message.as_deref(), Some(expected_message));
+            assert_eq!(error.code, expected_code);
+            assert_eq!(
+                error
+                    .diagnostic_context
+                    .get("error_type")
+                    .map(String::as_str),
+                expected_type
+            );
+            assert!(matches!(
+                error.sources.as_slice(),
+                [ProviderErrorSource { message: Some(message), .. }]
+                    if message == expected_message
+            ));
+            assert!(!format!("{error:?}").contains("do-not-expose"));
+        }
     }
 
     #[test]
