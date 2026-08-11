@@ -238,13 +238,17 @@ mod tests {
     async fn wait_latest(
         coordinator: &mut MarkdownProjectionCoordinator,
     ) -> MarkdownProjectionCompletion {
-        for _ in 0..100 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
             if let Some(completion) = coordinator.try_latest_completion() {
                 return completion;
             }
+            assert!(
+                Instant::now() < deadline,
+                "Markdown projection worker did not complete"
+            );
             sleep(Duration::from_millis(2)).await;
         }
-        panic!("Markdown projection worker did not complete");
     }
 
     fn rendered(completion: &MarkdownProjectionCompletion) -> &MarkdownRenderResult {
