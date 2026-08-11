@@ -1,12 +1,24 @@
 //! TUI provider picker state.
 
 use bcode_ipc::PluginServiceSummary;
+use bmux_tui::event::Event;
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
+
+/// Outcome from one provider-picker event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderPickerOutcome {
+    /// Picker state changed and remains open.
+    Continue,
+    /// Continue to model selection with the selected provider.
+    Select(Option<String>),
+    /// Close without choosing a provider.
+    Cancel,
+}
 
 /// Model provider picker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +82,44 @@ impl ProviderPickerApp {
         self.list.replace_indices(filtered_indices);
     }
 
+    /// Handle one terminal event through picker-owned input and selection policy.
+    pub fn handle_event(
+        &mut self,
+        event: &Event,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> ProviderPickerOutcome {
+        match event {
+            Event::Paste(text) => {
+                let _ = super::text_input_flow::handle_paste(&mut self.filter, text);
+                self.refresh_filter();
+            }
+            Event::Key(stroke) => match stroke.key {
+                bmux_keyboard::KeyCode::Escape => return ProviderPickerOutcome::Cancel,
+                bmux_keyboard::KeyCode::Enter => {
+                    return ProviderPickerOutcome::Select(self.selected_provider_id());
+                }
+                bmux_keyboard::KeyCode::Up => self.select_previous(),
+                bmux_keyboard::KeyCode::Down => self.select_next(),
+                _ => {
+                    if super::text_input_flow::handle_key(&mut self.filter, keymap, *stroke)
+                        != bmux_tui_components::text_input::TextInputOutcome::Ignored
+                    {
+                        self.refresh_filter();
+                    }
+                }
+            },
+            Event::Mouse(mouse) => {
+                if let Some(row) = super::picker_mouse::picker_row_from_mouse(*mouse)
+                    && self.select_visible(row)
+                {
+                    return ProviderPickerOutcome::Select(self.selected_provider_id());
+                }
+            }
+            Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) => {}
+        }
+        ProviderPickerOutcome::Continue
+    }
+
     /// Move selection down.
     pub fn select_next(&mut self) {
         self.list.select_next();
@@ -116,4 +166,46 @@ fn empty_item(message: &str, muted: Style) -> ListItem {
         message.to_owned(),
         muted,
     )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderPickerApp, ProviderPickerOutcome};
+    use bmux_keyboard::{KeyCode, KeyStroke};
+    use bmux_tui::event::Event;
+
+    #[test]
+    fn event_policy_owns_navigation_selection_and_cancel() {
+        let mut picker = ProviderPickerApp::new(vec![
+            bcode_ipc::PluginServiceSummary {
+                plugin_id: "one".to_owned(),
+                interface_id: "bcode.model-provider".to_owned(),
+                name: None,
+                description: None,
+                workflow_blocks: Vec::new(),
+            },
+            bcode_ipc::PluginServiceSummary {
+                plugin_id: "two".to_owned(),
+                interface_id: "bcode.model-provider".to_owned(),
+                name: None,
+                description: None,
+                workflow_blocks: Vec::new(),
+            },
+        ]);
+        let keymap =
+            super::super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+        assert_eq!(
+            picker.handle_event(&Event::Key(KeyStroke::simple(KeyCode::Down)), &keymap),
+            ProviderPickerOutcome::Continue
+        );
+        assert_eq!(
+            picker.handle_event(&Event::Key(KeyStroke::simple(KeyCode::Enter)), &keymap),
+            ProviderPickerOutcome::Select(Some("two".to_owned()))
+        );
+        assert_eq!(
+            picker.handle_event(&Event::Key(KeyStroke::simple(KeyCode::Escape)), &keymap),
+            ProviderPickerOutcome::Cancel
+        );
+    }
 }

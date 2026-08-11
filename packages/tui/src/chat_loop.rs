@@ -138,8 +138,7 @@ struct RootPluginSurface {
 struct RootForkPromptPicker {
     session_id: bcode_session_models::SessionId,
     submission: super::session_fork_dialog::SessionForkDialogSubmission,
-    prompts: Vec<super::session_fork_flow::ForkPromptCandidate>,
-    selected: usize,
+    picker: super::session_fork_flow::ForkPromptPicker,
 }
 
 struct RootModelPicker {
@@ -930,13 +929,14 @@ impl ChatLoopState {
             .as_mut()
             .expect("fork flow has dialog or prompt picker");
         if let Event::Key(stroke) = event {
-            match stroke.key {
-                bmux_keyboard::KeyCode::Escape => {
+            match picker.picker.handle_key(*stroke) {
+                super::session_fork_flow::ForkPromptPickerOutcome::Handled
+                | super::session_fork_flow::ForkPromptPickerOutcome::Ignored => {}
+                super::session_fork_flow::ForkPromptPickerOutcome::Canceled => {
                     self.fork_prompt_picker = None;
                     return SessionForkRootOutcome::Canceled;
                 }
-                bmux_keyboard::KeyCode::Enter => {
-                    let prompt = picker.prompts[picker.selected].clone();
+                super::session_fork_flow::ForkPromptPickerOutcome::Select(prompt) => {
                     let outcome = SessionForkRootOutcome::CreateFork {
                         session_id: picker.session_id,
                         submission: picker.submission.clone(),
@@ -945,15 +945,6 @@ impl ChatLoopState {
                     self.fork_prompt_picker = None;
                     return outcome;
                 }
-                bmux_keyboard::KeyCode::Up if picker.selected > 0 => {
-                    picker.selected = picker.selected.saturating_sub(1);
-                }
-                bmux_keyboard::KeyCode::Down
-                    if picker.selected.saturating_add(1) < picker.prompts.len() =>
-                {
-                    picker.selected = picker.selected.saturating_add(1);
-                }
-                _ => {}
             }
         }
         SessionForkRootOutcome::Handled
@@ -1016,43 +1007,17 @@ impl ChatLoopState {
         event: &Event,
     ) -> Option<(Option<String>, super::model_flow::ModelPickerAction)> {
         if let Some(picker) = self.provider_picker.as_mut() {
-            match event {
-                Event::Paste(text) => {
-                    let _ = super::text_input_flow::handle_paste(picker.filter_mut(), text);
-                    picker.refresh_filter();
+            match picker.handle_event(event, keymap) {
+                super::provider_picker::ProviderPickerOutcome::Continue => return None,
+                super::provider_picker::ProviderPickerOutcome::Cancel => {
+                    self.provider_picker = None;
+                    return Some((None, super::model_flow::ModelPickerAction::Cancel));
                 }
-                Event::Key(stroke) => match stroke.key {
-                    bmux_keyboard::KeyCode::Escape => {
-                        self.provider_picker = None;
-                        return Some((None, super::model_flow::ModelPickerAction::Cancel));
-                    }
-                    bmux_keyboard::KeyCode::Enter => {
-                        let provider = picker.selected_provider_id();
-                        self.provider_picker = None;
-                        return Some((provider, super::model_flow::ModelPickerAction::Continue));
-                    }
-                    bmux_keyboard::KeyCode::Up => picker.select_previous(),
-                    bmux_keyboard::KeyCode::Down => picker.select_next(),
-                    _ => {
-                        if super::text_input_flow::handle_key(picker.filter_mut(), keymap, *stroke)
-                            != bmux_tui_components::text_input::TextInputOutcome::Ignored
-                        {
-                            picker.refresh_filter();
-                        }
-                    }
-                },
-                Event::Mouse(mouse) => {
-                    if let Some(row) = super::picker_mouse::picker_row_from_mouse(*mouse)
-                        && picker.select_visible(row)
-                    {
-                        let provider = picker.selected_provider_id();
-                        self.provider_picker = None;
-                        return Some((provider, super::model_flow::ModelPickerAction::Continue));
-                    }
+                super::provider_picker::ProviderPickerOutcome::Select(provider) => {
+                    self.provider_picker = None;
+                    return Some((provider, super::model_flow::ModelPickerAction::Continue));
                 }
-                Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) => {}
             }
-            return None;
         }
         let model = self.model_picker.as_mut()?;
         if matches!(event, Event::Key(stroke) if stroke.key == bmux_keyboard::KeyCode::Enter)
@@ -2234,8 +2199,7 @@ pub fn apply_effect_result(
                 loop_state.fork_prompt_picker = Some(RootForkPromptPicker {
                     session_id,
                     submission,
-                    prompts,
-                    selected: 0,
+                    picker: super::session_fork_flow::ForkPromptPicker::new(prompts),
                 });
                 chat.app
                     .set_status("select the prompt to edit in the fork".to_owned());
@@ -4091,8 +4055,8 @@ pub fn draw_chat_frame<W: Write>(
         if let Some(picker) = &loop_state.fork_prompt_picker {
             super::session_fork_flow::render_prompt_picker(
                 frame,
-                &picker.prompts,
-                picker.selected,
+                picker.picker.prompts(),
+                picker.picker.selected(),
                 theme,
             );
         }

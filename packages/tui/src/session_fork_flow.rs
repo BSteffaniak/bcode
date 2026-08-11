@@ -12,7 +12,75 @@ use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
 
 use super::TuiError;
 
-#[derive(Clone)]
+/// State for selecting the user prompt that bounds a session fork.
+#[derive(Debug, Clone)]
+pub struct ForkPromptPicker {
+    prompts: Vec<ForkPromptCandidate>,
+    selected: usize,
+}
+
+/// Outcome from one fork-prompt picker key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkPromptPickerOutcome {
+    /// Selection changed and the picker remains open.
+    Handled,
+    /// Activate the selected prompt.
+    Select(ForkPromptCandidate),
+    /// Close without selecting a prompt.
+    Canceled,
+    /// The key is not owned by this picker.
+    Ignored,
+}
+
+impl ForkPromptPicker {
+    /// Create picker state from available prompts.
+    #[must_use]
+    pub const fn new(prompts: Vec<ForkPromptCandidate>) -> Self {
+        Self {
+            prompts,
+            selected: 0,
+        }
+    }
+
+    /// Return available prompt rows.
+    #[must_use]
+    pub fn prompts(&self) -> &[ForkPromptCandidate] {
+        &self.prompts
+    }
+
+    /// Return the selected row.
+    #[must_use]
+    pub const fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Handle one picker key.
+    pub fn handle_key(&mut self, stroke: bmux_keyboard::KeyStroke) -> ForkPromptPickerOutcome {
+        match stroke.key {
+            bmux_keyboard::KeyCode::Escape => ForkPromptPickerOutcome::Canceled,
+            bmux_keyboard::KeyCode::Enter => self.prompts.get(self.selected).cloned().map_or(
+                ForkPromptPickerOutcome::Ignored,
+                ForkPromptPickerOutcome::Select,
+            ),
+            bmux_keyboard::KeyCode::Up if self.selected > 0 => {
+                self.selected = self.selected.saturating_sub(1);
+                ForkPromptPickerOutcome::Handled
+            }
+            bmux_keyboard::KeyCode::Down
+                if self.selected.saturating_add(1) < self.prompts.len() =>
+            {
+                self.selected = self.selected.saturating_add(1);
+                ForkPromptPickerOutcome::Handled
+            }
+            bmux_keyboard::KeyCode::Up | bmux_keyboard::KeyCode::Down => {
+                ForkPromptPickerOutcome::Handled
+            }
+            _ => ForkPromptPickerOutcome::Ignored,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkPromptCandidate {
     pub sequence: u64,
     pub text: String,
@@ -168,4 +236,41 @@ fn one_line(text: &str) -> String {
         output.push('…');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ForkPromptCandidate, ForkPromptPicker, ForkPromptPickerOutcome};
+    use bmux_keyboard::{KeyCode, KeyStroke};
+
+    #[test]
+    fn picker_state_owns_navigation_selection_and_cancel() {
+        let mut picker = ForkPromptPicker::new(vec![
+            ForkPromptCandidate {
+                sequence: 1,
+                text: "first".to_owned(),
+            },
+            ForkPromptCandidate {
+                sequence: 2,
+                text: "second".to_owned(),
+            },
+        ]);
+
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Down)),
+            ForkPromptPickerOutcome::Handled
+        );
+        assert_eq!(picker.selected(), 1);
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Enter)),
+            ForkPromptPickerOutcome::Select(ForkPromptCandidate {
+                sequence: 2,
+                text: "second".to_owned(),
+            })
+        );
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Escape)),
+            ForkPromptPickerOutcome::Canceled
+        );
+    }
 }
