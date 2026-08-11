@@ -3230,6 +3230,80 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ordinary_plan_never_invokes_scan_provider_without_explicit_deep_intent() {
+        let mut indexed = bcode_session_search::SessionSearchProviderInfo {
+            plugin_id: "indexed".to_owned(),
+            capabilities: provider_capabilities("indexed"),
+            status: provider_status("indexed"),
+        };
+        indexed
+            .capabilities
+            .content_kinds
+            .insert(SearchContentKind::UserMessage);
+        let mut scan = bcode_session_search::SessionSearchProviderInfo {
+            plugin_id: "bcode.compressed-session-search".to_owned(),
+            capabilities: provider_capabilities("bcode.compressed-session-search"),
+            status: provider_status("bcode.compressed-session-search"),
+        };
+        scan.capabilities.execution = SearchExecutionKind::Scan;
+        scan.capabilities.content_kinds = BTreeSet::from([
+            SearchContentKind::ShellOutput,
+            SearchContentKind::ToolOutput,
+        ]);
+        let discovery = bcode_session_search::ListSessionSearchProvidersResponse {
+            providers: vec![indexed, scan],
+            failures: Vec::new(),
+        };
+
+        let ordinary_request = request();
+        let ordinary = bcode_session_search::plan_session_search_with_policy_and_routes(
+            &ordinary_request,
+            discovery.clone(),
+            &SessionSearchPlanPolicy {
+                per_provider_deadline_ms: 100,
+                ..SessionSearchPlanPolicy::default()
+            },
+            &[],
+        );
+        assert!(
+            ordinary
+                .providers
+                .iter()
+                .all(|provider| provider.plugin_id != "bcode.compressed-session-search")
+        );
+        assert!(
+            ordinary
+                .failures
+                .iter()
+                .all(|failure| failure.plugin_id != "indexed")
+        );
+
+        let mut deep_request = request();
+        deep_request.filters.content_kinds = BTreeSet::from([
+            SearchContentKind::ShellOutput,
+            SearchContentKind::ToolOutput,
+        ]);
+        let deep = bcode_session_search::plan_session_search_with_policy_and_routes(
+            &deep_request,
+            discovery,
+            &SessionSearchPlanPolicy {
+                execution_class: bcode_session_search::SessionSearchExecutionClass::Deep,
+                per_provider_deadline_ms: 100,
+                ..SessionSearchPlanPolicy::default()
+            },
+            &[],
+        );
+        assert!(
+            deep.providers
+                .iter()
+                .any(|provider| { provider.plugin_id == "bcode.compressed-session-search" }),
+            "providers={:?}, failures={:?}",
+            deep.providers,
+            deep.failures
+        );
+    }
+
+    #[test]
     fn malformed_provider_response_fields_are_rejected() {
         let request = request();
         let mut malformed = response();
@@ -3985,6 +4059,53 @@ pub(crate) mod tests {
         assert_eq!(terminal_progress.failed_sessions, 0);
         assert_eq!(terminal_progress.providers.len(), 2);
         drop(progress);
+    }
+
+    #[tokio::test]
+    async fn complete_backfill_traverses_more_than_two_catalog_pages_without_skipping_sessions() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session_count = MAX_BACKFILL_SESSIONS * 2 + 1;
+        for index in 0..session_count {
+            let session = state
+                .sessions
+                .create_session(
+                    Some(format!("multi-page backfill {index}")),
+                    workspace.path().to_path_buf(),
+                )
+                .await
+                .expect("create session");
+            state
+                .sessions
+                .append_context_compacted(session.id, format!("content {index}"), 0)
+                .await
+                .expect("append event");
+        }
+
+        let response = complete_backfill(
+            &state,
+            bcode_session_search::CompleteSessionSearchBackfillRequest {
+                provider_id: Some(FAST_PROVIDER_ID.to_owned()),
+                session_ids: BTreeSet::new(),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                slice_deadline_ms: 300_000,
+            },
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+        )
+        .await
+        .expect("complete multi-page backfill");
+
+        let provider = &response.providers[0];
+        assert_eq!(provider.catalog_pages, 3);
+        assert_eq!(provider.selected_sessions, session_count);
+        assert_eq!(provider.completed_sessions, session_count);
+        assert_eq!(provider.incomplete_sessions, 0);
+        assert_eq!(provider.failed_sessions, 0);
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), session_count);
     }
 
     #[tokio::test]
