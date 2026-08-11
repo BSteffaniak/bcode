@@ -191,17 +191,23 @@ impl SessionPickerApp {
         self.list = FilteredListState::new(self.search_results.len());
         self.mode = SessionPickerMode::TranscriptSearch;
         self.refresh_search_preview();
-        let completion = if !self.search_query_complete {
-            "query incomplete"
-        } else if !self.search_coverage_complete {
-            "coverage incomplete"
-        } else if self.search_failures > 0 {
-            "provider failures"
+        let query = if self.search_query_complete {
+            "query complete"
         } else {
-            "complete searchable coverage"
+            "query incomplete"
+        };
+        let coverage = if self.search_coverage_complete {
+            "searchable coverage complete"
+        } else {
+            "searchable coverage incomplete"
+        };
+        let failures = if self.search_failures == 0 {
+            "no provider failures".to_owned()
+        } else {
+            format!("{} provider failures", self.search_failures)
         };
         self.status = format!(
-            "{} results from {} providers; {completion}; {}. Press ? for details",
+            "{} results from {} providers; {query}; {coverage}; {failures}; {}. Press ? for details",
             self.search_results.len(),
             self.search_provider_reports,
             self.search_controls.depth.explanation()
@@ -728,6 +734,84 @@ mod tests {
     }
 
     #[test]
+    fn transcript_status_keeps_query_coverage_and_failures_independent() {
+        let cases = [
+            (
+                true,
+                true,
+                0,
+                [
+                    "query complete",
+                    "searchable coverage complete",
+                    "no provider failures",
+                ],
+            ),
+            (
+                false,
+                true,
+                0,
+                [
+                    "query incomplete",
+                    "searchable coverage complete",
+                    "no provider failures",
+                ],
+            ),
+            (
+                true,
+                false,
+                0,
+                [
+                    "query complete",
+                    "searchable coverage incomplete",
+                    "no provider failures",
+                ],
+            ),
+            (
+                true,
+                true,
+                1,
+                [
+                    "query complete",
+                    "searchable coverage complete",
+                    "1 provider failures",
+                ],
+            ),
+        ];
+        for (query_complete, coverage_complete, failures, expected) in cases {
+            let mut app = SessionPickerApp::new(Vec::new());
+            let response = bcode_session_search::FederatedSessionSearchResponse {
+                hits: Vec::new(),
+                query_complete,
+                coverage_complete,
+                providers: Vec::new(),
+                failures: (0..failures)
+                    .map(|_| bcode_session_search::SessionSearchProviderFailure {
+                        plugin_id: "provider".to_owned(),
+                        error: bcode_session_search::SessionSearchServiceError {
+                            code: bcode_session_search::SearchErrorCode::ProviderUnavailable,
+                            message: "unavailable".to_owned(),
+                            retryable: true,
+                        },
+                        stage: bcode_session_search::SessionSearchProviderStage::Execution,
+                        elapsed_ms: 0,
+                        content: Vec::new(),
+                    })
+                    .collect(),
+            };
+
+            app.set_search_results(&response, Vec::new());
+
+            for phrase in expected {
+                assert!(
+                    app.status().contains(phrase),
+                    "missing {phrase}: {}",
+                    app.status()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dedicated_search_state_controls_request_preview_and_human_status() {
         let mut app = SessionPickerApp::new(vec![summary("one", "/one")]);
         app.start_transcript_search();
@@ -760,7 +844,7 @@ mod tests {
             failures: Vec::new(),
         };
         app.set_search_results(&response, vec![hit]);
-        assert!(app.status().contains("complete searchable coverage"));
+        assert!(app.status().contains("searchable coverage complete"));
         assert!(!app.status().contains("query_complete="));
         assert!(!app.search_preview().is_empty());
     }

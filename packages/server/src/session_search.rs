@@ -3365,6 +3365,13 @@ pub(crate) mod tests {
                 .iter()
                 .all(|failure| failure.plugin_id != "indexed")
         );
+        assert!(
+            ordinary
+                .failures
+                .iter()
+                .all(|failure| failure.plugin_id != "bcode.compressed-session-search"),
+            "deep-only providers are intentionally ineligible, not ordinary query failures"
+        );
 
         let mut deep_request = request();
         deep_request.filters.content_kinds = BTreeSet::from([

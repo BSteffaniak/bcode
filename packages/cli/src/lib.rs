@@ -13949,6 +13949,84 @@ mod web_command_tests {
     }
 
     #[test]
+    fn operation_payload_serialization_size_regression() {
+        let outcomes = (0..bcode_ipc::MAX_SESSION_BULK_MIGRATION_OUTCOMES)
+            .map(|_| bcode_ipc::SessionBulkMigrationOutcome {
+                session_id: bcode_session_models::SessionId::new(),
+                category: bcode_ipc::SessionCompatibilityCategory::MigrationRequired,
+                action: bcode_ipc::SessionCompatibilityAction::Migrate,
+                message: Some("x".repeat(bcode_ipc::MAX_SESSION_COMPATIBILITY_MESSAGE_BYTES)),
+            })
+            .collect::<Vec<_>>();
+        let migration = bcode_ipc::SessionBulkMigrationOperationStatus {
+            operation_id: "operation".to_owned(),
+            revision: 1,
+            state: bcode_ipc::SessionBulkMigrationState::NeedsAttention,
+            mode: bcode_ipc::SessionBulkMigrationMode::Migrate,
+            selected: outcomes.len() as u64,
+            visited: outcomes.len() as u64,
+            migrated: 0,
+            blocked: outcomes.len() as u64,
+            failed: 0,
+            current_session_id: None,
+            outcomes,
+        };
+        let migration_bytes = serde_json::to_vec(&migration)
+            .expect("bounded migration payload")
+            .len();
+        assert!(migration_bytes < 512 * 1024, "{migration_bytes}");
+
+        let providers = (0..bcode_session_search::MAX_COMPLETE_BACKFILL_PROVIDERS)
+            .map(
+                |index| bcode_session_search::CompleteSessionSearchBackfillProviderResult {
+                    provider_id: format!("provider-{index}"),
+                    selected_sessions: bcode_session_search::MAX_BACKFILL_SESSIONS,
+                    completed_sessions: 0,
+                    incomplete_sessions: 0,
+                    failed_sessions: bcode_session_search::MAX_BACKFILL_SESSIONS,
+                    catalog_pages: 1,
+                    issues: (0..bcode_session_search::MAX_COMPLETE_BACKFILL_ISSUE_SAMPLES)
+                        .map(
+                            |_| bcode_session_search::CompleteSessionSearchBackfillIssueSummary {
+                                code: bcode_session_search::SearchErrorCode::ProviderUnavailable,
+                                count: 1,
+                                retryable: true,
+                                sample_session_ids: (0
+                                    ..bcode_session_search::MAX_COMPLETE_BACKFILL_ISSUE_SAMPLES)
+                                    .map(|_| bcode_session_models::SessionId::new())
+                                    .collect(),
+                                sample_message: Some(
+                                    "x".repeat(bcode_session_search::MAX_HIT_PREVIEW_BYTES),
+                                ),
+                            },
+                        )
+                        .collect(),
+                    error: None,
+                },
+            )
+            .collect::<Vec<_>>();
+        let backfill = bcode_session_search::CompleteSessionSearchBackfillResponse {
+            provider_ids: providers
+                .iter()
+                .map(|provider| provider.provider_id.clone())
+                .collect(),
+            catalog_revision_started: 1,
+            catalog_revision_completed: 1,
+            convergence_passes: 1,
+            cancelled: false,
+            providers,
+        };
+        backfill.validate().expect("bounded backfill response");
+        let backfill_bytes = serde_json::to_vec(&backfill)
+            .expect("bounded backfill payload")
+            .len();
+        assert!(backfill_bytes < 5 * 1024 * 1024, "{backfill_bytes}");
+        println!(
+            "session_operation_payload_sizes migration_bytes={migration_bytes} backfill_bytes={backfill_bytes}"
+        );
+    }
+
+    #[test]
     fn compatibility_issue_format_is_actionable_and_specific() {
         for (compatibility, expected_classification) in [
             (

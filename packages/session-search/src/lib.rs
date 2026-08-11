@@ -1136,6 +1136,13 @@ fn filter_discovery_for_policy(
     let mut providers = Vec::new();
     let mut failures = discovery.failures;
     for provider in discovery.providers {
+        if matches!(
+            policy.execution_class,
+            SessionSearchExecutionClass::Ordinary
+        ) && matches!(provider.capabilities.execution, SearchExecutionKind::Scan)
+        {
+            continue;
+        }
         let exclusion = if matches!(provider.status.state, SearchProviderState::Stale) {
             Some((
                 SearchErrorCode::StaleIndex,
@@ -1152,15 +1159,6 @@ fn filter_discovery_for_policy(
             Some((
                 SearchErrorCode::UnsupportedQuery,
                 "remote provider requires explicit authorization",
-            ))
-        } else if matches!(
-            policy.execution_class,
-            SessionSearchExecutionClass::Ordinary
-        ) && matches!(provider.capabilities.execution, SearchExecutionKind::Scan)
-        {
-            Some((
-                SearchErrorCode::UnsupportedQuery,
-                "cold scan provider requires explicit deep search",
             ))
         } else if coverage_exceeds_staleness(&provider.status, policy.maximum_staleness_sequences) {
             Some((
@@ -2900,12 +2898,12 @@ mod tests {
             vec!["fresh"]
         );
         assert_eq!(plan.per_provider_deadline_ms, 1_000);
-        assert_eq!(plan.failures.len(), 3);
-        assert!(plan.failures.iter().any(|failure| {
-            failure.plugin_id == "scan"
-                && failure.error.code == SearchErrorCode::UnsupportedQuery
-                && failure.error.message.contains("explicit deep search")
-        }));
+        assert_eq!(plan.failures.len(), 2);
+        assert!(
+            plan.failures
+                .iter()
+                .all(|failure| failure.plugin_id != "scan")
+        );
         assert!(plan.failures.iter().any(|failure| {
             failure.plugin_id == "remote"
                 && failure.error.code == SearchErrorCode::UnsupportedQuery

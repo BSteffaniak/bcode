@@ -683,6 +683,7 @@ fn capabilities() -> SessionSearchCapabilities {
             SearchFeature::Phrase,
             SearchFeature::Regex,
             SearchFeature::StructuredFilters,
+            SearchFeature::RelevanceSort,
             SearchFeature::IncrementalIngestion,
             SearchFeature::HistoricalBackfill,
             SearchFeature::RemoveSession,
@@ -1660,6 +1661,34 @@ mod tests {
             .insert(bcode_session_search::SearchMessageRole::User);
         let response = plugin.search(&config, &unsupported, &ServiceCancellation::default());
         assert!(response.error.is_some());
+    }
+
+    #[test]
+    fn capabilities_match_implemented_provider_relevance_sort() {
+        let capabilities = capabilities();
+        assert!(
+            capabilities
+                .features
+                .contains(&SearchFeature::RelevanceSort)
+        );
+        let request = SessionSearchRequest {
+            query: SessionSearchQuery::Text {
+                text: "needle".to_owned(),
+                mode: bcode_session_search::TextMatchMode::Terms,
+                fields: BTreeSet::new(),
+            },
+            filters: SessionSearchFilters {
+                content_kinds: large_content_kinds(),
+                ..SessionSearchFilters::default()
+            },
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 20,
+            cursor: None,
+            deadline_ms: Some(5_000),
+        };
+        capabilities
+            .supports_request(&request)
+            .expect("implemented default deep request is advertised");
     }
 
     #[test]

@@ -96,7 +96,7 @@ fn header_line(mode: SessionPickerMode) -> Line {
         SessionPickerMode::Rename => "  Enter saves rename  Esc cancels",
         SessionPickerMode::DeleteConfirm => "  Y confirms delete  N/Esc cancels",
         SessionPickerMode::TranscriptSearch => {
-            "  Enter searches/opens  Up/Down select  M mode  D deep  S sort  N next  I inventory  G migrate  B backfill  C cancel  ? details  Esc sessions"
+            "  Enter searches/opens  Up/Down select  Alt-M mode  Alt-D deep  Alt-S sort  Alt-N next  Alt-I inventory  Alt-G migrate  Alt-B backfill  Alt-X cancel  ? details  Esc sessions"
         }
     };
     Line::from_spans(vec![
@@ -165,7 +165,12 @@ mod tests {
             .iter()
             .map(|span| span.content.as_str())
             .collect::<String>();
-        for expected in ["I inventory", "G migrate", "B backfill", "C cancel"] {
+        for expected in [
+            "Alt-I inventory",
+            "Alt-G migrate",
+            "Alt-B backfill",
+            "Alt-X cancel",
+        ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
         }
     }

@@ -1563,12 +1563,16 @@ impl ChatLoopState {
                             });
                         }
                     }
-                    bmux_keyboard::KeyCode::Char('m' | 'M') => {
+                    bmux_keyboard::KeyCode::Char('m' | 'M') if stroke.modifiers.alt => {
                         picker.cycle_search_match_mode();
                     }
-                    bmux_keyboard::KeyCode::Char('d' | 'D') => picker.toggle_search_depth(),
-                    bmux_keyboard::KeyCode::Char('s' | 'S') => picker.cycle_search_sort(),
-                    bmux_keyboard::KeyCode::Char('n' | 'N') => {
+                    bmux_keyboard::KeyCode::Char('d' | 'D') if stroke.modifiers.alt => {
+                        picker.toggle_search_depth();
+                    }
+                    bmux_keyboard::KeyCode::Char('s' | 'S') if stroke.modifiers.alt => {
+                        picker.cycle_search_sort();
+                    }
+                    bmux_keyboard::KeyCode::Char('n' | 'N') if stroke.modifiers.alt => {
                         let query = picker.filter().buffer().text().trim().to_owned();
                         if query.is_empty() || !picker.has_next_search_page() {
                             picker.set_status("No next search page available".to_owned());
@@ -1586,7 +1590,7 @@ impl ChatLoopState {
                             });
                         }
                     }
-                    bmux_keyboard::KeyCode::Char('i' | 'I') => {
+                    bmux_keyboard::KeyCode::Char('i' | 'I') if stroke.modifiers.alt => {
                         picker.set_status("Inventorying canonical compatibility…".to_owned());
                         chat.replace_effect(TuiEffect::StartBulkMigration {
                             request: bcode_ipc::SessionBulkMigrationStartRequest {
@@ -1598,7 +1602,7 @@ impl ChatLoopState {
                             },
                         });
                     }
-                    bmux_keyboard::KeyCode::Char('g' | 'G') => {
+                    bmux_keyboard::KeyCode::Char('g' | 'G') if stroke.modifiers.alt => {
                         if picker.confirm_canonical_migration() {
                             picker.set_status("Starting confirmed canonical migration…".to_owned());
                             chat.replace_effect(TuiEffect::StartBulkMigration {
@@ -1614,12 +1618,12 @@ impl ChatLoopState {
                             });
                         } else {
                             picker.set_status(
-                                "Canonical migration is separate from indexing and creates verified backups. Press G again to confirm"
+                                "Canonical migration is separate from indexing and creates verified backups. Press Alt-G again to confirm"
                                     .to_owned(),
                             );
                         }
                     }
-                    bmux_keyboard::KeyCode::Char('b' | 'B') => {
+                    bmux_keyboard::KeyCode::Char('b' | 'B') if stroke.modifiers.alt => {
                         picker.set_status("Starting separate derived search backfill…".to_owned());
                         chat.replace_effect(TuiEffect::StartSearchIndexing {
                             request: bcode_session_search::CompleteSessionSearchBackfillRequest {
@@ -1631,7 +1635,7 @@ impl ChatLoopState {
                             },
                         });
                     }
-                    bmux_keyboard::KeyCode::Char('c' | 'C') => {
+                    bmux_keyboard::KeyCode::Char('x' | 'X') if stroke.modifiers.alt => {
                         if let Some(operation_id) = picker.take_bulk_migration_operation_id() {
                             picker.set_status(
                                 "Cancelling canonical migration between sessions…".to_owned(),
@@ -2359,7 +2363,7 @@ pub fn apply_effect_result(
                     Ok(started) => {
                         picker.set_search_backfill_operation_id(started.operation_id.clone());
                         picker.set_status(format!(
-                            "Derived search backfill started: {}. Press C to cancel",
+                            "Derived search backfill started: {}. Press Alt-X to cancel",
                             started.operation_id
                         ));
                         chat.replace_effect(TuiEffect::WaitSearchIndexing {
