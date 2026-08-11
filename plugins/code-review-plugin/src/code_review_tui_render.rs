@@ -2290,12 +2290,10 @@ fn render_source_view_row(
     let rendered = render_display_row_with_affordance(show_comment_affordance, display_row, theme);
     let mut line = rendered.line;
     if let Some(marker) = app.range_selection_marker_at(app.selected_file, source_row) {
-        line.spans
-            .insert(0, Span::styled(marker, Style::new().fg(Color::Blue)));
+        line.spans.insert(0, Span::styled(marker, theme.focused));
     }
     if let Some(marker) = app.draft_marker_at(app.selected_file, source_row) {
-        line.spans
-            .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
+        line.spans.insert(0, Span::styled(marker, theme.diff.hunk));
     }
     let (line, style) = if source_row == app.selected_diff_line {
         (
@@ -2325,10 +2323,7 @@ fn render_expanded_context_file_line(
     let old = line_number.map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
     let new = line_number.map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
     let mut spans = vec![
-        Span::styled(
-            format!(" {old} {new} "),
-            row_style.patch(Style::new().fg(Color::BrightBlack)),
-        ),
+        Span::styled(format!(" {old} {new} "), row_style.patch(theme.muted)),
         Span::styled(
             " ",
             row_style.patch(marker_style(ReviewDisplayRowSource::Context, theme)),
@@ -2534,7 +2529,7 @@ fn render_display_row_with_affordance(
                 "✎",
                 rendered
                     .style
-                    .patch(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    .patch(theme.focused.add_modifier(Modifier::BOLD)),
             ),
         );
     }
@@ -2567,10 +2562,7 @@ fn render_display_row(row: &ReviewDisplayRow, theme: ReviewTheme) -> RenderedRow
             let row_style = row_style(row.source, theme);
             let marker = row.source.diff_marker().unwrap_or(' ');
             let mut spans = vec![
-                Span::styled(
-                    format!(" {old} {new} "),
-                    row_style.patch(Style::new().fg(Color::BrightBlack)),
-                ),
+                Span::styled(format!(" {old} {new} "), row_style.patch(theme.muted)),
                 Span::styled(
                     marker.to_string(),
                     row_style.patch(marker_style(row.source, theme).add_modifier(Modifier::BOLD)),

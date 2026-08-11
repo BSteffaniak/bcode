@@ -270,6 +270,11 @@ if ! rg -q 'surfaces\.overlay\.patch\(theme\.text\)' \
   fail "code-review overlays must derive their surface and control states from renderer-owned component presentation"
 fi
 
+if rg -n 'Color::' plugins/code-review-plugin/src/code_review_tui_render.rs \
+  | awk -F: '$2 >= 116 && $2 < 3900 { print; found = 1 } END { exit found ? 0 : 1 }'; then
+  fail "code-review production rendering must consume resolved host semantics rather than local colors"
+fi
+
 if ! rg -q 'pub const fn component_theme\(self\) -> ComponentTheme' packages/tui/src/theme.rs \
   || ! rg -q 'let components = theme\.component_theme\(\)' packages/tui/src/render.rs; then
   fail "PresentedTheme must have one canonical BMUX ComponentTheme conversion used by plugin delivery"
@@ -309,6 +314,122 @@ for source_path in [
         raise SystemExit(
             f"{source_path}: migrated plugin transcript visuals must consume "
             "renderer-owned component theme roles"
+        )
+
+# Every remaining direct plugin color belongs to one source-backed category:
+# * terminal/syntax/color-format conversion;
+# * a neutral compatibility fallback used only when no host theme is available; or
+# * BLIMS-owned simulation/standalone-office visualization semantics.
+# New direct colors must be classified here rather than silently expanding a file allowlist.
+allowed_color_functions = {
+    "plugins/blims-plugin/src/cli.rs": {
+        "blims_hint_styles",
+        "blims_modal_theme",
+        "blims_text_view_styles",
+        "color_from_name",
+        "dashboard_line",
+        "render",
+        "render_activity_panel",
+        "render_agent_thought_bubbles",
+        "render_blims_footer",
+        "render_blims_header",
+        "render_blims_help_modal",
+        "render_blims_loading",
+        "render_blims_map",
+        "render_blims_sidebar",
+        "render_ceo_dashboard_modal",
+        "render_conversation_modal",
+        "render_current_room_panel",
+        "render_dashboard_agent_work",
+        "render_dashboard_artifacts",
+        "render_dashboard_guidance",
+        "render_dashboard_proposals",
+        "render_inbox_panel",
+        "render_interactions_panel",
+        "render_live_log_panel",
+        "render_world_picker",
+        "room_bg",
+        "tile_glyph",
+    },
+    "plugins/code-review-plugin/src/code_review_tui.rs": {"syntax_palette"},
+    "plugins/code-review-plugin/src/code_review_tui_render.rs": {
+        "default",
+        "fallback_review_diff_theme",
+        "syntax_palette",
+    },
+    "plugins/eval-plugin/src/eval_viewer.rs": {
+        "accent",
+        "border",
+        "danger",
+        "dashboard_bg",
+        "eval_button_styles",
+        "eval_table_styles",
+        "muted",
+        "panel_alt",
+        "purple",
+        "selected_style",
+        "success",
+        "text_color",
+        "warning",
+    },
+    "plugins/filesystem-plugin/src/file_change_tui.rs": {"syntax_palette"},
+    "plugins/filesystem-plugin/src/filesystem_tui.rs": {
+        "accent",
+        "hex_color",
+        "label",
+        "muted",
+        "path_style",
+        "syntax_palette",
+        "title",
+        "value_style",
+    },
+    "plugins/loop-plugin/src/lib.rs": {
+        "loop_hint_styles",
+        "loop_status_styles",
+        "render",
+    },
+    "plugins/metrics-plugin/src/metrics_dashboard.rs": {
+        "accent",
+        "border",
+        "danger",
+        "dashboard_bg",
+        "metric_button_styles",
+        "metric_table_styles",
+        "muted",
+        "panel_alt",
+        "purple",
+        "selected_style",
+        "success",
+        "text",
+        "warning",
+    },
+    "plugins/question-plugin/src/question_tui.rs": {"default"},
+    "plugins/read-plugin/src/output.rs": {"to_crossterm_color"},
+}
+
+import re
+
+function_pattern = re.compile(
+    r"(?:^|\s)(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\("
+)
+for source_path in sorted(Path("plugins").glob("*-plugin/src/**/*.rs")):
+    production = source_path.read_text().split("#[cfg(test)]", 1)[0]
+    current_function = "<module>"
+    direct_color_functions = set()
+    for line in production.splitlines():
+        match = function_pattern.search(line)
+        if match:
+            current_function = match.group(1)
+        if "Color::" in line:
+            direct_color_functions.add(current_function)
+    if not direct_color_functions:
+        continue
+    relative = str(source_path)
+    allowed = allowed_color_functions.get(relative, set())
+    unexpected = sorted(direct_color_functions - allowed)
+    if unexpected:
+        raise SystemExit(
+            f"{relative}: unclassified direct plugin colors in {', '.join(unexpected)}"
         )
 PY
 
