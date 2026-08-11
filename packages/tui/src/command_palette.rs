@@ -1,7 +1,10 @@
 //! TUI command palette state and actions.
 
 use bcode_command::{CommandContribution, CommandSurface};
-use bmux_tui::palette::{CommandPaletteState, PaletteItem};
+use bmux_keyboard::KeyStroke;
+use bmux_tui::palette::{
+    CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
+};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -40,6 +43,12 @@ impl BmuxCommandPalette {
             .iter()
             .map(|contribution| palette_item(contribution, muted))
             .collect()
+    }
+
+    /// Handle one keyboard input through the palette component's policy.
+    pub fn handle_key(&mut self, stroke: KeyStroke, visible_rows: u16) -> CommandPaletteKeyOutcome {
+        let items = self.cloned_items(Style::new());
+        CommandPalette::new(&items).handle_key(&mut self.state, visible_rows, stroke)
     }
 
     /// Return palette state mutably.

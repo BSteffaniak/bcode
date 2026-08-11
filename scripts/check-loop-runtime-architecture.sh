@@ -1525,6 +1525,21 @@ if rg -n 'sync_for_render\(|list_state_mut\(' packages/tui/src --glob '*.rs' \
 fi
 rm -f /tmp/bcode-tui-split-list-state-api.txt
 
+if rg -n 'bmux_tui::palette::CommandPalette::new' packages/tui/src --glob '*.rs' \
+  --glob '!command_palette.rs' \
+  --glob '!command_palette_render.rs' \
+  >/tmp/bcode-tui-split-command-palette.txt; then
+  echo "Runtime architecture violation: command-palette event policy must remain owned by BmuxCommandPalette rather than duplicated in orchestration." >&2
+  cat /tmp/bcode-tui-split-command-palette.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-tui-split-command-palette.txt
+if ! rg -q 'pub fn handle_key\(' packages/tui/src/command_palette.rs \
+  || ! rg -q 'match palette\.handle_key\(stroke, 12\)' packages/tui/src/chat_loop.rs; then
+  echo "Runtime architecture violation: command-palette state must delegate keyboard policy through its shared component adapter." >&2
+  violations=1
+fi
+
 if rg -n 'path = "\.\./bmux/' Cargo.toml >/tmp/bcode-undocumented-bmux-paths.txt; then
   echo "Runtime architecture violation: local BMUX path overrides must not remain in the final dependency graph." >&2
   cat /tmp/bcode-undocumented-bmux-paths.txt >&2
