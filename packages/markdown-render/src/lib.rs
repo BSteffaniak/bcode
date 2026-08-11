@@ -3372,6 +3372,7 @@ impl TerminalMarkdownRenderer {
                     self.push_text(value, style);
                 }
             }
+            Input::File => {}
         }
     }
 
