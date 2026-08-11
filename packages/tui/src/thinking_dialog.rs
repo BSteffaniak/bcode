@@ -1,6 +1,20 @@
 //! TUI reasoning output settings modal state.
 
 use bcode_ipc::SessionModelStatus;
+use bmux_keyboard::{KeyCode, KeyStroke};
+
+/// Outcome from one reasoning-settings dialog keyboard update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingDialogOutcome {
+    /// Focus or a setting changed and the dialog remains open.
+    Handled,
+    /// Apply the current settings and close the dialog.
+    Apply,
+    /// Close the dialog without applying the current settings.
+    Cancel,
+    /// The key is not owned by the reasoning-settings dialog.
+    Ignored,
+}
 
 /// Initially focused reasoning output setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +205,27 @@ impl ThinkingDialogState {
         }
     }
 
+    /// Handle one keyboard input through the dialog's interaction policy.
+    pub fn handle_key(&mut self, stroke: KeyStroke) -> ThinkingDialogOutcome {
+        match stroke.key {
+            KeyCode::Up => {
+                self.focus_previous();
+                ThinkingDialogOutcome::Handled
+            }
+            KeyCode::Down => {
+                self.focus_next();
+                ThinkingDialogOutcome::Handled
+            }
+            KeyCode::Char(' ') => {
+                self.cycle_focused();
+                ThinkingDialogOutcome::Handled
+            }
+            KeyCode::Enter => ThinkingDialogOutcome::Apply,
+            KeyCode::Escape => ThinkingDialogOutcome::Cancel,
+            _ => ThinkingDialogOutcome::Ignored,
+        }
+    }
+
     /// Cycle/toggle the focused setting.
     pub fn cycle_focused(&mut self) {
         match self.focused_row {
@@ -225,4 +260,61 @@ fn next_value(current: Option<&str>, values: &[String]) -> Option<String> {
         .and_then(|current| values.iter().position(|value| value == current))
         .map_or(0, |index| index.saturating_add(1) % values.len());
     values.get(next_index).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ThinkingDialogOutcome, ThinkingDialogState};
+    use bmux_keyboard::{KeyCode, KeyStroke};
+
+    fn status() -> bcode_ipc::SessionModelStatus {
+        bcode_ipc::SessionModelStatus {
+            provider_plugin_id: None,
+            requested_model_id: None,
+            effective_model_id: None,
+            model_id: None,
+            context_window: None,
+            context_occupancy: None,
+            request_context_error: None,
+            auth_profile: None,
+            context_format_version: None,
+            compatibility_key: None,
+            max_output_tokens: None,
+            reasoning: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+            prompt_cache_mode: None,
+            conversation_reuse_mode: None,
+            compaction_mode: None,
+            compaction_backend: None,
+            proactive_compaction_threshold_percent: None,
+            cache: None,
+            metadata_source: None,
+            pricing: None,
+        }
+    }
+
+    #[test]
+    fn keyboard_policy_owns_focus_changes_apply_and_cancel() {
+        let mut dialog =
+            ThinkingDialogState::new(false, bcode_config::TuiThinkingMode::All, &status());
+
+        assert_eq!(
+            dialog.handle_key(KeyStroke::simple(KeyCode::Down)),
+            ThinkingDialogOutcome::Handled
+        );
+        assert_eq!(dialog.focused_row(), 1);
+        assert_eq!(
+            dialog.handle_key(KeyStroke::simple(KeyCode::Enter)),
+            ThinkingDialogOutcome::Apply
+        );
+        assert_eq!(
+            dialog.handle_key(KeyStroke::simple(KeyCode::Escape)),
+            ThinkingDialogOutcome::Cancel
+        );
+        assert_eq!(
+            dialog.handle_key(KeyStroke::simple(KeyCode::Char('x'))),
+            ThinkingDialogOutcome::Ignored
+        );
+    }
 }

@@ -1275,34 +1275,28 @@ impl ChatLoopState {
         let Some(dialog) = self.timeline_dialog.as_mut() else {
             return TimelineDialogRootOutcome::Unhandled;
         };
-        match stroke.key {
-            bmux_keyboard::KeyCode::Up | bmux_keyboard::KeyCode::Char('k') => {
-                dialog.select_previous();
+        match dialog.handle_key(stroke) {
+            super::timeline_dialog::TimelineDialogOutcome::Handled => {
+                chat.app.set_status("timeline".to_owned());
+                TimelineDialogRootOutcome::Handled
             }
-            bmux_keyboard::KeyCode::Down | bmux_keyboard::KeyCode::Char('j') => {
-                dialog.select_next();
-            }
-            bmux_keyboard::KeyCode::PageUp => dialog.page_previous(10),
-            bmux_keyboard::KeyCode::PageDown => dialog.page_next(10),
-            bmux_keyboard::KeyCode::Home => dialog.select_first(),
-            bmux_keyboard::KeyCode::End => dialog.select_last(),
-            bmux_keyboard::KeyCode::Escape => {
-                self.timeline_dialog = None;
-                chat.app.set_status("timeline closed".to_owned());
-                return TimelineDialogRootOutcome::Handled;
-            }
-            bmux_keyboard::KeyCode::Enter => {
+            super::timeline_dialog::TimelineDialogOutcome::Activate => {
                 let selected = dialog.selected_entry().cloned();
                 self.timeline_dialog = None;
-                return selected.map_or(
+                selected.map_or(
                     TimelineDialogRootOutcome::Handled,
                     TimelineDialogRootOutcome::Jump,
-                );
+                )
             }
-            _ => return TimelineDialogRootOutcome::Unhandled,
+            super::timeline_dialog::TimelineDialogOutcome::Cancel => {
+                self.timeline_dialog = None;
+                chat.app.set_status("timeline closed".to_owned());
+                TimelineDialogRootOutcome::Handled
+            }
+            super::timeline_dialog::TimelineDialogOutcome::Ignored => {
+                TimelineDialogRootOutcome::Unhandled
+            }
         }
-        chat.app.set_status("timeline".to_owned());
-        TimelineDialogRootOutcome::Handled
     }
 
     pub fn handle_thinking_dialog_key(
@@ -1313,30 +1307,31 @@ impl ChatLoopState {
         let Some(dialog) = self.thinking_dialog.as_mut() else {
             return ThinkingDialogRootOutcome::Unhandled;
         };
-        match stroke.key {
-            bmux_keyboard::KeyCode::Up => dialog.focus_previous(),
-            bmux_keyboard::KeyCode::Down => dialog.focus_next(),
-            bmux_keyboard::KeyCode::Char(' ') => dialog.cycle_focused(),
-            bmux_keyboard::KeyCode::Escape => {
-                self.thinking_dialog = None;
+        match dialog.handle_key(stroke) {
+            super::thinking_dialog::ThinkingDialogOutcome::Handled => {
                 chat.app
-                    .set_status("reasoning output settings canceled".to_owned());
-                return ThinkingDialogRootOutcome::Handled;
+                    .set_status("reasoning output setting changed".to_owned());
+                ThinkingDialogRootOutcome::Handled
             }
-            bmux_keyboard::KeyCode::Enter => {
+            super::thinking_dialog::ThinkingDialogOutcome::Apply => {
                 let dialog = self.thinking_dialog.take().expect("dialog checked above");
-                return ThinkingDialogRootOutcome::Apply {
+                ThinkingDialogRootOutcome::Apply {
                     effort: dialog.effort().map(ToOwned::to_owned),
                     summary: dialog.summary().map(ToOwned::to_owned),
                     visible: dialog.visible(),
                     mode: dialog.mode(),
-                };
+                }
             }
-            _ => return ThinkingDialogRootOutcome::Unhandled,
+            super::thinking_dialog::ThinkingDialogOutcome::Cancel => {
+                self.thinking_dialog = None;
+                chat.app
+                    .set_status("reasoning output settings canceled".to_owned());
+                ThinkingDialogRootOutcome::Handled
+            }
+            super::thinking_dialog::ThinkingDialogOutcome::Ignored => {
+                ThinkingDialogRootOutcome::Unhandled
+            }
         }
-        chat.app
-            .set_status("reasoning output setting changed".to_owned());
-        ThinkingDialogRootOutcome::Handled
     }
 
     pub fn session_changed(&mut self, session_id: Option<bcode_session_models::SessionId>) {

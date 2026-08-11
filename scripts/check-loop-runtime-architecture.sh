@@ -1540,6 +1540,21 @@ if ! rg -q 'pub fn handle_key\(' packages/tui/src/command_palette.rs \
   violations=1
 fi
 
+for dialog_state in timeline thinking; do
+  if ! rg -q 'pub fn handle_key\(' "packages/tui/src/${dialog_state}_dialog.rs" \
+    || ! rg -q 'match dialog\.handle_key\(stroke\)' packages/tui/src/chat_loop.rs; then
+    echo "Runtime architecture violation: ${dialog_state} dialog state must own keyboard policy and orchestration must consume typed outcomes." >&2
+    violations=1
+  fi
+done
+if rg -n 'dialog\.(select_previous|select_next|page_previous|page_next|select_first|select_last|focus_previous|cycle_focused)\(' \
+  packages/tui/src/chat_loop.rs >/tmp/bcode-tui-split-dialog-policy.txt; then
+  echo "Runtime architecture violation: dialog keyboard policy was duplicated in TUI orchestration." >&2
+  cat /tmp/bcode-tui-split-dialog-policy.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-tui-split-dialog-policy.txt
+
 if rg -n 'path = "\.\./bmux/' Cargo.toml >/tmp/bcode-undocumented-bmux-paths.txt; then
   echo "Runtime architecture violation: local BMUX path overrides must not remain in the final dependency graph." >&2
   cat /tmp/bcode-undocumented-bmux-paths.txt >&2

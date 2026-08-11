@@ -1,5 +1,20 @@
 //! Timeline dialog state for browsing user-sent messages.
 
+use bmux_keyboard::{KeyCode, KeyStroke};
+
+/// Outcome from one timeline-dialog keyboard update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineDialogOutcome {
+    /// Selection changed and the dialog remains open.
+    Handled,
+    /// Activate the selected timeline entry and close the dialog.
+    Activate,
+    /// Close the dialog without activating an entry.
+    Cancel,
+    /// The key is not owned by the timeline dialog.
+    Ignored,
+}
+
 /// One selectable user-message timeline row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEntry {
@@ -133,6 +148,39 @@ impl TimelineDialogState {
         self.selected = self.entries.len().saturating_sub(1);
     }
 
+    /// Handle one keyboard input through the dialog's navigation policy.
+    pub fn handle_key(&mut self, stroke: KeyStroke) -> TimelineDialogOutcome {
+        match stroke.key {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.select_previous();
+                TimelineDialogOutcome::Handled
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.select_next();
+                TimelineDialogOutcome::Handled
+            }
+            KeyCode::PageUp => {
+                self.page_previous(10);
+                TimelineDialogOutcome::Handled
+            }
+            KeyCode::PageDown => {
+                self.page_next(10);
+                TimelineDialogOutcome::Handled
+            }
+            KeyCode::Home => {
+                self.select_first();
+                TimelineDialogOutcome::Handled
+            }
+            KeyCode::End => {
+                self.select_last();
+                TimelineDialogOutcome::Handled
+            }
+            KeyCode::Enter => TimelineDialogOutcome::Activate,
+            KeyCode::Escape => TimelineDialogOutcome::Cancel,
+            _ => TimelineDialogOutcome::Ignored,
+        }
+    }
+
     /// Keep selected entry visible in the provided viewport height.
     pub fn sync_scroll(&mut self, visible_rows: usize) {
         let visible_rows = visible_rows.max(1);
@@ -141,5 +189,41 @@ impl TimelineDialogState {
         } else if self.selected >= self.scroll.saturating_add(visible_rows) {
             self.scroll = self.selected.saturating_add(1).saturating_sub(visible_rows);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TimelineDialogOutcome, TimelineDialogState, TimelineEntry};
+    use bmux_keyboard::{KeyCode, KeyStroke};
+
+    fn state() -> TimelineDialogState {
+        TimelineDialogState::new(vec![
+            TimelineEntry::new(Some(0), 1, 10, "first"),
+            TimelineEntry::new(Some(1), 2, 20, "second"),
+        ])
+    }
+
+    #[test]
+    fn keyboard_policy_owns_navigation_activation_and_cancel() {
+        let mut dialog = state();
+
+        assert_eq!(
+            dialog.handle_key(KeyStroke::simple(KeyCode::Up)),
+            TimelineDialogOutcome::Handled
+        );
+        assert_eq!(dialog.selected(), 0);
+        assert_eq!(
+            dialog.handle_key(KeyStroke::simple(KeyCode::Enter)),
+            TimelineDialogOutcome::Activate
+        );
+        assert_eq!(
+            dialog.handle_key(KeyStroke::simple(KeyCode::Escape)),
+            TimelineDialogOutcome::Cancel
+        );
+        assert_eq!(
+            dialog.handle_key(KeyStroke::simple(KeyCode::Char('x'))),
+            TimelineDialogOutcome::Ignored
+        );
     }
 }
