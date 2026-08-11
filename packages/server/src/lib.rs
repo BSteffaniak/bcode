@@ -16,6 +16,12 @@ mod model_ignores;
 mod request_routing;
 mod runtime_work;
 mod session_bulk_migration;
+
+use request_routing::{
+    AgentSkillPluginRequest, PermissionInteractionRequest, RoutedRequest, RuntimeAndModelRequest,
+    SessionLifecycleRequest, SessionSearchAttachRequest, SessionTurnRequest,
+    WorkflowAuthoringRequest, WorkflowDefinitionRequest, WorkflowMutationRequest,
+};
 mod session_migration_adapter;
 mod session_migration_execution;
 
@@ -4049,6 +4055,83 @@ const fn request_kind(request: &Request) -> &'static str {
     }
 }
 
+/// Dispatch a request to the single dispatcher that owns its domain.
+///
+/// Each arm boxes and awaits exactly one dispatcher, so only that dispatcher's future is live. The
+/// dispatchers no longer forward to one another, which is what previously kept several large futures
+/// on the stack at once.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_routed_request(
+    request: RoutedRequest,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    attached_session: &mut Option<SessionId>,
+) -> Result<(), ServerError> {
+    match request {
+        RoutedRequest::SessionLifecycle(request) => {
+            Box::pin(handle_request_inner(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+        RoutedRequest::SessionSearchAttach(request) => {
+            Box::pin(handle_session_search_attach_request(
+                request,
+                request_id,
+                client_id,
+                state,
+                writer,
+                attached_session,
+            ))
+            .await
+        }
+        RoutedRequest::SessionTurn(request) => {
+            Box::pin(handle_turn_workflow_model_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+        RoutedRequest::WorkflowMutation(request) => {
+            Box::pin(handle_workflow_mutation_request(
+                *request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+        RoutedRequest::WorkflowAuthoring(request) => {
+            Box::pin(handle_workflow_authoring_request(
+                request, request_id, state, writer,
+            ))
+            .await
+        }
+        RoutedRequest::WorkflowDefinition(request) => {
+            Box::pin(handle_workflow_validation_request(
+                *request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+        RoutedRequest::RuntimeAndModel(request) => {
+            Box::pin(handle_workflow_run_request(
+                *request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+        RoutedRequest::PermissionInteraction(request) => {
+            Box::pin(handle_permission_interaction_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+        RoutedRequest::AgentSkillPlugin(request) => {
+            Box::pin(handle_agent_permission_plugin_request(
+                request, request_id, state, writer,
+            ))
+            .await
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     request: Request,
@@ -4061,8 +4144,8 @@ async fn handle_request(
     let labels = request_metric_labels(&request);
     let context = request_metrics_context(&request, request_id, client_id, *attached_session);
     let result = Box::pin(state.metrics.in_context(context, async {
-        Box::pin(handle_request_inner(
-            request,
+        Box::pin(dispatch_routed_request(
+            RoutedRequest::from_request(request),
             request_id,
             client_id,
             state,
@@ -4080,242 +4163,16 @@ async fn handle_request(
     result
 }
 
-/// Dispatch client, session-lifecycle, history, search, and attach requests.
-///
-/// Later request domains are handled by boxed sub-dispatchers so this frame stays bounded.
-/// Domain that owns a request, used to route directly to its dispatcher.
-///
-/// Dispatchers are chained by fall-through, so without this a permission request would traverse the
-/// session-search, turn/model, and three workflow dispatchers before reaching its own. Each is an
-/// `async fn` whose future stays live for the whole call, so those unrelated frames dominated the
-/// stack: measured at ~1.24 MiB for one fall-through hop. Classifying first means a request
-/// instantiates only its own domain's dispatcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestDomain {
-    /// Handled directly by [`handle_request_inner`].
-    Primary,
-    SessionSearchAttach,
-    TurnWorkflowModel,
-    WorkflowMutation,
-    WorkflowAuthoring,
-    WorkflowValidation,
-    WorkflowRun,
-    Remaining,
-}
-
-/// Classify a request without consuming it, so routing costs no frame of its own.
-#[allow(clippy::too_many_lines)]
-const fn request_domain(request: &Request) -> RequestDomain {
-    match request {
-        Request::Hello { .. }
-        | Request::UpdateClientRuntimeContext { .. }
-        | Request::Ping
-        | Request::IngestClientMetrics { .. }
-        | Request::ServerStatus { .. }
-        | Request::ModelCatalogDiagnostics
-        | Request::ServerStop { .. }
-        | Request::ReleaseSessionOwnership { .. }
-        | Request::SetComposerDraft { .. }
-        | Request::ComposerDraft { .. }
-        | Request::CreateSession { .. }
-        | Request::ListSessions { .. }
-        | Request::SubscribeCatalogUpdates
-        | Request::ChangeSessionWorkingDirectory { .. }
-        | Request::ListWorktrees(_)
-        | Request::CreateWorktree(_)
-        | Request::RemoveWorktree(_)
-        | Request::RalphStatus(_)
-        | Request::RunRalphLoop(_)
-        | Request::ApproveRalphRun(_)
-        | Request::CancelRalphLoop(_)
-        | Request::ListRalphRuns(_)
-        | Request::ListRalphIterations(_)
-        | Request::ResumeRalphRun(_)
-        | Request::RalphRunStatus(_)
-        | Request::RecordRalphLifecycle(_)
-        | Request::RenameSession { .. }
-        | Request::DeleteSession { .. }
-        | Request::ReadSessionArtifact { .. }
-        | Request::InvocationInput { .. }
-        | Request::ForkSession { .. }
-        | Request::CloneSession { .. }
-        | Request::SessionHistory { .. }
-        | Request::SessionHistoryPage { .. }
-        | Request::SessionHistoryAround { .. }
-        | Request::SessionInspection { .. } => RequestDomain::Primary,
-        Request::SessionSearch { .. }
-        | Request::SessionSearchProviders
-        | Request::SessionSearchExplain { .. }
-        | Request::SessionSearchPurge { .. }
-        | Request::SessionSearchRebuild { .. }
-        | Request::SessionSearchCompleteBackfillStart { .. }
-        | Request::SessionSearchBackfillStart { .. }
-        | Request::SessionSearchBackfillStatus { .. }
-        | Request::SessionSearchBackfillWait { .. }
-        | Request::SessionSearchBackfillCancel { .. }
-        | Request::SessionSearchBackfill { .. }
-        | Request::PrepareSessionOpen { .. }
-        | Request::WaitSessionOpenProgress { .. }
-        | Request::AttachSession { .. }
-        | Request::AttachSessionRecent { .. }
-        | Request::AttachSessionProjectionWindow { .. }
-        | Request::ImportExternalSession { .. }
-        | Request::RefreshSessionCatalog { .. } => RequestDomain::SessionSearchAttach,
-        Request::SendUserMessage { .. }
-        | Request::SendUserMessageWithPlacement { .. }
-        | Request::SendUserMessageWithExecution { .. }
-        | Request::SubmitTurn { .. }
-        | Request::InvokeSkill { .. }
-        | Request::InvokeSkillWithExecution { .. }
-        | Request::CancelSessionTurn { .. }
-        | Request::CancelRuntimeWork { .. }
-        | Request::ApplyWorkflowSource(_)
-        | Request::ResetIncompatibleWorkflowStore { .. }
-        | Request::CancelWorkflowComputation { .. }
-        | Request::ApplyWorkflowDraftEdits(_) => RequestDomain::TurnWorkflowModel,
-        Request::CreateAuthoredWorkflow(_)
-        | Request::UpdateWorkflowDraft(_)
-        | Request::PublishWorkflowDraft(_)
-        | Request::PublishAndStartWorkflow(_)
-        | Request::ActivateWorkflowRevision(_)
-        | Request::SetAuthoredWorkflowArchived(_)
-        | Request::DiscardWorkflowDraft(_)
-        | Request::ForkWorkflowDraft(_)
-        | Request::CreateWorkflowPreset(_)
-        | Request::UpdateWorkflowPreset(_)
-        | Request::DeleteWorkflowPreset(_)
-        | Request::ExportWorkflowRevision(_)
-        | Request::PreviewWorkflowImport(_)
-        | Request::ImportWorkflow(_)
-        | Request::ImportWorkflowDraft(_)
-        | Request::ImportWorkflowRevision(_)
-        | Request::StartAuthoredWorkflow(_)
-        | Request::StartWorkflowPackageExport(_) => RequestDomain::WorkflowMutation,
-        Request::ListAuthoredWorkflows { .. }
-        | Request::GetAuthoredWorkflow { .. }
-        | Request::InspectAuthoredWorkflow { .. }
-        | Request::ListWorkflowDrafts { .. }
-        | Request::GetWorkflowDraft { .. }
-        | Request::ListWorkflowRevisions { .. }
-        | Request::GetWorkflowRevision { .. }
-        | Request::InspectWorkflowRevisionRequirements { .. }
-        | Request::ListWorkflowPresets { .. }
-        | Request::GetWorkflowPreset { .. } => RequestDomain::WorkflowAuthoring,
-        Request::WorkflowAuthoringCatalog
-        | Request::GetWorkflowPackagePublication { .. }
-        | Request::ApplyWorkflowPackage(_)
-        | Request::PublishWorkflowPackage(_)
-        | Request::ValidateWorkflowPackage(_)
-        | Request::PreviewWorkflowPackage(_)
-        | Request::ValidateWorkflowSource(_)
-        | Request::PreviewWorkflowSource(_)
-        | Request::ValidateWorkflowAuthoring { .. }
-        | Request::PreviewWorkflowCompilation { .. }
-        | Request::ListWorkflowTemplates { .. }
-        | Request::DescribeWorkflowTemplate { .. }
-        | Request::InstantiateWorkflowTemplate(_)
-        | Request::StartWorkflowTemplate(_)
-        | Request::RegisterWorkflowDefinition(_)
-        | Request::StartWorkflow(_)
-        | Request::StartWorkflowRun(_)
-        | Request::ListWorkflowDefinitions { .. }
-        | Request::DescribeWorkflowDefinition { .. } => RequestDomain::WorkflowValidation,
-        Request::InspectWorkflowRun { .. }
-        | Request::WorkflowRunStatus { .. }
-        | Request::AssociatedWorkflowRun { .. }
-        | Request::InspectAssociatedWorkflowRun { .. }
-        | Request::ControlAssociatedWorkflowRun { .. }
-        | Request::ListWorkflowRuns { .. }
-        | Request::CancelWorkflowRun { .. }
-        | Request::PauseWorkflowRun { .. }
-        | Request::ResumeWorkflowRun { .. }
-        | Request::DoctorWorkflowRun { .. }
-        | Request::RepairWorkflowAttempt { .. }
-        | Request::RetryWorkflowNode { .. }
-        | Request::ListWorkflowWaits { .. }
-        | Request::ProvideWorkflowInput { .. }
-        | Request::ResolveWorkflowApproval { .. }
-        | Request::ListWorkflowMutationApprovals { .. }
-        | Request::ResolveWorkflowMutationApproval { .. }
-        | Request::WorkflowAttemptHistory { .. }
-        | Request::WorkflowEventHistory { .. }
-        | Request::ListRuntimeWork { .. }
-        | Request::RuntimeWorkHistory { .. }
-        | Request::SubscribeRuntimeWork { .. }
-        | Request::CompactSession { .. }
-        | Request::SetSessionModel { .. }
-        | Request::SetSessionReasoning { .. }
-        | Request::AppendPresentationNote { .. }
-        | Request::SessionModelStatus { .. }
-        | Request::DefaultModelStatus
-        | Request::SessionModelList { .. } => RequestDomain::WorkflowRun,
-        _ => RequestDomain::Remaining,
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 async fn handle_request_inner(
-    request: Request,
+    request: SessionLifecycleRequest,
     request_id: u64,
     client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
-    attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
-    // Route directly to the owning dispatcher. Dispatchers are chained by fall-through, so entering
-    // the chain would keep every intermediate dispatcher's future live for the whole call.
-    match request_domain(&request) {
-        RequestDomain::Primary => {}
-        RequestDomain::SessionSearchAttach => {
-            return Box::pin(handle_session_search_attach_request(
-                request,
-                request_id,
-                client_id,
-                state,
-                writer,
-                attached_session,
-            ))
-            .await;
-        }
-        RequestDomain::TurnWorkflowModel => {
-            return Box::pin(handle_turn_workflow_model_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await;
-        }
-        RequestDomain::WorkflowMutation => {
-            return Box::pin(handle_workflow_mutation_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await;
-        }
-        RequestDomain::WorkflowAuthoring => {
-            return Box::pin(handle_workflow_authoring_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await;
-        }
-        RequestDomain::WorkflowValidation => {
-            return Box::pin(handle_workflow_validation_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await;
-        }
-        RequestDomain::WorkflowRun => {
-            return Box::pin(handle_workflow_run_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await;
-        }
-        RequestDomain::Remaining => {
-            return Box::pin(handle_remaining_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await;
-        }
-    }
     match request {
-        Request::Hello {
+        SessionLifecycleRequest::Hello {
             client_name,
             runtime_context,
             daemon_namespace,
@@ -4337,7 +4194,7 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::UpdateClientRuntimeContext { runtime_context } => {
+        SessionLifecycleRequest::UpdateClientRuntimeContext { runtime_context } => {
             handle_update_client_runtime_context(
                 request_id,
                 client_id,
@@ -4347,43 +4204,45 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::Ping => handle_ping(request_id, writer).await,
-        Request::IngestClientMetrics { batch } => {
+        SessionLifecycleRequest::Ping => handle_ping(request_id, writer).await,
+        SessionLifecycleRequest::IngestClientMetrics { batch } => {
             handle_ingest_client_metrics(request_id, state, writer, batch).await
         }
-        Request::ServerStatus { working_directory } => {
+        SessionLifecycleRequest::ServerStatus { working_directory } => {
             handle_server_status(request_id, state, writer, working_directory.as_deref()).await
         }
-        Request::ModelCatalogDiagnostics => {
+        SessionLifecycleRequest::ModelCatalogDiagnostics => {
             handle_model_catalog_diagnostics(request_id, state, writer).await
         }
-        Request::ServerStop { mode } => handle_server_stop(request_id, state, writer, mode).await,
-        Request::ReleaseSessionOwnership { session_id } => {
+        SessionLifecycleRequest::ServerStop { mode } => {
+            handle_server_stop(request_id, state, writer, mode).await
+        }
+        SessionLifecycleRequest::ReleaseSessionOwnership { session_id } => {
             handle_release_session_ownership(request_id, state, writer, session_id).await
         }
-        Request::SetComposerDraft { scope, text } => {
+        SessionLifecycleRequest::SetComposerDraft { scope, text } => {
             handle_set_composer_draft(request_id, state, writer, scope, text).await
         }
-        Request::ComposerDraft { scope } => {
+        SessionLifecycleRequest::ComposerDraft { scope } => {
             handle_composer_draft(request_id, state, writer, scope).await
         }
-        Request::CreateSession {
+        SessionLifecycleRequest::CreateSession {
             name,
             working_directory,
         } => handle_create_session(request_id, state, writer, name, working_directory).await,
-        Request::ListSessions { working_directory } => {
+        SessionLifecycleRequest::ListSessions { working_directory } => {
             handle_list_sessions(request_id, state, writer, &working_directory).await
         }
-        Request::SessionCompatibilityInventory { request } => {
+        SessionLifecycleRequest::SessionCompatibilityInventory { request } => {
             handle_session_compatibility_inventory(request_id, state, writer, request).await
         }
-        Request::SessionBulkMigrationStart { request } => {
+        SessionLifecycleRequest::SessionBulkMigrationStart { request } => {
             session_bulk_migration::handle_session_bulk_migration_start(
                 request_id, state, writer, request,
             )
             .await
         }
-        Request::SessionBulkMigrationStatus { operation_id } => {
+        SessionLifecycleRequest::SessionBulkMigrationStatus { operation_id } => {
             session_bulk_migration::handle_session_bulk_migration_status(
                 request_id,
                 state,
@@ -4392,7 +4251,7 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::SessionBulkMigrationWait {
+        SessionLifecycleRequest::SessionBulkMigrationWait {
             operation_id,
             after_revision,
             timeout_ms,
@@ -4407,7 +4266,7 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::SessionBulkMigrationCancel { operation_id } => {
+        SessionLifecycleRequest::SessionBulkMigrationCancel { operation_id } => {
             session_bulk_migration::handle_session_bulk_migration_cancel(
                 request_id,
                 state,
@@ -4416,10 +4275,10 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::SubscribeCatalogUpdates => {
+        SessionLifecycleRequest::SubscribeCatalogUpdates => {
             handle_subscribe_catalog_updates(request_id, client_id, state, writer).await
         }
-        Request::ChangeSessionWorkingDirectory {
+        SessionLifecycleRequest::ChangeSessionWorkingDirectory {
             session_id,
             working_directory,
         } => {
@@ -4432,52 +4291,52 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::ListWorktrees(request) => {
+        SessionLifecycleRequest::ListWorktrees(request) => {
             handle_list_worktrees(request_id, state, writer, request).await
         }
-        Request::CreateWorktree(request) => {
+        SessionLifecycleRequest::CreateWorktree(request) => {
             handle_create_worktree(request_id, state, writer, request).await
         }
-        Request::RemoveWorktree(request) => {
+        SessionLifecycleRequest::RemoveWorktree(request) => {
             handle_remove_worktree(request_id, state, writer, request).await
         }
-        Request::RalphStatus(request) => {
+        SessionLifecycleRequest::RalphStatus(request) => {
             handle_ralph_status(request_id, state, writer, request).await
         }
-        Request::RunRalphLoop(request) => {
+        SessionLifecycleRequest::RunRalphLoop(request) => {
             handle_run_ralph_loop(request_id, client_id, state, writer, request).await
         }
-        Request::ApproveRalphRun(request) => {
+        SessionLifecycleRequest::ApproveRalphRun(request) => {
             handle_approve_ralph_run(request_id, client_id, state, writer, request).await
         }
-        Request::CancelRalphLoop(request) => {
+        SessionLifecycleRequest::CancelRalphLoop(request) => {
             Box::pin(handle_cancel_ralph_loop(request_id, state, writer, request)).await
         }
-        Request::ListRalphRuns(request) => {
+        SessionLifecycleRequest::ListRalphRuns(request) => {
             Box::pin(handle_list_ralph_runs(request_id, state, writer, *request)).await
         }
-        Request::ListRalphIterations(request) => {
+        SessionLifecycleRequest::ListRalphIterations(request) => {
             Box::pin(handle_list_ralph_iterations(
                 request_id, state, writer, *request,
             ))
             .await
         }
-        Request::ResumeRalphRun(request) => {
+        SessionLifecycleRequest::ResumeRalphRun(request) => {
             handle_resume_ralph_run(request_id, state, writer, request).await
         }
-        Request::RalphRunStatus(request) => {
+        SessionLifecycleRequest::RalphRunStatus(request) => {
             handle_ralph_run_status(request_id, state, writer, request).await
         }
-        Request::RecordRalphLifecycle(request) => {
+        SessionLifecycleRequest::RecordRalphLifecycle(request) => {
             handle_record_ralph_lifecycle(request_id, state, writer, request).await
         }
-        Request::RenameSession { session_id, name } => {
+        SessionLifecycleRequest::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
         }
-        Request::DeleteSession { session_id } => {
+        SessionLifecycleRequest::DeleteSession { session_id } => {
             handle_delete_session(request_id, state, writer, session_id).await
         }
-        Request::ReadSessionArtifact {
+        SessionLifecycleRequest::ReadSessionArtifact {
             session_id,
             artifact_id,
             reference_key,
@@ -4496,10 +4355,10 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::InvocationInput { session_id, input } => {
+        SessionLifecycleRequest::InvocationInput { session_id, input } => {
             handle_invocation_input(request_id, state, writer, session_id, input).await
         }
-        Request::ForkSession {
+        SessionLifecycleRequest::ForkSession {
             source_session_id,
             prompt_sequence,
             name,
@@ -4514,7 +4373,7 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::CloneSession {
+        SessionLifecycleRequest::CloneSession {
             source_session_id,
             name,
             expected_generation,
@@ -4529,30 +4388,19 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::SessionHistory { session_id } => {
+        SessionLifecycleRequest::SessionHistory { session_id } => {
             handle_session_history(request_id, client_id, state, writer, session_id).await
         }
-        Request::SessionHistoryPage { session_id, query } => {
+        SessionLifecycleRequest::SessionHistoryPage { session_id, query } => {
             handle_session_history_page(request_id, client_id, state, writer, session_id, query)
                 .await
         }
-        Request::SessionHistoryAround { session_id, query } => {
+        SessionLifecycleRequest::SessionHistoryAround { session_id, query } => {
             handle_session_history_around(request_id, client_id, state, writer, session_id, query)
                 .await
         }
-        Request::SessionInspection { session_id, query } => {
+        SessionLifecycleRequest::SessionInspection { session_id, query } => {
             handle_session_inspection(request_id, client_id, state, writer, session_id, query).await
-        }
-        request => {
-            Box::pin(handle_session_search_attach_request(
-                request,
-                request_id,
-                client_id,
-                state,
-                writer,
-                attached_session,
-            ))
-            .await
         }
     }
 }
@@ -4563,7 +4411,7 @@ async fn handle_request_inner(
 /// request arm's locals at once.
 #[allow(clippy::too_many_lines)]
 async fn handle_session_search_attach_request(
-    request: Request,
+    request: SessionSearchAttachRequest,
     request_id: u64,
     client_id: ClientId,
     state: &Arc<ServerState>,
@@ -4571,7 +4419,7 @@ async fn handle_session_search_attach_request(
     attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
     match request {
-        Request::SessionSearch {
+        SessionSearchAttachRequest::SessionSearch {
             request,
             policy,
             routes,
@@ -4579,7 +4427,7 @@ async fn handle_session_search_attach_request(
         } => {
             handle_session_search(request_id, state, writer, request, policy, routes, hydrate).await
         }
-        Request::SessionSearchProviders => {
+        SessionSearchAttachRequest::SessionSearchProviders => {
             let response = session_search::list_providers(state).await;
             send_response(
                 writer,
@@ -4588,7 +4436,7 @@ async fn handle_session_search_attach_request(
             )
             .await
         }
-        Request::SessionSearchExplain {
+        SessionSearchAttachRequest::SessionSearchExplain {
             request,
             policy,
             routes,
@@ -4604,33 +4452,33 @@ async fn handle_session_search_attach_request(
             )
             .await
         }
-        Request::SessionSearchPurge {
+        SessionSearchAttachRequest::SessionSearchPurge {
             provider_id,
             confirmation,
         } => {
             let result = session_search::purge_provider(state, &provider_id, confirmation).await;
             handle_session_search_maintenance(request_id, writer, result).await
         }
-        Request::SessionSearchRebuild {
+        SessionSearchAttachRequest::SessionSearchRebuild {
             provider_id,
             confirmation,
         } => {
             let result = session_search::rebuild_provider(state, &provider_id, confirmation).await;
             handle_session_search_maintenance(request_id, writer, result).await
         }
-        Request::SessionSearchCompleteBackfillStart { request } => {
+        SessionSearchAttachRequest::SessionSearchCompleteBackfillStart { request } => {
             let result = start_complete_session_search_backfill(Arc::clone(state), request).await;
             handle_complete_session_search_backfill_start(request_id, writer, result).await
         }
-        Request::SessionSearchBackfillStart { request } => {
+        SessionSearchAttachRequest::SessionSearchBackfillStart { request } => {
             let result = start_session_search_backfill(Arc::clone(state), request).await;
             handle_session_search_backfill_start(request_id, writer, result).await
         }
-        Request::SessionSearchBackfillStatus { operation_id } => {
+        SessionSearchAttachRequest::SessionSearchBackfillStatus { operation_id } => {
             let result = session_search_backfill_status(state, &operation_id).await;
             handle_session_search_backfill_operation(request_id, writer, result).await
         }
-        Request::SessionSearchBackfillWait {
+        SessionSearchAttachRequest::SessionSearchBackfillWait {
             operation_id,
             after_revision,
             timeout_ms,
@@ -4640,18 +4488,18 @@ async fn handle_session_search_attach_request(
                     .await;
             handle_session_search_backfill_operation(request_id, writer, result).await
         }
-        Request::SessionSearchBackfillCancel { operation_id } => {
+        SessionSearchAttachRequest::SessionSearchBackfillCancel { operation_id } => {
             let result = cancel_session_search_backfill(state, &operation_id).await;
             handle_session_search_backfill_operation(request_id, writer, result).await
         }
-        Request::SessionSearchBackfill { request } => {
+        SessionSearchAttachRequest::SessionSearchBackfill { request } => {
             let result = session_search::backfill_provider(state, request).await;
             handle_session_search_backfill(request_id, writer, result).await
         }
-        Request::PrepareSessionOpen { session_id } => {
+        SessionSearchAttachRequest::PrepareSessionOpen { session_id } => {
             handle_prepare_session_open(request_id, state, writer, session_id).await
         }
-        Request::WaitSessionOpenProgress {
+        SessionSearchAttachRequest::WaitSessionOpenProgress {
             session_id,
             operation_id,
             after_revision,
@@ -4668,7 +4516,7 @@ async fn handle_session_search_attach_request(
             )
             .await
         }
-        Request::AttachSession { session_id } => {
+        SessionSearchAttachRequest::AttachSession { session_id } => {
             let client_cwd = state.client_working_directory(client_id).await;
             let session_id =
                 session_import::resolve_attach_session_id(state, session_id, client_cwd.as_deref())
@@ -4683,7 +4531,7 @@ async fn handle_session_search_attach_request(
             )
             .await
         }
-        Request::AttachSessionRecent { session_id, limit } => {
+        SessionSearchAttachRequest::AttachSessionRecent { session_id, limit } => {
             let client_cwd = state.client_working_directory(client_id).await;
             let session_id =
                 session_import::resolve_attach_session_id(state, session_id, client_cwd.as_deref())
@@ -4699,7 +4547,7 @@ async fn handle_session_search_attach_request(
             )
             .await
         }
-        Request::AttachSessionProjectionWindow {
+        SessionSearchAttachRequest::AttachSessionProjectionWindow {
             session_id,
             request,
         } => {
@@ -4718,7 +4566,7 @@ async fn handle_session_search_attach_request(
             )
             .await
         }
-        Request::ImportExternalSession {
+        SessionSearchAttachRequest::ImportExternalSession {
             source_id,
             external_session_id,
             working_directory,
@@ -4733,7 +4581,7 @@ async fn handle_session_search_attach_request(
             )
             .await
         }
-        Request::RefreshSessionCatalog {
+        SessionSearchAttachRequest::RefreshSessionCatalog {
             working_directory,
             sources,
         } => {
@@ -4757,12 +4605,6 @@ async fn handle_session_search_attach_request(
             )
             .await
         }
-        request => {
-            Box::pin(handle_turn_workflow_model_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await
-        }
     }
 }
 
@@ -4773,14 +4615,14 @@ async fn handle_session_search_attach_request(
 /// combined stack frame stays bounded regardless of how deep the IPC call chain runs.
 #[allow(clippy::too_many_lines)]
 async fn handle_turn_workflow_model_request(
-    request: Request,
+    request: SessionTurnRequest,
     request_id: u64,
     client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
-        Request::SendUserMessage { session_id, text } => {
+        SessionTurnRequest::SendUserMessage { session_id, text } => {
             handle_user_message(
                 request_id,
                 client_id,
@@ -4793,7 +4635,7 @@ async fn handle_turn_workflow_model_request(
             )
             .await
         }
-        Request::SendUserMessageWithPlacement {
+        SessionTurnRequest::SendUserMessageWithPlacement {
             session_id,
             text,
             placement,
@@ -4810,7 +4652,7 @@ async fn handle_turn_workflow_model_request(
             )
             .await
         }
-        Request::SendUserMessageWithExecution {
+        SessionTurnRequest::SendUserMessageWithExecution {
             session_id,
             text,
             placement,
@@ -4821,7 +4663,7 @@ async fn handle_turn_workflow_model_request(
             )
             .await
         }
-        Request::SubmitTurn {
+        SessionTurnRequest::SubmitTurn {
             session_id,
             text,
             admission,
@@ -4831,7 +4673,7 @@ async fn handle_turn_workflow_model_request(
             )
             .await
         }
-        Request::InvokeSkill {
+        SessionTurnRequest::InvokeSkill {
             session_id,
             skill_id,
             arguments,
@@ -4850,7 +4692,7 @@ async fn handle_turn_workflow_model_request(
             )
             .await
         }
-        Request::InvokeSkillWithExecution {
+        SessionTurnRequest::InvokeSkillWithExecution {
             session_id,
             skill_id,
             arguments,
@@ -4870,7 +4712,7 @@ async fn handle_turn_workflow_model_request(
             )
             .await
         }
-        Request::CancelSessionTurn {
+        SessionTurnRequest::CancelSessionTurn {
             session_id,
             clear_queue,
         } => {
@@ -4884,21 +4726,15 @@ async fn handle_turn_workflow_model_request(
             )
             .await
         }
-        Request::CancelRuntimeWork {
+        SessionTurnRequest::CancelRuntimeWork {
             session_id,
             work_id,
         } => {
             handle_cancel_runtime_work(request_id, client_id, state, writer, session_id, work_id)
                 .await
         }
-        Request::ApplyWorkflowSource(request) => {
+        SessionTurnRequest::ApplyWorkflowSource(request) => {
             handle_apply_workflow_source(request_id, client_id, state, writer, request).await
-        }
-        request => {
-            Box::pin(handle_workflow_mutation_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await
         }
     }
 }
@@ -4908,17 +4744,17 @@ async fn handle_turn_workflow_model_request(
 /// Split out of [`handle_turn_workflow_model_request`] to keep each dispatcher frame bounded.
 #[allow(clippy::too_many_lines)]
 async fn handle_workflow_mutation_request(
-    request: Request,
+    request: WorkflowMutationRequest,
     request_id: u64,
     client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
-        Request::CreateAuthoredWorkflow(request) => {
+        WorkflowMutationRequest::CreateAuthoredWorkflow(request) => {
             handle_create_authored_workflow(request_id, client_id, state, writer, request).await
         }
-        Request::CancelWorkflowComputation { operation_id } => {
+        WorkflowMutationRequest::CancelWorkflowComputation { operation_id } => {
             let cancelled = cancel_workflow_computation(state, &operation_id);
             send_response(
                 writer,
@@ -4929,7 +4765,7 @@ async fn handle_workflow_mutation_request(
             )
             .await
         }
-        Request::ResetIncompatibleWorkflowStore { .. } => {
+        WorkflowMutationRequest::ResetIncompatibleWorkflowStore { .. } => {
             send_response(
                 writer,
                 request_id,
@@ -4940,66 +4776,60 @@ async fn handle_workflow_mutation_request(
             )
             .await
         }
-        Request::ApplyWorkflowDraftEdits(request) => {
+        WorkflowMutationRequest::ApplyWorkflowDraftEdits(request) => {
             handle_apply_workflow_draft_edits(request_id, client_id, state, writer, request).await
         }
-        Request::UpdateWorkflowDraft(request) => {
+        WorkflowMutationRequest::UpdateWorkflowDraft(request) => {
             handle_update_workflow_draft(request_id, client_id, state, writer, request).await
         }
-        Request::PublishWorkflowDraft(request) => {
+        WorkflowMutationRequest::PublishWorkflowDraft(request) => {
             handle_publish_workflow_draft(request_id, client_id, state, writer, request).await
         }
-        Request::PublishAndStartWorkflow(request) => {
+        WorkflowMutationRequest::PublishAndStartWorkflow(request) => {
             handle_publish_and_start_workflow(request_id, client_id, state, writer, *request).await
         }
-        Request::ActivateWorkflowRevision(request) => {
+        WorkflowMutationRequest::ActivateWorkflowRevision(request) => {
             handle_activate_workflow_revision(request_id, client_id, state, writer, request).await
         }
-        Request::SetAuthoredWorkflowArchived(request) => {
+        WorkflowMutationRequest::SetAuthoredWorkflowArchived(request) => {
             handle_set_authored_workflow_archived(request_id, client_id, state, writer, request)
                 .await
         }
-        Request::DiscardWorkflowDraft(request) => {
+        WorkflowMutationRequest::DiscardWorkflowDraft(request) => {
             handle_discard_workflow_draft(request_id, client_id, state, writer, request).await
         }
-        Request::ForkWorkflowDraft(request) => {
+        WorkflowMutationRequest::ForkWorkflowDraft(request) => {
             handle_fork_workflow_draft(request_id, client_id, state, writer, request).await
         }
-        Request::CreateWorkflowPreset(request) => {
+        WorkflowMutationRequest::CreateWorkflowPreset(request) => {
             handle_create_workflow_preset(request_id, client_id, state, writer, request).await
         }
-        Request::UpdateWorkflowPreset(request) => {
+        WorkflowMutationRequest::UpdateWorkflowPreset(request) => {
             handle_update_workflow_preset(request_id, client_id, state, writer, request).await
         }
-        Request::DeleteWorkflowPreset(request) => {
+        WorkflowMutationRequest::DeleteWorkflowPreset(request) => {
             handle_delete_workflow_preset(request_id, client_id, state, writer, request).await
         }
-        Request::ExportWorkflowRevision(request) => {
+        WorkflowMutationRequest::ExportWorkflowRevision(request) => {
             handle_export_workflow_revision(request_id, state, writer, request).await
         }
-        Request::PreviewWorkflowImport(request) => {
+        WorkflowMutationRequest::PreviewWorkflowImport(request) => {
             handle_preview_workflow_import(request_id, state, writer, request).await
         }
-        Request::ImportWorkflow(request) => {
+        WorkflowMutationRequest::ImportWorkflow(request) => {
             handle_import_workflow(request_id, client_id, state, writer, request).await
         }
-        Request::ImportWorkflowDraft(request) => {
+        WorkflowMutationRequest::ImportWorkflowDraft(request) => {
             handle_import_workflow_draft(request_id, client_id, state, writer, request).await
         }
-        Request::ImportWorkflowRevision(request) => {
+        WorkflowMutationRequest::ImportWorkflowRevision(request) => {
             handle_import_workflow_revision(request_id, client_id, state, writer, request).await
         }
-        Request::StartAuthoredWorkflow(request) => {
+        WorkflowMutationRequest::StartAuthoredWorkflow(request) => {
             handle_start_authored_workflow(request_id, client_id, state, writer, request).await
         }
-        Request::StartWorkflowPackageExport(request) => {
+        WorkflowMutationRequest::StartWorkflowPackageExport(request) => {
             handle_start_workflow_package_export(request_id, client_id, state, writer, request).await
-        }
-        request => {
-            Box::pin(handle_workflow_authoring_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await
         }
     }
 }
@@ -5010,14 +4840,13 @@ async fn handle_workflow_mutation_request(
 /// bounded; workflow authoring arms carry large request and page payloads.
 #[allow(clippy::too_many_lines)]
 async fn handle_workflow_authoring_request(
-    request: Request,
+    request: WorkflowAuthoringRequest,
     request_id: u64,
-    client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
-        Request::ListAuthoredWorkflows { cursor, limit } => {
+        WorkflowAuthoringRequest::ListAuthoredWorkflows { cursor, limit } => {
             let workflows = state
                 .workflow_store
                 .lock()
@@ -5031,7 +4860,7 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        Request::GetAuthoredWorkflow { workflow_id } => {
+        WorkflowAuthoringRequest::GetAuthoredWorkflow { workflow_id } => {
             let workflow = state
                 .workflow_store
                 .lock()
@@ -5045,7 +4874,7 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        Request::InspectAuthoredWorkflow { workflow_id, limit } => {
+        WorkflowAuthoringRequest::InspectAuthoredWorkflow { workflow_id, limit } => {
             let inspection = authored_workflow_inspection(state, &workflow_id, limit)?;
             send_response(
                 writer,
@@ -5056,7 +4885,7 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        Request::ListWorkflowDrafts {
+        WorkflowAuthoringRequest::ListWorkflowDrafts {
             workflow_id,
             cursor,
             limit,
@@ -5078,7 +4907,7 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        Request::GetWorkflowDraft {
+        WorkflowAuthoringRequest::GetWorkflowDraft {
             workflow_id,
             draft_id,
         } => {
@@ -5096,7 +4925,7 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        Request::ListWorkflowRevisions {
+        WorkflowAuthoringRequest::ListWorkflowRevisions {
             workflow_id,
             cursor,
             limit,
@@ -5114,7 +4943,7 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        Request::GetWorkflowRevision {
+        WorkflowAuthoringRequest::GetWorkflowRevision {
             workflow_id,
             revision,
         } => {
@@ -5132,7 +4961,7 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        Request::InspectWorkflowRevisionRequirements {
+        WorkflowAuthoringRequest::InspectWorkflowRevisionRequirements {
             workflow_id,
             revision,
         } => {
@@ -5145,7 +4974,7 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        Request::ListWorkflowPresets {
+        WorkflowAuthoringRequest::ListWorkflowPresets {
             workflow_id,
             cursor,
             limit,
@@ -5167,7 +4996,7 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        Request::GetWorkflowPreset {
+        WorkflowAuthoringRequest::GetWorkflowPreset {
             workflow_id,
             preset_id,
         } => {
@@ -5184,12 +5013,6 @@ async fn handle_workflow_authoring_request(
             )
             .await
         }
-        request => {
-            Box::pin(handle_workflow_validation_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await
-        }
     }
 }
 
@@ -5199,17 +5022,17 @@ async fn handle_workflow_authoring_request(
 /// through their own boxed future rather than reserving that space in a shared frame.
 #[allow(clippy::too_many_lines)]
 async fn handle_workflow_validation_request(
-    request: Request,
+    request: WorkflowDefinitionRequest,
     request_id: u64,
     client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
-        Request::WorkflowAuthoringCatalog => {
+        WorkflowDefinitionRequest::WorkflowAuthoringCatalog => {
             handle_workflow_authoring_catalog(request_id, state, writer).await
         }
-        Request::GetWorkflowPackagePublication { package_id } => {
+        WorkflowDefinitionRequest::GetWorkflowPackagePublication { package_id } => {
             let receipt = state
                 .workflow_store
                 .lock()
@@ -5222,7 +5045,7 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
-        Request::ApplyWorkflowPackage(request) => {
+        WorkflowDefinitionRequest::ApplyWorkflowPackage(request) => {
             let result = state
                 .workflow_store
                 .lock()
@@ -5237,7 +5060,7 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
-        Request::PublishWorkflowPackage(request) => {
+        WorkflowDefinitionRequest::PublishWorkflowPackage(request) => {
             let result = state
                 .workflow_store
                 .lock()
@@ -5252,7 +5075,7 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
-        Request::ValidateWorkflowPackage(request) => {
+        WorkflowDefinitionRequest::ValidateWorkflowPackage(request) => {
             let catalog = workflow_authoring_catalog_snapshot(state).await?;
             let result = run_workflow_computation(
                 state,
@@ -5270,7 +5093,7 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
-        Request::PreviewWorkflowPackage(request) => {
+        WorkflowDefinitionRequest::PreviewWorkflowPackage(request) => {
             let mut catalog = workflow_authoring_catalog_snapshot(state).await?;
             for dependency in &request.dependency_plans {
                 for member in &dependency.members {
@@ -5302,7 +5125,7 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
-        Request::ValidateWorkflowSource(request) => {
+        WorkflowDefinitionRequest::ValidateWorkflowSource(request) => {
             let catalog = workflow_authoring_catalog_snapshot(state).await?;
             let source_format = request.source_format;
             let result = run_workflow_computation(
@@ -5330,7 +5153,7 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
-        Request::PreviewWorkflowSource(request) => {
+        WorkflowDefinitionRequest::PreviewWorkflowSource(request) => {
             let catalog = workflow_authoring_catalog_snapshot(state).await?;
             let source_format = request.source_format;
             let configuration = request.configuration;
@@ -5364,7 +5187,7 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
-        Request::ValidateWorkflowAuthoring { document, control } => {
+        WorkflowDefinitionRequest::ValidateWorkflowAuthoring { document, control } => {
             let started_at = Instant::now();
             let report = run_workflow_computation(
                 state,
@@ -5386,7 +5209,7 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
-        Request::PreviewWorkflowCompilation {
+        WorkflowDefinitionRequest::PreviewWorkflowCompilation {
             document,
             configuration,
             control,
@@ -5401,32 +5224,10 @@ async fn handle_workflow_validation_request(
             )
             .await
         }
-        request => {
-            Box::pin(handle_workflow_runtime_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await
-        }
-    }
-}
-
-/// Dispatch workflow template, execution, runtime-work, and model-setting requests.
-///
-/// This second boxed dispatcher keeps large authoring/package computation futures out of the
-/// runtime request frame.
-#[allow(clippy::too_many_lines)]
-async fn handle_workflow_runtime_request(
-    request: Request,
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    match request {
-        Request::ListWorkflowTemplates { limit } => {
+        WorkflowDefinitionRequest::ListWorkflowTemplates { limit } => {
             handle_list_workflow_templates(request_id, state, writer, limit).await
         }
-        Request::DescribeWorkflowTemplate {
+        WorkflowDefinitionRequest::DescribeWorkflowTemplate {
             owner_plugin_id,
             template_id,
             template_version,
@@ -5441,37 +5242,31 @@ async fn handle_workflow_runtime_request(
             )
             .await
         }
-        Request::InstantiateWorkflowTemplate(request) => {
+        WorkflowDefinitionRequest::InstantiateWorkflowTemplate(request) => {
             handle_instantiate_workflow_template(request_id, client_id, state, writer, request)
                 .await
         }
-        Request::StartWorkflowTemplate(request) => {
+        WorkflowDefinitionRequest::StartWorkflowTemplate(request) => {
             handle_start_workflow_template(request_id, state, writer, request).await
         }
-        Request::RegisterWorkflowDefinition(request) => {
+        WorkflowDefinitionRequest::RegisterWorkflowDefinition(request) => {
             handle_register_workflow_definition(request_id, state, writer, request).await
         }
-        Request::StartWorkflow(request) => {
+        WorkflowDefinitionRequest::StartWorkflow(request) => {
             handle_start_workflow(request_id, state, writer, request).await
         }
-        Request::StartWorkflowRun(request) => {
+        WorkflowDefinitionRequest::StartWorkflowRun(request) => {
             handle_start_workflow_run(request_id, state, writer, request).await
         }
-        Request::ListWorkflowDefinitions { limit } => {
+        WorkflowDefinitionRequest::ListWorkflowDefinitions { limit } => {
             handle_list_workflow_definitions(request_id, state, writer, limit).await
         }
-        Request::DescribeWorkflowDefinition {
+        WorkflowDefinitionRequest::DescribeWorkflowDefinition {
             definition_id,
             version,
         } => {
             handle_describe_workflow_definition(request_id, state, writer, definition_id, version)
                 .await
-        }
-        request => {
-            Box::pin(handle_workflow_run_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await
         }
     }
 }
@@ -5483,51 +5278,51 @@ async fn handle_workflow_runtime_request(
 /// frame to any other domain's path.
 #[allow(clippy::too_many_lines)]
 async fn handle_workflow_run_request(
-    request: Request,
+    request: RuntimeAndModelRequest,
     request_id: u64,
     client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
-        Request::InspectWorkflowRun { run_id, limit } => {
+        RuntimeAndModelRequest::InspectWorkflowRun { run_id, limit } => {
             handle_inspect_workflow_run(request_id, state, writer, run_id, limit).await
         }
-        Request::WorkflowRunStatus { run_id } => {
+        RuntimeAndModelRequest::WorkflowRunStatus { run_id } => {
             handle_workflow_run_status(request_id, state, writer, run_id).await
         }
-        Request::AssociatedWorkflowRun { key } => {
+        RuntimeAndModelRequest::AssociatedWorkflowRun { key } => {
             handle_associated_workflow_run(request_id, state, writer, key).await
         }
-        Request::InspectAssociatedWorkflowRun { key, limit } => {
+        RuntimeAndModelRequest::InspectAssociatedWorkflowRun { key, limit } => {
             handle_inspect_associated_workflow_run(request_id, state, writer, key, limit).await
         }
-        Request::ControlAssociatedWorkflowRun { key, action } => {
+        RuntimeAndModelRequest::ControlAssociatedWorkflowRun { key, action } => {
             handle_control_associated_workflow_run(request_id, state, writer, key, action).await
         }
-        Request::ListWorkflowRuns { limit } => {
+        RuntimeAndModelRequest::ListWorkflowRuns { limit } => {
             handle_list_workflow_runs(request_id, state, writer, limit).await
         }
-        Request::CancelWorkflowRun { run_id } => {
+        RuntimeAndModelRequest::CancelWorkflowRun { run_id } => {
             handle_cancel_workflow_run(request_id, state, writer, run_id).await
         }
-        Request::PauseWorkflowRun { run_id } => {
+        RuntimeAndModelRequest::PauseWorkflowRun { run_id } => {
             handle_pause_workflow_run(request_id, state, writer, run_id).await
         }
-        Request::ResumeWorkflowRun { run_id } => {
+        RuntimeAndModelRequest::ResumeWorkflowRun { run_id } => {
             handle_resume_workflow_run(request_id, state, writer, run_id).await
         }
-        Request::DoctorWorkflowRun { run_id, limit } => {
+        RuntimeAndModelRequest::DoctorWorkflowRun { run_id, limit } => {
             handle_doctor_workflow_run(request_id, state, writer, run_id, limit).await
         }
-        Request::RepairWorkflowAttempt {
+        RuntimeAndModelRequest::RepairWorkflowAttempt {
             dispatch_identity,
             resolution,
         } => {
             handle_repair_workflow_attempt(request_id, state, writer, dispatch_identity, resolution)
                 .await
         }
-        Request::RetryWorkflowNode {
+        RuntimeAndModelRequest::RetryWorkflowNode {
             run_id,
             node_id,
             activation_id,
@@ -5544,10 +5339,10 @@ async fn handle_workflow_run_request(
             )
             .await
         }
-        Request::ListWorkflowWaits { run_id, limit } => {
+        RuntimeAndModelRequest::ListWorkflowWaits { run_id, limit } => {
             handle_list_workflow_waits(request_id, state, writer, run_id, limit).await
         }
-        Request::ProvideWorkflowInput {
+        RuntimeAndModelRequest::ProvideWorkflowInput {
             run_id,
             node_id,
             activation_id,
@@ -5564,7 +5359,7 @@ async fn handle_workflow_run_request(
             )
             .await
         }
-        Request::ResolveWorkflowApproval {
+        RuntimeAndModelRequest::ResolveWorkflowApproval {
             run_id,
             node_id,
             activation_id,
@@ -5581,10 +5376,10 @@ async fn handle_workflow_run_request(
             )
             .await
         }
-        Request::ListWorkflowMutationApprovals { run_id, limit } => {
+        RuntimeAndModelRequest::ListWorkflowMutationApprovals { run_id, limit } => {
             handle_list_workflow_mutation_approvals(request_id, state, writer, run_id, limit).await
         }
-        Request::ResolveWorkflowMutationApproval {
+        RuntimeAndModelRequest::ResolveWorkflowMutationApproval {
             approval_id,
             decision,
         } => {
@@ -5597,14 +5392,14 @@ async fn handle_workflow_run_request(
             )
             .await
         }
-        Request::WorkflowAttemptHistory {
+        RuntimeAndModelRequest::WorkflowAttemptHistory {
             run_id,
             cursor,
             limit,
         } => {
             handle_workflow_attempt_history(request_id, state, writer, run_id, cursor, limit).await
         }
-        Request::WorkflowEventHistory {
+        RuntimeAndModelRequest::WorkflowEventHistory {
             run_id,
             after_sequence,
             limit,
@@ -5612,38 +5407,19 @@ async fn handle_workflow_run_request(
             handle_workflow_event_history(request_id, state, writer, run_id, after_sequence, limit)
                 .await
         }
-        request => {
-            Box::pin(handle_runtime_session_configuration_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await
-        }
-    }
-}
-
-/// Dispatch runtime-work, session-model, and provider-auth configuration requests.
-#[allow(clippy::too_many_lines)]
-async fn handle_runtime_session_configuration_request(
-    request: Request,
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    match request {
-        Request::ListRuntimeWork { session_id } => {
+        RuntimeAndModelRequest::ListRuntimeWork { session_id } => {
             handle_list_runtime_work(request_id, state, writer, session_id).await
         }
-        Request::RuntimeWorkHistory { session_id, limit } => {
+        RuntimeAndModelRequest::RuntimeWorkHistory { session_id, limit } => {
             handle_runtime_work_history(request_id, state, writer, session_id, limit).await
         }
-        Request::SubscribeRuntimeWork { session_id } => {
+        RuntimeAndModelRequest::SubscribeRuntimeWork { session_id } => {
             handle_subscribe_runtime_work(request_id, client_id, state, writer, session_id).await
         }
-        Request::CompactSession { session_id } => {
+        RuntimeAndModelRequest::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
         }
-        Request::SetSessionModel {
+        RuntimeAndModelRequest::SetSessionModel {
             session_id,
             provider_plugin_id,
             model_id,
@@ -5658,7 +5434,7 @@ async fn handle_runtime_session_configuration_request(
             )
             .await
         }
-        Request::SetSessionReasoning {
+        RuntimeAndModelRequest::SetSessionReasoning {
             session_id,
             effort,
             summary,
@@ -5666,7 +5442,7 @@ async fn handle_runtime_session_configuration_request(
             handle_set_session_reasoning(request_id, state, writer, session_id, effort, summary)
                 .await
         }
-        Request::AppendPresentationNote {
+        RuntimeAndModelRequest::AppendPresentationNote {
             session_id,
             source_id,
             note_id,
@@ -5687,17 +5463,17 @@ async fn handle_runtime_session_configuration_request(
             )
             .await
         }
-        Request::SessionModelStatus { session_id } => {
+        RuntimeAndModelRequest::SessionModelStatus { session_id } => {
             handle_session_model_status(request_id, client_id, state, writer, session_id).await
         }
-        Request::DefaultModelStatus => {
+        RuntimeAndModelRequest::DefaultModelStatus => {
             handle_default_model_status(request_id, client_id, state, writer).await
         }
-        Request::SessionModelList { provider_plugin_id } => {
+        RuntimeAndModelRequest::SessionModelList { provider_plugin_id } => {
             handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
                 .await
         }
-        Request::AuthPoolList => {
+        RuntimeAndModelRequest::AuthPoolList => {
             let config = bcode_config::load_config()?;
             send_response(
                 writer,
@@ -5708,7 +5484,7 @@ async fn handle_runtime_session_configuration_request(
             )
             .await
         }
-        Request::SetAuthPoolPreference { pool, profile } => {
+        RuntimeAndModelRequest::SetAuthPoolPreference { pool, profile } => {
             match bcode_provider_auth::set_auth_pool_preference(&pool, profile.as_deref()) {
                 Ok(_) => {
                     send_response(
@@ -5731,74 +5507,41 @@ async fn handle_runtime_session_configuration_request(
                 }
             }
         }
-        request => {
-            Box::pin(handle_remaining_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await
-        }
     }
 }
 
-/// Dispatch requests not handled by an earlier domain dispatcher.
-///
-/// Every dispatcher hop in this chain is awaited through a boxed future. Clippy's
-/// `large_stack_frames` lint is per-function, but stack depth accumulates across hops, so a chain
-/// of individually-acceptable frames can still exhaust a default thread stack. Boxing each hop
-/// keeps the total bounded regardless of how many domains a request traverses.
-async fn handle_remaining_request(
-    request: Request,
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    Box::pin(handle_agent_permission_plugin_request(
-        request, request_id, client_id, state, writer,
-    ))
-    .await
-}
-
+/// Dispatch requests owned by the agent, skill, and plugin domain.
 async fn handle_agent_permission_plugin_request(
-    request: Request,
+    request: AgentSkillPluginRequest,
     request_id: u64,
-    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
-        Request::ListAgents => handle_list_agents(request_id, state, writer).await,
-        Request::ListSkills => handle_list_skills(request_id, state, writer).await,
-        Request::DescribeSkill { skill_id } => {
+        AgentSkillPluginRequest::ListAgents => handle_list_agents(request_id, state, writer).await,
+        AgentSkillPluginRequest::ListSkills => handle_list_skills(request_id, state, writer).await,
+        AgentSkillPluginRequest::DescribeSkill { skill_id } => {
             handle_describe_skill(request_id, state, writer, &skill_id).await
         }
-        Request::ActivateSkill {
+        AgentSkillPluginRequest::ActivateSkill {
             session_id,
             skill_id,
         } => handle_activate_skill(request_id, state, writer, session_id, skill_id).await,
-        Request::DeactivateSkill {
+        AgentSkillPluginRequest::DeactivateSkill {
             session_id,
             skill_id,
         } => handle_deactivate_skill(request_id, state, writer, session_id, skill_id).await,
-        Request::ActiveSkills { session_id } => {
+        AgentSkillPluginRequest::ActiveSkills { session_id } => {
             handle_active_skills(request_id, state, writer, session_id).await
         }
-        Request::AgentPolicyStatus => handle_agent_policy_status(request_id, state, writer).await,
-        Request::SetSessionAgent {
+        AgentSkillPluginRequest::AgentPolicyStatus => {
+            handle_agent_policy_status(request_id, state, writer).await
+        }
+        AgentSkillPluginRequest::SetSessionAgent {
             session_id,
             agent_id,
         } => handle_set_session_agent(request_id, state, writer, session_id, agent_id).await,
-        Request::ListPermissions
-        | Request::ResolvePermission { .. }
-        | Request::ResolvePermissionBatch { .. }
-        | Request::ListPendingToolExchanges
-        | Request::ResolveToolExchange { .. } => {
-            Box::pin(handle_permission_interaction_request(
-                request, request_id, client_id, state, writer,
-            ))
-            .await
-        }
-        Request::AddPermissionRule {
+        AgentSkillPluginRequest::AddPermissionRule {
             agent_id,
             category,
             pattern,
@@ -5809,11 +5552,13 @@ async fn handle_agent_permission_plugin_request(
             )
             .await
         }
-        Request::ListPluginServices => handle_list_plugin_services(request_id, state, writer).await,
-        Request::ListPluginContributions => {
+        AgentSkillPluginRequest::ListPluginServices => {
+            handle_list_plugin_services(request_id, state, writer).await
+        }
+        AgentSkillPluginRequest::ListPluginContributions => {
             handle_list_plugin_contributions(request_id, state, writer).await
         }
-        Request::InvokePluginService {
+        AgentSkillPluginRequest::InvokePluginService {
             plugin_id,
             interface_id,
             operation,
@@ -5830,7 +5575,7 @@ async fn handle_agent_permission_plugin_request(
             )
             .await
         }
-        Request::CallPluginService {
+        AgentSkillPluginRequest::CallPluginService {
             interface_id,
             operation,
             payload,
@@ -5838,37 +5583,24 @@ async fn handle_agent_permission_plugin_request(
             handle_call_plugin_service(request_id, state, writer, &interface_id, operation, payload)
                 .await
         }
-        Request::PublishPluginEvent { topic, payload } => {
+        AgentSkillPluginRequest::PublishPluginEvent { topic, payload } => {
             handle_publish_plugin_event(request_id, state, writer, &topic, &payload).await
         }
-        Request::ListWorktrees(_)
-        | Request::CreateWorktree(_)
-        | Request::RemoveWorktree(_)
-        | Request::RalphStatus(_)
-        | Request::RunRalphLoop(_)
-        | Request::ApproveRalphRun(_)
-        | Request::CancelRalphLoop(_)
-        | Request::ListRalphRuns(_)
-        | Request::ListRalphIterations(_)
-        | Request::ResumeRalphRun(_)
-        | Request::RalphRunStatus(_)
-        | Request::RecordRalphLifecycle(_) => {
-            unreachable!("primary request routed to primary handler")
-        }
-        _ => unreachable!("primary request routed to agent/permission/plugin handler"),
     }
 }
 
 async fn handle_permission_interaction_request(
-    request: Request,
+    request: PermissionInteractionRequest,
     request_id: u64,
     client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
-        Request::ListPermissions => handle_list_permissions(request_id, state, writer).await,
-        Request::ResolvePermission {
+        PermissionInteractionRequest::ListPermissions => {
+            handle_list_permissions(request_id, state, writer).await
+        }
+        PermissionInteractionRequest::ResolvePermission {
             permission_id,
             approved,
             remember,
@@ -5883,13 +5615,13 @@ async fn handle_permission_interaction_request(
             )
             .await
         }
-        Request::ResolvePermissionBatch { batch_id, approved } => {
+        PermissionInteractionRequest::ResolvePermissionBatch { batch_id, approved } => {
             handle_resolve_permission_batch(request_id, state, writer, &batch_id, approved).await
         }
-        Request::ListPendingToolExchanges => {
+        PermissionInteractionRequest::ListPendingToolExchanges => {
             handle_list_pending_tool_exchanges(request_id, state, writer).await
         }
-        Request::ResolveToolExchange {
+        PermissionInteractionRequest::ResolveToolExchange {
             exchange_id,
             resolution_json,
         } => {
@@ -5904,7 +5636,6 @@ async fn handle_permission_interaction_request(
             )
             .await
         }
-        _ => unreachable!("request routed to permission/interaction handler"),
     }
 }
 

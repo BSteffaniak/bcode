@@ -1621,6 +1621,27 @@ if rg -n 'path = "\.\./bmux/' Cargo.toml >/tmp/bcode-undocumented-bmux-paths.txt
   violations=1
 fi
 
+# IPC request dispatch must stay type-routed. Dispatchers were once chained by fall-through, so a
+# request instantiated every intermediate dispatcher's future before reaching its own; one hop
+# measured 1.24 MiB and overflowed the stack. `RoutedRequest` binds each request to one domain, and
+# each dispatcher takes its own domain type so it holds no `Request` to forward.
+if rg -n '^\s*_ => RequestDomain::' packages/server/src >/tmp/bcode-request-domain-wildcard.txt; then
+  echo "Runtime architecture violation: request routing must not use a wildcard domain arm; an unclassified variant would silently rejoin the fall-through chain." >&2
+  cat /tmp/bcode-request-domain-wildcard.txt >&2
+  violations=1
+fi
+
+if rg -n '^\s*request => \{' packages/server/src/lib.rs >/tmp/bcode-dispatcher-fallthrough.txt; then
+  echo "Runtime architecture violation: dispatchers must not forward unhandled requests to another dispatcher; route through RoutedRequest instead." >&2
+  cat /tmp/bcode-dispatcher-fallthrough.txt >&2
+  violations=1
+fi
+
+if ! rg -q 'pub fn from_request\(request: Request\) -> Self' packages/server/src/request_routing.rs; then
+  echo "Runtime architecture violation: packages/server/src/request_routing.rs must define the exhaustive RoutedRequest::from_request classifier." >&2
+  violations=1
+fi
+
 if ! python3 - <<'PY'
 from pathlib import Path
 import re
