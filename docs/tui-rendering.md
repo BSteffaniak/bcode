@@ -1,5 +1,26 @@
 # TUI rendering configuration
 
+## Component ownership and direct primitive boundary
+
+Bcode's normal terminal shell composes generic controls from `bmux_tui_components` and coding-agent
+recipes from `bcode_tui_components`. Production consumers request exact component features; the
+repository checks those requests with `scripts/check-tui-component-features.sh` and prohibits the
+`all` convenience bundle in production manifests.
+
+Direct `bmux_tui` primitives remain valid only for thin terminal-boundary adaptation that shared
+components cannot own coherently: full-canvas underpaint, bounded scratch-frame clipping, terminal
+image placement, domain-specific map/diff drawing, and component internals. Two Bcode picker list
+adapters remain nested inside shared `PickerFrame`/`ModalFrame` composition, while Eval and Metrics
+adapt their domain rows into BMUX tables. `scripts/check-loop-runtime-architecture.sh` mechanically
+rejects new raw reusable controls outside these classified adapters.
+
+The generic component crate intentionally retains `bmux_keyboard` and `bmux_text_edit` through
+`bmux_tui`'s baseline. The primitive crate's public event, focus, list, viewport, picker, palette,
+history, and text-input APIs expose those types directly; splitting them would be a separate
+primitive-API redesign, not component feature isolation. Component-owned optional dependencies such
+as terminal-grid and Unicode helpers remain feature-gated and are checked by BMUX's complete feature
+matrix.
+
 ## Theme ownership
 
 Terminal presentation is derived from the active versioned theme definition described in

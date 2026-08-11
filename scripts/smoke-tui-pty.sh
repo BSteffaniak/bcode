@@ -72,22 +72,23 @@ export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
 export BCODE_STATE_DIR="${workdir}/state"
 export BCODE_NO_ONBOARD=1
-cat >"${workdir}/config/bcode/plugins/fake-provider/bcode-plugin.toml" <<EOF
-id = "bcode.fake-provider"
-name = "Bcode Fake Model Provider"
-version = "0.0.1"
+python3 - "${root}/plugins/fake-provider-plugin/bcode-plugin.toml" \
+    "${workdir}/config/bcode/plugins/fake-provider/bcode-plugin.toml" "${fake_dylib}" <<'PY'
+from pathlib import Path
+import re
+import sys
 
-[[services]]
-interface_id = "bcode.model-provider/v1"
-name = "Fake Model Provider"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${fake_dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
+source_path, destination_path, library_path = sys.argv[1:]
+manifest = Path(source_path).read_text()
+manifest, replacements = re.subn(
+    r'(?m)^library\s*=\s*"[^"]+"$',
+    f'library      = "{library_path}"',
+    manifest,
+)
+if replacements != 1:
+    raise SystemExit(f"{source_path}: expected exactly one runtime library declaration")
+Path(destination_path).write_text(manifest)
+PY
 cat >"${BCODE_CONFIG}" <<'EOF'
 [plugins]
 enabled = ["bcode.fake-provider", "bcode.shell"]

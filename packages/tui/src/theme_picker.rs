@@ -5,6 +5,7 @@ use bmux_tui::list::ListState;
 
 use std::collections::BTreeMap;
 
+use super::filtered_list::FilteredListState;
 use super::theme::{ResolvedTheme, ThemeCatalogEntry};
 
 /// Theme picker outcome for one key event.
@@ -26,15 +27,16 @@ pub struct ThemePickerState {
     entries: Vec<ThemeCatalogEntry>,
     resolved_previews: BTreeMap<String, ResolvedTheme>,
     diagnostics: Vec<String>,
-    list: ListState,
+    list: FilteredListState,
 }
 
 impl ThemePickerState {
     /// Create a picker from stable catalog rows.
     #[must_use]
     pub fn new(entries: Vec<ThemeCatalogEntry>, diagnostics: Vec<String>) -> Self {
-        let mut list = ListState::default();
-        list.select(entries.iter().position(|entry| entry.selected).or(Some(0)));
+        let selected = entries.iter().position(|entry| entry.selected).unwrap_or(0);
+        let mut list = FilteredListState::new(entries.len());
+        let _selected = list.select_visible(selected);
         Self {
             entries,
             resolved_previews: BTreeMap::new(),
@@ -66,32 +68,29 @@ impl ThemePickerState {
         &self.diagnostics
     }
 
-    /// Return list state mutably for rendering.
-    pub const fn list_mut(&mut self) -> &mut ListState {
-        &mut self.list
+    /// Synchronize list visibility before rendering and return its render state.
+    pub fn list_render_state(&mut self, viewport_height: u16) -> &mut ListState {
+        self.list.render_state(viewport_height)
     }
 
     /// Return the current list offset for hit testing.
     #[must_use]
     pub const fn list_offset(&self) -> usize {
-        self.list.offset
+        self.list.offset()
     }
 
     /// Return selected catalog entry.
     #[must_use]
     pub fn selected_entry(&self) -> Option<&ThemeCatalogEntry> {
         self.list
-            .selected
+            .selected_source_index()
             .and_then(|selected| self.entries.get(selected))
     }
 
     /// Return selected theme id.
     #[must_use]
     pub fn selected_id(&self) -> Option<&str> {
-        self.list
-            .selected
-            .and_then(|index| self.entries.get(index))
-            .map(|entry| entry.id.as_str())
+        self.selected_entry().map(|entry| entry.id.as_str())
     }
 
     /// Select one absolute row and preview it.
@@ -99,7 +98,7 @@ impl ThemePickerState {
         let Some(entry) = self.entries.get(row) else {
             return ThemePickerOutcome::Ignored;
         };
-        self.list.select(Some(row));
+        let _selected = self.list.select_visible(row);
         ThemePickerOutcome::Preview(entry.id.clone())
     }
 
@@ -108,7 +107,7 @@ impl ThemePickerState {
         let Some(entry) = self.entries.get(row) else {
             return ThemePickerOutcome::Ignored;
         };
-        self.list.select(Some(row));
+        let _selected = self.list.select_visible(row);
         ThemePickerOutcome::Apply(entry.id.clone())
     }
 
@@ -131,15 +130,15 @@ impl ThemePickerState {
         if self.entries.is_empty() {
             return ThemePickerOutcome::Ignored;
         }
-        let current = self.list.selected.unwrap_or(0);
-        let last = self.entries.len().saturating_sub(1);
-        let next = if delta < 0 {
-            current.saturating_sub(1)
+        if delta < 0 {
+            self.list.select_previous();
         } else {
-            current.saturating_add(1).min(last)
-        };
-        self.list.select(Some(next));
-        ThemePickerOutcome::Preview(self.entries[next].id.clone())
+            self.list.select_next();
+        }
+        self.selected_id()
+            .map_or(ThemePickerOutcome::Ignored, |id| {
+                ThemePickerOutcome::Preview(id.to_owned())
+            })
     }
 }
 

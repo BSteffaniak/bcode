@@ -24,9 +24,17 @@ impl FilteredListState {
         }
     }
 
-    /// Return the BMUX list state mutably.
-    pub const fn list_state_mut(&mut self) -> &mut ListState {
+    /// Synchronize selection visibility and return the BMUX render state.
+    pub fn render_state(&mut self, viewport_height: u16) -> &mut ListState {
+        self.list_state
+            .ensure_selected_visible(viewport_height, self.filtered_indices.len());
         &mut self.list_state
+    }
+
+    /// Return the current scroll offset.
+    #[must_use]
+    pub const fn offset(&self) -> usize {
+        self.list_state.offset
     }
 
     /// Return filtered source indices.
@@ -75,5 +83,38 @@ impl FilteredListState {
         }
         self.list_state.select(Some(row));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FilteredListState;
+
+    #[test]
+    fn render_state_owns_selection_visibility_synchronization() {
+        let mut state = FilteredListState::new(12);
+        assert!(state.select_visible(11));
+        assert_eq!(state.offset(), 0);
+
+        let rendered = state.render_state(3);
+        assert_eq!(rendered.selected, Some(11));
+        assert_eq!(rendered.offset, 9);
+        assert_eq!(state.offset(), 9);
+    }
+
+    #[test]
+    fn filtering_defers_scroll_normalization_until_viewport_is_known() {
+        let mut state = FilteredListState::new(12);
+        assert!(state.select_visible(11));
+        let _rendered = state.render_state(3);
+        assert_eq!(state.offset(), 9);
+
+        state.replace_indices(vec![4]);
+        assert_eq!(state.selected_source_index(), Some(4));
+        assert_eq!(state.offset(), 9);
+
+        let rendered = state.render_state(3);
+        assert_eq!(rendered.selected, Some(0));
+        assert_eq!(rendered.offset, 0);
     }
 }

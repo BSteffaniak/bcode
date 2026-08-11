@@ -36,9 +36,9 @@ impl WorktreePickerApp {
         &mut self.filter
     }
 
-    /// Return list state.
-    pub const fn list_state_mut(&mut self) -> &mut ListState {
-        self.list.list_state_mut()
+    /// Synchronize list visibility before rendering and return its render state.
+    pub fn list_render_state(&mut self, viewport_height: u16) -> &mut ListState {
+        self.list.render_state(viewport_height)
     }
 
     /// Return picker status.

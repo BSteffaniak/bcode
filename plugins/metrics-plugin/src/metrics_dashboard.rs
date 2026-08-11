@@ -39,6 +39,17 @@ fn theme_color(select: impl FnOnce(PluginTuiTheme) -> Option<Color>, fallback: C
     ACTIVE_THEME.with(|theme| theme.get().and_then(select).unwrap_or(fallback))
 }
 
+fn theme_style(select: impl FnOnce(PluginTuiTheme) -> Style, fallback: Style) -> Style {
+    ACTIVE_THEME.with(|theme| theme.get().map_or(fallback, select))
+}
+
+fn selected_style() -> Style {
+    theme_style(
+        |theme| theme.selection,
+        Style::new().fg(Color::Black).bg(Color::Rgb(56, 189, 248)),
+    )
+}
+
 fn dashboard_bg() -> Color {
     theme_color(|theme| theme.canvas.bg, Color::Rgb(8, 13, 20))
 }
@@ -60,13 +71,6 @@ fn border() -> Color {
 
 fn accent() -> Color {
     theme_color(|theme| theme.focused.fg, Color::Rgb(56, 189, 248))
-}
-
-fn accent_strong() -> Color {
-    theme_color(
-        |theme| theme.selection.bg.or(theme.focused.fg),
-        Color::Rgb(14, 165, 233),
-    )
 }
 
 fn success() -> Color {
@@ -1018,16 +1022,21 @@ fn metric_table_styles() -> TableStyles {
             .bg(panel())
             .add_modifier(Modifier::BOLD),
         row: Style::new().fg(text()).bg(panel()),
-        selected: Style::new()
-            .fg(Color::Black)
-            .bg(accent())
-            .add_modifier(Modifier::BOLD),
-        selected_column: Style::new().fg(Color::Black).bg(accent_strong()),
-        selected_cell: Style::new()
-            .fg(Color::Black)
-            .bg(warning())
-            .add_modifier(Modifier::BOLD),
-        hovered: Style::new().fg(Color::White).bg(panel_alt()),
+        selected: selected_style().add_modifier(Modifier::BOLD),
+        selected_column: selected_style(),
+        selected_cell: theme_style(
+            |theme| {
+                theme
+                    .component_theme()
+                    .map_or(theme.selection, |theme| theme.warning)
+            },
+            Style::new().fg(Color::Black).bg(warning()),
+        )
+        .add_modifier(Modifier::BOLD),
+        hovered: theme_style(
+            |theme| theme.focused,
+            Style::new().fg(Color::White).bg(panel_alt()),
+        ),
         disabled: Style::new().fg(muted()).bg(panel()),
         separator: Style::new().fg(border()).bg(panel()),
         empty: Style::new().fg(muted()).bg(panel()),
@@ -1037,19 +1046,13 @@ fn metric_table_styles() -> TableStyles {
 fn metric_tab_styles() -> TabBarStyles {
     TabBarStyles {
         normal: Style::new().fg(muted()).bg(dashboard_bg()),
-        selected: Style::new()
-            .fg(Color::Black)
-            .bg(accent())
-            .add_modifier(Modifier::BOLD),
+        selected: selected_style().add_modifier(Modifier::BOLD),
         focused: Style::new()
             .fg(text())
             .bg(panel_alt())
             .add_modifier(Modifier::UNDERLINE),
         hovered: Style::new().fg(text()).bg(panel_alt()),
-        pressed: Style::new()
-            .fg(Color::Black)
-            .bg(accent_strong())
-            .add_modifier(Modifier::BOLD),
+        pressed: selected_style().add_modifier(Modifier::BOLD),
         disabled: Style::new().fg(border()).bg(dashboard_bg()),
         separator: Style::new().fg(border()).bg(dashboard_bg()),
     }
@@ -1071,11 +1074,11 @@ fn metric_hint_styles() -> KeyHintBarStyles {
 fn metric_button_styles() -> ButtonStyles {
     ButtonStyles {
         normal: Style::new().fg(text()).bg(panel_alt()),
-        hovered: Style::new().fg(Color::Black).bg(accent()),
-        pressed: Style::new()
-            .fg(Color::Black)
-            .bg(accent_strong())
-            .add_modifier(Modifier::BOLD),
+        hovered: theme_style(
+            |theme| theme.focused,
+            Style::new().fg(Color::Black).bg(accent()),
+        ),
+        pressed: selected_style().add_modifier(Modifier::BOLD),
         focused: Style::new()
             .fg(text())
             .bg(panel_alt())

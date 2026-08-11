@@ -55,11 +55,12 @@ pub fn render_theme_picker(picker: &mut ThemePickerState, frame: &mut Frame<'_>,
             ]))
         })
         .collect::<Vec<_>>();
+    let list_state = picker.list_render_state(list_area.height);
     List::new(&items)
         .style(theme.text)
         .highlight_symbol("› ")
         .selected_style(theme.selection)
-        .render(list_area, frame, picker.list_mut());
+        .render(list_area, frame, list_state);
     if let Some(preview_area) = preview_area {
         render_preview(picker, preview_area, frame, theme);
     }

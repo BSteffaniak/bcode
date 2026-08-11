@@ -1456,6 +1456,75 @@ if ! grep -F 'fn select_presentation_damage(' packages/tui/src/root_program.rs >
   violations=1
 fi
 
+# The normal shell and plugin native surfaces may use these primitives only for renderer-boundary
+# adaptation that shared components cannot own coherently: full-canvas underpaint, scratch-frame
+# clipping, terminal image placement, domain-specific map/diff drawing, and component internals.
+# Reusable controls and chrome must use bmux_tui_components or bcode_tui_components.
+if rg -n '\b(Paragraph|Block|List|Tabs|Gauge|Scrollbar|Clear|Canvas|Chart)::' \
+  packages/tui/src plugins --glob '*.rs' \
+  --glob '!packages/tui/src/picker_render.rs' \
+  --glob '!packages/tui/src/theme_picker_render.rs' \
+  --glob '!plugins/eval-plugin/src/eval_viewer.rs' \
+  --glob '!plugins/metrics-plugin/src/metrics_dashboard.rs' \
+  >/tmp/bcode-tui-unapproved-primitive-controls.txt; then
+  echo "Runtime architecture violation: reusable TUI controls escaped shared component ownership." >&2
+  cat /tmp/bcode-tui-unapproved-primitive-controls.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-tui-unapproved-primitive-controls.txt
+
+if ! rg -q 'PickerFrame' packages/tui/src/picker_render.rs \
+  || ! rg -q 'ModalFrame' packages/tui/src/theme_picker_render.rs \
+  || ! rg -q 'bmux_tui_components::table::Table|use bmux_tui_components::table' plugins/eval-plugin/src/eval_viewer.rs \
+  || ! rg -q 'bmux_tui_components::table::Table|use bmux_tui_components::table' plugins/metrics-plugin/src/metrics_dashboard.rs; then
+  echo "Runtime architecture violation: approved primitive adapters must remain nested in shared component composition." >&2
+  violations=1
+fi
+
+picker_state_files=(
+  packages/tui/src/model_picker.rs
+  packages/tui/src/provider_picker.rs
+  packages/tui/src/session_picker.rs
+  packages/tui/src/skill_picker.rs
+  packages/tui/src/theme_picker.rs
+  packages/tui/src/worktree_picker.rs
+)
+if rg -n '\bListState\b' packages/tui/src --glob '*.rs' \
+  --glob '!filtered_list.rs' \
+  --glob '!picker_render.rs' \
+  --glob '!model_picker.rs' \
+  --glob '!provider_picker.rs' \
+  --glob '!session_picker.rs' \
+  --glob '!skill_picker.rs' \
+  --glob '!theme_picker.rs' \
+  --glob '!worktree_picker.rs' \
+  >/tmp/bcode-tui-unapproved-list-state.txt; then
+  echo "Runtime architecture violation: raw BMUX list state escaped the shared filtered-list owner." >&2
+  cat /tmp/bcode-tui-unapproved-list-state.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-tui-unapproved-list-state.txt
+if ! rg -q 'state: &mut ListState' packages/tui/src/picker_render.rs \
+  || ! rg -q '\.render\(area, frame, state\)' packages/tui/src/picker_render.rs; then
+  echo "Runtime architecture violation: the approved picker ListState adapter must remain a thin shared-list render boundary." >&2
+  violations=1
+fi
+for picker_state_file in "${picker_state_files[@]}"; do
+  if ! rg -q 'FilteredListState' "${picker_state_file}" \
+    || ! rg -q 'self\.list\.render_state\(viewport_height\)' "${picker_state_file}"; then
+    echo "Runtime architecture violation: picker state must delegate viewport-aware render state to FilteredListState: ${picker_state_file}" >&2
+    violations=1
+  fi
+done
+
+if rg -n 'sync_for_render\(|list_state_mut\(' packages/tui/src --glob '*.rs' \
+  >/tmp/bcode-tui-split-list-state-api.txt; then
+  echo "Runtime architecture violation: split picker list synchronization/state lending must not return." >&2
+  cat /tmp/bcode-tui-split-list-state-api.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-tui-split-list-state-api.txt
+
 if rg -n 'path = "\.\./bmux/' Cargo.toml >/tmp/bcode-undocumented-bmux-paths.txt; then
   echo "Runtime architecture violation: local BMUX path overrides must not remain in the final dependency graph." >&2
   cat /tmp/bcode-undocumented-bmux-paths.txt >&2

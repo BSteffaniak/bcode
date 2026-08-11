@@ -61,5 +61,11 @@ pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, them
         list_area.height.saturating_sub(1),
     );
     let items = app.list_items(item_area.width, theme);
-    render_picker_list(&items, app.list_state_mut(), item_area, frame, theme);
+    render_picker_list(
+        &items,
+        app.list_render_state(item_area.height),
+        item_area,
+        frame,
+        theme,
+    );
 }

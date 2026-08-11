@@ -56,6 +56,8 @@ struct ReviewTheme {
     muted: Style,
     focused: Style,
     selection: Style,
+    overlay: Style,
+    diff: bcode_plugin_sdk::tui::PluginTuiDiffTheme,
 }
 
 impl Default for ReviewTheme {
@@ -65,6 +67,8 @@ impl Default for ReviewTheme {
             muted: Style::new().fg(Color::BrightBlack),
             focused: Style::new().fg(Color::Cyan),
             selection: Style::new().add_modifier(Modifier::REVERSED),
+            overlay: Style::new().fg(Color::White).bg(Color::BrightBlack),
+            diff: fallback_review_diff_theme(),
         }
     }
 }
@@ -77,12 +81,34 @@ impl ReviewTheme {
 
 impl From<bcode_plugin_sdk::tui::PluginTuiTheme> for ReviewTheme {
     fn from(theme: bcode_plugin_sdk::tui::PluginTuiTheme) -> Self {
+        let component = theme.component_theme();
         Self {
             canvas: theme.canvas,
             muted: theme.muted,
             focused: theme.focused,
             selection: theme.selection,
+            overlay: component.map_or_else(
+                || theme.canvas.patch(theme.text),
+                |theme| theme.surfaces.overlay.patch(theme.text),
+            ),
+            diff: theme.diff,
         }
+    }
+}
+
+const fn fallback_review_diff_theme() -> bcode_plugin_sdk::tui::PluginTuiDiffTheme {
+    bcode_plugin_sdk::tui::PluginTuiDiffTheme {
+        text: Style::new(),
+        muted: Style::new().fg(Color::BrightBlack),
+        title: Style::new().fg(Color::BrightMagenta),
+        label: Style::new().fg(Color::BrightBlack),
+        added: Style::new().fg(Color::BrightGreen),
+        removed: Style::new().fg(Color::BrightRed),
+        hunk: Style::new().fg(Color::BrightMagenta),
+        added_row: Style::new().bg(Color::Rgb(0, 24, 16)),
+        removed_row: Style::new().bg(Color::Rgb(32, 10, 10)),
+        added_emphasis: Style::new().fg(Color::BrightGreen),
+        removed_emphasis: Style::new().fg(Color::BrightRed),
     }
 }
 
@@ -103,7 +129,7 @@ pub fn render(
     render_chrome(app, area, frame, review_theme);
     let diff_area = render_body(app, area, frame, review_theme);
     render_main_content(app, diff_area, frame, theme, review_theme);
-    render_overlays(app, area, frame);
+    render_overlays(app, area, frame, review_theme);
 }
 
 fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
@@ -260,21 +286,21 @@ fn render_main_content(
     }
 }
 
-fn render_overlays(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_overlays(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
     if app.help_visible {
-        render_help(app, area, frame);
+        render_help(app, area, frame, theme);
     }
     if app.comment_editor.is_some() {
-        render_comment_editor(app, area, frame);
+        render_comment_editor(app, area, frame, theme);
     }
     if app.prompt_state.is_some() {
-        render_prompt(app, area, frame);
+        render_prompt(app, area, frame, theme);
     }
     if app.import_state.is_some() {
-        render_import_modal(app, area, frame);
+        render_import_modal(app, area, frame, theme);
     }
     if app.publish_state.is_some() {
-        render_publish_modal(app, area, frame);
+        render_publish_modal(app, area, frame, theme);
     }
 }
 
@@ -1841,7 +1867,7 @@ fn render_view_row(
     can_highlight: bool,
     syntax_hint: &str,
     width: u16,
-    _theme: ReviewTheme,
+    theme: ReviewTheme,
 ) -> RenderedRow {
     match &view_row.block {
         ReviewViewBlock::OmittedContext { .. }
@@ -1850,7 +1876,7 @@ fn render_view_row(
             render_context_status_view_row(&view_row.block)
         }
         ReviewViewBlock::DisplayRow(display_row) => {
-            render_source_view_row(app, view_row, display_row)
+            render_source_view_row(app, view_row, display_row, theme)
         }
         ReviewViewBlock::FileLine {
             line_number,
@@ -1866,6 +1892,7 @@ fn render_view_row(
                 syntax_highlighter,
                 can_highlight,
                 syntax_hint,
+                theme,
             )
         }
         ReviewViewBlock::FileLine {
@@ -2240,9 +2267,10 @@ fn render_source_view_row(
     app: &ReviewApp,
     view_row: &ReviewViewRow,
     display_row: &ReviewDisplayRow,
+    theme: ReviewTheme,
 ) -> RenderedRow {
     let Some(source_row) = view_row.source_row else {
-        return render_display_row(display_row);
+        return render_display_row(display_row, theme);
     };
     let show_comment_affordance = source_row == app.selected_diff_line
         && matches!(
@@ -2251,7 +2279,7 @@ fn render_source_view_row(
                 | ReviewDisplayRowSource::Removed
                 | ReviewDisplayRowSource::Context
         );
-    let rendered = render_display_row_with_affordance(show_comment_affordance, display_row);
+    let rendered = render_display_row_with_affordance(show_comment_affordance, display_row, theme);
     let mut line = rendered.line;
     if let Some(marker) = app.range_selection_marker_at(app.selected_file, source_row) {
         line.spans
@@ -2277,8 +2305,9 @@ fn render_expanded_context_file_line(
     syntax_highlighter: &SyntaxHighlighter,
     can_highlight: bool,
     syntax_hint: &str,
+    theme: ReviewTheme,
 ) -> RenderedRow {
-    let row_style = row_style(ReviewDisplayRowSource::Context);
+    let row_style = row_style(ReviewDisplayRowSource::Context, theme);
     let old = line_number.map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
     let new = line_number.map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
     let mut spans = vec![
@@ -2288,7 +2317,7 @@ fn render_expanded_context_file_line(
         ),
         Span::styled(
             " ",
-            row_style.patch(marker_style(ReviewDisplayRowSource::Context)),
+            row_style.patch(marker_style(ReviewDisplayRowSource::Context, theme)),
         ),
     ];
     spans.extend(highlighted_source_spans(
@@ -2474,8 +2503,9 @@ fn highlighted_source_spans(
 fn render_display_row_with_affordance(
     show_comment_affordance: bool,
     row: &ReviewDisplayRow,
+    theme: ReviewTheme,
 ) -> RenderedRow {
-    let mut rendered = render_display_row(row);
+    let mut rendered = render_display_row(row, theme);
     if show_comment_affordance {
         rendered.line.spans.insert(
             0,
@@ -2490,15 +2520,15 @@ fn render_display_row_with_affordance(
     rendered
 }
 
-fn render_display_row(row: &ReviewDisplayRow) -> RenderedRow {
+fn render_display_row(row: &ReviewDisplayRow, theme: ReviewTheme) -> RenderedRow {
     match row.source {
         ReviewDisplayRowSource::HunkHeader => {
-            let style = row_style(row.source);
+            let style = row_style(row.source, theme);
             RenderedRow {
                 line: Line::from_spans(
                     row.segments
                         .iter()
-                        .map(|segment| render_display_segment(segment, style))
+                        .map(|segment| render_display_segment(segment, style, theme))
                         .collect::<Vec<_>>(),
                 ),
                 style,
@@ -2513,7 +2543,7 @@ fn render_display_row(row: &ReviewDisplayRow) -> RenderedRow {
             let new = row
                 .new_line
                 .map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
-            let row_style = row_style(row.source);
+            let row_style = row_style(row.source, theme);
             let marker = row.source.diff_marker().unwrap_or(' ');
             let mut spans = vec![
                 Span::styled(
@@ -2522,13 +2552,13 @@ fn render_display_row(row: &ReviewDisplayRow) -> RenderedRow {
                 ),
                 Span::styled(
                     marker.to_string(),
-                    row_style.patch(marker_style(row.source).add_modifier(Modifier::BOLD)),
+                    row_style.patch(marker_style(row.source, theme).add_modifier(Modifier::BOLD)),
                 ),
             ];
             spans.extend(
                 row.segments
                     .iter()
-                    .map(|segment| render_display_segment(segment, row_style)),
+                    .map(|segment| render_display_segment(segment, row_style, theme)),
             );
             RenderedRow {
                 line: Line::from_spans(spans),
@@ -2538,52 +2568,51 @@ fn render_display_row(row: &ReviewDisplayRow) -> RenderedRow {
     }
 }
 
-fn render_display_segment(segment: &ReviewDisplaySegment, base_style: Style) -> Span {
+fn render_display_segment(
+    segment: &ReviewDisplaySegment,
+    base_style: Style,
+    theme: ReviewTheme,
+) -> Span {
     Span::styled(
         segment.text.clone(),
-        base_style.patch(style_for_segment(segment)),
+        base_style.patch(style_for_segment(segment, theme)),
     )
 }
 
-fn style_for_segment(segment: &ReviewDisplaySegment) -> Style {
+fn style_for_segment(segment: &ReviewDisplaySegment, theme: ReviewTheme) -> Style {
     let mut style = Style::new();
     for role in &segment.roles {
-        style = style.patch(style_for_role(role));
+        style = style.patch(style_for_role(role, theme));
     }
     style
 }
 
-const fn style_for_role(role: &ReviewDisplayTextRole) -> Style {
+const fn style_for_role(role: &ReviewDisplayTextRole, theme: ReviewTheme) -> Style {
     match role {
         ReviewDisplayTextRole::Code
         | ReviewDisplayTextRole::DiffAdded
         | ReviewDisplayTextRole::DiffRemoved
         | ReviewDisplayTextRole::DiffContext => Style::new(),
         ReviewDisplayTextRole::Syntax(style) => syntax_style_to_tui(*style),
-        ReviewDisplayTextRole::HunkHeader => {
-            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)
-        }
+        ReviewDisplayTextRole::HunkHeader => theme.diff.hunk.add_modifier(Modifier::BOLD),
     }
 }
 
-const fn row_style(source: ReviewDisplayRowSource) -> Style {
+const fn row_style(source: ReviewDisplayRowSource, theme: ReviewTheme) -> Style {
     match source {
-        ReviewDisplayRowSource::HunkHeader => Style::new()
-            .fg(Color::BrightMagenta)
-            .bg(Color::Rgb(24, 18, 34))
-            .add_modifier(Modifier::BOLD),
-        ReviewDisplayRowSource::Context => Style::new(),
-        ReviewDisplayRowSource::Added => Style::new().bg(Color::Rgb(0, 24, 16)),
-        ReviewDisplayRowSource::Removed => Style::new().bg(Color::Rgb(32, 10, 10)),
+        ReviewDisplayRowSource::HunkHeader => theme.diff.hunk.add_modifier(Modifier::BOLD),
+        ReviewDisplayRowSource::Context => theme.diff.text,
+        ReviewDisplayRowSource::Added => theme.diff.added_row,
+        ReviewDisplayRowSource::Removed => theme.diff.removed_row,
     }
 }
 
-const fn marker_style(source: ReviewDisplayRowSource) -> Style {
+const fn marker_style(source: ReviewDisplayRowSource, theme: ReviewTheme) -> Style {
     match source {
-        ReviewDisplayRowSource::Added => Style::new().fg(Color::BrightGreen),
-        ReviewDisplayRowSource::Removed => Style::new().fg(Color::BrightRed),
-        ReviewDisplayRowSource::HunkHeader => Style::new().fg(Color::BrightMagenta),
-        ReviewDisplayRowSource::Context => Style::new().fg(Color::BrightBlack),
+        ReviewDisplayRowSource::Added => theme.diff.added,
+        ReviewDisplayRowSource::Removed => theme.diff.removed,
+        ReviewDisplayRowSource::HunkHeader => theme.diff.hunk,
+        ReviewDisplayRowSource::Context => theme.diff.muted,
     }
 }
 
@@ -2601,7 +2630,7 @@ const fn syntax_style_to_tui(style: bcode_syntax_render::SyntaxStyle) -> Style {
     output
 }
 
-fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
     let width = area.width.min(68);
     let height = 18;
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
@@ -2609,11 +2638,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         .y
         .saturating_add(area.height.saturating_sub(height) / 2);
     let popup = Rect::new(x, y, width, height);
-    frame.fill(
-        popup,
-        " ",
-        Style::new().fg(Color::White).bg(Color::BrightBlack),
-    );
+    frame.fill(popup, " ", theme.overlay);
     let lines = help_lines(app);
     for (index, text) in lines.iter().enumerate() {
         let y = popup
@@ -2631,7 +2656,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             ),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(text, usize::from(popup.width.saturating_sub(2))),
-                Style::new().fg(Color::White).bg(Color::BrightBlack),
+                theme.overlay,
             )]),
         );
     }
@@ -2738,14 +2763,14 @@ const DIFF_HELP_LINES: &[&str] = &[
     " ctrl+d              exit review",
 ];
 
-fn legacy_review_modal(area: Rect, width: u16, height: u16, frame: &mut Frame<'_>) -> Rect {
-    legacy_review_modal_with_background(
-        area,
-        width,
-        height,
-        frame,
-        Style::new().fg(Color::White).bg(Color::BrightBlack),
-    )
+fn legacy_review_modal(
+    area: Rect,
+    width: u16,
+    height: u16,
+    frame: &mut Frame<'_>,
+    theme: ReviewTheme,
+) -> Rect {
+    legacy_review_modal_with_background(area, width, height, frame, theme.overlay, theme)
 }
 
 fn legacy_review_modal_with_background(
@@ -2754,6 +2779,7 @@ fn legacy_review_modal_with_background(
     height: u16,
     frame: &mut Frame<'_>,
     background: Style,
+    theme: ReviewTheme,
 ) -> Rect {
     let modal = ModalFrame::new(
         ModalSizing::fixed(
@@ -2765,7 +2791,7 @@ fn legacy_review_modal_with_background(
             background,
             background,
             background,
-            Style::new().fg(Color::BrightBlack).bg(Color::BrightBlack),
+            theme.muted.patch(background),
             background,
         ),
     )
@@ -2780,6 +2806,7 @@ fn legacy_review_modal_at(
     popup: Rect,
     frame: &mut Frame<'_>,
     background: Style,
+    theme: ReviewTheme,
 ) -> Rect {
     let modal = ModalFrame::new(
         ModalSizing::fixed(
@@ -2791,9 +2818,7 @@ fn legacy_review_modal_at(
             background,
             background,
             background,
-            Style::new()
-                .fg(Color::BrightBlack)
-                .bg(background.bg.unwrap_or(Color::Black)),
+            theme.muted.patch(background),
             background,
         ),
     )
@@ -2803,7 +2828,7 @@ fn legacy_review_modal_at(
     modal.panel_area(area)
 }
 
-fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
     let Some(state) = &app.import_state else {
         return;
     };
@@ -2812,7 +2837,7 @@ fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if width < 30 || height < 8 {
         return;
     }
-    let popup = legacy_review_modal(area, width, height, frame);
+    let popup = legacy_review_modal(area, width, height, frame, theme);
     let header = Rect::new(
         popup.x.saturating_add(1),
         popup.y,
@@ -2875,7 +2900,7 @@ fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
-fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
     let Some(state) = &app.publish_state else {
         return;
     };
@@ -2884,7 +2909,7 @@ fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if width < 30 || height < 8 {
         return;
     }
-    let popup = legacy_review_modal(area, width, height, frame);
+    let popup = legacy_review_modal(area, width, height, frame, theme);
     match state {
         ReviewPublishState::Checklist => render_publish_checklist(app, popup, frame),
         ReviewPublishState::Picker => render_publisher_picker(app, popup, frame),
@@ -3155,7 +3180,12 @@ fn render_publish_preview(
     }
 }
 
-fn render_comment_editor(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_comment_editor(
+    app: &mut ReviewApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: ReviewTheme,
+) {
     let editor = app.comment_editor.clone();
     let Some(editor) = editor.as_ref() else {
         return;
@@ -3181,6 +3211,7 @@ fn render_comment_editor(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         Rect::new(x, y, width, height),
         frame,
         Style::new().fg(Color::White).bg(Color::Black),
+        theme,
     );
     render_comment_editor_header(editor, popup, frame);
     let text_height = usize::from(height.saturating_sub(4));
@@ -3533,8 +3564,9 @@ fn render_add_source_menu(
     popup: Rect,
     height: u16,
     frame: &mut Frame<'_>,
+    theme: ReviewTheme,
 ) {
-    render_source_menu_items(prompt, add_source_menu_items(), popup, height, frame);
+    render_source_menu_items(prompt, add_source_menu_items(), popup, height, frame, theme);
 }
 
 fn render_advanced_source_menu(
@@ -3542,8 +3574,16 @@ fn render_advanced_source_menu(
     popup: Rect,
     height: u16,
     frame: &mut Frame<'_>,
+    theme: ReviewTheme,
 ) {
-    render_source_menu_items(prompt, advanced_source_menu_items(), popup, height, frame);
+    render_source_menu_items(
+        prompt,
+        advanced_source_menu_items(),
+        popup,
+        height,
+        frame,
+        theme,
+    );
 }
 
 fn render_source_menu_items(
@@ -3552,6 +3592,7 @@ fn render_source_menu_items(
     popup: Rect,
     height: u16,
     frame: &mut Frame<'_>,
+    theme: ReviewTheme,
 ) {
     for (row, item) in items
         .iter()
@@ -3559,9 +3600,9 @@ fn render_source_menu_items(
         .enumerate()
     {
         let style = if row == prompt.selected {
-            Style::new().fg(Color::Black).bg(Color::Yellow)
+            theme.selection
         } else {
-            Style::new().fg(Color::White).bg(Color::Black)
+            theme.overlay
         };
         let text = format!(" {:<16} {}", item.label, item.help);
         frame.write_line(
@@ -3581,7 +3622,7 @@ fn render_source_menu_items(
     }
 }
 
-fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
     let Some(prompt) = &app.prompt_state else {
         return;
     };
@@ -3590,22 +3631,16 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if width < 20 || height < 3 {
         return;
     }
-    let popup = legacy_review_modal_with_background(
-        area,
-        width,
-        height,
-        frame,
-        Style::new().fg(Color::White).bg(Color::Black),
-    );
+    let popup =
+        legacy_review_modal_with_background(area, width, height, frame, theme.overlay, theme);
     let title = prompt_title(&prompt.kind);
     frame.write_line(
         Rect::new(popup.x, popup.y, popup.width, 1),
         &Line::from_spans(vec![Span::styled(
             title,
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            theme
+                .selection
+                .patch(Style::new().add_modifier(Modifier::BOLD)),
         )]),
     );
     let query = prompt.buffer.text();
@@ -3618,28 +3653,30 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         ),
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(query, usize::from(popup.width.saturating_sub(2))),
-            Style::new().fg(Color::White).bg(Color::Black),
+            theme.overlay,
         )]),
     );
     match &prompt.kind {
-        ReviewPromptKind::AddSourceKind => render_add_source_menu(prompt, popup, height, frame),
+        ReviewPromptKind::AddSourceKind => {
+            render_add_source_menu(prompt, popup, height, frame, theme);
+        }
         ReviewPromptKind::AddAdvancedSourceKind => {
-            render_advanced_source_menu(prompt, popup, height, frame);
+            render_advanced_source_menu(prompt, popup, height, frame, theme);
         }
         ReviewPromptKind::AddFileSourcePicker | ReviewPromptKind::AddFileRangePathPicker => {
-            render_add_repository_file_picker(app, prompt, popup, height, query, frame);
+            render_add_repository_file_picker(app, prompt, popup, height, query, frame, theme);
         }
         ReviewPromptKind::AddCommitPicker
         | ReviewPromptKind::AddCommitRangeBasePicker
         | ReviewPromptKind::AddCommitRangeHeadPicker { .. } => {
-            render_add_repository_commit_picker(app, prompt, popup, height, query, frame);
+            render_add_repository_commit_picker(app, prompt, popup, height, query, frame, theme);
         }
         ReviewPromptKind::AddBranchCompareBasePicker
         | ReviewPromptKind::AddBranchCompareHeadPicker { .. } => {
-            render_add_repository_branch_picker(app, prompt, popup, height, query, frame);
+            render_add_repository_branch_picker(app, prompt, popup, height, query, frame, theme);
         }
         ReviewPromptKind::FilePicker => {
-            render_file_picker(app, prompt, popup, height, query, frame);
+            render_file_picker(app, prompt, popup, height, query, frame, theme);
         }
         _ => {}
     }
@@ -3652,7 +3689,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         ),
         &Line::from_spans(vec![Span::styled(
             prompt_footer_text(&prompt.kind),
-            Style::new().fg(Color::Black).bg(Color::Yellow),
+            theme.selection,
         )]),
     );
 }
@@ -3664,6 +3701,7 @@ fn render_add_repository_file_picker(
     height: u16,
     query: &str,
     frame: &mut Frame<'_>,
+    theme: ReviewTheme,
 ) {
     for (row, path) in app
         .repository_file_picker_matches(query)
@@ -3671,7 +3709,7 @@ fn render_add_repository_file_picker(
         .take(usize::from(height.saturating_sub(3)))
         .enumerate()
     {
-        render_prompt_choice(row, prompt.selected, popup, &path, frame);
+        render_prompt_choice(row, prompt.selected, popup, &path, frame, theme);
     }
 }
 
@@ -3682,6 +3720,7 @@ fn render_add_repository_commit_picker(
     height: u16,
     query: &str,
     frame: &mut Frame<'_>,
+    theme: ReviewTheme,
 ) {
     for (row, commit) in app
         .repository_commit_picker_matches(query)
@@ -3695,6 +3734,7 @@ fn render_add_repository_commit_picker(
             popup,
             &format!("{} {}", commit.short_rev, commit.subject),
             frame,
+            theme,
         );
     }
 }
@@ -3706,6 +3746,7 @@ fn render_add_repository_branch_picker(
     height: u16,
     query: &str,
     frame: &mut Frame<'_>,
+    theme: ReviewTheme,
 ) {
     for (row, branch) in app
         .repository_branch_picker_matches(query)
@@ -3713,7 +3754,7 @@ fn render_add_repository_branch_picker(
         .take(usize::from(height.saturating_sub(3)))
         .enumerate()
     {
-        render_prompt_choice(row, prompt.selected, popup, &branch, frame);
+        render_prompt_choice(row, prompt.selected, popup, &branch, frame, theme);
     }
 }
 
@@ -3724,6 +3765,7 @@ fn render_file_picker(
     height: u16,
     query: &str,
     frame: &mut Frame<'_>,
+    theme: ReviewTheme,
 ) {
     for (row, index) in app
         .file_picker_matches(query)
@@ -3737,6 +3779,7 @@ fn render_file_picker(
             popup,
             app.review.files[index].display_path(),
             frame,
+            theme,
         );
     }
 }
@@ -3747,11 +3790,12 @@ fn render_prompt_choice(
     popup: Rect,
     text: &str,
     frame: &mut Frame<'_>,
+    theme: ReviewTheme,
 ) {
     let style = if row == selected {
-        Style::new().fg(Color::Black).bg(Color::Yellow)
+        theme.selection
     } else {
-        Style::new().fg(Color::White).bg(Color::Black)
+        theme.overlay
     };
     frame.write_line(
         Rect::new(
@@ -3835,11 +3879,40 @@ mod tests {
     }
 
     #[test]
-    fn terminal_native_theme_does_not_force_black_canvas() {
+    fn host_theme_controls_help_overlay_surface() {
         let mut app = crate::code_review_tui::tests::sample_app();
+        app.help_visible = true;
+        let mut theme = terminal_native_theme();
+        theme.canvas = Style::new().bg(Color::Blue);
+        theme.text = Style::new().fg(Color::BrightWhite);
+
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buffer = Buffer::empty(area);
+        render(&mut app, &mut Frame::new(&mut buffer), Some(theme));
+        let popup = Rect::new(16, 3, 68, 18);
+
+        assert_eq!(
+            buffer
+                .get(Point::new(popup.x, popup.y))
+                .expect("help overlay")
+                .style
+                .bg,
+            Some(Color::Blue)
+        );
+        assert!(
+            buffer
+                .get(Point::new(popup.x, popup.y))
+                .expect("help text")
+                .style
+                .fg
+                .is_none_or(|color| color == Color::BrightWhite)
+        );
+    }
+
+    fn terminal_native_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
         let default_style = Style::new();
         let syntax_color = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(12, 34, 56);
-        let theme = bcode_plugin_sdk::tui::PluginTuiTheme {
+        bcode_plugin_sdk::tui::PluginTuiTheme {
             component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
             canvas: default_style,
             text: default_style,
@@ -3878,7 +3951,13 @@ mod tests {
                 operator: syntax_color,
                 punctuation: syntax_color,
             },
-        };
+        }
+    }
+
+    #[test]
+    fn terminal_native_theme_does_not_force_black_canvas() {
+        let mut app = crate::code_review_tui::tests::sample_app();
+        let theme = terminal_native_theme();
 
         let rendered = render_app_text_with_theme(&mut app, 100, 24, Some(theme));
         assert!(rendered.contains("bcode review"));
@@ -4147,6 +4226,7 @@ mod tests {
             &SyntaxHighlighter::new(),
             true,
             "src/lib.rs",
+            ReviewTheme::default(),
         );
 
         assert!(

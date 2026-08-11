@@ -104,7 +104,7 @@ pub fn render_picker_panel(
         .inner
 }
 
-/// Render a standard selectable list and persist scroll state.
+/// Render a standard selectable list using caller-synchronized render state.
 pub fn render_picker_list(
     items: &[ListItem],
     state: &mut ListState,
@@ -112,14 +112,11 @@ pub fn render_picker_list(
     frame: &mut Frame<'_>,
     theme: TuiTheme,
 ) {
-    let mut render_state = *state;
-    render_state.ensure_selected_visible(area.height, items.len());
     List::new(items)
         .style(theme.text)
         .selected_style(theme.selection)
         .highlight_symbol("> ")
-        .render(area, frame, &mut render_state);
-    *state = render_state;
+        .render(area, frame, state);
 }
 
 #[cfg(test)]

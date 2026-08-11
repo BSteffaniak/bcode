@@ -34,7 +34,7 @@ pub fn render_picker(app: &mut WorktreePickerApp, frame: &mut Frame<'_>, theme: 
         return;
     };
     let items = app.list_items(theme.muted);
-    render_picker_list(&items, app.list_state_mut(), list_area, frame, theme);
+    render_picker_list(&items, app.list_render_state(list_area.height), list_area, frame, theme);
 }
 
 fn header_line() -> Line {

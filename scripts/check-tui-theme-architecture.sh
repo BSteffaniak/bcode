@@ -39,6 +39,19 @@ if ! rg -q 'fn render_with_theme' plugins/loop-plugin/src/lib.rs \
   fail "loop plugin surface must consume renderer-owned theme presentation"
 fi
 
+if ! rg -q 'fn diff_added\(\) -> Style' plugins/vim-edit-plugin/src/vim_edit_playback_tui.rs \
+  || ! rg -q 'theme_style\(\|theme\| theme\.diff\.added,' plugins/vim-edit-plugin/src/vim_edit_playback_tui.rs \
+  || ! rg -q 'fn diff_removed\(\) -> Style' plugins/vim-edit-plugin/src/vim_edit_playback_tui.rs \
+  || ! rg -q 'theme_style\(\|theme\| theme\.diff\.removed,' plugins/vim-edit-plugin/src/vim_edit_playback_tui.rs; then
+  fail "Vim-edit transcript diffs must consume renderer-owned semantic diff roles"
+fi
+
+if rg -n 'selected: Style::new\(\)[[:space:]]*$|selected_column: Style::new\(\)|selected_cell: Style::new\(\)' \
+  plugins/metrics-plugin/src/metrics_dashboard.rs \
+  plugins/eval-plugin/src/eval_viewer.rs; then
+  fail "eval/metrics reusable control states must consume renderer-owned selection presentation"
+fi
+
 if rg -n 'background\(theme\.text\)|frame\.fill\(area, " ", theme\.text\)|Style::new\(\)\.fg\(theme\.accent\)' \
   packages/tui/src/command_palette_render.rs \
   packages/tui/src/picker_render.rs \
@@ -211,6 +224,20 @@ fi
 if rg -n 'frame\.fill\(area,[^\n]*Color::Black' \
   plugins/code-review-plugin/src/code_review_tui_render.rs; then
   fail "code-review full-screen canvas must use renderer-owned theme presentation"
+fi
+
+if rg -n 'ReviewDisplayRowSource::Added => Style::new|ReviewDisplayRowSource::Removed => Style::new|ReviewDisplayTextRole::HunkHeader => Style::new' \
+  plugins/code-review-plugin/src/code_review_tui_render.rs; then
+  fail "code-review diff rows must consume renderer-owned semantic diff presentation"
+fi
+
+if ! rg -q 'surfaces\.overlay\.patch\(theme\.text\)' \
+  plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_help[\s\S]{0,1200}Color::BrightBlack' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs \
+  || rg -n -U 'fn render_prompt[\s\S]{0,2400}Color::(Black|White|Yellow)' \
+    plugins/code-review-plugin/src/code_review_tui_render.rs; then
+  fail "code-review overlays must derive their surface and control states from renderer-owned component presentation"
 fi
 
 if ! rg -q 'pub const fn component_theme\(self\) -> ComponentTheme' packages/tui/src/theme.rs \

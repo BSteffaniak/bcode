@@ -100,9 +100,9 @@ impl SessionPickerApp {
         }
     }
 
-    /// Return list state.
-    pub const fn list_state_mut(&mut self) -> &mut ListState {
-        self.list.list_state_mut()
+    /// Synchronize list visibility before rendering and return its render state.
+    pub fn list_render_state(&mut self, viewport_height: u16) -> &mut ListState {
+        self.list.render_state(viewport_height)
     }
 
     /// Return picker status.
@@ -297,10 +297,6 @@ impl SessionPickerApp {
             .filter_map(|(index, session)| session_matches(session, &query).then_some(index))
             .collect();
         self.list.replace_indices(filtered_indices);
-        let visible_count = self.list.indices().len();
-        self.list
-            .list_state_mut()
-            .ensure_selected_visible(1, visible_count);
     }
 
     /// Move selection down.

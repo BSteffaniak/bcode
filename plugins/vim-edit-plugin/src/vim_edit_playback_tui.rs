@@ -353,9 +353,9 @@ fn diff_rows(diff: &str, width: u16) -> Vec<Line> {
         .take(24)
         .map(|line| {
             let style = if line.starts_with('+') {
-                Style::new().fg(Color::Green)
+                diff_added()
             } else if line.starts_with('-') {
-                Style::new().fg(Color::Red)
+                diff_removed()
             } else {
                 value_style()
             };
@@ -481,6 +481,12 @@ fn value_style() -> Style {
 fn cursor_line_style() -> Style {
     theme_style(|theme| theme.selection, Style::new().fg(Color::Yellow))
 }
+fn diff_added() -> Style {
+    theme_style(|theme| theme.diff.added, Style::new().fg(Color::Green))
+}
+fn diff_removed() -> Style {
+    theme_style(|theme| theme.diff.removed, Style::new().fg(Color::Red))
+}
 
 #[cfg(test)]
 mod tests {
@@ -521,8 +527,8 @@ mod tests {
                 muted: style,
                 title: style,
                 label: style,
-                added: style,
-                removed: style,
+                added: style.fg(Color::BrightGreen),
+                removed: style.fg(Color::BrightRed),
                 hunk: style,
                 added_row: style,
                 removed_row: style,
@@ -566,6 +572,24 @@ mod tests {
         }));
         assert!(rows.iter().flat_map(|line| &line.spans).any(|span| {
             span.content.contains("default") && span.style.fg == Some(Color::Blue)
+        }));
+    }
+
+    #[test]
+    fn visual_adapter_uses_host_theme_for_diff_roles() {
+        let payload = json!({
+            "diff": "+added\n-removed\n context"
+        });
+        let context = unknown_visual_context().with_theme(test_theme());
+        let rows =
+            VimEditPlaybackTuiVisualAdapter.rows(VIM_EDIT_PLAYBACK_SCHEMA, &payload, &context);
+        let spans = rows.iter().flat_map(|line| &line.spans).collect::<Vec<_>>();
+
+        assert!(spans.iter().any(|span| {
+            span.content.contains("+added") && span.style.fg == Some(Color::BrightGreen)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content.contains("-removed") && span.style.fg == Some(Color::BrightRed)
         }));
     }
 

@@ -72,3 +72,12 @@ Managed-runtime terminal and timer latency are covered by a Bcode-bound acceptan
 pinned runtime artifact: with 10,000 reliable messages queued, independently admitted input and an
 immediately due timer must reach the serialized update within 100 ms. Together with the structural,
 timing, rendering, PTY, and process-RSS evidence above, no product verification item remains open.
+
+The final merged-dependency distribution was captured with
+`scripts/capture-tui-product-latency.sh target/tui-product-latency.json` using five independent test
+processes. Across 250 committed-presentation samples, terminal-input p99 was **0.140 ms** and
+due-timer p99 was **0.068 ms**, both below the locked **100 ms** budget. Peak process RSS p95 was
+**16,941,056 bytes**, below the locked **33,554,432-byte** budget. The generated artifact records the
+exact toolchain, machine, revision, dirty-state marker, sample distributions, and gate outcomes so
+later captures remain directly attributable rather than being described as durable or
+reconnect-safe state.
