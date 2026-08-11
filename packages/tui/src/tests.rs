@@ -911,6 +911,44 @@ fn configured_ctrl_enter_submits_while_enter_inserts_newline() {
 }
 
 #[test]
+fn shared_composer_control_inserts_text_and_rejects_command_modifiers() {
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    let plain = input::handle_key(&mut app, &keymap, key(KeyCode::Char('c')));
+    assert!(plain.redraw);
+    assert_eq!(app.composer().text(), "c");
+
+    let shifted = input::handle_key(
+        &mut app,
+        &keymap,
+        KeyStroke::with_modifiers(
+            KeyCode::Char('A'),
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        ),
+    );
+    assert!(shifted.redraw);
+    assert_eq!(app.composer().text(), "cA");
+
+    let command = input::handle_key(
+        &mut app,
+        &keymap,
+        KeyStroke::with_modifiers(
+            KeyCode::Char('x'),
+            Modifiers {
+                super_key: true,
+                ..Modifiers::NONE
+            },
+        ),
+    );
+    assert!(!command.redraw);
+    assert_eq!(app.composer().text(), "cA");
+}
+
+#[test]
 fn default_tab_requests_agent_cycle_in_chat_input() {
     let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);

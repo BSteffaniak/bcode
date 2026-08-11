@@ -415,49 +415,25 @@ impl BcodeRuntimeModel {
         let Some(dialog) = self.loop_state.permission_dialog.as_mut() else {
             return super::invalidation::UiInvalidation::None;
         };
-        match action {
-            super::keymap::BmuxAction::SelectUp => {
-                dialog.focus_previous();
+        match dialog.handle_action(action) {
+            super::permission_dialog::PermissionDialogOutcome::FocusChanged(label) => {
                 self.chat
                     .app
-                    .set_status(format!("permission choice: {}", dialog.focused_label()));
+                    .set_status(format!("permission choice: {label}"));
             }
-            super::keymap::BmuxAction::SelectDown => {
-                dialog.focus_next();
-                self.chat
-                    .app
-                    .set_status(format!("permission choice: {}", dialog.focused_label()));
+            super::permission_dialog::PermissionDialogOutcome::Resolve(resolution) => {
+                self.queue_permission_resolution(resolution);
             }
-            super::keymap::BmuxAction::PermissionApprove => {
-                self.queue_permission_resolution(true, false, false);
+            super::permission_dialog::PermissionDialogOutcome::Ignored => {
+                return super::invalidation::UiInvalidation::None;
             }
-            super::keymap::BmuxAction::PermissionDeny | super::keymap::BmuxAction::SelectCancel => {
-                self.queue_permission_resolution(false, false, false);
-            }
-            super::keymap::BmuxAction::SelectConfirm => {
-                self.queue_focused_permission_resolution();
-            }
-            _ => return super::invalidation::UiInvalidation::None,
         }
         super::invalidation::UiInvalidation::Structural
     }
 
-    fn queue_focused_permission_resolution(&mut self) {
-        let Some(dialog) = self.loop_state.permission_dialog.as_ref() else {
-            return;
-        };
-        self.queue_permission_resolution(
-            dialog.focused_approval(),
-            dialog.focused_remember(),
-            dialog.focused_batch(),
-        );
-    }
-
     fn queue_permission_resolution(
         &mut self,
-        approved: bool,
-        remember: bool,
-        apply_to_batch: bool,
+        resolution: super::permission_dialog::PermissionDialogResolution,
     ) {
         let Some(dialog) = self.loop_state.permission_dialog.as_ref() else {
             return;
@@ -468,19 +444,18 @@ impl BcodeRuntimeModel {
             .batch
             .as_ref()
             .map(|batch| batch.batch_id.clone());
-        let label = dialog.focused_label();
         self.chat
             .start_effect(super::effects::TuiEffect::ResolvePermission {
                 permission_id,
-                approved,
-                remember,
-                apply_to_batch,
+                approved: resolution.approved,
+                remember: resolution.remember,
+                apply_to_batch: resolution.apply_to_batch,
                 batch_id,
             });
         self.loop_state.permission_dialog = None;
         self.chat
             .app
-            .set_status(format!("resolving permission: {label}"));
+            .set_status(format!("resolving permission: {}", resolution.label));
     }
 
     fn apply_plugin_surface_close(

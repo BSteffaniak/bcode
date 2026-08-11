@@ -1540,6 +1540,19 @@ if ! rg -q 'pub fn handle_key\(' packages/tui/src/command_palette.rs \
   violations=1
 fi
 
+if rg -n 'bmux_tui::input::(TextInputKeyHandler|TextInputKeyOutcome)|handle_default_text_key\(' \
+  packages/tui/src --glob '*.rs' >/tmp/bcode-tui-obsolete-text-input-helper.txt; then
+  echo "Runtime architecture violation: composer text input bypassed the shared TextInputControl owner." >&2
+  cat /tmp/bcode-tui-obsolete-text-input-helper.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-tui-obsolete-text-input-helper.txt
+if ! rg -q 'TextInputControl::new\(&composer_policy\(\)\)\.handle_key\(app\.composer_state_mut\(\), stroke\)' \
+  packages/tui/src/input.rs; then
+  echo "Runtime architecture violation: chat composer keyboard input must delegate through the shared TextInputControl state." >&2
+  violations=1
+fi
+
 for dialog_state in timeline thinking; do
   if ! rg -q 'pub fn handle_key\(' "packages/tui/src/${dialog_state}_dialog.rs" \
     || ! rg -q 'match dialog\.handle_key\(stroke\)' packages/tui/src/chat_loop.rs; then
@@ -1547,8 +1560,15 @@ for dialog_state in timeline thinking; do
     violations=1
   fi
 done
-if rg -n 'dialog\.(select_previous|select_next|page_previous|page_next|select_first|select_last|focus_previous|cycle_focused)\(' \
-  packages/tui/src/chat_loop.rs >/tmp/bcode-tui-split-dialog-policy.txt; then
+if ! rg -q 'pub const fn handle_action\(' packages/tui/src/permission_dialog.rs \
+  || ! rg -q 'match dialog\.handle_action\(action\)' packages/tui/src/root_program.rs \
+  || ! rg -q 'dialog\.activate_action\(index\)' packages/tui/src/mouse_flow.rs; then
+  echo "Runtime architecture violation: permission dialog state must own keyboard and mouse decision policy through typed outcomes." >&2
+  violations=1
+fi
+if rg -n 'dialog\.(select_previous|select_next|page_previous|page_next|select_first|select_last|focus_previous|focused_approval|focused_remember|focused_batch|cycle_focused)\(' \
+  packages/tui/src/chat_loop.rs packages/tui/src/root_program.rs packages/tui/src/mouse_flow.rs \
+  >/tmp/bcode-tui-split-dialog-policy.txt; then
   echo "Runtime architecture violation: dialog keyboard policy was duplicated in TUI orchestration." >&2
   cat /tmp/bcode-tui-split-dialog-policy.txt >&2
   violations=1

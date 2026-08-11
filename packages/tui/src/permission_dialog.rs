@@ -2,6 +2,32 @@
 
 use bcode_session_view_models::PermissionView;
 
+use super::keymap::BmuxAction;
+
+/// Permission decision requested by the dialog's interaction policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionDialogResolution {
+    /// Whether the permission should be approved.
+    pub approved: bool,
+    /// Whether the decision should be persisted as policy.
+    pub remember: bool,
+    /// Whether the decision applies to the complete permission batch.
+    pub apply_to_batch: bool,
+    /// User-facing label for the selected decision.
+    pub label: &'static str,
+}
+
+/// Outcome from one permission-dialog semantic action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDialogOutcome {
+    /// Focus changed and the status should present the selected label.
+    FocusChanged(&'static str),
+    /// Resolve the permission with the selected decision.
+    Resolve(PermissionDialogResolution),
+    /// The action is not owned by the permission dialog.
+    Ignored,
+}
+
 /// Pending permission dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionDialogState {
@@ -93,6 +119,61 @@ impl PermissionDialogState {
             (false, false, 0) => "approve",
             (true | false, true | false, _) => "deny",
         }
+    }
+
+    /// Handle one semantic permission-dialog action.
+    pub const fn handle_action(&mut self, action: BmuxAction) -> PermissionDialogOutcome {
+        match action {
+            BmuxAction::SelectUp => {
+                self.focus_previous();
+                PermissionDialogOutcome::FocusChanged(self.focused_label())
+            }
+            BmuxAction::SelectDown => {
+                self.focus_next();
+                PermissionDialogOutcome::FocusChanged(self.focused_label())
+            }
+            BmuxAction::PermissionApprove => {
+                PermissionDialogOutcome::Resolve(Self::resolution(true, false, false, "approve"))
+            }
+            BmuxAction::PermissionDeny | BmuxAction::SelectCancel => {
+                PermissionDialogOutcome::Resolve(Self::resolution(false, false, false, "deny"))
+            }
+            BmuxAction::SelectConfirm => PermissionDialogOutcome::Resolve(Self::resolution(
+                self.focused_approval(),
+                self.focused_remember(),
+                self.focused_batch(),
+                self.focused_label(),
+            )),
+            _ => PermissionDialogOutcome::Ignored,
+        }
+    }
+
+    const fn resolution(
+        approved: bool,
+        remember: bool,
+        apply_to_batch: bool,
+        label: &'static str,
+    ) -> PermissionDialogResolution {
+        PermissionDialogResolution {
+            approved,
+            remember,
+            apply_to_batch,
+            label,
+        }
+    }
+
+    /// Focus one action by zero-based index and return its resolution.
+    #[must_use]
+    pub const fn activate_action(&mut self, index: usize) -> Option<PermissionDialogResolution> {
+        if !self.focus_action(index) {
+            return None;
+        }
+        Some(Self::resolution(
+            self.focused_approval(),
+            self.focused_remember(),
+            self.focused_batch(),
+            self.focused_label(),
+        ))
     }
 
     /// Focus one action by zero-based index.
@@ -235,5 +316,53 @@ mod tests {
             assert_eq!(dialog.focused_remember(), expected.2);
             dialog.focus_next();
         }
+    }
+
+    #[test]
+    fn semantic_actions_own_navigation_and_resolution_policy() {
+        let mut dialog = PermissionDialogState::new(permission_with_batch(true, true));
+
+        assert_eq!(
+            dialog.handle_action(BmuxAction::SelectDown),
+            PermissionDialogOutcome::FocusChanged("approve batch")
+        );
+        assert_eq!(
+            dialog.handle_action(BmuxAction::SelectConfirm),
+            PermissionDialogOutcome::Resolve(PermissionDialogResolution {
+                approved: true,
+                remember: false,
+                apply_to_batch: true,
+                label: "approve batch",
+            })
+        );
+        assert_eq!(
+            dialog.handle_action(BmuxAction::PermissionDeny),
+            PermissionDialogOutcome::Resolve(PermissionDialogResolution {
+                approved: false,
+                remember: false,
+                apply_to_batch: false,
+                label: "deny",
+            })
+        );
+        assert_eq!(
+            dialog.handle_action(BmuxAction::AppExit),
+            PermissionDialogOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn mouse_activation_returns_the_same_owned_resolution() {
+        let mut dialog = PermissionDialogState::new(permission_with_batch(true, true));
+
+        assert_eq!(
+            dialog.activate_action(2),
+            Some(PermissionDialogResolution {
+                approved: true,
+                remember: true,
+                apply_to_batch: false,
+                label: "remember allow",
+            })
+        );
+        assert_eq!(dialog.activate_action(6), None);
     }
 }

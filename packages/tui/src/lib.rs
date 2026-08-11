@@ -23,7 +23,6 @@ pub(crate) mod exit_state;
 pub(crate) mod filtered_list;
 #[cfg(test)]
 mod frame_sequence_harness;
-pub(crate) mod helpers;
 pub(crate) mod history_flow;
 pub(crate) mod indexed_transcript_layout;
 pub(crate) mod input;
@@ -153,7 +152,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_session_models::SessionId;
 use bmux_tui::crossterm::CrosstermTerminalGuard;
+use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
+use crossterm::terminal::size;
+
+fn terminal_area() -> io::Result<Rect> {
+    let (width, height) = size()?;
+    Ok(Rect::new(0, 0, width, height))
+}
 
 const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const OLDER_HISTORY_EVENT_LIMIT: usize = 256;
@@ -253,7 +259,7 @@ pub async fn run_onboarding() -> Result<(), TuiError> {
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            helpers::terminal_area()?,
+            terminal_area()?,
         );
         run_onboarding_runtime(&mut terminal, store, shell, &config.tui).await
     };
@@ -456,7 +462,7 @@ pub async fn run_ralph_home() -> Result<(), TuiError> {
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            helpers::terminal_area()?,
+            terminal_area()?,
         );
         Box::pin(runtime::run_event_loop_with_startup_and_static_bundled(
             &mut terminal,
@@ -510,7 +516,7 @@ pub async fn run_with_static_bundled(
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            helpers::terminal_area()?,
+            terminal_area()?,
         );
         Box::pin(runtime::run_event_loop_with_static_bundled(
             &mut terminal,
@@ -543,7 +549,7 @@ pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), T
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            helpers::terminal_area()?,
+            terminal_area()?,
         );
         Box::pin(code_review_launcher::run_home(&mut terminal, repo_path)).await
     };
@@ -581,7 +587,7 @@ pub async fn run_code_review_workspace(
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            helpers::terminal_area()?,
+            terminal_area()?,
         );
         Box::pin(code_review_launcher::run_workspace(
             &mut terminal,
@@ -621,7 +627,7 @@ pub async fn run_code_review(
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            helpers::terminal_area()?,
+            terminal_area()?,
         );
         Box::pin(code_review_launcher::run(&mut terminal, repo_path, target)).await
     };
@@ -653,7 +659,7 @@ pub async fn run_eval_viewer_picker(repo_path: std::path::PathBuf) -> Result<(),
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            helpers::terminal_area()?,
+            terminal_area()?,
         );
         Box::pin(eval_launcher::run_picker(&mut terminal, repo_path)).await
     };
@@ -678,7 +684,7 @@ pub async fn run_metrics_dashboard(
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            helpers::terminal_area()?,
+            terminal_area()?,
         );
         Box::pin(metrics_launcher::run_dashboard(
             &mut terminal,
@@ -710,7 +716,7 @@ pub async fn run_eval_viewer(
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            helpers::terminal_area()?,
+            terminal_area()?,
         );
         Box::pin(eval_launcher::run_viewer(&mut terminal, repo_path, run)).await
     };

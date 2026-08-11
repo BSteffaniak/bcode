@@ -78,29 +78,25 @@ pub fn handle_permission_action_mouse(
     let Some(dialog) = permission_dialog.as_mut() else {
         return false;
     };
-    if !dialog.focus_action(index) {
+    let Some(resolution) = dialog.activate_action(index) else {
         return false;
-    }
+    };
     let permission_id = dialog.permission().permission_id.clone();
     let batch_id = dialog
         .permission()
         .batch
         .as_ref()
         .map(|batch| batch.batch_id.clone());
-    let approved = dialog.focused_approval();
-    let remember = dialog.focused_remember();
-    let apply_to_batch = dialog.focused_batch();
-    let label = dialog.focused_label();
     chat.start_effect(TuiEffect::ResolvePermission {
         permission_id,
-        approved,
-        remember,
-        apply_to_batch,
+        approved: resolution.approved,
+        remember: resolution.remember,
+        apply_to_batch: resolution.apply_to_batch,
         batch_id,
     });
     *permission_dialog = None;
     chat.app
-        .set_status(format!("resolving permission: {label}"));
+        .set_status(format!("resolving permission: {}", resolution.label));
     true
 }
 

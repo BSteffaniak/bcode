@@ -1652,6 +1652,11 @@ impl BmuxApp {
         &self.composer
     }
 
+    /// Return the composer text input state mutably.
+    pub const fn composer_state_mut(&mut self) -> &mut TextInputState {
+        &mut self.composer
+    }
+
     /// Return the composer buffer.
     #[must_use]
     pub const fn composer(&self) -> &TextEditBuffer {
