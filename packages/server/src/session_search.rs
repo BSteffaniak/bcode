@@ -602,6 +602,67 @@ pub async fn backfill_provider_with_cancellation(
             break;
         }
         let session_id = summary.id;
+        match state.sessions.session_health(session_id).await {
+            bcode_session::SessionHealth::Migratable { source, target }
+            | bcode_session::SessionHealth::BlockedOwner { source, target, .. } => {
+                sessions.push(SessionSearchBackfillSessionResult {
+                    session_id,
+                    outcome: SessionSearchBackfillOutcome::Failed,
+                    batches_applied: 0,
+                    indexed_through_sequence: provider
+                        .status
+                        .coverage
+                        .iter()
+                        .find(|coverage| coverage.generation.session_id == session_id)
+                        .and_then(|coverage| coverage.indexed_through_sequence),
+                    canonical_tail_sequence: None,
+                    error: Some(SessionSearchServiceError {
+                        code: SearchErrorCode::MigrationRequired,
+                        message: format!(
+                            "canonical session writer epoch {source} requires explicit migration to {target} before search backfill"
+                        ),
+                        retryable: false,
+                    }),
+                });
+                continue;
+            }
+            bcode_session::SessionHealth::WriterIncompatible { actual, expected } => {
+                sessions.push(SessionSearchBackfillSessionResult {
+                    session_id,
+                    outcome: SessionSearchBackfillOutcome::Failed,
+                    batches_applied: 0,
+                    indexed_through_sequence: None,
+                    canonical_tail_sequence: None,
+                    error: Some(SessionSearchServiceError {
+                        code: SearchErrorCode::FutureVersion,
+                        message: format!(
+                            "canonical session writer epoch {actual:?} is incompatible with expected epoch {expected}; upgrade Bcode before search backfill"
+                        ),
+                        retryable: false,
+                    }),
+                });
+                continue;
+            }
+            bcode_session::SessionHealth::NotFound => {
+                sessions.push(SessionSearchBackfillSessionResult {
+                    session_id,
+                    outcome: SessionSearchBackfillOutcome::Failed,
+                    batches_applied: 0,
+                    indexed_through_sequence: None,
+                    canonical_tail_sequence: None,
+                    error: Some(SessionSearchServiceError {
+                        code: SearchErrorCode::ProviderUnavailable,
+                        message: "canonical session is missing; locate or restore it before search backfill".to_owned(),
+                        retryable: false,
+                    }),
+                });
+                continue;
+            }
+            bcode_session::SessionHealth::Ready
+            | bcode_session::SessionHealth::DegradedReadOnly { .. }
+            | bcode_session::SessionHealth::ProjectionStale { .. }
+            | bcode_session::SessionHealth::RepairRequired { .. } => {}
+        }
         if state.session_migrations.is_active(session_id).await {
             sessions.push(SessionSearchBackfillSessionResult {
                 session_id,
@@ -1173,6 +1234,32 @@ async fn ingest_session_tail(
         .session_summary(session_id)
         .await
         .map_err(IngestionError::retryable)?;
+    match state.sessions.session_health(session_id).await {
+        bcode_session::SessionHealth::Ready
+        | bcode_session::SessionHealth::DegradedReadOnly { .. } => {}
+        bcode_session::SessionHealth::Migratable { source, target }
+        | bcode_session::SessionHealth::BlockedOwner { source, target, .. } => {
+            return Err(IngestionError::permanent(format!(
+                "canonical session writer epoch {source} requires explicit migration to {target} before search ingestion"
+            )));
+        }
+        bcode_session::SessionHealth::WriterIncompatible { actual, expected } => {
+            return Err(IngestionError::permanent(format!(
+                "canonical session writer epoch {actual:?} is incompatible with expected epoch {expected}; upgrade Bcode before search ingestion"
+            )));
+        }
+        bcode_session::SessionHealth::NotFound => {
+            return Err(IngestionError::permanent(
+                "canonical session is missing; locate or restore it before search ingestion",
+            ));
+        }
+        bcode_session::SessionHealth::ProjectionStale { .. }
+        | bcode_session::SessionHealth::RepairRequired { .. } => {
+            return Err(IngestionError::permanent(
+                "canonical session requires explicit repair or reindex before search ingestion",
+            ));
+        }
+    }
     for provider in providers {
         state
             .session_search_work
@@ -2407,6 +2494,7 @@ pub(crate) mod tests {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+    use switchy::database::query::FilterableQuery as _;
 
     const FAST_PROVIDER_ID: &str = "test.fast-session-search";
     const SLOW_PROVIDER_ID: &str = "test.slow-session-search";
@@ -4741,6 +4829,67 @@ pub(crate) mod tests {
                 .contains("ahead of the canonical session tail")
         );
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_backfill_reports_released_historical_session_as_migration_required() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("released historical backfill".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        let root = state
+            .sessions
+            .session_store_root()
+            .expect("persistent session root");
+        let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("open session DB");
+        let source_writer_epoch = *bcode_session_migration::RELEASED_HISTORICAL_WRITER_EPOCHS
+            .last()
+            .expect("released writer inventory");
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                switchy::database::DatabaseValue::Int64(i64::from(source_writer_epoch)),
+            )
+            .where_eq("contract_id", switchy::database::DatabaseValue::Int32(1))
+            .execute(db.database())
+            .await
+            .expect("mark released historical writer");
+        drop(db);
+
+        let response = backfill_provider(
+            &state,
+            BackfillSessionSearchRequest {
+                provider_id: FAST_PROVIDER_ID.to_owned(),
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                cursor: None,
+                deadline_ms: 5_000,
+            },
+        )
+        .await
+        .expect("backfill returns categorized historical result");
+
+        assert_eq!(response.failed_sessions, 1);
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
+        let error = response.sessions[0]
+            .error
+            .as_ref()
+            .expect("migration-required error");
+        assert_eq!(error.code, SearchErrorCode::MigrationRequired);
+        assert!(!error.retryable);
+        assert!(error.message.contains("explicit migration"));
     }
 
     #[tokio::test]
