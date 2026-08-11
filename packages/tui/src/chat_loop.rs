@@ -2106,6 +2106,56 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
     started
 }
 
+fn bulk_migration_status_message(
+    status: &bcode_ipc::SessionBulkMigrationOperationStatus,
+) -> String {
+    let state = match status.state {
+        bcode_ipc::SessionBulkMigrationState::Running => "running",
+        bcode_ipc::SessionBulkMigrationState::CancellationRequested => "cancelling",
+        bcode_ipc::SessionBulkMigrationState::Completed => "completed",
+        bcode_ipc::SessionBulkMigrationState::NeedsAttention => "needs attention",
+        bcode_ipc::SessionBulkMigrationState::Cancelled => "cancelled",
+    };
+    format!(
+        "Canonical migration {state}: visited {}, migrated {}, blocked {}, failed {}",
+        status.visited, status.migrated, status.blocked, status.failed
+    )
+}
+
+fn search_backfill_status_message(
+    status: &bcode_session_search::SessionSearchBackfillOperationStatus,
+) -> String {
+    let state = match status.state {
+        bcode_session_search::SessionSearchBackfillOperationState::Running => "running",
+        bcode_session_search::SessionSearchBackfillOperationState::CancellationRequested => {
+            "cancelling"
+        }
+        bcode_session_search::SessionSearchBackfillOperationState::Completed => "completed",
+        bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention => {
+            "needs attention"
+        }
+        bcode_session_search::SessionSearchBackfillOperationState::Cancelled => "cancelled",
+        bcode_session_search::SessionSearchBackfillOperationState::Failed => "failed",
+    };
+    let Some(progress) = status.complete_progress.as_ref() else {
+        return format!(
+            "Derived search backfill {state}: revision {}",
+            status.revision
+        );
+    };
+    let unvisited = progress
+        .selected_sessions
+        .saturating_sub(progress.visited_sessions);
+    format!(
+        "Derived search backfill {state}: visited {}, complete {}, blocked/incomplete {}, failed {}, unvisited {}",
+        progress.visited_sessions,
+        progress.completed_sessions,
+        progress.incomplete_sessions,
+        progress.failed_sessions,
+        unvisited
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn apply_effect_result(
     settings: &mut TuiRuntimeSettings,
@@ -2304,14 +2354,7 @@ pub fn apply_effect_result(
                 match result {
                     Ok(status) => {
                         picker.set_bulk_migration_operation_id(status.operation_id.clone());
-                        picker.set_status(format!(
-                            "Canonical migration {:?}: visited {}, migrated {}, blocked {}, failed {}",
-                            status.state,
-                            status.visited,
-                            status.migrated,
-                            status.blocked,
-                            status.failed
-                        ));
+                        picker.set_status(bulk_migration_status_message(&status));
                         if matches!(
                             status.state,
                             bcode_ipc::SessionBulkMigrationState::Running
@@ -2332,14 +2375,7 @@ pub fn apply_effect_result(
                 match result {
                     Ok(status) => {
                         picker.set_bulk_migration_operation_id(status.operation_id.clone());
-                        picker.set_status(format!(
-                            "Canonical migration {:?}: visited {}, migrated {}, blocked {}, failed {}",
-                            status.state,
-                            status.visited,
-                            status.migrated,
-                            status.blocked,
-                            status.failed
-                        ));
+                        picker.set_status(bulk_migration_status_message(&status));
                         if matches!(
                             status.state,
                             bcode_ipc::SessionBulkMigrationState::Running
@@ -2381,10 +2417,7 @@ pub fn apply_effect_result(
                 match result {
                     Ok(status) => {
                         picker.set_search_backfill_operation_id(status.operation_id.clone());
-                        picker.set_status(format!(
-                            "Derived search backfill {:?}: revision {}",
-                            status.state, status.revision
-                        ));
+                        picker.set_status(search_backfill_status_message(&status));
                         if matches!(
                             status.state,
                             bcode_session_search::SessionSearchBackfillOperationState::Running
@@ -5018,6 +5051,73 @@ pub fn cycle_session_agent(chat: &mut ActiveChat) {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    #[test]
+    fn search_maintenance_status_messages_are_human_readable_and_truthful() {
+        let migration = bcode_ipc::SessionBulkMigrationOperationStatus {
+            operation_id: "migration".to_owned(),
+            revision: 2,
+            state: bcode_ipc::SessionBulkMigrationState::NeedsAttention,
+            mode: bcode_ipc::SessionBulkMigrationMode::Migrate,
+            selected: 6,
+            visited: 5,
+            migrated: 3,
+            blocked: 1,
+            failed: 1,
+            current_session_id: None,
+            outcomes: Vec::new(),
+        };
+        assert_eq!(
+            bulk_migration_status_message(&migration),
+            "Canonical migration needs attention: visited 5, migrated 3, blocked 1, failed 1"
+        );
+
+        let backfill = bcode_session_search::SessionSearchBackfillOperationStatus {
+            operation_id: "backfill".to_owned(),
+            provider_id: "all".to_owned(),
+            revision: 4,
+            state: bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention,
+            response: None,
+            complete_progress: Some(
+                bcode_session_search::CompleteSessionSearchBackfillProgress {
+                    provider_ids: vec!["provider".to_owned()],
+                    current_provider_id: None,
+                    catalog_revision_started: 1,
+                    convergence_pass: 1,
+                    providers_completed: 1,
+                    selected_sessions: 8,
+                    visited_sessions: 6,
+                    completed_sessions: 3,
+                    incomplete_sessions: 2,
+                    failed_sessions: 1,
+                    providers: vec![
+                        bcode_session_search::CompleteSessionSearchBackfillProviderResult {
+                            provider_id: "provider".to_owned(),
+                            selected_sessions: 8,
+                            completed_sessions: 3,
+                            incomplete_sessions: 2,
+                            failed_sessions: 1,
+                            catalog_pages: 1,
+                            issues: Vec::new(),
+                            error: None,
+                        },
+                    ],
+                },
+            ),
+            complete_response: None,
+            error: None,
+        };
+        assert_eq!(
+            search_backfill_status_message(&backfill),
+            "Derived search backfill needs attention: visited 6, complete 3, blocked/incomplete 2, failed 1, unvisited 2"
+        );
+        backfill
+            .complete_progress
+            .as_ref()
+            .expect("progress")
+            .validate()
+            .expect("portable progress");
+    }
 
     struct PassiveSurface;
 

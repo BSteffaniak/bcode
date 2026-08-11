@@ -110,8 +110,10 @@ A provider never opens canonical Bcode databases and never writes canonical sess
 receives bounded versioned search records projected by Bcode from finalized semantic events.
 
 The standard distribution includes Tantivy and compressed deep-output search while preserving
-independent compile-time feature paths. Host-owned distribution policy enables Tantivy for ordinary
-transcript search and leaves compressed shell/tool-output search disabled until explicitly selected.
+independent compile-time feature paths. Host-owned distribution policy enables both bundled local
+providers by default while keeping their query routes distinct: Tantivy serves ordinary transcript
+search, and compressed shell/tool-output scans require explicit deep query intent. Either provider
+can be disabled independently; disabling compressed search also stops its ingestion and storage I/O.
 When `storage_root` is omitted, the application supplies a lazy authorized provider root under
 `<state>/derived/plugins/<artifact-namespace>/<plugin-id>/`; generic plugin plumbing only transports
 that optional path and providers still perform confinement checks. Exact artifact namespaces prevent

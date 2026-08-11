@@ -88,11 +88,12 @@ The default session picker also uses:
 | `Ctrl+R` | Rename the selected session |
 | `Ctrl+D` | Delete the selected session |
 
-Transcript search can use discoverable keyboard controls: `M` cycles terms/phrase/prefix/fuzzy/regex,
-`D` toggles ordinary versus explicit deep search, `S` cycles sorting, `N` continues with the next
-provider cursor, and `Up`/`Down` update the bounded preview. `I` inventories canonical
-compatibility, `G` uses two-step confirmation for canonical migration, `B` starts the separate
-derived-provider backfill, and `C` cancels the latest transient maintenance operation.
+Transcript search uses discoverable keyboard controls: `Alt-M` cycles
+terms/phrase/prefix/fuzzy/regex, `Alt-D` toggles ordinary versus explicit deep search, `Alt-S` cycles
+sorting, `Alt-N` continues with the next provider cursor, and `Up`/`Down` update the bounded preview.
+`Alt-I` inventories canonical compatibility, `Alt-G` uses two-step confirmation for canonical
+migration, `Alt-B` starts the separate derived-provider backfill, and `Alt-X` cancels the latest
+transient maintenance operation.
 
 Optional textual controls include `mode:`, `deep:`, `content:`, `cwd:`, `after:`, `before:`,
 `provider:`, `model:`, `agent:`, `tool:`, `status:`, `field:`, and `sort:`. Press `?` in search for
