@@ -806,14 +806,27 @@ fn fake_structured_output_error(error: &dyn std::fmt::Display) -> ProviderError 
     }
 }
 
+/// Extract the structured JSON payload the host embedded in a prompt.
+///
+/// The host appends the structured input as the final `\n\n`-separated block, and when it also sends
+/// instructions it wraps that block in `<workflow-input-json>` delimiters so untrusted input cannot
+/// be confused with instructions. Unwrap those delimiters when present so this provider observes the
+/// same payload the host sent.
+fn structured_input_payload(user_text: &str) -> &str {
+    let block = user_text.rsplit("\n\n").next().unwrap_or(user_text).trim();
+    block
+        .strip_prefix("<workflow-input-json>")
+        .and_then(|value| value.strip_suffix("</workflow-input-json>"))
+        .unwrap_or(block)
+}
+
 fn configured_matching_input(
     user_text: &str,
     schema: &serde_json::Value,
     flagship_lifecycle: bool,
 ) -> Result<serde_json::Value, ProviderError> {
-    let input: serde_json::Value =
-        serde_json::from_str(user_text.rsplit("\n\n").next().unwrap_or(user_text))
-            .map_err(|error| fake_structured_output_error(&error))?;
+    let input: serde_json::Value = serde_json::from_str(structured_input_payload(user_text))
+        .map_err(|error| fake_structured_output_error(&error))?;
     if flagship_lifecycle {
         return flagship_lifecycle_output(&input, schema).ok_or_else(|| ProviderError {
             code: "no_matching_fake_structured_input".to_string(),
@@ -878,7 +891,7 @@ fn configured_fake_structured_output(
             .parse::<u64>()
             .map_err(|error| fake_structured_output_error(&error))?;
         let mut value: serde_json::Value =
-            serde_json::from_str(user_text.rsplit("\n\n").next().unwrap_or(user_text))
+            serde_json::from_str(structured_input_payload(user_text))
                 .map_err(|error| fake_structured_output_error(&error))?;
         let evaluation = user_text.starts_with("Read-only loop completion evaluation.");
         let iteration = value
@@ -901,7 +914,7 @@ fn configured_fake_structured_output(
             .strip_prefix("echo_input:")
             .map_or_else(
                 || serde_json::from_str(configured),
-                |_| serde_json::from_str(user_text.rsplit("\n\n").next().unwrap_or(user_text)),
+                |_| serde_json::from_str(structured_input_payload(user_text)),
             )
             .map_err(|error| fake_structured_output_error(&error))?
     };
@@ -2026,6 +2039,27 @@ mod tests {
         CapabilitySupport, ModelParameterKey, ProviderOutputEvent, RequestedModelFeature,
         StructuredOutputMode, TurnOutputPosition,
     };
+
+    /// The host wraps structured input in delimiters whenever it also sends instructions, so payload
+    /// extraction must unwrap them. Missing this left the payload unparseable and surfaced as
+    /// `invalid_fake_structured_output`.
+    #[test]
+    fn structured_input_payload_unwraps_host_delimiters() {
+        let payload = r#"{"iteration":1}"#;
+
+        assert_eq!(structured_input_payload(payload), payload);
+        assert_eq!(
+            structured_input_payload(&format!(
+                "Implement the requested work.\n\n<workflow-input-json>{payload}</workflow-input-json>"
+            )),
+            payload
+        );
+        // Without instructions the host sends the bare payload as the final block.
+        assert_eq!(
+            structured_input_payload(&format!("Instructions.\n\n{payload}")),
+            payload
+        );
+    }
 
     fn drain_script_until(
         turn: &FakeTurn,
