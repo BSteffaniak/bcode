@@ -29425,8 +29425,40 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
                         "workflow prompt receipt has no output_schema_id".to_string(),
                     )
                 })?;
-            observe_workflow_turn(self.state, session_id, turn_id, output_schema_id, request).await
+            let observation =
+                observe_workflow_turn(self.state, session_id, turn_id, output_schema_id, request)
+                    .await;
+            structural_observation_or_unknown(observation, request)
         })
+    }
+}
+
+/// Convert a structurally undecodable observation into [`AttemptObservation::Unknown`].
+///
+/// A receipt whose stored contract cannot be decoded is deterministic damage: retrying the same
+/// observation will always fail the same way. Propagating the error would let the caller log and
+/// continue, leaving the attempt in `running` forever. Reporting `Unknown` instead routes the
+/// attempt through the store's existing repair path, so mutating attempts become `repair_required`
+/// and read-only attempts are reported as unresolved.
+///
+/// Transport-shaped failures are propagated unchanged, because those can succeed on a later
+/// reconciliation and must not be recorded as unprovable state.
+fn structural_observation_or_unknown(
+    observation: Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError>,
+    request: &bcode_workflow_store::AttemptReconciliationRequest,
+) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
+    match observation {
+        Err(WorkflowStoreError::InvalidData(message)) => {
+            tracing::warn!(
+                run_id = %request.run_id,
+                node_id = %request.node_id,
+                dispatch_identity = %request.dispatch_identity,
+                "workflow attempt receipt cannot be decoded; reporting unknown so it is surfaced \
+                 for repair instead of remaining active: {message}"
+            );
+            Ok(bcode_workflow_store::AttemptObservation::Unknown)
+        }
+        other => other,
     }
 }
 
@@ -31385,6 +31417,22 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
                         )
                         .collect::<BTreeSet<_>>();
                     let sibling_cancellations = summary.sibling_cancellations;
+                    // Surface unprovable state rather than discarding it. Mutating attempts already
+                    // moved to `repair_required`; read-only attempts stay active, so they are the
+                    // ones an operator would otherwise never hear about.
+                    if !summary.repair_required.is_empty() {
+                        tracing::warn!(
+                            attempts = ?summary.repair_required,
+                            "workflow attempts require explicit repair after startup reconciliation"
+                        );
+                    }
+                    if !summary.unresolved_read_only.is_empty() {
+                        tracing::warn!(
+                            attempts = ?summary.unresolved_read_only,
+                            "read-only workflow attempts could not be resolved at startup and \
+                             remain active; they need explicit inspection"
+                        );
+                    }
                     drop(store);
                     if let Err(error) =
                         propagate_fail_fast_sibling_cancellation(state, sibling_cancellations).await
@@ -54021,6 +54069,142 @@ library = "test"
         ] {
             assert!(validate_workflow_output_semantics(&schema, &output).is_err());
         }
+    }
+
+    /// An undecodable receipt contract must not leave its attempt active forever.
+    ///
+    /// Reconciliation used to return an error here, which the caller logged and ignored, so the run
+    /// stayed `running` with no failure, retry, or repair signal. A mutating attempt must now be
+    /// surfaced as `repair_required` instead.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn undecodable_receipt_contract_marks_a_mutating_attempt_repair_required() {
+        // This test drives real workflow reconciliation, so it serializes against the other
+        // workflow-runtime tests.
+        let _workflow_runtime_guard = WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(Some("parent".to_string()), PathBuf::from("."))
+            .await
+            .expect("parent");
+        // Reconciliation only decodes the node contract once the observed turn is terminal;
+        // otherwise it correctly reports the attempt as still running.
+        let turn_id = format!("{}-1", parent.id);
+        sessions
+            .append_model_turn_started(parent.id, turn_id.clone())
+            .await
+            .expect("turn start");
+        sessions
+            .append_assistant_message(parent.id, "1".to_string())
+            .await
+            .expect("output");
+        sessions
+            .append_model_turn_finished(
+                parent.id,
+                turn_id.clone(),
+                ModelTurnOutcome::Completed,
+                None,
+            )
+            .await
+            .expect("terminal");
+        let state = test_server_state(sessions);
+        let store_path = {
+            let mut store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A task node has `null` configuration, so the prompt contract cannot be decoded.
+            let definition = bcode_workflow::WorkflowBuilder::new(
+                "undecodable",
+                bcode_workflow::Step::<u32, u32>::task("agent", |value, _context| async move {
+                    Ok(value)
+                }),
+            )
+            .build()
+            .expect("workflow")
+            .definition()
+            .clone();
+            store
+                .persist_definition("undecodable", 1, &definition)
+                .expect("definition");
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: "undecodable-run".to_string(),
+                    definition_id: "undecodable".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: Some(parent.id.to_string()),
+                    parent_session_generation: None,
+                    binding: None,
+                    authored_provenance: None,
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 1,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".to_string(),
+                        profile_id: "build".to_string(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            let pending = store
+                .pending_activations(1)
+                .expect("pending")
+                .pop()
+                .expect("node");
+            let prepared = store
+                .prepare_pending_activation(
+                    &pending.run_id,
+                    &pending.node_id,
+                    &pending.activation_id,
+                    bcode_workflow_store::DispatchSideEffect::Mutating,
+                    serde_json::json!({"owner": "test"}),
+                    2,
+                )
+                .expect("prepare")
+                .expect("prepared");
+            store
+                .persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                    run_id: prepared.activation.run_id,
+                    node_id: prepared.activation.node_id,
+                    activation_id: prepared.activation.activation_id,
+                    attempt: 1,
+                    dispatch_identity: prepared.dispatch_identity,
+                    receipt: serde_json::json!({
+                        "session_id": parent.id,
+                        "turn_id": turn_id,
+                        "output_schema_id": "u32",
+                    }),
+                    admitted_at_ms: 3,
+                })
+                .expect("receipt");
+            store.path().to_path_buf()
+        };
+
+        let observer = WorkflowTurnReceiptObserver { state: &state };
+        let mut store = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("scheduler store");
+        let summary = store
+            .reconcile_receipt_backed_attempts_async(&observer, 10, 4)
+            .await
+            .expect("reconciliation must not fail closed on undecodable damage");
+
+        assert_eq!(
+            summary.repair_required.len(),
+            1,
+            "undecodable damage must be surfaced for repair: {summary:?}"
+        );
+        assert_eq!(
+            store
+                .run_summary("undecodable-run")
+                .expect("summary")
+                .expect("run")
+                .status,
+            bcode_workflow_store::RunStatus::RepairRequired,
+            "the run must not remain active"
+        );
     }
 
     #[tokio::test]
