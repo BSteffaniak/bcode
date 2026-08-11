@@ -6,6 +6,65 @@ the daemon and remains available through `session list`, `session history`, `ses
 Never open `catalog.db`, `session.db`, WAL files, provider checkpoint files, or provider indexes to
 investigate a session.
 
+## Compatibility inventory and canonical migration
+
+Inspect compatibility without mutating canonical sessions:
+
+```sh
+bcode session migrate-inventory --json
+bcode session migrate-inventory --session <session-id> --after-timestamp-ms <ms>
+```
+
+The inventory categorizes ready, migration-required, owner-blocked, temporarily locked,
+repair-required, format-incompatible, and missing sessions with bounded counts and capped examples.
+Use the reported action: retry transient ownership/locks, repair damaged storage explicitly, or
+upgrade Bcode for future formats. Inventory never migrates or backfills search.
+
+Start confirmed canonical migration for all eligible sessions, or add `--session`/timestamp filters:
+
+```sh
+bcode session migrate-start \
+  --confirm migrate-supported-sessions \
+  --foreground
+```
+
+For detached operation handling:
+
+```sh
+bcode session migrate-start --confirm migrate-supported-sessions --json
+bcode session migrate-status <operation-id> --json
+bcode session migrate-wait <operation-id> --after-revision <revision> --json
+bcode session migrate-cancel <operation-id> --json
+```
+
+Migration performs a verified per-session backup before canonical mutation and reuses the normal
+migration receipt and strict validation path. Completed sessions remain current on repeated
+invocation. Cancellation takes effect between sessions; it does not undo a completed transactional
+migration. Aggregate operation IDs and revisions are transient daemon-local notifications, not
+reconnect-safe or durable resume tokens. After daemon restart, explicitly invoke inventory or
+migration again; durable current classification and receipts identify remaining work.
+
+Canonical migration and search backfill are separate operations. Migration never invokes providers,
+and backfill never changes canonical history.
+
+## Historical backfill recovery
+
+Complete backfill traverses all selected bounded catalog pages and automatically continues after
+ordinary slice deadlines. `needs_attention` means coordination completed but one or more sessions or
+providers remain blocked/incomplete; inspect categorized issue samples, address their action, and
+explicitly invoke backfill again. Provider checkpoints make re-invocation idempotent. A daemon
+restart discards aggregate backfill operation state, so old operation IDs cannot be resumed; start a
+new backfill and let canonical tails/checkpoints reconstruct remaining work.
+
+Typical actions:
+
+* migration required: run compatibility inventory, then confirmed canonical migration;
+* owner blocked or temporarily locked: release/stop the owner, wait, and retry;
+* quota exceeded: adjust provider-owned quota/storage policy, then retry;
+* corrupt provider state: purge/rebuild only that provider, then backfill;
+* repair required or format incompatible: use canonical diagnosis/repair or upgrade Bcode; never
+  repair canonical history from a derived index.
+
 ## Enablement and storage
 
 Global search execution and ingestion are controlled independently of plugin selection:

@@ -111,6 +111,10 @@ pub mod historical_event_families {
         RequestContextTokenCount, SessionEventKind, ToolArtifact, ToolArtifactRef,
         ToolInvocationResult, ToolInvocationResultRecord, source_kind,
     };
+    use bcode_session_models::{
+        EXECUTION_SESSION_PROVENANCE_VERSION, ExecutionSessionContextMode,
+        ExecutionSessionProvenance, SessionVisibility,
+    };
     use serde::Deserialize;
 
     #[derive(Debug, Deserialize)]
@@ -428,6 +432,58 @@ pub mod historical_event_families {
                 },
             }))
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyExecutionSessionCreated {
+        provenance: LegacyExecutionSessionProvenance,
+        visibility: SessionVisibility,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyExecutionSessionProvenance {
+        owner: String,
+        run_id: String,
+        node_id: String,
+        attempt: u32,
+        parent_session_id: bcode_session_models::SessionId,
+        context_mode: ExecutionSessionContextMode,
+        #[serde(default)]
+        parent_generation: Option<u64>,
+    }
+
+    pub fn decode_execution_session_created(
+        envelope: &HistoricalEnvelope,
+    ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
+        let (event_kind, event_payload) = source_kind(envelope)?;
+        let source = serde_json::from_value::<LegacyExecutionSessionCreated>(event_payload.clone())
+            .map_err(|error| HistoricalSessionEventError::InvalidEvent {
+                schema_version: envelope.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: error.to_string(),
+            })?;
+        let metadata = HistoricalEventMetadata {
+            source_schema: envelope.schema_version,
+            source_kind: event_kind.to_owned(),
+        };
+        Ok(HistoricalDecode::Converted {
+            event: envelope.materialize(SessionEventKind::ExecutionSessionCreated {
+                provenance: Box::new(ExecutionSessionProvenance {
+                    version: EXECUTION_SESSION_PROVENANCE_VERSION,
+                    owner: source.provenance.owner,
+                    run_id: source.provenance.run_id,
+                    node_id: source.provenance.node_id,
+                    activation_id: None,
+                    attempt: source.provenance.attempt,
+                    parent_session_id: source.provenance.parent_session_id,
+                    context_mode: source.provenance.context_mode,
+                    workspace_snapshot: None,
+                    parent_generation: source.provenance.parent_generation,
+                }),
+                visibility: source.visibility,
+            }),
+            metadata,
+        })
     }
 
     pub fn decode_tool_call_finished(

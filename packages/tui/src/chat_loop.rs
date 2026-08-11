@@ -1448,10 +1448,17 @@ impl ChatLoopState {
                                 "Type a transcript query, then press Ctrl-F".to_owned(),
                             );
                         } else {
+                            picker.start_transcript_search();
+                            let Ok((request, policy)) = picker.search_request(&query, false) else {
+                                picker.set_status(
+                                    "Invalid search controls; press ? for syntax".to_owned(),
+                                );
+                                return SessionPickerRootOutcome::Handled;
+                            };
                             picker.set_status("Searching transcripts…".to_owned());
                             chat.replace_effect(TuiEffect::SearchSessions {
-                                request: Box::new(root_session_search_request(query)),
-                                policy: bcode_session_search::SessionSearchPlanPolicy::default(),
+                                request: Box::new(request),
+                                policy,
                             });
                         }
                     } else if let Some(action) =
@@ -1543,12 +1550,105 @@ impl ChatLoopState {
                             picker
                                 .set_status("Type a transcript query, then press Enter".to_owned());
                         } else {
+                            let Ok((request, policy)) = picker.search_request(&query, false) else {
+                                picker.set_status(
+                                    "Invalid search controls; press ? for syntax".to_owned(),
+                                );
+                                return SessionPickerRootOutcome::Handled;
+                            };
                             picker.set_status("Searching transcripts…".to_owned());
                             chat.replace_effect(TuiEffect::SearchSessions {
-                                request: Box::new(root_session_search_request(query)),
-                                policy: bcode_session_search::SessionSearchPlanPolicy::default(),
+                                request: Box::new(request),
+                                policy,
                             });
                         }
+                    }
+                    bmux_keyboard::KeyCode::Char('m' | 'M') => {
+                        picker.cycle_search_match_mode();
+                    }
+                    bmux_keyboard::KeyCode::Char('d' | 'D') => picker.toggle_search_depth(),
+                    bmux_keyboard::KeyCode::Char('s' | 'S') => picker.cycle_search_sort(),
+                    bmux_keyboard::KeyCode::Char('n' | 'N') => {
+                        let query = picker.filter().buffer().text().trim().to_owned();
+                        if query.is_empty() || !picker.has_next_search_page() {
+                            picker.set_status("No next search page available".to_owned());
+                        } else {
+                            let Ok((request, policy)) = picker.search_request(&query, true) else {
+                                picker.set_status(
+                                    "Invalid search controls; press ? for syntax".to_owned(),
+                                );
+                                return SessionPickerRootOutcome::Handled;
+                            };
+                            picker.set_status("Loading next search page…".to_owned());
+                            chat.replace_effect(TuiEffect::SearchSessions {
+                                request: Box::new(request),
+                                policy,
+                            });
+                        }
+                    }
+                    bmux_keyboard::KeyCode::Char('i' | 'I') => {
+                        picker.set_status("Inventorying canonical compatibility…".to_owned());
+                        chat.replace_effect(TuiEffect::StartBulkMigration {
+                            request: bcode_ipc::SessionBulkMigrationStartRequest {
+                                mode: bcode_ipc::SessionBulkMigrationMode::Inventory,
+                                session_ids: std::collections::BTreeSet::new(),
+                                after_timestamp_ms: None,
+                                before_timestamp_ms: None,
+                                confirmation: None,
+                            },
+                        });
+                    }
+                    bmux_keyboard::KeyCode::Char('g' | 'G') => {
+                        if picker.confirm_canonical_migration() {
+                            picker.set_status("Starting confirmed canonical migration…".to_owned());
+                            chat.replace_effect(TuiEffect::StartBulkMigration {
+                                request: bcode_ipc::SessionBulkMigrationStartRequest {
+                                    mode: bcode_ipc::SessionBulkMigrationMode::Migrate,
+                                    session_ids: std::collections::BTreeSet::new(),
+                                    after_timestamp_ms: None,
+                                    before_timestamp_ms: None,
+                                    confirmation: Some(
+                                        bcode_ipc::SESSION_BULK_MIGRATION_CONFIRMATION.to_owned(),
+                                    ),
+                                },
+                            });
+                        } else {
+                            picker.set_status(
+                                "Canonical migration is separate from indexing and creates verified backups. Press G again to confirm"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    bmux_keyboard::KeyCode::Char('b' | 'B') => {
+                        picker.set_status("Starting separate derived search backfill…".to_owned());
+                        chat.replace_effect(TuiEffect::StartSearchIndexing {
+                            request: bcode_session_search::CompleteSessionSearchBackfillRequest {
+                                provider_id: None,
+                                session_ids: std::collections::BTreeSet::new(),
+                                after_timestamp_ms: None,
+                                before_timestamp_ms: None,
+                                slice_deadline_ms: 30_000,
+                            },
+                        });
+                    }
+                    bmux_keyboard::KeyCode::Char('c' | 'C') => {
+                        if let Some(operation_id) = picker.take_bulk_migration_operation_id() {
+                            picker.set_status(
+                                "Cancelling canonical migration between sessions…".to_owned(),
+                            );
+                            chat.replace_effect(TuiEffect::CancelBulkMigration { operation_id });
+                        } else if let Some(operation_id) =
+                            picker.take_search_backfill_operation_id()
+                        {
+                            picker.set_status("Cancelling derived search backfill…".to_owned());
+                            chat.replace_effect(TuiEffect::CancelSearchIndexing { operation_id });
+                        } else {
+                            picker
+                                .set_status("No active maintenance operation to cancel".to_owned());
+                        }
+                    }
+                    bmux_keyboard::KeyCode::Char('?') => {
+                        picker.set_status(super::session_search::SEARCH_CONTROL_HELP.to_owned());
                     }
                     bmux_keyboard::KeyCode::Up => picker.select_previous(),
                     bmux_keyboard::KeyCode::Down => picker.select_next(),
@@ -2194,6 +2294,109 @@ pub fn apply_effect_result(
         }
         TuiEffectResult::SessionsSearched { result } => {
             loop_state.apply_session_search_result(result);
+        }
+        TuiEffectResult::BulkMigrationUpdated { result } => {
+            if let Some(picker) = loop_state.session_picker.as_mut() {
+                match result {
+                    Ok(status) => {
+                        picker.set_bulk_migration_operation_id(status.operation_id.clone());
+                        picker.set_status(format!(
+                            "Canonical migration {:?}: visited {}, migrated {}, blocked {}, failed {}",
+                            status.state,
+                            status.visited,
+                            status.migrated,
+                            status.blocked,
+                            status.failed
+                        ));
+                        if matches!(
+                            status.state,
+                            bcode_ipc::SessionBulkMigrationState::Running
+                                | bcode_ipc::SessionBulkMigrationState::CancellationRequested
+                        ) {
+                            chat.replace_effect(TuiEffect::WaitBulkMigration {
+                                operation_id: status.operation_id,
+                                after_revision: status.revision,
+                            });
+                        }
+                    }
+                    Err(error) => picker.set_status(format!("Canonical migration failed: {error}")),
+                }
+            }
+        }
+        TuiEffectResult::BulkMigrationWaited { result } => {
+            if let Some(picker) = loop_state.session_picker.as_mut() {
+                match result {
+                    Ok(status) => {
+                        picker.set_bulk_migration_operation_id(status.operation_id.clone());
+                        picker.set_status(format!(
+                            "Canonical migration {:?}: visited {}, migrated {}, blocked {}, failed {}",
+                            status.state,
+                            status.visited,
+                            status.migrated,
+                            status.blocked,
+                            status.failed
+                        ));
+                        if matches!(
+                            status.state,
+                            bcode_ipc::SessionBulkMigrationState::Running
+                                | bcode_ipc::SessionBulkMigrationState::CancellationRequested
+                        ) {
+                            chat.replace_effect(TuiEffect::WaitBulkMigration {
+                                operation_id: status.operation_id,
+                                after_revision: status.revision,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        picker.set_status(format!("Canonical migration wait failed: {error}"));
+                    }
+                }
+            }
+        }
+        TuiEffectResult::SearchIndexingStarted { result } => {
+            if let Some(picker) = loop_state.session_picker.as_mut() {
+                match result {
+                    Ok(started) => {
+                        picker.set_search_backfill_operation_id(started.operation_id.clone());
+                        picker.set_status(format!(
+                            "Derived search backfill started: {}. Press C to cancel",
+                            started.operation_id
+                        ));
+                        chat.replace_effect(TuiEffect::WaitSearchIndexing {
+                            operation_id: started.operation_id,
+                            after_revision: 0,
+                        });
+                    }
+                    Err(error) => picker.set_status(format!("Search backfill failed: {error}")),
+                }
+            }
+        }
+        TuiEffectResult::SearchIndexingUpdated { result }
+        | TuiEffectResult::SearchIndexingWaited { result } => {
+            if let Some(picker) = loop_state.session_picker.as_mut() {
+                match result {
+                    Ok(status) => {
+                        picker.set_search_backfill_operation_id(status.operation_id.clone());
+                        picker.set_status(format!(
+                            "Derived search backfill {:?}: revision {}",
+                            status.state, status.revision
+                        ));
+                        if matches!(
+                            status.state,
+                            bcode_session_search::SessionSearchBackfillOperationState::Running
+                                | bcode_session_search::SessionSearchBackfillOperationState::CancellationRequested
+                        ) {
+                            chat.replace_effect(TuiEffect::WaitSearchIndexing {
+                                operation_id: status.operation_id,
+                                after_revision: status.revision,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        picker.set_status(format!("Search backfill action failed: {error}"));
+                    }
+                }
+            }
         }
         TuiEffectResult::SlashCommandExecuted { message, result } => match result {
             Ok(outcome) => {
@@ -4204,21 +4407,6 @@ pub fn draw_chat_frame<W: Write>(
         );
     }
     Ok(draw_stats)
-}
-
-fn root_session_search_request(query: String) -> bcode_session_search::SessionSearchRequest {
-    bcode_session_search::SessionSearchRequest {
-        query: bcode_session_search::SessionSearchQuery::Text {
-            text: query,
-            mode: bcode_session_search::TextMatchMode::Terms,
-            fields: std::collections::BTreeSet::new(),
-        },
-        filters: bcode_session_search::SessionSearchFilters::default(),
-        sort: bcode_session_search::SessionSearchSort::ProviderRelevance,
-        limit: 20,
-        cursor: None,
-        deadline_ms: Some(5_000),
-    }
 }
 
 fn elapsed_millis(started: Instant) -> u64 {

@@ -1264,6 +1264,8 @@ pub struct FederatedProviderReport {
     pub elapsed_ms: u64,
     pub query_complete: bool,
     pub coverage_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<SearchCursor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub searched_content: Vec<SearchContentKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2565,6 +2567,7 @@ mod tests {
                     elapsed_ms: 1,
                     query_complete: true,
                     coverage_complete: true,
+                    next_cursor: None,
                     searched_content: vec![SearchContentKind::UserMessage],
                     excluded_content: Vec::new(),
                 },

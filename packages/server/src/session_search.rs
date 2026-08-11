@@ -2126,6 +2126,7 @@ pub async fn search_federated_with_policy_and_routes(
                         elapsed_ms,
                         query_complete: response.query_complete,
                         coverage_complete: response.coverage_complete,
+                        next_cursor: response.next_cursor,
                         searched_content: response.searched_content,
                         excluded_content: response.excluded_content,
                     },

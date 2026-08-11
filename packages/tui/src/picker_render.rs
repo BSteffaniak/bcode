@@ -67,8 +67,12 @@ pub fn render_picker_status(
 }
 
 /// Return list area between a picker content row and bottom row.
-pub fn picker_list_area(inner: Rect, list_y: u16, bottom_y: u16) -> Option<Rect> {
-    (bottom_y > list_y).then_some(Rect::new(inner.x, list_y, inner.width, bottom_y - list_y))
+pub const fn picker_list_area(inner: Rect, list_y: u16, bottom_y: u16) -> Option<Rect> {
+    if bottom_y > list_y {
+        Some(Rect::new(inner.x, list_y, inner.width, bottom_y - list_y))
+    } else {
+        None
+    }
 }
 
 /// Render a standard picker panel and return its inner area.
@@ -127,6 +131,15 @@ mod tests {
 
     use super::render_picker_panel;
     use crate::render::TuiTheme;
+
+    #[test]
+    fn picker_list_area_rejects_inverted_bounds_without_underflow() {
+        assert_eq!(super::picker_list_area(Rect::new(2, 2, 20, 4), 4, 3), None);
+        assert_eq!(
+            super::picker_list_area(Rect::new(2, 2, 20, 4), 3, 5),
+            Some(Rect::new(2, 3, 20, 2))
+        );
+    }
 
     #[test]
     fn picker_panel_chrome_tracks_terminal_native_dark_and_light_themes() {

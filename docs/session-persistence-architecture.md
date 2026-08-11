@@ -192,6 +192,29 @@ Health, doctor, diagnosis, catalog, and audit paths remain non-migrating. A norm
 load may migrate only storage classified as known legacy after it acquires exclusive per-session
 maintenance ownership. All other maintenance remains explicit.
 
+## Explicit bounded bulk migration
+
+Bulk canonical migration is a server-owned maintenance workflow layered on the existing per-session
+migration service. `SessionBulkMigrationStart` selects stable bounded catalog pages and either
+inventories compatibility without mutation or, after exact confirmation, starts or joins the
+existing per-session migration operation. The aggregate coordinator never implements a second
+historical decoder or target path: released-format planning, frozen decoding, backup creation,
+normalization, transactional current-target migration, projection rebuild, strict validation, and
+receipts remain owned by `bcode_session_migration` and the policy-free current migration target.
+
+Mutation requires `migrate-supported-sessions`. Each eligible session acquires exclusive maintenance
+ownership before backup or canonical changes. A live owner or maintenance lock is reported as a
+bounded blocker while later sessions continue. Verified backups and migration receipts are durable
+per-session evidence; current canonical classification makes explicit re-invocation idempotent.
+Search providers are not consulted or invoked by canonical migration.
+
+Aggregate operation IDs, revisions, cursors, progress, and outcome samples are bounded daemon-local
+notification state. They define no retention, acknowledgment, replay, or conflict protocol and are
+therefore neither reconnect-safe nor durably resumable. After daemon restart an old aggregate ID is
+unavailable; the user explicitly invokes inventory or migration again. Durable current-session
+classification and receipts determine which sessions still require work. Cancellation is
+cooperative between per-session units and does not roll back a completed session migration.
+
 ## Current runtime and migration boundaries
 
 `bcode_session` owns only the current writer contract, current event model, current projections,

@@ -207,6 +207,48 @@ projections, and unavailable/corrupt canonical DB state classify as repair-requi
 hydration never substitutes another event or returns guessed canonical content. Query-execution
 completeness and corpus-coverage completeness are distinct.
 
+## Compatibility inventory and canonical migration
+
+The daemon exposes a read-only compatibility inventory independent of provider discovery. It scans
+stable bounded catalog pages and classifies sessions as ready, migration-required, owner-blocked,
+temporarily locked, repair-required, format-incompatible, or missing. Portable results include only
+safe known writer/schema facts, typed action and retryability, bounded category totals, and capped
+samples. Envelope inspection is scalar and bounded; released kind/schema classification belongs to
+the migration inventory and unknown future input fails closed. Inventory never decodes complete
+history, repairs projections, writes indexes, or mutates canonical sessions.
+
+Canonical migration and derived backfill are separate explicit workflows. Bulk migration uses exact
+confirmation and the migration domain's backup, receipt, normalization, transactional target, and
+validation path. Search backfill may report migration-required or blocked sessions but cannot start
+canonical migration. Conversely, canonical migration has no provider knowledge. This separation
+keeps disposable provider state outside canonical authority.
+
+## Complete historical backfill coordination
+
+The complete coordinator snapshots enabled provider identities and traverses every selected catalog
+page through bounded per-provider slices. A slice deadline resumes at the first unvisited session;
+it does not skip the rest of a page or become a terminal provider failure. Providers continue after
+another provider/session blocker. Fresh canonical tails and provider checkpoints drive bounded
+convergence when catalog revision changes. Progress and terminal responses retain capped categorized
+issue summaries and use `needs_attention` for completed coordination with blockers, separately from
+coordinator failure.
+
+Provider checkpoints and canonical tails are durable facts used by explicit re-invocation. Aggregate
+operation IDs, revisions, cursors, snapshots, and event envelopes are transient notification state:
+they do not define retention, acknowledgment, replay, or conflict behavior and do not promise
+reconnect-safe or durable resume. After restart, explicitly invoke backfill again; checkpoint-based
+idempotency reconstructs remaining work.
+
+## TUI product flow
+
+`/search`, the command palette, the configurable global-search key, and picker `Ctrl-F` all route to
+host-owned federated search effects. The frontend owns interaction state, bounded rendering, stale
+result suppression, keyboard selection, and canonical hit navigation; query planning, provider
+eligibility, privacy/deep policy, hydration, and coverage semantics remain server-owned. Ordinary
+search excludes scan providers. Deep search is explicit and its high-volume local storage/privacy
+impact must remain visible. Canonical migration inventory/execution and disposable provider backfill
+must be presented as separate confirmed actions.
+
 ## Ingestion and maintenance
 
 Canonical append succeeds or fails independently of search. Only the existing post-commit mutation

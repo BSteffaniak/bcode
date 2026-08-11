@@ -1566,7 +1566,7 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     },
     ReleasedEventVariantDescriptor {
         kind: "execution_session_created",
-        treatment: ReleasedEventTreatment::CurrentEquivalent,
+        treatment: ReleasedEventTreatment::ExplicitConversion,
     },
     ReleasedEventVariantDescriptor {
         kind: "interactive_tool_request_created",
@@ -2370,7 +2370,11 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             explicit,
-            BTreeSet::from(["context_usage_observed", "tool_call_finished"])
+            BTreeSet::from([
+                "context_usage_observed",
+                "execution_session_created",
+                "tool_call_finished",
+            ])
         );
         let retired = RELEASED_EVENT_VARIANTS
             .iter()

@@ -88,11 +88,25 @@ The default session picker also uses:
 | `Ctrl+R` | Rename the selected session |
 | `Ctrl+D` | Delete the selected session |
 
-Transcript search can use `deep:`, `content:<kind>`, and `provider:<id>` query controls when matching search providers are enabled. Search previews remain derived results; opening one hydrates the corresponding canonical session location.
+Transcript search can use discoverable keyboard controls: `M` cycles terms/phrase/prefix/fuzzy/regex,
+`D` toggles ordinary versus explicit deep search, `S` cycles sorting, `N` continues with the next
+provider cursor, and `Up`/`Down` update the bounded preview. `I` inventories canonical
+compatibility, `G` uses two-step confirmation for canonical migration, `B` starts the separate
+derived-provider backfill, and `C` cancels the latest transient maintenance operation.
+
+Optional textual controls include `mode:`, `deep:`, `content:`, `cwd:`, `after:`, `before:`,
+`provider:`, `model:`, `agent:`, `tool:`, `status:`, `field:`, and `sort:`. Press `?` in search for
+the accepted values. Deep mode may scan locally retained compressed shell/tool output; ordinary mode
+excludes those scan providers. Search previews remain derived results; opening one hydrates the
+corresponding canonical session location. Canonical migration and search indexing remain visibly
+separate operations.
 
 ## Command palette and slash commands
 
 `Ctrl+F` opens the command palette in the normal chat scope. Type to filter and press `Enter` to run a command. Plugins can contribute commands and complete TUI surfaces to the same palette.
+
+`Ctrl+G` opens global session search from the normal chat scope by default and is configurable as
+`tui.session.search`. `Ctrl+F` remains the session-picker compatibility search route.
 
 Typing `/` in the composer exposes slash-command completion. Common commands include:
 

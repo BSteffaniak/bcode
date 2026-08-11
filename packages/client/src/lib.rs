@@ -2055,6 +2055,21 @@ impl BcodeClient {
         }
     }
 
+    /// Start explicit bounded indexing across every enabled session-search provider.
+    ///
+    /// The server owns canonical traversal and provider coordination; this client call only starts
+    /// the addressable operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_search_index_all_start(
+        &self,
+        request: bcode_session_search::CompleteSessionSearchBackfillRequest,
+    ) -> Result<bcode_session_search::StartSessionSearchBackfillResponse, ClientError> {
+        self.session_search_complete_backfill_start(request).await
+    }
+
     /// Start an addressable bounded single-provider historical backfill operation.
     ///
     /// # Errors

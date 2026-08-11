@@ -328,6 +328,9 @@ fn decode_for_migration(
         });
     }
     let source_kind = envelope.source_kind_name()?;
+    if source_kind == "execution_session_created" && envelope.schema_version() <= 41 {
+        return historical_event_families::decode_execution_session_created(&envelope);
+    }
     if source_kind == "tool_call_finished" && envelope.schema_version() <= 39 {
         return historical_event_families::decode_tool_call_finished(&envelope);
     }

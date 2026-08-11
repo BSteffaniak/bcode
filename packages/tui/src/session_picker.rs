@@ -37,6 +37,12 @@ pub struct SessionPickerApp {
     search_coverage_complete: bool,
     search_provider_reports: usize,
     search_failures: usize,
+    search_controls: super::session_search::SessionSearchControls,
+    search_cursor: Option<bcode_session_search::SearchCursor>,
+    search_preview: String,
+    migration_confirmation_armed: bool,
+    bulk_migration_operation_id: Option<String>,
+    search_backfill_operation_id: Option<String>,
     mode: SessionPickerMode,
 }
 
@@ -58,6 +64,12 @@ impl SessionPickerApp {
             search_coverage_complete: true,
             search_provider_reports: 0,
             search_failures: 0,
+            search_controls: super::session_search::SessionSearchControls::default(),
+            search_cursor: None,
+            search_preview: String::new(),
+            migration_confirmation_armed: false,
+            bulk_migration_operation_id: None,
+            search_backfill_operation_id: None,
             mode: SessionPickerMode::Filter,
         }
     }
@@ -153,6 +165,8 @@ impl SessionPickerApp {
     /// Enter transcript-search query mode.
     pub fn start_transcript_search(&mut self) {
         self.search_results.clear();
+        self.search_cursor = None;
+        self.search_preview.clear();
         self.mode = SessionPickerMode::TranscriptSearch;
         self.list = FilteredListState::new(0);
         "Type a transcript query, then press Enter".clone_into(&mut self.status);
@@ -170,14 +184,27 @@ impl SessionPickerApp {
         self.search_coverage_complete = response.coverage_complete;
         self.search_provider_reports = response.providers.len();
         self.search_failures = response.failures.len();
+        self.search_cursor = response
+            .providers
+            .iter()
+            .find_map(|provider| provider.next_cursor.clone());
         self.list = FilteredListState::new(self.search_results.len());
         self.mode = SessionPickerMode::TranscriptSearch;
+        self.refresh_search_preview();
+        let completion = if !self.search_query_complete {
+            "query incomplete"
+        } else if !self.search_coverage_complete {
+            "coverage incomplete"
+        } else if self.search_failures > 0 {
+            "provider failures"
+        } else {
+            "complete searchable coverage"
+        };
         self.status = format!(
-            "Transcript results: providers={}, failures={}, query_complete={}, coverage_complete={}",
+            "{} results from {} providers; {completion}; {}. Press ? for details",
+            self.search_results.len(),
             self.search_provider_reports,
-            self.search_failures,
-            self.search_query_complete,
-            self.search_coverage_complete
+            self.search_controls.depth.explanation()
         );
     }
 
@@ -190,9 +217,107 @@ impl SessionPickerApp {
         self.search_results.get(index)
     }
 
+    /// Cycle discoverable match mode.
+    pub fn cycle_search_match_mode(&mut self) {
+        self.search_controls.cycle_match_mode();
+        self.status = format!("Match mode: {:?}", self.search_controls.match_mode);
+    }
+
+    /// Toggle explicit ordinary/deep search intent.
+    pub fn toggle_search_depth(&mut self) {
+        self.search_controls.toggle_depth();
+        self.search_controls
+            .depth
+            .explanation()
+            .clone_into(&mut self.status);
+    }
+
+    /// Cycle deterministic search result ordering.
+    pub fn cycle_search_sort(&mut self) {
+        self.search_controls.cycle_sort();
+        self.status = format!("Sort: {:?}", self.search_controls.sort);
+    }
+
+    /// Build the current bounded search request and explicit provider policy.
+    pub fn search_request(
+        &self,
+        query: &str,
+        continue_page: bool,
+    ) -> Result<
+        (
+            bcode_session_search::SessionSearchRequest,
+            bcode_session_search::SessionSearchPlanPolicy,
+        ),
+        String,
+    > {
+        let parsed =
+            super::session_search::parse_search_input(query, self.search_controls.clone())?;
+        let cursor = continue_page.then(|| self.search_cursor.clone()).flatten();
+        Ok((
+            parsed.controls.request(parsed.query, cursor),
+            parsed.controls.depth.policy(),
+        ))
+    }
+
+    /// Return whether another provider cursor is available.
+    #[must_use]
+    pub const fn has_next_search_page(&self) -> bool {
+        self.search_cursor.is_some()
+    }
+
+    /// Return bounded preview for the selected result.
+    #[must_use]
+    pub fn search_preview(&self) -> &str {
+        &self.search_preview
+    }
+
+    fn refresh_search_preview(&mut self) {
+        self.search_preview = self
+            .selected_search_result()
+            .and_then(|result| result.hit.preview.as_deref())
+            .unwrap_or("No canonical preview available")
+            .chars()
+            .take(512)
+            .collect();
+    }
+
+    /// Arm or consume the explicit two-step canonical migration confirmation.
+    pub const fn confirm_canonical_migration(&mut self) -> bool {
+        if self.migration_confirmation_armed {
+            self.migration_confirmation_armed = false;
+            true
+        } else {
+            self.migration_confirmation_armed = true;
+            false
+        }
+    }
+
+    /// Record the latest transient aggregate canonical migration identity.
+    pub fn set_bulk_migration_operation_id(&mut self, operation_id: String) {
+        self.bulk_migration_operation_id = Some(operation_id);
+    }
+
+    /// Take the latest transient aggregate canonical migration identity for cancellation.
+    pub const fn take_bulk_migration_operation_id(&mut self) -> Option<String> {
+        self.bulk_migration_operation_id.take()
+    }
+
+    /// Record the latest transient aggregate derived backfill identity.
+    pub fn set_search_backfill_operation_id(&mut self, operation_id: String) {
+        self.search_backfill_operation_id = Some(operation_id);
+    }
+
+    /// Take the latest transient aggregate derived backfill identity for cancellation.
+    pub const fn take_search_backfill_operation_id(&mut self) -> Option<String> {
+        self.search_backfill_operation_id.take()
+    }
+
     /// Leave transcript-search results and rebuild local catalog filtering.
     pub fn close_search_results(&mut self) {
         self.search_results.clear();
+        self.search_cursor = None;
+        self.search_preview.clear();
+        self.migration_confirmation_armed = false;
         self.mode = SessionPickerMode::Filter;
         self.list = FilteredListState::new(self.sessions.len());
         self.refresh_filter();
@@ -251,8 +376,12 @@ impl SessionPickerApp {
     }
 
     /// Select a visible row by zero-based index.
-    pub const fn select_visible(&mut self, row: usize) -> bool {
-        self.list.select_visible(row)
+    pub fn select_visible(&mut self, row: usize) -> bool {
+        let selected = self.list.select_visible(row);
+        if selected && self.mode == SessionPickerMode::TranscriptSearch {
+            self.refresh_search_preview();
+        }
+        selected
     }
 
     /// Enter rename mode for the selected session.
@@ -311,11 +440,17 @@ impl SessionPickerApp {
     /// Move selection down.
     pub fn select_next(&mut self) {
         self.list.select_next();
+        if self.mode == SessionPickerMode::TranscriptSearch {
+            self.refresh_search_preview();
+        }
     }
 
     /// Move selection up.
     pub fn select_previous(&mut self) {
         self.list.select_previous();
+        if self.mode == SessionPickerMode::TranscriptSearch {
+            self.refresh_search_preview();
+        }
     }
 }
 
@@ -541,7 +676,7 @@ mod tests {
             .collect::<String>();
         assert!(first_text.contains("Canonical title"));
         assert!(first_text.contains("@99"));
-        assert!(app.status().contains("query_complete=false"));
+        assert!(app.status().contains("query incomplete"));
         assert_eq!(app.selected_search_result(), Some(&first));
         app.select_next();
         assert_eq!(
@@ -551,6 +686,64 @@ mod tests {
         );
         app.close_search_results();
         assert_eq!(app.mode(), SessionPickerMode::Filter);
+    }
+
+    #[test]
+    fn dedicated_search_state_controls_request_preview_and_human_status() {
+        let mut app = SessionPickerApp::new(vec![summary("one", "/one")]);
+        app.start_transcript_search();
+        app.cycle_search_match_mode();
+        app.toggle_search_depth();
+        app.cycle_search_sort();
+        let (request, policy) = app.search_request("needle", false).expect("search request");
+        assert!(matches!(
+            request.query,
+            bcode_session_search::SessionSearchQuery::Text {
+                mode: bcode_session_search::TextMatchMode::Phrase,
+                ..
+            }
+        ));
+        assert_eq!(
+            request.sort,
+            bcode_session_search::SessionSearchSort::NewestFirst
+        );
+        assert_eq!(
+            policy.execution_class,
+            bcode_session_search::SessionSearchExecutionClass::Deep
+        );
+
+        let hit = sample_search_result(bcode_session_search::SearchHitHydrationOutcome::Hydrated);
+        let response = bcode_session_search::FederatedSessionSearchResponse {
+            hits: vec![hit.hit.clone()],
+            query_complete: true,
+            coverage_complete: true,
+            providers: Vec::new(),
+            failures: Vec::new(),
+        };
+        app.set_search_results(&response, vec![hit]);
+        assert!(app.status().contains("complete searchable coverage"));
+        assert!(!app.status().contains("query_complete="));
+        assert!(!app.search_preview().is_empty());
+    }
+
+    #[test]
+    fn maintenance_controls_require_confirmation_and_retain_cancellable_operations() {
+        let mut app = SessionPickerApp::new(Vec::new());
+        assert!(!app.confirm_canonical_migration());
+        assert!(app.confirm_canonical_migration());
+        assert!(!app.confirm_canonical_migration());
+
+        app.set_bulk_migration_operation_id("migration-1".to_owned());
+        app.set_search_backfill_operation_id("backfill-1".to_owned());
+        assert_eq!(
+            app.take_bulk_migration_operation_id().as_deref(),
+            Some("migration-1")
+        );
+        assert!(app.take_bulk_migration_operation_id().is_none());
+        assert_eq!(
+            app.take_search_backfill_operation_id().as_deref(),
+            Some("backfill-1")
+        );
     }
 
     #[test]

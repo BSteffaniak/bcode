@@ -14146,6 +14146,7 @@ mod web_command_tests {
                 elapsed_ms: 1,
                 query_complete: true,
                 coverage_complete: true,
+                next_cursor: None,
                 searched_content: Vec::new(),
                 excluded_content: Vec::new(),
             }],

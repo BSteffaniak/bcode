@@ -471,10 +471,6 @@ pub enum Request {
     ListSessions {
         working_directory: PathBuf,
     },
-    /// Read one bounded non-mutating compatibility inventory page.
-    SessionCompatibilityInventory {
-        request: SessionCompatibilityInventoryRequest,
-    },
     RenameSession {
         session_id: SessionId,
         name: Option<String>,
@@ -1063,6 +1059,10 @@ pub enum Request {
     /// Explicitly backfill selected or bounded catalog sessions into one provider.
     SessionSearchBackfill {
         request: bcode_session_search::BackfillSessionSearchRequest,
+    },
+    /// Read one bounded non-mutating compatibility inventory page.
+    SessionCompatibilityInventory {
+        request: SessionCompatibilityInventoryRequest,
     },
     /// Explicitly inventory or start bounded canonical migration for selected sessions.
     SessionBulkMigrationStart {
@@ -2557,9 +2557,6 @@ pub enum ResponsePayload {
         #[serde(default)]
         catalog_revision: u64,
     },
-    SessionCompatibilityInventory {
-        response: SessionCompatibilityInventoryResponse,
-    },
     SessionRenamed {
         session: SessionSummary,
     },
@@ -3000,6 +2997,9 @@ pub enum ResponsePayload {
     },
     SessionSearchBackfill {
         response: bcode_session_search::SessionSearchBackfillResponse,
+    },
+    SessionCompatibilityInventory {
+        response: SessionCompatibilityInventoryResponse,
     },
     SessionBulkMigrationOperation {
         status: SessionBulkMigrationOperationStatus,
@@ -4608,6 +4608,7 @@ mod tests {
                     elapsed_ms: 2,
                     query_complete: true,
                     coverage_complete: true,
+                    next_cursor: None,
                     searched_content: vec![SearchContentKind::UserMessage],
                     excluded_content: Vec::new(),
                 }],

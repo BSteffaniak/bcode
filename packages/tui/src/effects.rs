@@ -181,6 +181,28 @@ pub enum TuiEffect {
         request: Box<bcode_session_search::SessionSearchRequest>,
         policy: bcode_session_search::SessionSearchPlanPolicy,
     },
+    /// Start compatibility inventory or confirmed canonical migration.
+    StartBulkMigration {
+        request: bcode_ipc::SessionBulkMigrationStartRequest,
+    },
+    /// Cooperatively cancel transient aggregate canonical migration.
+    CancelBulkMigration { operation_id: String },
+    /// Wait for the next transient aggregate canonical migration revision.
+    WaitBulkMigration {
+        operation_id: String,
+        after_revision: u64,
+    },
+    /// Start explicit all-enabled-provider historical backfill.
+    StartSearchIndexing {
+        request: bcode_session_search::CompleteSessionSearchBackfillRequest,
+    },
+    /// Cancel transient aggregate derived-search backfill.
+    CancelSearchIndexing { operation_id: String },
+    /// Wait for the next transient aggregate derived-search backfill revision.
+    WaitSearchIndexing {
+        operation_id: String,
+        after_revision: u64,
+    },
     /// Execute a resolved slash command without terminal navigation.
     ExecuteSlashCommand {
         /// Current session.
@@ -577,6 +599,21 @@ pub enum TuiEffectResult {
             ClientError,
         >,
     },
+    BulkMigrationUpdated {
+        result: Result<bcode_ipc::SessionBulkMigrationOperationStatus, ClientError>,
+    },
+    BulkMigrationWaited {
+        result: Result<bcode_ipc::SessionBulkMigrationOperationStatus, ClientError>,
+    },
+    SearchIndexingStarted {
+        result: Result<bcode_session_search::StartSessionSearchBackfillResponse, ClientError>,
+    },
+    SearchIndexingUpdated {
+        result: Result<bcode_session_search::SessionSearchBackfillOperationStatus, ClientError>,
+    },
+    SearchIndexingWaited {
+        result: Result<bcode_session_search::SessionSearchBackfillOperationStatus, ClientError>,
+    },
     /// Resolved slash command execution completed.
     SlashCommandExecuted {
         /// Submitted command text.
@@ -856,6 +893,11 @@ impl TuiEffectResult {
             | Self::SessionRenamed { .. }
             | Self::SessionDeleted { .. }
             | Self::SessionsSearched { .. }
+            | Self::BulkMigrationUpdated { .. }
+            | Self::BulkMigrationWaited { .. }
+            | Self::SearchIndexingStarted { .. }
+            | Self::SearchIndexingUpdated { .. }
+            | Self::SearchIndexingWaited { .. }
             | Self::SlashCommandExecuted { .. }
             | Self::ThinkingDialogLoaded { .. }
             | Self::TimelineJumpLoaded { .. }
@@ -952,6 +994,8 @@ enum EffectKey {
     RenameSession(SessionId),
     DeleteSession(SessionId),
     SearchSessions,
+    BulkMigration,
+    SearchIndexing,
     SlashCommand,
     RalphAction,
     RalphStart,
@@ -1148,6 +1192,12 @@ impl TuiEffect {
             | Self::RenameSession { .. }
             | Self::DeleteSession { .. }
             | Self::SearchSessions { .. }
+            | Self::StartBulkMigration { .. }
+            | Self::CancelBulkMigration { .. }
+            | Self::WaitBulkMigration { .. }
+            | Self::StartSearchIndexing { .. }
+            | Self::CancelSearchIndexing { .. }
+            | Self::WaitSearchIndexing { .. }
             | Self::ExecuteSlashCommand { .. }
             | Self::RalphAction { .. }
             | Self::RalphStart { .. }
@@ -1211,6 +1261,12 @@ impl TuiEffect {
             | Self::RenameSession { .. }
             | Self::DeleteSession { .. }
             | Self::SearchSessions { .. }
+            | Self::StartBulkMigration { .. }
+            | Self::CancelBulkMigration { .. }
+            | Self::WaitBulkMigration { .. }
+            | Self::StartSearchIndexing { .. }
+            | Self::CancelSearchIndexing { .. }
+            | Self::WaitSearchIndexing { .. }
             | Self::ExecuteSlashCommand { .. }
             | Self::RalphAction { .. }
             | Self::RalphStart { .. }
@@ -1416,6 +1472,12 @@ impl TuiEffect {
             Self::RenameSession { session_id, .. } => EffectKey::RenameSession(*session_id),
             Self::DeleteSession { session_id } => EffectKey::DeleteSession(*session_id),
             Self::SearchSessions { .. } => EffectKey::SearchSessions,
+            Self::StartBulkMigration { .. }
+            | Self::CancelBulkMigration { .. }
+            | Self::WaitBulkMigration { .. } => EffectKey::BulkMigration,
+            Self::StartSearchIndexing { .. }
+            | Self::CancelSearchIndexing { .. }
+            | Self::WaitSearchIndexing { .. } => EffectKey::SearchIndexing,
             Self::ExecuteSlashCommand { .. } => EffectKey::SlashCommand,
             Self::RalphAction { .. } => EffectKey::RalphAction,
             Self::RalphStart { .. } => EffectKey::RalphStart,
@@ -1634,6 +1696,34 @@ impl TuiEffect {
             Self::SearchSessions { request, policy } => TuiEffectResult::SessionsSearched {
                 result: client
                     .session_search(*request, policy, Vec::new(), true)
+                    .await,
+            },
+            Self::StartBulkMigration { request } => TuiEffectResult::BulkMigrationUpdated {
+                result: client.start_session_bulk_migration(request).await,
+            },
+            Self::CancelBulkMigration { operation_id } => TuiEffectResult::BulkMigrationUpdated {
+                result: client.cancel_session_bulk_migration(operation_id).await,
+            },
+            Self::WaitBulkMigration {
+                operation_id,
+                after_revision,
+            } => TuiEffectResult::BulkMigrationWaited {
+                result: client
+                    .wait_session_bulk_migration(operation_id, after_revision, 30_000)
+                    .await,
+            },
+            Self::StartSearchIndexing { request } => TuiEffectResult::SearchIndexingStarted {
+                result: client.session_search_index_all_start(request).await,
+            },
+            Self::CancelSearchIndexing { operation_id } => TuiEffectResult::SearchIndexingUpdated {
+                result: client.session_search_backfill_cancel(operation_id).await,
+            },
+            Self::WaitSearchIndexing {
+                operation_id,
+                after_revision,
+            } => TuiEffectResult::SearchIndexingWaited {
+                result: client
+                    .session_search_backfill_wait(operation_id, after_revision, 30_000)
                     .await,
             },
             Self::ExecuteSlashCommand {
