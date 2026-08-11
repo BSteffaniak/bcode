@@ -15,7 +15,6 @@ tui_sources = "\n".join(
     path.read_text(encoding="utf-8") for path in Path("packages/tui/src").rglob("*.rs")
 )
 cli = Path("packages/cli/src/lib.rs").read_text(encoding="utf-8")
-plugin_surface_host = Path("packages/tui/src/plugin_surface_host.rs").read_text(encoding="utf-8")
 invariants = Path("INVARIANTS.md").read_text(encoding="utf-8")
 
 required = {
@@ -47,9 +46,13 @@ required = {
             for path in Path("packages/tui/src").rglob("*.rs")
             if path.name != "tests.rs"
         ),
-    "plugin surface host must use the explicit embedded server path":
-        "run_embedded_with_static_bundled" in plugin_surface_host
-        and "run_with_static_bundled(" not in plugin_surface_host,
+    # An in-process server must not advertise a discoverable daemon record, or a client targeting a
+    # different artifact could attach to it. `run_with_static_bundled` publishes a record;
+    # `run_embedded_with_static_bundled` is the non-publishing entry point in-process hosts must use.
+    # `bcode_tui` depends on `bcode_server`, so calling the publishing entry point is reachable.
+    # Matching the qualified path avoids colliding with the TUI's own `run_with_static_bundled`.
+    "TUI must not start a record-publishing server":
+        "bcode_server::run_with_static_bundled" not in tui_sources,
     "embedded server path must not publish a daemon record":
         "run_with_static_bundled_inner(endpoint, static_plugins, false).await" in server,
     "historical exact responsive daemons must remain gracefully controllable":
