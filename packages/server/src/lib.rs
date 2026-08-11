@@ -13,6 +13,7 @@ pub(crate) mod context_accounting;
 pub(crate) mod context_compaction;
 mod invariant_guidance;
 mod model_ignores;
+mod request_routing;
 mod runtime_work;
 mod session_bulk_migration;
 mod session_migration_adapter;

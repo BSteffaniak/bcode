@@ -1,0 +1,1539 @@
+//! Type-enforced routing of IPC requests to the dispatcher that owns them.
+//!
+//! `Request` is one flat enum spanning every product area. Dispatchers used to be chained by
+//! fall-through, so a request walked through unrelated dispatchers before reaching its own.
+//! Each dispatcher is an `async fn` whose future stays live for the whole call, so those
+//! unrelated frames accumulated on the stack: one fall-through hop measured 1.24 MiB.
+//!
+//! [`Request::into_routed`] binds a request to its owning domain in a single exhaustive
+//! `match` with no wildcard arm, so adding a `Request` variant fails to compile until it is
+//! placed. Each dispatcher then takes its own domain type and therefore holds no `Request` to
+//! forward, which makes fall-through unrepresentable rather than merely avoided.
+
+// Variant blocks are copied verbatim from `Request`, so the field types here are exactly
+// those the wire enum already names.
+use bcode_ipc::{Request, *};
+use bcode_session_models::{
+    ProjectionWindowRequest, SessionHistoryAroundQuery, SessionHistoryQuery, SessionId,
+    SessionInspectionQuery, SessionOpenOperationId, WorkId,
+};
+use bcode_skill_models::SkillId;
+use std::path::PathBuf;
+
+/// Requests owned by the SessionLifecycle dispatcher (36 variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLifecycleRequest {
+    Hello {
+        client_name: String,
+        runtime_context: Option<ClientRuntimeContext>,
+        daemon_namespace: String,
+        artifact_id: Option<ArtifactId>,
+        build_fingerprint: String,
+    },
+    UpdateClientRuntimeContext {
+        runtime_context: Option<ClientRuntimeContext>,
+    },
+    Ping,
+    /// Submit bounded client-side TUI telemetry to the daemon-owned metrics registry.
+    IngestClientMetrics {
+        /// Validated-at-ingress metric observations.
+        batch: bcode_metrics::ClientMetricBatch,
+    },
+    ServerStatus {
+        /// Client working directory used to scope repository-local status.
+        working_directory: Option<PathBuf>,
+    },
+    /// Inspect effective model catalog and refresh state.
+    ModelCatalogDiagnostics,
+    ServerStop {
+        mode: ServerStopMode,
+    },
+    /// Ask this daemon to release runtime ownership when the session is quiescent.
+    ReleaseSessionOwnership {
+        session_id: SessionId,
+    },
+    SetComposerDraft {
+        scope: ComposerDraftScope,
+        text: String,
+    },
+    ComposerDraft {
+        scope: ComposerDraftScope,
+    },
+    CreateSession {
+        name: Option<String>,
+        working_directory: PathBuf,
+    },
+    ListSessions {
+        working_directory: PathBuf,
+    },
+    SubscribeCatalogUpdates,
+    ChangeSessionWorkingDirectory {
+        session_id: SessionId,
+        working_directory: PathBuf,
+    },
+    ListWorktrees(WorktreeListRequest),
+    CreateWorktree(WorktreeCreateRequest),
+    RemoveWorktree(WorktreeRemoveRequest),
+    RalphStatus(RalphStatusRequest),
+    RunRalphLoop(RalphRunRequest),
+    ApproveRalphRun(RalphApproveRequest),
+    CancelRalphLoop(RalphCancelRequest),
+    ListRalphRuns(Box<RalphListRunsRequest>),
+    ListRalphIterations(Box<RalphListIterationsRequest>),
+    ResumeRalphRun(RalphResumeRequest),
+    RalphRunStatus(RalphRunStatusRequest),
+    RecordRalphLifecycle(RalphLifecycleRequest),
+    RenameSession {
+        session_id: SessionId,
+        name: Option<String>,
+    },
+    DeleteSession {
+        session_id: SessionId,
+    },
+    /// Read a bounded byte range from a generic session artifact reference.
+    ReadSessionArtifact {
+        session_id: SessionId,
+        artifact_id: String,
+        reference_key: String,
+        offset: u64,
+        length: u32,
+    },
+    /// Deliver opaque schema-versioned input to an active invocation.
+    InvocationInput {
+        session_id: SessionId,
+        input: bcode_tool::ToolInvocationInput,
+    },
+    ForkSession {
+        source_session_id: SessionId,
+        prompt_sequence: u64,
+        name: Option<String>,
+    },
+    CloneSession {
+        source_session_id: SessionId,
+        name: Option<String>,
+        /// Require the cloned history snapshot to end at this generation.
+        expected_generation: Option<u64>,
+    },
+    /// Explicit complete-history request for export/debug/history commands only.
+    ///
+    /// This request may force the server to read every canonical event for the session.
+    /// Normal runtime flows must use `SessionHistoryPage`, projection-window requests, or
+    /// typed read-model endpoints instead.
+    SessionHistory {
+        session_id: SessionId,
+    },
+    SessionHistoryPage {
+        session_id: SessionId,
+        query: SessionHistoryQuery,
+    },
+    SessionHistoryAround {
+        session_id: SessionId,
+        query: SessionHistoryAroundQuery,
+    },
+    SessionInspection {
+        session_id: SessionId,
+        query: SessionInspectionQuery,
+    },
+}
+
+/// Requests owned by the SessionSearchAttach dispatcher (18 variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSearchAttachRequest {
+    SessionSearch {
+        request: bcode_session_search::SessionSearchRequest,
+        policy: bcode_session_search::SessionSearchPlanPolicy,
+        routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+        hydrate: bool,
+    },
+    SessionSearchProviders,
+    SessionSearchExplain {
+        request: bcode_session_search::SessionSearchRequest,
+        policy: bcode_session_search::SessionSearchPlanPolicy,
+        routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+    },
+    /// Explicitly purge one provider's derived session-search state.
+    SessionSearchPurge {
+        provider_id: String,
+        confirmation: String,
+    },
+    /// Explicitly recreate one provider's empty derived session-search state.
+    SessionSearchRebuild {
+        provider_id: String,
+        confirmation: String,
+    },
+    /// Start an addressable complete historical backfill operation.
+    SessionSearchCompleteBackfillStart {
+        request: bcode_session_search::CompleteSessionSearchBackfillRequest,
+    },
+    /// Start an addressable bounded single-provider historical backfill operation.
+    SessionSearchBackfillStart {
+        request: bcode_session_search::BackfillSessionSearchRequest,
+    },
+    /// Read bounded state for an addressable historical backfill operation.
+    SessionSearchBackfillStatus {
+        operation_id: String,
+    },
+    /// Wait for a newer revision or timeout for an addressable historical backfill operation.
+    SessionSearchBackfillWait {
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    },
+    /// Request cancellation of an addressable historical backfill operation.
+    SessionSearchBackfillCancel {
+        operation_id: String,
+    },
+    /// Explicitly backfill selected or bounded catalog sessions into one provider.
+    SessionSearchBackfill {
+        request: bcode_session_search::BackfillSessionSearchRequest,
+    },
+    /// Classify a session for open and start or join required legacy migration.
+    PrepareSessionOpen {
+        session_id: SessionId,
+    },
+    /// Wait for a newer session-open operation snapshot or a bounded timeout.
+    WaitSessionOpenProgress {
+        session_id: SessionId,
+        operation_id: SessionOpenOperationId,
+        after_revision: u64,
+        timeout_ms: u64,
+    },
+    AttachSession {
+        session_id: SessionId,
+    },
+    AttachSessionRecent {
+        session_id: SessionId,
+        limit: usize,
+    },
+    AttachSessionProjectionWindow {
+        session_id: SessionId,
+        request: ProjectionWindowRequest,
+    },
+    ImportExternalSession {
+        source_id: String,
+        external_session_id: String,
+        /// Client working directory used when the imported source has no cwd metadata.
+        working_directory: Option<PathBuf>,
+    },
+    RefreshSessionCatalog {
+        working_directory: Option<PathBuf>,
+        sources: Option<Vec<String>>,
+    },
+}
+
+/// Requests owned by the SessionTurn dispatcher (9 variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionTurnRequest {
+    SendUserMessage {
+        session_id: SessionId,
+        text: String,
+    },
+    SendUserMessageWithPlacement {
+        session_id: SessionId,
+        text: String,
+        placement: PromptPlacement,
+    },
+    /// Send an ordinary user message with immutable execution options for its admitted turn.
+    SendUserMessageWithExecution {
+        session_id: SessionId,
+        text: String,
+        placement: PromptPlacement,
+        execution: bcode_session_models::TurnExecutionOptions,
+    },
+    /// Submit an ordinary turn through generic admission metadata.
+    SubmitTurn {
+        session_id: SessionId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    },
+    InvokeSkill {
+        session_id: SessionId,
+        skill_id: SkillId,
+        arguments: String,
+        display_text: String,
+    },
+    /// Invoke a skill with immutable execution options for its admitted turn.
+    InvokeSkillWithExecution {
+        session_id: SessionId,
+        skill_id: SkillId,
+        arguments: String,
+        display_text: String,
+        execution: bcode_session_models::TurnExecutionOptions,
+    },
+    CancelSessionTurn {
+        session_id: SessionId,
+        clear_queue: bool,
+    },
+    CancelRuntimeWork {
+        session_id: SessionId,
+        work_id: WorkId,
+    },
+    /// Apply one already-lowered portable source through a single daemon-owned application operation.
+    ApplyWorkflowSource(ApplyWorkflowSourceRequest),
+}
+
+/// Requests owned by the WorkflowMutation dispatcher (21 variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowMutationRequest {
+    /// Atomically create one logical workflow and its initial mutable draft.
+    CreateAuthoredWorkflow(CreateAuthoredWorkflowRequest),
+    /// Cancel one exact in-flight authored-workflow validation or compilation operation.
+    CancelWorkflowComputation { operation_id: String },
+    /// Explicitly reset an incompatible workflow store after destructive confirmation.
+    ResetIncompatibleWorkflowStore {
+        /// Must equal the documented destructive confirmation token.
+        confirm: String,
+    },
+    /// Apply one atomic semantic edit batch to an exact draft generation.
+    ApplyWorkflowDraftEdits(ApplyWorkflowDraftEditsRequest),
+    /// Replace one exact draft generation.
+    UpdateWorkflowDraft(UpdateWorkflowDraftRequest),
+    /// Publish one exact draft generation, optionally activating it atomically.
+    PublishWorkflowDraft(PublishWorkflowDraftRequest),
+    /// Publish one exact draft and then independently attempt durable run admission.
+    PublishAndStartWorkflow(Box<PublishAndStartWorkflowRequest>),
+    /// Compare-and-set one immutable revision as active.
+    ActivateWorkflowRevision(ActivateWorkflowRevisionRequest),
+    /// Archive or unarchive one logical workflow.
+    SetAuthoredWorkflowArchived(SetAuthoredWorkflowArchivedRequest),
+    /// Discard one exact mutable draft generation.
+    DiscardWorkflowDraft(DiscardWorkflowDraftRequest),
+    /// Fork one exact draft or revision into a new mutable draft.
+    ForkWorkflowDraft(ForkWorkflowDraftRequest),
+    /// Create one revision-bound preset.
+    CreateWorkflowPreset(CreateWorkflowPresetRequest),
+    /// Replace one exact preset generation.
+    UpdateWorkflowPreset(UpdateWorkflowPresetRequest),
+    /// Delete one exact preset generation.
+    DeleteWorkflowPreset(DeleteWorkflowPresetRequest),
+    /// Export one exact immutable authored revision.
+    ExportWorkflowRevision(ExportWorkflowRevisionRequest),
+    /// Preview one portable import without mutation.
+    PreviewWorkflowImport(PreviewWorkflowImportRequest),
+    /// Import one portable bundle as a new logical workflow and draft.
+    ImportWorkflow(ImportWorkflowRequest),
+    /// Import one portable bundle as a new draft in an existing logical workflow.
+    ImportWorkflowDraft(ImportWorkflowDraftRequest),
+    /// Import one portable bundle as the exact next immutable revision of an existing workflow.
+    ImportWorkflowRevision(ImportWorkflowRevisionRequest),
+    /// Resolve and start one immutable authored-workflow revision.
+    StartAuthoredWorkflow(StartAuthoredWorkflowRequest),
+    /// Resolve one exact published package export and start its authored revision.
+    StartWorkflowPackageExport(StartWorkflowPackageExportRequest),
+}
+
+/// Requests owned by the WorkflowAuthoring dispatcher (10 variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowAuthoringRequest {
+    /// List bounded logical authored workflows.
+    ListAuthoredWorkflows {
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
+        limit: usize,
+    },
+    /// Get one logical authored workflow.
+    GetAuthoredWorkflow { workflow_id: String },
+    /// Return one bounded aggregate authored-workflow inspection snapshot.
+    InspectAuthoredWorkflow { workflow_id: String, limit: usize },
+    /// List bounded drafts for one logical workflow.
+    ListWorkflowDrafts {
+        workflow_id: String,
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
+        limit: usize,
+    },
+    /// Get one exact mutable draft.
+    GetWorkflowDraft {
+        workflow_id: String,
+        draft_id: String,
+    },
+    /// List bounded immutable published revisions.
+    ListWorkflowRevisions {
+        workflow_id: String,
+        cursor: Option<bcode_workflow::WorkflowRevisionListCursor>,
+        limit: usize,
+    },
+    /// Get one exact immutable published revision.
+    GetWorkflowRevision { workflow_id: String, revision: u64 },
+    /// Inspect one immutable revision together with current, non-canonical requirement availability.
+    InspectWorkflowRevisionRequirements { workflow_id: String, revision: u64 },
+    /// List bounded revision-bound presets.
+    ListWorkflowPresets {
+        workflow_id: String,
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
+        limit: usize,
+    },
+    /// Get one exact revision-bound preset.
+    GetWorkflowPreset {
+        workflow_id: String,
+        preset_id: String,
+    },
+}
+
+/// Requests owned by the WorkflowDefinition dispatcher (19 variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowDefinitionRequest {
+    /// Return the portable runtime-workflow authoring catalog.
+    WorkflowAuthoringCatalog,
+    /// Read one bounded derived package publication receipt without mutation.
+    GetWorkflowPackagePublication { package_id: String },
+    /// Atomically apply one previously validated package plan as canonical package drafts.
+    ApplyWorkflowPackage(ApplyWorkflowPackageRequest),
+    /// Atomically publish every exact package draft generation.
+    PublishWorkflowPackage(PublishWorkflowPackageRequest),
+    /// Validate and plan one bounded workflow package through the daemon-owned catalog.
+    ValidateWorkflowPackage(WorkflowPackageComputationRequest),
+    /// Compile-preview one complete package plan through the daemon-owned catalog.
+    PreviewWorkflowPackage(WorkflowPackagePreviewRequest),
+    /// Validate and lower one raw workflow source through the daemon-owned catalog.
+    ValidateWorkflowSource(WorkflowSourceComputationRequest),
+    /// Lower and compile-preview one raw workflow source through the daemon-owned catalog.
+    PreviewWorkflowSource(WorkflowSourcePreviewRequest),
+    /// Validate one portable workflow authoring document without mutation.
+    ValidateWorkflowAuthoring {
+        document: bcode_workflow::WorkflowAuthoringDocument,
+        control: WorkflowComputationControl,
+    },
+    /// Compile and preview one authored workflow without mutation or dispatch.
+    PreviewWorkflowCompilation {
+        document: bcode_workflow::WorkflowAuthoringDocument,
+        configuration: Option<serde_json::Value>,
+        control: WorkflowComputationControl,
+    },
+    /// List bounded plugin-owned workflow templates and requirement diagnostics.
+    ListWorkflowTemplates { limit: usize },
+    /// Describe one exact loaded plugin-owned workflow template.
+    DescribeWorkflowTemplate {
+        owner_plugin_id: String,
+        template_id: String,
+        template_version: u32,
+    },
+    /// Instantiate one external standard authoring-document template as a mutable draft.
+    InstantiateWorkflowTemplate(WorkflowTemplateInstantiationRequest),
+    /// Register and start one exact loaded template with validated configuration.
+    StartWorkflowTemplate(WorkflowTemplateStartRequest),
+    /// Register one immutable, structurally validated workflow definition.
+    RegisterWorkflowDefinition(WorkflowDefinitionRegistrationRequest),
+    /// Register an exact definition and start its bound durable run through one retry-safe request.
+    StartWorkflow(WorkflowStartRequest),
+    /// Start one durable workflow from an existing exact definition.
+    StartWorkflowRun(WorkflowRunStartRequest),
+    /// List bounded, checksum-verified durable workflow definitions.
+    ListWorkflowDefinitions { limit: usize },
+    /// Describe one exact durable workflow definition version.
+    DescribeWorkflowDefinition { definition_id: String, version: u32 },
+}
+
+/// Requests owned by the RuntimeAndModel dispatcher (31 variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeAndModelRequest {
+    /// Return one bounded aggregate workflow inspection snapshot.
+    InspectWorkflowRun {
+        run_id: String,
+        limit: usize,
+    },
+    /// Return one bounded durable workflow run summary.
+    WorkflowRunStatus {
+        run_id: String,
+    },
+    /// Return the newest run for one exact generic binding key.
+    AssociatedWorkflowRun {
+        key: WorkflowRunBindingLookup,
+    },
+    /// Inspect the newest run for one exact generic binding key.
+    InspectAssociatedWorkflowRun {
+        key: WorkflowRunBindingLookup,
+        limit: usize,
+    },
+    /// Apply one lifecycle transition to the newest run for one exact binding key.
+    ControlAssociatedWorkflowRun {
+        key: WorkflowRunBindingLookup,
+        action: WorkflowRunControlAction,
+    },
+    /// List bounded durable workflow run summaries.
+    ListWorkflowRuns {
+        limit: usize,
+    },
+    /// Request durable cancellation of one workflow run.
+    CancelWorkflowRun {
+        run_id: String,
+    },
+    /// Pause one running workflow before further scheduler admission.
+    PauseWorkflowRun {
+        run_id: String,
+    },
+    /// Resume one paused workflow for subsequent scheduler admission.
+    ResumeWorkflowRun {
+        run_id: String,
+    },
+    /// Run one bounded non-mutating workflow doctor inspection.
+    DoctorWorkflowRun {
+        run_id: String,
+        limit: usize,
+    },
+    /// Apply one explicit typed resolution to a repair-required attempt.
+    RepairWorkflowAttempt {
+        dispatch_identity: String,
+        resolution: bcode_workflow_store::RepairResolution,
+    },
+    /// Explicitly retry one exact latest failed workflow node attempt.
+    RetryWorkflowNode {
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        failed_attempt: u32,
+    },
+    /// List bounded durable input/approval waits for one workflow run.
+    ListWorkflowWaits {
+        run_id: String,
+        limit: usize,
+    },
+    /// Resolve one exact durable input wait with schema-validated JSON.
+    ProvideWorkflowInput {
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        value: serde_json::Value,
+    },
+    /// Resolve one exact durable approval wait.
+    ResolveWorkflowApproval {
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        approved: bool,
+    },
+    /// List bounded pending durable mutation approvals for one workflow run.
+    ListWorkflowMutationApprovals {
+        run_id: String,
+        limit: usize,
+    },
+    /// Resolve one exact durable mutation approval by stable approval identity.
+    ResolveWorkflowMutationApproval {
+        approval_id: String,
+        decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
+    },
+    /// Return one bounded page of durable workflow attempts.
+    WorkflowAttemptHistory {
+        run_id: String,
+        cursor: Option<bcode_workflow_store::AttemptCursor>,
+        limit: usize,
+    },
+    /// Return one bounded page of durable workflow events.
+    WorkflowEventHistory {
+        run_id: String,
+        after_sequence: Option<u64>,
+        limit: usize,
+    },
+    ListRuntimeWork {
+        session_id: SessionId,
+    },
+    RuntimeWorkHistory {
+        session_id: SessionId,
+        limit: usize,
+    },
+    SubscribeRuntimeWork {
+        session_id: SessionId,
+    },
+    CompactSession {
+        session_id: SessionId,
+    },
+    SetSessionModel {
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+    },
+    SetSessionReasoning {
+        session_id: SessionId,
+        effort: Option<String>,
+        summary: Option<String>,
+    },
+    /// Append one durable, presentation-only note at the current session sequence.
+    AppendPresentationNote {
+        session_id: SessionId,
+        source_id: String,
+        note_id: String,
+        text: String,
+        format: bcode_command::CommandTextFormat,
+    },
+    SessionModelStatus {
+        session_id: SessionId,
+    },
+    DefaultModelStatus,
+    SessionModelList {
+        provider_plugin_id: Option<String>,
+    },
+    /// List portable auth-pool status.
+    AuthPoolList,
+    /// Persist or clear an interactive preferred auth-pool profile.
+    SetAuthPoolPreference {
+        pool: String,
+        profile: Option<String>,
+    },
+}
+
+/// Requests owned by the PermissionInteraction dispatcher (5 variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionInteractionRequest {
+    ListPermissions,
+    ResolvePermission {
+        permission_id: String,
+        approved: bool,
+        remember: bool,
+    },
+    /// Resolve every currently pending checkpoint in one exact authorization batch.
+    ResolvePermissionBatch {
+        batch_id: String,
+        approved: bool,
+    },
+    ListPendingToolExchanges,
+    ResolveToolExchange {
+        exchange_id: String,
+        resolution_json: serde_json::Value,
+    },
+}
+
+/// Requests owned by the AgentSkillPlugin dispatcher (14 variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSkillPluginRequest {
+    ListAgents,
+    ListSkills,
+    DescribeSkill {
+        skill_id: SkillId,
+    },
+    ActivateSkill {
+        session_id: SessionId,
+        skill_id: SkillId,
+    },
+    DeactivateSkill {
+        session_id: SessionId,
+        skill_id: SkillId,
+    },
+    ActiveSkills {
+        session_id: SessionId,
+    },
+    AgentPolicyStatus,
+    SetSessionAgent {
+        session_id: SessionId,
+        agent_id: String,
+    },
+    AddPermissionRule {
+        agent_id: String,
+        category: String,
+        pattern: String,
+        action: String,
+    },
+    ListPluginServices,
+    ListPluginContributions,
+    InvokePluginService {
+        plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    },
+    CallPluginService {
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    },
+    PublishPluginEvent {
+        topic: String,
+        payload: Vec<u8>,
+    },
+}
+
+/// A request bound to the domain that owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutedRequest {
+    SessionLifecycle(SessionLifecycleRequest),
+    SessionSearchAttach(SessionSearchAttachRequest),
+    SessionTurn(SessionTurnRequest),
+    WorkflowMutation(Box<WorkflowMutationRequest>),
+    WorkflowAuthoring(WorkflowAuthoringRequest),
+    WorkflowDefinition(Box<WorkflowDefinitionRequest>),
+    RuntimeAndModel(Box<RuntimeAndModelRequest>),
+    PermissionInteraction(PermissionInteractionRequest),
+    AgentSkillPlugin(AgentSkillPluginRequest),
+}
+
+impl RoutedRequest {
+    /// Bind a request to the domain that owns it.
+    ///
+    /// This `match` deliberately has no wildcard arm: a new `Request` variant fails to
+    /// compile until it is assigned a domain, which is what prevents a variant from
+    /// silently falling back to the shared dispatch chain again.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn from_request(request: Request) -> Self {
+        match request {
+            Request::Hello {
+                client_name,
+                runtime_context,
+                daemon_namespace,
+                artifact_id,
+                build_fingerprint,
+            } => Self::SessionLifecycle(SessionLifecycleRequest::Hello {
+                client_name,
+                runtime_context,
+                daemon_namespace,
+                artifact_id,
+                build_fingerprint,
+            }),
+            Request::Ping => Self::SessionLifecycle(SessionLifecycleRequest::Ping),
+            Request::ServerStatus { working_directory } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ServerStatus { working_directory })
+            }
+            Request::ServerStop { mode } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ServerStop { mode })
+            }
+            Request::CreateSession {
+                name,
+                working_directory,
+            } => Self::SessionLifecycle(SessionLifecycleRequest::CreateSession {
+                name,
+                working_directory,
+            }),
+            Request::ListSessions { working_directory } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ListSessions { working_directory })
+            }
+            Request::RenameSession { session_id, name } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::RenameSession { session_id, name })
+            }
+            Request::DeleteSession { session_id } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::DeleteSession { session_id })
+            }
+            Request::SessionHistory { session_id } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::SessionHistory { session_id })
+            }
+            Request::SessionHistoryPage { session_id, query } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::SessionHistoryPage {
+                    session_id,
+                    query,
+                })
+            }
+            Request::AttachSession { session_id } => {
+                Self::SessionSearchAttach(SessionSearchAttachRequest::AttachSession { session_id })
+            }
+            Request::AttachSessionRecent { session_id, limit } => {
+                Self::SessionSearchAttach(SessionSearchAttachRequest::AttachSessionRecent {
+                    session_id,
+                    limit,
+                })
+            }
+            Request::SendUserMessage { session_id, text } => {
+                Self::SessionTurn(SessionTurnRequest::SendUserMessage { session_id, text })
+            }
+            Request::SendUserMessageWithPlacement {
+                session_id,
+                text,
+                placement,
+            } => Self::SessionTurn(SessionTurnRequest::SendUserMessageWithPlacement {
+                session_id,
+                text,
+                placement,
+            }),
+            Request::SendUserMessageWithExecution {
+                session_id,
+                text,
+                placement,
+                execution,
+            } => Self::SessionTurn(SessionTurnRequest::SendUserMessageWithExecution {
+                session_id,
+                text,
+                placement,
+                execution,
+            }),
+            Request::SubmitTurn {
+                session_id,
+                text,
+                admission,
+            } => Self::SessionTurn(SessionTurnRequest::SubmitTurn {
+                session_id,
+                text,
+                admission,
+            }),
+            Request::InvokeSkill {
+                session_id,
+                skill_id,
+                arguments,
+                display_text,
+            } => Self::SessionTurn(SessionTurnRequest::InvokeSkill {
+                session_id,
+                skill_id,
+                arguments,
+                display_text,
+            }),
+            Request::InvokeSkillWithExecution {
+                session_id,
+                skill_id,
+                arguments,
+                display_text,
+                execution,
+            } => Self::SessionTurn(SessionTurnRequest::InvokeSkillWithExecution {
+                session_id,
+                skill_id,
+                arguments,
+                display_text,
+                execution,
+            }),
+            Request::CancelSessionTurn {
+                session_id,
+                clear_queue,
+            } => Self::SessionTurn(SessionTurnRequest::CancelSessionTurn {
+                session_id,
+                clear_queue,
+            }),
+            Request::CancelRuntimeWork {
+                session_id,
+                work_id,
+            } => Self::SessionTurn(SessionTurnRequest::CancelRuntimeWork {
+                session_id,
+                work_id,
+            }),
+            Request::CreateAuthoredWorkflow(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::CreateAuthoredWorkflow(payload),
+            )),
+            Request::ApplyWorkflowSource(payload) => {
+                Self::SessionTurn(SessionTurnRequest::ApplyWorkflowSource(payload))
+            }
+            Request::CancelWorkflowComputation { operation_id } => Self::WorkflowMutation(
+                Box::new(WorkflowMutationRequest::CancelWorkflowComputation { operation_id }),
+            ),
+            Request::ResetIncompatibleWorkflowStore { confirm } => Self::WorkflowMutation(
+                Box::new(WorkflowMutationRequest::ResetIncompatibleWorkflowStore { confirm }),
+            ),
+            Request::ApplyWorkflowDraftEdits(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::ApplyWorkflowDraftEdits(payload),
+            )),
+            Request::UpdateWorkflowDraft(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::UpdateWorkflowDraft(payload),
+            )),
+            Request::PublishWorkflowDraft(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::PublishWorkflowDraft(payload),
+            )),
+            Request::PublishAndStartWorkflow(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::PublishAndStartWorkflow(payload),
+            )),
+            Request::ActivateWorkflowRevision(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::ActivateWorkflowRevision(payload),
+            )),
+            Request::SetAuthoredWorkflowArchived(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::SetAuthoredWorkflowArchived(payload),
+            )),
+            Request::DiscardWorkflowDraft(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::DiscardWorkflowDraft(payload),
+            )),
+            Request::ForkWorkflowDraft(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::ForkWorkflowDraft(payload),
+            )),
+            Request::CreateWorkflowPreset(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::CreateWorkflowPreset(payload),
+            )),
+            Request::UpdateWorkflowPreset(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::UpdateWorkflowPreset(payload),
+            )),
+            Request::DeleteWorkflowPreset(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::DeleteWorkflowPreset(payload),
+            )),
+            Request::ExportWorkflowRevision(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::ExportWorkflowRevision(payload),
+            )),
+            Request::PreviewWorkflowImport(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::PreviewWorkflowImport(payload),
+            )),
+            Request::ImportWorkflow(payload) => {
+                Self::WorkflowMutation(Box::new(WorkflowMutationRequest::ImportWorkflow(payload)))
+            }
+            Request::ImportWorkflowDraft(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::ImportWorkflowDraft(payload),
+            )),
+            Request::ImportWorkflowRevision(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::ImportWorkflowRevision(payload),
+            )),
+            Request::StartAuthoredWorkflow(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::StartAuthoredWorkflow(payload),
+            )),
+            Request::StartWorkflowPackageExport(payload) => Self::WorkflowMutation(Box::new(
+                WorkflowMutationRequest::StartWorkflowPackageExport(payload),
+            )),
+            Request::ListAuthoredWorkflows { cursor, limit } => {
+                Self::WorkflowAuthoring(WorkflowAuthoringRequest::ListAuthoredWorkflows {
+                    cursor,
+                    limit,
+                })
+            }
+            Request::GetAuthoredWorkflow { workflow_id } => {
+                Self::WorkflowAuthoring(WorkflowAuthoringRequest::GetAuthoredWorkflow {
+                    workflow_id,
+                })
+            }
+            Request::InspectAuthoredWorkflow { workflow_id, limit } => {
+                Self::WorkflowAuthoring(WorkflowAuthoringRequest::InspectAuthoredWorkflow {
+                    workflow_id,
+                    limit,
+                })
+            }
+            Request::ListWorkflowDrafts {
+                workflow_id,
+                cursor,
+                limit,
+            } => Self::WorkflowAuthoring(WorkflowAuthoringRequest::ListWorkflowDrafts {
+                workflow_id,
+                cursor,
+                limit,
+            }),
+            Request::GetWorkflowDraft {
+                workflow_id,
+                draft_id,
+            } => Self::WorkflowAuthoring(WorkflowAuthoringRequest::GetWorkflowDraft {
+                workflow_id,
+                draft_id,
+            }),
+            Request::ListWorkflowRevisions {
+                workflow_id,
+                cursor,
+                limit,
+            } => Self::WorkflowAuthoring(WorkflowAuthoringRequest::ListWorkflowRevisions {
+                workflow_id,
+                cursor,
+                limit,
+            }),
+            Request::GetWorkflowRevision {
+                workflow_id,
+                revision,
+            } => Self::WorkflowAuthoring(WorkflowAuthoringRequest::GetWorkflowRevision {
+                workflow_id,
+                revision,
+            }),
+            Request::InspectWorkflowRevisionRequirements {
+                workflow_id,
+                revision,
+            } => Self::WorkflowAuthoring(
+                WorkflowAuthoringRequest::InspectWorkflowRevisionRequirements {
+                    workflow_id,
+                    revision,
+                },
+            ),
+            Request::ListWorkflowPresets {
+                workflow_id,
+                cursor,
+                limit,
+            } => Self::WorkflowAuthoring(WorkflowAuthoringRequest::ListWorkflowPresets {
+                workflow_id,
+                cursor,
+                limit,
+            }),
+            Request::GetWorkflowPreset {
+                workflow_id,
+                preset_id,
+            } => Self::WorkflowAuthoring(WorkflowAuthoringRequest::GetWorkflowPreset {
+                workflow_id,
+                preset_id,
+            }),
+            Request::WorkflowAuthoringCatalog => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::WorkflowAuthoringCatalog,
+            )),
+            Request::GetWorkflowPackagePublication { package_id } => Self::WorkflowDefinition(
+                Box::new(WorkflowDefinitionRequest::GetWorkflowPackagePublication { package_id }),
+            ),
+            Request::ApplyWorkflowPackage(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::ApplyWorkflowPackage(payload),
+            )),
+            Request::PublishWorkflowPackage(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::PublishWorkflowPackage(payload),
+            )),
+            Request::ValidateWorkflowPackage(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::ValidateWorkflowPackage(payload),
+            )),
+            Request::PreviewWorkflowPackage(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::PreviewWorkflowPackage(payload),
+            )),
+            Request::ValidateWorkflowSource(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::ValidateWorkflowSource(payload),
+            )),
+            Request::PreviewWorkflowSource(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::PreviewWorkflowSource(payload),
+            )),
+            Request::ValidateWorkflowAuthoring { document, control } => {
+                Self::WorkflowDefinition(Box::new(
+                    WorkflowDefinitionRequest::ValidateWorkflowAuthoring { document, control },
+                ))
+            }
+            Request::PreviewWorkflowCompilation {
+                document,
+                configuration,
+                control,
+            } => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::PreviewWorkflowCompilation {
+                    document,
+                    configuration,
+                    control,
+                },
+            )),
+            Request::ListWorkflowTemplates { limit } => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::ListWorkflowTemplates { limit },
+            )),
+            Request::DescribeWorkflowTemplate {
+                owner_plugin_id,
+                template_id,
+                template_version,
+            } => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::DescribeWorkflowTemplate {
+                    owner_plugin_id,
+                    template_id,
+                    template_version,
+                },
+            )),
+            Request::InstantiateWorkflowTemplate(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::InstantiateWorkflowTemplate(payload),
+            )),
+            Request::StartWorkflowTemplate(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::StartWorkflowTemplate(payload),
+            )),
+            Request::RegisterWorkflowDefinition(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::RegisterWorkflowDefinition(payload),
+            )),
+            Request::StartWorkflow(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::StartWorkflow(payload),
+            )),
+            Request::StartWorkflowRun(payload) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::StartWorkflowRun(payload),
+            )),
+            Request::ListWorkflowDefinitions { limit } => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::ListWorkflowDefinitions { limit },
+            )),
+            Request::DescribeWorkflowDefinition {
+                definition_id,
+                version,
+            } => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::DescribeWorkflowDefinition {
+                    definition_id,
+                    version,
+                },
+            )),
+            Request::InspectWorkflowRun { run_id, limit } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::InspectWorkflowRun {
+                    run_id,
+                    limit,
+                }))
+            }
+            Request::WorkflowRunStatus { run_id } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowRunStatus {
+                    run_id,
+                }))
+            }
+            Request::AssociatedWorkflowRun { key } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::AssociatedWorkflowRun {
+                    key,
+                }))
+            }
+            Request::InspectAssociatedWorkflowRun { key, limit } => Self::RuntimeAndModel(
+                Box::new(RuntimeAndModelRequest::InspectAssociatedWorkflowRun { key, limit }),
+            ),
+            Request::ControlAssociatedWorkflowRun { key, action } => Self::RuntimeAndModel(
+                Box::new(RuntimeAndModelRequest::ControlAssociatedWorkflowRun { key, action }),
+            ),
+            Request::ListWorkflowRuns { limit } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ListWorkflowRuns { limit }))
+            }
+            Request::DoctorWorkflowRun { run_id, limit } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::DoctorWorkflowRun {
+                    run_id,
+                    limit,
+                }))
+            }
+            Request::RepairWorkflowAttempt {
+                dispatch_identity,
+                resolution,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::RepairWorkflowAttempt {
+                dispatch_identity,
+                resolution,
+            })),
+            Request::RetryWorkflowNode {
+                run_id,
+                node_id,
+                activation_id,
+                failed_attempt,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::RetryWorkflowNode {
+                run_id,
+                node_id,
+                activation_id,
+                failed_attempt,
+            })),
+            Request::CancelWorkflowRun { run_id } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::CancelWorkflowRun {
+                    run_id,
+                }))
+            }
+            Request::PauseWorkflowRun { run_id } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::PauseWorkflowRun {
+                    run_id,
+                }))
+            }
+            Request::ResumeWorkflowRun { run_id } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ResumeWorkflowRun {
+                    run_id,
+                }))
+            }
+            Request::ListWorkflowWaits { run_id, limit } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ListWorkflowWaits {
+                    run_id,
+                    limit,
+                }))
+            }
+            Request::ProvideWorkflowInput {
+                run_id,
+                node_id,
+                activation_id,
+                value,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ProvideWorkflowInput {
+                run_id,
+                node_id,
+                activation_id,
+                value,
+            })),
+            Request::ResolveWorkflowApproval {
+                run_id,
+                node_id,
+                activation_id,
+                approved,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ResolveWorkflowApproval {
+                run_id,
+                node_id,
+                activation_id,
+                approved,
+            })),
+            Request::ListWorkflowMutationApprovals { run_id, limit } => Self::RuntimeAndModel(
+                Box::new(RuntimeAndModelRequest::ListWorkflowMutationApprovals { run_id, limit }),
+            ),
+            Request::ResolveWorkflowMutationApproval {
+                approval_id,
+                decision,
+            } => Self::RuntimeAndModel(Box::new(
+                RuntimeAndModelRequest::ResolveWorkflowMutationApproval {
+                    approval_id,
+                    decision,
+                },
+            )),
+            Request::WorkflowAttemptHistory {
+                run_id,
+                cursor,
+                limit,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowAttemptHistory {
+                run_id,
+                cursor,
+                limit,
+            })),
+            Request::WorkflowEventHistory {
+                run_id,
+                after_sequence,
+                limit,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowEventHistory {
+                run_id,
+                after_sequence,
+                limit,
+            })),
+            Request::CompactSession { session_id } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::CompactSession {
+                    session_id,
+                }))
+            }
+            Request::SetSessionModel {
+                session_id,
+                provider_plugin_id,
+                model_id,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SetSessionModel {
+                session_id,
+                provider_plugin_id,
+                model_id,
+            })),
+            Request::SetSessionReasoning {
+                session_id,
+                effort,
+                summary,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SetSessionReasoning {
+                session_id,
+                effort,
+                summary,
+            })),
+            Request::SessionModelStatus { session_id } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SessionModelStatus {
+                    session_id,
+                }))
+            }
+            Request::DefaultModelStatus => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::DefaultModelStatus))
+            }
+            Request::SessionModelList { provider_plugin_id } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SessionModelList {
+                    provider_plugin_id,
+                }))
+            }
+            Request::ListAgents => Self::AgentSkillPlugin(AgentSkillPluginRequest::ListAgents),
+            Request::ListSkills => Self::AgentSkillPlugin(AgentSkillPluginRequest::ListSkills),
+            Request::DescribeSkill { skill_id } => {
+                Self::AgentSkillPlugin(AgentSkillPluginRequest::DescribeSkill { skill_id })
+            }
+            Request::ActivateSkill {
+                session_id,
+                skill_id,
+            } => Self::AgentSkillPlugin(AgentSkillPluginRequest::ActivateSkill {
+                session_id,
+                skill_id,
+            }),
+            Request::DeactivateSkill {
+                session_id,
+                skill_id,
+            } => Self::AgentSkillPlugin(AgentSkillPluginRequest::DeactivateSkill {
+                session_id,
+                skill_id,
+            }),
+            Request::ActiveSkills { session_id } => {
+                Self::AgentSkillPlugin(AgentSkillPluginRequest::ActiveSkills { session_id })
+            }
+            Request::AgentPolicyStatus => {
+                Self::AgentSkillPlugin(AgentSkillPluginRequest::AgentPolicyStatus)
+            }
+            Request::SetSessionAgent {
+                session_id,
+                agent_id,
+            } => Self::AgentSkillPlugin(AgentSkillPluginRequest::SetSessionAgent {
+                session_id,
+                agent_id,
+            }),
+            Request::SessionHistoryAround { session_id, query } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::SessionHistoryAround {
+                    session_id,
+                    query,
+                })
+            }
+            Request::ListPermissions => {
+                Self::PermissionInteraction(PermissionInteractionRequest::ListPermissions)
+            }
+            Request::ResolvePermission {
+                permission_id,
+                approved,
+                remember,
+            } => Self::PermissionInteraction(PermissionInteractionRequest::ResolvePermission {
+                permission_id,
+                approved,
+                remember,
+            }),
+            Request::AddPermissionRule {
+                agent_id,
+                category,
+                pattern,
+                action,
+            } => Self::AgentSkillPlugin(AgentSkillPluginRequest::AddPermissionRule {
+                agent_id,
+                category,
+                pattern,
+                action,
+            }),
+            Request::ListPluginServices => {
+                Self::AgentSkillPlugin(AgentSkillPluginRequest::ListPluginServices)
+            }
+            Request::ListPluginContributions => {
+                Self::AgentSkillPlugin(AgentSkillPluginRequest::ListPluginContributions)
+            }
+            Request::InvokePluginService {
+                plugin_id,
+                interface_id,
+                operation,
+                payload,
+            } => Self::AgentSkillPlugin(AgentSkillPluginRequest::InvokePluginService {
+                plugin_id,
+                interface_id,
+                operation,
+                payload,
+            }),
+            Request::CallPluginService {
+                interface_id,
+                operation,
+                payload,
+            } => Self::AgentSkillPlugin(AgentSkillPluginRequest::CallPluginService {
+                interface_id,
+                operation,
+                payload,
+            }),
+            Request::PublishPluginEvent { topic, payload } => {
+                Self::AgentSkillPlugin(AgentSkillPluginRequest::PublishPluginEvent {
+                    topic,
+                    payload,
+                })
+            }
+            Request::UpdateClientRuntimeContext { runtime_context } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::UpdateClientRuntimeContext {
+                    runtime_context,
+                })
+            }
+            Request::ChangeSessionWorkingDirectory {
+                session_id,
+                working_directory,
+            } => Self::SessionLifecycle(SessionLifecycleRequest::ChangeSessionWorkingDirectory {
+                session_id,
+                working_directory,
+            }),
+            Request::ListWorktrees(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ListWorktrees(payload))
+            }
+            Request::CreateWorktree(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::CreateWorktree(payload))
+            }
+            Request::RemoveWorktree(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::RemoveWorktree(payload))
+            }
+            Request::RalphStatus(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::RalphStatus(payload))
+            }
+            Request::RunRalphLoop(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::RunRalphLoop(payload))
+            }
+            Request::CancelRalphLoop(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::CancelRalphLoop(payload))
+            }
+            Request::ListRalphRuns(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ListRalphRuns(payload))
+            }
+            Request::ListRalphIterations(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ListRalphIterations(payload))
+            }
+            Request::ResumeRalphRun(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ResumeRalphRun(payload))
+            }
+            Request::ApproveRalphRun(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ApproveRalphRun(payload))
+            }
+            Request::RalphRunStatus(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::RalphRunStatus(payload))
+            }
+            Request::RecordRalphLifecycle(payload) => {
+                Self::SessionLifecycle(SessionLifecycleRequest::RecordRalphLifecycle(payload))
+            }
+            Request::PrepareSessionOpen { session_id } => {
+                Self::SessionSearchAttach(SessionSearchAttachRequest::PrepareSessionOpen {
+                    session_id,
+                })
+            }
+            Request::WaitSessionOpenProgress {
+                session_id,
+                operation_id,
+                after_revision,
+                timeout_ms,
+            } => Self::SessionSearchAttach(SessionSearchAttachRequest::WaitSessionOpenProgress {
+                session_id,
+                operation_id,
+                after_revision,
+                timeout_ms,
+            }),
+            Request::ImportExternalSession {
+                source_id,
+                external_session_id,
+                working_directory,
+            } => Self::SessionSearchAttach(SessionSearchAttachRequest::ImportExternalSession {
+                source_id,
+                external_session_id,
+                working_directory,
+            }),
+            Request::ForkSession {
+                source_session_id,
+                prompt_sequence,
+                name,
+            } => Self::SessionLifecycle(SessionLifecycleRequest::ForkSession {
+                source_session_id,
+                prompt_sequence,
+                name,
+            }),
+            Request::CloneSession {
+                source_session_id,
+                name,
+                expected_generation,
+            } => Self::SessionLifecycle(SessionLifecycleRequest::CloneSession {
+                source_session_id,
+                name,
+                expected_generation,
+            }),
+            Request::RefreshSessionCatalog {
+                working_directory,
+                sources,
+            } => Self::SessionSearchAttach(SessionSearchAttachRequest::RefreshSessionCatalog {
+                working_directory,
+                sources,
+            }),
+            Request::ListRuntimeWork { session_id } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ListRuntimeWork {
+                    session_id,
+                }))
+            }
+            Request::RuntimeWorkHistory { session_id, limit } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::RuntimeWorkHistory {
+                    session_id,
+                    limit,
+                }))
+            }
+            Request::SubscribeRuntimeWork { session_id } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SubscribeRuntimeWork {
+                    session_id,
+                }))
+            }
+            Request::SubscribeCatalogUpdates => {
+                Self::SessionLifecycle(SessionLifecycleRequest::SubscribeCatalogUpdates)
+            }
+            Request::AttachSessionProjectionWindow {
+                session_id,
+                request,
+            } => Self::SessionSearchAttach(
+                SessionSearchAttachRequest::AttachSessionProjectionWindow {
+                    session_id,
+                    request,
+                },
+            ),
+            Request::SetComposerDraft { scope, text } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::SetComposerDraft { scope, text })
+            }
+            Request::ComposerDraft { scope } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ComposerDraft { scope })
+            }
+            Request::ListPendingToolExchanges => {
+                Self::PermissionInteraction(PermissionInteractionRequest::ListPendingToolExchanges)
+            }
+            Request::ResolveToolExchange {
+                exchange_id,
+                resolution_json,
+            } => Self::PermissionInteraction(PermissionInteractionRequest::ResolveToolExchange {
+                exchange_id,
+                resolution_json,
+            }),
+            Request::ModelCatalogDiagnostics => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ModelCatalogDiagnostics)
+            }
+            Request::ReadSessionArtifact {
+                session_id,
+                artifact_id,
+                reference_key,
+                offset,
+                length,
+            } => Self::SessionLifecycle(SessionLifecycleRequest::ReadSessionArtifact {
+                session_id,
+                artifact_id,
+                reference_key,
+                offset,
+                length,
+            }),
+            Request::InvocationInput { session_id, input } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::InvocationInput {
+                    session_id,
+                    input,
+                })
+            }
+            Request::ResolvePermissionBatch { batch_id, approved } => {
+                Self::PermissionInteraction(PermissionInteractionRequest::ResolvePermissionBatch {
+                    batch_id,
+                    approved,
+                })
+            }
+            Request::IngestClientMetrics { batch } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::IngestClientMetrics { batch })
+            }
+            Request::AuthPoolList => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::AuthPoolList))
+            }
+            Request::SetAuthPoolPreference { pool, profile } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SetAuthPoolPreference {
+                    pool,
+                    profile,
+                }))
+            }
+            Request::ReleaseSessionOwnership { session_id } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::ReleaseSessionOwnership {
+                    session_id,
+                })
+            }
+            Request::SessionInspection { session_id, query } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::SessionInspection {
+                    session_id,
+                    query,
+                })
+            }
+            Request::SessionSearch {
+                request,
+                policy,
+                routes,
+                hydrate,
+            } => Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearch {
+                request,
+                policy,
+                routes,
+                hydrate,
+            }),
+            Request::SessionSearchProviders => {
+                Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearchProviders)
+            }
+            Request::SessionSearchExplain {
+                request,
+                policy,
+                routes,
+            } => Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearchExplain {
+                request,
+                policy,
+                routes,
+            }),
+            Request::SessionSearchPurge {
+                provider_id,
+                confirmation,
+            } => Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearchPurge {
+                provider_id,
+                confirmation,
+            }),
+            Request::SessionSearchRebuild {
+                provider_id,
+                confirmation,
+            } => Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearchRebuild {
+                provider_id,
+                confirmation,
+            }),
+            Request::SessionSearchCompleteBackfillStart { request } => Self::SessionSearchAttach(
+                SessionSearchAttachRequest::SessionSearchCompleteBackfillStart { request },
+            ),
+            Request::SessionSearchBackfillStart { request } => {
+                Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearchBackfillStart {
+                    request,
+                })
+            }
+            Request::SessionSearchBackfillStatus { operation_id } => {
+                Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearchBackfillStatus {
+                    operation_id,
+                })
+            }
+            Request::SessionSearchBackfillWait {
+                operation_id,
+                after_revision,
+                timeout_ms,
+            } => Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearchBackfillWait {
+                operation_id,
+                after_revision,
+                timeout_ms,
+            }),
+            Request::SessionSearchBackfillCancel { operation_id } => {
+                Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearchBackfillCancel {
+                    operation_id,
+                })
+            }
+            Request::SessionSearchBackfill { request } => {
+                Self::SessionSearchAttach(SessionSearchAttachRequest::SessionSearchBackfill {
+                    request,
+                })
+            }
+            Request::AppendPresentationNote {
+                session_id,
+                source_id,
+                note_id,
+                text,
+                format,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::AppendPresentationNote {
+                session_id,
+                source_id,
+                note_id,
+                text,
+                format,
+            })),
+        }
+    }
+}
