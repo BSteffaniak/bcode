@@ -155,6 +155,8 @@ struct GitArtifactContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GitPreparationDescriptor {
+    artifact_root: PathBuf,
+    relative_destination: PathBuf,
     destination: PathBuf,
     artifact_scope: String,
 }
@@ -178,33 +180,85 @@ fn git_preparation_descriptor(
         bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA,
         bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
     )?;
-    if artifact
-        .as_ref()
-        .is_some_and(|context| !context.root.is_absolute())
-    {
-        return Err("artifact root must be absolute".to_owned());
-    }
-    let remote = parse_git_remote(&clone.url).map_err(|error| error.to_string())?;
-    let (destination, artifact_scope) = clone.destination.as_ref().map_or_else(
-        || {
-            let root = artifact
-                .as_ref()
-                .map_or_else(default_global_artifact_dir, |context| context.root.clone());
-            (default_destination(&root, &remote), "session".to_owned())
-        },
-        |destination| {
-            let destination = if destination.is_absolute() {
-                destination.clone()
-            } else {
-                workspace.working_directory.join(destination)
-            };
-            (destination, "explicit".to_owned())
-        },
+    let (artifact_root, artifact_scope) = artifact.map_or_else(
+        || (default_global_artifact_dir(), "global".to_owned()),
+        |context| (context.root, "session".to_owned()),
     );
+    let artifact_root = resolve_artifact_root(&artifact_root)?;
+    let remote = parse_git_remote(&clone.url).map_err(|error| error.to_string())?;
+    let relative_destination = clone.destination.as_ref().map_or_else(
+        || Ok(default_destination(Path::new(""), &remote)),
+        |destination| {
+            validate_clone_destination(destination).map(|path| Path::new("git").join(path))
+        },
+    )?;
+    let destination = confined_clone_destination(&artifact_root, &relative_destination)?;
     Ok(GitPreparationDescriptor {
+        artifact_root,
+        relative_destination,
         destination,
         artifact_scope,
     })
+}
+
+fn validate_clone_destination(destination: &Path) -> Result<PathBuf, String> {
+    if destination.as_os_str().is_empty() || destination.is_absolute() {
+        return Err("Git clone destination must be a non-empty artifact-relative path".to_owned());
+    }
+    if destination
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(
+            "Git clone destination must not contain parent traversal or root components".to_owned(),
+        );
+    }
+    Ok(destination.to_path_buf())
+}
+
+fn resolve_artifact_root(root: &Path) -> Result<PathBuf, String> {
+    if !root.is_absolute() {
+        return Err("artifact root must be absolute".to_owned());
+    }
+    let mut existing = root;
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| "artifact root has no existing ancestor".to_owned())?;
+        missing.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or_else(|| "artifact root has no existing ancestor".to_owned())?;
+    }
+    let mut resolved = existing
+        .canonicalize()
+        .map_err(|error| format!("artifact root is unavailable: {error}"))?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn confined_clone_destination(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+    let relative = validate_clone_destination(relative)?;
+    let destination = root.join(&relative);
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err("Git clone destination escapes artifact storage".to_owned());
+        };
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("Git clone destination traverses a symbolic link".to_owned());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(format!("Git clone destination is unavailable: {error}")),
+        }
+    }
+    Ok(destination)
 }
 
 fn decode_owner_context<T: serde::de::DeserializeOwned>(
@@ -283,8 +337,27 @@ fn clone_repository(
     descriptor: &GitPreparationDescriptor,
 ) -> Result<CloneResponse, GitError> {
     let remote = parse_git_remote(&request.url)?;
-    let base = descriptor.destination.clone();
+    let artifact_root =
+        resolve_artifact_root(&descriptor.artifact_root).map_err(GitError::InvalidRequest)?;
+    if artifact_root != descriptor.artifact_root {
+        return Err(GitError::InvalidRequest(
+            "prepared Git artifact root changed before execution".to_owned(),
+        ));
+    }
+    let base = confined_clone_destination(&artifact_root, &descriptor.relative_destination)
+        .map_err(GitError::InvalidRequest)?;
+    if base != descriptor.destination {
+        return Err(GitError::InvalidRequest(
+            "prepared Git clone destination does not match its artifact root".to_owned(),
+        ));
+    }
     if base.exists() {
+        if !base.is_dir() {
+            return Err(GitError::InvalidRequest(format!(
+                "Git clone destination {} is not a directory",
+                base.display()
+            )));
+        }
         return Ok(clone_response(
             request,
             remote,
@@ -474,7 +547,7 @@ fn sanitize_path_component(component: &str) -> String {
 }
 
 fn default_global_artifact_dir() -> PathBuf {
-    default_state_dir().join("artifacts").join("git")
+    default_state_dir().join("artifacts")
 }
 
 fn default_state_dir() -> PathBuf {
@@ -504,7 +577,7 @@ fn clone_tool_definition() -> ToolDefinition {
                 "url": { "type": "string" },
                 "ref": { "type": "string", "description": "Optional branch or tag to clone" },
                 "branch": { "type": "string", "description": "Deprecated alias for ref" },
-                "destination": { "type": "string" }
+                "destination": { "type": "string", "description": "Optional path relative to Bcode-managed artifact storage; absolute paths and parent traversal are rejected" }
             }
         }),
     }
@@ -629,6 +702,9 @@ mod tests {
 
     #[test]
     fn git_owner_prepares_permission_required_clone_policy() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let artifact_root = root.path().join("artifacts");
         let definition = clone_tool_definition();
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
@@ -639,17 +715,16 @@ mod tests {
                     "destination": "repos/bcode"
                 }),
             },
-            host_context: host_context(
-                Path::new("/tmp/workspace"),
-                Some(Path::new("/tmp/artifacts")),
-            ),
+            host_context: host_context(&workspace, Some(&artifact_root)),
         };
         let policy = git_policy_preparation(&request, &definition).expect("Git preparation");
+        let artifact_root = resolve_artifact_root(&artifact_root).expect("artifact root");
+        let destination = artifact_root.join("git/repos/bcode");
         assert!(policy.requires_permission);
         assert_eq!(
             policy.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Write {
-                paths: vec!["/tmp/workspace/repos/bcode".to_owned()],
+                paths: vec![destination.display().to_string()],
                 category: "write".to_owned(),
             }
         );
@@ -657,8 +732,10 @@ mod tests {
             serde_json::from_value::<GitPreparationDescriptor>(policy.descriptor)
                 .expect("Git descriptor"),
             GitPreparationDescriptor {
-                destination: PathBuf::from("/tmp/workspace/repos/bcode"),
-                artifact_scope: "explicit".to_owned(),
+                artifact_root,
+                relative_destination: PathBuf::from("git/repos/bcode"),
+                destination,
+                artifact_scope: "session".to_owned(),
             }
         );
     }
@@ -696,6 +773,9 @@ mod tests {
 
     #[test]
     fn default_destination_uses_owner_resolved_artifact_root() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let artifact_root = root.path().join("artifacts/session-1");
         let definition = clone_tool_definition();
         let request = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
@@ -705,21 +785,101 @@ mod tests {
                     "url": "https://gitlab.com/group/project"
                 }),
             },
-            host_context: host_context(
-                Path::new("/tmp/workspace"),
-                Some(Path::new("/tmp/artifacts/session-1")),
-            ),
+            host_context: host_context(&workspace, Some(&artifact_root)),
         };
 
         let descriptor = git_preparation_descriptor(&request).expect("Git descriptor");
+        let artifact_root = resolve_artifact_root(&artifact_root).expect("artifact root");
 
         assert_eq!(
             descriptor,
             GitPreparationDescriptor {
-                destination: PathBuf::from("/tmp/artifacts/session-1/git/gitlab.com/group/project"),
+                destination: artifact_root.join("git/gitlab.com/group/project"),
+                relative_destination: PathBuf::from("git/gitlab.com/group/project"),
+                artifact_root,
                 artifact_scope: "session".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn explicit_destination_is_confined_to_artifact_root() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let artifact_root = root.path().join("artifacts");
+        let definition = clone_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name,
+                arguments: serde_json::json!({
+                    "url": "https://github.com/rust-lang/rustfmt",
+                    "destination": "rustfmt-reference"
+                }),
+            },
+            host_context: host_context(&workspace, Some(&artifact_root)),
+        };
+
+        let descriptor = git_preparation_descriptor(&request).expect("Git descriptor");
+        let artifact_root = resolve_artifact_root(&artifact_root).expect("artifact root");
+        assert_eq!(
+            descriptor.destination,
+            artifact_root.join("git/rustfmt-reference")
+        );
+        assert!(!descriptor.destination.starts_with(&workspace));
+        assert_eq!(descriptor.artifact_scope, "session");
+    }
+
+    #[test]
+    fn preparation_rejects_destinations_outside_artifact_storage() {
+        for destination in ["/tmp/repository", "../repository", "repos/../../repository"] {
+            let definition = clone_tool_definition();
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "call".to_owned(),
+                    tool_name: definition.name,
+                    arguments: serde_json::json!({
+                        "url": "https://github.com/bmorphism/bcode",
+                        "destination": destination
+                    }),
+                },
+                host_context: host_context(
+                    Path::new("/tmp/workspace"),
+                    Some(Path::new("/tmp/artifacts")),
+                ),
+            };
+
+            assert!(
+                git_preparation_descriptor(&request).is_err(),
+                "{destination}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparation_rejects_symlink_escape_from_artifact_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let artifact_root = root.path().join("artifacts");
+        std::fs::create_dir(&artifact_root).expect("artifact root");
+        symlink(root.path(), artifact_root.join("git")).expect("symlink");
+        let definition = clone_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name,
+                arguments: serde_json::json!({
+                    "url": "https://github.com/bmorphism/bcode",
+                    "destination": "repository"
+                }),
+            },
+            host_context: host_context(root.path(), Some(&artifact_root)),
+        };
+
+        let error = git_preparation_descriptor(&request).expect_err("symlink escape");
+        assert!(error.contains("symbolic link"));
     }
 
     #[test]
