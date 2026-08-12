@@ -13,6 +13,30 @@ use std::collections::BTreeSet;
 pub const INTERRUPTED_TOOL_OUTPUT: &str =
     "tool invocation was interrupted before Bcode could persist a result";
 
+/// Build the top-level instruction bundle from the system prompt and system messages.
+///
+/// The Responses API carries instructions out-of-band rather than as a system message, so system
+/// content is concatenated here and system messages project to nothing in the input list.
+/// Returns `None` when there is no non-blank system content.
+#[must_use]
+pub fn response_instruction_bundle(
+    system_prompt: Option<&str>,
+    messages: &[bcode_model::ModelMessage],
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        parts.push(system_prompt.to_string());
+    }
+    parts.extend(
+        messages
+            .iter()
+            .filter(|message| message.role == bcode_model::MessageRole::System)
+            .map(joined_text_content)
+            .filter(|text| !text.trim().is_empty()),
+    );
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 /// Concatenate the text blocks of a message, ignoring non-text content.
 #[must_use]
 pub fn joined_text_content(message: &bcode_model::ModelMessage) -> String {
@@ -336,6 +360,33 @@ mod tests {
 
     fn identity(name: &str) -> String {
         name.to_string()
+    }
+
+    #[test]
+    fn instruction_bundle_joins_system_prompt_and_system_messages() {
+        let messages = vec![
+            text_message(bcode_model::MessageRole::System, "second"),
+            text_message(bcode_model::MessageRole::User, "ignored"),
+            text_message(bcode_model::MessageRole::System, "third"),
+        ];
+
+        assert_eq!(
+            response_instruction_bundle(Some("first"), &messages).as_deref(),
+            Some("first\n\nsecond\n\nthird")
+        );
+        // Blank prompts and blank system messages are skipped entirely.
+        assert_eq!(
+            response_instruction_bundle(Some("   "), &messages).as_deref(),
+            Some("second\n\nthird")
+        );
+        assert_eq!(response_instruction_bundle(None, &[]), None);
+        assert_eq!(
+            response_instruction_bundle(
+                None,
+                &[text_message(bcode_model::MessageRole::System, "  ")]
+            ),
+            None
+        );
     }
 
     #[test]

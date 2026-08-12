@@ -633,6 +633,67 @@ mod tests {
     }
 
     #[test]
+    fn every_reasoning_kind_maps_to_its_documented_part_map_and_role() {
+        // Regression guard for helper extraction: the original inlined this mapping four times.
+        // Summary parts accumulate separately from Raw/Legacy, which share the content map.
+        let recorder = Recorder::default();
+        let mut items = BTreeMap::new();
+
+        for (kind, index_field, expected_prefix, expected_role) in [
+            (
+                bcode_session_models::ReasoningContentKind::Summary,
+                "summary_index",
+                "summary",
+                bcode_session_models::ReasoningContentRole::Milestone,
+            ),
+            (
+                bcode_session_models::ReasoningContentKind::Raw,
+                "content_index",
+                "raw",
+                bcode_session_models::ReasoningContentRole::Detail,
+            ),
+            (
+                bcode_session_models::ReasoningContentKind::Legacy,
+                "content_index",
+                "legacy",
+                bcode_session_models::ReasoningContentRole::Unknown,
+            ),
+        ] {
+            items.clear();
+            let event = serde_json::json!({
+                "output_index": 0,
+                index_field: 3,
+                "delta": "text"
+            });
+            process_responses_reasoning_delta(&event, &recorder, &mut items, kind);
+
+            // The index field is read from the kind-appropriate key.
+            let item = &items[&0];
+            let parts = match kind {
+                bcode_session_models::ReasoningContentKind::Summary => &item.summary,
+                bcode_session_models::ReasoningContentKind::Raw
+                | bcode_session_models::ReasoningContentKind::Legacy => &item.content,
+            };
+            assert_eq!(
+                parts.get(&3).map(String::as_str),
+                Some("text"),
+                "{kind:?} must accumulate at the index from {index_field}"
+            );
+
+            let events = recorder.events.borrow();
+            let last = events.last().expect("a delta event was reported");
+            let bcode_model::ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartDelta { part_id, role, .. },
+            } = last
+            else {
+                panic!("expected a reasoning part delta, got {last:?}");
+            };
+            assert_eq!(part_id, &format!("{expected_prefix}-3"), "{kind:?}");
+            assert_eq!(*role, expected_role, "{kind:?}");
+        }
+    }
+
+    #[test]
     fn stream_lines_classify_by_sse_field() {
         assert_eq!(
             classify_responses_stream_line("data: [DONE]").expect("done decodes"),

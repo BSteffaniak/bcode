@@ -45,8 +45,8 @@ use bcode_openai_responses::{
     process_responses_function_arguments_delta, process_responses_function_arguments_done,
     process_responses_output_item, process_responses_reasoning_delta,
     process_responses_reasoning_done, process_responses_reasoning_output_item,
-    reasoning_output_index, responses_event_type, responses_incomplete_reason,
-    responses_output_item_text, responses_text_delta,
+    reasoning_output_index, response_instruction_bundle, responses_event_type,
+    responses_incomplete_reason, responses_output_item_text, responses_text_delta,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
@@ -5372,7 +5372,8 @@ fn responses_projection(
     project_reused_history: bool,
     dialect: OpenAiCompatibleDialect,
 ) -> ResponsesProjection {
-    let instruction_bundle = response_instruction_bundle(request);
+    let instruction_bundle =
+        response_instruction_bundle(request.system_prompt.as_deref(), &request.messages);
     let input = model_messages_to_responses_input(request, project_reused_history, dialect);
     let instructions = match strategy {
         ResponsesInstructionStrategy::TopLevelInstructions => instruction_bundle,
@@ -5477,24 +5478,6 @@ fn provider_reasoning_insert_index(input: &[ResponsesInputItem]) -> usize {
         return trailing_tool_protocol_start;
     }
     input.len().saturating_sub(1)
-}
-
-fn response_instruction_bundle(request: &ModelTurnRequest) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(system_prompt) = &request.system_prompt
-        && !system_prompt.trim().is_empty()
-    {
-        parts.push(system_prompt.clone());
-    }
-    parts.extend(
-        request
-            .messages
-            .iter()
-            .filter(|message| message.role == MessageRole::System)
-            .map(joined_text_content)
-            .filter(|text| !text.trim().is_empty()),
-    );
-    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn model_messages_to_responses_input(
