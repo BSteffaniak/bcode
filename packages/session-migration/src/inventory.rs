@@ -1427,9 +1427,7 @@ impl ReleasedEventVariantDescriptor {
 #[must_use]
 pub fn classify_event_kind_schema(kind: &str, schema: u16) -> ReleasedEventKindClassification {
     if schema == CURRENT_EVENT_SCHEMA
-        && RELEASED_EVENT_VARIANTS
-            .iter()
-            .any(|descriptor| descriptor.kind == kind)
+        && bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS.contains(&kind)
     {
         return ReleasedEventKindClassification::Current;
     }
@@ -1474,8 +1472,11 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         "execution_session_created" => (39, 41),
         "opaque_event" => (39, 39),
         "interactive_tool_request_created" | "interactive_tool_request_resolved" => (25, 35),
-        "inert_history" => (42, 42),
+        "inert_history" => (40, 42),
         "legacy_event" | "legacy_turn_finished" | "legacy_turn_started" => (32, 39),
+        "positioned_assistant_reasoning_activity"
+        | "positioned_assistant_response_segment"
+        | "positioned_tool_call_requested" => (42, 42),
         "request_context_observed" => (32, 41),
         "legacy_tool_invocation_presentation" => (25, 39),
         "reasoning_changed" => (25, 41),
@@ -1639,6 +1640,18 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     },
     ReleasedEventVariantDescriptor {
         kind: "plugin_status_note",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "positioned_assistant_reasoning_activity",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "positioned_assistant_response_segment",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "positioned_tool_call_requested",
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
@@ -2361,19 +2374,44 @@ mod tests {
     }
 
     #[test]
-    fn current_inert_history_is_current_but_historical_and_future_forms_are_unknown() {
-        assert_eq!(
-            classify_event_kind_schema("inert_history", CURRENT_EVENT_SCHEMA),
-            ReleasedEventKindClassification::Current
-        );
-        assert_eq!(
-            classify_event_kind_schema("inert_history", CURRENT_EVENT_SCHEMA - 1),
-            ReleasedEventKindClassification::Unknown
-        );
-        assert_eq!(
-            classify_event_kind_schema("inert_history", CURRENT_EVENT_SCHEMA + 1),
-            ReleasedEventKindClassification::Unknown
-        );
+    fn current_only_event_kinds_fail_closed_outside_their_released_schema_ranges() {
+        for (kind, first_schema) in [
+            ("inert_history", 40),
+            (
+                "positioned_assistant_reasoning_activity",
+                CURRENT_EVENT_SCHEMA,
+            ),
+            (
+                "positioned_assistant_response_segment",
+                CURRENT_EVENT_SCHEMA,
+            ),
+            ("positioned_tool_call_requested", CURRENT_EVENT_SCHEMA),
+        ] {
+            assert_eq!(
+                classify_event_kind_schema(kind, first_schema),
+                if first_schema == CURRENT_EVENT_SCHEMA {
+                    ReleasedEventKindClassification::Current
+                } else {
+                    ReleasedEventKindClassification::ReleasedHistorical
+                },
+                "first released schema for {kind}"
+            );
+            assert_eq!(
+                classify_event_kind_schema(kind, CURRENT_EVENT_SCHEMA),
+                ReleasedEventKindClassification::Current,
+                "current schema for {kind}"
+            );
+            assert_eq!(
+                classify_event_kind_schema(kind, first_schema - 1),
+                ReleasedEventKindClassification::Unknown,
+                "pre-release schema for {kind}"
+            );
+            assert_eq!(
+                classify_event_kind_schema(kind, CURRENT_EVENT_SCHEMA + 1),
+                ReleasedEventKindClassification::Unknown,
+                "future schema for {kind}"
+            );
+        }
     }
 
     #[test]
@@ -2383,7 +2421,23 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].kind < pair[1].kind)
         );
-        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 62);
+        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 65);
+        assert_eq!(
+            bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            RELEASED_EVENT_VARIANTS
+                .iter()
+                .filter(|variant| {
+                    bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS
+                        .contains(&variant.kind)
+                })
+                .map(|variant| variant.kind)
+                .collect::<BTreeSet<_>>(),
+            "migration inventory must include every current persisted event kind"
+        );
+
         let explicit = RELEASED_EVENT_VARIANTS
             .iter()
             .filter(|variant| variant.treatment == ReleasedEventTreatment::ExplicitConversion)

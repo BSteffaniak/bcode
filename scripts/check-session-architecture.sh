@@ -285,6 +285,19 @@ if ! rg -q 'create_verified_migration_backup' packages/server/src/session_migrat
   violations=1
 fi
 
+current_event_kind_inventory=/tmp/bcode-current-event-kind-inventory.txt
+current_event_kind_mapping=/tmp/bcode-current-event-kind-mapping.txt
+sed -n '/pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS/,/^];/p' packages/session/models/src/lib.rs \
+  | rg -o '"[a-z0-9_]+"' | tr -d '"' | sort -u >"${current_event_kind_inventory}"
+sed -n '/pub const fn persisted_session_event_kind_name/,/^}/p' packages/session/models/src/lib.rs \
+  | rg -o '"[a-z0-9_]+"' | tr -d '"' | sort -u >"${current_event_kind_mapping}"
+if ! diff -u "${current_event_kind_inventory}" "${current_event_kind_mapping}" \
+  >/tmp/bcode-current-event-kind-drift.txt; then
+  echo "Session current event-kind inventory violation: current persistence mapping and capability inventory differ." >&2
+  cat /tmp/bcode-current-event-kind-drift.txt >&2
+  violations=1
+fi
+
 if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 6' packages/session/models/src/lib.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH: u32 = bcode_session_migration_target::CURRENT_WRITER_EPOCH' packages/session-migration/src/inventory.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH.*CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/session-migration-target/src/lib.rs \
@@ -294,7 +307,10 @@ if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 6' packages/session/mode
   || ! rg -q 'RELEASED_EVENT_VARIANTS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_schema_ranges_match_all_ref_inventory_boundaries' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_variant_treatments_are_sorted_unique_and_total' packages/session-migration/src/inventory.rs \
-  || ! rg -q 'RELEASED_EVENT_VARIANTS.len\(\), 62' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_EVENT_VARIANTS.len\(\), 65' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'CURRENT_PERSISTED_SESSION_EVENT_KINDS' packages/session/models/src/lib.rs \
+  || ! rg -q 'persisted_session_event_kind_name as event_kind_name' packages/session/src/db_event_store.rs \
+  || ! rg -q 'migration inventory must include every current persisted event kind' packages/session-migration/src/inventory.rs \
   || ! rg -q 'inventoried_retired_families_materialize_as_inert_current_history' packages/session-migration/src/execution.rs \
   || ! rg -q 'every inventoried retired variant must be an explicit reviewed decision' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_MIGRATION_IDS' packages/session-migration/src/inventory.rs \

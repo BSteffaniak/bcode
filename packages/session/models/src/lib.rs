@@ -293,6 +293,128 @@ fn tool_invocation_projection_mut<'a>(
 /// Current persisted session event schema version.
 pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 42;
 
+/// Stable persisted event kinds emitted by the current session schema.
+///
+/// Historical schema ranges and conversion policy remain migration-owned. This list is the
+/// policy-free current-format capability inventory used to prevent migration classification drift.
+pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
+    "agent_changed",
+    "assistant_delta",
+    "assistant_message",
+    "assistant_reasoning_activity",
+    "assistant_reasoning_delta",
+    "assistant_reasoning_message",
+    "assistant_response_segment",
+    "client_attached",
+    "client_detached",
+    "context_compacted",
+    "execution_session_created",
+    "inert_history",
+    "model_changed",
+    "model_turn_cancel_requested",
+    "model_turn_finished",
+    "model_turn_started",
+    "model_usage",
+    "permission_requested",
+    "permission_resolved",
+    "plugin_status_note",
+    "positioned_assistant_reasoning_activity",
+    "positioned_assistant_response_segment",
+    "positioned_tool_call_requested",
+    "provider_context_compacted",
+    "ralph_lifecycle",
+    "reasoning_changed",
+    "request_context_observed",
+    "runtime_work_cancel_requested",
+    "runtime_work_finished",
+    "runtime_work_progress",
+    "runtime_work_started",
+    "session_created",
+    "session_forked",
+    "session_imported",
+    "session_renamed",
+    "skill_activated",
+    "skill_context_loaded",
+    "skill_deactivated",
+    "skill_invocation_failed",
+    "skill_invoked",
+    "skill_suggested",
+    "system_message",
+    "tool_call_requested",
+    "tool_contribution",
+    "tool_contribution_placed",
+    "tool_exchange_requested",
+    "tool_exchange_resolved",
+    "tool_invocation_lifecycle",
+    "tool_invocation_result_recorded",
+    "trace_event",
+    "user_message",
+    "working_directory_changed",
+];
+
+/// Return the stable persisted kind name for a current session event.
+#[must_use]
+pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'static str {
+    match kind {
+        SessionEventKind::SessionCreated { .. } => "session_created",
+        SessionEventKind::ClientAttached { .. } => "client_attached",
+        SessionEventKind::ClientDetached { .. } => "client_detached",
+        SessionEventKind::UserMessage { .. } => "user_message",
+        SessionEventKind::AssistantDelta { .. } => "assistant_delta",
+        SessionEventKind::AssistantMessage { .. } => "assistant_message",
+        SessionEventKind::AssistantReasoningDelta { .. } => "assistant_reasoning_delta",
+        SessionEventKind::AssistantReasoningMessage { .. } => "assistant_reasoning_message",
+        SessionEventKind::AssistantResponseSegment { .. } => "assistant_response_segment",
+        SessionEventKind::PositionedAssistantResponseSegment { .. } => {
+            "positioned_assistant_response_segment"
+        }
+        SessionEventKind::PositionedAssistantReasoningActivity { .. } => {
+            "positioned_assistant_reasoning_activity"
+        }
+        SessionEventKind::PositionedToolCallRequested { .. } => "positioned_tool_call_requested",
+        SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
+        SessionEventKind::PermissionRequested { .. } => "permission_requested",
+        SessionEventKind::PermissionResolved { .. } => "permission_resolved",
+        SessionEventKind::ModelChanged { .. } => "model_changed",
+        SessionEventKind::ReasoningChanged { .. } => "reasoning_changed",
+        SessionEventKind::SystemMessage { .. } => "system_message",
+        SessionEventKind::AgentChanged { .. } => "agent_changed",
+        SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
+        SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
+        SessionEventKind::ModelUsage { .. } => "model_usage",
+        SessionEventKind::ContextCompacted { .. } => "context_compacted",
+        SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
+        SessionEventKind::RequestContextObserved { .. } => "request_context_observed",
+        SessionEventKind::SessionRenamed { .. } => "session_renamed",
+        SessionEventKind::TraceEvent { .. } => "trace_event",
+        SessionEventKind::SkillInvoked { .. } => "skill_invoked",
+        SessionEventKind::SkillSuggested { .. } => "skill_suggested",
+        SessionEventKind::SkillActivated { .. } => "skill_activated",
+        SessionEventKind::SkillDeactivated { .. } => "skill_deactivated",
+        SessionEventKind::SkillContextLoaded { .. } => "skill_context_loaded",
+        SessionEventKind::SkillInvocationFailed { .. } => "skill_invocation_failed",
+        SessionEventKind::RuntimeWorkStarted { .. } => "runtime_work_started",
+        SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
+        SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
+        SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
+        SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
+        SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
+        SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
+        SessionEventKind::ToolContribution { .. } => "tool_contribution",
+        SessionEventKind::ToolContributionPlaced { .. } => "tool_contribution_placed",
+        SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
+        SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
+        SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
+        SessionEventKind::SessionImported { .. } => "session_imported",
+        SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
+        SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
+        SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
+        SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
+        SessionEventKind::InertHistory { .. } => "inert_history",
+    }
+}
+
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
 pub fn current_unix_timestamp_ms() -> u64 {

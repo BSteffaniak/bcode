@@ -33775,44 +33775,92 @@ mod tests {
             bcode_session::db::SessionDb::open_existing_turso_in_root(current.id, root.path())
                 .await
                 .expect("current DB");
-        let inert_history = SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: current.updated_at_ms,
-            session_id: current.id,
-            provenance: None,
-            kind: SessionEventKind::InertHistory {
-                event_type: "retired_fixture".to_owned(),
-                payload: serde_json::json!({"retained": true}),
-            },
-        };
-        current_db
-            .database()
-            .insert("events")
-            .value("event_seq", DatabaseValue::Int64(1))
-            .value("event_type", "inert_history")
-            .value(
-                "schema_version",
-                DatabaseValue::Int64(i64::from(inert_history.schema_version)),
-            )
-            .value(
-                "created_at_ms",
-                DatabaseValue::Int64(i64::try_from(inert_history.timestamp_ms).unwrap_or(i64::MAX)),
-            )
-            .value(
-                "payload",
-                serde_json::to_string(&inert_history).expect("serialize inert history"),
-            )
-            .execute(current_db.database())
-            .await
-            .expect("insert current inert history");
+        let current_events = [
+            (
+                "inert_history",
+                SessionEventKind::InertHistory {
+                    event_type: "retired_fixture".to_owned(),
+                    payload: serde_json::json!({"retained": true}),
+                },
+            ),
+            (
+                "positioned_assistant_response_segment",
+                SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id: "turn".to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(0),
+                    segment_id: "segment".to_owned(),
+                    segment_order: 0,
+                    text: "answer".to_owned(),
+                },
+            ),
+            (
+                "positioned_assistant_reasoning_activity",
+                SessionEventKind::PositionedAssistantReasoningActivity {
+                    turn_id: "turn".to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(1),
+                    activity: bcode_session_models::ReasoningActivity {
+                        activity_id: "reasoning".to_owned(),
+                        order: 0,
+                        status: bcode_session_models::ReasoningActivityStatus::Completed,
+                        parts: Vec::new(),
+                        opaque: true,
+                    },
+                },
+            ),
+            (
+                "positioned_tool_call_requested",
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id: "turn".to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(2),
+                    tool_call_id: "call".to_owned(),
+                    producer_plugin_id: None,
+                    tool_name: "fixture".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                },
+            ),
+        ];
+        for (offset, (event_type, kind)) in current_events.into_iter().enumerate() {
+            let sequence = u64::try_from(offset).expect("fixture offset") + 1;
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: current.updated_at_ms,
+                session_id: current.id,
+                provenance: None,
+                kind,
+            };
+            current_db
+                .database()
+                .insert("events")
+                .value(
+                    "event_seq",
+                    DatabaseValue::Int64(i64::try_from(sequence).expect("fixture sequence")),
+                )
+                .value("event_type", event_type)
+                .value(
+                    "schema_version",
+                    DatabaseValue::Int64(i64::from(event.schema_version)),
+                )
+                .value(
+                    "created_at_ms",
+                    DatabaseValue::Int64(i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX)),
+                )
+                .value(
+                    "payload",
+                    serde_json::to_string(&event).expect("serialize current event"),
+                )
+                .execute(current_db.database())
+                .await
+                .expect("insert current event");
+        }
         drop(current_db);
         assert_eq!(
             classify_session_compatibility(Some(root.path()), &current_summary)
                 .await
                 .category,
             Category::Ready,
-            "current inert history must not be misclassified as future state"
+            "all current event envelopes must remain ready during compatibility inventory"
         );
 
         for schema in bcode_session_migration::RELEASED_HISTORICAL_EVENT_SCHEMAS {
