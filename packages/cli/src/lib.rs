@@ -117,6 +117,8 @@ pub enum CliError {
     Theme(String),
     #[error("theme filesystem error: {0}")]
     ThemeIo(std::io::Error),
+    #[error("plugin surface repository path error: {0}")]
+    SurfaceRepoPath(String),
     #[error("{0}")]
     AuthPrimeFailed(String),
 }
@@ -196,6 +198,7 @@ pub async fn run_with_static_bundled(
                 repo_path,
                 options,
             }) => {
+                let repo_path = resolve_surface_repo_path(repo_path)?;
                 ensure_server_running().await?;
                 bcode_tui::run_plugin_surface(surface_kind, repo_path, options).await?;
             }
@@ -212,6 +215,37 @@ pub async fn run_with_static_bundled(
         Err(error) => error.exit(),
     };
     Box::pin(handle_cli(cli)).await
+}
+
+/// Resolve a plugin-supplied surface repository path against the CLI process working directory.
+///
+/// Plugin CLI handlers express "current directory" as a relative path such as `.`. That relative
+/// path must be resolved here, in the client process, because the surface context is forwarded to
+/// the daemon, which has its own unrelated working directory inherited from whichever invocation
+/// first started it.
+fn resolve_surface_repo_path(
+    repo_path: Option<std::path::PathBuf>,
+) -> Result<Option<std::path::PathBuf>, CliError> {
+    let caller_cwd = std::env::current_dir().map_err(|error| {
+        CliError::SurfaceRepoPath(format!("current working directory is unavailable: {error}"))
+    })?;
+    let requested = repo_path.map_or_else(
+        || caller_cwd.clone(),
+        |path| {
+            if path.is_absolute() {
+                path
+            } else {
+                caller_cwd.join(path)
+            }
+        },
+    );
+    let resolved = fs::canonicalize(&requested).map_err(|error| {
+        CliError::SurfaceRepoPath(format!(
+            "{} is unavailable: {error}",
+            display_from_current_dir(&requested)
+        ))
+    })?;
+    Ok(Some(resolved))
 }
 
 fn config_override_from_matches(
@@ -13776,6 +13810,61 @@ mod theme_command_tests {
             std::fs::read_to_string(copied).expect("copied theme"),
             bcode_tui::theme::definition::ThemeCatalog::bundled_source("terminal-native")
                 .expect("bundled source")
+        );
+    }
+}
+
+#[cfg(test)]
+mod plugin_surface_repo_path_tests {
+    use super::*;
+
+    #[test]
+    fn missing_repo_path_resolves_to_caller_working_directory() {
+        let expected = fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("canonical current directory");
+
+        let resolved = resolve_surface_repo_path(None).expect("current directory resolves");
+
+        assert_eq!(resolved, Some(expected));
+    }
+
+    #[test]
+    fn relative_repo_path_resolves_against_caller_working_directory() {
+        let expected = fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("canonical current directory");
+
+        let resolved = resolve_surface_repo_path(Some(std::path::PathBuf::from(".")))
+            .expect("relative path resolves");
+
+        assert_eq!(
+            resolved,
+            Some(expected),
+            "`.` must resolve in the client process, not the daemon"
+        );
+    }
+
+    #[test]
+    fn absolute_repo_path_is_preserved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let expected = fs::canonicalize(temp.path()).expect("canonical tempdir");
+
+        let resolved =
+            resolve_surface_repo_path(Some(expected.clone())).expect("absolute path resolves");
+
+        assert_eq!(resolved, Some(expected));
+    }
+
+    #[test]
+    fn unavailable_repo_path_is_surfaced_rather_than_silently_defaulted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("does-not-exist");
+
+        let error =
+            resolve_surface_repo_path(Some(missing)).expect_err("missing path should fail closed");
+
+        assert!(
+            matches!(error, CliError::SurfaceRepoPath(_)),
+            "expected a surface repo path error, got {error:?}"
         );
     }
 }

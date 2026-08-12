@@ -48,6 +48,19 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         run(cli.command).await.map_err(|e| e.to_string())
     })
 }
+/// Resolve a `--repo` argument against the CLI process working directory.
+///
+/// Code review git and state operations run inside the daemon, which has its own unrelated working
+/// directory, so a relative argument such as the `.` default must be resolved here.
+fn resolve_repo_argument(repo: &Path) -> Result<PathBuf, CliError> {
+    std::fs::canonicalize(repo).map_err(|error| {
+        CliError::Review(format!(
+            "repository path {} is unavailable: {error}",
+            repo.display()
+        ))
+    })
+}
+
 fn surface_outcome(repo: PathBuf, target: Option<ReviewTarget>) -> StaticCliOutcome {
     let mut options = BTreeMap::new();
     if let Some(target) = target {
@@ -180,7 +193,10 @@ impl From<ReviewTargetArg> for ReviewTarget {
 
 async fn run(command: Option<ReviewCommand>) -> Result<StaticCliOutcome, CliError> {
     let Some(command) = command else {
-        return Ok(surface_outcome(PathBuf::from("."), None));
+        return Ok(surface_outcome(
+            resolve_repo_argument(Path::new("."))?,
+            None,
+        ));
     };
     let (repo, target) = match command {
         ReviewCommand::Unstaged { repo } => (repo, ReviewTarget::WorkingTreeUnstaged),
@@ -227,7 +243,7 @@ async fn run(command: Option<ReviewCommand>) -> Result<StaticCliOutcome, CliErro
             return Ok(StaticCliOutcome::default());
         }
     };
-    Ok(surface_outcome(repo, Some(target)))
+    Ok(surface_outcome(resolve_repo_argument(&repo)?, Some(target)))
 }
 
 struct GithubPublishCliRequest {
@@ -244,8 +260,9 @@ struct GithubPublishCliRequest {
 
 async fn publish_github_review(request: GithubPublishCliRequest) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
+    let repo = resolve_repo_argument(&request.repo)?;
     let bundle_payload = serde_json::to_vec(&ReviewContextRequest {
-        repo_path: request.repo.clone(),
+        repo_path: repo.clone(),
         target: request.target,
     })?;
     let bundle_response = client
@@ -258,11 +275,11 @@ async fn publish_github_review(request: GithubPublishCliRequest) -> Result<(), C
     let bundle = plugin_response_json::<ReviewBundle>(bundle_response)?;
     let repository = match request.github_repo {
         Some(repository) => repository,
-        None => detect_github_repository(&request.repo)?,
+        None => detect_github_repository(&repo)?,
     };
     let pull_request = match request.pr {
         Some(pull_request) => pull_request,
-        None => detect_pull_request_number(&request.repo)?,
+        None => detect_pull_request_number(&repo)?,
     };
     let mut options = serde_json::json!({
         "repository": repository,
@@ -376,4 +393,58 @@ fn parse_pull_request_from_branch(branch: &str) -> Option<u64> {
         .and_then(|rest| rest.split('/').next())
         .or_else(|| branch.strip_prefix("pr/"))
         .and_then(|value| value.parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_argument_resolves_relative_default_to_absolute_path() {
+        let resolved = resolve_repo_argument(Path::new(".")).expect("current directory resolves");
+        assert!(
+            resolved.is_absolute(),
+            "relative repo argument should resolve to an absolute path, got {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn repo_argument_resolves_nested_relative_path_against_current_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested = temp.path().join("nested");
+        std::fs::create_dir(&nested).expect("create nested directory");
+        let expected = std::fs::canonicalize(&nested).expect("canonical nested directory");
+
+        let resolved = resolve_repo_argument(&nested).expect("nested directory resolves");
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn repo_argument_rejects_missing_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("does-not-exist");
+
+        let error = resolve_repo_argument(&missing).expect_err("missing directory should fail");
+
+        assert!(
+            matches!(error, CliError::Review(_)),
+            "expected a review error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn surface_outcome_forwards_resolved_repository_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = std::fs::canonicalize(temp.path()).expect("canonical tempdir");
+
+        let outcome = surface_outcome(repo.clone(), Some(ReviewTarget::IndexStaged));
+
+        let Some(StaticCliHostAction::OpenTuiSurface { repo_path, .. }) = outcome.host_action
+        else {
+            panic!("expected an OpenTuiSurface host action");
+        };
+        assert_eq!(repo_path, Some(repo));
+    }
 }

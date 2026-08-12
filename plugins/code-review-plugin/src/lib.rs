@@ -2576,6 +2576,12 @@ fn rendered_hunk_lines(hunk: &ReviewHunk) -> Vec<String> {
 }
 
 fn resolve_repo_root(repo_path: &Path) -> Result<PathBuf, ReviewError> {
+    if !repo_path.is_absolute() {
+        return Err(ReviewError::InvalidRequest(format!(
+            "repo_path must be absolute, but received: {}",
+            repo_path.display()
+        )));
+    }
     if !repo_path.is_dir() {
         return Err(ReviewError::InvalidRequest(format!(
             "repo_path is not a directory: {}",
@@ -5530,6 +5536,32 @@ mod tests {
         )
         .expect("reopen suggestions");
         assert_eq!(reopened.suggestions, vec![updated]);
+    }
+
+    #[test]
+    fn repo_root_resolution_rejects_relative_paths() {
+        for relative in [".", "./nested", "nested", ".."] {
+            let error = resolve_repo_root(Path::new(relative))
+                .expect_err("relative repo_path should be rejected");
+
+            match error {
+                ReviewError::InvalidRequest(message) => assert!(
+                    message.contains("must be absolute"),
+                    "expected an absolute-path rejection for {relative:?}, got {message}"
+                ),
+                other => panic!("expected InvalidRequest for {relative:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn repo_root_resolution_accepts_absolute_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = initialized_test_repository(temp.path());
+
+        let repo_root = resolve_repo_root(&repo).expect("absolute repository resolves");
+
+        assert!(repo_root.is_absolute());
     }
 
     #[test]

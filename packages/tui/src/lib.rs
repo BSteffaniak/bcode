@@ -415,30 +415,25 @@ pub async fn run_plugin_surface(
     repo_path: Option<std::path::PathBuf>,
     options: std::collections::BTreeMap<String, String>,
 ) -> Result<(), TuiError> {
+    let repo = resolved_surface_repo_path(&surface_kind, repo_path)?;
     if surface_kind == "ralph-home" {
-        return run_ralph_home().await;
+        return run_ralph_home(repo).await;
     }
     if surface_kind == "code-review" {
-        let repo = repo_path.unwrap_or_else(|| std::path::PathBuf::from("."));
         if let Some(target) = options.get("target") {
             return run_code_review(repo, serde_json::from_str(target)?).await;
         }
         return run_code_review_home(repo).await;
     }
     if surface_kind == "eval-run-picker" {
-        return run_eval_viewer_picker(repo_path.unwrap_or_else(|| std::path::PathBuf::from(".")))
-            .await;
+        return run_eval_viewer_picker(repo).await;
     }
     if surface_kind == "eval-run-viewer" {
-        return run_eval_viewer(
-            repo_path.unwrap_or_else(|| std::path::PathBuf::from(".")),
-            options.get("run").map(std::path::PathBuf::from),
-        )
-        .await;
+        return run_eval_viewer(repo, options.get("run").map(std::path::PathBuf::from)).await;
     }
     if surface_kind == "metrics-dashboard" {
         return run_metrics_dashboard(
-            repo_path.unwrap_or_else(|| std::path::PathBuf::from(".")),
+            repo,
             options.get("metrics_path").map(std::path::PathBuf::from),
         )
         .await;
@@ -449,13 +444,38 @@ pub async fn run_plugin_surface(
     })
 }
 
+/// Require an absolute startup-surface repository path.
+///
+/// Callers resolve "current directory" against their own working directory before reaching this
+/// boundary. Accepting a relative path here would silently re-resolve it against whichever process
+/// later consumes it, so an unresolved path is treated as a contract violation.
+fn resolved_surface_repo_path(
+    surface_kind: &str,
+    repo_path: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, TuiError> {
+    match repo_path {
+        Some(path) if path.is_absolute() => Ok(path),
+        Some(path) => Err(TuiError::PluginService {
+            code: "unresolved_surface_repo_path".to_owned(),
+            message: format!(
+                "plugin surface `{surface_kind}` requires an absolute repository path, but received `{}`",
+                path.display()
+            ),
+        }),
+        None => Err(TuiError::PluginService {
+            code: "missing_surface_repo_path".to_owned(),
+            message: format!("plugin surface `{surface_kind}` requires a repository path"),
+        }),
+    }
+}
+
 /// Run the main terminal user interface and open Ralph on startup.
 ///
 /// # Errors
 ///
 /// Returns I/O or plugin service errors.
 #[allow(clippy::future_not_send)]
-pub async fn run_ralph_home() -> Result<(), TuiError> {
+pub async fn run_ralph_home(repo_path: std::path::PathBuf) -> Result<(), TuiError> {
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;
     let result = {
@@ -468,7 +488,7 @@ pub async fn run_ralph_home() -> Result<(), TuiError> {
         Box::pin(runtime::run_event_loop_with_startup_and_static_bundled(
             &mut terminal,
             None,
-            startup_action::StartupTuiAction::OpenRalphHome,
+            startup_action::StartupTuiAction::OpenRalphHome { repo_path },
             &static_bundled_plugins(),
         ))
         .await

@@ -216,12 +216,7 @@ async fn run_root<W: Write>(
     );
     let mut model =
         root_program::BcodeRuntimeModel::new(initialized.chat, initialized.settings, loop_state);
-    if startup_action == StartupTuiAction::OpenRalphHome {
-        let repo_path = model
-            .chat
-            .app
-            .working_directory()
-            .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
+    if let StartupTuiAction::OpenRalphHome { repo_path } = startup_action {
         let surface = super::ralph_launcher::open_root_ralph_home_surface(repo_path, None).await?;
         model.queue_plugin_surface("bcode.ralph", surface);
     }
