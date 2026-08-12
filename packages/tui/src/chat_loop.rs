@@ -4041,7 +4041,7 @@ fn reconcile_markdown_presentation(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn draw_chat_frame<W: Write>(
     terminal: &mut Terminal<&mut W>,
     chat: &mut ActiveChat,
@@ -4049,9 +4049,22 @@ pub fn draw_chat_frame<W: Write>(
     schedule_delay: Duration,
     frame_interval: Option<Duration>,
     damage: bmux_tui::damage::Damage,
-) -> Result<bmux_tui::terminal::DrawStats, TuiError> {
+    fast_temporal_presentation: bool,
+    committed_layout: Option<render::FrameLayout>,
+) -> Result<(bmux_tui::terminal::DrawStats, Option<render::FrameLayout>), TuiError> {
     let frame_started = Instant::now();
     let prepare_started = frame_started;
+    if fast_temporal_presentation && let Some(layout) = committed_layout {
+        return draw_temporal_frame(
+            terminal,
+            chat,
+            loop_state,
+            damage,
+            frame_interval,
+            frame_started,
+            layout,
+        );
+    }
     let full_transcript_area = render::transcript_area_for_frame(&chat.app, terminal.area());
     let interaction_rows = loop_state
         .interactive_surface
@@ -4225,9 +4238,17 @@ pub fn draw_chat_frame<W: Write>(
     let prepare_ms = elapsed_millis(prepare_started);
     let theme = render::TuiTheme::for_app(&chat.app);
     let draw_started = Instant::now();
+    let regions = damage.retained_regions().to_vec();
+    let full_damage = damage.is_full();
+    let intersects = |area: bmux_tui::geometry::Rect| {
+        full_damage
+            || regions
+                .iter()
+                .any(|region| !area.intersection(*region).is_empty())
+    };
     let draw_stats = terminal.draw_damage(damage, |frame| {
         if let Some(layout) = layout {
-            render::render_prepared(&mut chat.app, frame, layout);
+            render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
         }
         for contribution_id in &rich_presentation.image_removed {
             super::markdown_image::MarkdownImagePresentationStore::remove_from_frame(
@@ -4241,44 +4262,46 @@ pub fn draw_chat_frame<W: Write>(
                 frame,
             );
         }
-        for region in &rich_presentation.rich {
-            let Some(visible_rect) = region.visible_rect else {
-                continue;
-            };
-            match &region.contribution_kind {
-                bcode_markdown_render::MarkdownContributionKind::Image { .. } => {
-                    if let Some(runtime) = &loop_state.markdown_presentation {
-                        let destination = markdown_image_destination_rect(visible_rect);
-                        if !runtime.images.present_ready(
-                            &region.contribution_id,
-                            destination,
-                            layout.map_or(visible_rect, |layout| layout.body),
-                            frame,
-                        ) && let Some(fallback) = image_region_fallback(
-                            runtime,
-                            &region.contribution_id,
-                            &region.contribution_kind,
-                        ) {
-                            write_markdown_fallback(frame, destination, &fallback);
+        if layout.is_some_and(|layout| intersects(layout.body)) {
+            for region in &rich_presentation.rich {
+                let Some(visible_rect) = region.visible_rect else {
+                    continue;
+                };
+                match &region.contribution_kind {
+                    bcode_markdown_render::MarkdownContributionKind::Image { .. } => {
+                        if let Some(runtime) = &loop_state.markdown_presentation {
+                            let destination = markdown_image_destination_rect(visible_rect);
+                            if !runtime.images.present_ready(
+                                &region.contribution_id,
+                                destination,
+                                layout.map_or(visible_rect, |layout| layout.body),
+                                frame,
+                            ) && let Some(fallback) = image_region_fallback(
+                                runtime,
+                                &region.contribution_id,
+                                &region.contribution_kind,
+                            ) {
+                                write_markdown_fallback(frame, destination, &fallback);
+                            }
                         }
                     }
-                }
-                bcode_markdown_render::MarkdownContributionKind::Mermaid { .. } => {
-                    if let Some(runtime) = &loop_state.markdown_mermaid {
-                        if let Some(placement) = runtime.presentations.ready_placement(
-                            &region.contribution_id,
-                            markdown_mermaid_destination_rect(visible_rect),
-                            layout.map_or(visible_rect, |layout| layout.body),
-                        ) {
-                            frame.push_image(placement);
-                        } else if let Some(fallback) =
-                            runtime.presentations.fallback(&region.contribution_id)
-                        {
-                            write_markdown_fallback(frame, visible_rect, &fallback);
+                    bcode_markdown_render::MarkdownContributionKind::Mermaid { .. } => {
+                        if let Some(runtime) = &loop_state.markdown_mermaid {
+                            if let Some(placement) = runtime.presentations.ready_placement(
+                                &region.contribution_id,
+                                markdown_mermaid_destination_rect(visible_rect),
+                                layout.map_or(visible_rect, |layout| layout.body),
+                            ) {
+                                frame.push_image(placement);
+                            } else if let Some(fallback) =
+                                runtime.presentations.fallback(&region.contribution_id)
+                            {
+                                write_markdown_fallback(frame, visible_rect, &fallback);
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         if let Some(slash_palette) = &loop_state.slash_palette {
@@ -4443,7 +4466,86 @@ pub fn draw_chat_frame<W: Write>(
             u64::try_from(schedule_delay.as_millis()).unwrap_or(u64::MAX),
         );
     }
-    Ok(draw_stats)
+    Ok((draw_stats, layout))
+}
+
+fn draw_temporal_frame<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    damage: bmux_tui::damage::Damage,
+    frame_interval: Option<Duration>,
+    frame_started: Instant,
+    layout: render::FrameLayout,
+) -> Result<(bmux_tui::terminal::DrawStats, Option<render::FrameLayout>), TuiError> {
+    let regions = damage.retained_regions().to_vec();
+    let intersects = |area: Rect| {
+        regions
+            .iter()
+            .any(|region| !area.intersection(*region).is_empty())
+    };
+    let draw_started = Instant::now();
+    let draw_stats = terminal.draw_damage(damage, |frame| {
+        render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
+    })?;
+    record_frame_telemetry(
+        loop_state,
+        &draw_stats,
+        Duration::ZERO,
+        frame_interval,
+        frame_started,
+        draw_started,
+        0,
+    );
+    Ok((draw_stats, Some(layout)))
+}
+
+fn record_frame_telemetry(
+    loop_state: &mut ChatLoopState,
+    draw_stats: &bmux_tui::terminal::DrawStats,
+    schedule_delay: Duration,
+    frame_interval: Option<Duration>,
+    frame_started: Instant,
+    draw_started: Instant,
+    prepare_ms: u64,
+) {
+    loop_state.telemetry.record_histogram(
+        "tui.frame.changed_cells",
+        u64::try_from(draw_stats.changed_cells).unwrap_or(u64::MAX),
+    );
+    if draw_stats.full_repaint {
+        loop_state
+            .telemetry
+            .add_counter("tui.frame.full_repaint_total", 1);
+    }
+    let draw_ms = elapsed_millis(draw_started);
+    let total_ms = elapsed_millis(frame_started);
+    loop_state.telemetry.add_counter("tui.frame.total", 1);
+    let frame_budget_ms = frame_interval.map_or(u64::MAX, |interval| {
+        u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)
+    });
+    if total_ms >= frame_budget_ms {
+        loop_state
+            .telemetry
+            .add_counter("tui.frame.over_budget_total", 1);
+    }
+    let frame_index = loop_state.frame_index;
+    loop_state.frame_index = loop_state.frame_index.wrapping_add(1);
+    if frame_index.is_multiple_of(16) || total_ms >= frame_budget_ms {
+        loop_state
+            .telemetry
+            .record_histogram("tui.frame.prepare_ms", prepare_ms);
+        loop_state
+            .telemetry
+            .record_histogram("tui.frame.draw_ms", draw_ms);
+        loop_state
+            .telemetry
+            .record_histogram("tui.frame.total_ms", total_ms);
+        loop_state.telemetry.record_histogram(
+            "tui.frame.schedule_delay_ms",
+            u64::try_from(schedule_delay.as_millis()).unwrap_or(u64::MAX),
+        );
+    }
 }
 
 fn elapsed_millis(started: Instant) -> u64 {

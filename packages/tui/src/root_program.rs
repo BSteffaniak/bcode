@@ -205,10 +205,14 @@ pub struct BcodeRuntimeModel {
     pub invalidation: super::invalidation::UiInvalidation,
     /// Generic terminal-space damage selected by Bcode for the next presentation.
     presentation_damage: bmux_tui::damage::Damage,
+    /// Whether the next stable temporal presentation can skip full frame preparation.
+    fast_temporal_presentation: bool,
     /// Last successfully committed terminal hit map used for pointer routing.
     pub committed_hits: bmux_tui::hit::HitMap,
     /// Last successfully committed terminal frame area.
     pub committed_area: bmux_tui::geometry::Rect,
+    /// Last successfully committed frame layout used for regional damage projection.
+    committed_layout: Option<super::render::FrameLayout>,
     /// Last successfully committed presentation timestamp.
     pub last_presented_at: Option<Instant>,
     /// Whether closing the root plugin surface should terminate this runtime invocation.
@@ -267,8 +271,10 @@ impl BcodeRuntimeModel {
             ordered_notes: OrderedPresentationQueue::default(),
             invalidation: super::invalidation::UiInvalidation::Full,
             presentation_damage: bmux_tui::damage::Damage::Full,
+            fast_temporal_presentation: false,
             committed_hits: bmux_tui::hit::HitMap::default(),
             committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
+            committed_layout: None,
             last_presented_at: None,
             exit_after_plugin_surface: false,
             plugin_surface_result: None,
@@ -1371,13 +1377,9 @@ impl BcodeRuntimeModel {
             return;
         };
         let now = Instant::now();
-        let invalidation_at = self
-            .chat
-            .app
-            .invalidation_requests(now, std::time::SystemTime::now())
-            .into_iter()
-            .map(|request| request.at)
-            .min();
+        let now_system = std::time::SystemTime::now();
+        let invalidation_requests = self.chat.app.invalidation_requests(now, now_system);
+        let invalidation_at = invalidation_requests.iter().map(|request| request.at).min();
         let deadlines = [
             (RootTimer::Invalidations, invalidation_at),
             (
@@ -1418,20 +1420,30 @@ impl BcodeRuntimeModel {
     fn select_presentation_damage(
         &self,
         invalidation: super::invalidation::UiInvalidation,
-        cursor_only: bool,
+        temporal_damage: &[super::app::TemporalDamage],
     ) -> bmux_tui::damage::Damage {
-        if cursor_only && invalidation == super::invalidation::UiInvalidation::Paint {
-            let composer = self
-                .chat
-                .app
-                .composer_panel_area()
-                .intersection(self.committed_area);
-            if !composer.is_empty() {
-                return bmux_tui::damage::Damage::regions(
-                    [composer],
+        if invalidation == super::invalidation::UiInvalidation::Paint
+            && let Some(layout) = self.committed_layout
+        {
+            let regions = temporal_damage.iter().filter_map(|damage| match damage {
+                super::app::TemporalDamage::Composer => Some(layout.composer()),
+                super::app::TemporalDamage::Status => Some(layout.status()),
+                super::app::TemporalDamage::LatestBar => layout.latest_bar(),
+                super::app::TemporalDamage::Transcript => Some(layout.body()),
+                super::app::TemporalDamage::Full => None,
+            });
+            if !temporal_damage.contains(&super::app::TemporalDamage::Full) {
+                let damage = bmux_tui::damage::Damage::regions(
+                    regions,
                     self.committed_area,
-                    bmux_tui::damage::DamagePolicy::default(),
+                    bmux_tui::damage::DamagePolicy {
+                        max_regions: 64,
+                        max_area_percent: 100,
+                    },
                 );
+                if !damage.is_none() {
+                    return damage;
+                }
             }
         }
         bmux_tui::damage::Damage::Full
@@ -1440,24 +1452,35 @@ impl BcodeRuntimeModel {
     fn handle_timer(
         &mut self,
         timer: &bmux_tui_runtime::TimerId,
-    ) -> (super::invalidation::UiInvalidation, bool) {
+    ) -> (
+        super::invalidation::UiInvalidation,
+        Vec<super::app::TemporalDamage>,
+    ) {
         self.scheduled_deadlines.remove(timer);
         let now = Instant::now();
         let invalidation = match timer.as_str() {
             "bcode.invalidations" => {
-                let due = self
-                    .chat
-                    .app
-                    .invalidation_requests(now, std::time::SystemTime::now())
-                    .into_iter()
+                let now_system = std::time::SystemTime::now();
+                let requests = self.chat.app.invalidation_requests(now, now_system);
+                let due = requests
+                    .iter()
                     .filter(|request| request.at <= now)
-                    .map(|request| request.key)
+                    .map(|request| request.key.clone())
                     .collect::<Vec<_>>();
-                let cursor_only = due.len() == 1
-                    && due
-                        .first()
-                        .is_some_and(super::cursor_blink::CursorBlink::owns_invalidation);
-                return (self.chat.app.handle_invalidations(&due, now), cursor_only);
+                if due.is_empty() {
+                    let overdue_slack = Duration::from_millis(2);
+                    if let Some(request) = requests
+                        .iter()
+                        .min_by_key(|request| request.at)
+                        .filter(|request| request.at <= now + overdue_slack)
+                    {
+                        return self.chat.app.handle_invalidations_with_damage(
+                            std::slice::from_ref(&request.key),
+                            now,
+                        );
+                    }
+                }
+                return self.chat.app.handle_invalidations_with_damage(&due, now);
             }
             "bcode.artifact_retry" => {
                 self.loop_state.start_due_artifact_fetches(now);
@@ -1485,7 +1508,7 @@ impl BcodeRuntimeModel {
                 self.theme_reload_at = now + Duration::from_millis(750);
                 let signature = super::theme::active_theme_input_signature(&self.chat.app);
                 if signature == self.theme_input_signature {
-                    return (super::invalidation::UiInvalidation::None, false);
+                    return (super::invalidation::UiInvalidation::None, Vec::new());
                 }
                 self.theme_input_signature = signature;
                 self.chat.app.invalidate_theme_catalog();
@@ -1502,7 +1525,7 @@ impl BcodeRuntimeModel {
             }
             _ => super::invalidation::UiInvalidation::None,
         };
-        (invalidation, false)
+        (invalidation, Vec::new())
     }
 
     #[allow(dead_code)]
@@ -1565,18 +1588,22 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
         let frame_interval = program.settings.bmux_runtime_config().frame_interval;
         let damage = std::mem::replace(
             &mut program.presentation_damage,
-            bmux_tui::damage::Damage::Full,
+            bmux_tui::damage::Damage::None,
         );
-        let draw_stats = super::chat_loop::draw_chat_frame(
+        let fast_temporal_presentation = std::mem::take(&mut program.fast_temporal_presentation);
+        let (draw_stats, layout) = super::chat_loop::draw_chat_frame(
             self.terminal,
             &mut program.chat,
             &mut program.loop_state,
             Duration::ZERO,
             frame_interval,
             damage,
+            fast_temporal_presentation,
+            program.committed_layout,
         )?;
         program.committed_hits = self.terminal.hits().clone();
         program.committed_area = self.terminal.area();
+        program.committed_layout = layout;
         program.presentation_committed(started);
         Ok(bmux_tui_runtime::PresentReport {
             changed_cells: draw_stats.changed_cells,
@@ -1594,7 +1621,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         &mut self,
         event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
     ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
-        let mut cursor_only = false;
+        let mut temporal_damage = Vec::new();
         let damage = match event {
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Bootstrap { handle }) => {
                 self.runtime_handle = Some(handle.clone());
@@ -1969,8 +1996,8 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 BcodeRuntimeMessage::InteractionRetryDue | BcodeRuntimeMessage::TelemetryFlushDue,
             ) => super::invalidation::UiInvalidation::None,
             bmux_tui_runtime::RuntimeEvent::Timer(timer) => {
-                let (damage, is_cursor_only) = self.handle_timer(&timer);
-                cursor_only = is_cursor_only;
+                let (damage, due_temporal_damage) = self.handle_timer(&timer);
+                temporal_damage = due_temporal_damage;
                 damage
             }
         };
@@ -1982,7 +2009,14 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             .loop_state
             .prepare_runtime_work(&mut self.chat, self.committed_area);
         self.invalidation = self.invalidation.merge(housekeeping);
-        self.presentation_damage = self.select_presentation_damage(self.invalidation, cursor_only);
+        self.presentation_damage =
+            self.select_presentation_damage(self.invalidation, &temporal_damage);
+        self.fast_temporal_presentation = self.invalidation
+            == super::invalidation::UiInvalidation::Paint
+            && !temporal_damage.is_empty()
+            && !temporal_damage.contains(&super::app::TemporalDamage::Full)
+            && !temporal_damage.contains(&super::app::TemporalDamage::Transcript)
+            && !self.presentation_damage.is_full();
         let mut update = match self.invalidation {
             super::invalidation::UiInvalidation::None => bmux_tui_runtime::Update::none(),
             super::invalidation::UiInvalidation::Full => bmux_tui_runtime::Update::reset(),
@@ -2156,6 +2190,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_partial_presentation_matches_full_production_presenter() {
+        use bmux_tui_runtime::Presenter;
+
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut partial_model = root_test_model();
+        let mut full_model = root_test_model();
+        let mut partial_bytes = Vec::new();
+        let mut full_bytes = Vec::new();
+        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
+        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
+        {
+            super::BcodeRuntimePresenter::new(&mut partial_terminal)
+                .present(&mut partial_model)
+                .expect("initial partial frame");
+            super::BcodeRuntimePresenter::new(&mut full_terminal)
+                .present(&mut full_model)
+                .expect("initial full frame");
+        }
+
+        for model in [&mut partial_model, &mut full_model] {
+            model.chat.app.set_status("timer advanced".to_owned());
+            model.invalidation = super::super::invalidation::UiInvalidation::Paint;
+        }
+        partial_model.presentation_damage = partial_model.select_presentation_damage(
+            super::super::invalidation::UiInvalidation::Paint,
+            &[super::super::app::TemporalDamage::Status],
+        );
+        partial_model.fast_temporal_presentation = true;
+        full_model.presentation_damage = bmux_tui::damage::Damage::Full;
+
+        super::BcodeRuntimePresenter::new(&mut partial_terminal)
+            .present(&mut partial_model)
+            .expect("partial status frame");
+        super::BcodeRuntimePresenter::new(&mut full_terminal)
+            .present(&mut full_model)
+            .expect("full status frame");
+
+        assert_eq!(
+            partial_terminal.retained_buffer(),
+            full_terminal.retained_buffer()
+        );
+        assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
+        assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
+    }
+
+    #[tokio::test]
     async fn cursor_partial_presentation_matches_full_production_presenter() {
         use bmux_tui_runtime::Presenter;
 
@@ -2196,8 +2276,12 @@ mod tests {
             );
             model.invalidation = super::super::invalidation::UiInvalidation::Paint;
         }
-        partial_model.presentation_damage = partial_model
-            .select_presentation_damage(super::super::invalidation::UiInvalidation::Paint, true);
+        let temporal_damage = [super::super::app::TemporalDamage::Composer];
+        partial_model.presentation_damage = partial_model.select_presentation_damage(
+            super::super::invalidation::UiInvalidation::Paint,
+            &temporal_damage,
+        );
+        partial_model.fast_temporal_presentation = true;
         full_model.presentation_damage = bmux_tui::damage::Damage::Full;
 
         {
@@ -2238,36 +2322,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn presentation_damage_is_local_only_for_cursor_blink() {
-        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
-        let mut chat = root_test_chat();
-        chat.app
-            .set_composer_content_area(bmux_tui::geometry::Rect::new(2, 20, 76, 1));
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
-        model.committed_area = area;
+    async fn presentation_damage_localizes_stable_temporal_regions() {
+        use bmux_tui_runtime::Presenter;
 
-        let cursor = model
-            .select_presentation_damage(super::super::invalidation::UiInvalidation::Paint, true);
-        assert!(matches!(cursor, bmux_tui::damage::Damage::Regions(_)));
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut model = root_test_model();
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        {
+            let mut presenter = super::BcodeRuntimePresenter::new(&mut terminal);
+            presenter
+                .present(&mut model)
+                .expect("initial frame presents");
+        }
+
+        for temporal_damage in [
+            super::super::app::TemporalDamage::Composer,
+            super::super::app::TemporalDamage::Status,
+            super::super::app::TemporalDamage::Transcript,
+        ] {
+            assert!(matches!(
+                model.select_presentation_damage(
+                    super::super::invalidation::UiInvalidation::Paint,
+                    &[temporal_damage],
+                ),
+                bmux_tui::damage::Damage::Regions(_)
+            ));
+        }
+        assert!(
+            model
+                .select_presentation_damage(
+                    super::super::invalidation::UiInvalidation::Paint,
+                    &[super::super::app::TemporalDamage::Full],
+                )
+                .is_full()
+        );
         for invalidation in [
-            super::super::invalidation::UiInvalidation::Paint,
             super::super::invalidation::UiInvalidation::Items,
             super::super::invalidation::UiInvalidation::Structural,
             super::super::invalidation::UiInvalidation::Full,
         ] {
             assert!(
                 model
-                    .select_presentation_damage(invalidation, false)
+                    .select_presentation_damage(
+                        invalidation,
+                        &[super::super::app::TemporalDamage::Status],
+                    )
                     .is_full()
             );
         }

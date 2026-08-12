@@ -437,6 +437,32 @@ pub struct FrameLayout {
     composer_content: Rect,
 }
 
+impl FrameLayout {
+    /// Return the transcript body area.
+    #[must_use]
+    pub const fn body(self) -> Rect {
+        self.body
+    }
+
+    /// Return the animated latest-content bar area, when visible.
+    #[must_use]
+    pub const fn latest_bar(self) -> Option<Rect> {
+        self.latest_bar
+    }
+
+    /// Return the status-line area.
+    #[must_use]
+    pub const fn status(self) -> Rect {
+        self.status
+    }
+
+    /// Return the composer panel area.
+    #[must_use]
+    pub const fn composer(self) -> Rect {
+        self.composer
+    }
+}
+
 /// Compute the transcript area for a full terminal frame.
 #[must_use]
 pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
@@ -482,45 +508,69 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
 }
 
 /// Render one TUI frame after [`prepare_frame`] has synchronized projections.
+#[cfg(test)]
 pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLayout) {
+    render_prepared_damage(app, frame, layout, |_| true);
+}
+
+/// Render only prepared layout regions selected by terminal-space damage.
+pub fn render_prepared_damage(
+    app: &mut BmuxApp,
+    frame: &mut Frame<'_>,
+    layout: FrameLayout,
+    intersects: impl Fn(Rect) -> bool,
+) {
     if layout.area.is_empty() {
         return;
     }
 
-    frame.fill(layout.area, " ", app.presented_theme().canvas);
-    app.transcript_markdown_cache().retain_resident_iter(
-        app.transcript().iter(),
-        app.transcript_projection_revision(),
-    );
     let theme = TuiTheme::for_app(app);
-    render_header(app, layout.header, frame, theme);
-    render_composer(app, layout.composer, frame, theme);
-    let focused_regions = transcript_markdown_regions(app, layout.body);
-    if app.begin_markdown_semantics_reconciliation(layout.body.width) {
-        let footnote_rows = transcript_markdown_footnote_rows(app, layout.body.width);
-        app.reconcile_markdown_footnote_rows(footnote_rows);
-        let fragment_rows = transcript_markdown_fragment_rows(app, layout.body.width);
-        app.reconcile_markdown_fragments(fragment_rows);
-        let resident_details = transcript_markdown_details_ids(app, layout.body.width);
-        app.reconcile_markdown_details(&resident_details);
+    if intersects(layout.header) {
+        frame.fill(layout.header, " ", app.presented_theme().canvas);
+        render_header(app, layout.header, frame, theme);
     }
-    let mut visible = Vec::new();
-    let mut seen_ids = std::collections::BTreeSet::new();
-    for region in focused_regions {
-        if seen_ids.insert(region.contribution_id.clone()) {
-            visible.push(crate::markdown_interaction::VisibleMarkdownContribution {
-                id: region.contribution_id,
-                kind: region.contribution_kind,
-            });
+    if intersects(layout.composer) {
+        frame.fill(layout.composer, " ", app.presented_theme().canvas);
+        render_composer(app, layout.composer, frame, theme);
+    }
+    if intersects(layout.body) {
+        frame.fill(layout.body, " ", app.presented_theme().canvas);
+        app.transcript_markdown_cache().retain_resident_iter(
+            app.transcript().iter(),
+            app.transcript_projection_revision(),
+        );
+        let focused_regions = transcript_markdown_regions(app, layout.body);
+        if app.begin_markdown_semantics_reconciliation(layout.body.width) {
+            let footnote_rows = transcript_markdown_footnote_rows(app, layout.body.width);
+            app.reconcile_markdown_footnote_rows(footnote_rows);
+            let fragment_rows = transcript_markdown_fragment_rows(app, layout.body.width);
+            app.reconcile_markdown_fragments(fragment_rows);
+            let resident_details = transcript_markdown_details_ids(app, layout.body.width);
+            app.reconcile_markdown_details(&resident_details);
         }
+        let mut visible = Vec::new();
+        let mut seen_ids = std::collections::BTreeSet::new();
+        for region in focused_regions {
+            if seen_ids.insert(region.contribution_id.clone()) {
+                visible.push(crate::markdown_interaction::VisibleMarkdownContribution {
+                    id: region.contribution_id,
+                    kind: region.contribution_kind,
+                });
+            }
+        }
+        app.reconcile_markdown_interactions(visible);
+        render_body(app, layout.body, frame);
+        render_markdown_source_view(app, layout.body, frame);
     }
-    app.reconcile_markdown_interactions(visible);
-    render_body(app, layout.body, frame);
-    render_markdown_source_view(app, layout.body, frame);
-    if let Some(latest_bar) = layout.latest_bar {
+    if let Some(latest_bar) = layout.latest_bar
+        && intersects(latest_bar)
+    {
         render_latest_bar(app, latest_bar, frame, Instant::now());
     }
-    render_status(app, layout.status, frame, theme);
+    if intersects(layout.status) {
+        frame.fill(layout.status, " ", app.presented_theme().canvas);
+        render_status(app, layout.status, frame, theme);
+    }
 }
 
 impl FrameLayout {
@@ -5063,6 +5113,11 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: 
         .vertical_scroll(app.composer_scroll_offset_for_render())
         .cursor_visible(app.cursor_visible())
         .render(inner, frame);
+    if !app.cursor_visible() {
+        frame.set_cursor(bmux_tui::frame::Cursor::hidden(
+            bmux_tui::geometry::Point::new(inner.x, inner.y),
+        ));
+    }
 }
 
 fn muted_style() -> Style {

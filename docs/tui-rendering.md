@@ -214,9 +214,10 @@ Semantic events continue to update application state immediately. The cadence li
 
 BMUX `Terminal` retains the previous frame and reports `DrawStats` from its ANSI cell-diff flush.
 Bcode records `tui.frame.changed_cells` and `tui.frame.full_repaint_total`; repeated same-size draws
-therefore use BMUX's retained-buffer changed-cell transport, while resize or explicit backend reset
-may repaint fully. Custom dirty-region transport is not justified unless production telemetry shows
-changed-cell amplification beyond the existing item-scoped layout and BMUX cell diff.
+therefore use BMUX's retained-buffer changed-cell transport. Stable timer and animation updates also
+use bounded terminal-space damage so Bcode composes only the affected chrome or transcript viewport,
+while resize, structural change, theme transition, or explicit backend reset may repaint fully.
+Production telemetry remains the guard against changed-cell or regional-composition amplification.
 
 ## Projection and presentation boundedness
 
@@ -224,12 +225,16 @@ Markdown projections are cached by item identity, canonical revision, and comple
 Each resident item keeps the current projection and at most eight variants; resident reconciliation,
 revision replacement, and generation checks prevent stale or incompatible results from being used.
 
-Bcode owns semantic invalidation. Only cursor-blink paint over a known composer region is localized;
-unknown, structural, transcript, plugin, theme, resize, reset, route, and onboarding changes use full
-damage. BMUX clips and bounds generic terminal regions and transactionally commits cells, hit regions,
-cursor state, and image state only after output succeeds. This retained presentation is process-local
-and does not define transport retention, acknowledgment, replay, conflict handling, reconnect safety,
-or durable resume.
+Bcode owns semantic invalidation and maps stable temporal work to terminal-space damage. Cursor blink
+repaints the composer, activity/spinner cadence repaints the status row, the active latest-content
+animation repaints its one-row bar, and elapsed tool labels or scroll animation repaint the transcript
+viewport. BMUX coalesces those bounded regions and retains cells plus cursor, focus, hit, and image
+metadata outside them. Structural changes, item row-count uncertainty, theme transitions, resize,
+reset, route changes, onboarding, overlays, and plugin surfaces still use full damage. Animation phase
+is derived from monotonic elapsed time so delayed or coalesced frames catch up rather than slowing;
+the final latest-bar deadline repaints its stable state before scheduling stops. This process-local
+retained presentation does not define transport retention, acknowledgment, replay, conflict handling,
+reconnect safety, or durable resume.
 
 ## Performance verification
 

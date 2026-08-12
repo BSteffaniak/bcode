@@ -51,6 +51,8 @@ const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
 const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
 const THEME_TRANSITION_INVALIDATION_KEY: &str = "theme-transition";
+const ACTIVITY_ANIMATION_INVALIDATION_KEY: &str = "activity-animation";
+const ACTIVITY_ANIMATION_FRAME: Duration = Duration::from_millis(100);
 const THEME_TRANSITION_FRAME: Duration = Duration::from_millis(16);
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 const TOOL_ELAPSED_INVALIDATION_PREFIX: &str = "tool-elapsed";
@@ -76,6 +78,21 @@ pub enum KeyActivationOutcome {
     Pending,
 }
 
+/// Terminal presentation region affected by one timed invalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TemporalDamage {
+    /// Composer panel, including cursor paint.
+    Composer,
+    /// Status/activity chrome.
+    Status,
+    /// Animated new-content indicator.
+    LatestBar,
+    /// Complete transcript viewport.
+    Transcript,
+    /// Unknown or global presentation region.
+    Full,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscriptScrollAnimation {
     start_top_row: usize,
@@ -97,7 +114,13 @@ impl TranscriptScrollAnimation {
     }
 
     fn advance_frame(&mut self, now: Instant) {
-        self.next_frame_at = now + TRANSCRIPT_SCROLL_ANIMATION_FRAME;
+        let elapsed = now.saturating_duration_since(self.started_at);
+        let frame_count = elapsed.as_nanos() / TRANSCRIPT_SCROLL_ANIMATION_FRAME.as_nanos().max(1);
+        let next_offset = TRANSCRIPT_SCROLL_ANIMATION_FRAME
+            .as_nanos()
+            .saturating_mul(frame_count.saturating_add(1));
+        self.next_frame_at =
+            self.started_at + Duration::from_nanos(u64::try_from(next_offset).unwrap_or(u64::MAX));
     }
 
     fn top_row_at(self, now: Instant) -> usize {
@@ -196,7 +219,15 @@ impl ThemeTransitionState {
     fn update(&mut self, now: Instant) -> Color {
         self.displayed_accent = self.accent_at(now);
         if self.is_active(now) {
-            self.next_frame_at = Some(now + THEME_TRANSITION_FRAME);
+            let elapsed = now.saturating_duration_since(self.started_at);
+            let frame_count = elapsed.as_nanos() / THEME_TRANSITION_FRAME.as_nanos().max(1);
+            let next_offset = THEME_TRANSITION_FRAME
+                .as_nanos()
+                .saturating_mul(frame_count.saturating_add(1));
+            self.next_frame_at = Some(
+                self.started_at
+                    + Duration::from_nanos(u64::try_from(next_offset).unwrap_or(u64::MAX)),
+            );
         } else {
             self.next_frame_at = None;
         }
@@ -2695,6 +2726,7 @@ impl BmuxApp {
             self.scroll_mode = TranscriptScrollMode::BottomFollow;
             self.latest_hidden_activity_at = None;
             self.latest_hidden_activity_burst = 0;
+            self.latest_bar_next_frame_at = None;
         } else {
             self.scroll_mode = TranscriptScrollMode::ManualDetached;
         }
@@ -2709,6 +2741,7 @@ impl BmuxApp {
         self.scroll_mode = TranscriptScrollMode::BottomFollow;
         self.latest_hidden_activity_at = None;
         self.latest_hidden_activity_burst = 0;
+        self.latest_bar_next_frame_at = None;
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.pending_assistant_stream_anchor = false;
         self.pending_visual_overflow_bottom = None;
@@ -2813,6 +2846,7 @@ impl BmuxApp {
             if !self.newer_transcript_content_below() {
                 self.latest_hidden_activity_at = None;
                 self.latest_hidden_activity_burst = 0;
+                self.latest_bar_next_frame_at = None;
             }
             return;
         };
@@ -2834,12 +2868,14 @@ impl BmuxApp {
             if !self.newer_transcript_content_below() {
                 self.latest_hidden_activity_at = None;
                 self.latest_hidden_activity_burst = 0;
+                self.latest_bar_next_frame_at = None;
             }
             return;
         }
         self.scroll_mode = TranscriptScrollMode::BottomFollow;
         self.latest_hidden_activity_at = None;
         self.latest_hidden_activity_burst = 0;
+        self.latest_bar_next_frame_at = None;
         self.viewport.scroll_to_bottom(&mut self.older_history);
     }
 
@@ -2857,10 +2893,10 @@ impl BmuxApp {
             )
             .max(1);
         self.latest_hidden_activity_at = Some(now);
-        if self.latest_bar_next_frame_at.is_none_or(|at| at <= now) {
-            self.latest_bar_next_frame_at =
-                Some(now + latest_bar_active_frame_duration(self.latest_hidden_activity_burst));
-        }
+        self.latest_bar_animation_started_at = now;
+        let frame_duration = latest_bar_active_frame_duration(self.latest_hidden_activity_burst);
+        let next_frame = next_latest_bar_frame_at(now, now, frame_duration);
+        self.latest_bar_next_frame_at = Some(next_frame);
         let velocity_rows_per_second = u128::try_from(changed_rows)
             .unwrap_or(u128::MAX)
             .saturating_mul(1_000)
@@ -3434,7 +3470,6 @@ impl BmuxApp {
             ));
         }
         if self.newer_transcript_content_below()
-            && self.latest_bar_active(now)
             && let Some(next_frame_at) = self.latest_bar_next_frame_at
         {
             requests.push(InvalidationRequest::new(
@@ -3448,6 +3483,12 @@ impl BmuxApp {
                 next_frame_at,
             ));
         }
+        if self.activity_animation_active() {
+            requests.push(InvalidationRequest::new(
+                InvalidationKey::new(ACTIVITY_ANIMATION_INVALIDATION_KEY),
+                now + ACTIVITY_ANIMATION_FRAME,
+            ));
+        }
         requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
         requests
     }
@@ -3458,19 +3499,37 @@ impl BmuxApp {
         keys: &[InvalidationKey],
         now: Instant,
     ) -> UiInvalidation {
-        keys.iter().fold(UiInvalidation::None, |invalidation, key| {
+        self.handle_invalidations_with_damage(keys, now).0
+    }
+
+    /// Handle timed invalidations and return their renderer-local terminal damage classes.
+    pub fn handle_invalidations_with_damage(
+        &mut self,
+        keys: &[InvalidationKey],
+        now: Instant,
+    ) -> (UiInvalidation, Vec<TemporalDamage>) {
+        let mut damage = BTreeSet::new();
+        let invalidation = keys.iter().fold(UiInvalidation::None, |invalidation, key| {
             if self.cursor.handle_invalidation(key, now) {
+                damage.insert(TemporalDamage::Composer);
                 invalidation.merge(UiInvalidation::Paint)
             } else if is_transcript_scroll_animation_invalidation(key) {
                 if self.handle_transcript_scroll_animation(now) {
-                    invalidation.merge(UiInvalidation::Structural)
+                    damage.insert(TemporalDamage::Transcript);
+                    invalidation.merge(UiInvalidation::Paint)
                 } else {
                     invalidation
                 }
             } else if is_latest_bar_animation_invalidation(key) {
-                self.latest_bar_next_frame_at = self.latest_bar_active(now).then(|| {
-                    now + latest_bar_active_frame_duration(self.latest_hidden_activity_burst)
+                let active = self.latest_bar_active(now);
+                self.latest_bar_next_frame_at = active.then(|| {
+                    next_latest_bar_frame_at(
+                        self.latest_bar_animation_started_at,
+                        now,
+                        latest_bar_active_frame_duration(self.latest_hidden_activity_burst),
+                    )
                 });
+                damage.insert(TemporalDamage::LatestBar);
                 invalidation.merge(UiInvalidation::Paint)
             } else if is_theme_transition_invalidation(key) {
                 self.update_theme_animation(now);
@@ -3478,15 +3537,33 @@ impl BmuxApp {
                     self.theme_transition.finish();
                     self.presented_theme = self.target_theme.presented(self.target_theme.accent);
                 }
+                damage.insert(TemporalDamage::Full);
                 invalidation.merge(UiInvalidation::Paint)
+            } else if is_activity_animation_invalidation(key) {
+                if self.activity_animation_active() {
+                    damage.insert(TemporalDamage::Status);
+                    invalidation.merge(UiInvalidation::Paint)
+                } else {
+                    invalidation
+                }
             } else if let Some(invocation_id) = tool_elapsed_invalidation_invocation_id(key) {
                 self.elapsed_layout_revision = self.elapsed_layout_revision.saturating_add(1);
                 self.elapsed_dirty_visuals.insert(invocation_id.to_owned());
-                invalidation.merge(UiInvalidation::Items)
+                damage.insert(TemporalDamage::Transcript);
+                invalidation.merge(UiInvalidation::Paint)
             } else {
                 invalidation
             }
-        })
+        });
+        (invalidation, damage.into_iter().collect())
+    }
+
+    const fn activity_animation_active(&self) -> bool {
+        !matches!(self.activity, ActivityState::Idle)
+            || matches!(
+                self.daemon_connection,
+                DaemonConnectionState::Connecting | DaemonConnectionState::Starting
+            )
     }
 
     fn latest_bar_active(&self, now: Instant) -> bool {
@@ -3507,6 +3584,8 @@ impl BmuxApp {
                 }
                 TranscriptScrollMode::BottomFollow => {
                     self.latest_hidden_activity_at = None;
+                    self.latest_hidden_activity_burst = 0;
+                    self.latest_bar_next_frame_at = None;
                     self.viewport.scroll_to_bottom(&mut self.older_history);
                 }
                 TranscriptScrollMode::AnchoredToEntry { .. }
@@ -3583,15 +3662,26 @@ impl BmuxApp {
         self.sync_theme_target(Instant::now());
     }
 
+    fn visible_transcript_entry_indexes(&self) -> BTreeSet<usize> {
+        let height = self.viewport.height();
+        if height == 0 {
+            return (0..self.transcript().len()).collect();
+        }
+        self.transcript_layout
+            .visible_transcript_entry_indexes(self.transcript_top_row(height), height)
+    }
+
     fn tool_elapsed_invalidation_requests(
         &self,
         now: Instant,
         now_system: SystemTime,
     ) -> impl Iterator<Item = InvalidationRequest> {
+        let visible = self.visible_transcript_entry_indexes();
         self.transcript
             .iter()
-            .filter_map(move |item| {
-                if !item.tool_is_active() {
+            .enumerate()
+            .filter_map(move |(index, item)| {
+                if !visible.contains(&index) || !item.tool_is_active() {
                     return None;
                 }
                 let invocation_id = item.visual_invocation_id()?;
@@ -4294,6 +4384,13 @@ fn latest_bar_active_frame_duration(burst: u8) -> Duration {
     )
 }
 
+fn next_latest_bar_frame_at(started_at: Instant, now: Instant, frame: Duration) -> Instant {
+    let frame_nanos = frame.as_nanos().max(1);
+    let frame_count = now.saturating_duration_since(started_at).as_nanos() / frame_nanos;
+    let next_offset = frame_nanos.saturating_mul(frame_count.saturating_add(1));
+    started_at + Duration::from_nanos(u64::try_from(next_offset).unwrap_or(u64::MAX))
+}
+
 fn tool_elapsed_invalidation_invocation_id(key: &InvalidationKey) -> Option<&str> {
     key.as_str()
         .strip_prefix(TOOL_ELAPSED_INVALIDATION_PREFIX)?
@@ -4307,6 +4404,10 @@ fn is_latest_bar_animation_invalidation(key: &InvalidationKey) -> bool {
 
 fn is_theme_transition_invalidation(key: &InvalidationKey) -> bool {
     key.as_str() == THEME_TRANSITION_INVALIDATION_KEY
+}
+
+fn is_activity_animation_invalidation(key: &InvalidationKey) -> bool {
+    key.as_str() == ACTIVITY_ANIMATION_INVALIDATION_KEY
 }
 
 fn is_transcript_scroll_animation_invalidation(key: &InvalidationKey) -> bool {
@@ -5443,7 +5544,56 @@ mod tests {
     }
 
     #[test]
-    fn tool_elapsed_invalidation_targets_structural_projection_entry() {
+    fn animation_deadlines_catch_up_from_monotonic_origin() {
+        let started_at = Instant::now();
+        let mut scroll = TranscriptScrollAnimation::new(0, 10, started_at);
+        let delayed = started_at + Duration::from_millis(73);
+        scroll.advance_frame(delayed);
+        assert_eq!(scroll.next_frame_at, started_at + Duration::from_millis(80));
+        assert!(scroll.next_frame_at > delayed);
+
+        assert_eq!(
+            next_latest_bar_frame_at(started_at, delayed, Duration::from_millis(40)),
+            started_at + Duration::from_millis(80)
+        );
+    }
+
+    #[test]
+    fn temporal_invalidations_report_precise_animation_damage() {
+        let now = Instant::now();
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_activity(ActivityState::PreparingModelRequest);
+
+        let (activity, damage) = app.handle_invalidations_with_damage(
+            &[InvalidationKey::new(ACTIVITY_ANIMATION_INVALIDATION_KEY)],
+            now,
+        );
+        assert_eq!(activity, UiInvalidation::Paint);
+        assert_eq!(damage, [TemporalDamage::Status]);
+
+        app.latest_hidden_activity_at = Some(now);
+        app.latest_hidden_activity_burst = 4;
+        app.latest_bar_animation_started_at = now;
+        app.latest_bar_next_frame_at = Some(now);
+        let (latest, damage) = app.handle_invalidations_with_damage(
+            &[InvalidationKey::new(LATEST_BAR_ANIMATION_INVALIDATION_KEY)],
+            now + Duration::from_millis(50),
+        );
+        assert_eq!(latest, UiInvalidation::Paint);
+        assert_eq!(damage, [TemporalDamage::LatestBar]);
+        assert!(app.latest_bar_next_frame_at.is_some());
+
+        let (finished, damage) = app.handle_invalidations_with_damage(
+            &[InvalidationKey::new(LATEST_BAR_ANIMATION_INVALIDATION_KEY)],
+            now + LATEST_BAR_ACTIVE_WINDOW,
+        );
+        assert_eq!(finished, UiInvalidation::Paint);
+        assert_eq!(damage, [TemporalDamage::LatestBar]);
+        assert!(app.latest_bar_next_frame_at.is_none());
+    }
+
+    #[test]
+    fn tool_elapsed_invalidation_targets_visual_projection_entry() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         let before = app.elapsed_layout_revision;
         let invalidation = app.handle_invalidations(
@@ -5453,7 +5603,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(invalidation, UiInvalidation::Items);
+        assert_eq!(invalidation, UiInvalidation::Paint);
         assert_eq!(app.elapsed_layout_revision, before.saturating_add(1));
         assert_eq!(
             app.drain_elapsed_dirty_visuals(),
