@@ -24,6 +24,64 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Request-shaping capabilities for one Responses deployment.
+///
+/// Provider integrations differ in which Responses features an endpoint accepts. Rather than
+/// exposing provider-private configuration or dialect enums to this crate, each integration
+/// resolves its own configuration into this neutral description of the request shape it needs.
+///
+/// Every field describes an observable property of the request, not the identity of a provider.
+/// Do not add provider-, product-, or dialect-named fields here.
+///
+/// These flags are genuinely independent request-shape facts rather than a state machine, so they
+/// are modeled the same way as `CatalogCapabilities` in `bcode_model_catalog_models`.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResponsesRequestCapabilities {
+    /// Endpoint accepts `previous_response_id` for server-side conversation reuse.
+    pub supports_previous_response_id: bool,
+    /// Endpoint accepts a `parallel_tool_calls` directive.
+    pub supports_parallel_tool_calls: bool,
+    /// Endpoint accepts a `prompt_cache_key` partition key.
+    pub supports_prompt_cache_key: bool,
+    /// Endpoint accepts an explicit `max_output_tokens` ceiling.
+    pub supports_max_output_tokens: bool,
+    /// Endpoint accepts a `text.verbosity` directive.
+    pub supports_text_verbosity: bool,
+    /// Endpoint accepts a `reasoning.context` directive.
+    pub supports_reasoning_context: bool,
+    /// Endpoint requires an explicit `strict` flag on tool definitions.
+    ///
+    /// When `false`, tool definitions omit `strict` entirely.
+    pub requires_explicit_tool_strictness: bool,
+    /// Endpoint replays opaque provider reasoning items as conversation input.
+    pub replays_provider_reasoning_items: bool,
+    /// Endpoint projects previously reused history instead of resending it.
+    pub projects_reused_history: bool,
+}
+
+impl ResponsesRequestCapabilities {
+    /// Capabilities for a deployment that accepts the documented public Responses request shape.
+    ///
+    /// This is the baseline for API-key style deployments: an explicit output ceiling, parallel
+    /// tool calls, and explicit tool strictness are all accepted, while provider-state replay is
+    /// not used.
+    #[must_use]
+    pub const fn public_responses_api() -> Self {
+        Self {
+            supports_previous_response_id: true,
+            supports_parallel_tool_calls: true,
+            supports_prompt_cache_key: false,
+            supports_max_output_tokens: true,
+            supports_text_verbosity: false,
+            supports_reasoning_context: false,
+            requires_explicit_tool_strictness: true,
+            replays_provider_reasoning_items: false,
+            projects_reused_history: true,
+        }
+    }
+}
+
 /// Streamed request body for the `OpenAI` Responses API.
 ///
 /// Field order matches the documented request shape. Optional fields are omitted entirely when

@@ -37,8 +37,8 @@ use bcode_model_provider_runtime::{
 };
 use bcode_openai_responses::{
     ResponsesContent, ResponsesContextManagement, ResponsesInputItem, ResponsesNativeSearchBody,
-    ResponsesReasoningOptions, ResponsesReasoningSummary, ResponsesRequest, ResponsesTextFormat,
-    ResponsesTextOptions, ResponsesTool,
+    ResponsesReasoningOptions, ResponsesReasoningSummary, ResponsesRequest,
+    ResponsesRequestCapabilities, ResponsesTextFormat, ResponsesTextOptions, ResponsesTool,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
@@ -1464,6 +1464,28 @@ impl OpenAiCompatibleDialect {
 
     const fn allows_missing_stream_content_type(self) -> bool {
         matches!(self, Self::ChatGptCodex)
+    }
+
+    /// Resolve this dialect into the neutral Responses request-shape description.
+    ///
+    /// Each field mirrors the behavior this dialect previously expressed inline, so the shared
+    /// wire-format crate never needs to know which dialect produced the request.
+    const fn responses_request_capabilities(self) -> ResponsesRequestCapabilities {
+        let codex = self.uses_codex_request_shape();
+        ResponsesRequestCapabilities {
+            supports_previous_response_id: self.supports_previous_response_id(),
+            supports_parallel_tool_calls: self.supports_parallel_tool_policy(),
+            // Codex partitions the prompt cache by session id; other deployments do not send a key.
+            supports_prompt_cache_key: codex,
+            // Codex rejects an explicit output ceiling.
+            supports_max_output_tokens: !codex,
+            supports_text_verbosity: codex,
+            supports_reasoning_context: codex,
+            // Codex omits `strict` on tool definitions; other deployments send `strict: false`.
+            requires_explicit_tool_strictness: !codex,
+            replays_provider_reasoning_items: codex,
+            projects_reused_history: self.projects_reused_history(),
+        }
     }
 
     const fn metadata_value(self) -> &'static str {
@@ -5452,10 +5474,11 @@ fn build_responses_request(
     model_id: &str,
 ) -> Result<serde_json::Value, ProviderError> {
     let previous_response_id = responses_previous_response_id(settings, request);
+    let capabilities = settings.dialect.responses_request_capabilities();
     let mut projection = responses_projection(
         request,
         responses_instruction_strategy(settings),
-        settings.dialect.projects_reused_history() && previous_response_id.is_some(),
+        capabilities.projects_reused_history && previous_response_id.is_some(),
         settings.dialect,
     );
     prepend_provider_reasoning_state(&mut projection.input, settings.dialect, request);
@@ -5482,7 +5505,7 @@ fn build_responses_request(
         tools: model_tools_to_responses_tools(request, settings.dialect)?,
         tool_choice: openai_tool_choice(request, true),
         parallel_tool_calls: if !request.tools.is_empty()
-            && settings.dialect.supports_parallel_tool_policy()
+            && capabilities.supports_parallel_tool_calls
         {
             request.tool_call_policy.parallel
         } else {
@@ -5491,12 +5514,12 @@ fn build_responses_request(
         text: responses_text_options(settings, request)?,
         reasoning: responses_reasoning_options(settings, request),
         include: responses_include(settings.dialect.reasoning_request_shape(), request),
-        prompt_cache_key: settings
-            .dialect
-            .uses_codex_request_shape()
+        prompt_cache_key: capabilities
+            .supports_prompt_cache_key
             .then(|| request.session_id.to_string()),
         temperature: request.parameters.temperature,
-        max_output_tokens: (!settings.dialect.uses_codex_request_shape())
+        max_output_tokens: capabilities
+            .supports_max_output_tokens
             .then_some(request.parameters.max_output_tokens)
             .flatten(),
         top_p: request.parameters.top_p,
@@ -5663,7 +5686,11 @@ fn responses_text_options(
             })
         })
         .transpose()?;
-    let verbosity = settings.dialect.uses_codex_request_shape().then_some("low");
+    let verbosity = settings
+        .dialect
+        .responses_request_capabilities()
+        .supports_text_verbosity
+        .then_some("low");
     Ok(
         (format.is_some() || verbosity.is_some()).then_some(ResponsesTextOptions {
             format,
@@ -5689,7 +5716,8 @@ fn responses_reasoning_options(
     let summary = request.parameters.reasoning_summary.clone();
     let context = settings
         .dialect
-        .uses_codex_request_shape()
+        .responses_request_capabilities()
+        .supports_reasoning_context
         .then_some("current_turn");
     (effort.is_some() || summary.is_some() || context.is_some()).then_some(
         ResponsesReasoningOptions {
@@ -5826,7 +5854,10 @@ fn has_provider_reasoning_state(
     dialect: OpenAiCompatibleDialect,
     request: &ModelTurnRequest,
 ) -> bool {
-    if !dialect.uses_codex_request_shape() {
+    if !dialect
+        .responses_request_capabilities()
+        .replays_provider_reasoning_items
+    {
         return false;
     }
     request
@@ -5847,7 +5878,10 @@ fn prepend_provider_reasoning_state(
     dialect: OpenAiCompatibleDialect,
     request: &ModelTurnRequest,
 ) {
-    if !dialect.uses_codex_request_shape() {
+    if !dialect
+        .responses_request_capabilities()
+        .replays_provider_reasoning_items
+    {
         return;
     }
     let Some(provider_state) = request.conversation_reuse.provider_state.as_ref() else {
@@ -6425,10 +6459,13 @@ fn model_tools_to_responses_tools(
             name: tool.provider_name,
             description: tool.description,
             parameters: tool.parameters,
-            strict: if dialect.uses_codex_request_shape() {
-                None
-            } else {
+            strict: if dialect
+                .responses_request_capabilities()
+                .requires_explicit_tool_strictness
+            {
                 Some(false)
+            } else {
+                None
             },
         })
         .collect())
@@ -11515,6 +11552,39 @@ mod tests {
                 .drain()
                 .iter()
                 .any(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { .. }))
+        );
+    }
+
+    #[test]
+    fn dialect_capabilities_describe_documented_request_shapes() {
+        // These mappings decide the emitted Responses request shape. Pinning them keeps a future
+        // edit from silently changing wire behavior for an existing dialect.
+        let public = OpenAiCompatibleDialect::ResponsesApi.responses_request_capabilities();
+        assert_eq!(
+            public,
+            ResponsesRequestCapabilities::public_responses_api(),
+            "the public Responses dialect must match the documented public request shape"
+        );
+
+        let codex = OpenAiCompatibleDialect::ChatGptCodex.responses_request_capabilities();
+        assert!(
+            codex.supports_prompt_cache_key,
+            "Codex partitions the prompt cache by session"
+        );
+        assert!(
+            !codex.supports_max_output_tokens,
+            "Codex rejects an explicit output ceiling"
+        );
+        assert!(codex.supports_text_verbosity);
+        assert!(codex.supports_reasoning_context);
+        assert!(
+            !codex.requires_explicit_tool_strictness,
+            "Codex omits `strict` on tool definitions"
+        );
+        assert!(codex.replays_provider_reasoning_items);
+        assert!(
+            !codex.supports_previous_response_id,
+            "Codex reuses conversations through provider state, not response ids"
         );
     }
 
