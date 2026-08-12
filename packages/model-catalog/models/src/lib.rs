@@ -415,6 +415,8 @@ pub enum CatalogApiSurface {
     InvokeModel,
     /// Anthropic Messages API surface (`/anthropic/v1/messages`, "bedrock-mantle").
     Messages,
+    /// `OpenAI` Responses API surface (for example `/openai/v1/responses`, "bedrock-mantle").
+    Responses,
 }
 
 /// Provider-native extended-thinking control shape.
@@ -493,6 +495,36 @@ mod tests {
         let runtime = ModelSupportTarget::new("openai", "api_key", "responses_api", Some("bcode"));
 
         assert!(generic.matches(&runtime));
+    }
+
+    #[test]
+    fn api_surface_round_trips_every_known_wire_value() {
+        for (surface, wire) in [
+            (CatalogApiSurface::Converse, "converse"),
+            (CatalogApiSurface::InvokeModel, "invoke_model"),
+            (CatalogApiSurface::Messages, "messages"),
+            (CatalogApiSurface::Responses, "responses"),
+        ] {
+            let encoded = serde_json::to_value(surface).expect("serialize api surface");
+            assert_eq!(encoded, serde_json::Value::String(wire.to_string()));
+            let decoded: CatalogApiSurface =
+                serde_json::from_value(encoded).expect("deserialize api surface");
+            assert_eq!(decoded, surface);
+        }
+    }
+
+    #[test]
+    fn unknown_api_surface_is_rejected_rather_than_coerced() {
+        // Unknown future surfaces must fail closed instead of silently decoding as a known
+        // older variant.
+        let error = serde_json::from_value::<CatalogApiSurface>(serde_json::Value::String(
+            "some_future_surface".to_string(),
+        ))
+        .expect_err("unknown api surface must be rejected");
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

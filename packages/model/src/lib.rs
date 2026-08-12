@@ -985,6 +985,8 @@ pub enum ModelApiSurface {
     InvokeModel,
     /// Anthropic Messages API surface (`/anthropic/v1/messages`).
     Messages,
+    /// `OpenAI` Responses API surface (for example `/openai/v1/responses`).
+    Responses,
 }
 
 /// Model picker/list visibility metadata.
@@ -2954,14 +2956,44 @@ pub enum ProviderErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelCatalogPolicy, ModelCatalogSupportHint, ModelFeatureSupport, ModelInfo, ModelList,
-        ModelListAuthority, ModelParameterKey, ModelPricingInfo, ModelPricingSource,
-        ModelPricingUnit, ModelTokenPrice, ModelTurnRequest, ModelVisibility,
+        ModelApiSurface, ModelCatalogPolicy, ModelCatalogSupportHint, ModelFeatureSupport,
+        ModelInfo, ModelList, ModelListAuthority, ModelParameterKey, ModelPricingInfo,
+        ModelPricingSource, ModelPricingUnit, ModelTokenPrice, ModelTurnRequest, ModelVisibility,
         ModelVisibilitySource, NegotiatedFeatureSupport, ParallelToolCallCapabilities,
         ProviderError, ProviderErrorCategory, ProviderErrorSource, ProviderOperationRequirement,
         ProviderRequestContext, ProviderRequestExtension, ProviderTurnEvent, RequestedModelFeature,
         StructuredOutputMode, TokenUsage, ToolCallRequestPolicy, ToolChoice, ToolChoiceMode,
     };
+
+    #[test]
+    fn api_surface_round_trips_every_known_wire_value() {
+        for (surface, wire) in [
+            (ModelApiSurface::Converse, "converse"),
+            (ModelApiSurface::InvokeModel, "invoke_model"),
+            (ModelApiSurface::Messages, "messages"),
+            (ModelApiSurface::Responses, "responses"),
+        ] {
+            let encoded = serde_json::to_value(surface).expect("serialize api surface");
+            assert_eq!(encoded, serde_json::Value::String(wire.to_string()));
+            let decoded: ModelApiSurface =
+                serde_json::from_value(encoded).expect("deserialize api surface");
+            assert_eq!(decoded, surface);
+        }
+    }
+
+    #[test]
+    fn unknown_api_surface_is_rejected_rather_than_coerced() {
+        // `ModelApiSurface` crosses the plugin boundary. An unsupported future surface must be
+        // surfaced as an error instead of being silently interpreted as a known older variant.
+        let error = serde_json::from_value::<ModelApiSurface>(serde_json::Value::String(
+            "some_future_surface".to_string(),
+        ))
+        .expect_err("unknown api surface must be rejected");
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn provider_error_diagnostics_round_trip_and_default_for_older_payloads() {

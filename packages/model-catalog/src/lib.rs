@@ -987,6 +987,9 @@ const fn model_api_surface_from_catalog(
         Some(bcode_model_catalog_models::CatalogApiSurface::Messages) => {
             Some(bcode_model::ModelApiSurface::Messages)
         }
+        Some(bcode_model_catalog_models::CatalogApiSurface::Responses) => {
+            Some(bcode_model::ModelApiSurface::Responses)
+        }
         None => None,
     }
 }
@@ -1630,6 +1633,112 @@ pub fn default_source_dir() -> PathBuf {
 mod tests {
     use super::*;
     use bcode_model::{ModelCacheInfo, ModelCapability, ModelVisibility};
+
+    #[test]
+    fn bedrock_openai_responses_models_resolve_with_region_prefixes() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let provider = catalog
+            .provider("bedrock")
+            .expect("bedrock provider exists");
+
+        // Bare ids, per-region inference-profile prefixes, and the cross-region `global.` prefix
+        // must all resolve to the same catalog entry.
+        for (model_id, expected_entry) in [
+            ("openai.gpt-5.6-sol", "openai.gpt-5.6-sol"),
+            ("us.openai.gpt-5.6-sol", "openai.gpt-5.6-sol"),
+            ("eu.openai.gpt-5.6-terra", "openai.gpt-5.6-terra"),
+            ("apac.openai.gpt-5.6-luna", "openai.gpt-5.6-luna"),
+            ("global.openai.gpt-5.5", "openai.gpt-5.5"),
+            ("us.openai.gpt-5.4", "openai.gpt-5.4"),
+            ("us.openai.gpt-oss-120b", "openai.gpt-oss-120b"),
+            ("us.openai.gpt-oss-20b", "openai.gpt-oss-20b"),
+        ] {
+            let entry = find_provider_model(provider, model_id)
+                .unwrap_or_else(|| panic!("{model_id} should resolve"));
+            assert_eq!(
+                entry.model_id, expected_entry,
+                "{model_id} resolved to the wrong entry"
+            );
+            assert_eq!(
+                entry.api_surface,
+                Some(bcode_model_catalog_models::CatalogApiSurface::Responses),
+                "{model_id} must route through the Responses surface"
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_openai_entries_beat_the_broad_claude_fallback() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let provider = catalog
+            .provider("bedrock")
+            .expect("bedrock provider exists");
+
+        // The provider file carries a broad `*claude*` fallback. OpenAI ids must never land on it.
+        for model_id in [
+            "openai.gpt-5.6-sol",
+            "us.openai.gpt-5.5",
+            "openai.gpt-oss-safeguard-120b",
+        ] {
+            let entry = find_provider_model(provider, model_id)
+                .unwrap_or_else(|| panic!("{model_id} should resolve"));
+            assert!(
+                entry.model_id.starts_with("openai."),
+                "{model_id} resolved to non-OpenAI entry {}",
+                entry.model_id
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_openai_models_carry_documented_limits() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let provider = catalog
+            .provider("bedrock")
+            .expect("bedrock provider exists");
+
+        for (model_id, context_window, max_output_tokens) in [
+            ("openai.gpt-5.6-sol", 1_000_000, 128_000),
+            ("openai.gpt-5.6-terra", 1_000_000, 128_000),
+            ("openai.gpt-5.6-luna", 1_000_000, 128_000),
+            ("openai.gpt-5.5", 272_000, 100_000),
+            ("openai.gpt-5.4", 272_000, 100_000),
+            ("openai.gpt-oss-120b", 128_000, 16_000),
+            ("openai.gpt-oss-20b", 128_000, 16_000),
+        ] {
+            let entry = provider
+                .models
+                .get(model_id)
+                .unwrap_or_else(|| panic!("{model_id} should exist"));
+            assert_eq!(entry.context_window, Some(context_window), "{model_id}");
+            assert_eq!(
+                entry.max_output_tokens,
+                Some(max_output_tokens),
+                "{model_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_openai_safeguard_models_do_not_claim_the_responses_surface() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let provider = catalog
+            .provider("bedrock")
+            .expect("bedrock provider exists");
+
+        // AWS model cards report `Responses: No` for the Safeguard variants; they are reachable
+        // over Converse instead, so they must not be pinned to the Responses surface.
+        for model_id in [
+            "openai.gpt-oss-safeguard-120b",
+            "openai.gpt-oss-safeguard-20b",
+        ] {
+            let entry = provider
+                .models
+                .get(model_id)
+                .unwrap_or_else(|| panic!("{model_id} should exist"));
+            assert_eq!(entry.api_surface, None, "{model_id}");
+        }
+    }
 
     #[test]
     fn catalog_loads_provider_error_handling_metadata() {
