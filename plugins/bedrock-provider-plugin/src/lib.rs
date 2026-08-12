@@ -50,8 +50,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROVIDER_ID: &str = "bcode.bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
-const DEFAULT_MANTLE_ANTHROPIC_BASE_URL_PREFIX: &str = "https://bedrock-mantle.";
-const DEFAULT_MANTLE_ANTHROPIC_BASE_URL_SUFFIX: &str = ".api.aws/anthropic";
+const DEFAULT_MANTLE_BASE_URL_PREFIX: &str = "https://bedrock-mantle.";
 const MODEL_DISCOVERY_TTL: Duration = Duration::from_mins(10);
 const COMPATIBILITY_CACHE_VERSION: u8 = 1;
 const COMPATIBILITY_CACHE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -413,6 +412,16 @@ async fn stream_bedrock_turn_inner(
     if transport == BedrockTransport::MantleAnthropic {
         return stream_mantle_anthropic_turn(request, &settings, &selection, turn, name_map).await;
     }
+    if transport == BedrockTransport::MantleOpenAi {
+        // The Responses streaming adapter is not implemented yet. Fail closed rather than falling
+        // through to Converse, which cannot serve these models at all.
+        return Err(provider_error(
+            "bedrock_mantle_openai_unsupported",
+            ProviderErrorCategory::Config,
+            "Bedrock Mantle OpenAI (Responses) streaming is not implemented yet; \
+             use 'mantle_anthropic' or 'bedrock_runtime'",
+        ));
+    }
     let client = bedrock_client(&settings).await;
     if request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Messages) {
         return stream_bedrock_messages_turn(request, &client, &selection, turn, name_map).await;
@@ -552,11 +561,52 @@ async fn stream_mantle_anthropic_turn(
     }))
 }
 
-fn mantle_anthropic_messages_endpoint(settings: &Settings) -> Result<String, ProviderError> {
+/// One Bedrock Mantle API flavor.
+///
+/// Mantle exposes provider-native surfaces under distinct path prefixes on the same regional
+/// host. Each flavor pairs the default base-URL suffix with the request path appended to it, so a
+/// new surface is added as data rather than as another hardcoded endpoint builder.
+///
+/// Note the `OpenAI` surface lives on `/openai/v1/responses`, which AWS documents as intentionally
+/// different from the `/v1/responses` path used by other models on the responses endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MantleFlavor {
+    /// Anthropic Messages surface (`/anthropic` + `/v1/messages`).
+    Anthropic,
+    /// `OpenAI` Responses surface (`/openai/v1` + `/responses`).
+    OpenAi,
+}
+
+impl MantleFlavor {
+    /// Default base-URL path suffix for this flavor.
+    const fn base_url_suffix(self) -> &'static str {
+        match self {
+            Self::Anthropic => ".api.aws/anthropic",
+            Self::OpenAi => ".api.aws/openai/v1",
+        }
+    }
+
+    /// Request path appended to the resolved base URL.
+    const fn request_path(self) -> &'static str {
+        match self {
+            Self::Anthropic => "/v1/messages",
+            Self::OpenAi => "/responses",
+        }
+    }
+}
+
+/// Build the Mantle endpoint for one API flavor.
+///
+/// # Errors
+///
+/// Returns an error when the configured base URL cannot be parsed, or when it uses a
+/// non-HTTPS scheme for a non-loopback host.
+fn mantle_endpoint(settings: &Settings, flavor: MantleFlavor) -> Result<String, ProviderError> {
     let region = settings.region.as_deref().unwrap_or(DEFAULT_REGION);
     let base_url = settings.mantle_base_url.clone().unwrap_or_else(|| {
         format!(
-            "{DEFAULT_MANTLE_ANTHROPIC_BASE_URL_PREFIX}{region}{DEFAULT_MANTLE_ANTHROPIC_BASE_URL_SUFFIX}"
+            "{DEFAULT_MANTLE_BASE_URL_PREFIX}{region}{suffix}",
+            suffix = flavor.base_url_suffix()
         )
     });
     let mut url = reqwest::Url::parse(base_url.trim()).map_err(|error| {
@@ -577,9 +627,17 @@ fn mantle_anthropic_messages_endpoint(settings: &Settings) -> Result<String, Pro
             "Bedrock Mantle base URL must use HTTPS",
         ));
     }
-    let path = format!("{}/v1/messages", url.path().trim_end_matches('/'));
+    let path = format!(
+        "{}{}",
+        url.path().trim_end_matches('/'),
+        flavor.request_path()
+    );
     url.set_path(&path);
     Ok(url.to_string())
+}
+
+fn mantle_anthropic_messages_endpoint(settings: &Settings) -> Result<String, ProviderError> {
+    mantle_endpoint(settings, MantleFlavor::Anthropic)
 }
 
 async fn mantle_status_error(response: reqwest::Response) -> ProviderError {
@@ -2364,6 +2422,7 @@ fn model_parameters_to_inference_config(
 enum BedrockTransport {
     Runtime,
     MantleAnthropic,
+    MantleOpenAi,
 }
 
 impl BedrockTransport {
@@ -2371,11 +2430,12 @@ impl BedrockTransport {
         match value.map(str::trim).filter(|value| !value.is_empty()) {
             None | Some("bedrock_runtime" | "runtime") => Ok(Self::Runtime),
             Some("mantle_anthropic" | "mantle") => Ok(Self::MantleAnthropic),
+            Some("mantle_openai") => Ok(Self::MantleOpenAi),
             Some(value) => Err(provider_error(
                 "bedrock_transport_invalid",
                 ProviderErrorCategory::Config,
                 format!(
-                    "unsupported Bedrock transport '{value}'; expected 'bedrock_runtime' or 'mantle_anthropic'"
+                    "unsupported Bedrock transport '{value}'; expected 'bedrock_runtime', 'mantle_anthropic', or 'mantle_openai'"
                 ),
             )),
         }
@@ -2385,7 +2445,16 @@ impl BedrockTransport {
         match self {
             Self::Runtime => "bedrock_runtime",
             Self::MantleAnthropic => "mantle_anthropic",
+            Self::MantleOpenAi => "mantle_openai",
         }
+    }
+
+    /// Whether this transport talks to the Mantle endpoint rather than Bedrock Runtime.
+    ///
+    /// Mantle has no Bedrock control-plane discovery API, so configured model membership is
+    /// authoritative for every Mantle flavor.
+    const fn is_mantle(self) -> bool {
+        matches!(self, Self::MantleAnthropic | Self::MantleOpenAi)
     }
 }
 
@@ -2429,6 +2498,24 @@ impl RegionSource {
 }
 
 impl Settings {
+    /// Resolve the Mantle API flavor implied by the configured transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured transport is invalid, or when it does not target
+    /// Mantle at all.
+    fn mantle_flavor(&self) -> Result<MantleFlavor, ProviderError> {
+        match self.transport.clone()? {
+            BedrockTransport::MantleAnthropic => Ok(MantleFlavor::Anthropic),
+            BedrockTransport::MantleOpenAi => Ok(MantleFlavor::OpenAi),
+            BedrockTransport::Runtime => Err(provider_error(
+                "bedrock_mantle_transport_required",
+                ProviderErrorCategory::Config,
+                "Bedrock Runtime transport does not use a Mantle endpoint",
+            )),
+        }
+    }
+
     fn resolve_from_context(context: &ProviderRequestContext) -> Self {
         Self::resolve_context(Some(context))
     }
@@ -2699,7 +2786,7 @@ impl BedrockProviderPlugin {
         if settings
             .transport
             .as_ref()
-            .is_ok_and(|transport| *transport == BedrockTransport::MantleAnthropic)
+            .is_ok_and(|transport| transport.is_mantle())
         {
             let model_ids = if settings.model_ids.is_empty() {
                 settings.default_model.iter().cloned().collect::<Vec<_>>()
@@ -2772,7 +2859,7 @@ impl BedrockProviderPlugin {
             && settings
                 .transport
                 .as_ref()
-                .is_ok_and(|transport| *transport == BedrockTransport::MantleAnthropic)
+                .is_ok_and(|transport| transport.is_mantle())
         {
             validation = validate_mantle_settings(&settings);
         }
@@ -2962,7 +3049,7 @@ async fn resolve_turn_model_selection(
     if settings
         .transport
         .as_ref()
-        .is_ok_and(|transport| *transport == BedrockTransport::MantleAnthropic)
+        .is_ok_and(|transport| transport.is_mantle())
     {
         return Err(provider_error(
             "bedrock_mantle_model_required",
@@ -3085,7 +3172,7 @@ fn warm_discovery_cache(
         || settings
             .transport
             .as_ref()
-            .is_ok_and(|transport| *transport == BedrockTransport::MantleAnthropic)
+            .is_ok_and(|transport| transport.is_mantle())
     {
         return;
     }
@@ -3778,7 +3865,9 @@ fn validate_mantle_settings(settings: &Settings) -> Result<(), ProviderError> {
             "Bedrock Mantle requires AWS_BEARER_TOKEN_BEDROCK or a mapped bearer_token credential",
         ));
     }
-    mantle_anthropic_messages_endpoint(settings).map(|_| ())
+    // Validate the endpoint for the flavor actually configured, so a bad base URL is reported
+    // against the surface the turn will use.
+    mantle_endpoint(settings, settings.mantle_flavor()?).map(|_| ())
 }
 
 fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
@@ -4821,6 +4910,41 @@ mod tests {
     }
 
     #[test]
+    fn mantle_config_validation_checks_the_endpoint_for_the_configured_flavor() {
+        // A base URL that is valid for one flavor must still be validated against the surface the
+        // configured transport will actually use.
+        for (transport, flavor) in [
+            (BedrockTransport::MantleAnthropic, MantleFlavor::Anthropic),
+            (BedrockTransport::MantleOpenAi, MantleFlavor::OpenAi),
+        ] {
+            let mut settings = test_settings();
+            settings.transport = Ok(transport);
+            assert_eq!(
+                settings.mantle_flavor().expect("flavor should resolve"),
+                flavor
+            );
+
+            settings.mantle_base_url = Some("http://mantle.example.com/v1".to_string());
+            // The bearer-token check runs before endpoint validation, so supply one to reach the
+            // endpoint check.
+            settings
+                .auth_credentials
+                .insert("bearer_token".to_string(), "secret".to_string());
+            assert_eq!(
+                validate_mantle_settings(&settings).unwrap_err().code,
+                "bedrock_mantle_base_url_insecure"
+            );
+        }
+
+        let mut runtime = test_settings();
+        runtime.transport = Ok(BedrockTransport::Runtime);
+        assert_eq!(
+            runtime.mantle_flavor().unwrap_err().code,
+            "bedrock_mantle_transport_required"
+        );
+    }
+
+    #[test]
     fn mantle_endpoint_defaults_from_region_and_accepts_local_tests() {
         let settings = test_settings();
         assert_eq!(
@@ -4834,6 +4958,94 @@ mod tests {
             mantle_anthropic_messages_endpoint(&local).expect("local endpoint"),
             "http://127.0.0.1:8080/anthropic/v1/messages"
         );
+    }
+
+    #[test]
+    fn mantle_openai_endpoint_uses_the_documented_responses_path() {
+        let mut settings = test_settings();
+        // AWS documents this as `openai/v1/responses`, deliberately different from the
+        // `v1/responses` path used by other models on the responses endpoint.
+        assert_eq!(
+            mantle_endpoint(&settings, MantleFlavor::OpenAi).expect("default endpoint"),
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses"
+        );
+
+        settings.region = Some("eu-west-1".to_string());
+        assert_eq!(
+            mantle_endpoint(&settings, MantleFlavor::OpenAi).expect("regional endpoint"),
+            "https://bedrock-mantle.eu-west-1.api.aws/openai/v1/responses"
+        );
+
+        let mut local = settings;
+        local.mantle_base_url = Some("http://localhost:8080/openai/v1/".to_string());
+        assert_eq!(
+            mantle_endpoint(&local, MantleFlavor::OpenAi).expect("local endpoint"),
+            "http://localhost:8080/openai/v1/responses"
+        );
+    }
+
+    #[test]
+    fn mantle_endpoints_reject_insecure_non_loopback_base_urls() {
+        for flavor in [MantleFlavor::Anthropic, MantleFlavor::OpenAi] {
+            let mut settings = test_settings();
+            settings.mantle_base_url = Some("http://mantle.example.com/openai/v1".to_string());
+            assert_eq!(
+                mantle_endpoint(&settings, flavor).unwrap_err().code,
+                "bedrock_mantle_base_url_insecure"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_parsing_covers_every_supported_value() {
+        for (value, expected) in [
+            (None, BedrockTransport::Runtime),
+            (Some("runtime"), BedrockTransport::Runtime),
+            (Some("bedrock_runtime"), BedrockTransport::Runtime),
+            (Some("mantle"), BedrockTransport::MantleAnthropic),
+            (Some("mantle_anthropic"), BedrockTransport::MantleAnthropic),
+            (Some("mantle_openai"), BedrockTransport::MantleOpenAi),
+        ] {
+            let parsed = BedrockTransport::parse(value).expect("transport should parse");
+            assert_eq!(parsed, expected, "value: {value:?}");
+            // `as_str` must round-trip so persisted/diagnostic values stay stable.
+            assert_eq!(
+                BedrockTransport::parse(Some(parsed.as_str())).expect("round-trip"),
+                expected
+            );
+        }
+
+        assert_eq!(
+            BedrockTransport::parse(Some("mantle_bedrock"))
+                .unwrap_err()
+                .code,
+            "bedrock_transport_invalid"
+        );
+    }
+
+    #[test]
+    fn every_mantle_transport_requires_an_explicitly_configured_model() {
+        // Mantle has no control-plane discovery, so both flavors must demand a configured model
+        // instead of silently falling back to a discovered default.
+        for transport in [
+            BedrockTransport::MantleAnthropic,
+            BedrockTransport::MantleOpenAi,
+        ] {
+            assert!(
+                transport.is_mantle(),
+                "{transport:?} must be a Mantle transport"
+            );
+            let mut settings = test_settings();
+            settings.transport = Ok(transport);
+            settings.default_model = None;
+            settings.model_ids.clear();
+            assert_eq!(
+                validate_mantle_settings(&settings).unwrap_err().code,
+                "bedrock_mantle_model_required"
+            );
+        }
+
+        assert!(!BedrockTransport::Runtime.is_mantle());
     }
 
     #[test]
