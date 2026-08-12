@@ -488,6 +488,50 @@ pub fn responses_incomplete_reason(event: &serde_json::Value) -> &str {
         .unwrap_or("response_incomplete")
 }
 
+/// Decode accumulated tool-call arguments into a JSON value.
+///
+/// Empty or whitespace-only arguments decode to an empty object, matching providers that omit
+/// arguments entirely for zero-argument tools.
+///
+/// # Errors
+///
+/// Returns a non-retryable `tool_arguments_decode_failed` error when the accumulated arguments are
+/// not valid JSON. The message includes the call id, tool name, and byte length, but never the
+/// argument content itself, so tool payloads cannot leak into diagnostics.
+pub fn parse_tool_arguments(
+    arguments: &str,
+    call_id: &str,
+    tool_name: &str,
+) -> Result<serde_json::Value, bcode_model::ProviderError> {
+    if arguments.trim().is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_str(arguments).map_err(|decode_error| {
+        let mut error = decode_error_template(format!(
+            "failed to decode arguments for tool call {call_id} ({tool_name}): {decode_error}; received {} bytes",
+            arguments.len()
+        ));
+        error.retryable = false;
+        error
+    })
+}
+
+/// Build the `tool_arguments_decode_failed` provider error.
+fn decode_error_template(message: String) -> bcode_model::ProviderError {
+    bcode_model::ProviderError {
+        code: "tool_arguments_decode_failed".to_string(),
+        category: bcode_model::ProviderErrorCategory::ProviderInternal,
+        message,
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +545,45 @@ mod tests {
         fn push(&self, event: bcode_model::ProviderTurnEvent) {
             self.events.borrow_mut().push(event);
         }
+    }
+
+    #[test]
+    fn empty_tool_arguments_decode_to_an_empty_object() {
+        for arguments in ["", "   ", "\n\t"] {
+            let value = parse_tool_arguments(arguments, "call_1", "read")
+                .expect("blank arguments must decode");
+            assert_eq!(value, serde_json::json!({}));
+        }
+    }
+
+    #[test]
+    fn valid_tool_arguments_decode_verbatim() {
+        let value = parse_tool_arguments(r#"{"path":"a.rs","limit":10}"#, "call_1", "read")
+            .expect("valid arguments must decode");
+        assert_eq!(value, serde_json::json!({"path": "a.rs", "limit": 10}));
+    }
+
+    #[test]
+    fn malformed_tool_arguments_fail_closed_without_leaking_content() {
+        let secret = r#"{"token":"sk-super-secret-value"#;
+        let error = parse_tool_arguments(secret, "call_9", "shell.run")
+            .expect_err("malformed arguments must fail");
+
+        assert_eq!(error.code, "tool_arguments_decode_failed");
+        assert!(
+            !error.retryable,
+            "a malformed payload will not become valid on retry"
+        );
+        // Diagnostics identify the call and size but must never echo the payload, which can carry
+        // secrets from tool arguments.
+        assert!(error.message.contains("call_9"));
+        assert!(error.message.contains("shell.run"));
+        assert!(error.message.contains(&format!("{} bytes", secret.len())));
+        assert!(
+            !error.message.contains("sk-super-secret-value"),
+            "argument content must not enter diagnostics: {}",
+            error.message
+        );
     }
 
     #[test]

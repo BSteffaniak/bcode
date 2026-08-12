@@ -39,7 +39,8 @@ use bcode_openai_responses::{
     ReasoningItemAccumulator, ResponsesContent, ResponsesContextManagement, ResponsesEventSink,
     ResponsesInputItem, ResponsesNativeSearchBody, ResponsesReasoningOptions,
     ResponsesReasoningSummary, ResponsesRequest, ResponsesRequestCapabilities, ResponsesTextFormat,
-    ResponsesTextOptions, ResponsesTool, ToolCallAccumulator, ensure_reasoning_activity_started,
+    ResponsesTextOptions, ResponsesTool, StreamOutcome, ToolCallAccumulator,
+    ensure_reasoning_activity_started, parse_tool_arguments,
     process_responses_function_arguments_delta, process_responses_function_arguments_done,
     process_responses_output_item, process_responses_reasoning_delta,
     process_responses_reasoning_done, process_responses_reasoning_output_item,
@@ -1856,14 +1857,6 @@ struct ParsedHttpError {
     message: String,
     code: Option<String>,
     error_type: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamOutcome {
-    Finished,
-    ToolCall,
-    MaxTokens,
-    Cancelled,
 }
 
 /// Adapter letting the shared Responses decoder report events into the provider turn runtime.
@@ -4284,7 +4277,7 @@ async fn read_stream_events(
                     &mut saw_tool_call,
                     &name_map,
                 )?;
-                if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens) {
+                if outcome.is_provider_terminal() {
                     return Ok(outcome);
                 }
             }
@@ -4339,7 +4332,7 @@ async fn read_responses_stream_events(
                     &mut reasoning_items,
                     &mut saw_tool_call,
                 )?;
-                if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens) {
+                if outcome.is_provider_terminal() {
                     return Ok(outcome);
                 }
             }
@@ -4379,10 +4372,7 @@ fn process_responses_stream_buffer(
             reasoning_items,
             saw_tool_call,
         )?;
-        if matches!(
-            outcome,
-            StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens
-        ) {
+        if outcome.is_provider_terminal() {
             return Ok(outcome);
         }
     }
@@ -4774,10 +4764,7 @@ fn process_stream_buffer(
         }
         buffer.drain(..=position);
         let outcome = process_stream_line(&line, turn, tool_calls, saw_tool_call, name_map)?;
-        if matches!(
-            outcome,
-            StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens
-        ) {
+        if outcome.is_provider_terminal() {
             return Ok(outcome);
         }
     }
@@ -4985,28 +4972,6 @@ fn finish_tool_calls(
         });
     }
     Ok(())
-}
-
-fn parse_tool_arguments(
-    arguments: &str,
-    call_id: &str,
-    tool_name: &str,
-) -> Result<serde_json::Value, ProviderError> {
-    if arguments.trim().is_empty() {
-        return Ok(serde_json::Value::Object(serde_json::Map::new()));
-    }
-    serde_json::from_str(arguments).map_err(|decode_error| {
-        let mut error = provider_error(
-            "tool_arguments_decode_failed",
-            ProviderErrorCategory::ProviderInternal,
-            format!(
-                "failed to decode arguments for tool call {call_id} ({tool_name}): {decode_error}; received {} bytes",
-                arguments.len()
-            ),
-        );
-        error.retryable = false;
-        error
-    })
 }
 
 fn provider_arguments_to_bcode(

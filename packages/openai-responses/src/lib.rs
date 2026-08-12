@@ -26,14 +26,38 @@ use serde::{Deserialize, Serialize};
 
 pub use decode::{
     ReasoningItemAccumulator, ToolCallAccumulator, ensure_reasoning_activity_started,
-    process_responses_function_arguments_delta, process_responses_function_arguments_done,
-    process_responses_output_item, process_responses_reasoning_delta,
-    process_responses_reasoning_done, process_responses_reasoning_output_item,
-    reasoning_output_index, reported_output_index, responses_incomplete_reason,
-    responses_output_item_text, tool_call_output_index,
+    parse_tool_arguments, process_responses_function_arguments_delta,
+    process_responses_function_arguments_done, process_responses_output_item,
+    process_responses_reasoning_delta, process_responses_reasoning_done,
+    process_responses_reasoning_output_item, reasoning_output_index, reported_output_index,
+    responses_incomplete_reason, responses_output_item_text, tool_call_output_index,
 };
-
 mod decode;
+
+/// Terminal outcome of decoding one streamed provider response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// The provider completed the turn with assistant output.
+    Finished,
+    /// The provider requested one or more tool calls.
+    ToolCall,
+    /// The provider stopped because the output token limit was reached.
+    MaxTokens,
+    /// The turn was cancelled before reaching a provider-reported terminal state.
+    Cancelled,
+}
+
+impl StreamOutcome {
+    /// Whether this outcome is a provider-reported terminal state.
+    ///
+    /// [`Self::Cancelled`] is not terminal in this sense: it means decoding stopped without the
+    /// provider reporting an outcome, so callers continue reading or unwind instead of committing
+    /// a result.
+    #[must_use]
+    pub const fn is_provider_terminal(self) -> bool {
+        matches!(self, Self::Finished | Self::ToolCall | Self::MaxTokens)
+    }
+}
 
 /// Sink for provider turn events produced while decoding a Responses stream.
 ///
@@ -356,6 +380,16 @@ pub struct ResponsesNativeSearchAnnotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_provider_reported_outcomes_are_terminal() {
+        // Cancellation means decoding stopped without a provider outcome, so it must not be
+        // treated as terminal — callers keep reading or unwind instead of committing a result.
+        assert!(StreamOutcome::Finished.is_provider_terminal());
+        assert!(StreamOutcome::ToolCall.is_provider_terminal());
+        assert!(StreamOutcome::MaxTokens.is_provider_terminal());
+        assert!(!StreamOutcome::Cancelled.is_provider_terminal());
+    }
 
     #[test]
     fn event_sink_is_implemented_for_references_and_receives_events_in_order() {
