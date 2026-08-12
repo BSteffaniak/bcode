@@ -27,8 +27,10 @@ use serde::{Deserialize, Serialize};
 pub use decode::{
     ReasoningItemAccumulator, ToolCallAccumulator, ensure_reasoning_activity_started,
     process_responses_function_arguments_delta, process_responses_function_arguments_done,
-    process_responses_reasoning_delta, process_responses_reasoning_done, reasoning_output_index,
-    reported_output_index,
+    process_responses_output_item, process_responses_reasoning_delta,
+    process_responses_reasoning_done, process_responses_reasoning_output_item,
+    reasoning_output_index, reported_output_index, responses_incomplete_reason,
+    responses_output_item_text, tool_call_output_index,
 };
 
 mod decode;

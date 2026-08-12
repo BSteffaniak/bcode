@@ -274,6 +274,220 @@ pub fn reported_output_index(event: &serde_json::Value) -> u32 {
         .unwrap_or(0)
 }
 
+/// Resolve the tool-call output index for an event.
+///
+/// Prefers the provider-reported `output_index`, then matches an already-tracked call by
+/// `call_id`, and finally allocates the next positional index.
+#[must_use]
+pub fn tool_call_output_index(
+    event: &serde_json::Value,
+    item: &serde_json::Value,
+    tool_calls: &BTreeMap<u32, ToolCallAccumulator>,
+) -> u32 {
+    if let Some(output_index) = event
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+    {
+        return output_index;
+    }
+    let call_id = item.get("call_id").and_then(serde_json::Value::as_str);
+    if let Some((index, _)) = tool_calls
+        .iter()
+        .find(|(_, call)| call.id.as_deref() == call_id)
+    {
+        return *index;
+    }
+    u32::try_from(tool_calls.len()).unwrap_or(u32::MAX)
+}
+
+/// Concatenated assistant text carried by a message output item, when non-empty.
+#[must_use]
+pub fn responses_output_item_text(event: &serde_json::Value) -> Option<String> {
+    let item = event.get("item")?;
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        return None;
+    }
+    let text = item
+        .get("content")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter(|part| {
+            matches!(
+                part.get("type").and_then(serde_json::Value::as_str),
+                Some("output_text" | "text" | "refusal")
+            )
+        })
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Apply a `function_call` output item, reporting a tool-call start once id and name are known.
+///
+/// `resolve_tool_name` maps the provider-visible tool name back to its original name.
+pub fn process_responses_output_item(
+    event: &serde_json::Value,
+    sink: &impl ResponsesEventSink,
+    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    saw_tool_call: &mut bool,
+    resolve_tool_name: &dyn Fn(&str) -> String,
+) {
+    let Some(item) = event.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+        return;
+    }
+    *saw_tool_call = true;
+    let output_index = tool_call_output_index(event, item, tool_calls);
+    let entry = tool_calls.entry(output_index).or_default();
+    if let Some(call_id) = item.get("call_id").and_then(serde_json::Value::as_str) {
+        entry.id = Some(call_id.to_string());
+    }
+    if let Some(name) = item.get("name").and_then(serde_json::Value::as_str) {
+        entry.name = Some(name.to_string());
+    }
+    if let Some(arguments) = item.get("arguments").and_then(serde_json::Value::as_str)
+        && !arguments.is_empty()
+    {
+        entry.arguments = arguments.to_string();
+    }
+    if !entry.started
+        && let (Some(id), Some(name)) = (&entry.id, &entry.name)
+    {
+        sink.push(bcode_model::ProviderTurnEvent::ToolCallStarted {
+            call_id: id.clone(),
+            name: resolve_tool_name(name),
+        });
+        entry.started = true;
+    }
+}
+
+/// Apply a `reasoning` output item, reporting opaque state, completed parts, and completion.
+pub fn process_responses_reasoning_output_item(
+    event: &serde_json::Value,
+    sink: &impl ResponsesEventSink,
+    reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
+    completed: bool,
+) {
+    let Some(item_value) = event.get("item") else {
+        return;
+    };
+    if item_value.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
+        return;
+    }
+    let output_index = event
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or_else(|| reasoning_output_index(event, reasoning_items));
+    let item = reasoning_items.entry(output_index).or_default();
+    if let Some(id) = item_value.get("id").and_then(serde_json::Value::as_str) {
+        item.id = Some(id.to_owned());
+    }
+    ensure_reasoning_activity_started(sink, output_index, item);
+    let activity_id = item.activity_id(output_index);
+    if let Some(encrypted_content) = item_value
+        .get("encrypted_content")
+        .and_then(serde_json::Value::as_str)
+        .filter(|encrypted_content| !encrypted_content.is_empty())
+    {
+        item.encrypted_content = Some(encrypted_content.to_owned());
+        sink.push(bcode_model::ProviderTurnEvent::ReasoningActivity {
+            event: bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
+                activity_id: activity_id.clone(),
+                activity_order: output_index,
+            },
+        });
+    }
+    if let Some(summary) = item_value
+        .get("summary")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (index, part) in summary.iter().enumerate() {
+            let Some(text) = part
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            let part_order = u32::try_from(index).unwrap_or(u32::MAX);
+            item.summary.insert(part_order, text.to_owned());
+            sink.push(bcode_model::ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    activity_id: activity_id.clone(),
+                    activity_order: output_index,
+                    part_id: format!("summary-{part_order}"),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    part_order,
+                    text: text.to_owned(),
+                },
+            });
+        }
+    }
+    if let Some(content) = item_value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (index, part) in content.iter().enumerate() {
+            if !matches!(
+                part.get("type").and_then(serde_json::Value::as_str),
+                Some("reasoning_text" | "text")
+            ) {
+                continue;
+            }
+            let Some(text) = part
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            let part_order = u32::try_from(index).unwrap_or(u32::MAX);
+            item.content.insert(part_order, text.to_owned());
+            sink.push(bcode_model::ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    activity_id: activity_id.clone(),
+                    activity_order: output_index,
+                    part_id: format!("raw-{part_order}"),
+                    kind: bcode_session_models::ReasoningContentKind::Raw,
+                    role: bcode_session_models::ReasoningContentRole::Detail,
+                    part_order,
+                    text: text.to_owned(),
+                },
+            });
+        }
+    }
+    if completed && !item.finished {
+        item.finished = true;
+        sink.push(bcode_model::ProviderTurnEvent::ReasoningActivity {
+            event: bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id,
+                activity_order: output_index,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        });
+    }
+}
+
+/// Reason string for an incomplete Responses stream, defaulting to `response_incomplete`.
+///
+/// Accepts either a `response.incomplete` event or a bare response object.
+#[must_use]
+pub fn responses_incomplete_reason(event: &serde_json::Value) -> &str {
+    event
+        .get("response")
+        .unwrap_or(event)
+        .get("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or("response_incomplete")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +501,194 @@ mod tests {
         fn push(&self, event: bcode_model::ProviderTurnEvent) {
             self.events.borrow_mut().push(event);
         }
+    }
+
+    #[test]
+    fn incomplete_reason_reads_nested_or_bare_responses_and_defaults() {
+        assert_eq!(
+            responses_incomplete_reason(&serde_json::json!({
+                "response": {"incomplete_details": {"reason": "max_output_tokens"}}
+            })),
+            "max_output_tokens"
+        );
+        // A bare response object is accepted too.
+        assert_eq!(
+            responses_incomplete_reason(&serde_json::json!({
+                "incomplete_details": {"reason": "content_filter"}
+            })),
+            "content_filter"
+        );
+        // Missing and blank reasons fall back to a stable default.
+        assert_eq!(
+            responses_incomplete_reason(&serde_json::json!({})),
+            "response_incomplete"
+        );
+        assert_eq!(
+            responses_incomplete_reason(&serde_json::json!({
+                "incomplete_details": {"reason": "   "}
+            })),
+            "response_incomplete"
+        );
+    }
+
+    #[test]
+    fn tool_call_output_index_prefers_reported_index_then_call_id_then_position() {
+        let mut calls = BTreeMap::new();
+        assert_eq!(
+            tool_call_output_index(
+                &serde_json::json!({"output_index": 4}),
+                &serde_json::json!({}),
+                &calls
+            ),
+            4
+        );
+
+        calls.insert(
+            2,
+            ToolCallAccumulator {
+                id: Some("call_a".to_string()),
+                ..ToolCallAccumulator::default()
+            },
+        );
+        assert_eq!(
+            tool_call_output_index(
+                &serde_json::json!({}),
+                &serde_json::json!({"call_id": "call_a"}),
+                &calls
+            ),
+            2
+        );
+        assert_eq!(
+            tool_call_output_index(
+                &serde_json::json!({}),
+                &serde_json::json!({"call_id": "unknown"}),
+                &calls
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn output_item_text_concatenates_only_text_parts() {
+        let event = serde_json::json!({
+            "item": {
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": "a"},
+                    {"type": "reasoning_text", "text": "skipped"},
+                    {"type": "refusal", "text": "b"},
+                ]
+            }
+        });
+        assert_eq!(responses_output_item_text(&event).as_deref(), Some("ab"));
+
+        // Non-message items and empty text yield nothing.
+        assert!(
+            responses_output_item_text(&serde_json::json!({"item": {"type": "reasoning"}}))
+                .is_none()
+        );
+        assert!(
+            responses_output_item_text(&serde_json::json!({
+                "item": {"type": "message", "content": []}
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn function_call_output_item_reports_start_once_and_maps_the_tool_name() {
+        let recorder = Recorder::default();
+        let mut calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let event = serde_json::json!({
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "provider_name",
+                "arguments": "{}"
+            }
+        });
+
+        let rename = |name: &str| format!("original::{name}");
+        process_responses_output_item(&event, &recorder, &mut calls, &mut saw_tool_call, &rename);
+        process_responses_output_item(&event, &recorder, &mut calls, &mut saw_tool_call, &rename);
+
+        assert!(saw_tool_call);
+        let events = recorder.events.borrow();
+        assert_eq!(events.len(), 1, "start must be reported exactly once");
+        assert!(matches!(
+            &events[0],
+            bcode_model::ProviderTurnEvent::ToolCallStarted { call_id, name }
+                if call_id == "call_1" && name == "original::provider_name"
+        ));
+        assert_eq!(calls[&0].arguments, "{}");
+    }
+
+    #[test]
+    fn non_function_call_output_items_are_ignored_by_the_tool_handler() {
+        let recorder = Recorder::default();
+        let mut calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+
+        process_responses_output_item(
+            &serde_json::json!({"item": {"type": "message"}}),
+            &recorder,
+            &mut calls,
+            &mut saw_tool_call,
+            &|name: &str| name.to_string(),
+        );
+
+        assert!(!saw_tool_call);
+        assert!(calls.is_empty());
+        assert!(recorder.events.borrow().is_empty());
+    }
+
+    #[test]
+    fn reasoning_output_item_records_opaque_state_parts_and_completion() {
+        let recorder = Recorder::default();
+        let mut items = BTreeMap::new();
+        let event = serde_json::json!({
+            "output_index": 0,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "opaque",
+                "summary": [{"text": "sum"}],
+                "content": [
+                    {"type": "reasoning_text", "text": "raw"},
+                    {"type": "image", "text": "ignored"}
+                ]
+            }
+        });
+
+        process_responses_reasoning_output_item(&event, &recorder, &mut items, true);
+
+        let item = &items[&0];
+        assert_eq!(item.encrypted_content.as_deref(), Some("opaque"));
+        assert_eq!(item.summary.get(&0).map(String::as_str), Some("sum"));
+        assert_eq!(item.content.get(&0).map(String::as_str), Some("raw"));
+        assert!(!item.content.contains_key(&1), "non-text parts are skipped");
+        assert!(item.finished);
+
+        // Completion is reported only once.
+        let before = recorder.events.borrow().len();
+        process_responses_reasoning_output_item(&event, &recorder, &mut items, true);
+        let finished = recorder
+            .events
+            .borrow()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    bcode_model::ProviderTurnEvent::ReasoningActivity {
+                        event: bcode_session_models::ReasoningActivityEvent::Finished { .. }
+                    }
+                )
+            })
+            .count();
+        assert_eq!(finished, 1);
+        assert!(recorder.events.borrow().len() >= before);
     }
 
     #[test]
