@@ -33771,6 +33771,50 @@ mod tests {
             Category::Ready
         );
 
+        let current_db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(current.id, root.path())
+                .await
+                .expect("current DB");
+        let inert_history = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: current.updated_at_ms,
+            session_id: current.id,
+            provenance: None,
+            kind: SessionEventKind::InertHistory {
+                event_type: "retired_fixture".to_owned(),
+                payload: serde_json::json!({"retained": true}),
+            },
+        };
+        current_db
+            .database()
+            .insert("events")
+            .value("event_seq", DatabaseValue::Int64(1))
+            .value("event_type", "inert_history")
+            .value(
+                "schema_version",
+                DatabaseValue::Int64(i64::from(inert_history.schema_version)),
+            )
+            .value(
+                "created_at_ms",
+                DatabaseValue::Int64(i64::try_from(inert_history.timestamp_ms).unwrap_or(i64::MAX)),
+            )
+            .value(
+                "payload",
+                serde_json::to_string(&inert_history).expect("serialize inert history"),
+            )
+            .execute(current_db.database())
+            .await
+            .expect("insert current inert history");
+        drop(current_db);
+        assert_eq!(
+            classify_session_compatibility(Some(root.path()), &current_summary)
+                .await
+                .category,
+            Category::Ready,
+            "current inert history must not be misclassified as future state"
+        );
+
         for schema in bcode_session_migration::RELEASED_HISTORICAL_EVENT_SCHEMAS {
             let session = sessions
                 .create_session(

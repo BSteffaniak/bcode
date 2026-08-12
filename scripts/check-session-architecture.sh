@@ -294,7 +294,7 @@ if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 6' packages/session/mode
   || ! rg -q 'RELEASED_EVENT_VARIANTS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_schema_ranges_match_all_ref_inventory_boundaries' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_variant_treatments_are_sorted_unique_and_total' packages/session-migration/src/inventory.rs \
-  || ! rg -q 'RELEASED_EVENT_VARIANTS.len\(\), 61' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_EVENT_VARIANTS.len\(\), 62' packages/session-migration/src/inventory.rs \
   || ! rg -q 'inventoried_retired_families_materialize_as_inert_current_history' packages/session-migration/src/execution.rs \
   || ! rg -q 'every inventoried retired variant must be an explicit reviewed decision' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_MIGRATION_IDS' packages/session-migration/src/inventory.rs \

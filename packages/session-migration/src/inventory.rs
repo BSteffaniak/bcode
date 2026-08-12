@@ -1474,6 +1474,7 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         "execution_session_created" => (39, 41),
         "opaque_event" => (39, 39),
         "interactive_tool_request_created" | "interactive_tool_request_resolved" => (25, 35),
+        "inert_history" => (42, 42),
         "legacy_event" | "legacy_turn_finished" | "legacy_turn_started" => (32, 39),
         "request_context_observed" => (32, 41),
         "legacy_tool_invocation_presentation" => (25, 39),
@@ -1567,6 +1568,10 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     ReleasedEventVariantDescriptor {
         kind: "execution_session_created",
         treatment: ReleasedEventTreatment::ExplicitConversion,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "inert_history",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
         kind: "interactive_tool_request_created",
@@ -2356,13 +2361,29 @@ mod tests {
     }
 
     #[test]
+    fn current_inert_history_is_current_but_historical_and_future_forms_are_unknown() {
+        assert_eq!(
+            classify_event_kind_schema("inert_history", CURRENT_EVENT_SCHEMA),
+            ReleasedEventKindClassification::Current
+        );
+        assert_eq!(
+            classify_event_kind_schema("inert_history", CURRENT_EVENT_SCHEMA - 1),
+            ReleasedEventKindClassification::Unknown
+        );
+        assert_eq!(
+            classify_event_kind_schema("inert_history", CURRENT_EVENT_SCHEMA + 1),
+            ReleasedEventKindClassification::Unknown
+        );
+    }
+
+    #[test]
     fn released_event_variant_treatments_are_sorted_unique_and_total() {
         assert!(
             RELEASED_EVENT_VARIANTS
                 .windows(2)
                 .all(|pair| pair[0].kind < pair[1].kind)
         );
-        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 61);
+        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 62);
         let explicit = RELEASED_EVENT_VARIANTS
             .iter()
             .filter(|variant| variant.treatment == ReleasedEventTreatment::ExplicitConversion)
