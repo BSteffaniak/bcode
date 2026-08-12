@@ -38,13 +38,14 @@ use bcode_model_provider_runtime::{
 use bcode_openai_responses::{
     ReasoningItemAccumulator, ResponsesContent, ResponsesContextManagement, ResponsesEventSink,
     ResponsesInputItem, ResponsesNativeSearchBody, ResponsesReasoningOptions,
-    ResponsesReasoningSummary, ResponsesRequest, ResponsesRequestCapabilities, ResponsesTextFormat,
-    ResponsesTextOptions, ResponsesTool, StreamOutcome, ToolCallAccumulator,
-    ensure_reasoning_activity_started, parse_tool_arguments,
-    process_responses_function_arguments_delta, process_responses_function_arguments_done,
-    process_responses_output_item, process_responses_reasoning_delta,
-    process_responses_reasoning_done, process_responses_reasoning_output_item,
-    reasoning_output_index, responses_incomplete_reason, responses_output_item_text,
+    ResponsesReasoningSummary, ResponsesRequest, ResponsesRequestCapabilities, ResponsesStreamLine,
+    ResponsesTextFormat, ResponsesTextOptions, ResponsesTool, StreamOutcome, ToolCallAccumulator,
+    classify_responses_stream_line, drain_complete_stream_lines, ensure_reasoning_activity_started,
+    parse_tool_arguments, process_responses_function_arguments_delta,
+    process_responses_function_arguments_done, process_responses_output_item,
+    process_responses_reasoning_delta, process_responses_reasoning_done,
+    process_responses_reasoning_output_item, reasoning_output_index, responses_event_type,
+    responses_incomplete_reason, responses_output_item_text, responses_text_delta,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
@@ -4359,14 +4360,9 @@ fn process_responses_stream_buffer(
     reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     saw_tool_call: &mut bool,
 ) -> Result<StreamOutcome, ProviderError> {
-    while let Some(position) = buffer.find('\n') {
-        let mut line = buffer[..position].to_string();
-        if line.ends_with('\r') {
-            line.pop();
-        }
-        buffer.drain(..=position);
+    for line in drain_complete_stream_lines(buffer) {
         let outcome = process_responses_stream_line(
-            line.trim(),
+            &line,
             processor,
             tool_calls,
             reasoning_items,
@@ -4406,34 +4402,23 @@ fn process_responses_stream_line(
     reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     saw_tool_call: &mut bool,
 ) -> Result<StreamOutcome, ProviderError> {
-    let Some(data) = line.strip_prefix("data: ") else {
-        return Ok(StreamOutcome::Cancelled);
+    let event = match classify_responses_stream_line(line)? {
+        ResponsesStreamLine::Ignored => return Ok(StreamOutcome::Cancelled),
+        ResponsesStreamLine::Done => {
+            if *saw_tool_call {
+                return Ok(StreamOutcome::ToolCall);
+            }
+            if !processor.saw_assistant_text.get() && reasoning_items.is_empty() {
+                return Err(empty_provider_response_error("done_marker"));
+            }
+            return Ok(StreamOutcome::Finished);
+        }
+        ResponsesStreamLine::Event(event) => event,
     };
-    if data == "[DONE]" {
-        if *saw_tool_call {
-            return Ok(StreamOutcome::ToolCall);
-        }
-        if !processor.saw_assistant_text.get() && reasoning_items.is_empty() {
-            return Err(empty_provider_response_error("done_marker"));
-        }
-        return Ok(StreamOutcome::Finished);
-    }
-    let event = serde_json::from_str::<serde_json::Value>(data).map_err(|error| {
-        provider_error(
-            "stream_decode_failed",
-            ProviderErrorCategory::ProviderInternal,
-            error.to_string(),
-        )
-    })?;
-    let event_type = event
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let event_type = responses_event_type(&event);
     match event_type {
         "response.output_text.delta" | "response.refusal.delta" => {
-            if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
-                && !delta.is_empty()
-            {
+            if let Some(delta) = responses_text_delta(&event) {
                 processor.sink.push(ProviderTurnEvent::TextDelta {
                     text: delta.to_string(),
                 });

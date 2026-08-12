@@ -532,6 +532,91 @@ fn decode_error_template(message: String) -> bcode_model::ProviderError {
     }
 }
 
+/// One decoded line from a Responses SSE stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponsesStreamLine {
+    /// The line carries no payload (comment, blank line, or a non-`data:` field).
+    Ignored,
+    /// The stream signalled completion with the `[DONE]` sentinel.
+    Done,
+    /// The line carries a JSON event payload.
+    Event(serde_json::Value),
+}
+
+/// Classify one already-trimmed SSE line from a Responses stream.
+///
+/// Only `data:` lines carry payloads; everything else is [`ResponsesStreamLine::Ignored`] so
+/// callers can skip comments and framing fields without interpreting them.
+///
+/// # Errors
+///
+/// Returns a `stream_decode_failed` error when a `data:` payload is not valid JSON.
+pub fn classify_responses_stream_line(
+    line: &str,
+) -> Result<ResponsesStreamLine, bcode_model::ProviderError> {
+    let Some(data) = line.strip_prefix("data: ") else {
+        return Ok(ResponsesStreamLine::Ignored);
+    };
+    if data == "[DONE]" {
+        return Ok(ResponsesStreamLine::Done);
+    }
+    serde_json::from_str::<serde_json::Value>(data)
+        .map(ResponsesStreamLine::Event)
+        .map_err(|error| stream_decode_failed(&error.to_string()))
+}
+
+/// Build the `stream_decode_failed` provider error.
+fn stream_decode_failed(message: &str) -> bcode_model::ProviderError {
+    bcode_model::ProviderError {
+        code: "stream_decode_failed".to_string(),
+        category: bcode_model::ProviderErrorCategory::ProviderInternal,
+        message: message.to_string(),
+        // Matches the provider runtime's default retryability for `ProviderInternal`.
+        retryable: true,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    }
+}
+
+/// Split a streaming buffer into complete SSE lines, leaving any partial trailing line in place.
+///
+/// Handles both `\n` and `\r\n` terminators and trims each yielded line, so a caller can feed
+/// arbitrarily fragmented network chunks without reimplementing framing.
+pub fn drain_complete_stream_lines(buffer: &mut String) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(position) = buffer.find('\n') {
+        let mut line = buffer[..position].to_string();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        buffer.drain(..=position);
+        lines.push(line.trim().to_string());
+    }
+    lines
+}
+
+/// The event type reported by a Responses stream event, or an empty string when absent.
+#[must_use]
+pub fn responses_event_type(event: &serde_json::Value) -> &str {
+    event
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+/// Non-empty assistant text carried by a text or refusal delta event.
+#[must_use]
+pub fn responses_text_delta(event: &serde_json::Value) -> Option<&str> {
+    event
+        .get("delta")
+        .and_then(serde_json::Value::as_str)
+        .filter(|delta| !delta.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +630,77 @@ mod tests {
         fn push(&self, event: bcode_model::ProviderTurnEvent) {
             self.events.borrow_mut().push(event);
         }
+    }
+
+    #[test]
+    fn stream_lines_classify_by_sse_field() {
+        assert_eq!(
+            classify_responses_stream_line("data: [DONE]").expect("done decodes"),
+            ResponsesStreamLine::Done
+        );
+        assert_eq!(
+            classify_responses_stream_line(r#"data: {"type":"response.completed"}"#)
+                .expect("event decodes"),
+            ResponsesStreamLine::Event(serde_json::json!({"type": "response.completed"}))
+        );
+        // Comments, blank lines, and non-`data:` fields carry no payload.
+        for line in ["", ": keep-alive", "event: message", "id: 1"] {
+            assert_eq!(
+                classify_responses_stream_line(line).expect("non-data lines are ignored"),
+                ResponsesStreamLine::Ignored,
+                "line: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_stream_payloads_fail_with_a_retryable_decode_error() {
+        let error = classify_responses_stream_line("data: {not json")
+            .expect_err("malformed payload must fail");
+        assert_eq!(error.code, "stream_decode_failed");
+        // Matches the provider runtime's retryability for `ProviderInternal`.
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn draining_handles_fragmented_chunks_and_both_line_terminators() {
+        let mut buffer = String::from("data: a\r\ndata: b\n");
+        assert_eq!(
+            drain_complete_stream_lines(&mut buffer),
+            vec!["data: a".to_string(), "data: b".to_string()]
+        );
+        assert!(buffer.is_empty());
+
+        // A partial trailing line stays buffered until its terminator arrives.
+        let mut buffer = String::from("data: {\"ty");
+        assert!(drain_complete_stream_lines(&mut buffer).is_empty());
+        assert_eq!(buffer, "data: {\"ty");
+        buffer.push_str("pe\":\"x\"}\n");
+        assert_eq!(
+            drain_complete_stream_lines(&mut buffer),
+            vec!["data: {\"type\":\"x\"}".to_string()]
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn event_type_and_text_delta_accessors_tolerate_missing_fields() {
+        assert_eq!(
+            responses_event_type(&serde_json::json!({"type": "response.completed"})),
+            "response.completed"
+        );
+        assert_eq!(responses_event_type(&serde_json::json!({})), "");
+
+        assert_eq!(
+            responses_text_delta(&serde_json::json!({"delta": "hi"})),
+            Some("hi")
+        );
+        // Empty deltas are treated as absent so callers never emit empty text.
+        assert_eq!(
+            responses_text_delta(&serde_json::json!({"delta": ""})),
+            None
+        );
+        assert_eq!(responses_text_delta(&serde_json::json!({})), None);
     }
 
     #[test]
