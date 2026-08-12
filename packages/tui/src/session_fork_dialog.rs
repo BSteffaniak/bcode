@@ -3,7 +3,7 @@
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
-use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
+use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormPolicy, FormState};
 use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
 
 /// Fork/clone operation kind.
@@ -161,6 +161,7 @@ impl SessionForkDialog {
             Some(""),
         ];
         if let FormOutcome::Focused(index) = Form::new(&fields, &values)
+            .policy(FormPolicy::wrapping())
             .handle_event(&mut self.form, &bmux_tui::event::Event::Key(tab_stroke()))
         {
             self.focus = match index {

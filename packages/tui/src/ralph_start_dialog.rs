@@ -2,7 +2,7 @@
 
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::geometry::Rect;
-use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
+use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormPolicy, FormState};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 
 /// Focusable fields in the Ralph loop start dialog.
@@ -104,6 +104,7 @@ impl RalphStartDialog {
             Some(validation_commands.as_str()),
         ];
         if let FormOutcome::Focused(index) = Form::new(&fields, &values)
+            .policy(FormPolicy::wrapping())
             .handle_event(&mut self.form, &bmux_tui::event::Event::Key(tab_stroke()))
         {
             self.set_focused_index(index);

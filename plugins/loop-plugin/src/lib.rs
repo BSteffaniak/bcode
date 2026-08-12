@@ -1771,6 +1771,45 @@ mod tests {
     }
 
     #[test]
+    fn start_surface_accepts_typing_in_each_input_field() {
+        let host = TestHost::default();
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.limit = text_state("");
+        let key = |key| {
+            Event::Key(bmux_keyboard::KeyStroke {
+                key,
+                modifiers: bmux_keyboard::Modifiers::default(),
+            })
+        };
+
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char('p')), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.prompt.buffer().text(), "p");
+
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Tab), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char('c')), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.condition.buffer().text(), "c");
+
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Tab), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char('4')), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.limit.buffer().text(), "4");
+    }
+
+    #[test]
     fn start_surface_consumes_renderer_owned_theme_presentation() {
         let mut surface = LoopSurface::new(Some(SessionId::new()));
         let canvas = Style::new().fg(Color::White).bg(Color::Blue);
