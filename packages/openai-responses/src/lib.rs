@@ -1,0 +1,430 @@
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+
+//! `OpenAI` Responses API wire format types.
+//!
+//! This crate owns the serialized request shapes used by the `OpenAI` Responses API
+//! (`POST /responses`) so multiple provider integrations can share one implementation of the wire
+//! format instead of duplicating it.
+//!
+//! # Scope
+//!
+//! These are portable data types plus lightweight helpers on owned values. Provider behavior
+//! stays with the provider integrations that consume this crate, including:
+//!
+//! * authentication and credential resolution
+//! * endpoint/base-URL construction
+//! * HTTP transport, streaming, and retry interpretation
+//! * conversation-reuse and provider-state policy
+//! * any dialect-specific request shaping decisions
+//!
+//! Callers describe the request variations they need through [`ResponsesRequestCapabilities`]
+//! rather than exposing their own configuration types here.
+
+use serde::{Deserialize, Serialize};
+
+/// Streamed request body for the `OpenAI` Responses API.
+///
+/// Field order matches the documented request shape. Optional fields are omitted entirely when
+/// unset so provider endpoints that reject explicit nulls behave correctly.
+#[derive(Debug, Serialize)]
+pub struct ResponsesRequest {
+    /// Provider-native model id.
+    pub model: String,
+    /// Top-level instruction bundle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Ordered conversation input items.
+    pub input: Vec<ResponsesInputItem>,
+    /// Whether the response is streamed.
+    pub stream: bool,
+    /// Whether the provider should persist the response.
+    pub store: bool,
+    /// Prior response id, when reusing server-side conversation state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    /// Server-side context management directives.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_management: Vec<ResponsesContextManagement>,
+    /// Callable tools exposed to the model.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ResponsesTool>,
+    /// Tool-choice directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    /// Whether parallel tool calls are permitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// Text output options.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<ResponsesTextOptions>,
+    /// Reasoning options.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResponsesReasoningOptions>,
+    /// Additional response fields to include.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<&'static str>,
+    /// Prompt-cache partition key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// Sampling temperature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Output token ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Nucleus sampling probability mass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+}
+
+/// Server-side context management directive.
+#[derive(Debug, Serialize)]
+pub struct ResponsesContextManagement {
+    /// Directive discriminator, for example `compaction`.
+    pub r#type: &'static str,
+    /// Token threshold at which the provider compacts context.
+    pub compact_threshold: u64,
+}
+
+/// Reasoning controls for a Responses request.
+#[derive(Debug, Serialize)]
+pub struct ResponsesReasoningOptions {
+    /// Requested reasoning effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Requested reasoning summary verbosity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Reasoning context directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<&'static str>,
+}
+
+/// Text output controls for a Responses request.
+#[derive(Debug, Serialize)]
+pub struct ResponsesTextOptions {
+    /// Structured output format, when constrained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ResponsesTextFormat>,
+    /// Output verbosity directive.
+    pub verbosity: &'static str,
+}
+
+/// Structured output schema for a Responses request.
+#[derive(Debug, Serialize)]
+pub struct ResponsesTextFormat {
+    /// Format discriminator, for example `json_schema`.
+    pub r#type: &'static str,
+    /// Schema name.
+    pub name: String,
+    /// JSON schema value.
+    pub schema: serde_json::Value,
+    /// Whether the provider must enforce the schema strictly.
+    pub strict: bool,
+}
+
+/// One conversation input item.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesInputItem {
+    /// Role-tagged message.
+    Message {
+        /// Message role.
+        role: String,
+        /// Message content parts.
+        content: Vec<ResponsesContent>,
+    },
+    /// Model-issued tool call.
+    FunctionCall {
+        /// Correlation id for the call.
+        call_id: String,
+        /// Tool name.
+        name: String,
+        /// Serialized JSON arguments.
+        arguments: String,
+    },
+    /// Result of a tool call.
+    FunctionCallOutput {
+        /// Correlation id of the originating call.
+        call_id: String,
+        /// Serialized tool output.
+        output: String,
+    },
+    /// Replayed provider reasoning item.
+    Reasoning {
+        /// Provider reasoning item id.
+        id: String,
+        /// Reasoning summary parts.
+        #[serde(default)]
+        summary: Vec<ResponsesReasoningSummary>,
+        /// Opaque provider reasoning payload.
+        encrypted_content: String,
+    },
+    /// Replayed provider compaction item.
+    Compaction {
+        /// Provider compaction item id.
+        id: String,
+        /// Opaque provider compaction payload.
+        encrypted_content: String,
+        /// Producer of the compaction item, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+}
+
+/// One reasoning summary part.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesReasoningSummary {
+    /// Plain-text reasoning summary.
+    SummaryText {
+        /// Summary text.
+        text: String,
+    },
+}
+
+/// One message content part.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesContent {
+    /// Caller-supplied text.
+    InputText {
+        /// Text value.
+        text: String,
+    },
+    /// Model-produced text.
+    OutputText {
+        /// Text value.
+        text: String,
+    },
+    /// Caller-supplied image reference.
+    InputImage {
+        /// Image URL or data URL.
+        image_url: String,
+    },
+}
+
+/// One callable tool definition.
+#[derive(Debug, Serialize)]
+pub struct ResponsesTool {
+    /// Tool discriminator, for example `function`.
+    pub r#type: &'static str,
+    /// Tool name as exposed to the model.
+    pub name: String,
+    /// Tool description.
+    pub description: String,
+    /// JSON schema for tool parameters.
+    pub parameters: serde_json::Value,
+    /// Whether the provider must enforce the schema strictly.
+    pub strict: Option<bool>,
+}
+
+/// Decoded provider-native web search response body.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesNativeSearchBody {
+    /// Output items returned by the provider.
+    #[serde(default)]
+    pub output: Vec<ResponsesNativeSearchOutputItem>,
+}
+
+/// One provider-native web search output item.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesNativeSearchOutputItem {
+    /// Content parts for this output item.
+    #[serde(default)]
+    pub content: Vec<ResponsesNativeSearchContentItem>,
+}
+
+/// One provider-native web search content part.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesNativeSearchContentItem {
+    /// Content text, when present.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Citation annotations attached to this content part.
+    #[serde(default)]
+    pub annotations: Vec<ResponsesNativeSearchAnnotation>,
+}
+
+/// One provider-native web search citation annotation.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesNativeSearchAnnotation {
+    /// Annotation discriminator.
+    #[serde(default)]
+    pub r#type: String,
+    /// Cited document title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Cited document URL.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unset_optional_request_fields_are_omitted_entirely() {
+        let request = ResponsesRequest {
+            model: "test-model".to_string(),
+            instructions: None,
+            input: Vec::new(),
+            stream: true,
+            store: false,
+            previous_response_id: None,
+            context_management: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            text: None,
+            reasoning: None,
+            include: Vec::new(),
+            prompt_cache_key: None,
+            temperature: None,
+            max_output_tokens: None,
+            top_p: None,
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize request");
+        let object = value.as_object().expect("request is an object");
+
+        // Endpoints reject explicit nulls for these fields, so they must be absent rather than
+        // serialized as `null`.
+        for field in [
+            "instructions",
+            "previous_response_id",
+            "context_management",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "text",
+            "reasoning",
+            "include",
+            "prompt_cache_key",
+            "temperature",
+            "max_output_tokens",
+            "top_p",
+        ] {
+            assert!(!object.contains_key(field), "{field} must be omitted");
+        }
+        assert_eq!(
+            object.get("model").and_then(serde_json::Value::as_str),
+            Some("test-model")
+        );
+        assert_eq!(
+            object.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            object.get("store").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(object.contains_key("input"));
+    }
+
+    #[test]
+    fn input_items_use_type_tagged_snake_case_wire_names() {
+        let items = vec![
+            ResponsesInputItem::Message {
+                role: "user".to_string(),
+                content: vec![ResponsesContent::InputText {
+                    text: "hi".to_string(),
+                }],
+            },
+            ResponsesInputItem::FunctionCall {
+                call_id: "call_1".to_string(),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+            },
+            ResponsesInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: "done".to_string(),
+            },
+            ResponsesInputItem::Reasoning {
+                id: "rs_1".to_string(),
+                summary: vec![ResponsesReasoningSummary::SummaryText {
+                    text: "thinking".to_string(),
+                }],
+                encrypted_content: "opaque".to_string(),
+            },
+            ResponsesInputItem::Compaction {
+                id: "cp_1".to_string(),
+                encrypted_content: "opaque".to_string(),
+                created_by: None,
+            },
+        ];
+
+        let value = serde_json::to_value(&items).expect("serialize input items");
+        let encoded = value.as_array().expect("input items are an array");
+        let types = encoded
+            .iter()
+            .map(|item| item.get("type").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                Some("message"),
+                Some("function_call"),
+                Some("function_call_output"),
+                Some("reasoning"),
+                Some("compaction"),
+            ]
+        );
+
+        // `created_by` is omitted when absent.
+        assert!(
+            !encoded[4]
+                .as_object()
+                .expect("compaction item is an object")
+                .contains_key("created_by")
+        );
+
+        let decoded: Vec<ResponsesInputItem> =
+            serde_json::from_value(value).expect("input items round-trip");
+        assert_eq!(decoded.len(), items.len());
+    }
+
+    #[test]
+    fn content_parts_use_documented_wire_names() {
+        let value = serde_json::to_value(vec![
+            ResponsesContent::InputText {
+                text: "a".to_string(),
+            },
+            ResponsesContent::OutputText {
+                text: "b".to_string(),
+            },
+            ResponsesContent::InputImage {
+                image_url: "https://example.invalid/i.png".to_string(),
+            },
+        ])
+        .expect("serialize content");
+        let types = value
+            .as_array()
+            .expect("content is an array")
+            .iter()
+            .map(|item| item.get("type").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![Some("input_text"), Some("output_text"), Some("input_image")]
+        );
+    }
+
+    #[test]
+    fn native_search_body_tolerates_absent_collections() {
+        let body: ResponsesNativeSearchBody =
+            serde_json::from_str("{}").expect("empty body decodes");
+        assert!(body.output.is_empty());
+
+        let body: ResponsesNativeSearchBody =
+            serde_json::from_str(r#"{"output":[{"content":[{"text":"t"}]}]}"#)
+                .expect("body decodes");
+        assert_eq!(body.output.len(), 1);
+        assert_eq!(body.output[0].content.len(), 1);
+        assert_eq!(body.output[0].content[0].text.as_deref(), Some("t"));
+        assert!(body.output[0].content[0].annotations.is_empty());
+    }
+}

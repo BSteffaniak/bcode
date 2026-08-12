@@ -2148,6 +2148,7 @@ dependencies = [
  "bcode_model",
  "bcode_model_discovery",
  "bcode_model_provider_runtime",
+ "bcode_openai_responses",
  "bcode_plugin_sdk",
  "bcode_provider_auth",
  "bcode_provider_auth_models",
@@ -2162,6 +2163,14 @@ dependencies = [
  "sshenv_vault",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "bcode_openai_responses"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

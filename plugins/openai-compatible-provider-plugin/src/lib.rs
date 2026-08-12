@@ -35,6 +35,11 @@ use bcode_model_provider_runtime::{
     ProviderOutputPositionAllocator, ProviderRuntime, retry_hint_from_json_value,
     retry_hint_from_response_parts, sanitize_provider_diagnostic,
 };
+use bcode_openai_responses::{
+    ResponsesContent, ResponsesContextManagement, ResponsesInputItem, ResponsesNativeSearchBody,
+    ResponsesReasoningOptions, ResponsesReasoningSummary, ResponsesRequest, ResponsesTextFormat,
+    ResponsesTextOptions, ResponsesTool,
+};
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
 use bcode_provider_auth::auth_pool_state;
@@ -1650,154 +1655,6 @@ struct ChatResponseJsonSchema {
 #[derive(Debug, Serialize)]
 struct ChatStreamOptions {
     include_usage: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesRequest {
-    model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
-    input: Vec<ResponsesInputItem>,
-    stream: bool,
-    store: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_response_id: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    context_management: Vec<ResponsesContextManagement>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<ResponsesTool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parallel_tool_calls: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<ResponsesTextOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ResponsesReasoningOptions>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    include: Vec<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f32>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesContextManagement {
-    r#type: &'static str,
-    compact_threshold: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesReasoningOptions {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    summary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<&'static str>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesTextOptions {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    format: Option<ResponsesTextFormat>,
-    verbosity: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesTextFormat {
-    r#type: &'static str,
-    name: String,
-    schema: serde_json::Value,
-    strict: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ResponsesInputItem {
-    Message {
-        role: String,
-        content: Vec<ResponsesContent>,
-    },
-    FunctionCall {
-        call_id: String,
-        name: String,
-        arguments: String,
-    },
-    FunctionCallOutput {
-        call_id: String,
-        output: String,
-    },
-    Reasoning {
-        id: String,
-        #[serde(default)]
-        summary: Vec<ResponsesReasoningSummary>,
-        encrypted_content: String,
-    },
-    Compaction {
-        id: String,
-        encrypted_content: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        created_by: Option<String>,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ResponsesReasoningSummary {
-    SummaryText { text: String },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ResponsesContent {
-    InputText { text: String },
-    OutputText { text: String },
-    InputImage { image_url: String },
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesTool {
-    r#type: &'static str,
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-    strict: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesNativeSearchBody {
-    #[serde(default)]
-    output: Vec<ResponsesNativeSearchOutputItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesNativeSearchOutputItem {
-    #[serde(default)]
-    content: Vec<ResponsesNativeSearchContentItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesNativeSearchContentItem {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    annotations: Vec<ResponsesNativeSearchAnnotation>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesNativeSearchAnnotation {
-    #[serde(default)]
-    r#type: String,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

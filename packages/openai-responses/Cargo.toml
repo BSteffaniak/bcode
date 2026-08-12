@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["data-structures"]
+description = "OpenAI Responses API wire format for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "openai", "responses"]
+license     = { workspace = true }
+name        = "bcode_openai_responses"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []
