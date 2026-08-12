@@ -227,7 +227,7 @@ pub async fn compact_context_inner(
 
 pub fn process_responses_compaction_output_item(
     event: &serde_json::Value,
-    turn: &TurnState,
+    sink: &impl ResponsesEventSink,
     context_format: &ProviderContextFormat,
     completed_items: &std::cell::RefCell<BTreeSet<(u32, String)>>,
 ) {
@@ -238,7 +238,7 @@ pub fn process_responses_compaction_output_item(
         return;
     }
     if !valid_compaction_item(item) {
-        turn.push(ProviderTurnEvent::Warning {
+        sink.push(ProviderTurnEvent::Warning {
             message:
                 "provider emitted a malformed compaction item; no context boundary was created"
                     .to_string(),
@@ -259,7 +259,7 @@ pub fn process_responses_compaction_output_item(
     {
         return;
     }
-    turn.push(ProviderTurnEvent::ContextCompacted {
+    sink.push(ProviderTurnEvent::ContextCompacted {
         messages: vec![ModelMessage {
             role: MessageRole::Assistant,
             content: vec![ContentBlock::ProviderExtension {
@@ -420,14 +420,24 @@ mod tests {
             "output_index": 2,
             "item": {"type": "compaction", "id": "cmp", "encrypted_content": "opaque"}
         });
-        process_responses_compaction_output_item(&valid, &turn, &format, &completed);
-        process_responses_compaction_output_item(&valid, &turn, &format, &completed);
+        process_responses_compaction_output_item(
+            &valid,
+            &TurnEventSink(&turn),
+            &format,
+            &completed,
+        );
+        process_responses_compaction_output_item(
+            &valid,
+            &TurnEventSink(&turn),
+            &format,
+            &completed,
+        );
         process_responses_compaction_output_item(
             &serde_json::json!({
                 "output_index": 3,
                 "item": {"type": "compaction", "id": "bad", "encrypted_content": ""}
             }),
-            &turn,
+            &TurnEventSink(&turn),
             &format,
             &completed,
         );

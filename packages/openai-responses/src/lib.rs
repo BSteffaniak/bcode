@@ -24,6 +24,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Sink for provider turn events produced while decoding a Responses stream.
+///
+/// Stream decoding needs to report semantic events as they are parsed, but the concrete turn
+/// runtime — including output-position allocation and cancellation — is owned by the provider
+/// runtime rather than by this crate. Provider integrations implement this trait over their own
+/// turn state so decoding stays free of runtime ownership.
+///
+/// Implementations must tolerate being called from a streaming decode loop and must not block.
+pub trait ResponsesEventSink {
+    /// Report one decoded provider turn event.
+    fn push(&self, event: bcode_model::ProviderTurnEvent);
+}
+
+impl<T> ResponsesEventSink for &T
+where
+    T: ResponsesEventSink + ?Sized,
+{
+    fn push(&self, event: bcode_model::ProviderTurnEvent) {
+        (**self).push(event);
+    }
+}
+
 /// Request-shaping capabilities for one Responses deployment.
 ///
 /// Provider integrations differ in which Responses features an endpoint accepts. Rather than
@@ -323,6 +345,45 @@ pub struct ResponsesNativeSearchAnnotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_sink_is_implemented_for_references_and_receives_events_in_order() {
+        struct Recorder {
+            events: std::cell::RefCell<Vec<bcode_model::ProviderTurnEvent>>,
+        }
+
+        impl ResponsesEventSink for Recorder {
+            fn push(&self, event: bcode_model::ProviderTurnEvent) {
+                self.events.borrow_mut().push(event);
+            }
+        }
+
+        fn emit(sink: &impl ResponsesEventSink) {
+            sink.push(bcode_model::ProviderTurnEvent::TextDelta {
+                text: "a".to_string(),
+            });
+            sink.push(bcode_model::ProviderTurnEvent::TextDelta {
+                text: "b".to_string(),
+            });
+        }
+
+        let recorder = Recorder {
+            events: std::cell::RefCell::new(Vec::new()),
+        };
+        // Exercises the blanket reference impl, which lets decode helpers accept `&Sink`.
+        emit(&&recorder);
+
+        let events = recorder.events.borrow();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            bcode_model::ProviderTurnEvent::TextDelta { text } if text == "a"
+        ));
+        assert!(matches!(
+            &events[1],
+            bcode_model::ProviderTurnEvent::TextDelta { text } if text == "b"
+        ));
+    }
 
     #[test]
     fn unset_optional_request_fields_are_omitted_entirely() {

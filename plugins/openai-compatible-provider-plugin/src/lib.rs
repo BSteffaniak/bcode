@@ -36,9 +36,10 @@ use bcode_model_provider_runtime::{
     retry_hint_from_response_parts, sanitize_provider_diagnostic,
 };
 use bcode_openai_responses::{
-    ResponsesContent, ResponsesContextManagement, ResponsesInputItem, ResponsesNativeSearchBody,
-    ResponsesReasoningOptions, ResponsesReasoningSummary, ResponsesRequest,
-    ResponsesRequestCapabilities, ResponsesTextFormat, ResponsesTextOptions, ResponsesTool,
+    ResponsesContent, ResponsesContextManagement, ResponsesEventSink, ResponsesInputItem,
+    ResponsesNativeSearchBody, ResponsesReasoningOptions, ResponsesReasoningSummary,
+    ResponsesRequest, ResponsesRequestCapabilities, ResponsesTextFormat, ResponsesTextOptions,
+    ResponsesTool,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
@@ -1884,6 +1885,19 @@ impl ReasoningItemAccumulator {
         self.id
             .clone()
             .unwrap_or_else(|| format!("reasoning-{output_index}"))
+    }
+}
+
+/// Adapter letting the shared Responses decoder report events into the provider turn runtime.
+///
+/// `TurnState` owns output-position allocation and cancellation, which stay in the runtime crate;
+/// this newtype exposes only event emission to the wire-format layer.
+#[derive(Debug, Clone, Copy)]
+struct TurnEventSink<'a>(&'a TurnState);
+
+impl ResponsesEventSink for TurnEventSink<'_> {
+    fn push(&self, event: ProviderTurnEvent) {
+        self.0.push(event);
     }
 }
 
@@ -4318,7 +4332,7 @@ async fn read_responses_stream_events(
     let context_format =
         context_compaction::openai_context_format(&settings_for_context(&request.provider_context));
     let processor = ResponsesStreamProcessor {
-        turn,
+        sink: TurnEventSink(turn),
         dialect,
         context_format,
         name_map: &name_map,
@@ -4357,7 +4371,7 @@ async fn read_responses_stream_events(
 }
 
 struct ResponsesStreamProcessor<'a> {
-    turn: &'a TurnState,
+    sink: TurnEventSink<'a>,
     dialect: OpenAiCompatibleDialect,
     context_format: ProviderContextFormat,
     name_map: &'a BTreeMap<String, String>,
@@ -4452,7 +4466,7 @@ fn process_responses_stream_line(
             if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
                 && !delta.is_empty()
             {
-                processor.turn.push(ProviderTurnEvent::TextDelta {
+                processor.sink.push(ProviderTurnEvent::TextDelta {
                     text: delta.to_string(),
                 });
                 processor.saw_assistant_text.set(true);
@@ -4460,25 +4474,25 @@ fn process_responses_stream_line(
         }
         "response.reasoning_summary_text.delta" => process_responses_reasoning_delta(
             &event,
-            processor.turn,
+            &processor.sink,
             reasoning_items,
             bcode_session_models::ReasoningContentKind::Summary,
         ),
         "response.reasoning_text.delta" => process_responses_reasoning_delta(
             &event,
-            processor.turn,
+            &processor.sink,
             reasoning_items,
             bcode_session_models::ReasoningContentKind::Raw,
         ),
         "response.reasoning_summary_text.done" => process_responses_reasoning_done(
             &event,
-            processor.turn,
+            &processor.sink,
             reasoning_items,
             bcode_session_models::ReasoningContentKind::Summary,
         ),
         "response.reasoning_text.done" => process_responses_reasoning_done(
             &event,
-            processor.turn,
+            &processor.sink,
             reasoning_items,
             bcode_session_models::ReasoningContentKind::Raw,
         ),
@@ -4490,7 +4504,7 @@ fn process_responses_stream_line(
             {
                 item.id = Some(item_id.to_owned());
             }
-            ensure_reasoning_activity_started(processor.turn, output_index, item);
+            ensure_reasoning_activity_started(&processor.sink, output_index, item);
         }
         "response.reasoning_summary_part.done" => {
             let output_index = reasoning_output_index(&event, reasoning_items);
@@ -4505,9 +4519,9 @@ fn process_responses_stream_line(
             {
                 item.id = Some(item_id.to_owned());
             }
-            ensure_reasoning_activity_started(processor.turn, output_index, item);
+            ensure_reasoning_activity_started(&processor.sink, output_index, item);
             if let Some(text) = item.summary.get(&part_index).cloned() {
-                processor.turn.push(ProviderTurnEvent::ReasoningActivity {
+                processor.sink.push(ProviderTurnEvent::ReasoningActivity {
                     event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
                         activity_id: item.activity_id(output_index),
                         activity_order: output_index,
@@ -4523,17 +4537,22 @@ fn process_responses_stream_line(
         "response.output_item.added" => {
             process_responses_output_item(
                 &event,
-                processor.turn,
+                &processor.sink,
                 tool_calls,
                 saw_tool_call,
                 processor.name_map,
             );
-            process_responses_reasoning_output_item(&event, processor.turn, reasoning_items, false);
+            process_responses_reasoning_output_item(
+                &event,
+                &processor.sink,
+                reasoning_items,
+                false,
+            );
         }
         "response.output_item.done" => {
             process_responses_output_item(
                 &event,
-                processor.turn,
+                &processor.sink,
                 tool_calls,
                 saw_tool_call,
                 processor.name_map,
@@ -4541,19 +4560,19 @@ fn process_responses_stream_line(
             if !processor.saw_assistant_text.get()
                 && let Some(text) = responses_output_item_text(&event)
             {
-                processor.turn.push(ProviderTurnEvent::TextDelta { text });
+                processor.sink.push(ProviderTurnEvent::TextDelta { text });
                 processor.saw_assistant_text.set(true);
             }
-            process_responses_reasoning_output_item(&event, processor.turn, reasoning_items, true);
+            process_responses_reasoning_output_item(&event, &processor.sink, reasoning_items, true);
             context_compaction::process_responses_compaction_output_item(
                 &event,
-                processor.turn,
+                &processor.sink,
                 &processor.context_format,
                 &processor.completed_compaction_items,
             );
         }
         "response.function_call_arguments.delta" => {
-            process_responses_function_arguments_delta(&event, processor.turn, tool_calls);
+            process_responses_function_arguments_delta(&event, &processor.sink, tool_calls);
         }
         "response.function_call_arguments.done" => {
             process_responses_function_arguments_done(&event, tool_calls);
@@ -4563,12 +4582,12 @@ fn process_responses_stream_line(
                 let exact_input = (!processor.uses_previous_response)
                     .then(|| usage.prompt_tokens.or(usage.input_tokens))
                     .flatten();
-                processor.turn.push(ProviderTurnEvent::Usage {
+                processor.sink.push(ProviderTurnEvent::Usage {
                     usage: token_usage_from_openai_usage(usage, processor.dialect),
                 });
                 if let Some(tokens) = exact_input {
                     processor
-                        .turn
+                        .sink
                         .push(ProviderTurnEvent::ExactRequestInputTokens {
                             tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
                         });
@@ -4576,7 +4595,7 @@ fn process_responses_stream_line(
             }
             let outcome = if *saw_tool_call {
                 finish_tool_calls(
-                    processor.turn,
+                    &processor.sink,
                     tool_calls,
                     processor.name_map,
                     processor.dialect,
@@ -4594,13 +4613,13 @@ fn process_responses_stream_line(
                     .and_then(|response| response.get("id"))
                     .and_then(serde_json::Value::as_str)
             {
-                processor.turn.push(ProviderTurnEvent::ProviderMetadata {
+                processor.sink.push(ProviderTurnEvent::ProviderMetadata {
                     key: "provider_response_id".to_string(),
                     value: response_id.to_string(),
                 });
             }
             if !processor.suppress_provider_reuse_state {
-                push_responses_provider_state(processor.turn, reasoning_items);
+                push_responses_provider_state(&processor.sink, reasoning_items);
             }
             return Ok(outcome);
         }
@@ -4610,12 +4629,12 @@ fn process_responses_stream_line(
                     let exact_input = (!processor.uses_previous_response)
                         .then(|| usage.prompt_tokens.or(usage.input_tokens))
                         .flatten();
-                    processor.turn.push(ProviderTurnEvent::Usage {
+                    processor.sink.push(ProviderTurnEvent::Usage {
                         usage: token_usage_from_openai_usage(usage, processor.dialect),
                     });
                     if let Some(tokens) = exact_input {
                         processor
-                            .turn
+                            .sink
                             .push(ProviderTurnEvent::ExactRequestInputTokens {
                                 tokens: bcode_model::ExactRequestInputTokens::new(u64::from(
                                     tokens,
@@ -4630,13 +4649,13 @@ fn process_responses_stream_line(
                         .and_then(|response| response.get("id"))
                         .and_then(serde_json::Value::as_str)
                 {
-                    processor.turn.push(ProviderTurnEvent::ProviderMetadata {
+                    processor.sink.push(ProviderTurnEvent::ProviderMetadata {
                         key: "provider_response_id".to_string(),
                         value: response_id.to_string(),
                     });
                 }
                 if !processor.suppress_provider_reuse_state {
-                    push_responses_provider_state(processor.turn, reasoning_items);
+                    push_responses_provider_state(&processor.sink, reasoning_items);
                 }
                 return Ok(StreamOutcome::MaxTokens);
             }
@@ -4776,7 +4795,7 @@ fn reasoning_output_index(
 }
 
 fn ensure_reasoning_activity_started(
-    turn: &TurnState,
+    sink: &impl ResponsesEventSink,
     output_index: u32,
     item: &mut ReasoningItemAccumulator,
 ) {
@@ -4784,7 +4803,7 @@ fn ensure_reasoning_activity_started(
         return;
     }
     item.started = true;
-    turn.push(ProviderTurnEvent::ReasoningActivity {
+    sink.push(ProviderTurnEvent::ReasoningActivity {
         event: bcode_session_models::ReasoningActivityEvent::Started {
             activity_id: item.activity_id(output_index),
             order: output_index,
@@ -4794,7 +4813,7 @@ fn ensure_reasoning_activity_started(
 
 fn process_responses_reasoning_delta(
     event: &serde_json::Value,
-    turn: &TurnState,
+    sink: &impl ResponsesEventSink,
     reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     kind: bcode_session_models::ReasoningContentKind,
 ) {
@@ -4820,7 +4839,7 @@ fn process_responses_reasoning_delta(
     {
         item.id = Some(item_id.to_owned());
     }
-    ensure_reasoning_activity_started(turn, output_index, item);
+    ensure_reasoning_activity_started(sink, output_index, item);
     let activity_id = item.activity_id(output_index);
     let (parts, prefix, role) = match kind {
         bcode_session_models::ReasoningContentKind::Summary => (
@@ -4840,7 +4859,7 @@ fn process_responses_reasoning_delta(
         ),
     };
     parts.entry(part_index).or_default().push_str(delta);
-    turn.push(ProviderTurnEvent::ReasoningActivity {
+    sink.push(ProviderTurnEvent::ReasoningActivity {
         event: bcode_session_models::ReasoningActivityEvent::PartDelta {
             activity_id,
             activity_order: output_index,
@@ -4855,7 +4874,7 @@ fn process_responses_reasoning_delta(
 
 fn process_responses_reasoning_done(
     event: &serde_json::Value,
-    turn: &TurnState,
+    sink: &impl ResponsesEventSink,
     reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     kind: bcode_session_models::ReasoningContentKind,
 ) {
@@ -4877,7 +4896,7 @@ fn process_responses_reasoning_done(
     {
         item.id = Some(item_id.to_owned());
     }
-    ensure_reasoning_activity_started(turn, output_index, item);
+    ensure_reasoning_activity_started(sink, output_index, item);
     let activity_id = item.activity_id(output_index);
     let (parts, prefix, role) = match kind {
         bcode_session_models::ReasoningContentKind::Summary => (
@@ -4897,7 +4916,7 @@ fn process_responses_reasoning_done(
         ),
     };
     parts.insert(part_index, text.to_owned());
-    turn.push(ProviderTurnEvent::ReasoningActivity {
+    sink.push(ProviderTurnEvent::ReasoningActivity {
         event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
             activity_id,
             activity_order: output_index,
@@ -4932,7 +4951,7 @@ fn responses_output_item_text(event: &serde_json::Value) -> Option<String> {
 
 fn process_responses_output_item(
     event: &serde_json::Value,
-    turn: &TurnState,
+    sink: &impl ResponsesEventSink,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
     saw_tool_call: &mut bool,
     name_map: &BTreeMap<String, String>,
@@ -4960,7 +4979,7 @@ fn process_responses_output_item(
     if !entry.started
         && let (Some(id), Some(name)) = (&entry.id, &entry.name)
     {
-        turn.push(ProviderTurnEvent::ToolCallStarted {
+        sink.push(ProviderTurnEvent::ToolCallStarted {
             call_id: id.clone(),
             name: original_tool_name(name, name_map),
         });
@@ -4970,7 +4989,7 @@ fn process_responses_output_item(
 
 fn process_responses_reasoning_output_item(
     event: &serde_json::Value,
-    turn: &TurnState,
+    sink: &impl ResponsesEventSink,
     reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     completed: bool,
 ) {
@@ -4989,7 +5008,7 @@ fn process_responses_reasoning_output_item(
     if let Some(id) = item_value.get("id").and_then(serde_json::Value::as_str) {
         item.id = Some(id.to_owned());
     }
-    ensure_reasoning_activity_started(turn, output_index, item);
+    ensure_reasoning_activity_started(sink, output_index, item);
     let activity_id = item.activity_id(output_index);
     if let Some(encrypted_content) = item_value
         .get("encrypted_content")
@@ -4997,7 +5016,7 @@ fn process_responses_reasoning_output_item(
         .filter(|encrypted_content| !encrypted_content.is_empty())
     {
         item.encrypted_content = Some(encrypted_content.to_owned());
-        turn.push(ProviderTurnEvent::ReasoningActivity {
+        sink.push(ProviderTurnEvent::ReasoningActivity {
             event: bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
                 activity_id: activity_id.clone(),
                 activity_order: output_index,
@@ -5018,7 +5037,7 @@ fn process_responses_reasoning_output_item(
             };
             let part_order = u32::try_from(index).unwrap_or(u32::MAX);
             item.summary.insert(part_order, text.to_owned());
-            turn.push(ProviderTurnEvent::ReasoningActivity {
+            sink.push(ProviderTurnEvent::ReasoningActivity {
                 event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
                     activity_id: activity_id.clone(),
                     activity_order: output_index,
@@ -5051,7 +5070,7 @@ fn process_responses_reasoning_output_item(
             };
             let part_order = u32::try_from(index).unwrap_or(u32::MAX);
             item.content.insert(part_order, text.to_owned());
-            turn.push(ProviderTurnEvent::ReasoningActivity {
+            sink.push(ProviderTurnEvent::ReasoningActivity {
                 event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
                     activity_id: activity_id.clone(),
                     activity_order: output_index,
@@ -5066,7 +5085,7 @@ fn process_responses_reasoning_output_item(
     }
     if completed && !item.finished {
         item.finished = true;
-        turn.push(ProviderTurnEvent::ReasoningActivity {
+        sink.push(ProviderTurnEvent::ReasoningActivity {
             event: bcode_session_models::ReasoningActivityEvent::Finished {
                 activity_id,
                 activity_order: output_index,
@@ -5077,7 +5096,7 @@ fn process_responses_reasoning_output_item(
 }
 
 fn push_responses_provider_state(
-    turn: &TurnState,
+    sink: &impl ResponsesEventSink,
     reasoning_items: &BTreeMap<u32, ReasoningItemAccumulator>,
 ) {
     let state = OpenAiProviderState {
@@ -5097,7 +5116,7 @@ fn push_responses_provider_state(
         return;
     }
     if let Ok(value) = serde_json::to_string(&state) {
-        turn.push(ProviderTurnEvent::ProviderMetadata {
+        sink.push(ProviderTurnEvent::ProviderMetadata {
             key: "provider_state".to_string(),
             value,
         });
@@ -5128,7 +5147,7 @@ fn responses_output_index(
 
 fn process_responses_function_arguments_delta(
     event: &serde_json::Value,
-    turn: &TurnState,
+    sink: &impl ResponsesEventSink,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
 ) {
     let output_index = event
@@ -5142,7 +5161,7 @@ fn process_responses_function_arguments_delta(
         if !delta.is_empty()
             && let Some(call_id) = &entry.id
         {
-            turn.push(ProviderTurnEvent::ToolCallDelta {
+            sink.push(ProviderTurnEvent::ToolCallDelta {
                 call_id: call_id.clone(),
                 delta: delta.to_string(),
             });
@@ -5249,7 +5268,7 @@ fn process_stream_line(
             && finish_reason == "tool_calls"
         {
             finish_tool_calls(
-                turn,
+                &TurnEventSink(turn),
                 tool_calls,
                 name_map,
                 OpenAiCompatibleDialect::ChatCompletions,
@@ -5358,7 +5377,7 @@ fn process_tool_call_deltas(
 }
 
 fn finish_tool_calls(
-    turn: &TurnState,
+    sink: &impl ResponsesEventSink,
     tool_calls: &BTreeMap<u32, ToolCallAccumulator>,
     name_map: &BTreeMap<String, String>,
     dialect: OpenAiCompatibleDialect,
@@ -5380,7 +5399,7 @@ fn finish_tool_calls(
         })?;
         let name = original_tool_name(&provider_name, name_map);
         let arguments = parse_tool_arguments(&accumulator.arguments, &id, &name)?;
-        turn.push(ProviderTurnEvent::ToolCallFinished {
+        sink.push(ProviderTurnEvent::ToolCallFinished {
             call: ToolCall {
                 id,
                 name: name.clone(),
@@ -11500,7 +11519,7 @@ mod tests {
         ]);
 
         finish_tool_calls(
-            &turn,
+            &TurnEventSink(&turn),
             &calls,
             &BTreeMap::new(),
             OpenAiCompatibleDialect::ResponsesApi,
@@ -11540,7 +11559,7 @@ mod tests {
         )]);
 
         let error = finish_tool_calls(
-            &turn,
+            &TurnEventSink(&turn),
             &calls,
             &BTreeMap::new(),
             OpenAiCompatibleDialect::ResponsesApi,
@@ -11753,7 +11772,7 @@ mod tests {
         name_map: &'a BTreeMap<String, String>,
     ) -> ResponsesStreamProcessor<'a> {
         ResponsesStreamProcessor {
-            turn,
+            sink: TurnEventSink(turn),
             dialect: OpenAiCompatibleDialect::ResponsesApi,
             context_format: ProviderContextFormat {
                 version: 1,
@@ -12018,7 +12037,7 @@ mod tests {
         let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let processor = ResponsesStreamProcessor {
-            turn: &turn,
+            sink: TurnEventSink(&turn),
             dialect: OpenAiCompatibleDialect::ChatGptCodex,
             context_format: ProviderContextFormat {
                 version: 1,
@@ -12095,7 +12114,7 @@ mod tests {
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
         let processor = ResponsesStreamProcessor {
-            turn: &turn,
+            sink: TurnEventSink(&turn),
             dialect: OpenAiCompatibleDialect::ChatGptCodex,
             context_format: ProviderContextFormat {
                 version: 1,
