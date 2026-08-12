@@ -24,6 +24,15 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use decode::{
+    ReasoningItemAccumulator, ToolCallAccumulator, ensure_reasoning_activity_started,
+    process_responses_function_arguments_delta, process_responses_function_arguments_done,
+    process_responses_reasoning_delta, process_responses_reasoning_done, reasoning_output_index,
+    reported_output_index,
+};
+
+mod decode;
+
 /// Sink for provider turn events produced while decoding a Responses stream.
 ///
 /// Stream decoding needs to report semantic events as they are parsed, but the concrete turn

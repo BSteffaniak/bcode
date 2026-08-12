@@ -36,10 +36,12 @@ use bcode_model_provider_runtime::{
     retry_hint_from_response_parts, sanitize_provider_diagnostic,
 };
 use bcode_openai_responses::{
-    ResponsesContent, ResponsesContextManagement, ResponsesEventSink, ResponsesInputItem,
-    ResponsesNativeSearchBody, ResponsesReasoningOptions, ResponsesReasoningSummary,
-    ResponsesRequest, ResponsesRequestCapabilities, ResponsesTextFormat, ResponsesTextOptions,
-    ResponsesTool,
+    ReasoningItemAccumulator, ResponsesContent, ResponsesContextManagement, ResponsesEventSink,
+    ResponsesInputItem, ResponsesNativeSearchBody, ResponsesReasoningOptions,
+    ResponsesReasoningSummary, ResponsesRequest, ResponsesRequestCapabilities, ResponsesTextFormat,
+    ResponsesTextOptions, ResponsesTool, ToolCallAccumulator, ensure_reasoning_activity_started,
+    process_responses_function_arguments_delta, process_responses_function_arguments_done,
+    process_responses_reasoning_delta, process_responses_reasoning_done, reasoning_output_index,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
@@ -1860,32 +1862,6 @@ enum StreamOutcome {
     ToolCall,
     MaxTokens,
     Cancelled,
-}
-
-#[derive(Debug, Default)]
-struct ToolCallAccumulator {
-    id: Option<String>,
-    name: Option<String>,
-    arguments: String,
-    started: bool,
-}
-
-#[derive(Debug, Default)]
-struct ReasoningItemAccumulator {
-    id: Option<String>,
-    encrypted_content: Option<String>,
-    summary: BTreeMap<u32, String>,
-    content: BTreeMap<u32, String>,
-    started: bool,
-    finished: bool,
-}
-
-impl ReasoningItemAccumulator {
-    fn activity_id(&self, output_index: u32) -> String {
-        self.id
-            .clone()
-            .unwrap_or_else(|| format!("reasoning-{output_index}"))
-    }
 }
 
 /// Adapter letting the shared Responses decoder report events into the provider turn runtime.
@@ -4765,170 +4741,6 @@ fn responses_incomplete_error(event: &serde_json::Value) -> ProviderError {
     error
 }
 
-fn reasoning_output_index(
-    event: &serde_json::Value,
-    reasoning_items: &BTreeMap<u32, ReasoningItemAccumulator>,
-) -> u32 {
-    if let Some(output_index) = event
-        .get("output_index")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|index| u32::try_from(index).ok())
-    {
-        return output_index;
-    }
-    let item_id = event
-        .get("item_id")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            event
-                .get("item")
-                .and_then(|item| item.get("id"))
-                .and_then(serde_json::Value::as_str)
-        });
-    if let Some((index, _)) = reasoning_items
-        .iter()
-        .find(|(_, item)| item.id.as_deref() == item_id)
-    {
-        return *index;
-    }
-    u32::try_from(reasoning_items.len()).unwrap_or(u32::MAX)
-}
-
-fn ensure_reasoning_activity_started(
-    sink: &impl ResponsesEventSink,
-    output_index: u32,
-    item: &mut ReasoningItemAccumulator,
-) {
-    if item.started {
-        return;
-    }
-    item.started = true;
-    sink.push(ProviderTurnEvent::ReasoningActivity {
-        event: bcode_session_models::ReasoningActivityEvent::Started {
-            activity_id: item.activity_id(output_index),
-            order: output_index,
-        },
-    });
-}
-
-fn process_responses_reasoning_delta(
-    event: &serde_json::Value,
-    sink: &impl ResponsesEventSink,
-    reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
-    kind: bcode_session_models::ReasoningContentKind,
-) {
-    let Some(delta) = event
-        .get("delta")
-        .and_then(serde_json::Value::as_str)
-        .filter(|delta| !delta.is_empty())
-    else {
-        return;
-    };
-    let output_index = reasoning_output_index(event, reasoning_items);
-    let part_index = match kind {
-        bcode_session_models::ReasoningContentKind::Summary => event.get("summary_index"),
-        bcode_session_models::ReasoningContentKind::Raw
-        | bcode_session_models::ReasoningContentKind::Legacy => event.get("content_index"),
-    }
-    .and_then(serde_json::Value::as_u64)
-    .and_then(|index| u32::try_from(index).ok())
-    .unwrap_or(0);
-    let item = reasoning_items.entry(output_index).or_default();
-    if item.id.is_none()
-        && let Some(item_id) = event.get("item_id").and_then(serde_json::Value::as_str)
-    {
-        item.id = Some(item_id.to_owned());
-    }
-    ensure_reasoning_activity_started(sink, output_index, item);
-    let activity_id = item.activity_id(output_index);
-    let (parts, prefix, role) = match kind {
-        bcode_session_models::ReasoningContentKind::Summary => (
-            &mut item.summary,
-            "summary",
-            bcode_session_models::ReasoningContentRole::Milestone,
-        ),
-        bcode_session_models::ReasoningContentKind::Raw => (
-            &mut item.content,
-            "raw",
-            bcode_session_models::ReasoningContentRole::Detail,
-        ),
-        bcode_session_models::ReasoningContentKind::Legacy => (
-            &mut item.content,
-            "legacy",
-            bcode_session_models::ReasoningContentRole::Unknown,
-        ),
-    };
-    parts.entry(part_index).or_default().push_str(delta);
-    sink.push(ProviderTurnEvent::ReasoningActivity {
-        event: bcode_session_models::ReasoningActivityEvent::PartDelta {
-            activity_id,
-            activity_order: output_index,
-            part_id: format!("{prefix}-{part_index}"),
-            kind,
-            role,
-            part_order: part_index,
-            text: delta.to_owned(),
-        },
-    });
-}
-
-fn process_responses_reasoning_done(
-    event: &serde_json::Value,
-    sink: &impl ResponsesEventSink,
-    reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
-    kind: bcode_session_models::ReasoningContentKind,
-) {
-    let Some(text) = event.get("text").and_then(serde_json::Value::as_str) else {
-        return;
-    };
-    let output_index = reasoning_output_index(event, reasoning_items);
-    let part_index = match kind {
-        bcode_session_models::ReasoningContentKind::Summary => event.get("summary_index"),
-        bcode_session_models::ReasoningContentKind::Raw
-        | bcode_session_models::ReasoningContentKind::Legacy => event.get("content_index"),
-    }
-    .and_then(serde_json::Value::as_u64)
-    .and_then(|index| u32::try_from(index).ok())
-    .unwrap_or(0);
-    let item = reasoning_items.entry(output_index).or_default();
-    if item.id.is_none()
-        && let Some(item_id) = event.get("item_id").and_then(serde_json::Value::as_str)
-    {
-        item.id = Some(item_id.to_owned());
-    }
-    ensure_reasoning_activity_started(sink, output_index, item);
-    let activity_id = item.activity_id(output_index);
-    let (parts, prefix, role) = match kind {
-        bcode_session_models::ReasoningContentKind::Summary => (
-            &mut item.summary,
-            "summary",
-            bcode_session_models::ReasoningContentRole::Milestone,
-        ),
-        bcode_session_models::ReasoningContentKind::Raw => (
-            &mut item.content,
-            "raw",
-            bcode_session_models::ReasoningContentRole::Detail,
-        ),
-        bcode_session_models::ReasoningContentKind::Legacy => (
-            &mut item.content,
-            "legacy",
-            bcode_session_models::ReasoningContentRole::Unknown,
-        ),
-    };
-    parts.insert(part_index, text.to_owned());
-    sink.push(ProviderTurnEvent::ReasoningActivity {
-        event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
-            activity_id,
-            activity_order: output_index,
-            part_id: format!("{prefix}-{part_index}"),
-            kind,
-            role,
-            part_order: part_index,
-            text: text.to_owned(),
-        },
-    });
-}
-
 fn responses_output_item_text(event: &serde_json::Value) -> Option<String> {
     let item = event.get("item")?;
     if item.get("type").and_then(serde_json::Value::as_str) != Some("message") {
@@ -5143,44 +4955,6 @@ fn responses_output_index(
         return *index;
     }
     u32::try_from(tool_calls.len()).unwrap_or(u32::MAX)
-}
-
-fn process_responses_function_arguments_delta(
-    event: &serde_json::Value,
-    sink: &impl ResponsesEventSink,
-    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
-) {
-    let output_index = event
-        .get("output_index")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|index| u32::try_from(index).ok())
-        .unwrap_or(0);
-    if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
-        let entry = tool_calls.entry(output_index).or_default();
-        entry.arguments.push_str(delta);
-        if !delta.is_empty()
-            && let Some(call_id) = &entry.id
-        {
-            sink.push(ProviderTurnEvent::ToolCallDelta {
-                call_id: call_id.clone(),
-                delta: delta.to_string(),
-            });
-        }
-    }
-}
-
-fn process_responses_function_arguments_done(
-    event: &serde_json::Value,
-    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
-) {
-    let output_index = event
-        .get("output_index")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|index| u32::try_from(index).ok())
-        .unwrap_or(0);
-    if let Some(arguments) = event.get("arguments").and_then(serde_json::Value::as_str) {
-        tool_calls.entry(output_index).or_default().arguments = arguments.to_string();
-    }
 }
 
 fn process_stream_buffer(

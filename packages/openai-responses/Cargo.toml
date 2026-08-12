@@ -11,9 +11,10 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_model = { workspace = true }
-serde       = { workspace = true, features = ["derive"] }
-serde_json  = { workspace = true, features = ["std"] }
+bcode_model          = { workspace = true }
+bcode_session_models = { workspace = true }
+serde                = { workspace = true, features = ["derive"] }
+serde_json           = { workspace = true, features = ["std"] }
 
 [features]
 default          = []
