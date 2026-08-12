@@ -273,6 +273,7 @@ pub fn process_responses_compaction_output_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_openai_responses::ResponsesContent;
 
     #[test]
     fn compact_request_serializes_only_supported_fields() {

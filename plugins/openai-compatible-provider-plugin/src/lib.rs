@@ -36,16 +36,17 @@ use bcode_model_provider_runtime::{
     retry_hint_from_response_parts, sanitize_provider_diagnostic,
 };
 use bcode_openai_responses::{
-    ReasoningItemAccumulator, ResponsesContent, ResponsesContextManagement, ResponsesEventSink,
-    ResponsesInputItem, ResponsesNativeSearchBody, ResponsesReasoningOptions,
-    ResponsesReasoningSummary, ResponsesRequest, ResponsesRequestCapabilities, ResponsesStreamLine,
-    ResponsesTextFormat, ResponsesTextOptions, ResponsesTool, StreamOutcome, ToolCallAccumulator,
+    ReasoningItemAccumulator, ResponsesContextManagement, ResponsesEventSink, ResponsesInputItem,
+    ResponsesNativeSearchBody, ResponsesReasoningOptions, ResponsesReasoningSummary,
+    ResponsesRequest, ResponsesRequestCapabilities, ResponsesStreamLine, ResponsesTextFormat,
+    ResponsesTextOptions, ResponsesTool, StreamOutcome, ToolCallAccumulator,
     classify_responses_stream_line, drain_complete_stream_lines, ensure_reasoning_activity_started,
-    parse_tool_arguments, process_responses_function_arguments_delta,
-    process_responses_function_arguments_done, process_responses_output_item,
-    process_responses_reasoning_delta, process_responses_reasoning_done,
-    process_responses_reasoning_output_item, reasoning_output_index, responses_event_type,
-    responses_incomplete_reason, responses_output_item_text, responses_text_delta,
+    image_data_url, joined_text_content, parse_tool_arguments,
+    process_responses_function_arguments_delta, process_responses_function_arguments_done,
+    process_responses_output_item, process_responses_reasoning_delta,
+    process_responses_reasoning_done, process_responses_reasoning_output_item,
+    reasoning_output_index, responses_event_type, responses_incomplete_reason,
+    responses_output_item_text, responses_text_delta,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
@@ -5511,256 +5512,9 @@ fn model_messages_to_responses_input(
         })
         .flatten()
         .unwrap_or_default();
-    let mut input = Vec::new();
-    let mut seen_tool_call_ids = BTreeSet::new();
-    let mut pending_tool_call_ids = BTreeSet::new();
-    for message in request
-        .messages
-        .iter()
-        .skip(start.min(request.messages.len()))
-    {
-        for item in model_message_to_responses_input(message, dialect) {
-            push_sanitized_responses_input_item(
-                &mut input,
-                &mut seen_tool_call_ids,
-                &mut pending_tool_call_ids,
-                item,
-            );
-        }
-    }
-    append_missing_responses_tool_outputs(&mut input, &mut pending_tool_call_ids);
-    input
-}
-
-fn push_sanitized_responses_input_item(
-    input: &mut Vec<ResponsesInputItem>,
-    seen_tool_call_ids: &mut BTreeSet<String>,
-    pending_tool_call_ids: &mut BTreeSet<String>,
-    item: ResponsesInputItem,
-) {
-    match item {
-        ResponsesInputItem::FunctionCall {
-            call_id,
-            name,
-            arguments,
-        } => {
-            if !seen_tool_call_ids.insert(call_id.clone()) {
-                append_missing_responses_tool_outputs(input, pending_tool_call_ids);
-                input.push(ResponsesInputItem::Message {
-                    role: "user".to_string(),
-                    content: vec![ResponsesContent::InputText {
-                        text: format!(
-                            "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {call_id}; tool: {name}; arguments: {arguments}"
-                        ),
-                    }],
-                });
-                return;
-            }
-            pending_tool_call_ids.insert(call_id.clone());
-            input.push(ResponsesInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            });
-        }
-        ResponsesInputItem::FunctionCallOutput { call_id, output } => {
-            if pending_tool_call_ids.remove(&call_id) {
-                input.push(ResponsesInputItem::FunctionCallOutput { call_id, output });
-            } else {
-                append_missing_responses_tool_outputs(input, pending_tool_call_ids);
-                input.push(ResponsesInputItem::Message {
-                    role: "user".to_string(),
-                    content: vec![ResponsesContent::InputText {
-                        text: format!(
-                            "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {call_id}; result: {output}"
-                        ),
-                    }],
-                });
-            }
-        }
-        ResponsesInputItem::Message { role, content } => {
-            append_missing_responses_tool_outputs(input, pending_tool_call_ids);
-            input.push(ResponsesInputItem::Message { role, content });
-        }
-        ResponsesInputItem::Reasoning {
-            id,
-            summary,
-            encrypted_content,
-        } => {
-            append_missing_responses_tool_outputs(input, pending_tool_call_ids);
-            input.push(ResponsesInputItem::Reasoning {
-                id,
-                summary,
-                encrypted_content,
-            });
-        }
-        ResponsesInputItem::Compaction {
-            id,
-            encrypted_content,
-            created_by,
-        } => {
-            append_missing_responses_tool_outputs(input, pending_tool_call_ids);
-            input.push(ResponsesInputItem::Compaction {
-                id,
-                encrypted_content,
-                created_by,
-            });
-        }
-    }
-}
-
-fn append_missing_responses_tool_outputs(
-    input: &mut Vec<ResponsesInputItem>,
-    pending_tool_call_ids: &mut BTreeSet<String>,
-) {
-    input.extend(
-        std::mem::take(pending_tool_call_ids)
-            .into_iter()
-            .map(|call_id| ResponsesInputItem::FunctionCallOutput {
-                call_id,
-                output: "tool invocation was interrupted before Bcode could persist a result"
-                    .to_string(),
-            }),
-    );
-}
-
-fn model_message_to_responses_input(
-    message: &ModelMessage,
-    dialect: OpenAiCompatibleDialect,
-) -> Vec<ResponsesInputItem> {
-    let extension_items = message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ProviderExtension { value } => {
-                serde_json::from_value::<ResponsesInputItem>(value.clone()).ok()
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !extension_items.is_empty() {
-        return extension_items;
-    }
-    match message.role {
-        MessageRole::System => Vec::new(),
-        MessageRole::User => responses_message("user", message, true),
-        MessageRole::Assistant => responses_assistant_items(message, dialect),
-        MessageRole::Tool => responses_tool_items(message),
-    }
-}
-
-fn responses_message(
-    role: &'static str,
-    message: &ModelMessage,
-    input_text: bool,
-) -> Vec<ResponsesInputItem> {
-    let mut content = Vec::new();
-    let text = joined_text_content(message);
-    if !text.is_empty() {
-        content.push(if input_text {
-            ResponsesContent::InputText { text }
-        } else {
-            ResponsesContent::OutputText { text }
-        });
-    }
-    for block in &message.content {
-        if let ContentBlock::Image { image } = block {
-            content.push(ResponsesContent::InputImage {
-                image_url: image_data_url(image),
-            });
-        }
-    }
-    if content.is_empty() {
-        return Vec::new();
-    }
-    vec![ResponsesInputItem::Message {
-        role: role.to_string(),
-        content,
-    }]
-}
-
-fn responses_assistant_items(
-    message: &ModelMessage,
-    dialect: OpenAiCompatibleDialect,
-) -> Vec<ResponsesInputItem> {
-    let mut items = responses_message("assistant", message, false);
-    items.extend(message.content.iter().filter_map(|block| match block {
-        ContentBlock::ToolCall { call } => Some(ResponsesInputItem::FunctionCall {
-            call_id: call.id.clone(),
-            name: provider_tool_name(&call.name, dialect),
-            arguments: serde_json::to_string(&call.arguments).unwrap_or_default(),
-        }),
-        _ => None,
-    }));
-    items
-}
-
-fn responses_tool_items(message: &ModelMessage) -> Vec<ResponsesInputItem> {
-    let mut items = Vec::new();
-    for block in &message.content {
-        let ContentBlock::ToolResult { result } = block else {
-            continue;
-        };
-        items.push(ResponsesInputItem::FunctionCallOutput {
-            call_id: result.call_id.clone(),
-            output: result.output.clone(),
-        });
-        for content in &result.content {
-            match content {
-                bcode_model::ToolResultContent::Image { image } => {
-                    items.push(ResponsesInputItem::Message {
-                        role: "user".to_string(),
-                        content: vec![
-                            ResponsesContent::InputText {
-                                text: format!(
-                                    "Image content returned by tool call {}:",
-                                    result.call_id
-                                ),
-                            },
-                            ResponsesContent::InputImage {
-                                image_url: image_data_url(image),
-                            },
-                        ],
-                    });
-                }
-                bcode_model::ToolResultContent::ImageRef { image } => {
-                    items.push(ResponsesInputItem::Message {
-                        role: "user".to_string(),
-                        content: vec![ResponsesContent::InputText {
-                            text: image_ref_text(&result.call_id, image),
-                        }],
-                    });
-                }
-                bcode_model::ToolResultContent::Text { text } => {
-                    items.push(ResponsesInputItem::Message {
-                        role: "user".to_string(),
-                        content: vec![ResponsesContent::InputText { text: text.clone() }],
-                    });
-                }
-            }
-        }
-    }
-    items
-}
-
-fn image_ref_text(call_id: &str, image: &bcode_model::ImageRefContent) -> String {
-    let dimensions = image
-        .metadata
-        .width
-        .zip(image.metadata.height)
-        .map_or_else(String::new, |(width, height)| format!(" {width}x{height}"));
-    let byte_len = image
-        .metadata
-        .byte_len
-        .map_or_else(String::new, |byte_len| format!(" {byte_len} bytes"));
-    format!(
-        "Image reference returned by tool call {call_id}: {} {}{}{}",
-        image.path, image.mime_type, dimensions, byte_len
-    )
-}
-
-fn image_data_url(image: &bcode_model::ImageContent) -> String {
-    format!("data:{};base64,{}", image.mime_type, image.data_base64)
+    bcode_openai_responses::model_messages_to_responses_input(&request.messages, start, &|name| {
+        provider_tool_name(name, dialect)
+    })
 }
 
 fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessage> {
@@ -5979,18 +5733,6 @@ fn tool_chat_message(message: &ModelMessage) -> Option<ChatMessage> {
         }),
         _ => None,
     })
-}
-
-fn joined_text_content(message: &ModelMessage) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn model_tools_to_responses_tools(
@@ -8756,6 +8498,7 @@ mod tests {
         BlockingModelProviderInvoker, ProviderConformanceOptions, ProviderConformanceOutcome,
         run_provider_conformance_suite,
     };
+    use bcode_openai_responses::{ResponsesContent, responses_tool_items};
     use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
