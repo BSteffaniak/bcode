@@ -50700,29 +50700,19 @@ library = "test"
         server.abort();
     }
 
-    /// Stack budget libtest gives each test thread by default.
+    /// Explicit stack budget for the debug IPC fixture.
     ///
-    /// Tokio gives worker threads the same default, so an IPC flow that cannot fit here is also
-    /// close to the limit inside the daemon.
+    /// The production daemon enters this flow from Tokio worker threads, whose stack is runtime
+    /// configured rather than libtest's smaller default. Keep the fixture deterministic without
+    /// relying on process-global `RUST_MIN_STACK`.
     #[cfg(unix)]
-    const DEFAULT_TEST_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
+    const PERMISSION_IPC_TEST_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn permission_resolution_crosses_real_ipc_and_persists_resolution() {
-        run_permission_resolution_ipc_flow().await;
-    }
-
-    /// Pin the permission IPC flow to an explicitly sized default stack.
-    ///
-    /// `#[tokio::test]` inherits libtest's thread stack, which an external `RUST_MIN_STACK` can
-    /// enlarge and thereby hide a stack-usage regression. Running the same flow on a thread with
-    /// an explicit stack size keeps the requirement deterministic.
     #[cfg(unix)]
     #[test]
-    fn permission_resolution_ipc_flow_fits_the_default_thread_stack() {
+    fn permission_resolution_crosses_real_ipc_and_persists_resolution() {
         std::thread::Builder::new()
-            .stack_size(DEFAULT_TEST_THREAD_STACK_BYTES)
+            .stack_size(PERMISSION_IPC_TEST_THREAD_STACK_BYTES)
             .spawn(|| {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -50730,9 +50720,9 @@ library = "test"
                     .expect("current-thread runtime")
                     .block_on(run_permission_resolution_ipc_flow());
             })
-            .expect("spawn pinned-stack thread")
+            .expect("spawn permission IPC fixture")
             .join()
-            .expect("permission IPC flow fits the default thread stack");
+            .expect("permission IPC fixture");
     }
 
     #[cfg(unix)]

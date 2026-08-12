@@ -48,7 +48,7 @@ trap cleanup EXIT
 cd "${root}"
 if [[ "${BCODE_SESSION_SEARCH_PTY_SKIP_BUILD:-0}" != "1" ]]; then
     cargo build "${cargo_profile_args[@]}" --quiet -p bcode --features distribution
-    cargo build "${cargo_profile_args[@]}" --quiet -p bcode_tui_components --bin bcode_terminal_grid_probe
+    cargo build "${cargo_profile_args[@]}" --quiet -p bcode_tui_components --features terminal-viewer --bin bcode_terminal_grid_probe
 fi
 if [[ ! -x "${bcode_binary}" || ! -x "${grid_probe_binary}" ]]; then
     echo "smoke-session-search-pty: required binaries are missing" >&2
@@ -217,7 +217,7 @@ while time.monotonic() < deadline:
         continue
     if inventory_started and not inventory_completed and (
         b"canonical migration completed" in lower
-        or b"canonical migration needsattention" in lower
+        or b"canonical migration needs attention" in lower
     ):
         inventory_completed = True
         os.write(fd, b"\x1b[98;3u")

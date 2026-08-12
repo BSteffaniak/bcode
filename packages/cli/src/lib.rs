@@ -15281,7 +15281,10 @@ mod workflow_source_tests {
             blocks: std::collections::BTreeMap::new(),
             node_configuration_schemas: bcode_workflow::workflow_node_configuration_schemas(),
             workflow_definitions: std::collections::BTreeMap::new(),
-            agent_profiles: std::collections::BTreeSet::from(["review".to_string()]),
+            agent_profiles: std::collections::BTreeSet::from([
+                "plan".to_string(),
+                "review".to_string(),
+            ]),
             authoring_actions: std::collections::BTreeMap::new(),
         };
         let plan =
@@ -15420,6 +15423,7 @@ mod workflow_source_tests {
             workflow_definitions: std::collections::BTreeMap::new(),
             agent_profiles: std::collections::BTreeSet::from([
                 "build".to_string(),
+                "plan".to_string(),
                 "review".to_string(),
             ]),
             authoring_actions: std::collections::BTreeMap::new(),
@@ -15656,7 +15660,7 @@ mod workflow_source_tests {
             ])),
         )
         .expect("delivery closure plans");
-        assert_eq!(plan.packages.len(), 4);
+        assert_eq!(plan.packages.len(), closure.packages.len());
         let entry = plan
             .packages
             .iter()
@@ -15684,6 +15688,7 @@ mod workflow_source_tests {
             &closure,
             &workflow_test_catalog(std::collections::BTreeSet::from([
                 "build".to_string(),
+                "plan".to_string(),
                 "review".to_string(),
             ])),
         )
@@ -16042,6 +16047,7 @@ mod workflow_source_tests {
             &closure,
             &workflow_test_catalog(std::collections::BTreeSet::from([
                 "build".to_string(),
+                "plan".to_string(),
                 "review".to_string(),
             ])),
         )
