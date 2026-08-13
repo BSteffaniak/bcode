@@ -364,8 +364,6 @@ pub struct ServerState {
     startup_config: bcode_config::BcodeConfig,
     session_configs: Mutex<BTreeMap<SessionId, bcode_config::BcodeConfig>>,
     session_skills: Mutex<BTreeMap<SessionId, Option<SkillRegistry>>>,
-    prompt_cache_mode: bcode_model::PromptCacheMode,
-    conversation_reuse_mode: bcode_model::ConversationReuseMode,
     selected_reasoning: bcode_config::ReasoningConfig,
     selected_reasoning_capabilities: Option<bcode_model::ModelReasoningInfo>,
     provider_state: Mutex<ProviderStateStore>,
@@ -373,14 +371,10 @@ pub struct ServerState {
     trace_store: TraceStore,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
-    auto_compaction: bcode_config::CompactionConfig,
-    invariants: bcode_config::InvariantsConfig,
-    invariant_selector_model: Option<InvariantSelectorModel>,
     invariant_guidance: Arc<Mutex<BTreeMap<SessionId, invariant_guidance::InvariantGuidance>>>,
     invariant_full_fallback: Arc<Mutex<BTreeSet<SessionId>>>,
     invariant_guidance_generation: Arc<Mutex<BTreeMap<SessionId, u64>>>,
     invariant_background_tasks: Mutex<BTreeMap<SessionId, JoinHandle<()>>>,
-    system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_prompt_options: SkillPromptCatalogOptions,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
@@ -1382,8 +1376,6 @@ struct ServerStateInit {
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
     startup_config: bcode_config::BcodeConfig,
-    prompt_cache_mode: bcode_model::PromptCacheMode,
-    conversation_reuse_mode: bcode_model::ConversationReuseMode,
     selected_reasoning: bcode_config::ReasoningConfig,
     selected_reasoning_capabilities: Option<bcode_model::ModelReasoningInfo>,
     provider_state: ProviderStateStore,
@@ -1392,10 +1384,6 @@ struct ServerStateInit {
     trace_store: TraceStore,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
-    auto_compaction: bcode_config::CompactionConfig,
-    invariants: bcode_config::InvariantsConfig,
-    invariant_selector_model: Option<InvariantSelectorModel>,
-    system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_prompt_options: SkillPromptCatalogOptions,
     daemon_status: DaemonStatus,
@@ -1573,8 +1561,6 @@ impl ServerState {
             startup_config: init.startup_config,
             session_configs: Mutex::default(),
             session_skills: Mutex::default(),
-            prompt_cache_mode: init.prompt_cache_mode,
-            conversation_reuse_mode: init.conversation_reuse_mode,
             selected_reasoning: init.selected_reasoning,
             selected_reasoning_capabilities: init.selected_reasoning_capabilities,
             provider_state: Mutex::new(init.provider_state),
@@ -1582,14 +1568,10 @@ impl ServerState {
             trace_store: init.trace_store,
             model_streaming: init.model_streaming,
             model_retry: init.model_retry,
-            auto_compaction: init.auto_compaction,
-            invariants: init.invariants,
-            invariant_selector_model: init.invariant_selector_model,
             invariant_guidance: Arc::new(Mutex::new(BTreeMap::new())),
             invariant_full_fallback: Arc::new(Mutex::new(BTreeSet::new())),
             invariant_guidance_generation: Arc::new(Mutex::new(BTreeMap::new())),
             invariant_background_tasks: Mutex::new(BTreeMap::new()),
-            system_prompt: init.system_prompt,
             skills: init.skills,
             skill_prompt_options: init.skill_prompt_options,
             active_skills: Mutex::default(),
@@ -2726,16 +2708,21 @@ fn resolve_invariant_selector_model(
     })
 }
 
-fn invariant_selector_runtime(state: &ServerState) -> Option<InvariantSelectorRuntime> {
-    if !state.invariants.enabled
-        || state.invariants.mode != bcode_config::InvariantGuidanceMode::Relevant
+async fn invariant_selector_runtime(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Option<InvariantSelectorRuntime> {
+    let config = state.session_config(session_id).await;
+    if !config.invariants.enabled
+        || config.invariants.mode != bcode_config::InvariantGuidanceMode::Relevant
     {
         return None;
     }
+    let active = config.resolved_model_selection();
     Some(InvariantSelectorRuntime {
         plugins: state.plugins.clone(),
-        config: state.invariants.clone(),
-        model: state.invariant_selector_model.clone()?,
+        config: config.invariants.clone(),
+        model: resolve_invariant_selector_model(&config, &active)?,
         guidance: Arc::clone(&state.invariant_guidance),
         full_fallback: Arc::clone(&state.invariant_full_fallback),
         generations: Arc::clone(&state.invariant_guidance_generation),
@@ -2747,7 +2734,7 @@ async fn prepare_initial_invariant_guidance(
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
 ) {
-    let Some(runtime) = invariant_selector_runtime(state) else {
+    let Some(runtime) = invariant_selector_runtime(state, session_id).await else {
         return;
     };
     let Some(task) = user_message_text(trigger_event) else {
@@ -2758,7 +2745,8 @@ async fn prepare_initial_invariant_guidance(
         .session_working_directory(session_id)
         .await
         .unwrap_or_else(|_| PathBuf::from("."));
-    let Some(catalog) = read_invariant_catalog(&cwd, &state.system_prompt) else {
+    let config = state.session_config(session_id).await;
+    let Some(catalog) = read_invariant_catalog(&cwd, &config.system_prompt) else {
         return;
     };
     let generation = next_invariant_generation(&runtime, session_id).await;
@@ -2768,11 +2756,11 @@ async fn prepare_initial_invariant_guidance(
         &catalog,
         task,
         trigger_event.sequence,
-        state.invariants.selector.initial_timeout_ms,
+        config.invariants.selector.initial_timeout_ms,
     )
     .await;
     if matches!(result, InvariantSelectorRun::TimedOut)
-        && state.invariants.selector.on_timeout
+        && config.invariants.selector.on_timeout
             == bcode_config::InvariantSelectorTimeoutPolicy::Full
     {
         state
@@ -2800,7 +2788,7 @@ async fn prepare_background_invariant_guidance_work(
     source_sequence: u64,
     assistant_output: Option<&str>,
 ) -> Option<BackgroundInvariantGuidanceWork> {
-    let runtime = invariant_selector_runtime(state)?;
+    let runtime = invariant_selector_runtime(state, session_id).await?;
     let history = state
         .sessions
         .model_context_events(session_id)
@@ -2815,7 +2803,8 @@ async fn prepare_background_invariant_guidance_work(
         .session_working_directory(session_id)
         .await
         .unwrap_or_else(|_| PathBuf::from("."));
-    let catalog = read_invariant_catalog(&cwd, &state.system_prompt)?;
+    let config = state.session_config(session_id).await;
+    let catalog = read_invariant_catalog(&cwd, &config.system_prompt)?;
     if let Some(previous) = state.invariant_guidance.lock().await.get(&session_id)
         && previous.catalog_digest == catalog.digest
         && previous.source_sequence >= source_sequence
@@ -3451,7 +3440,6 @@ async fn run_with_static_bundled_inner(
             .and_then(fs::canonicalize)
             .unwrap_or_else(|_| PathBuf::from(".")),
     );
-    let invariant_selector_model = resolve_invariant_selector_model(&config, &resolved_model);
     let selected_provider_context = bcode_provider_auth::resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
             config: &config,
@@ -3472,8 +3460,6 @@ async fn run_with_static_bundled_inner(
             selected_model_id: resolved_model.model_id,
             selected_provider_context,
             startup_config: config.clone(),
-            prompt_cache_mode: config.model.effective_prompt_cache_mode(),
-            conversation_reuse_mode: config.model.effective_conversation_reuse_mode(),
             selected_reasoning: resolved_model.reasoning.clone(),
             selected_reasoning_capabilities: reasoning_capabilities_from_config(
                 &resolved_model.reasoning,
@@ -3484,10 +3470,6 @@ async fn run_with_static_bundled_inner(
             trace_store: TraceStore::new(default_trace_store_dir()),
             model_streaming: config.model.streaming,
             model_retry: config.model.retry,
-            auto_compaction: config.model.compaction,
-            invariants: config.invariants,
-            invariant_selector_model,
-            system_prompt: config.system_prompt,
             skill_prompt_options: skill_prompt_options_from_config(&config.skills.prompt),
             skills,
             daemon_status,
@@ -12843,7 +12825,8 @@ async fn handle_session_model_status(
         state.client_runtime_context(client_id).await,
     )
     .await;
-    let status = model_status_for_selection(state, selection, Some(session_id)).await;
+    let config = state.session_config(session_id).await;
+    let status = model_status_for_selection(state, selection, Some(session_id), &config).await;
     send_response(
         writer,
         request_id,
@@ -12858,11 +12841,14 @@ async fn handle_default_model_status(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let selection = default_model_selection_with_runtime_context(
-        state,
-        state.client_runtime_context(client_id).await,
-    );
-    let status = model_status_for_selection(state, selection, None).await;
+    let runtime_context = state.client_runtime_context(client_id).await;
+    let config = runtime_context
+        .as_ref()
+        .and_then(|context| context.effective_config_toml.as_deref())
+        .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
+        .unwrap_or_else(|| state.startup_config.clone());
+    let selection = default_model_selection_with_runtime_context(state, runtime_context);
+    let status = model_status_for_selection(state, selection, None, &config).await;
     send_response(
         writer,
         request_id,
@@ -12941,6 +12927,7 @@ async fn model_status_for_selection(
     state: &ServerState,
     selection: SessionModelSelection,
     session_id: Option<SessionId>,
+    config: &bcode_config::BcodeConfig,
 ) -> bcode_ipc::SessionModelStatus {
     let mut models = resolved_provider_models(
         state,
@@ -13021,16 +13008,19 @@ async fn model_status_for_selection(
         reasoning: merge_reasoning_override(base_reasoning, reasoning_override),
         reasoning_effort: selection.reasoning_effort,
         reasoning_summary: selection.reasoning_summary,
-        prompt_cache_mode: Some(prompt_cache_mode_name(state.prompt_cache_mode).to_string()),
-        conversation_reuse_mode: Some(
-            conversation_reuse_mode_name(state.conversation_reuse_mode).to_string(),
+        prompt_cache_mode: Some(
+            prompt_cache_mode_name(config.model.effective_prompt_cache_mode()).to_string(),
         ),
-        compaction_mode: Some(compaction_mode_name(state.auto_compaction.mode).to_string()),
+        conversation_reuse_mode: Some(
+            conversation_reuse_mode_name(config.model.effective_conversation_reuse_mode())
+                .to_string(),
+        ),
+        compaction_mode: Some(compaction_mode_name(config.model.compaction.mode).to_string()),
         compaction_backend: Some(
-            compaction_backend_name(state.auto_compaction.backend).to_string(),
+            compaction_backend_name(config.model.compaction.backend).to_string(),
         ),
         proactive_compaction_threshold_percent: Some(
-            state.auto_compaction.proactive_threshold_percent,
+            config.model.compaction.proactive_threshold_percent,
         ),
         cache: cache_info,
         metadata_source,
@@ -19018,6 +19008,10 @@ async fn run_model_turn(
     supplied_cancel_state: Option<Arc<TurnCancelState>>,
 ) -> ModelTurnCompletion {
     let session_id = permit.enter_turn();
+    state
+        .set_session_config_from_runtime_context(session_id, runtime_context.as_ref())
+        .await;
+    let turn_config = state.session_config(session_id).await;
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
     let model_work_id = WorkId::new(format!("model_{turn_id}"));
     let cancel_state =
@@ -19038,7 +19032,10 @@ async fn run_model_turn(
     )
     .await;
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
-    if state.invariants.selector.wait_for_background_on_next_prompt
+    if turn_config
+        .invariants
+        .selector
+        .wait_for_background_on_next_prompt
         && let Some(task) = state
             .invariant_background_tasks
             .lock()
@@ -19047,8 +19044,8 @@ async fn run_model_turn(
     {
         let _ = task.await;
     }
-    if state.invariants.enabled
-        && state.invariants.mode == bcode_config::InvariantGuidanceMode::Relevant
+    if turn_config.invariants.enabled
+        && turn_config.invariants.mode == bcode_config::InvariantGuidanceMode::Relevant
         && !state
             .invariant_guidance
             .lock()
@@ -19062,8 +19059,8 @@ async fn run_model_turn(
             .await
             .insert(session_id, guidance);
     }
-    if state.invariants.enabled
-        && state.invariants.mode == bcode_config::InvariantGuidanceMode::Relevant
+    if turn_config.invariants.enabled
+        && turn_config.invariants.mode == bcode_config::InvariantGuidanceMode::Relevant
         && !state
             .invariant_guidance
             .lock()
@@ -19133,9 +19130,6 @@ async fn run_model_turn_inner(
     phase: &Arc<Mutex<SessionRuntimePhase>>,
 ) -> ModelTurnCompletion {
     let execution = turn_execution_options(trigger_event);
-    state
-        .set_session_config_from_runtime_context(session_id, runtime_context.as_ref())
-        .await;
     let turn_config = state.session_config(session_id).await;
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
     let mut selection =
@@ -23451,6 +23445,7 @@ async fn build_model_turn_request(
     let conversation_reuse_timer = state.metrics.timer();
     let conversation_reuse = plan_conversation_reuse(
         state,
+        config.model.effective_conversation_reuse_mode(),
         &projection,
         messages.len(),
         model_cache_info.as_ref(),
@@ -23495,7 +23490,8 @@ async fn build_model_turn_request(
     let context_management = if compaction_policy.decision.strategy
         == AutomaticCompactionStrategy::ProviderManaged
     {
-        let status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
+        let status =
+            model_status_for_selection(state, selection.clone(), Some(session_id), config).await;
         provider_managed_context_request(
             compaction_policy.decision,
             status.context_window,
@@ -24506,11 +24502,11 @@ fn supports_provider_conversation_reuse(cache_info: Option<&bcode_model::ModelCa
 
 async fn plan_conversation_reuse(
     state: &ServerState,
+    mode: bcode_model::ConversationReuseMode,
     projection: &ConversationProjection,
     message_count: usize,
     cache_info: Option<&bcode_model::ModelCacheInfo>,
 ) -> bcode_model::ConversationReuseHints {
-    let mode = state.conversation_reuse_mode;
     if !mode.is_enabled() || !supports_provider_conversation_reuse(cache_info) {
         return bcode_model::ConversationReuseHints::default();
     }
@@ -40099,7 +40095,7 @@ library = "test"
             automatic_compaction_policy(
                 &before_restart,
                 &selection(false),
-                &before_restart.auto_compaction
+                &before_restart.startup_config.model.compaction
             )
             .await
             .decision
@@ -40113,7 +40109,7 @@ library = "test"
             automatic_compaction_policy(
                 &after_restart,
                 &selection(true),
-                &after_restart.auto_compaction
+                &after_restart.startup_config.model.compaction
             )
             .await
             .decision
@@ -40138,7 +40134,7 @@ library = "test"
         let unsupported = automatic_compaction_policy(
             &state,
             &selection(BTreeMap::new()),
-            &state.auto_compaction,
+            &state.startup_config.model.compaction,
         )
         .await;
         assert_eq!(
@@ -40156,7 +40152,7 @@ library = "test"
                 "fake_managed_compaction".to_string(),
                 "true".to_string(),
             )])),
-            &state.auto_compaction,
+            &state.startup_config.model.compaction,
         )
         .await;
         assert_eq!(
@@ -40175,7 +40171,7 @@ library = "test"
                 "fake_context_capabilities_failure".to_string(),
                 "true".to_string(),
             )])),
-            &state.auto_compaction,
+            &state.startup_config.model.compaction,
         )
         .await;
         assert_eq!(
@@ -40194,7 +40190,7 @@ library = "test"
                 "fake_managed_compaction".to_string(),
                 "true".to_string(),
             )])),
-            &state.auto_compaction,
+            &state.startup_config.model.compaction,
         )
         .await;
         assert_eq!(
@@ -43648,8 +43644,8 @@ library = "test"
             .await
             .expect("append trigger event");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
         state
             .selected_provider_context
             .settings
@@ -43792,8 +43788,8 @@ library = "test"
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
@@ -53141,8 +53137,6 @@ library = "test"
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
                 startup_config: bcode_config::BcodeConfig::default(),
-                prompt_cache_mode: bcode_model::PromptCacheMode::Off,
-                conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
@@ -53151,12 +53145,8 @@ library = "test"
                 trace_store: TraceStore::new(PathBuf::new()),
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
-                auto_compaction: bcode_config::CompactionConfig::default(),
-                invariants: bcode_config::InvariantsConfig::default(),
-                invariant_selector_model: None,
                 skills: None,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
-                system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus {
                     namespace: bcode_ipc::daemon_namespace(),
                     protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
@@ -54382,7 +54372,7 @@ library = "test"
         )
         .expect("registry");
         let mut state = test_server_state(SessionManager::default());
-        state.system_prompt.sections.skill_catalog = false;
+        state.startup_config.system_prompt.sections.skill_catalog = false;
         state.skills = Some(registry);
         let catalog = workflow_skill_catalog_instruction(&state);
         assert!(
@@ -60625,8 +60615,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Some(runtime_context.clone()),
         )
         .await;
-        let policy =
-            automatic_compaction_policy(&state, &effective_selection, &state.auto_compaction).await;
+        let policy = automatic_compaction_policy(
+            &state,
+            &effective_selection,
+            &state.startup_config.model.compaction,
+        )
+        .await;
         assert_eq!(
             policy.decision.strategy,
             AutomaticCompactionStrategy::ProviderManaged
@@ -60722,7 +60716,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("append trigger event");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
         state.selected_provider_context.settings.insert(
             "fake_unknown_context_window".to_string(),
             "true".to_string(),
@@ -60844,8 +60838,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("append trigger event");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.mode = bcode_config::CompactionMode::OnOverflow;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
+        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::OnOverflow;
+        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
         state
             .selected_provider_context
             .settings
@@ -61011,9 +61005,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("append trigger event");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.mode = bcode_config::CompactionMode::OnOverflow;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
-        state.auto_compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::OnOverflow;
+        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
         state
             .selected_provider_context
             .settings
@@ -61160,13 +61154,29 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("append trigger event");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.system_prompt.sections.repository_context = false;
-        state.system_prompt.sections.repository_invariants = false;
-        state.system_prompt.sections.dynamic_repository_context = false;
-        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
-        state.auto_compaction.proactive_threshold_percent = 90;
-        state.auto_compaction.keep_recent_tokens = 1;
+        state
+            .startup_config
+            .system_prompt
+            .sections
+            .repository_context = false;
+        state
+            .startup_config
+            .system_prompt
+            .sections
+            .repository_invariants = false;
+        state
+            .startup_config
+            .system_prompt
+            .sections
+            .dynamic_repository_context = false;
+        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
+        state
+            .startup_config
+            .model
+            .compaction
+            .proactive_threshold_percent = 90;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
 
         let mut permit = SessionTurnPermit::new(session_id);
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
@@ -61293,8 +61303,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("context before failure");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend =
+            bcode_config::CompactionBackend::ProviderNative;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             requested_model_id: None,
@@ -61453,8 +61464,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend =
+            bcode_config::CompactionBackend::ProviderNative;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             requested_model_id: None,
@@ -61533,8 +61545,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend =
+            bcode_config::CompactionBackend::ProviderNative;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             model_id: Some("fake-model".to_string()),
@@ -61592,8 +61605,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .id;
         append_large_followup_fixture(&sessions, session_id).await;
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
-        state.auto_compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.tool_output.context_chars = 20_000;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_owned()),
@@ -61697,8 +61710,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("trigger");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
-        state.auto_compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
         let provider_context = bcode_model::ProviderRequestContext {
             settings: BTreeMap::from([
                 (
@@ -61806,8 +61819,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("append active turn");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
-        state.auto_compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_owned()),
             model_id: Some("fake-echo".to_owned()),
@@ -61991,8 +62004,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::Auto;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Auto;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             requested_model_id: None,
@@ -62059,8 +62072,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::Auto;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Auto;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             requested_model_id: None,
@@ -62138,8 +62151,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend =
+            bcode_config::CompactionBackend::ProviderNative;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             requested_model_id: None,
@@ -62249,8 +62263,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session should be created");
         let session_id = summary.id;
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
-        state.auto_compaction.backend = bcode_config::CompactionBackend::ProviderNative;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend =
+            bcode_config::CompactionBackend::ProviderNative;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             requested_model_id: None,
@@ -62377,7 +62392,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("append assistant turn");
         }
         let mut state = test_server_state(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
         let cancel_state = TurnCancelState::default();
         let Err(error) = compact_session_context_with_limit(
             &state,
@@ -62524,8 +62539,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("trigger");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
-        state.auto_compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
         let provider_context = bcode_model::ProviderRequestContext {
             settings: BTreeMap::from([
                 (
@@ -62618,7 +62633,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await;
         }
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.auto_compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_owned()),
             model_id: Some("fake-echo".to_owned()),
@@ -62905,8 +62920,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
                 startup_config: bcode_config::BcodeConfig::default(),
-                prompt_cache_mode: bcode_model::PromptCacheMode::default(),
-                conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
@@ -62915,12 +62928,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 trace_store: TraceStore::new(PathBuf::new()),
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
-                auto_compaction: bcode_config::CompactionConfig::default(),
-                invariants: bcode_config::InvariantsConfig::default(),
-                invariant_selector_model: None,
                 skills: None,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
-                system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 startup_started_at: None,
@@ -63738,8 +63747,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
                 startup_config: bcode_config::BcodeConfig::default(),
-                prompt_cache_mode: bcode_model::PromptCacheMode::default(),
-                conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
@@ -63748,12 +63755,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 trace_store: TraceStore::new(PathBuf::new()),
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
-                auto_compaction: bcode_config::CompactionConfig::default(),
-                invariants: bcode_config::InvariantsConfig::default(),
-                invariant_selector_model: None,
                 skills: None,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
-                system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 startup_started_at: None,
@@ -64101,7 +64104,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             tools: Vec::new(),
         };
         let compaction_policy =
-            automatic_compaction_policy(&state, &selection, &state.auto_compaction).await;
+            automatic_compaction_policy(&state, &selection, &state.startup_config.model.compaction)
+                .await;
 
         let prepared = build_model_turn_request(
             &state,

@@ -740,9 +740,10 @@ pub async fn request_exceeds_compaction_capacity(
     request: &ModelTurnRequest,
     projected_input_tokens: u64,
 ) -> Option<(u64, CompactionCapacity)> {
-    let model_status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
-    let context_window = model_status.context_window?;
     let config = state.session_config(session_id).await;
+    let model_status =
+        model_status_for_selection(state, selection.clone(), Some(session_id), &config).await;
+    let context_window = model_status.context_window?;
     let capacity = compaction_capacity_tokens(
         context_window,
         config.model.compaction.proactive_threshold_percent,
@@ -796,7 +797,8 @@ pub async fn maybe_auto_compact_session_context(
     let projected_context_chars =
         projected_model_context_chars(&history, config.model.tool_output.context_chars);
     let projected_context_tokens = evaluation.candidate_input_tokens;
-    let model_status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
+    let model_status =
+        model_status_for_selection(state, selection.clone(), Some(session_id), &config).await;
     let Some(context_window_tokens) = model_status.context_window else {
         append_context_compaction_trace(
             state,
