@@ -1128,6 +1128,7 @@ pub fn build_compaction_request(
         }],
         tools: Vec::new(),
         tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+        tool_schema_mode: None,
         structured_output: None,
         context_management: bcode_model::ContextManagementRequest::default(),
         parameters: ModelParameters::default(),

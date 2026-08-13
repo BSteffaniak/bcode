@@ -3815,6 +3815,7 @@ fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
             .map(model_tool_definition)
             .collect(),
         tool_call_policy: request.tool_call_policy.clone(),
+        tool_schema_mode: None,
         parameters: request.parameters.clone(),
         structured_output: request.structured_output.clone(),
         context_management: bcode_model::ContextManagementRequest::default(),

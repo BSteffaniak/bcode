@@ -18,10 +18,11 @@ use aws_sdk_bedrockruntime::types::{
     AnyToolChoice, AutoToolChoice, CachePointBlock, CachePointType,
     ContentBlock as BedrockContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
     ConverseStreamOutput, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration,
-    Message as BedrockMessage, ReasoningContentBlockDelta, ResponseStream, SpecificToolChoice,
-    StopReason as BedrockStopReason, SystemContentBlock, Tool, ToolChoice as BedrockToolChoice,
-    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
-    ToolSpecification, ToolUseBlock,
+    JsonSchemaDefinition, Message as BedrockMessage, OutputConfig, OutputFormat,
+    OutputFormatStructure, OutputFormatType, ReasoningContentBlockDelta, ResponseStream,
+    SpecificToolChoice, StopReason as BedrockStopReason, SystemContentBlock, Tool,
+    ToolChoice as BedrockToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+    ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
 };
 use aws_smithy_types::Blob;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
@@ -161,7 +162,7 @@ impl BedrockProviderPlugin {
             );
         }
         match context.request.operation.as_str() {
-            OP_CAPABILITIES => json_response(&capabilities()),
+            OP_CAPABILITIES => Self::capabilities_response(&context.request),
             OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => self.validate_config_response(&context.request),
             OP_START_TURN => self.start_turn(
@@ -176,6 +177,14 @@ impl BedrockProviderPlugin {
                 "unsupported model provider operation",
             ),
         }
+    }
+
+    fn capabilities_response(request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<bcode_model::ProviderCapabilitiesRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        json_response(&capabilities_for_context(&request.provider_context))
     }
 
     fn models_response(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -304,11 +313,17 @@ fn validate_bedrock_request(
     request: &ModelTurnRequest,
     responses_surface: bool,
 ) -> Result<(), ProviderError> {
-    if request.structured_output.is_some() && !responses_surface {
+    if request.structured_output.is_some()
+        && !responses_surface
+        && matches!(
+            Settings::resolve(Some(request)).transport,
+            Ok(BedrockTransport::MantleAnthropic)
+        )
+    {
         return Err(provider_error(
             "bedrock_structured_output_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
-            "Bedrock Converse does not provide provider-native JSON Schema enforcement",
+            "the selected Bedrock surface does not support provider-native JSON Schema enforcement",
         ));
     }
     if request.parameters.reasoning_summary.is_some() && !responses_surface {
@@ -479,6 +494,9 @@ async fn stream_bedrock_turn_inner(
         }
         if let Some(inference_config) = bedrock_request.inference_config {
             builder = builder.inference_config(inference_config);
+        }
+        if let Some(output_config) = bedrock_request.output_config {
+            builder = builder.output_config(output_config);
         }
         if let Some(additional_fields) = bedrock_request.additional_model_request_fields {
             builder = builder.additional_model_request_fields(additional_fields);
@@ -2212,6 +2230,7 @@ struct BedrockConverseRequest {
     system: Vec<SystemContentBlock>,
     tool_config: Option<ToolConfiguration>,
     inference_config: Option<InferenceConfiguration>,
+    output_config: Option<OutputConfig>,
     additional_model_request_fields: Option<Document>,
 }
 
@@ -2305,6 +2324,25 @@ fn build_anthropic_messages_request_value(
         body.insert(
             "stop_sequences".to_string(),
             serde_json::json!(request.parameters.stop_sequences),
+        );
+    }
+    if let Some(structured) = &request.structured_output {
+        let schema = bcode_model_schema::normalize(&structured.schema, &bedrock_schema_dialect())
+            .map_err(|error| {
+            provider_error(
+                "invalid_structured_output_schema",
+                ProviderErrorCategory::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+        body.insert(
+            "output_config".to_string(),
+            serde_json::json!({
+                "format": {
+                    "type": "json_schema",
+                    "schema": schema
+                }
+            }),
         );
     }
     apply_anthropic_thinking_fields(&mut body, &request.parameters);
@@ -2546,6 +2584,61 @@ fn prompt_cache_point_count(request: &ModelTurnRequest) -> usize {
         .count()
 }
 
+fn bedrock_schema_dialect() -> bcode_model_schema::SchemaDialect {
+    use bcode_model_schema::{ObjectPropertyPolicy, SchemaDialect, UnsupportedKeywordPolicy};
+    SchemaDialect {
+        object_properties: ObjectPropertyPolicy::RequireAllAndClose,
+        unsupported_keywords: std::collections::BTreeMap::from([
+            ("minimum".to_string(), UnsupportedKeywordPolicy::Remove),
+            ("maximum".to_string(), UnsupportedKeywordPolicy::Remove),
+            ("multipleOf".to_string(), UnsupportedKeywordPolicy::Remove),
+            ("minLength".to_string(), UnsupportedKeywordPolicy::Remove),
+            ("maxLength".to_string(), UnsupportedKeywordPolicy::Remove),
+        ]),
+        accepted_min_items: std::collections::BTreeSet::from([0, 1]),
+        ..SchemaDialect::default()
+    }
+}
+
+fn bedrock_output_config(
+    request: &ModelTurnRequest,
+) -> Result<Option<OutputConfig>, ProviderError> {
+    let Some(structured) = &request.structured_output else {
+        return Ok(None);
+    };
+    let schema = bcode_model_schema::normalize(&structured.schema, &bedrock_schema_dialect())
+        .map_err(|error| {
+            provider_error(
+                "invalid_structured_output_schema",
+                ProviderErrorCategory::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+    let definition = JsonSchemaDefinition::builder()
+        .schema(schema.to_string())
+        .name(structured.name.clone())
+        .build()
+        .map_err(|error| {
+            provider_error(
+                "invalid_structured_output_schema",
+                ProviderErrorCategory::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+    let format = OutputFormat::builder()
+        .r#type(OutputFormatType::JsonSchema)
+        .structure(OutputFormatStructure::JsonSchema(definition))
+        .build()
+        .map_err(|error| {
+            provider_error(
+                "invalid_structured_output_schema",
+                ProviderErrorCategory::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+    Ok(Some(OutputConfig::builder().text_format(format).build()))
+}
+
 fn build_converse_request(
     request: &ModelTurnRequest,
     model_id: String,
@@ -2556,6 +2649,7 @@ fn build_converse_request(
         system: system_blocks(request),
         tool_config: model_tools_to_bedrock_tool_config(request)?,
         inference_config: model_parameters_to_inference_config(request),
+        output_config: bedrock_output_config(request)?,
         additional_model_request_fields: bedrock_thinking_fields(&request.parameters),
     })
 }
@@ -2867,12 +2961,16 @@ fn model_tools_to_bedrock_tool_config(
         .tools
         .iter()
         .map(|tool| {
-            ToolSpecification::builder()
+            let mut specification = ToolSpecification::builder()
                 .name(bedrock_tool_name(&tool.name))
                 .description(tool.description.clone())
                 .input_schema(ToolInputSchema::Json(json_value_to_document(
                     bedrock_tool_input_schema(tool)?,
-                )))
+                )));
+            if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict) {
+                specification = specification.strict(true);
+            }
+            specification
                 .build()
                 .map(Tool::ToolSpec)
                 .map_err(|error| build_error(&error))
@@ -3233,9 +3331,7 @@ impl BedrockSurfaceCapabilities {
     /// Resolve the surface-varying capabilities for a surface.
     fn for_surface(responses_surface: bool) -> Self {
         use bcode_model::{CapabilitySource, CapabilitySupport};
-        let supported = || CapabilitySupport::Supported {
-            source: CapabilitySource::BundledCatalog,
-        };
+        let supported = || CapabilitySupport::supported(CapabilitySource::BundledCatalog);
         let unsupported = |reason: &str| CapabilitySupport::Unsupported {
             source: CapabilitySource::BundledCatalog,
             reason: reason.to_string(),
@@ -3251,7 +3347,7 @@ impl BedrockSurfaceCapabilities {
             reasoning_summary: unsupported(
                 "Bedrock Anthropic extended thinking has no provider-visible reasoning summary",
             ),
-            structured_output: unsupported("Bedrock Converse structured output is not implemented"),
+            structured_output: supported(),
             parallel_tool_calls: unsupported(
                 "Bedrock model-specific parallel support is not guaranteed",
             ),
@@ -3270,11 +3366,10 @@ fn bedrock_feature_support_for(responses_surface: bool) -> bcode_model::ModelFea
     use bcode_model::{
         CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
         ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
+        ToolSchemaMode,
     };
     let surface = BedrockSurfaceCapabilities::for_surface(responses_surface);
-    let supported = || CapabilitySupport::Supported {
-        source: CapabilitySource::BundledCatalog,
-    };
+    let supported = || CapabilitySupport::supported(CapabilitySource::BundledCatalog);
     let unsupported = |reason: &str| CapabilitySupport::Unsupported {
         source: CapabilitySource::BundledCatalog,
         reason: reason.to_string(),
@@ -3309,6 +3404,12 @@ fn bedrock_feature_support_for(responses_surface: bool) -> bcode_model::ModelFea
             (ToolChoiceMode::Required, supported()),
             (ToolChoiceMode::Named, supported()),
             (ToolChoiceMode::Parallel, surface.parallel_tool_calls),
+        ]
+        .into_iter()
+        .collect(),
+        tool_schema: [
+            (ToolSchemaMode::Permissive, supported()),
+            (ToolSchemaMode::Strict, supported()),
         ]
         .into_iter()
         .collect(),
@@ -3350,8 +3451,8 @@ fn bedrock_feature_support_for(responses_surface: bool) -> bcode_model::ModelFea
     }
 }
 
-fn capabilities() -> ProviderCapabilities {
-    let settings = Settings::resolve(None);
+fn capabilities_for_context(context: &bcode_model::ProviderRequestContext) -> ProviderCapabilities {
+    let settings = Settings::resolve_from_context(context);
     ProviderCapabilities {
         provider_id: PROVIDER_ID.to_string(),
         display_name: "Amazon Bedrock".to_string(),
@@ -5518,6 +5619,89 @@ mod tests {
     use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
 
     #[test]
+    fn converse_structured_output_normalizes_schema_and_builds_output_config() {
+        let mut request = test_model_turn_request();
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "LoopWorkflowIteration".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "iteration": {"type": "integer", "minimum": 0},
+                    "summary": {"type": "string"}
+                }
+            }),
+            strict: true,
+        });
+
+        let config = bedrock_output_config(&request)
+            .expect("schema should normalize")
+            .expect("structured request should build output config");
+        let format = config.text_format().expect("text format");
+        assert_eq!(format.r#type(), &OutputFormatType::JsonSchema);
+        let definition = format
+            .structure()
+            .expect("structure")
+            .as_json_schema()
+            .expect("json schema");
+        assert_eq!(definition.name(), Some("LoopWorkflowIteration"));
+        let schema: serde_json::Value =
+            serde_json::from_str(definition.schema()).expect("normalized schema JSON");
+        assert!(schema.pointer("/properties/iteration/minimum").is_none());
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["iteration", "summary"])
+        );
+
+        let built = build_converse_request(&request, "model".to_string())
+            .expect("Converse request should build");
+        assert!(built.output_config.is_some());
+    }
+
+    #[test]
+    fn mantle_anthropic_rejects_structured_output_but_converse_accepts_it() {
+        let mut request = test_model_turn_request();
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        validate_bedrock_request(&request, false)
+            .expect("Converse should support structured output");
+
+        request
+            .provider_context
+            .settings
+            .insert("transport".to_string(), "mantle_anthropic".to_string());
+        let error = validate_bedrock_request(&request, false)
+            .expect_err("Mantle Anthropic should reject structured output");
+        assert_eq!(error.code, "bedrock_structured_output_unsupported");
+    }
+
+    #[test]
+    fn anthropic_messages_structured_output_uses_native_output_config() {
+        let mut request = test_model_turn_request();
+        request.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Messages);
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}}
+            }),
+            strict: true,
+        });
+        validate_bedrock_request(&request, false)
+            .expect("Bedrock Runtime Messages should support structured output");
+        let body = build_anthropic_messages_request_value(&request)
+            .expect("Messages request should build");
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(
+            body["output_config"]["format"]["schema"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
     fn anthropic_messages_error_event_is_normalized() {
         let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new());
         let turn = TurnState::default();
@@ -7089,6 +7273,7 @@ mod tests {
                 input_schema: serde_json::json!({"type":"object"}),
             }],
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            tool_schema_mode: None,
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
@@ -7152,10 +7337,11 @@ mod tests {
                 .parameter(ModelParameterKey::Temperature)
                 .is_guaranteed()
         );
-        assert!(matches!(
-            provider.structured_output(StructuredOutputMode::StrictJsonSchema),
-            CapabilitySupport::Unsupported { .. }
-        ));
+        assert!(
+            provider
+                .structured_output(StructuredOutputMode::StrictJsonSchema)
+                .is_guaranteed()
+        );
         assert!(
             provider
                 .parameter(ModelParameterKey::ReasoningBudgetTokens)
@@ -7190,8 +7376,16 @@ mod tests {
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         });
-        let error = validate_bedrock_request(&request, false).expect_err("schema mode must fail");
+        validate_bedrock_request(&request, false).expect("Converse schema mode must be supported");
+
+        request
+            .provider_context
+            .settings
+            .insert("transport".to_string(), "mantle_anthropic".to_string());
+        let error = validate_bedrock_request(&request, false)
+            .expect_err("Mantle Anthropic schema mode must fail");
         assert_eq!(error.category, ProviderErrorCategory::UnsupportedFeature);
+        request.provider_context.settings.clear();
 
         request.structured_output = None;
         request.parameters.reasoning_effort = Some(bcode_model::ReasoningEffort::High);
@@ -7455,6 +7649,7 @@ mod tests {
             messages: Vec::new(),
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            tool_schema_mode: None,
             parameters: bcode_model::ModelParameters::default(),
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),

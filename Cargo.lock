@@ -1399,6 +1399,7 @@ dependencies = [
  "bcode_config",
  "bcode_model",
  "bcode_model_provider_runtime",
+ "bcode_model_schema",
  "bcode_openai_responses",
  "bcode_plugin_sdk",
  "bcode_session_models",
@@ -2097,6 +2098,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_model_schema"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_models_site"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2149,6 +2158,7 @@ dependencies = [
  "bcode_model",
  "bcode_model_discovery",
  "bcode_model_provider_runtime",
+ "bcode_model_schema",
  "bcode_openai_responses",
  "bcode_plugin_sdk",
  "bcode_provider_auth",

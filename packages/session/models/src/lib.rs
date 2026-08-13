@@ -314,6 +314,7 @@ pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
     "model_turn_cancel_requested",
     "model_turn_finished",
     "model_turn_started",
+    "model_feature_fidelity_negotiated",
     "model_usage",
     "permission_requested",
     "permission_resolved",
@@ -380,6 +381,9 @@ pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'sta
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::AgentChanged { .. } => "agent_changed",
         SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
+        SessionEventKind::ModelFeatureFidelityNegotiated { .. } => {
+            "model_feature_fidelity_negotiated"
+        }
         SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
         SessionEventKind::ModelUsage { .. } => "model_usage",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
@@ -1107,6 +1111,21 @@ impl TurnReceipt {
             accepted_event_sequence,
         }
     }
+}
+
+/// Persisted fidelity of one negotiated model feature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFeatureFidelity {
+    /// Stable schema version for this record.
+    pub version: u32,
+    /// Provider-neutral requested feature family.
+    pub family: String,
+    /// Provider-neutral requested feature value.
+    pub feature: String,
+    /// Native or adapter-mediated implementation mechanism.
+    pub mechanism: String,
+    /// Exact or reduced portable-contract fidelity.
+    pub fidelity: String,
 }
 
 /// Generic scheduling priority for an admitted turn.
@@ -3052,6 +3071,11 @@ pub enum SessionEventKind {
         /// Working directory captured for execution, when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         working_directory: Option<PathBuf>,
+    },
+    /// Durable diagnostic record of one negotiated feature implementation.
+    ModelFeatureFidelityNegotiated {
+        turn_id: String,
+        feature: ModelFeatureFidelity,
     },
 }
 

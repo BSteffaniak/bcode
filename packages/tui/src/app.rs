@@ -4802,6 +4802,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ReasoningChanged { .. }
         | SessionEventKind::AgentChanged { .. }
         | SessionEventKind::ModelTurnStarted { .. }
+        | SessionEventKind::ModelFeatureFidelityNegotiated { .. }
         | SessionEventKind::ModelTurnCancelRequested { .. }
         | SessionEventKind::SessionRenamed { .. }
         | SessionEventKind::SessionImported { .. }

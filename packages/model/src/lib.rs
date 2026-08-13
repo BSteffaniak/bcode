@@ -28,6 +28,15 @@ pub use context_management::{
     ContextManagementCapabilitiesRequest, ContextManagementRequest, ProviderContextFormat,
 };
 
+/// Capability discovery request for the active provider surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilitiesRequest {
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
+    #[serde(default)]
+    pub selected_model_id: Option<String>,
+}
+
 /// Provider context setting for explicit catalog provider mapping.
 pub const CATALOG_PROVIDER_ID_SETTING: &str = "catalog_provider_id";
 
@@ -116,7 +125,7 @@ pub struct ProviderOperationContract {
 pub const MODEL_PROVIDER_OPERATIONS: &[ProviderOperationContract] = &[
     ProviderOperationContract {
         operation: OP_CAPABILITIES,
-        request_type: "()",
+        request_type: "ProviderCapabilitiesRequest",
         response_type: "ProviderCapabilities",
         requirement: ProviderOperationRequirement::Required,
         behavior: "return stable provider identity and truthful capability declarations",
@@ -409,7 +418,29 @@ pub enum CapabilitySource {
     TestContract,
 }
 
-/// One truthful support claim with its provenance.
+/// Mechanism used to provide a supported capability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityMechanism {
+    /// The selected provider surface implements the capability directly.
+    #[default]
+    Native,
+    /// The provider adapter implements the capability by translating or composing native features.
+    AdapterMediated,
+}
+
+/// Fidelity of a supported capability relative to its portable contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityFidelity {
+    /// The implementation satisfies the complete portable contract.
+    #[default]
+    Exact,
+    /// The implementation is usable but has declared limitations relative to the portable contract.
+    Reduced,
+}
+
+/// One truthful support claim with its provenance, mechanism, and fidelity.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CapabilitySupport {
@@ -417,7 +448,15 @@ pub enum CapabilitySupport {
     #[default]
     Unknown,
     /// The feature is supported according to the stated source.
-    Supported { source: CapabilitySource },
+    Supported {
+        source: CapabilitySource,
+        /// How the selected provider surface supplies the capability.
+        #[serde(default)]
+        mechanism: CapabilityMechanism,
+        /// How completely the implementation satisfies the portable contract.
+        #[serde(default)]
+        fidelity: CapabilityFidelity,
+    },
     /// The feature is unsupported according to the stated source.
     Unsupported {
         source: CapabilitySource,
@@ -426,6 +465,16 @@ pub enum CapabilitySupport {
 }
 
 impl CapabilitySupport {
+    /// Construct a native, exact support claim.
+    #[must_use]
+    pub const fn supported(source: CapabilitySource) -> Self {
+        Self::Supported {
+            source,
+            mechanism: CapabilityMechanism::Native,
+            fidelity: CapabilityFidelity::Exact,
+        }
+    }
+
     /// Return whether this is an affirmative, provenance-bearing support claim.
     #[must_use]
     pub const fn is_guaranteed(&self) -> bool {
@@ -437,7 +486,7 @@ impl CapabilitySupport {
     pub const fn source(&self) -> Option<CapabilitySource> {
         match self {
             Self::Unknown => None,
-            Self::Supported { source } | Self::Unsupported { source, .. } => Some(*source),
+            Self::Supported { source, .. } | Self::Unsupported { source, .. } => Some(*source),
         }
     }
 }
@@ -458,6 +507,8 @@ pub enum NegotiatedFeatureSupport {
     Guaranteed {
         provider_source: CapabilitySource,
         model_source: CapabilitySource,
+        mechanism: CapabilityMechanism,
+        fidelity: CapabilityFidelity,
     },
     /// One scope explicitly rejects the feature.
     Unsupported {
@@ -510,6 +561,14 @@ pub enum ToolChoiceMode {
     Parallel,
 }
 
+/// Tool-schema enforcement modes negotiated independently from tool selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSchemaMode {
+    Permissive,
+    Strict,
+}
+
 /// Prompt-cache hint families negotiated independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -546,6 +605,8 @@ pub struct ModelFeatureSupport {
     #[serde(default)]
     pub tool_choice: BTreeMap<ToolChoiceMode, CapabilitySupport>,
     #[serde(default)]
+    pub tool_schema: BTreeMap<ToolSchemaMode, CapabilitySupport>,
+    #[serde(default)]
     pub prompt_cache: BTreeMap<PromptCacheFeature, CapabilitySupport>,
     #[serde(default)]
     pub media_input: BTreeMap<MediaInputFeature, CapabilitySupport>,
@@ -572,6 +633,14 @@ impl ModelFeatureSupport {
     #[must_use]
     pub fn tool_choice(&self, mode: ToolChoiceMode) -> &CapabilitySupport {
         self.tool_choice
+            .get(&mode)
+            .unwrap_or(&CapabilitySupport::Unknown)
+    }
+
+    /// Return the tool-schema enforcement claim, defaulting to unknown.
+    #[must_use]
+    pub fn tool_schema(&self, mode: ToolSchemaMode) -> &CapabilitySupport {
+        self.tool_schema
             .get(&mode)
             .unwrap_or(&CapabilitySupport::Unknown)
     }
@@ -624,6 +693,9 @@ impl ModelFeatureSupport {
             ]
             .into_iter()
             .all(|mode| self.tool_choice.contains_key(&mode))
+            && [ToolSchemaMode::Permissive, ToolSchemaMode::Strict]
+                .into_iter()
+                .all(|mode| self.tool_schema.contains_key(&mode))
             && [
                 PromptCacheFeature::ConversationPrefix,
                 PromptCacheFeature::ExplicitSystem,
@@ -684,9 +756,27 @@ fn negotiate_feature_claims(
             scope: CapabilityScope::Model,
         };
     }
+    let CapabilitySupport::Supported {
+        source: provider_source,
+        mechanism: provider_mechanism,
+        fidelity: provider_fidelity,
+    } = provider
+    else {
+        unreachable!("unsupported and unknown provider claims returned above");
+    };
+    let CapabilitySupport::Supported {
+        source: model_source,
+        mechanism: model_mechanism,
+        fidelity: model_fidelity,
+    } = model
+    else {
+        unreachable!("unsupported and unknown model claims returned above");
+    };
     NegotiatedFeatureSupport::Guaranteed {
-        provider_source: provider.source().expect("provider support source"),
-        model_source: model.source().expect("model support source"),
+        provider_source: *provider_source,
+        model_source: *model_source,
+        mechanism: std::cmp::max(*provider_mechanism, *model_mechanism),
+        fidelity: std::cmp::max(*provider_fidelity, *model_fidelity),
     }
 }
 
@@ -2053,6 +2143,9 @@ pub struct ModelTurnRequest {
     /// Host-resolved policy for provider-generated tool calls.
     #[serde(default)]
     pub tool_call_policy: ToolCallRequestPolicy,
+    /// Provider-native schema enforcement requested uniformly for exposed tools.
+    #[serde(default)]
+    pub tool_schema_mode: Option<ToolSchemaMode>,
     #[serde(default)]
     pub parameters: ModelParameters,
     #[serde(default)]
@@ -2618,6 +2711,7 @@ pub enum RequestedModelFeature {
     Parameter(ModelParameterKey),
     StructuredOutput(StructuredOutputMode),
     ToolChoice(ToolChoiceMode),
+    ToolSchema(ToolSchemaMode),
     PromptCache(PromptCacheFeature),
     MediaInput(MediaInputFeature),
 }
@@ -2630,6 +2724,7 @@ impl RequestedModelFeature {
             Self::Parameter(parameter) => support.parameter(parameter),
             Self::StructuredOutput(mode) => support.structured_output(mode),
             Self::ToolChoice(mode) => support.tool_choice(mode),
+            Self::ToolSchema(mode) => support.tool_schema(mode),
             Self::PromptCache(feature) => support.prompt_cache(feature),
             Self::MediaInput(feature) => support.media_input(feature),
         }
@@ -2748,6 +2843,9 @@ fn collect_output_and_tool_features(
                 StructuredOutputMode::JsonSchema
             },
         ));
+    }
+    if let Some(mode) = request.tool_schema_mode {
+        features.insert(RequestedModelFeature::ToolSchema(mode));
     }
     if request.tools.is_empty()
         && matches!(request.tool_call_policy.choice, ToolChoice::Auto)
@@ -2970,6 +3068,7 @@ mod tests {
         ProviderError, ProviderErrorCategory, ProviderErrorSource, ProviderOperationRequirement,
         ProviderRequestContext, ProviderRequestExtension, ProviderTurnEvent, RequestedModelFeature,
         StructuredOutputMode, TokenUsage, ToolCallRequestPolicy, ToolChoice, ToolChoiceMode,
+        ToolSchemaMode,
     };
 
     #[test]
@@ -3138,9 +3237,7 @@ mod tests {
         let mut provider = ModelFeatureSupport::default();
         provider.parameters.insert(
             ModelParameterKey::Temperature,
-            super::CapabilitySupport::Supported {
-                source: super::CapabilitySource::BundledCatalog,
-            },
+            super::CapabilitySupport::supported(super::CapabilitySource::BundledCatalog),
         );
         let mut model = ModelFeatureSupport::default();
 
@@ -3168,11 +3265,43 @@ mod tests {
 
         model.parameters.insert(
             ModelParameterKey::Temperature,
-            super::CapabilitySupport::Supported {
-                source: super::CapabilitySource::ProviderApi,
-            },
+            super::CapabilitySupport::supported(super::CapabilitySource::ProviderApi),
         );
         assert!(provider.negotiate(&model, feature).is_guaranteed());
+    }
+
+    #[test]
+    fn capability_negotiation_preserves_the_weaker_supported_fidelity() {
+        let provider = super::CapabilitySupport::supported(super::CapabilitySource::BundledCatalog);
+        let model = super::CapabilitySupport::Supported {
+            source: super::CapabilitySource::ProviderApi,
+            mechanism: super::CapabilityMechanism::AdapterMediated,
+            fidelity: super::CapabilityFidelity::Reduced,
+        };
+
+        assert_eq!(
+            super::negotiate_feature_claims(&provider, &model),
+            NegotiatedFeatureSupport::Guaranteed {
+                provider_source: super::CapabilitySource::BundledCatalog,
+                model_source: super::CapabilitySource::ProviderApi,
+                mechanism: super::CapabilityMechanism::AdapterMediated,
+                fidelity: super::CapabilityFidelity::Reduced,
+            }
+        );
+    }
+
+    #[test]
+    fn older_supported_capability_payloads_default_to_native_exact_fidelity() {
+        let support: super::CapabilitySupport = serde_json::from_value(serde_json::json!({
+            "status": "supported",
+            "source": "provider_api"
+        }))
+        .expect("old supported capability should decode");
+
+        assert_eq!(
+            support,
+            super::CapabilitySupport::supported(super::CapabilitySource::ProviderApi)
+        );
     }
 
     #[test]
@@ -3197,6 +3326,49 @@ mod tests {
         }))
         .expect("old model info should decode");
         assert_eq!(model.feature_support, ModelFeatureSupport::default());
+    }
+
+    #[test]
+    fn request_feature_inventory_tracks_strict_tool_schema_intent() {
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "turn_id": "turn",
+            "model_id": "model",
+            "messages": [],
+            "tools": [{
+                "name": "lookup",
+                "description": "lookup",
+                "input_schema": {"type": "object"}
+            }],
+            "tool_schema_mode": "strict"
+        }))
+        .expect("request should decode");
+
+        assert!(
+            request
+                .requested_features()
+                .contains(&RequestedModelFeature::ToolSchema(ToolSchemaMode::Strict))
+        );
+        request.tool_schema_mode = Some(ToolSchemaMode::Permissive);
+        let features = request.requested_features();
+        assert!(features.contains(&RequestedModelFeature::ToolSchema(
+            ToolSchemaMode::Permissive
+        )));
+        assert!(!features.contains(&RequestedModelFeature::ToolSchema(ToolSchemaMode::Strict)));
+    }
+
+    #[test]
+    fn provider_capability_request_round_trips_context() {
+        let request = super::ProviderCapabilitiesRequest {
+            provider_context: ProviderRequestContext {
+                model_profile: Some("profile".to_string()),
+                ..ProviderRequestContext::default()
+            },
+            selected_model_id: Some("model".to_string()),
+        };
+        let value = serde_json::to_value(&request).expect("request should encode");
+        let decoded = serde_json::from_value(value).expect("request should decode");
+        assert_eq!(request, decoded);
     }
 
     #[test]

@@ -61,6 +61,7 @@ Required migration invariants:
 | `SystemMessage` | Shared product-authored system message. | transcript | Text-format rendering and layout. | **Complete**. |
 | `AgentChanged` | Selected agent identity. | non-transcript | Header, theme, and picker presentation. | **Complete**. |
 | `ModelTurnStarted` | Active turn identity and cancellation state. | non-transcript | Activity chrome and submission controls. | **Complete**. |
+| `ModelFeatureFidelityNegotiated` | Durable diagnostic record of negotiated provider/model feature mechanism and fidelity. | non-transcript | No presentation; available to bounded diagnostics and inspection. | **Complete**. |
 | `ModelTurnFinished` | Terminal turn outcome and message; error outcomes also publish a shared failure message. | transcript | Activity settlement and error-message rendering. | **Complete**. |
 | `ModelUsage` | Latest usage and cumulative metered tokens. | non-transcript | Footer and accounting display. | **Complete**. |
 | `ContextCompacted` | Shared compaction history note. | transcript | Compaction styling and layout. | **Complete**. |

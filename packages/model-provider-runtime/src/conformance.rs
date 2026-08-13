@@ -679,7 +679,7 @@ where
         options,
         "capabilities",
         bcode_model::OP_CAPABILITIES,
-        &(),
+        &bcode_model::ProviderCapabilitiesRequest::default(),
     )?;
     validate_provider_identity(&provider)?;
     let models: ModelList = invoke(
@@ -1592,6 +1592,7 @@ fn turn_request(
         }],
         tools: Vec::new(),
         tool_call_policy: ToolCallRequestPolicy::default(),
+        tool_schema_mode: None,
         parameters: ModelParameters::default(),
         structured_output: None,
         context_management: bcode_model::ContextManagementRequest::default(),

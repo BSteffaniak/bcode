@@ -1058,11 +1058,11 @@ fn feature_support_from_catalog(
         support.media_input.extend([
             (
                 MediaInputFeature::UserImage,
-                CapabilitySupport::Supported { source },
+                CapabilitySupport::supported(source),
             ),
             (
                 MediaInputFeature::ToolResultImage,
-                CapabilitySupport::Supported { source },
+                CapabilitySupport::supported(source),
             ),
         ]);
     }
@@ -1070,7 +1070,7 @@ fn feature_support_from_catalog(
         support.tool_choice.insert(
             ToolChoiceMode::Parallel,
             if parallel {
-                CapabilitySupport::Supported { source }
+                CapabilitySupport::supported(source)
             } else {
                 CapabilitySupport::Unsupported {
                     source,
@@ -2089,9 +2089,9 @@ mod tests {
                 .feature_support
                 .tool_choice
                 .get(&ToolChoiceMode::Parallel),
-            Some(&CapabilitySupport::Supported {
-                source: CapabilitySource::BundledCatalog,
-            })
+            Some(&CapabilitySupport::supported(
+                CapabilitySource::BundledCatalog
+            ))
         );
     }
 

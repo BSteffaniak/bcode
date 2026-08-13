@@ -236,7 +236,7 @@ impl FakeProviderPlugin {
         }
 
         match context.request.operation.as_str() {
-            OP_CAPABILITIES => json_response(&capabilities()),
+            OP_CAPABILITIES => Self::capabilities_response(&context.request),
             OP_MODELS => Self::models(&context.request),
             OP_VALIDATE_CONFIG => Self::validate_config(&context.request),
             OP_CONTEXT_MANAGEMENT_CAPABILITIES => {
@@ -342,6 +342,13 @@ impl FakeProviderPlugin {
             messages: vec![opaque],
             context_format: fake_context_format(),
         })
+    }
+
+    fn capabilities_response(request: &ServiceRequest) -> ServiceResponse {
+        if let Err(error) = request.payload_json::<bcode_model::ProviderCapabilitiesRequest>() {
+            return invalid_request(&error);
+        }
+        json_response(&capabilities())
     }
 
     fn start_turn(&self, request: &ServiceRequest, positioned_output: bool) -> ServiceResponse {
@@ -1702,10 +1709,9 @@ fn fake_feature_support() -> bcode_model::ModelFeatureSupport {
     use bcode_model::{
         CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
         ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
+        ToolSchemaMode,
     };
-    let supported = || CapabilitySupport::Supported {
-        source: CapabilitySource::TestContract,
-    };
+    let supported = || CapabilitySupport::supported(CapabilitySource::TestContract);
     let unsupported = |reason: &str| CapabilitySupport::Unsupported {
         source: CapabilitySource::TestContract,
         reason: reason.to_string(),
@@ -1754,6 +1760,12 @@ fn fake_feature_support() -> bcode_model::ModelFeatureSupport {
         ]
         .into_iter()
         .map(|mode| (mode, supported()))
+        .collect(),
+        tool_schema: [
+            (ToolSchemaMode::Permissive, supported()),
+            (ToolSchemaMode::Strict, supported()),
+        ]
+        .into_iter()
         .collect(),
         prompt_cache: [
             PromptCacheFeature::ConversationPrefix,

@@ -189,9 +189,7 @@ mod tests {
     use super::*;
 
     fn capability_support() -> bcode_model::CapabilitySupport {
-        bcode_model::CapabilitySupport::Supported {
-            source: bcode_model::CapabilitySource::BundledCatalog,
-        }
+        bcode_model::CapabilitySupport::supported(bcode_model::CapabilitySource::BundledCatalog)
     }
 
     fn provider_capabilities(supported: bool) -> bcode_model::ProviderCapabilities {

@@ -181,7 +181,17 @@ ordinary prose, silently drop the schema, or report `EndTurn` for a value known 
 schema.
 
 The SDK independently parses and validates final structured output. Provider-native enforcement is
-an additional guarantee, not a replacement for application-side validation.
+an additional guarantee, not a replacement for application-side validation. Capability declarations
+also report whether a guarantee is native or adapter-mediated and whether its portable fidelity is
+exact or reduced. Context-sensitive claims are resolved using `ProviderCapabilitiesRequest`, which
+carries the active provider context and selected model; unknown claims fail closed.
+
+Strict tool-schema enforcement is request-level policy (`ModelTurnRequest.tool_schema_mode`), not
+metadata on portable tool definitions. Provider adapters may normalize schemas to their declared
+JSON Schema dialect. An adapter may emulate structured output only on a tool-free provider round;
+its synthetic tool must be intercepted inside the adapter and must never enter host dispatch,
+authorization, or canonical tool history. Negotiated fidelity is persisted as a versioned canonical
+session event.
 
 ## Tool calls and continuation
 

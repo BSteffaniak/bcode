@@ -209,6 +209,7 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::SkillInvocationFailed { .. }
         | SessionEventKind::RuntimeWorkCancelRequested { .. }
         | SessionEventKind::ModelTurnCancelRequested { .. }
+        | SessionEventKind::ModelFeatureFidelityNegotiated { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SessionImported { .. }
         | SessionEventKind::SessionForked { .. }
@@ -436,6 +437,7 @@ pub fn project_event(
         | SessionEventKind::SkillInvocationFailed { .. }
         | SessionEventKind::RuntimeWorkCancelRequested { .. }
         | SessionEventKind::ModelTurnCancelRequested { .. }
+        | SessionEventKind::ModelFeatureFidelityNegotiated { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SessionImported { .. }
         | SessionEventKind::SessionForked { .. }

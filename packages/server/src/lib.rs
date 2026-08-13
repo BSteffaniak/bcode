@@ -2995,6 +2995,7 @@ async fn run_invariant_selector(
             parallel: Some(false),
             choice: ToolChoice::None,
         },
+        tool_schema_mode: None,
         parameters,
         structured_output: None,
         context_management: bcode_model::ContextManagementRequest::default(),
@@ -19925,11 +19926,14 @@ async fn provider_retry_rules(
     };
     state
         .plugins
-        .invoke_service_json::<(), bcode_model::ProviderCapabilities>(
+        .invoke_service_json::<
+            bcode_model::ProviderCapabilitiesRequest,
+            bcode_model::ProviderCapabilities,
+        >(
             provider_plugin_id,
             bcode_model::MODEL_PROVIDER_INTERFACE_ID,
             bcode_model::OP_CAPABILITIES,
-            &(),
+            &bcode_model::ProviderCapabilitiesRequest::default(),
         )
         .await
         .map_or_else(|_| Vec::new(), |capabilities| capabilities.retry_rules)
@@ -23532,6 +23536,7 @@ async fn build_model_turn_request(
             config.tools.execution.runtime_options().parallel,
             bcode_model::ToolChoice::Auto,
         ),
+        tool_schema_mode: None,
         structured_output: execution.structured_output.as_ref().map(|request| {
             bcode_model::StructuredOutputRequest {
                 name: bcode_session_models::structured_output_name(&request.name),
@@ -23558,6 +23563,8 @@ async fn build_model_turn_request(
     let context_projection =
         projected_request_context(state, session_id, provider_plugin_id, &request).await;
     image_input::hydrate_tool_result_images(state, session_id, provider_plugin_id, &mut request)
+        .await;
+    append_negotiated_feature_fidelity_events(state, session_id, provider_plugin_id, &request)
         .await;
     Ok(PreparedModelRequest {
         request,
@@ -23928,6 +23935,102 @@ fn supported_reasoning_value<'a>(
     (supported.is_empty() || supported.iter().any(|value| value == requested)).then_some(requested)
 }
 
+async fn append_negotiated_feature_fidelity_events(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_plugin_id: Option<&str>,
+    request: &ModelTurnRequest,
+) {
+    let Some(provider_plugin_id) = provider_plugin_id else {
+        return;
+    };
+    let Ok(provider) = state
+        .plugins
+        .invoke_service_json::<
+            bcode_model::ProviderCapabilitiesRequest,
+            bcode_model::ProviderCapabilities,
+        >(
+            provider_plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_CAPABILITIES,
+            &bcode_model::ProviderCapabilitiesRequest {
+                provider_context: request.provider_context.clone(),
+                selected_model_id: Some(request.model_id.clone()),
+            },
+        )
+        .await
+    else {
+        return;
+    };
+    let Ok(models) = resolved_provider_models(
+        state,
+        Some(provider_plugin_id.to_string()),
+        bcode_model::ModelListRequest {
+            provider_context: request.provider_context.clone(),
+            selected_model_id: Some(request.model_id.clone()),
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let Some(model) = models
+        .models
+        .into_iter()
+        .find(|model| model.model_id == request.model_id)
+    else {
+        return;
+    };
+    for (feature, support) in
+        request.negotiate_requested_features(&provider.feature_support, &model.feature_support)
+    {
+        let bcode_model::NegotiatedFeatureSupport::Guaranteed {
+            mechanism,
+            fidelity,
+            ..
+        } = support
+        else {
+            continue;
+        };
+        let Ok(feature_value) = serde_json::to_value(feature) else {
+            continue;
+        };
+        let family = feature_value
+            .get("family")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let feature_name = feature_value
+            .get("feature")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        if let Ok(event) = state
+            .sessions
+            .append_model_feature_fidelity(
+                session_id,
+                request.turn_id.clone(),
+                bcode_session_models::ModelFeatureFidelity {
+                    version: 1,
+                    family,
+                    feature: feature_name,
+                    mechanism: serde_json::to_value(mechanism)
+                        .ok()
+                        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    fidelity: serde_json::to_value(fidelity)
+                        .ok()
+                        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                },
+            )
+            .await
+        {
+            publish_session_event(state, &event).await;
+        }
+    }
+}
+
 async fn resolve_parallel_tool_call_capabilities(
     state: &ServerState,
     provider_plugin_id: Option<&str>,
@@ -23938,11 +24041,14 @@ async fn resolve_parallel_tool_call_capabilities(
     let provider = if let Some(provider_plugin_id) = provider_plugin_id {
         state
             .plugins
-            .invoke_service_json::<(), bcode_model::ProviderCapabilities>(
+            .invoke_service_json::<bcode_model::ProviderCapabilitiesRequest, bcode_model::ProviderCapabilities>(
                 provider_plugin_id,
                 bcode_model::MODEL_PROVIDER_INTERFACE_ID,
                 bcode_model::OP_CAPABILITIES,
-                &(),
+                &bcode_model::ProviderCapabilitiesRequest {
+                    provider_context: provider_context.clone(),
+                    selected_model_id: Some(selected_model_id.to_owned()),
+                },
             )
             .await
             .ok()
@@ -32736,6 +32842,9 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::AgentChanged { .. } => "agent_changed",
         SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
+        SessionEventKind::ModelFeatureFidelityNegotiated { .. } => {
+            "model_feature_fidelity_negotiated"
+        }
         SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
         SessionEventKind::ModelUsage { .. } => "model_usage",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
@@ -39879,6 +39988,7 @@ library = "test"
             }],
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            tool_schema_mode: None,
             parameters: bcode_model::ModelParameters::default(),
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
@@ -40630,6 +40740,7 @@ library = "test"
             messages,
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            tool_schema_mode: None,
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             parameters: ModelParameters::default(),
@@ -53107,6 +53218,7 @@ library = "test"
                 parallel: Some(false),
                 choice: ToolChoice::None,
             },
+            tool_schema_mode: None,
             parameters: ModelParameters::default(),
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),

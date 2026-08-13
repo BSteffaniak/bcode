@@ -5469,9 +5469,7 @@ mod tests {
             ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
         };
 
-        let supported = || CapabilitySupport::Supported {
-            source: CapabilitySource::BundledCatalog,
-        };
+        let supported = || CapabilitySupport::supported(CapabilitySource::BundledCatalog);
         let unsupported = || CapabilitySupport::Unsupported {
             source: CapabilitySource::Probe,
             reason: "not available".to_string(),
@@ -5496,6 +5494,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            tool_schema: std::collections::BTreeMap::new(),
             prompt_cache: std::iter::once((PromptCacheFeature::ConversationPrefix, supported()))
                 .collect(),
             media_input: std::iter::once((MediaInputFeature::UserImage, supported())).collect(),

@@ -571,6 +571,7 @@ mod tests {
             messages: Vec::new(),
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            tool_schema_mode: None,
             parameters: bcode_model::ModelParameters::default(),
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),

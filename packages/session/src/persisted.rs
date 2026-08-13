@@ -444,6 +444,10 @@ enum PersistedSessionEventKind {
         arguments_json: String,
         working_directory: Option<PathBuf>,
     },
+    ModelFeatureFidelityNegotiated {
+        turn_id: String,
+        feature: bcode_session_models::ModelFeatureFidelity,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -533,6 +537,12 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             SessionEventKind::ModelTurnStarted { turn_id } => Self::ModelTurnStarted {
                 turn_id: turn_id.clone(),
             },
+            SessionEventKind::ModelFeatureFidelityNegotiated { turn_id, feature } => {
+                Self::ModelFeatureFidelityNegotiated {
+                    turn_id: turn_id.clone(),
+                    feature: feature.clone(),
+                }
+            }
             SessionEventKind::ModelTurnFinished {
                 turn_id,
                 outcome,
@@ -939,6 +949,9 @@ impl PersistedSessionEventKind {
             Self::SystemMessage { text } => SessionEventKind::SystemMessage { text },
             Self::AgentChanged { agent_id } => SessionEventKind::AgentChanged { agent_id },
             Self::ModelTurnStarted { turn_id } => SessionEventKind::ModelTurnStarted { turn_id },
+            Self::ModelFeatureFidelityNegotiated { turn_id, feature } => {
+                SessionEventKind::ModelFeatureFidelityNegotiated { turn_id, feature }
+            }
             Self::ModelTurnFinished {
                 turn_id,
                 outcome,

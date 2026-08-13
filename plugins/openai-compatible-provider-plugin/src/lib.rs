@@ -1177,7 +1177,7 @@ impl OpenAiCompatibleProviderPlugin {
         }
 
         match context.request.operation.as_str() {
-            OP_CAPABILITIES => json_response(&capabilities()),
+            OP_CAPABILITIES => Self::capabilities_response(&context.request),
             OP_CONTEXT_MANAGEMENT_CAPABILITIES => {
                 Self::context_management_capabilities(&context.request)
             }
@@ -1202,6 +1202,16 @@ impl OpenAiCompatibleProviderPlugin {
                 "unsupported model provider operation",
             ),
         }
+    }
+
+    fn capabilities_response(request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<bcode_model::ProviderCapabilitiesRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        json_response(&capabilities_for_settings(&settings_for_context(
+            &request.provider_context,
+        )))
     }
 
     fn models_response(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -1698,6 +1708,8 @@ struct ChatToolFunction {
     name: String,
     description: String,
     parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3588,6 +3600,7 @@ fn verification_turn_request(request: &bcode_model::VerifyModelRequest) -> Model
         }],
         tools: Vec::new(),
         tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+        tool_schema_mode: None,
         structured_output: None,
         context_management: bcode_model::ContextManagementRequest::default(),
         parameters: bcode_model::ModelParameters {
@@ -5147,35 +5160,6 @@ fn openai_tool_choice(
 }
 
 fn strict_openai_schema(schema: &serde_json::Value) -> Result<serde_json::Value, ProviderError> {
-    fn normalize(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(object) => {
-                let is_object = object.get("type").and_then(serde_json::Value::as_str)
-                    == Some("object")
-                    || object.contains_key("properties");
-                if is_object {
-                    object.insert("additionalProperties".to_string(), serde_json::json!(false));
-                    let properties = object
-                        .entry("properties".to_string())
-                        .or_insert_with(|| serde_json::json!({}));
-                    if let Some(properties) = properties.as_object() {
-                        let required = properties.keys().cloned().collect::<Vec<_>>();
-                        object.insert("required".to_string(), serde_json::json!(required));
-                    }
-                }
-                for child in object.values_mut() {
-                    normalize(child);
-                }
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    normalize(value);
-                }
-            }
-            _ => {}
-        }
-    }
-
     if !schema.is_object() {
         return Err(provider_error(
             "invalid_structured_output_schema",
@@ -5183,9 +5167,20 @@ fn strict_openai_schema(schema: &serde_json::Value) -> Result<serde_json::Value,
             "strict structured-output schema must be a JSON object",
         ));
     }
-    let mut schema = schema.clone();
-    normalize(&mut schema);
-    Ok(schema)
+    bcode_model_schema::normalize(
+        schema,
+        &bcode_model_schema::SchemaDialect {
+            object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
+            ..bcode_model_schema::SchemaDialect::default()
+        },
+    )
+    .map_err(|error| {
+        provider_error(
+            "invalid_structured_output_schema",
+            ProviderErrorCategory::InvalidRequest,
+            error.to_string(),
+        )
+    })
 }
 
 fn provider_structured_output_schema(
@@ -5730,11 +5725,12 @@ fn model_tools_to_responses_tools(
             name: tool.provider_name,
             description: tool.description,
             parameters: tool.parameters,
-            strict: if dialect
-                .responses_request_capabilities()
-                .requires_explicit_tool_strictness
+            strict: if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict)
+                || dialect
+                    .responses_request_capabilities()
+                    .requires_explicit_tool_strictness
             {
-                Some(false)
+                Some(request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict))
             } else {
                 None
             },
@@ -5755,6 +5751,8 @@ fn model_tools_to_chat_tools(
                 name: tool.provider_name,
                 description: tool.description,
                 parameters: tool.parameters,
+                strict: (request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict))
+                    .then_some(true),
             },
         })
         .collect())
@@ -5788,7 +5786,11 @@ fn project_model_tools(
         projected.push(ProjectedTool {
             provider_name,
             description: tool.description.clone(),
-            parameters: tool.input_schema.clone(),
+            parameters: if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict) {
+                strict_openai_schema(&tool.input_schema)?
+            } else {
+                tool.input_schema.clone()
+            },
         });
     }
     Ok(projected)
@@ -5842,9 +5844,7 @@ fn openai_parameter_support(
     dialect: OpenAiCompatibleDialect,
 ) -> BTreeMap<bcode_model::ModelParameterKey, bcode_model::CapabilitySupport> {
     use bcode_model::{CapabilitySource, CapabilitySupport, ModelParameterKey};
-    let supported = || CapabilitySupport::Supported {
-        source: CapabilitySource::BundledCatalog,
-    };
+    let supported = || CapabilitySupport::supported(CapabilitySource::BundledCatalog);
     let unsupported = |reason: &str| CapabilitySupport::Unsupported {
         source: CapabilitySource::BundledCatalog,
         reason: reason.to_string(),
@@ -5906,11 +5906,9 @@ fn openai_parameter_support(
 fn openai_feature_support(dialect: OpenAiCompatibleDialect) -> bcode_model::ModelFeatureSupport {
     use bcode_model::{
         CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
-        PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
+        PromptCacheFeature, StructuredOutputMode, ToolChoiceMode, ToolSchemaMode,
     };
-    let supported = || CapabilitySupport::Supported {
-        source: CapabilitySource::BundledCatalog,
-    };
+    let supported = || CapabilitySupport::supported(CapabilitySource::BundledCatalog);
     let unsupported = |reason: &str| CapabilitySupport::Unsupported {
         source: CapabilitySource::BundledCatalog,
         reason: reason.to_string(),
@@ -5939,6 +5937,12 @@ fn openai_feature_support(dialect: OpenAiCompatibleDialect) -> bcode_model::Mode
                 unsupported("active API surface does not support parallel tool policy")
             },
         )))
+        .collect(),
+        tool_schema: [
+            (ToolSchemaMode::Permissive, supported()),
+            (ToolSchemaMode::Strict, supported()),
+        ]
+        .into_iter()
         .collect(),
         prompt_cache: [
             (PromptCacheFeature::ConversationPrefix, supported()),
@@ -5993,8 +5997,12 @@ fn openai_feature_support(dialect: OpenAiCompatibleDialect) -> bcode_model::Mode
     }
 }
 
+#[cfg(test)]
 fn capabilities() -> ProviderCapabilities {
-    let settings = settings();
+    capabilities_for_settings(&settings())
+}
+
+fn capabilities_for_settings(settings: &Settings) -> ProviderCapabilities {
     let capabilities = BTreeSet::from([
         ProviderCapability::Streaming,
         ProviderCapability::Cancellation,
@@ -6013,7 +6021,7 @@ fn capabilities() -> ProviderCapabilities {
             .into_iter()
             .collect(),
         retry_rules: vec![unsupported_content_type_retry_rule()],
-        metadata: diagnostics_metadata(&settings, None),
+        metadata: diagnostics_metadata(settings, None),
     }
 }
 
@@ -6828,6 +6836,7 @@ fn diagnostics_metadata(
     metadata
 }
 
+#[cfg(test)]
 fn settings() -> Settings {
     settings_for_context(&ProviderRequestContext::default())
 }
@@ -9779,6 +9788,7 @@ mod tests {
                 parallel: Some(true),
                 ..bcode_model::ToolCallRequestPolicy::default()
             },
+            tool_schema_mode: None,
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
@@ -10299,6 +10309,7 @@ mod tests {
             ],
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            tool_schema_mode: None,
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
@@ -10349,6 +10360,7 @@ mod tests {
             ],
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            tool_schema_mode: None,
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
@@ -10473,6 +10485,7 @@ mod tests {
             ],
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            tool_schema_mode: None,
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),

@@ -131,9 +131,7 @@ fn provider_registry_negotiates_parallel_only_when_provider_and_model_support_it
     let feature_support = ModelFeatureSupport {
         tool_choice: std::iter::once((
             ToolChoiceMode::Parallel,
-            CapabilitySupport::Supported {
-                source: CapabilitySource::Configuration,
-            },
+            CapabilitySupport::supported(CapabilitySource::Configuration),
         ))
         .collect(),
         ..ModelFeatureSupport::default()

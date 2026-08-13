@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Portable model-output JSON Schema normalization for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "json-schema", "model"]
+license     = { workspace = true }
+name        = "bcode_model_schema"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -11802,6 +11802,9 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::AgentChanged { .. } => "agent_changed",
         SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
+        SessionEventKind::ModelFeatureFidelityNegotiated { .. } => {
+            "model_feature_fidelity_negotiated"
+        }
         SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
         SessionEventKind::ModelUsage { .. } => "model_usage",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
@@ -12484,6 +12487,10 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::ModelTurnStarted { turn_id } => {
             println!("#{} model turn started: {turn_id}", event.sequence);
         }
+        SessionEventKind::ModelFeatureFidelityNegotiated { turn_id, feature } => println!(
+            "#{} model feature fidelity: {turn_id} {}:{} mechanism={} fidelity={}",
+            event.sequence, feature.family, feature.feature, feature.mechanism, feature.fidelity
+        ),
         SessionEventKind::ModelTurnCancelRequested { turn_id, .. } => {
             println!(
                 "#{} model turn cancellation requested: {turn_id}",

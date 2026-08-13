@@ -13,7 +13,7 @@ pub use conformance::{
 
 use bcode_model::{
     ProviderError, ProviderErrorCategory, ProviderOutputEvent, ProviderRetryHint,
-    ProviderTurnEvent, TurnOutputPosition,
+    ProviderTurnEvent, StructuredOutputRequest, ToolCall, ToolDefinition, TurnOutputPosition,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -22,6 +22,97 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, oneshot};
+
+/// Provider-local helper for enforcing one structured result through a synthetic tool.
+///
+/// The synthetic tool is never a host tool: adapters construct it only for the provider request
+/// and intercept its completed call before emitting normalized provider events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticStructuredOutput {
+    tool_name: String,
+    output_name: String,
+    schema: serde_json::Value,
+}
+
+impl SyntheticStructuredOutput {
+    /// Construct a provider-local structured-output constraint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when real tools are present, because forcing the synthetic tool would
+    /// suppress or compete with authorized host tool execution.
+    pub fn new(
+        request: &StructuredOutputRequest,
+        has_real_tools: bool,
+    ) -> Result<Self, ProviderError> {
+        if has_real_tools {
+            return Err(simple_provider_error(
+                "structured_output_emulation_requires_tool_free_round",
+                ProviderErrorCategory::UnsupportedFeature,
+                "structured-output emulation requires a tool-free provider round",
+            ));
+        }
+        Ok(Self {
+            tool_name: format!("bcode_structured_{}", request.name),
+            output_name: request.name.clone(),
+            schema: request.schema.clone(),
+        })
+    }
+
+    /// Return the provider-facing synthetic tool definition.
+    #[must_use]
+    pub fn tool(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.tool_name.clone(),
+            description: format!("Return the final {} value", self.output_name),
+            input_schema: self.schema.clone(),
+        }
+    }
+
+    /// Convert the intercepted synthetic call into portable assistant JSON text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call targets another tool or its arguments cannot be serialized.
+    pub fn completed_text(&self, call: &ToolCall) -> Result<String, ProviderError> {
+        if call.name != self.tool_name {
+            return Err(simple_provider_error(
+                "unexpected_structured_output_tool",
+                ProviderErrorCategory::InvalidRequest,
+                format!(
+                    "expected synthetic tool '{}', got '{}'",
+                    self.tool_name, call.name
+                ),
+            ));
+        }
+        serde_json::to_string(&call.arguments).map_err(|error| {
+            simple_provider_error(
+                "invalid_structured_output_arguments",
+                ProviderErrorCategory::InvalidRequest,
+                error.to_string(),
+            )
+        })
+    }
+}
+
+fn simple_provider_error(
+    code: &str,
+    category: ProviderErrorCategory,
+    message: impl Into<String>,
+) -> ProviderError {
+    ProviderError {
+        code: code.to_string(),
+        category,
+        message: message.into(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    }
+}
 
 /// Outcome from a provider streaming turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -993,6 +1084,7 @@ where
         }],
         tools: Vec::new(),
         tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+        tool_schema_mode: None,
         structured_output: None,
         context_management: bcode_model::ContextManagementRequest::default(),
         parameters: request.parameters,
@@ -1131,6 +1223,27 @@ mod output_position_tests {
                 ..
             } if call_id == "call-1"
         ));
+    }
+
+    #[test]
+    fn synthetic_structured_output_is_tool_free_and_intercepts_completed_call() {
+        let request = StructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        };
+        let helper = SyntheticStructuredOutput::new(&request, false).expect("tool-free helper");
+        let tool = helper.tool();
+        assert_eq!(tool.input_schema, request.schema);
+        let text = helper
+            .completed_text(&ToolCall {
+                id: "synthetic-call".to_string(),
+                name: tool.name,
+                arguments: serde_json::json!({"ok": true}),
+            })
+            .expect("synthetic call should become text");
+        assert_eq!(text, r#"{"ok":true}"#);
+        assert!(SyntheticStructuredOutput::new(&request, true).is_err());
     }
 
     #[test]

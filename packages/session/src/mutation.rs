@@ -388,6 +388,24 @@ impl SessionManager {
             .await
     }
 
+    /// Append negotiated model-feature fidelity to canonical event history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_model_feature_fidelity(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        feature: bcode_session_models::ModelFeatureFidelity,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ModelFeatureFidelityNegotiated { turn_id, feature },
+        )
+        .await
+    }
+
     /// Append a model-turn-cancel-requested event to a session.
     ///
     /// # Errors
