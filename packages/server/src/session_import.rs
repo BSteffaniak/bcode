@@ -95,7 +95,13 @@ fn imported_session_event_kind(
             },
         },
         ImportableSessionEventKind::ModelChanged { provider, model } => {
-            SessionEventKind::ModelChanged { provider, model }
+            // Imported history carries no selection provenance, so treat it as a resolved default
+            // rather than inferring a deliberate in-session choice.
+            SessionEventKind::ModelChanged {
+                provider,
+                model,
+                selection_source: bcode_session_models::ModelSelectionSource::ConfigDefault,
+            }
         }
         ImportableSessionEventKind::AgentChanged { agent_id } => {
             SessionEventKind::AgentChanged { agent_id }

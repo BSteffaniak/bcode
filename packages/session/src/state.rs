@@ -22,6 +22,21 @@ pub enum SessionLoadStatusKind {
     SummaryOnly,
 }
 
+/// Maximum number of per-model reasoning selections retained for one session.
+///
+/// This memory is derived presentation/runtime convenience state, so it is bounded rather than
+/// growing with every model a long-lived session touches.
+pub const REASONING_MEMORY_CAPACITY: usize = 16;
+
+/// Reasoning selection remembered for one provider/model pair.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RememberedReasoning {
+    /// Remembered reasoning effort, when one was explicitly set.
+    pub effort: Option<String>,
+    /// Remembered reasoning summary, when one was explicitly set.
+    pub summary: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LiveTextStreamKey {
     Assistant {
@@ -54,8 +69,16 @@ pub struct SessionState {
     pub(crate) has_user_message: bool,
     pub(crate) current_provider: Option<String>,
     pub(crate) current_model: Option<String>,
+    pub(crate) model_selection_source: bcode_session_models::ModelSelectionSource,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) reasoning_summary: Option<String>,
+    /// Reasoning selections remembered per provider/model pair.
+    ///
+    /// Derived, disposable, and bounded to [`REASONING_MEMORY_CAPACITY`] entries so attach and
+    /// refresh remain bounded regardless of how many models a session touches.
+    pub(crate) reasoning_by_model:
+        BTreeMap<bcode_session_models::ModelScopeKey, RememberedReasoning>,
+    pub(crate) reasoning_by_model_order: Vec<bcode_session_models::ModelScopeKey>,
     pub(crate) current_agent: Option<String>,
     pub(crate) latest_compaction_sequence: Option<u64>,
     pub(crate) context_epoch: u64,
@@ -118,8 +141,11 @@ impl SessionState {
             has_user_message: false,
             current_provider: None,
             current_model: None,
+            model_selection_source: bcode_session_models::ModelSelectionSource::default(),
             reasoning_effort: None,
             reasoning_summary: None,
+            reasoning_by_model: BTreeMap::new(),
+            reasoning_by_model_order: Vec::new(),
             current_agent: None,
             latest_compaction_sequence: None,
             context_epoch: 0,
@@ -178,8 +204,11 @@ impl SessionState {
             has_user_message: state.has_user_message,
             current_provider: state.current_provider,
             current_model: state.current_model,
+            model_selection_source: state.model_selection_source,
             reasoning_effort: state.reasoning_effort,
             reasoning_summary: state.reasoning_summary,
+            reasoning_by_model: state.reasoning_by_model,
+            reasoning_by_model_order: state.reasoning_by_model_order,
             current_agent: state.current_agent,
             latest_compaction_sequence: state.latest_compaction_sequence,
             context_epoch: state.latest_compaction_sequence.unwrap_or_default(),
@@ -193,6 +222,29 @@ impl SessionState {
             live_text_checkpoint_order: Vec::new(),
             live_text_tombstones: BTreeMap::new(),
             live_text_tombstone_order: Vec::new(),
+        }
+    }
+
+    /// Remember a reasoning selection for one provider/model pair.
+    ///
+    /// Entries are evicted in least-recently-updated order once
+    /// [`REASONING_MEMORY_CAPACITY`] is reached so this derived memory stays bounded.
+    pub(crate) fn remember_reasoning(
+        &mut self,
+        scope: bcode_session_models::ModelScopeKey,
+        reasoning: RememberedReasoning,
+    ) {
+        self.reasoning_by_model_order
+            .retain(|existing| existing != &scope);
+        if reasoning == RememberedReasoning::default() {
+            self.reasoning_by_model.remove(&scope);
+            return;
+        }
+        self.reasoning_by_model.insert(scope.clone(), reasoning);
+        self.reasoning_by_model_order.push(scope);
+        while self.reasoning_by_model_order.len() > REASONING_MEMORY_CAPACITY {
+            let evicted = self.reasoning_by_model_order.remove(0);
+            self.reasoning_by_model.remove(&evicted);
         }
     }
 
@@ -307,15 +359,52 @@ impl SessionState {
                     .working_directory
                     .clone_from(&self.working_directory);
             }
-            SessionEventKind::ModelChanged { provider, model } => {
+            SessionEventKind::ModelChanged {
+                provider,
+                model,
+                selection_source,
+            } => {
                 self.current_provider = Some(provider.clone());
                 self.current_model = Some(model.clone());
+                self.model_selection_source = *selection_source;
                 self.context_epoch = event.sequence;
                 self.context_occupancy = None;
+                // Restore the reasoning selection previously remembered for this exact
+                // provider/model pair. When the pair has no remembered selection, clear the
+                // active values so the incoming model resolves its own default rather than
+                // inheriting the outgoing model's effort.
+                let scope = bcode_session_models::ModelScopeKey::new(provider, model);
+                let remembered = self.reasoning_by_model.get(&scope).cloned();
+                let remembered = remembered.unwrap_or_default();
+                self.reasoning_effort = remembered.effort;
+                self.reasoning_summary = remembered.summary;
             }
-            SessionEventKind::ReasoningChanged { effort, summary } => {
+            SessionEventKind::ReasoningChanged {
+                effort,
+                summary,
+                model_scope,
+            } => {
                 self.reasoning_effort.clone_from(effort);
                 self.reasoning_summary.clone_from(summary);
+                // Remember the selection against its declared scope, falling back to the
+                // currently active model for history persisted before scoping existed.
+                let scope = model_scope.clone().or_else(|| {
+                    self.current_provider
+                        .as_ref()
+                        .zip(self.current_model.as_ref())
+                        .map(|(provider, model)| {
+                            bcode_session_models::ModelScopeKey::new(provider, model)
+                        })
+                });
+                if let Some(scope) = scope {
+                    self.remember_reasoning(
+                        scope,
+                        RememberedReasoning {
+                            effort: effort.clone(),
+                            summary: summary.clone(),
+                        },
+                    );
+                }
             }
             SessionEventKind::AgentChanged { agent_id } => {
                 self.current_agent = Some(agent_id.clone());

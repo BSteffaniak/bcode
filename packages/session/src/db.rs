@@ -281,6 +281,88 @@ pub struct RuntimeWorkProjection {
     pub cancellable: bool,
 }
 
+/// Serialized form of one remembered per-model reasoning selection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReasoningByModelEntry {
+    provider: String,
+    model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+}
+
+/// Decode a persisted model-selection source, treating unknown values as the default.
+///
+/// Unknown values are treated as [`bcode_session_models::ModelSelectionSource::ConfigDefault`]
+/// because a derived projection must never upgrade an unrecognized value into a sticky
+/// user selection.
+fn decode_model_selection_source(
+    value: &str,
+) -> Option<bcode_session_models::ModelSelectionSource> {
+    serde_json::from_str(value).ok()
+}
+
+/// Encode a model-selection source for the session-state projection.
+fn encode_model_selection_source(source: bcode_session_models::ModelSelectionSource) -> String {
+    serde_json::to_string(&source).expect("model selection source serializes")
+}
+
+type ReasoningMemory = (
+    std::collections::BTreeMap<
+        bcode_session_models::ModelScopeKey,
+        crate::state::RememberedReasoning,
+    >,
+    Vec<bcode_session_models::ModelScopeKey>,
+);
+
+/// Decode remembered per-model reasoning selections, preserving least-recently-updated order.
+///
+/// Malformed derived state decodes as empty rather than failing the read, because this projection
+/// is disposable and is rebuilt incrementally from subsequent events.
+fn decode_reasoning_by_model(value: &str) -> ReasoningMemory {
+    let Ok(entries) = serde_json::from_str::<Vec<ReasoningByModelEntry>>(value) else {
+        return ReasoningMemory::default();
+    };
+    let mut map = std::collections::BTreeMap::new();
+    let mut order = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let scope = bcode_session_models::ModelScopeKey::new(entry.provider, entry.model);
+        order.retain(|existing: &bcode_session_models::ModelScopeKey| existing != &scope);
+        map.insert(
+            scope.clone(),
+            crate::state::RememberedReasoning {
+                effort: entry.effort,
+                summary: entry.summary,
+            },
+        );
+        order.push(scope);
+    }
+    (map, order)
+}
+
+/// Encode remembered per-model reasoning selections in least-recently-updated order.
+fn encode_reasoning_by_model(
+    memory: &std::collections::BTreeMap<
+        bcode_session_models::ModelScopeKey,
+        crate::state::RememberedReasoning,
+    >,
+    order: &[bcode_session_models::ModelScopeKey],
+) -> String {
+    let entries = order
+        .iter()
+        .filter_map(|scope| {
+            memory.get(scope).map(|reasoning| ReasoningByModelEntry {
+                provider: scope.provider.clone(),
+                model: scope.model.clone(),
+                effort: reasoning.effort.clone(),
+                summary: reasoning.summary.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&entries).expect("reasoning memory serializes")
+}
+
 /// Typed session-state projection row stored in a per-session database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDbState {
@@ -298,10 +380,19 @@ pub struct SessionDbState {
     pub current_provider: Option<String>,
     /// Current model selection, if any.
     pub current_model: Option<String>,
+    /// Why the current model became active.
+    pub model_selection_source: bcode_session_models::ModelSelectionSource,
     /// Current reasoning effort selection, if any.
     pub reasoning_effort: Option<String>,
     /// Current reasoning summary selection, if any.
     pub reasoning_summary: Option<String>,
+    /// Reasoning selections remembered per provider/model pair.
+    pub reasoning_by_model: std::collections::BTreeMap<
+        bcode_session_models::ModelScopeKey,
+        crate::state::RememberedReasoning,
+    >,
+    /// Least-recently-updated ordering for `reasoning_by_model`.
+    pub reasoning_by_model_order: Vec<bcode_session_models::ModelScopeKey>,
     /// Projection-updated timestamp, when known.
     pub updated_at_ms: Option<u64>,
     /// Whether the input-history projection has at least one user message.
@@ -1480,6 +1571,8 @@ impl SessionDb {
                 "title",
                 "reasoning_effort",
                 "reasoning_summary",
+                "model_selection_source",
+                "reasoning_by_model",
                 "updated_at_ms",
                 "visibility",
                 "execution_provenance",
@@ -1511,6 +1604,10 @@ impl SessionDb {
                 column: "visibility".to_string(),
             })?
             .unwrap_or_default();
+        let (reasoning_by_model, reasoning_by_model_order) =
+            optional_string(&row, "reasoning_by_model")
+                .as_deref()
+                .map_or_else(Default::default, decode_reasoning_by_model);
         Ok(Some(SessionDbState {
             session_id: row_session_id,
             last_event_seq: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
@@ -1524,6 +1621,12 @@ impl SessionDb {
             current_model: optional_string(&row, "current_model"),
             reasoning_effort: optional_string(&row, "reasoning_effort"),
             reasoning_summary: optional_string(&row, "reasoning_summary"),
+            model_selection_source: optional_string(&row, "model_selection_source")
+                .as_deref()
+                .and_then(decode_model_selection_source)
+                .unwrap_or_default(),
+            reasoning_by_model,
+            reasoning_by_model_order,
             updated_at_ms: row
                 .get("updated_at_ms")
                 .and_then(|value| value.as_i64())
@@ -3919,6 +4022,65 @@ async fn project_migration_materialized_checkpoints_at_tail(
     Ok(())
 }
 
+/// Load remembered per-model reasoning selections from the session-state projection.
+async fn load_reasoning_memory(
+    db: &dyn Database,
+    session_id: SessionId,
+) -> SessionDbResult<ReasoningMemory> {
+    let row = db
+        .select("session_state")
+        .columns(&["reasoning_by_model"])
+        .where_eq("session_id", session_id.to_string())
+        .execute_first(db)
+        .await?;
+    Ok(row
+        .as_ref()
+        .and_then(|row| optional_string(row, "reasoning_by_model"))
+        .as_deref()
+        .map_or_else(ReasoningMemory::default, decode_reasoning_by_model))
+}
+
+/// Read the projection's active provider/model pair, when both are known.
+async fn active_model_scope(
+    db: &dyn Database,
+    session_id: SessionId,
+) -> SessionDbResult<Option<bcode_session_models::ModelScopeKey>> {
+    let row = db
+        .select("session_state")
+        .columns(&["current_provider", "current_model"])
+        .where_eq("session_id", session_id.to_string())
+        .execute_first(db)
+        .await?;
+    Ok(row.as_ref().and_then(|row| {
+        let provider = optional_string(row, "current_provider")?;
+        let model = optional_string(row, "current_model")?;
+        Some(bcode_session_models::ModelScopeKey::new(provider, model))
+    }))
+}
+
+/// Insert or update one remembered reasoning selection, evicting least-recently-updated entries.
+fn remember_reasoning_in_projection(
+    memory: &mut std::collections::BTreeMap<
+        bcode_session_models::ModelScopeKey,
+        crate::state::RememberedReasoning,
+    >,
+    order: &mut Vec<bcode_session_models::ModelScopeKey>,
+    scope: bcode_session_models::ModelScopeKey,
+    reasoning: crate::state::RememberedReasoning,
+) {
+    order.retain(|existing| existing != &scope);
+    if reasoning == crate::state::RememberedReasoning::default() {
+        memory.remove(&scope);
+        return;
+    }
+    memory.insert(scope.clone(), reasoning);
+    order.push(scope);
+    while order.len() > crate::state::REASONING_MEMORY_CAPACITY {
+        let evicted = order.remove(0);
+        memory.remove(&evicted);
+    }
+}
+
 async fn project_materialized_event(
     db: &dyn Database,
     event: &SessionEvent,
@@ -3981,18 +4143,61 @@ async fn project_event(
                 .execute(db)
                 .await?;
         }
-        SessionEventKind::ModelChanged { provider, model } => {
+        SessionEventKind::ModelChanged {
+            provider,
+            model,
+            selection_source,
+        } => {
+            // Restore the reasoning selection remembered for the incoming provider/model pair so
+            // the projection matches in-memory state without replaying history.
+            let (memory, _) = load_reasoning_memory(db, event.session_id).await?;
+            let remembered = memory
+                .get(&bcode_session_models::ModelScopeKey::new(provider, model))
+                .cloned()
+                .unwrap_or_default();
             db.update("session_state")
                 .value("current_provider", provider.clone())
                 .value("current_model", model.clone())
+                .value(
+                    "model_selection_source",
+                    encode_model_selection_source(*selection_source),
+                )
+                .value("reasoning_effort", remembered.effort)
+                .value("reasoning_summary", remembered.summary)
                 .where_eq("session_id", event.session_id.to_string())
                 .execute(db)
                 .await?;
         }
-        SessionEventKind::ReasoningChanged { effort, summary } => {
+        SessionEventKind::ReasoningChanged {
+            effort,
+            summary,
+            model_scope,
+        } => {
+            let (mut memory, mut order) = load_reasoning_memory(db, event.session_id).await?;
+            // Fall back to the projection's active model for history persisted before reasoning
+            // selections carried an explicit scope.
+            let scope = match model_scope.clone() {
+                Some(scope) => Some(scope),
+                None => active_model_scope(db, event.session_id).await?,
+            };
+            if let Some(scope) = scope {
+                remember_reasoning_in_projection(
+                    &mut memory,
+                    &mut order,
+                    scope,
+                    crate::state::RememberedReasoning {
+                        effort: effort.clone(),
+                        summary: summary.clone(),
+                    },
+                );
+            }
             db.update("session_state")
                 .value("reasoning_effort", effort.clone())
                 .value("reasoning_summary", summary.clone())
+                .value(
+                    "reasoning_by_model",
+                    encode_reasoning_by_model(&memory, &order),
+                )
                 .where_eq("session_id", event.session_id.to_string())
                 .execute(db)
                 .await?;
@@ -4831,6 +5036,10 @@ mod tests {
                     ),
                     DatabaseValue::String("032_terminal_tool_lifecycle_projection".to_owned()),
                     DatabaseValue::String("033_session_migration_receipts_table".to_owned()),
+                    DatabaseValue::String(
+                        "034_session_state_model_selection_source_column".to_owned(),
+                    ),
+                    DatabaseValue::String("035_session_state_reasoning_by_model_column".to_owned()),
                 ],
             )
             .execute(db.database())
@@ -6474,11 +6683,16 @@ mod tests {
             (
                 "current-schema-v42.json",
                 include_str!("../fixtures/migrations/current-schema-v42.json"),
+                ExpectedHistory::PersistedEventError,
+            ),
+            (
+                "current-schema-v43.json",
+                include_str!("../fixtures/migrations/current-schema-v43.json"),
                 ExpectedHistory::Sequences(&[0]),
             ),
             (
-                "future-schema-v43.json",
-                include_str!("../fixtures/migrations/future-schema-v43.json"),
+                "future-schema-v44.json",
+                include_str!("../fixtures/migrations/future-schema-v44.json"),
                 ExpectedHistory::PersistedEventError,
             ),
             (
@@ -8292,6 +8506,7 @@ mod tests {
             SessionEventKind::ModelChanged {
                 provider: "provider".to_string(),
                 model: "model".to_string(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
             },
         ))
         .await
@@ -8335,6 +8550,7 @@ mod tests {
             SessionEventKind::ModelChanged {
                 provider: "provider".to_string(),
                 model: "model".to_string(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
             },
         ))
         .await

@@ -5979,6 +5979,7 @@ mod tests {
             SessionEventKind::ModelChanged {
                 provider: "provider".to_string(),
                 model: "model".to_string(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
             },
             SessionEventKind::SystemMessage {
                 text: "system".to_string(),

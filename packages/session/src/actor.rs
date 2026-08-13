@@ -464,6 +464,19 @@ impl SessionHandle {
         self.send(SessionCommand::CurrentReasoningSelection).await
     }
 
+    /// Return the reasoning selection remembered for one provider/model pair, when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session actor is unavailable.
+    pub async fn remembered_reasoning_for_model(
+        &self,
+        scope: bcode_session_models::ModelScopeKey,
+    ) -> Result<Option<crate::state::RememberedReasoning>, SessionError> {
+        self.send(|reply| SessionCommand::RememberedReasoningForModel { scope, reply })
+            .await
+    }
+
     pub async fn current_agent_selection(&self) -> Result<Option<String>, SessionError> {
         self.send(SessionCommand::CurrentAgentSelection).await
     }
@@ -626,6 +639,10 @@ enum SessionCommand {
     CurrentRuntimeSelection(oneshot::Sender<crate::SessionRuntimeSelection>),
     CurrentModelSelection(oneshot::Sender<(Option<String>, Option<String>)>),
     CurrentReasoningSelection(oneshot::Sender<(Option<String>, Option<String>)>),
+    RememberedReasoningForModel {
+        scope: bcode_session_models::ModelScopeKey,
+        reply: oneshot::Sender<Option<crate::state::RememberedReasoning>>,
+    },
     CurrentAgentSelection(oneshot::Sender<Option<String>>),
     SetCurrentAgent {
         agent_id: String,
@@ -864,6 +881,7 @@ impl SessionActor {
                     agent_id: self.state.current_agent.clone(),
                     provider_plugin_id: self.state.current_provider.clone(),
                     model_id: self.state.current_model.clone(),
+                    model_selection_source: self.state.model_selection_source,
                     reasoning_effort: self.state.reasoning_effort.clone(),
                     reasoning_summary: self.state.reasoning_summary.clone(),
                 });
@@ -879,6 +897,9 @@ impl SessionActor {
                     self.state.reasoning_effort.clone(),
                     self.state.reasoning_summary.clone(),
                 ));
+            }
+            SessionCommand::RememberedReasoningForModel { scope, reply } => {
+                let _ = reply.send(self.state.reasoning_by_model.get(&scope).cloned());
             }
             SessionCommand::CurrentAgentSelection(reply) => {
                 let _ = reply.send(self.state.current_agent.clone());

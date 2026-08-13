@@ -197,6 +197,8 @@ enum PersistedSessionEventKind {
     ModelChanged {
         provider: String,
         model: String,
+        #[serde(default)]
+        selection_source: bcode_session_models::ModelSelectionSource,
     },
     SystemMessage {
         text: String,
@@ -368,6 +370,8 @@ enum PersistedSessionEventKind {
         effort: Option<String>,
         #[serde(default)]
         summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_scope: Option<bcode_session_models::ModelScopeKey>,
     },
     ProviderContextCompacted {
         snapshot: ProviderContextSnapshot,
@@ -513,9 +517,14 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 permission_id: permission_id.clone(),
                 approved: *approved,
             },
-            SessionEventKind::ModelChanged { provider, model } => Self::ModelChanged {
+            SessionEventKind::ModelChanged {
+                provider,
+                model,
+                selection_source,
+            } => Self::ModelChanged {
                 provider: provider.clone(),
                 model: model.clone(),
+                selection_source: *selection_source,
             },
             SessionEventKind::SystemMessage { text } => Self::SystemMessage { text: text.clone() },
             SessionEventKind::AgentChanged { agent_id } => Self::AgentChanged {
@@ -812,9 +821,14 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 message: message.clone(),
                 occurred_at_ms: *occurred_at_ms,
             },
-            SessionEventKind::ReasoningChanged { effort, summary } => Self::ReasoningChanged {
+            SessionEventKind::ReasoningChanged {
+                effort,
+                summary,
+                model_scope,
+            } => Self::ReasoningChanged {
                 effort: effort.clone(),
                 summary: summary.clone(),
+                model_scope: model_scope.clone(),
             },
             SessionEventKind::ProviderContextCompacted {
                 snapshot,
@@ -913,9 +927,15 @@ impl PersistedSessionEventKind {
                 permission_id,
                 approved,
             },
-            Self::ModelChanged { provider, model } => {
-                SessionEventKind::ModelChanged { provider, model }
-            }
+            Self::ModelChanged {
+                provider,
+                model,
+                selection_source,
+            } => SessionEventKind::ModelChanged {
+                provider,
+                model,
+                selection_source,
+            },
             Self::SystemMessage { text } => SessionEventKind::SystemMessage { text },
             Self::AgentChanged { agent_id } => SessionEventKind::AgentChanged { agent_id },
             Self::ModelTurnStarted { turn_id } => SessionEventKind::ModelTurnStarted { turn_id },
@@ -1133,9 +1153,15 @@ impl PersistedSessionEventKind {
                 message,
                 occurred_at_ms,
             },
-            Self::ReasoningChanged { effort, summary } => {
-                SessionEventKind::ReasoningChanged { effort, summary }
-            }
+            Self::ReasoningChanged {
+                effort,
+                summary,
+                model_scope,
+            } => SessionEventKind::ReasoningChanged {
+                effort,
+                summary,
+                model_scope,
+            },
             Self::ProviderContextCompacted {
                 snapshot,
                 compacted_through_sequence,

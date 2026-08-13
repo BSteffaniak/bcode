@@ -12596,7 +12596,12 @@ async fn handle_set_session_model(
     let provider = provider_plugin_id.unwrap_or_else(|| "<auto>".to_string());
     match state
         .sessions
-        .append_model_changed(session_id, provider.clone(), model_id.clone())
+        .append_model_changed(
+            session_id,
+            provider.clone(),
+            model_id.clone(),
+            bcode_session_models::ModelSelectionSource::UserExplicit,
+        )
         .await
     {
         Ok(event) => {
@@ -12654,9 +12659,17 @@ async fn set_session_reasoning_if_changed(
     {
         return Ok(None);
     }
+    // Scope the selection to the model actually in effect so it can be restored when this
+    // provider/model pair becomes active again.
+    let resolved = session_model_selection(state, session_id).await;
+    let model_scope = resolved
+        .provider_plugin_id
+        .as_deref()
+        .zip(resolved.model_id.as_deref())
+        .map(|(provider, model)| bcode_session_models::ModelScopeKey::new(provider, model));
     let event = state
         .sessions
-        .append_reasoning_changed(session_id, effort.clone(), summary.clone())
+        .append_reasoning_changed(session_id, effort.clone(), summary.clone(), model_scope)
         .await?;
     {
         let mut selections = state.session_model_selections.lock().await;
@@ -12675,11 +12688,8 @@ async fn set_session_reasoning_if_changed(
         selection.reasoning_effort = effort;
         selection.reasoning_summary = summary;
     }
-    state
-        .session_model_selection_origins
-        .lock()
-        .await
-        .insert(session_id, SessionModelSelectionOrigin::User);
+    // Deliberately leave the model-selection origin untouched. Choosing a reasoning effort is not
+    // a model selection, so it must not promote a resolved default into a sticky user choice.
     Ok(Some(event))
 }
 
@@ -13239,6 +13249,10 @@ async fn skill_preferred_model_can_apply(state: &ServerState, session_id: Sessio
 /// When a skill declares neither required nor preferred model, ensure the
 /// upcoming turn respects the user's active selection and does not resolve
 /// through provider defaults such as `default_codex_model_id`.
+///
+/// This pins the resolved selection in process state only. It must not append a `ModelChanged`
+/// event, because writing a resolved default into canonical history would make that default
+/// indistinguishable from a deliberate in-session choice and permanently pin the session model.
 async fn ensure_skill_turn_respects_active_selection(
     state: &ServerState,
     session_id: SessionId,
@@ -13256,27 +13270,15 @@ async fn ensure_skill_turn_respects_active_selection(
         return Ok(());
     }
 
-    // Re-assert the current selection by emitting a model-changed event
-    // using the resolved provider/model from the active selection.
-    // This guarantees that Codex/default surfaces are not consulted later.
+    // Materialize the resolved selection into the in-memory cache so later turn construction
+    // reuses it instead of consulting provider default surfaces.
     let selection = session_model_selection(state, session_id).await;
-    let provider = selection
-        .provider_plugin_id
-        .clone()
-        .unwrap_or_else(|| "<auto>".to_string());
-    let model = selection
-        .model_id
-        .clone()
-        .unwrap_or_else(|| "<default>".to_string());
-
-    // Only emit if we have a concrete model id to anchor on.
-    if selection.model_id.is_some()
-        && let Ok(event) = state
-            .sessions
-            .append_model_changed(session_id, provider, model)
+    if selection.model_id.is_some() {
+        state
+            .session_model_selections
+            .lock()
             .await
-    {
-        publish_session_event(state, &event).await;
+            .insert(session_id, selection);
     }
     Ok(())
 }
@@ -13341,7 +13343,16 @@ async fn apply_skill_model_request(
     }
     let event = state
         .sessions
-        .append_model_changed(session_id, provider.clone(), model_id.clone())
+        .append_model_changed(
+            session_id,
+            provider.clone(),
+            model_id.clone(),
+            if required {
+                bcode_session_models::ModelSelectionSource::SkillRequired
+            } else {
+                bcode_session_models::ModelSelectionSource::SkillPreferred
+            },
+        )
         .await
         .map_err(|error| session_error_response(&error))?;
     let mut selection = current_selection;
@@ -13575,7 +13586,12 @@ async fn restore_required_skill_model_override(
         .unwrap_or_else(|| "<default>".to_string());
     let event = state
         .sessions
-        .append_model_changed(session_id, provider, model)
+        .append_model_changed(
+            session_id,
+            provider,
+            model,
+            selection_source_for_origin(&previous_override.origin),
+        )
         .await?;
     state
         .session_model_selections
@@ -13616,7 +13632,12 @@ async fn restore_preferred_skill_model_override(
         .unwrap_or_else(|| "<default>".to_string());
     let event = state
         .sessions
-        .append_model_changed(session_id, provider, model)
+        .append_model_changed(
+            session_id,
+            provider,
+            model,
+            bcode_session_models::ModelSelectionSource::ConfigDefault,
+        )
         .await?;
     state
         .session_model_selections
@@ -22631,6 +22652,12 @@ fn model_selection_from_runtime_context(
     }
 }
 
+/// Resolve the effective model selection for a session.
+///
+/// A persisted model is honored only when it was explicitly selected in-session. Sessions whose
+/// model came from a resolved default re-resolve against current configuration, so changing the
+/// configured default model takes effect when an idle session is reopened. Sessions with active
+/// runtime work keep their in-flight selection so a running turn is never retargeted.
 async fn session_model_selection(
     state: &ServerState,
     session_id: SessionId,
@@ -22642,6 +22669,7 @@ async fn session_model_selection(
         agent_id: None,
         provider_plugin_id: state.selected_provider_plugin_id.clone(),
         model_id: state.selected_model_id.clone(),
+        model_selection_source: bcode_session_models::ModelSelectionSource::ConfigDefault,
         reasoning_effort: state.selected_reasoning.effort.clone(),
         reasoning_summary: state.selected_reasoning.summary.clone(),
     };
@@ -22650,46 +22678,67 @@ async fn session_model_selection(
         .current_runtime_selection(session_id)
         .await
         .unwrap_or_else(|_| fallback_runtime_selection());
-    let selection = SessionModelSelection {
-        provider_plugin_id: runtime_selection
-            .provider_plugin_id
-            .as_deref()
-            .and_then(provider_to_selection)
-            .or_else(|| state.selected_provider_plugin_id.clone()),
-        requested_model_id: runtime_selection
-            .model_id
-            .as_deref()
-            .and_then(model_to_selection),
-        model_id: runtime_selection
-            .model_id
-            .as_deref()
-            .and_then(model_to_selection)
-            .or_else(|| state.selected_model_id.clone()),
-        thinking_level: None,
-        reasoning_effort: runtime_selection
-            .reasoning_effort
-            .or_else(|| state.selected_reasoning.effort.clone()),
-        reasoning_summary: runtime_selection
-            .reasoning_summary
-            .or_else(|| state.selected_reasoning.summary.clone()),
-        reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-        provider_context: state.selected_provider_context.clone(),
-    };
-    let origin = if runtime_selection
+    // A non-explicit persisted model is a stale resolved default. Keep it only while runtime work
+    // is in flight; otherwise discard it so current configuration is re-resolved below.
+    let honor_persisted_model = runtime_selection.model_selection_source.is_sticky()
+        || state.session_has_active_turn(session_id).await;
+    let persisted_provider = runtime_selection
+        .provider_plugin_id
+        .as_deref()
+        .and_then(provider_to_selection)
+        .filter(|_| honor_persisted_model);
+    let persisted_model = runtime_selection
         .model_id
         .as_deref()
         .and_then(model_to_selection)
-        .is_some()
-        || runtime_selection
-            .provider_plugin_id
-            .as_deref()
-            .and_then(provider_to_selection)
-            .is_some()
-    {
-        SessionModelSelectionOrigin::User
-    } else {
-        SessionModelSelectionOrigin::Default
+        .filter(|_| honor_persisted_model);
+    let model_id = persisted_model
+        .clone()
+        .or_else(|| state.selected_model_id.clone());
+    let provider_plugin_id = persisted_provider
+        .clone()
+        .or_else(|| state.selected_provider_plugin_id.clone());
+    // Reasoning effort follows the model that is actually being used. Prefer the effort remembered
+    // for this exact provider/model pair, then the session's live value when the persisted model is
+    // still in effect, and finally the configured default for the resolved model.
+    let remembered = match provider_plugin_id.as_deref().zip(model_id.as_deref()) {
+        Some((provider, model)) => state
+            .sessions
+            .remembered_reasoning_for_model(
+                session_id,
+                bcode_session_models::ModelScopeKey::new(provider, model),
+            )
+            .await
+            .ok()
+            .flatten(),
+        None => None,
     };
+    let (reasoning_effort, reasoning_summary) = match remembered {
+        Some(remembered) => (remembered.effort, remembered.summary),
+        None if honor_persisted_model => (
+            runtime_selection
+                .reasoning_effort
+                .or_else(|| state.selected_reasoning.effort.clone()),
+            runtime_selection
+                .reasoning_summary
+                .or_else(|| state.selected_reasoning.summary.clone()),
+        ),
+        None => (
+            state.selected_reasoning.effort.clone(),
+            state.selected_reasoning.summary.clone(),
+        ),
+    };
+    let selection = SessionModelSelection {
+        provider_plugin_id,
+        requested_model_id: persisted_model.clone(),
+        model_id,
+        thinking_level: None,
+        reasoning_effort,
+        reasoning_summary,
+        reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
+        provider_context: state.selected_provider_context.clone(),
+    };
+    let origin = origin_for_selection_source(runtime_selection.model_selection_source);
     state
         .session_model_selections
         .lock()
@@ -22702,6 +22751,46 @@ async fn session_model_selection(
         .entry(session_id)
         .or_insert(origin);
     selection
+}
+
+/// Map a server selection origin back onto persisted provenance.
+const fn selection_source_for_origin(
+    origin: &SessionModelSelectionOrigin,
+) -> bcode_session_models::ModelSelectionSource {
+    match origin {
+        SessionModelSelectionOrigin::User => {
+            bcode_session_models::ModelSelectionSource::UserExplicit
+        }
+        SessionModelSelectionOrigin::Default => {
+            bcode_session_models::ModelSelectionSource::ConfigDefault
+        }
+        SessionModelSelectionOrigin::SkillRequired(_) => {
+            bcode_session_models::ModelSelectionSource::SkillRequired
+        }
+        SessionModelSelectionOrigin::SkillPreferred(_) => {
+            bcode_session_models::ModelSelectionSource::SkillPreferred
+        }
+    }
+}
+
+/// Map persisted model-selection provenance onto the server's selection-origin model.
+///
+/// Skill-scoped origins are not reconstructed from history because skill activation is process
+/// state; a persisted skill selection resolves to a non-sticky default on resume.
+const fn origin_for_selection_source(
+    source: bcode_session_models::ModelSelectionSource,
+) -> SessionModelSelectionOrigin {
+    match source {
+        bcode_session_models::ModelSelectionSource::UserExplicit => {
+            SessionModelSelectionOrigin::User
+        }
+        bcode_session_models::ModelSelectionSource::ConfigDefault
+        | bcode_session_models::ModelSelectionSource::SkillRequired
+        | bcode_session_models::ModelSelectionSource::SkillPreferred
+        | bcode_session_models::ModelSelectionSource::AgentProfile => {
+            SessionModelSelectionOrigin::Default
+        }
+    }
 }
 
 fn provider_to_selection(provider: &str) -> Option<String> {
@@ -22720,27 +22809,27 @@ fn model_to_selection(model: &str) -> Option<String> {
     }
 }
 
+/// Build the runtime-selection payload sent to clients on attach and refresh.
+///
+/// This reports the resolved selection rather than raw persisted state so a client never displays a
+/// stale default model that would not actually be used for the next turn.
 async fn session_runtime_selection_payload(
     state: &ServerState,
     session_id: SessionId,
 ) -> bcode_ipc::SessionRuntimeSelection {
-    state
-        .sessions
-        .current_runtime_selection(session_id)
-        .await
-        .map(|selection| bcode_ipc::SessionRuntimeSelection {
-            agent_id: selection.agent_id,
-            provider_plugin_id: selection
-                .provider_plugin_id
-                .as_deref()
-                .and_then(provider_to_selection),
-            requested_model_id: selection.model_id.as_deref().and_then(model_to_selection),
-            effective_model_id: selection.model_id.as_deref().and_then(model_to_selection),
-            model_id: selection.model_id.as_deref().and_then(model_to_selection),
-            reasoning_effort: selection.reasoning_effort,
-            reasoning_summary: selection.reasoning_summary,
-        })
-        .unwrap_or_default()
+    let Ok(runtime_selection) = state.sessions.current_runtime_selection(session_id).await else {
+        return bcode_ipc::SessionRuntimeSelection::default();
+    };
+    let resolved = session_model_selection(state, session_id).await;
+    bcode_ipc::SessionRuntimeSelection {
+        agent_id: runtime_selection.agent_id,
+        provider_plugin_id: resolved.provider_plugin_id,
+        requested_model_id: resolved.requested_model_id,
+        effective_model_id: resolved.model_id.clone(),
+        model_id: resolved.model_id,
+        reasoning_effort: resolved.reasoning_effort,
+        reasoning_summary: resolved.reasoning_summary,
+    }
 }
 
 fn model_provider_interface_for_plugin(
@@ -34343,7 +34432,7 @@ mod tests {
         assert_eq!(second_facts, first_facts);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canonical_writes_complete_when_provider_backfill_fails_unavailable() {
         let _guard = session_search::tests::lock_search_tests().await;
         let state = Arc::new(session_search::tests::state_with_providers(&[(
@@ -34398,6 +34487,7 @@ mod tests {
             if matches!(
                 status.state,
                 bcode_session_search::SessionSearchBackfillOperationState::Completed
+                    | bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention
                     | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
                     | bcode_session_search::SessionSearchBackfillOperationState::Failed
             ) {
@@ -34406,7 +34496,7 @@ mod tests {
         };
         assert_eq!(
             terminal.state,
-            bcode_session_search::SessionSearchBackfillOperationState::Failed
+            bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention
         );
         let page = state
             .sessions
@@ -34427,7 +34517,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn complete_backfill_operation_is_failed_when_one_provider_is_unavailable() {
         let _guard = session_search::tests::lock_search_tests().await;
         let state = Arc::new(session_search::tests::state_with_providers(&[
@@ -34476,6 +34566,7 @@ mod tests {
             if matches!(
                 status.state,
                 bcode_session_search::SessionSearchBackfillOperationState::Completed
+                    | bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention
                     | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
                     | bcode_session_search::SessionSearchBackfillOperationState::Failed
             ) {
@@ -34485,7 +34576,7 @@ mod tests {
 
         assert_eq!(
             terminal.state,
-            bcode_session_search::SessionSearchBackfillOperationState::Failed
+            bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention
         );
         let response = terminal
             .complete_response
@@ -34502,7 +34593,7 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canonical_writes_complete_while_slow_complete_backfill_is_blocked() {
         let _guard = session_search::tests::lock_search_tests().await;
         let state = Arc::new(session_search::tests::state_with_providers(&[(
@@ -34648,7 +34739,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[cfg(unix)]
     async fn assert_cancelled_backfill_status_is_stable(
         client: &bcode_client::BcodeClient,
         operation_id: &str,
@@ -34668,7 +34758,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_ipc_backfill_operation_lifecycle_and_restart_loss_are_explicit() {
         let _guard = session_search::tests::lock_search_tests().await;
         let state = Arc::new(session_search::tests::state_with_providers(&[(
@@ -43046,6 +43136,7 @@ library = "test"
                 session_id,
                 "bcode.fake-provider".to_string(),
                 "fake-echo".to_string(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
             )
             .await
             .expect("select fake provider");
@@ -59874,6 +59965,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 session_id,
                 "bcode.fake-provider".to_string(),
                 "fake-echo".to_string(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
             )
             .await
             .expect("select fake provider");
@@ -59989,6 +60081,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 session_id,
                 "bcode.fake-provider".to_string(),
                 "fake-echo".to_string(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
             )
             .await
             .expect("select fake provider");
@@ -60131,6 +60224,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 session_id,
                 "bcode.fake-provider".to_owned(),
                 "fake-echo".to_owned(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
             )
             .await
             .expect("select fake provider");
@@ -60232,6 +60326,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 session_id,
                 "bcode.fake-provider".to_string(),
                 "fake-echo".to_string(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
             )
             .await
             .expect("select fake provider");
@@ -60424,6 +60519,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 session_id,
                 "bcode.fake-provider".to_string(),
                 "fake-echo".to_string(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
             )
             .await
             .expect("select fake provider");

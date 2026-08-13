@@ -75,6 +75,7 @@ pub use manifest::{
     CURRENT_SESSION_FORMAT_EPOCH, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
 };
 use manifest::{SessionFormatMarker, SessionManifest};
+pub use state::RememberedReasoning;
 use state::{SessionLiveEventBroker, SessionLoadStatusKind, SessionState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
@@ -262,6 +263,12 @@ pub struct SessionRuntimeSelection {
     pub provider_plugin_id: Option<String>,
     /// Session-specific model id, when explicitly selected.
     pub model_id: Option<String>,
+    /// Why the current model became active.
+    ///
+    /// Consumers must treat any source other than
+    /// [`bcode_session_models::ModelSelectionSource::UserExplicit`] as a resolved default that
+    /// should be re-resolved rather than pinned when the session is resumed.
+    pub model_selection_source: bcode_session_models::ModelSelectionSource,
     /// Session-specific reasoning effort, when explicitly selected.
     pub reasoning_effort: Option<String>,
     /// Session-specific reasoning summary, when explicitly selected.
@@ -1363,8 +1370,11 @@ impl SessionManager {
             has_user_message: false,
             current_provider: None,
             current_model: None,
+            model_selection_source: bcode_session_models::ModelSelectionSource::default(),
             reasoning_effort: None,
             reasoning_summary: None,
+            reasoning_by_model: BTreeMap::new(),
+            reasoning_by_model_order: Vec::new(),
             current_agent: None,
             latest_compaction_sequence: None,
             context_epoch: 0,
@@ -2386,6 +2396,20 @@ impl SessionManager {
         handle.current_reasoning_selection().await
     }
 
+    /// Return the reasoning selection remembered for one provider/model pair, when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn remembered_reasoning_for_model(
+        &self,
+        session_id: SessionId,
+        scope: bcode_session_models::ModelScopeKey,
+    ) -> Result<Option<RememberedReasoning>, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.remembered_reasoning_for_model(scope).await
+    }
+
     /// Return the latest session-specific agent selection if one has been set.
     ///
     /// # Errors
@@ -2720,6 +2744,200 @@ mod tests {
         assert_eq!(drafts[0].text, "newer");
         assert_eq!(drafts[0].updated_at_ms, 20);
         catalog.close().await.expect("catalog closes");
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn model_selection_source_persists_across_manager_restart() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("provenance".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        manager
+            .append_model_changed(
+                session.id,
+                "provider-a".to_owned(),
+                "model-a".to_owned(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+            )
+            .await
+            .expect("explicit selection appends");
+        manager.shutdown_catalog_updates().await;
+        drop(manager);
+
+        let restored = SessionManager::persistent(&root).expect("manager restores");
+        let selection = restored
+            .current_runtime_selection(session.id)
+            .await
+            .expect("runtime selection reads");
+        assert_eq!(
+            selection.model_selection_source,
+            bcode_session_models::ModelSelectionSource::UserExplicit
+        );
+        assert!(selection.model_selection_source.is_sticky());
+        restored.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn config_default_model_selection_is_not_sticky() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("default".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        manager
+            .append_model_changed(
+                session.id,
+                "provider-a".to_owned(),
+                "model-a".to_owned(),
+                bcode_session_models::ModelSelectionSource::ConfigDefault,
+            )
+            .await
+            .expect("default selection appends");
+        let selection = manager
+            .current_runtime_selection(session.id)
+            .await
+            .expect("runtime selection reads");
+        assert!(!selection.model_selection_source.is_sticky());
+        manager.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_is_remembered_per_model_and_restored_on_return() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("reasoning".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let scope_a = bcode_session_models::ModelScopeKey::new("provider-a", "model-a");
+        let scope_b = bcode_session_models::ModelScopeKey::new("provider-b", "model-b");
+
+        manager
+            .append_model_changed(
+                session.id,
+                scope_a.provider.clone(),
+                scope_a.model.clone(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+            )
+            .await
+            .expect("select model a");
+        manager
+            .append_reasoning_changed(
+                session.id,
+                Some("high".to_owned()),
+                None,
+                Some(scope_a.clone()),
+            )
+            .await
+            .expect("set effort for model a");
+
+        // Switching to a model with no remembered effort must not inherit the previous effort.
+        manager
+            .append_model_changed(
+                session.id,
+                scope_b.provider.clone(),
+                scope_b.model.clone(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+            )
+            .await
+            .expect("select model b");
+        assert_eq!(
+            manager
+                .current_reasoning_selection(session.id)
+                .await
+                .expect("reasoning reads"),
+            (None, None)
+        );
+
+        manager
+            .append_reasoning_changed(
+                session.id,
+                Some("low".to_owned()),
+                None,
+                Some(scope_b.clone()),
+            )
+            .await
+            .expect("set effort for model b");
+
+        // Returning to model a restores the effort previously set for model a.
+        manager
+            .append_model_changed(
+                session.id,
+                scope_a.provider.clone(),
+                scope_a.model.clone(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+            )
+            .await
+            .expect("return to model a");
+        assert_eq!(
+            manager
+                .current_reasoning_selection(session.id)
+                .await
+                .expect("reasoning reads"),
+            (Some("high".to_owned()), None)
+        );
+        assert_eq!(
+            manager
+                .remembered_reasoning_for_model(session.id, scope_b)
+                .await
+                .expect("remembered reads")
+                .expect("model b remembered")
+                .effort,
+            Some("low".to_owned())
+        );
+        manager.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn per_model_reasoning_memory_stays_bounded() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("bounded".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let overflow = crate::state::REASONING_MEMORY_CAPACITY + 4;
+        for index in 0..overflow {
+            let scope =
+                bcode_session_models::ModelScopeKey::new("provider", format!("model-{index}"));
+            manager
+                .append_reasoning_changed(
+                    session.id,
+                    Some(format!("effort-{index}")),
+                    None,
+                    Some(scope),
+                )
+                .await
+                .expect("set effort");
+        }
+        // The oldest entries are evicted while the newest remain resolvable.
+        let evicted = bcode_session_models::ModelScopeKey::new("provider", "model-0");
+        assert!(
+            manager
+                .remembered_reasoning_for_model(session.id, evicted)
+                .await
+                .expect("remembered reads")
+                .is_none()
+        );
+        let retained =
+            bcode_session_models::ModelScopeKey::new("provider", format!("model-{}", overflow - 1));
+        assert_eq!(
+            manager
+                .remembered_reasoning_for_model(session.id, retained)
+                .await
+                .expect("remembered reads")
+                .expect("newest remembered")
+                .effort,
+            Some(format!("effort-{}", overflow - 1))
+        );
+        manager.shutdown_catalog_updates().await;
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
@@ -5156,7 +5374,12 @@ mod tests {
             .await
             .expect("tool result should append");
         manager
-            .append_model_changed(session.id, "provider".to_string(), "model".to_string())
+            .append_model_changed(
+                session.id,
+                "provider".to_string(),
+                "model".to_string(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+            )
             .await
             .expect("model change should append");
         manager
@@ -5234,7 +5457,7 @@ mod tests {
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,
-            SessionEventKind::ModelChanged { provider, model }
+            SessionEventKind::ModelChanged { provider, model, .. }
                 if provider == "provider" && model == "model"
         )));
         assert!(history.iter().any(|event| matches!(
@@ -5715,7 +5938,12 @@ mod tests {
             .await
             .expect("session should be created");
         manager
-            .append_model_changed(session.id, "provider".to_string(), "model".to_string())
+            .append_model_changed(
+                session.id,
+                "provider".to_string(),
+                "model".to_string(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+            )
             .await
             .expect("model should append");
         manager
@@ -5765,7 +5993,7 @@ mod tests {
             .expect("fork history should load");
         assert!(fork_history.iter().any(|event| matches!(
             &event.kind,
-            SessionEventKind::ModelChanged { provider, model }
+            SessionEventKind::ModelChanged { provider, model, .. }
                 if provider == "provider" && model == "model"
         )));
         assert!(fork_history.iter().any(|event| matches!(
@@ -7195,8 +7423,12 @@ mod tests {
                 include_str!("../fixtures/migrations/current-schema-v42.json"),
             ),
             (
-                "future-schema-v43.json",
-                include_str!("../fixtures/migrations/future-schema-v43.json"),
+                "current-schema-v43.json",
+                include_str!("../fixtures/migrations/current-schema-v43.json"),
+            ),
+            (
+                "future-schema-v44.json",
+                include_str!("../fixtures/migrations/future-schema-v44.json"),
             ),
             (
                 "malformed-json-v39.json",
@@ -8696,6 +8928,7 @@ mod tests {
                 SessionEventKind::ModelChanged {
                     provider: "provider".to_string(),
                     model: "model".to_string(),
+                    selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                 },
             ),
             (
@@ -8947,6 +9180,7 @@ mod tests {
                 SessionEventKind::ReasoningChanged {
                     effort: Some("medium".to_string()),
                     summary: Some("auto".to_string()),
+                    model_scope: None,
                 },
             ),
             (

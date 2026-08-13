@@ -61,6 +61,18 @@ fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
         "CREATE TABLE IF NOT EXISTS session_migration_receipts (\n    operation_id TEXT PRIMARY KEY NOT NULL,\n    session_id TEXT NOT NULL,\n    source_writer_epoch INTEGER NOT NULL,\n    target_writer_epoch INTEGER NOT NULL,\n    receipt TEXT NOT NULL,\n    completed_at_ms INTEGER NOT NULL\n)",
         "DROP TABLE IF EXISTS session_migration_receipts",
     );
+    add_sql_migration(
+        source,
+        "034_session_state_model_selection_source_column",
+        "ALTER TABLE session_state ADD COLUMN model_selection_source TEXT",
+        "ALTER TABLE session_state DROP COLUMN model_selection_source",
+    );
+    add_sql_migration(
+        source,
+        "035_session_state_reasoning_by_model_column",
+        "ALTER TABLE session_state ADD COLUMN reasoning_by_model TEXT",
+        "ALTER TABLE session_state DROP COLUMN reasoning_by_model",
+    );
 }
 
 fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {

@@ -3339,7 +3339,9 @@ impl BmuxApp {
                 }
                 self.set_permission_status(permission_id);
             }
-            SessionEventKind::ModelChanged { provider, model } => {
+            SessionEventKind::ModelChanged {
+                provider, model, ..
+            } => {
                 self.apply_shared_model_changed(provider, model);
             }
             SessionEventKind::ReasoningChanged { effort, .. } => {
@@ -6287,6 +6289,7 @@ mod tests {
             kind: bcode_session_models::SessionEventKind::ReasoningChanged {
                 effort: Some("high".to_owned()),
                 summary: Some("detailed".to_owned()),
+                model_scope: None,
             },
         }];
 
@@ -6315,6 +6318,7 @@ mod tests {
             bcode_session_models::SessionEventKind::ReasoningChanged {
                 effort: Some("high".to_owned()),
                 summary: Some("detailed".to_owned()),
+                model_scope: None,
             },
         ));
         app.absorb_session_event(&event(
@@ -6485,6 +6489,7 @@ mod tests {
             bcode_session_models::SessionEventKind::ModelChanged {
                 provider: "<auto>".to_owned(),
                 model: "<default>".to_owned(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
             },
         ));
         assert_eq!(app.selected_provider_plugin_id(), None);
@@ -6506,6 +6511,7 @@ mod tests {
             bcode_session_models::SessionEventKind::ReasoningChanged {
                 effort: Some("high".to_owned()),
                 summary: Some("detailed".to_owned()),
+                model_scope: None,
             },
         ));
         assert_eq!(app.reasoning_effort(), Some("high"));
@@ -6683,6 +6689,7 @@ mod tests {
             SessionEventKind::ReasoningChanged {
                 effort: Some("high".to_owned()),
                 summary: None,
+                model_scope: None,
             },
         ));
 

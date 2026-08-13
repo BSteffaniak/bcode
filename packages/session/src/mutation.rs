@@ -295,6 +295,10 @@ impl SessionManager {
 
     /// Append a model-changed event to a session.
     ///
+    /// `selection_source` records why the model became active. Only
+    /// [`bcode_session_models::ModelSelectionSource::UserExplicit`] keeps the model pinned across
+    /// session resume.
+    ///
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the event cannot be persisted.
@@ -303,15 +307,23 @@ impl SessionManager {
         session_id: SessionId,
         provider: String,
         model: String,
+        selection_source: bcode_session_models::ModelSelectionSource,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
-            SessionEventKind::ModelChanged { provider, model },
+            SessionEventKind::ModelChanged {
+                provider,
+                model,
+                selection_source,
+            },
         )
         .await
     }
 
     /// Append a reasoning-changed event to a session.
+    ///
+    /// `model_scope` records the provider/model pair the selection applies to so it can be
+    /// restored when that pair becomes active again.
     ///
     /// # Errors
     ///
@@ -321,10 +333,15 @@ impl SessionManager {
         session_id: SessionId,
         effort: Option<String>,
         summary: Option<String>,
+        model_scope: Option<bcode_session_models::ModelScopeKey>,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
-            SessionEventKind::ReasoningChanged { effort, summary },
+            SessionEventKind::ReasoningChanged {
+                effort,
+                summary,
+                model_scope,
+            },
         )
         .await
     }

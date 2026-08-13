@@ -450,6 +450,16 @@ pub mod historical_event_families {
         context_mode: ExecutionSessionContextMode,
         #[serde(default)]
         parent_generation: Option<u64>,
+        /// Present from the schema where activation identity was introduced.
+        ///
+        /// Captured so converting a later historical schema cannot silently drop it.
+        #[serde(default)]
+        activation_id: Option<String>,
+        /// Present from the schema where workspace snapshots were introduced.
+        ///
+        /// Captured so converting a later historical schema cannot silently drop it.
+        #[serde(default)]
+        workspace_snapshot: Option<String>,
     }
 
     pub fn decode_execution_session_created(
@@ -473,11 +483,11 @@ pub mod historical_event_families {
                     owner: source.provenance.owner,
                     run_id: source.provenance.run_id,
                     node_id: source.provenance.node_id,
-                    activation_id: None,
+                    activation_id: source.provenance.activation_id,
                     attempt: source.provenance.attempt,
                     parent_session_id: source.provenance.parent_session_id,
                     context_mode: source.provenance.context_mode,
-                    workspace_snapshot: None,
+                    workspace_snapshot: source.provenance.workspace_snapshot,
                     parent_generation: source.provenance.parent_generation,
                 }),
                 visibility: source.visibility,

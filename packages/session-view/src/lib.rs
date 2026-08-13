@@ -1483,7 +1483,9 @@ impl SessionView {
                     },
                 );
             }
-            SessionEventKind::ModelChanged { provider, model } => {
+            SessionEventKind::ModelChanged {
+                provider, model, ..
+            } => {
                 self.set_model_selection(
                     provider_to_display_selection(provider),
                     model_to_display_selection(model),
@@ -1494,7 +1496,9 @@ impl SessionView {
                 self.snapshot.runtime.agent_id = Some(agent_id.clone());
                 self.bump_revision();
             }
-            SessionEventKind::ReasoningChanged { effort, summary } => {
+            SessionEventKind::ReasoningChanged {
+                effort, summary, ..
+            } => {
                 self.snapshot.runtime.reasoning_effort.clone_from(effort);
                 self.snapshot.runtime.reasoning_summary.clone_from(summary);
                 self.bump_revision();
@@ -8338,6 +8342,7 @@ mod tests {
             SessionEventKind::ModelChanged {
                 provider: "<auto>".to_owned(),
                 model: "<default>".to_owned(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
             },
         ));
 
@@ -8352,6 +8357,7 @@ mod tests {
             SessionEventKind::ModelChanged {
                 provider: "provider".to_owned(),
                 model: "model".to_owned(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
             },
         ));
 

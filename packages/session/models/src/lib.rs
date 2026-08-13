@@ -291,7 +291,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 42;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 43;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -2572,6 +2572,61 @@ pub enum TraceRedaction {
     ManualRequired,
 }
 
+/// Origin of a session model selection.
+///
+/// Only [`ModelSelectionSource::UserExplicit`] represents a deliberate in-session choice by the
+/// user. Every other source is a resolved default and must not pin the session model when the
+/// session is later resumed.
+///
+/// IMPORTANT: This enum is persisted. Add new variants only at the end and bump
+/// `CURRENT_SESSION_EVENT_SCHEMA_VERSION` when doing so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSelectionSource {
+    /// Resolved from declarative configuration rather than chosen in-session.
+    ///
+    /// This is the default so that events persisted before model-selection provenance existed
+    /// decode as non-sticky config defaults rather than being mistaken for explicit choices.
+    #[default]
+    ConfigDefault,
+    /// Selected directly by the user during the session, for example via the model picker.
+    UserExplicit,
+    /// Applied because an active skill declares a required model.
+    SkillRequired,
+    /// Applied because an active skill declares a preferred model.
+    SkillPreferred,
+    /// Applied from the resolved agent profile.
+    AgentProfile,
+}
+
+impl ModelSelectionSource {
+    /// Return whether this source should keep the model pinned across session resume.
+    #[must_use]
+    pub const fn is_sticky(self) -> bool {
+        matches!(self, Self::UserExplicit)
+    }
+}
+
+/// Provider and model pair that scopes a remembered reasoning selection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ModelScopeKey {
+    /// Provider plugin id the reasoning selection applies to.
+    pub provider: String,
+    /// Model id the reasoning selection applies to.
+    pub model: String,
+}
+
+impl ModelScopeKey {
+    /// Create a scope key for a provider and model pair.
+    #[must_use]
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
 /// Correlation metadata for one permission checkpoint in a simultaneous batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionBatchCorrelation {
@@ -2648,6 +2703,12 @@ pub enum SessionEventKind {
     ModelChanged {
         provider: String,
         model: String,
+        /// Why this model became active.
+        ///
+        /// Defaults to [`ModelSelectionSource::ConfigDefault`] so pre-provenance history decodes
+        /// as a non-sticky default.
+        #[serde(default)]
+        selection_source: ModelSelectionSource,
     },
     SystemMessage {
         text: String,
@@ -2825,6 +2886,12 @@ pub enum SessionEventKind {
         effort: Option<String>,
         #[serde(default)]
         summary: Option<String>,
+        /// Provider and model this reasoning selection was made for.
+        ///
+        /// `None` for history persisted before reasoning selections were model-scoped; such
+        /// entries apply to the session rather than to a specific model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_scope: Option<ModelScopeKey>,
     },
     /// Renderer-neutral exchange request emitted while an invocation remains active.
     ToolExchangeRequested {

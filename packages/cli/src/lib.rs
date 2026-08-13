@@ -12187,6 +12187,19 @@ fn provider_compaction_description(
     )
 }
 
+/// Return a stable display label for persisted model-selection provenance.
+const fn model_selection_source_label(
+    source: bcode_session_models::ModelSelectionSource,
+) -> &'static str {
+    match source {
+        bcode_session_models::ModelSelectionSource::ConfigDefault => "config default",
+        bcode_session_models::ModelSelectionSource::UserExplicit => "user",
+        bcode_session_models::ModelSelectionSource::SkillRequired => "skill required",
+        bcode_session_models::ModelSelectionSource::SkillPreferred => "skill preferred",
+        bcode_session_models::ModelSelectionSource::AgentProfile => "agent profile",
+    }
+}
+
 fn print_session_event(event: &SessionEvent) {
     match &event.kind {
         SessionEventKind::TraceEvent { trace } => print_trace_session_event(event, trace),
@@ -12393,15 +12406,31 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 event.sequence
             );
         }
-        SessionEventKind::ModelChanged { provider, model } => {
-            println!("#{} model changed: {provider}/{model}", event.sequence);
-        }
-        SessionEventKind::ReasoningChanged { effort, summary } => {
+        SessionEventKind::ModelChanged {
+            provider,
+            model,
+            selection_source,
+        } => {
             println!(
-                "#{} reasoning changed: effort={} summary={}",
+                "#{} model changed: {provider}/{model} (source={})",
+                event.sequence,
+                model_selection_source_label(*selection_source)
+            );
+        }
+        SessionEventKind::ReasoningChanged {
+            effort,
+            summary,
+            model_scope,
+        } => {
+            println!(
+                "#{} reasoning changed: effort={} summary={} scope={}",
                 event.sequence,
                 effort.as_deref().unwrap_or("provider default"),
-                summary.as_deref().unwrap_or("provider default")
+                summary.as_deref().unwrap_or("provider default"),
+                model_scope.as_ref().map_or_else(
+                    || "session".to_owned(),
+                    |scope| format!("{}/{}", scope.provider, scope.model)
+                )
             );
         }
         SessionEventKind::AgentChanged { agent_id } => {

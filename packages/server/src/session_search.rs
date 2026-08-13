@@ -29,20 +29,21 @@ const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAINTENANCE_PROVIDER_SLICES_BEFORE_YIELD: usize = 1;
 
 /// Cooperative scheduler that prevents explicit maintenance from monopolizing provider work.
+///
+/// Maintenance is serialized by `maintenance_gate` and excludes ordinary work through the
+/// write side of `work_gate`. Tokio's `RwLock` acquires fairly, so a pending writer already
+/// blocks newly arriving readers; maintenance must not additionally spin waiting for the
+/// ordinary-waiter count to reach zero. Ordinary ingestion legitimately requeues retryable
+/// work indefinitely, so such a spin can livelock and never admit maintenance.
 #[derive(Debug, Default)]
 pub(crate) struct SessionSearchWorkScheduler {
     maintenance_gate: Mutex<()>,
     work_gate: RwLock<()>,
-    ordinary_waiters: std::sync::atomic::AtomicUsize,
 }
 
 impl SessionSearchWorkScheduler {
     async fn run_ordinary<T>(&self, work: impl std::future::Future<Output = T>) -> T {
-        self.ordinary_waiters
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let guard = self.work_gate.read().await;
-        self.ordinary_waiters
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         let result = work.await;
         drop(guard);
         result
@@ -50,13 +51,6 @@ impl SessionSearchWorkScheduler {
 
     async fn run_maintenance<T>(&self, work: impl std::future::Future<Output = T>) -> T {
         let maintenance_guard = self.maintenance_gate.lock().await;
-        while self
-            .ordinary_waiters
-            .load(std::sync::atomic::Ordering::Acquire)
-            > 0
-        {
-            tokio::task::yield_now().await;
-        }
         let work_guard = self.work_gate.write().await;
         let result = work.await;
         drop(work_guard);

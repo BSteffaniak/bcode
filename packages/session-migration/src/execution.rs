@@ -328,7 +328,7 @@ fn decode_for_migration(
         });
     }
     let source_kind = envelope.source_kind_name()?;
-    if source_kind == "execution_session_created" && envelope.schema_version() <= 41 {
+    if source_kind == "execution_session_created" && envelope.schema_version() <= 42 {
         return historical_event_families::decode_execution_session_created(&envelope);
     }
     if source_kind == "tool_call_finished" && envelope.schema_version() <= 39 {
@@ -433,6 +433,7 @@ mod tests {
             kind: SessionEventKind::ModelChanged {
                 provider: "provider".to_owned(),
                 model: "next-model".to_owned(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
             },
         };
         state.ingest(&reset);
@@ -961,11 +962,11 @@ mod tests {
     #[test]
     fn historical_codec_only_applies_family_rules_to_released_schema_ranges() {
         let payload = format!(
-            r#"{{"schema_version":43,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
+            r#"{{"schema_version":44,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
         );
         assert!(matches!(
             decode_for_migration(&payload, reject_current),
-            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 43 })
+            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 44 })
         ));
 
         let payload = format!(
