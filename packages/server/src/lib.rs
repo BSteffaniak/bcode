@@ -382,7 +382,6 @@ pub struct ServerState {
     invariant_background_tasks: Mutex<BTreeMap<SessionId, JoinHandle<()>>>,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
-    skill_context_bytes: Option<usize>,
     skill_prompt_options: SkillPromptCatalogOptions,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
@@ -1398,7 +1397,6 @@ struct ServerStateInit {
     invariant_selector_model: Option<InvariantSelectorModel>,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
-    skill_context_bytes: Option<usize>,
     skill_prompt_options: SkillPromptCatalogOptions,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
@@ -1593,7 +1591,6 @@ impl ServerState {
             invariant_background_tasks: Mutex::new(BTreeMap::new()),
             system_prompt: init.system_prompt,
             skills: init.skills,
-            skill_context_bytes: init.skill_context_bytes,
             skill_prompt_options: init.skill_prompt_options,
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
@@ -3491,10 +3488,6 @@ async fn run_with_static_bundled_inner(
             invariants: config.invariants,
             invariant_selector_model,
             system_prompt: config.system_prompt,
-            skill_context_bytes: config
-                .skills
-                .max_context_bytes
-                .map(std::num::NonZeroUsize::get),
             skill_prompt_options: skill_prompt_options_from_config(&config.skills.prompt),
             skills,
             daemon_status,
@@ -12015,7 +12008,7 @@ async fn process_skill_invocation_command(
             }
         }
     } else {
-        skill_model_policy_effort(state, &skill_id)
+        skill_model_policy_effort(state, permit.session_id(), &skill_id).await
     };
 
     let mut execution = execution;
@@ -13215,7 +13208,7 @@ async fn handle_activate_skill(
     session_id: SessionId,
     skill_id: SkillId,
 ) -> Result<(), ServerError> {
-    let Some(registry) = &state.skills else {
+    let Some(registry) = state.session_skills(session_id).await else {
         return send_response(
             writer,
             request_id,
@@ -13321,7 +13314,7 @@ async fn apply_skill_model_policy(
     session_id: SessionId,
     skill_id: &SkillId,
 ) -> Result<Option<bcode_skill_models::SkillThinkingEffort>, ErrorResponse> {
-    let Some(registry) = &state.skills else {
+    let Some(registry) = state.session_skills(session_id).await else {
         return Ok(None);
     };
     let manifest = registry.describe(skill_id).map_err(|error| {
@@ -13401,11 +13394,17 @@ async fn ensure_skill_turn_respects_active_selection(
     Ok(())
 }
 
-fn skill_model_policy_effort(
+async fn skill_model_policy_effort(
     state: &ServerState,
+    session_id: SessionId,
     skill_id: &SkillId,
 ) -> Option<bcode_skill_models::SkillThinkingEffort> {
-    let policy = state.skills.as_ref()?.describe(skill_id).ok()?.model_policy;
+    let policy = state
+        .session_skills(session_id)
+        .await?
+        .describe(skill_id)
+        .ok()?
+        .model_policy;
     policy
         .required
         .as_ref()
@@ -23187,8 +23186,9 @@ async fn prepare_static_model_turn_context(
         .unwrap_or(session_agent_selection(state, session_id).await);
     let agent_context = agent_context(state, session_id, &agent_id).await;
     let working_directory = state.sessions.session_working_directory(session_id).await?;
+    let skills = state.session_skills(session_id).await;
     let skill_catalog = if config.system_prompt.sections.skill_catalog {
-        state.skills.as_ref().map_or_else(String::new, |registry| {
+        skills.as_ref().map_or_else(String::new, |registry| {
             format_skill_catalog_for_prompt(
                 &registry.list(),
                 &skill_prompt_options_from_config(&config.skills.prompt),
@@ -33824,7 +33824,7 @@ async fn turn_skill_contexts(
     session_id: SessionId,
     trigger_sequence: u64,
 ) -> Vec<SkillContextResponse> {
-    let Some(registry) = &state.skills else {
+    let Some(registry) = state.session_skills(session_id).await else {
         return Vec::new();
     };
     let Some(invocation) = state
@@ -33839,7 +33839,13 @@ async fn turn_skill_contexts(
     let Some(summary) = registry.summary(&skill_id) else {
         return Vec::new();
     };
-    let context = match registry.context(&skill_id, state.skill_context_bytes) {
+    let context_budget = state
+        .session_config(session_id)
+        .await
+        .skills
+        .max_context_bytes
+        .map(std::num::NonZeroUsize::get);
+    let context = match registry.context(&skill_id, context_budget) {
         Ok(context) => context,
         Err(error) => {
             let _ = state
@@ -33864,9 +33870,7 @@ async fn turn_skill_contexts(
     };
     write!(context, "\n\nSkill invocation arguments:\n{arguments}").expect("write to string");
     let bytes_loaded = context.len();
-    let truncated = state
-        .skill_context_bytes
-        .is_some_and(|budget| bytes_loaded >= budget);
+    let truncated = context_budget.is_some_and(|budget| bytes_loaded >= budget);
     let model_policy = registry
         .describe(&skill_id)
         .ok()
@@ -33885,7 +33889,7 @@ async fn active_skill_contexts(
     state: &ServerState,
     session_id: SessionId,
 ) -> Vec<SkillContextResponse> {
-    let Some(registry) = &state.skills else {
+    let Some(registry) = state.session_skills(session_id).await else {
         return Vec::new();
     };
     let skill_ids = state
@@ -33896,7 +33900,11 @@ async fn active_skill_contexts(
         .cloned()
         .unwrap_or_default();
     let per_skill_budget = state
-        .skill_context_bytes
+        .session_config(session_id)
+        .await
+        .skills
+        .max_context_bytes
+        .map(std::num::NonZeroUsize::get)
         .and_then(|budget| budget.checked_div(skill_ids.len().max(1)));
     let mut contexts = Vec::new();
     for skill_id in skill_ids {
@@ -53147,7 +53155,6 @@ library = "test"
                 invariants: bcode_config::InvariantsConfig::default(),
                 invariant_selector_model: None,
                 skills: None,
-                skill_context_bytes: Some(0),
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus {
@@ -62912,7 +62919,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 invariants: bcode_config::InvariantsConfig::default(),
                 invariant_selector_model: None,
                 skills: None,
-                skill_context_bytes: Some(0),
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
@@ -63746,7 +63752,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 invariants: bcode_config::InvariantsConfig::default(),
                 invariant_selector_model: None,
                 skills: None,
-                skill_context_bytes: Some(0),
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
