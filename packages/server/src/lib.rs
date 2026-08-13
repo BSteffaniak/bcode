@@ -4145,7 +4145,7 @@ async fn dispatch_routed_request(
         }
         RoutedRequest::AgentSkillPlugin(request) => {
             Box::pin(handle_agent_permission_plugin_request(
-                request, request_id, state, writer,
+                request, request_id, client_id, state, writer,
             ))
             .await
         }
@@ -5534,11 +5534,14 @@ async fn handle_workflow_run_request(
 async fn handle_agent_permission_plugin_request(
     request: AgentSkillPluginRequest,
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
-        AgentSkillPluginRequest::ListAgents => handle_list_agents(request_id, state, writer).await,
+        AgentSkillPluginRequest::ListAgents => {
+            handle_list_agents(request_id, client_id, state, writer).await
+        }
         AgentSkillPluginRequest::ListSkills => handle_list_skills(request_id, state, writer).await,
         AgentSkillPluginRequest::DescribeSkill { skill_id } => {
             handle_describe_skill(request_id, state, writer, &skill_id).await
@@ -13101,10 +13104,16 @@ fn select_model_info(
 
 async fn handle_list_agents(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let agents = list_profiles(state, None).await;
+    let config = state
+        .client_runtime_context(client_id)
+        .await
+        .and_then(|context| context.effective_config_toml)
+        .and_then(|contents| bcode_config::decode_effective_config(&contents).ok());
+    let agents = list_profiles(state, config.as_ref()).await;
     send_response(
         writer,
         request_id,

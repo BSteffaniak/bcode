@@ -124,11 +124,12 @@ fn policy_and_tools_from_effective_toml(
 }
 
 fn agent_list_with_config(effective_config_toml: Option<&str>) -> AgentList {
-    let config = config_from_effective_toml(effective_config_toml)
-        .map(|config| AgentPermissionConfig {
+    let config = config_from_effective_toml(effective_config_toml).map_or_else(
+        || load_config().0,
+        |config| AgentPermissionConfig {
             agent: config.agent,
-        })
-        .map_or_else(|| load_config().0, |config| config);
+        },
+    );
     let plan = agent_config(&config, PLAN_AGENT);
     let build = agent_config(&config, BUILD_AGENT);
     AgentList {
@@ -274,7 +275,10 @@ fn evaluate_tool_request(
     let mut agent = agent_config(&config, &request.agent_id);
     apply_tool_selection_for_evaluation(&mut agent, &tools_config, &request.tool_name);
     if let Some(pinned) = &request.policy_profile {
-        let current = policy_profile_identity(&request.agent_id)?;
+        let current = policy_profile_identity(
+            &request.agent_id,
+            request.effective_config_toml.as_deref().map(String::as_str),
+        )?;
         if current != *pinned {
             return Ok(EvaluateToolCallResponse {
                 decision: AgentDecision::Deny,
@@ -306,10 +310,11 @@ fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {
 
 fn policy_profile_identity(
     profile_id: &str,
+    effective_config_toml: Option<&str>,
 ) -> Result<bcode_agent_profile::AgentPolicyProfileIdentity, String> {
-    let (config, _) = load_config();
+    let (config, tools_config) = policy_and_tools_from_effective_toml(effective_config_toml)
+        .unwrap_or_else(|| (load_config().0, load_tools_config()));
     let mut profile = agent_config(&config, profile_id);
-    let tools_config = load_tools_config();
     apply_tool_selection(&mut profile, &tools_config, &[]);
     let encoded = serde_json::to_vec(&profile).map_err(|error| error.to_string())?;
     let digest = Sha256::digest(encoded);
@@ -331,7 +336,10 @@ fn resolve_policy_profile_identity(request: &ServiceRequest) -> ServiceResponse 
             return ServiceResponse::error("invalid_request", error.to_string());
         }
     };
-    match policy_profile_identity(&request.profile_id) {
+    match policy_profile_identity(
+        &request.profile_id,
+        request.effective_config_toml.as_deref().map(String::as_str),
+    ) {
         Ok(identity) => json_response(&identity),
         Err(error) => ServiceResponse::error("encode_failed", error),
     }
@@ -524,7 +532,7 @@ mod tests {
             "[agent.build.permission]\ncommand = { \"*\" = \"allow\" }\n",
         )
         .expect("config");
-        let pinned = policy_profile_identity("build").expect("pinned identity");
+        let pinned = policy_profile_identity("build", None).expect("pinned identity");
         std::fs::write(
             &config_path,
             "[agent.build.permission]\ncommand = { \"*\" = \"deny\" }\n",
@@ -543,6 +551,7 @@ mod tests {
             requires_permission: true,
             policy_profile: Some(pinned),
             cwd: Some(root.to_string_lossy().into_owned()),
+            effective_config_toml: None,
         })
         .expect("evaluation");
         assert_eq!(evaluation.decision, AgentDecision::Deny);
@@ -567,15 +576,15 @@ mod tests {
             "[agent.build.permission]\ncommand = { \"*\" = \"ask\" }\n",
         )
         .expect("config");
-        let first = policy_profile_identity("build").expect("first identity");
-        let repeated = policy_profile_identity("build").expect("repeat identity");
+        let first = policy_profile_identity("build", None).expect("first identity");
+        let repeated = policy_profile_identity("build", None).expect("repeat identity");
         assert_eq!(first, repeated);
         std::fs::write(
             &config_path,
             "[agent.build.permission]\ncommand = { \"*\" = \"deny\" }\n",
         )
         .expect("updated config");
-        let changed = policy_profile_identity("build").expect("changed identity");
+        let changed = policy_profile_identity("build", None).expect("changed identity");
         assert_ne!(first.policy_digest_sha256, changed.policy_digest_sha256);
         match previous_config {
             Some(value) => unsafe { std::env::set_var("BCODE_CONFIG", value) },
@@ -586,7 +595,7 @@ mod tests {
 
     #[test]
     fn list_agents_contains_plan_and_build() {
-        let agents = agent_list().agents;
+        let agents = agent_list_with_config(None).agents;
 
         assert!(agents.iter().any(|agent| agent.id == PLAN_AGENT));
         assert!(agents.iter().any(|agent| agent.id == BUILD_AGENT));
@@ -622,6 +631,7 @@ mod tests {
             requires_permission: true,
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         };
 
         let result = evaluate_profile_tool_call(&agent, &request, Path::new("/tmp/project"));
