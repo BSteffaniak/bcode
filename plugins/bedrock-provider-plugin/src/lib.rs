@@ -49,6 +49,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROVIDER_ID: &str = "bcode.bedrock";
+/// Catalog provider id for Bedrock models, as used in `catalog/models/providers/bedrock.toml`.
+///
+/// This differs from [`PROVIDER_ID`], which identifies the plugin rather than the catalog provider.
+const CATALOG_PROVIDER_ID: &str = "bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_MANTLE_BASE_URL_PREFIX: &str = "https://bedrock-mantle.";
 const MODEL_DISCOVERY_TTL: Duration = Duration::from_mins(10);
@@ -567,6 +571,19 @@ async fn stream_mantle_anthropic_turn(
             "no usable Bedrock Mantle Anthropic model was available for the turn",
         )
     }))
+}
+
+/// Support target describing the Bedrock Mantle `OpenAI` Responses deployment.
+///
+/// Catalog entries declare this in `supported_by`, which lets the host expand picker membership from
+/// the catalog for a surface that has no control-plane listing.
+fn mantle_openai_support_hint() -> bcode_model::ModelCatalogSupportHint {
+    bcode_model::ModelCatalogSupportHint {
+        provider: CATALOG_PROVIDER_ID.to_string(),
+        auth_mode: "bearer_token".to_string(),
+        api_surface: "responses".to_string(),
+        integration: Some("bcode".to_string()),
+    }
 }
 
 /// Build the Mantle `OpenAI` Responses request body for one model.
@@ -3309,8 +3326,8 @@ fn capabilities() -> ProviderCapabilities {
 impl BedrockProviderPlugin {
     fn models(&self, request: &ModelListRequest) -> ModelList {
         let settings = Settings::resolve_from_context(&request.provider_context);
-        // Mantle has no Bedrock control-plane discovery API. Its configured model membership is
-        // authoritative and the central catalog enriches those IDs with capabilities and limits.
+        // Mantle has no Bedrock control-plane discovery API, so the catalog is authoritative for
+        // membership rather than `ListFoundationModels`.
         if settings
             .transport
             .as_ref()
@@ -3321,15 +3338,31 @@ impl BedrockProviderPlugin {
             } else {
                 settings.model_ids.clone()
             };
+            let models = model_infos_from_ids(&model_ids, settings.default_model.as_deref());
+            // The OpenAI Responses surface exists only on Mantle: those models are absent from
+            // `ListFoundationModels`, so without catalog expansion the picker would show only the
+            // single configured model. Ask the host to expand membership from catalog entries
+            // declaring support for this surface.
+            let policy = if settings
+                .transport
+                .as_ref()
+                .is_ok_and(|transport| *transport == BedrockTransport::MantleOpenAi)
+            {
+                bcode_model::ModelCatalogPolicy::ExpandSupported {
+                    provider_id: CATALOG_PROVIDER_ID.to_string(),
+                    target: mantle_openai_support_hint(),
+                    authority: bcode_model::ModelListAuthority::Authoritative,
+                }
+            } else {
+                bcode_model::ModelCatalogPolicy::EnrichOnly {
+                    provider_id: CATALOG_PROVIDER_ID.to_string(),
+                    target: None,
+                    authority: bcode_model::ModelListAuthority::Explicit,
+                }
+            };
             return ModelList {
-                models: model_infos_from_ids(&model_ids, settings.default_model.as_deref()),
-                catalog: ModelCatalogHints {
-                    policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
-                        provider_id: "bedrock".to_string(),
-                        target: None,
-                        authority: bcode_model::ModelListAuthority::Explicit,
-                    },
-                },
+                models,
+                catalog: ModelCatalogHints { policy },
             };
         }
         if settings.model_ids_are_explicit {
@@ -7181,6 +7214,58 @@ mod tests {
                 .contains("model")
         );
         assert!(compatibility.unsupported_streaming_for(&key).is_empty());
+    }
+
+    #[test]
+    fn mantle_openai_transport_requests_catalog_expansion_for_the_picker() {
+        // The OpenAI Responses models are absent from `ListFoundationModels`, so the plugin must
+        // ask the host to expand membership from catalog entries rather than reporting only the
+        // configured id. Anthropic Mantle keeps enrich-only semantics because its model ids are
+        // configured explicitly.
+        let hint = mantle_openai_support_hint();
+        assert_eq!(hint.provider, "bedrock");
+        assert_eq!(hint.auth_mode, "bearer_token");
+        assert_eq!(hint.api_surface, "responses");
+        assert_eq!(hint.integration.as_deref(), Some("bcode"));
+
+        let plugin = BedrockProviderPlugin::default();
+        let context = |transport: &str, model: &str| ProviderRequestContext {
+            settings: BTreeMap::from([
+                ("transport".to_string(), transport.to_string()),
+                ("model".to_string(), model.to_string()),
+            ]),
+            ..ProviderRequestContext::default()
+        };
+
+        let list = plugin.models(&ModelListRequest {
+            provider_context: context("mantle_openai", "openai.test-model"),
+            selected_model_id: None,
+        });
+        match &list.catalog.policy {
+            bcode_model::ModelCatalogPolicy::ExpandSupported {
+                provider_id,
+                target,
+                authority,
+            } => {
+                assert_eq!(provider_id, "bedrock");
+                assert_eq!(target, &hint);
+                assert_eq!(authority, &bcode_model::ModelListAuthority::Authoritative);
+            }
+            other => panic!("mantle_openai must expand from the catalog, got {other:?}"),
+        }
+
+        let anthropic = plugin.models(&ModelListRequest {
+            provider_context: context("mantle_anthropic", "anthropic.claude-opus-5"),
+            selected_model_id: None,
+        });
+        assert!(
+            matches!(
+                anthropic.catalog.policy,
+                bcode_model::ModelCatalogPolicy::EnrichOnly { .. }
+            ),
+            "mantle_anthropic keeps enrich-only membership, got {:?}",
+            anthropic.catalog.policy
+        );
     }
 
     #[test]

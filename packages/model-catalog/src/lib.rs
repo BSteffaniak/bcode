@@ -1741,6 +1741,145 @@ mod tests {
     }
 
     #[test]
+    fn mantle_openai_resolution_expands_the_picker_beyond_the_configured_model() {
+        // End-to-end guard for the reported bug: the plugin reports only the configured id, and the
+        // resolver must expand that into the full Responses model set for the picker.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let options = RemoteCatalogOptions {
+                disabled: true,
+                ..RemoteCatalogOptions::default()
+            };
+            let resolver = ModelCatalogResolver::new(options).expect("resolver");
+            let target = bcode_model::ModelCatalogSupportHint {
+                provider: "bedrock".to_string(),
+                auth_mode: "bearer_token".to_string(),
+                api_surface: "responses".to_string(),
+                integration: Some("bcode".to_string()),
+            };
+
+            let picker = resolver
+                .resolve_selection(
+                    bcode_model::ModelList {
+                        models: vec![ModelInfo {
+                            model_id: "openai.gpt-5.6-sol".to_string(),
+                            display_name: "openai.gpt-5.6-sol".to_string(),
+                            is_default: true,
+                            context_window: None,
+                            max_output_tokens: None,
+                            capabilities: std::collections::BTreeSet::new(),
+                            feature_support: bcode_model::ModelFeatureSupport::default(),
+                            reasoning: None,
+                            cache: ModelCacheInfo::default(),
+                            metadata_source: None,
+                            pricing: None,
+                            api_surface: None,
+                            visibility: ModelVisibility::Visible,
+                        }],
+                        catalog: bcode_model::ModelCatalogHints {
+                            policy: bcode_model::ModelCatalogPolicy::ExpandSupported {
+                                provider_id: "bedrock".to_string(),
+                                target,
+                                authority: bcode_model::ModelListAuthority::Authoritative,
+                            },
+                        },
+                    },
+                    None,
+                    Some("openai.gpt-5.6-sol"),
+                )
+                .await;
+
+            let ids = picker
+                .models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            for expected in [
+                "openai.gpt-5.6-sol",
+                "openai.gpt-5.6-terra",
+                "openai.gpt-5.6-luna",
+                "openai.gpt-5.5",
+                "openai.gpt-5.4",
+                "openai.gpt-oss-120b",
+                "openai.gpt-oss-20b",
+            ] {
+                assert!(
+                    ids.contains(expected),
+                    "{expected} must be in the picker; got {ids:?}"
+                );
+            }
+
+            // Enrichment must still apply to the configured model, and it stays the default.
+            let sol = picker
+                .models
+                .iter()
+                .find(|model| model.model_id == "openai.gpt-5.6-sol")
+                .expect("Sol is present");
+            assert_eq!(sol.context_window, Some(1_000_000));
+            assert_eq!(
+                sol.api_surface,
+                Some(bcode_model::ModelApiSurface::Responses)
+            );
+            assert!(sol.is_default);
+        });
+    }
+
+    #[test]
+    fn mantle_openai_picker_expands_to_every_catalog_responses_model() {
+        // Regression guard for the reported bug: the OpenAI Responses models exist only on Mantle,
+        // so `ListFoundationModels` never returns them. Without catalog expansion the picker showed
+        // only the single configured model (or, on the default transport, just the dual-surface
+        // `gpt-oss` models that Converse does list).
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let target = bcode_model_catalog_models::ModelSupportTarget::new(
+            "bedrock",
+            "bearer_token",
+            "responses",
+            Some("bcode"),
+        );
+
+        let models = catalog.provider_models_for_support_target("bedrock", &target, false);
+        let ids = models
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for expected in [
+            "openai.gpt-5.6-sol",
+            "openai.gpt-5.6-terra",
+            "openai.gpt-5.6-luna",
+            "openai.gpt-5.5",
+            "openai.gpt-5.4",
+            "openai.gpt-oss-120b",
+            "openai.gpt-oss-20b",
+        ] {
+            assert!(
+                ids.contains(expected),
+                "{expected} must be reachable through the Mantle OpenAI support target; got {ids:?}"
+            );
+        }
+
+        // The Converse-only Safeguard variants must not be advertised on this surface.
+        for excluded in [
+            "openai.gpt-oss-safeguard-120b",
+            "openai.gpt-oss-safeguard-20b",
+        ] {
+            assert!(
+                !ids.contains(excluded),
+                "{excluded} reports `Responses: No` and must not appear on the Mantle OpenAI surface"
+            );
+        }
+
+        // Claude entries must not leak onto the OpenAI surface either.
+        assert!(
+            ids.iter().all(|id| id.starts_with("openai.")),
+            "only OpenAI models declare the Mantle OpenAI target; got {ids:?}"
+        );
+    }
+
+    #[test]
     fn catalog_loads_provider_error_handling_metadata() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let provider = catalog.provider("openai").expect("openai provider exists");

@@ -28,9 +28,9 @@ entries, so `us.openai.gpt-5.6-sol` carries the same metadata as `openai.gpt-5.6
 
 ## Configure the transport
 
-Mantle has no control-plane model listing for this surface, so **a model must be configured
-explicitly**. Without one Bcode reports `bedrock_mantle_model_required` rather than falling back to
-a discovered default.
+Mantle has no control-plane model listing for this surface, so `ListFoundationModels` never returns
+the Responses-only models. Set the transport to `mantle_openai` and Bcode populates the model picker
+from catalog membership instead:
 
 ```sh
 export BCODE_BEDROCK_TRANSPORT=mantle_openai
@@ -38,6 +38,13 @@ export BCODE_BEDROCK_MODEL=openai.gpt-5.6-sol
 export BCODE_BEDROCK_REGION=us-east-1
 export AWS_BEARER_TOKEN_BEDROCK="<Bedrock long-term API key>"
 ```
+
+`BCODE_BEDROCK_MODEL` is still required — a turn needs a concrete model, and Bcode reports
+`bedrock_mantle_model_required` without one. It selects the default; `/model` and `/models` list all
+seven Responses models regardless.
+
+On the default `bedrock_runtime` transport, only the dual-surface `gpt-oss` models appear, because
+those are the only `OpenAI` models Bedrock's Converse control plane lists.
 
 Generate the API key from the Amazon Bedrock console. `AWS_BEARER_TOKEN_BEDROCK` is also accepted
 through Bcode's provider auth flow as the `bearer_token` credential, which is preferred over an
