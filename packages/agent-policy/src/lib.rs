@@ -794,6 +794,7 @@ mod tests {
             requires_permission: true,
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         }
     }
 
@@ -1155,6 +1156,7 @@ mod tests {
             requires_permission: true,
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         };
 
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
@@ -1190,6 +1192,7 @@ mod tests {
             requires_permission: tool_name != "filesystem.read",
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         }
     }
 
@@ -1347,6 +1350,7 @@ mod tests {
             requires_permission: true,
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         };
 
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
@@ -1376,6 +1380,7 @@ mod tests {
             requires_permission: false,
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         };
 
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
@@ -1409,6 +1414,7 @@ mod tests {
             requires_permission: true,
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         };
 
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
@@ -1439,6 +1445,7 @@ mod tests {
             requires_permission: true,
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         };
 
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
@@ -1469,6 +1476,7 @@ mod tests {
             requires_permission: true,
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         };
 
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
@@ -1492,6 +1500,7 @@ mod tests {
             requires_permission: true,
             policy_profile: None,
             cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
         };
 
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));

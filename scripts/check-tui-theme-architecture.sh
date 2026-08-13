@@ -31,9 +31,15 @@ if rg -n 'surface\.base' \
   fail "resolved canvas must consume the documented canvas semantic role"
 fi
 
-if ! rg -q 'frame\.fill\(layout\.area, " ", app\.presented_theme\(\)\.canvas\)' \
-  packages/tui/src/render.rs; then
-  fail "normal TUI rendering must fill the complete frame from resolved canvas presentation"
+if ! rg -q 'frame\.fill\(layout\.header, " ", app\.presented_theme\(\)\.canvas\)' \
+  packages/tui/src/render.rs \
+  || ! rg -q 'frame\.fill\(layout\.composer, " ", app\.presented_theme\(\)\.canvas\)' \
+    packages/tui/src/render.rs \
+  || ! rg -q 'frame\.fill\(layout\.body, " ", app\.presented_theme\(\)\.canvas\)' \
+    packages/tui/src/render.rs \
+  || ! rg -q 'frame\.fill\(layout\.status, " ", app\.presented_theme\(\)\.canvas\)' \
+    packages/tui/src/render.rs; then
+  fail "normal TUI rendering must fill every damaged frame region from resolved canvas presentation"
 fi
 
 if rg -n 'presented_theme\(\)\.background|semantic_state_theme\(\)\.background' \

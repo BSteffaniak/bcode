@@ -24,6 +24,7 @@ fn request(source: &str) -> EvaluateToolCallRequest {
         requires_permission: true,
         policy_profile: None,
         cwd: Some("/tmp/project".to_owned()),
+        effective_config_toml: None,
     }
 }
 

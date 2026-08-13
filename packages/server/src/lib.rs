@@ -53208,6 +53208,9 @@ library = "test"
         plugins: bcode_plugin::PluginRuntimeHost,
         ralph_store: bcode_ralph::RalphStateStore,
     ) -> ServerState {
+        let mut startup_config = bcode_config::BcodeConfig::default();
+        startup_config.model.prompt_cache.mode = bcode_model::PromptCacheMode::Off;
+        startup_config.model.tool_output.context_chars = 1_000;
         ServerState::new(
             sessions,
             plugins,
@@ -53218,7 +53221,7 @@ library = "test"
                 selected_provider_plugin_id: None,
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
-                startup_config: bcode_config::BcodeConfig::default(),
+                startup_config,
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
@@ -62627,7 +62630,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             settings: BTreeMap::from([
                 (
                     "model_metadata.fake-echo.context_window".to_owned(),
-                    "12000".to_owned(),
+                    "16000".to_owned(),
                 ),
                 ("fake_tool_rounds".to_owned(), "5".to_owned()),
             ]),

@@ -275,6 +275,7 @@ fn evaluate(case: &Case) -> AgentDecision {
         requires_permission: true,
         policy_profile: None,
         cwd: Some("/tmp/project".to_owned()),
+        effective_config_toml: None,
     };
     evaluate_tool_call(&config, &request, Path::new("/tmp/project"))
         .response
