@@ -520,6 +520,62 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn effective_config_scopes_agent_accent_and_permissions_without_ambient_state() {
+        let allow_toml = r##"
+[agent.build]
+accent = "#112233"
+tools = { "filesystem.read" = true }
+[agent.build.permission]
+read = { "**" = "allow" }
+"##;
+        let deny_toml = r##"
+[agent.build]
+accent = "#aabbcc"
+tools = { "filesystem.read" = true }
+[agent.build.permission]
+read = { "**" = "deny" }
+"##;
+
+        let allow_agents = agent_list_with_config(Some(allow_toml));
+        let deny_agents = agent_list_with_config(Some(deny_toml));
+        let build_accent = |agents: &AgentList| {
+            agents
+                .agents
+                .iter()
+                .find(|agent| agent.id == BUILD_AGENT)
+                .and_then(|agent| agent.accent.clone())
+        };
+        assert_eq!(build_accent(&allow_agents).as_deref(), Some("#112233"));
+        assert_eq!(build_accent(&deny_agents).as_deref(), Some("#aabbcc"));
+
+        let request = |config: &str| EvaluateToolCallRequest {
+            session_id: SessionId::new(),
+            agent_id: BUILD_AGENT.to_string(),
+            tool_name: "filesystem.read".to_string(),
+            operation: bcode_agent_profile::ToolPolicyOperation::Read {
+                paths: vec!["/tmp/project/file".to_string()],
+            },
+            aliases: vec!["read".to_string()],
+            requires_permission: true,
+            policy_profile: None,
+            cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: Some(Box::new(config.to_string())),
+        };
+        assert_eq!(
+            evaluate_tool_request(&request(allow_toml))
+                .expect("allow evaluation")
+                .decision,
+            AgentDecision::Allow
+        );
+        assert_eq!(
+            evaluate_tool_request(&request(deny_toml))
+                .expect("deny evaluation")
+                .decision,
+            AgentDecision::Deny
+        );
+    }
+
+    #[test]
     fn later_policy_changes_fail_closed_for_pinned_workflow_identity() {
         let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let root = unique_temp_dir();

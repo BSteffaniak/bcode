@@ -416,9 +416,10 @@ pub struct AutomaticCompactionPolicy {
 pub async fn automatic_compaction_policy(
     state: &ServerState,
     selection: &SessionModelSelection,
+    compaction: &bcode_config::CompactionConfig,
 ) -> AutomaticCompactionPolicy {
     let Some(provider_plugin_id) = selection.provider_plugin_id.as_deref() else {
-        let decision = resolve_compaction_decision(state.auto_compaction.mode, None);
+        let decision = resolve_compaction_decision(compaction.mode, None);
         return AutomaticCompactionPolicy {
             decision,
             capabilities: None,
@@ -462,7 +463,7 @@ pub async fn automatic_compaction_policy(
             format!("context-management capability discovery failed: {error}"),
         ),
     };
-    let decision = resolve_compaction_decision(state.auto_compaction.mode, capabilities.as_ref());
+    let decision = resolve_compaction_decision(compaction.mode, capabilities.as_ref());
     AutomaticCompactionPolicy {
         decision,
         capabilities,

@@ -19124,7 +19124,8 @@ async fn run_model_turn_inner(
     }
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
-    let compaction_policy = automatic_compaction_policy(state, &selection).await;
+    let compaction_policy =
+        automatic_compaction_policy(state, &selection, &turn_config.model.compaction).await;
     let compaction_decision = compaction_policy.decision;
     let provider_retry_rules = provider_retry_rules(state, provider_plugin_id.as_deref()).await;
     let remote_catalog_retry_rules =
@@ -40060,20 +40061,28 @@ library = "test"
         };
         let before_restart = test_server_state_with_fake_provider(SessionManager::default());
         assert_eq!(
-            automatic_compaction_policy(&before_restart, &selection(false))
-                .await
-                .decision
-                .strategy,
+            automatic_compaction_policy(
+                &before_restart,
+                &selection(false),
+                &before_restart.auto_compaction
+            )
+            .await
+            .decision
+            .strategy,
             AutomaticCompactionStrategy::OverflowOnly
         );
         drop(before_restart);
 
         let after_restart = test_server_state_with_fake_provider(SessionManager::default());
         assert_eq!(
-            automatic_compaction_policy(&after_restart, &selection(true))
-                .await
-                .decision
-                .strategy,
+            automatic_compaction_policy(
+                &after_restart,
+                &selection(true),
+                &after_restart.auto_compaction
+            )
+            .await
+            .decision
+            .strategy,
             AutomaticCompactionStrategy::ProviderManaged
         );
     }
@@ -40091,7 +40100,12 @@ library = "test"
             ..SessionModelSelection::default()
         };
 
-        let unsupported = automatic_compaction_policy(&state, &selection(BTreeMap::new())).await;
+        let unsupported = automatic_compaction_policy(
+            &state,
+            &selection(BTreeMap::new()),
+            &state.auto_compaction,
+        )
+        .await;
         assert_eq!(
             unsupported.decision.strategy,
             AutomaticCompactionStrategy::OverflowOnly
@@ -40107,6 +40121,7 @@ library = "test"
                 "fake_managed_compaction".to_string(),
                 "true".to_string(),
             )])),
+            &state.auto_compaction,
         )
         .await;
         assert_eq!(
@@ -40125,6 +40140,7 @@ library = "test"
                 "fake_context_capabilities_failure".to_string(),
                 "true".to_string(),
             )])),
+            &state.auto_compaction,
         )
         .await;
         assert_eq!(
@@ -40143,6 +40159,7 @@ library = "test"
                 "fake_managed_compaction".to_string(),
                 "true".to_string(),
             )])),
+            &state.auto_compaction,
         )
         .await;
         assert_eq!(
@@ -60576,7 +60593,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Some(runtime_context.clone()),
         )
         .await;
-        let policy = automatic_compaction_policy(&state, &effective_selection).await;
+        let policy =
+            automatic_compaction_policy(&state, &effective_selection, &state.auto_compaction).await;
         assert_eq!(
             policy.decision.strategy,
             AutomaticCompactionStrategy::ProviderManaged
@@ -64054,7 +64072,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             system_messages: Vec::new(),
             tools: Vec::new(),
         };
-        let compaction_policy = automatic_compaction_policy(&state, &selection).await;
+        let compaction_policy =
+            automatic_compaction_policy(&state, &selection, &state.auto_compaction).await;
 
         let prepared = build_model_turn_request(
             &state,
