@@ -4692,7 +4692,7 @@ fn bedrock_messages_sdk_error(
     } else if service_error.is_resource_not_found_exception() {
         ProviderErrorCategory::ModelNotFound
     } else if service_error.is_validation_exception() {
-        ProviderErrorCategory::InvalidRequest
+        bedrock_validation_exception_category(provider_message.as_deref())
     } else if provider_message
         .as_deref()
         .is_some_and(is_context_length_error)
@@ -5320,9 +5320,14 @@ fn bedrock_messages_stream_error<R>(
     } else if service_error.is_throttling_exception() {
         ProviderErrorCategory::RateLimit
     } else if service_error.is_validation_exception() {
-        ProviderErrorCategory::InvalidRequest
+        bedrock_validation_exception_category(provider_message.as_deref())
     } else if service_error.is_model_timeout_exception() {
         ProviderErrorCategory::Timeout
+    } else if provider_message
+        .as_deref()
+        .is_some_and(is_context_length_error)
+    {
+        ProviderErrorCategory::ContextLength
     } else {
         ProviderErrorCategory::ProviderInternal
     };
@@ -5395,7 +5400,7 @@ fn bedrock_stream_error<R>(
     } else if service_error.is_throttling_exception() {
         ProviderErrorCategory::RateLimit
     } else if service_error.is_validation_exception() {
-        ProviderErrorCategory::InvalidRequest
+        bedrock_validation_exception_category(provider_message.as_deref())
     } else if provider_message
         .as_deref()
         .is_some_and(is_context_length_error)
@@ -5422,6 +5427,21 @@ fn bedrock_stream_error<R>(
         message: provider_message,
     });
     normalized
+}
+
+/// Classify a Bedrock `ValidationException` that may actually report context overflow.
+///
+/// Bedrock reports prompt overflow (`prompt is too long: N tokens > M maximum`) as a
+/// `ValidationException`, so an exception-type-only mapping would categorize it as
+/// [`ProviderErrorCategory::InvalidRequest`] and hide it from overflow recovery. Overflow is the
+/// narrower classification, so the provider message is inspected before falling back to the
+/// generic invalid-request category.
+fn bedrock_validation_exception_category(provider_message: Option<&str>) -> ProviderErrorCategory {
+    if provider_message.is_some_and(is_context_length_error) {
+        ProviderErrorCategory::ContextLength
+    } else {
+        ProviderErrorCategory::InvalidRequest
+    }
 }
 
 fn is_context_length_error(message: &str) -> bool {
@@ -6616,6 +6636,61 @@ mod tests {
             bedrock_converse_stream_error_category(&error),
             ProviderErrorCategory::RateLimit
         );
+    }
+
+    /// Bedrock reports prompt overflow as a `ValidationException`, so validation classification
+    /// must inspect the provider message before falling back to `InvalidRequest`. Categorizing
+    /// overflow as `InvalidRequest` hides it from host overflow recovery and forces a manual
+    /// `/compact`.
+    #[test]
+    fn bedrock_validation_exception_prompt_overflow_is_context_length() {
+        assert_eq!(
+            bedrock_validation_exception_category(Some(
+                "prompt is too long: 1000646 tokens > 1000000 maximum"
+            )),
+            ProviderErrorCategory::ContextLength
+        );
+    }
+
+    #[test]
+    fn bedrock_validation_exception_without_overflow_stays_invalid_request() {
+        assert_eq!(
+            bedrock_validation_exception_category(Some(
+                "The model returned the following errors: malformed input"
+            )),
+            ProviderErrorCategory::InvalidRequest
+        );
+        assert_eq!(
+            bedrock_validation_exception_category(None),
+            ProviderErrorCategory::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn bedrock_converse_stream_validation_overflow_is_context_length() {
+        let error = ConverseStreamError::ValidationException(
+            aws_sdk_bedrockruntime::types::error::ValidationException::builder()
+                .message("prompt is too long: 1000646 tokens > 1000000 maximum")
+                .build(),
+        );
+
+        assert_eq!(
+            bedrock_converse_stream_error_category(&error),
+            ProviderErrorCategory::ContextLength
+        );
+    }
+
+    #[test]
+    fn bedrock_context_length_error_detects_reported_overflow_shapes() {
+        assert!(is_context_length_error(
+            "prompt is too long: 1000646 tokens > 1000000 maximum"
+        ));
+        assert!(is_context_length_error(
+            "Input is too long for requested model."
+        ));
+        assert!(!is_context_length_error(
+            "data retention mode 'default' is not available for this model"
+        ));
     }
 
     #[test]
