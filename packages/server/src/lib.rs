@@ -22602,18 +22602,24 @@ async fn session_model_selection_with_runtime_context(
     session_id: SessionId,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> SessionModelSelection {
-    let mut selection = session_model_selection(state, session_id).await;
-    if let Some(context) = runtime_context {
-        if selection.provider_plugin_id.is_none() {
-            selection.provider_plugin_id = context.selected_provider_plugin_id;
-        }
-        if selection.model_id.is_none() {
-            selection.model_id = context.selected_model_id;
-        }
-        if selection.requested_model_id.is_none() {
-            selection.requested_model_id = context.requested_model_id;
-        }
-        selection.provider_context = context.provider_context;
+    let selection = session_model_selection(state, session_id).await;
+    let Some(context) = runtime_context else {
+        return selection;
+    };
+    let origin = state
+        .session_model_selection_origins
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    if matches!(origin, SessionModelSelectionOrigin::Default)
+        && !state.session_has_active_turn(session_id).await
+        && (context.selected_provider_plugin_id.is_some()
+            || context.selected_model_id.is_some()
+            || context.requested_model_id.is_some())
+    {
+        return model_selection_from_runtime_context(state, context);
     }
     selection
 }
@@ -52579,6 +52585,108 @@ library = "test"
         let mut state = test_server_state(sessions);
         state.plugins = plugins;
         state
+    }
+
+    #[tokio::test]
+    async fn client_runtime_model_and_provider_context_replace_non_sticky_daemon_default() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("client default".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("daemon.provider".to_owned()),
+                model_id: Some("daemon-model".to_owned()),
+                provider_context: bcode_model::ProviderRequestContext {
+                    settings: BTreeMap::from([("source".to_owned(), "daemon".to_owned())]),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                ..SessionModelSelection::default()
+            },
+        );
+        let client_provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([("source".to_owned(), "client".to_owned())]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+
+        let selection = session_model_selection_with_runtime_context(
+            &state,
+            session_id,
+            Some(ClientRuntimeContext {
+                selected_provider_plugin_id: Some("client.provider".to_owned()),
+                selected_model_id: Some("client-model".to_owned()),
+                requested_model_id: Some("client-alias".to_owned()),
+                provider_context: client_provider_context.clone(),
+                ..ClientRuntimeContext::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            selection.provider_plugin_id.as_deref(),
+            Some("client.provider")
+        );
+        assert_eq!(selection.model_id.as_deref(), Some("client-model"));
+        assert_eq!(
+            selection.requested_model_id.as_deref(),
+            Some("client-alias")
+        );
+        assert_eq!(selection.provider_context, client_provider_context);
+    }
+
+    #[tokio::test]
+    async fn client_runtime_model_does_not_replace_sticky_user_selection() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("sticky model".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        let user_provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([("source".to_owned(), "user".to_owned())]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("user.provider".to_owned()),
+                model_id: Some("user-model".to_owned()),
+                provider_context: user_provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+        state
+            .session_model_selection_origins
+            .lock()
+            .await
+            .insert(session_id, SessionModelSelectionOrigin::User);
+
+        let selection = session_model_selection_with_runtime_context(
+            &state,
+            session_id,
+            Some(ClientRuntimeContext {
+                selected_provider_plugin_id: Some("client.provider".to_owned()),
+                selected_model_id: Some("client-model".to_owned()),
+                provider_context: bcode_model::ProviderRequestContext {
+                    settings: BTreeMap::from([("source".to_owned(), "client".to_owned())]),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                ..ClientRuntimeContext::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            selection.provider_plugin_id.as_deref(),
+            Some("user.provider")
+        );
+        assert_eq!(selection.model_id.as_deref(), Some("user-model"));
+        assert_eq!(selection.provider_context, user_provider_context);
     }
 
     #[test]
