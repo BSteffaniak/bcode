@@ -347,6 +347,7 @@ fn current_runtime_context() -> ClientRuntimeContext {
             ..ClientRuntimeContext::default()
         };
     };
+    let effective_config_toml = bcode_config::encode_effective_config(&config).ok();
     let mut env = CLIENT_RUNTIME_ENV_VARS
         .iter()
         .filter_map(|name| match std::env::var(name) {
@@ -368,6 +369,7 @@ fn current_runtime_context() -> ClientRuntimeContext {
     let env_keys = env.keys().cloned().map(|key| (key, true)).collect();
     ClientRuntimeContext {
         working_directory: Some(working_directory),
+        effective_config_toml,
         selected_provider_plugin_id: resolved.provider_plugin_id,
         selected_model_id: resolved.model_id,
         requested_model_id: resolved.selected_model_id,

@@ -1109,6 +1109,12 @@ pub struct ClientRuntimeContext {
     /// Canonical working directory of the client process.
     #[serde(default)]
     pub working_directory: Option<PathBuf>,
+    /// Fully resolved declarative configuration encoded as TOML by the client.
+    ///
+    /// The IPC layer treats this as opaque portable data. The daemon's config owner validates and
+    /// decodes it before use.
+    #[serde(default)]
+    pub effective_config_toml: Option<String>,
     #[serde(default)]
     pub selected_provider_plugin_id: Option<String>,
     #[serde(default)]

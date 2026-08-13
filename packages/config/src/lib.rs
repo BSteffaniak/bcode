@@ -6882,6 +6882,27 @@ pub fn load_composed_config_value_with_overrides(
     Ok(resolved)
 }
 
+/// Encode a fully resolved configuration for transport across a process boundary.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be serialized as TOML.
+pub fn encode_effective_config(config: &BcodeConfig) -> Result<String, ConfigError> {
+    toml::to_string(config).map_err(|source| ConfigError::Composition {
+        message: format!("failed to encode effective config: {source}"),
+    })
+}
+
+/// Decode a fully resolved configuration received from a trusted local client.
+///
+/// # Errors
+///
+/// Returns an error when the TOML is invalid or fails configuration validation.
+pub fn decode_effective_config(contents: &str) -> Result<BcodeConfig, ConfigError> {
+    let value = parse_raw_toml_config(contents, "client effective config")?;
+    validate_config_value(value, "client effective config")
+}
+
 /// Load and merge configuration from paths with explicit override layers.
 ///
 /// Precedence is: base config, provided paths, env config file, env raw TOML,
