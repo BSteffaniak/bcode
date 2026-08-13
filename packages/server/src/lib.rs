@@ -370,7 +370,6 @@ pub struct ServerState {
     provider_state: Mutex<ProviderStateStore>,
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
-    tool_execution: bcode_tool::ToolExecutionOptions,
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
@@ -1393,7 +1392,6 @@ struct ServerStateInit {
     observability: bcode_config::ObservabilityConfig,
     session_search_enabled: bool,
     trace_store: TraceStore,
-    tool_execution: bcode_tool::ToolExecutionOptions,
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
@@ -1586,7 +1584,6 @@ impl ServerState {
             provider_state: Mutex::new(init.provider_state),
             observability: init.observability,
             trace_store: init.trace_store,
-            tool_execution: init.tool_execution,
             tool_output_context_chars: init.tool_output_context_chars,
             model_streaming: init.model_streaming,
             model_retry: init.model_retry,
@@ -3470,7 +3467,6 @@ async fn run_with_static_bundled_inner(
             observability: config.observability,
             session_search_enabled: config.session_search.enabled,
             trace_store: TraceStore::new(default_trace_store_dir()),
-            tool_execution: config.tools.execution.runtime_options(),
             tool_output_context_chars: config.model.tool_output.context_chars,
             model_streaming: config.model.streaming,
             model_retry: config.model.retry,
@@ -19343,6 +19339,7 @@ async fn run_model_turn_inner(
                 provider_plugin_id: provider_plugin_id.as_deref(),
                 request: &request,
                 context_projection: &context_projection,
+                streaming: &turn_config.model.streaming,
             },
             Arc::clone(&cancel_state),
             command_context,
@@ -19412,6 +19409,7 @@ async fn run_model_turn_inner(
                     Arc::clone(&cancel_state),
                     command_context,
                     &execution,
+                    turn_config.tools.execution.runtime_options(),
                 )
                 .await
                 {
@@ -20454,6 +20452,7 @@ struct ModelTurnRoundContext<'a> {
     provider_plugin_id: Option<&'a str>,
     request: &'a ModelTurnRequest,
     context_projection: &'a bcode_session_models::RequestContextObservation,
+    streaming: &'a bcode_config::StreamingConfig,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -20471,6 +20470,7 @@ async fn run_model_turn_round(
         provider_plugin_id,
         request,
         context_projection,
+        streaming,
     } = round;
     let round_start = Instant::now();
     let provider_label = provider_plugin_id.unwrap_or("<auto>").to_string();
@@ -20581,6 +20581,7 @@ async fn run_model_turn_round(
             next_output_position,
             provider_plugin_id,
             provider_turn_id: &start.provider_turn_id,
+            streaming,
         },
         Arc::clone(&cancel_state),
         command_context,
@@ -20787,6 +20788,7 @@ struct ModelPollContext<'a> {
     next_output_position: &'a mut u64,
     provider_plugin_id: Option<&'a str>,
     provider_turn_id: &'a str,
+    streaming: &'a bcode_config::StreamingConfig,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -20803,6 +20805,7 @@ async fn poll_model_turn_events(
         next_output_position,
         provider_plugin_id,
         provider_turn_id,
+        streaming,
     } = poll;
     let mut stream = ModelStreamAccumulator::new(
         session_id,
@@ -20879,6 +20882,7 @@ async fn poll_model_turn_events(
             let Some(next_idle_for) = wait_for_model_progress_or_timeout(
                 state,
                 session_id,
+                streaming,
                 idle_for,
                 &mut no_progress_warned,
                 cancel_state.as_ref(),
@@ -20924,6 +20928,7 @@ async fn poll_model_turn_events(
             let Some(next_idle_for) = wait_for_model_progress_or_timeout(
                 state,
                 session_id,
+                streaming,
                 idle_for,
                 &mut no_progress_warned,
                 cancel_state.as_ref(),
@@ -21014,6 +21019,7 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
 async fn wait_for_model_progress_or_timeout(
     state: &ServerState,
     session_id: SessionId,
+    streaming: &bcode_config::StreamingConfig,
     idle_for: Duration,
     warned: &mut bool,
     cancel_state: &TurnCancelState,
@@ -21022,8 +21028,8 @@ async fn wait_for_model_progress_or_timeout(
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> Option<Duration> {
     let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
-    let warning_after = Duration::from_secs(state.model_streaming.no_progress_warning_secs);
-    let timeout_after = Duration::from_secs(state.model_streaming.no_progress_timeout_secs);
+    let warning_after = Duration::from_secs(streaming.no_progress_warning_secs);
+    let timeout_after = Duration::from_secs(streaming.no_progress_timeout_secs);
     if !*warned && idle_for >= warning_after {
         publish_provider_stream_progress_live(
             state,
@@ -25803,7 +25809,7 @@ async fn persist_scoped_turn_event(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn execute_model_tool_batch<'a>(
     state: &'a ServerState,
     session_id: SessionId,
@@ -25812,6 +25818,7 @@ fn execute_model_tool_batch<'a>(
     cancel_state: Arc<TurnCancelState>,
     command_context: &'a mut RuntimeCommandContext<'_>,
     execution: &bcode_session_models::TurnExecutionOptions,
+    tool_execution: bcode_tool::ToolExecutionOptions,
 ) -> ProviderCallFuture<'a, bool> {
     let tool_policy = execution.tools;
     let tool_allowlist = execution
@@ -25824,7 +25831,7 @@ fn execute_model_tool_batch<'a>(
             biased;
             () = cancel_state.cancelled() => return false,
             catalog = tokio::time::timeout(
-                Duration::from_millis(state.tool_execution.preparation_timeout_ms.get()),
+                Duration::from_millis(tool_execution.preparation_timeout_ms.get()),
                 collect_server_tool_catalog(state),
             ) => catalog,
         } {
@@ -25893,7 +25900,7 @@ fn execute_model_tool_batch<'a>(
                 &mut rounds,
                 &permission_context,
                 &host_context,
-                state.tool_execution,
+                tool_execution,
                 &scope,
             );
             let completed = wait_for_server_tool_batch(
@@ -38720,7 +38727,7 @@ library = "test"
             ..bcode_model::ProviderRequestContext::default()
         };
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.tool_execution.parallel = false;
+        state.startup_config.tools.execution.parallel = false;
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -45013,6 +45020,7 @@ library = "test"
         let result = wait_for_model_progress_or_timeout(
             &state,
             session_id,
+            &state.model_streaming,
             Duration::ZERO,
             &mut warned,
             &cancel_state,
@@ -45092,6 +45100,7 @@ library = "test"
             wait_for_model_progress_or_timeout(
                 &state,
                 session_id,
+                &state.model_streaming,
                 Duration::ZERO,
                 &mut warned,
                 &cancel_state,
@@ -49169,6 +49178,7 @@ library = "test"
                 Arc::new(TurnCancelState::default()),
                 &mut command_context,
                 &bcode_session_models::TurnExecutionOptions::default(),
+                bcode_tool::ToolExecutionOptions::default(),
             )
             .await
         );
@@ -49244,6 +49254,7 @@ library = "test"
                 task_cancel,
                 &mut command_context,
                 &bcode_session_models::TurnExecutionOptions::default(),
+                bcode_tool::ToolExecutionOptions::default(),
             )
             .await
         });
@@ -49314,7 +49325,7 @@ library = "test"
         let session_id = summary.id;
         let mut state = test_server_state_with_shell_plugin(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
-        state.tool_execution.parallel = true;
+        state.startup_config.tools.execution.parallel = true;
         let state = Arc::new(state);
         let calls = (0..5)
             .map(|index| bcode_model::ToolCall {
@@ -49353,6 +49364,7 @@ library = "test"
                 task_cancel,
                 &mut command_context,
                 &bcode_session_models::TurnExecutionOptions::default(),
+                bcode_tool::ToolExecutionOptions::default(),
             )
             .await
         });
@@ -53052,7 +53064,6 @@ library = "test"
                 observability: bcode_config::ObservabilityConfig::default(),
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
-                tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
@@ -62817,7 +62828,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 observability: bcode_config::ObservabilityConfig::default(),
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
-                tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
@@ -63654,7 +63664,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 observability: bcode_config::ObservabilityConfig::default(),
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
-                tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
