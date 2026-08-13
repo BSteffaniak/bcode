@@ -370,7 +370,6 @@ pub struct ServerState {
     provider_state: Mutex<ProviderStateStore>,
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
-    tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
@@ -1392,7 +1391,6 @@ struct ServerStateInit {
     observability: bcode_config::ObservabilityConfig,
     session_search_enabled: bool,
     trace_store: TraceStore,
-    tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
@@ -1584,7 +1582,6 @@ impl ServerState {
             provider_state: Mutex::new(init.provider_state),
             observability: init.observability,
             trace_store: init.trace_store,
-            tool_output_context_chars: init.tool_output_context_chars,
             model_streaming: init.model_streaming,
             model_retry: init.model_retry,
             auto_compaction: init.auto_compaction,
@@ -3467,7 +3464,6 @@ async fn run_with_static_bundled_inner(
             observability: config.observability,
             session_search_enabled: config.session_search.enabled,
             trace_store: TraceStore::new(default_trace_store_dir()),
-            tool_output_context_chars: config.model.tool_output.context_chars,
             model_streaming: config.model.streaming,
             model_retry: config.model.retry,
             auto_compaction: config.model.compaction,
@@ -19207,7 +19203,7 @@ async fn run_model_turn_inner(
             set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
         }
         let compaction_result = if should_evaluate_proactive {
-            maybe_auto_compact_session_context(
+            Box::pin(maybe_auto_compact_session_context(
                 state,
                 session_id,
                 &selection,
@@ -19219,7 +19215,7 @@ async fn run_model_turn_inner(
                     decision: compaction_decision,
                     previous_compacted_through_sequence: last_proactive_attempt_boundary,
                 },
-            )
+            ))
             .await
         } else {
             Ok(None)
@@ -43766,7 +43762,7 @@ library = "test"
         let current_turn = Arc::new(Mutex::new(None));
         let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
 
-        process_compact_session_command(
+        Box::pin(process_compact_session_command(
             &state,
             session_id,
             Arc::clone(&phase),
@@ -43782,7 +43778,7 @@ library = "test"
                 model_id: Some("fake-model".to_string()),
                 ..SessionModelSelection::default()
             },
-        )
+        ))
         .await
         .unwrap_or_else(|error| panic!("manual compaction failed: {error}"));
 
@@ -53114,7 +53110,6 @@ library = "test"
                 observability: bcode_config::ObservabilityConfig::default(),
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
-                tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
@@ -61562,7 +61557,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut state = test_server_state_with_fake_provider(sessions);
         state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
         state.auto_compaction.keep_recent_tokens = 1;
-        state.tool_output_context_chars = 20_000;
+        state.startup_config.model.tool_output.context_chars = 20_000;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_owned()),
             model_id: Some("fake-echo".to_owned()),
@@ -61573,8 +61568,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .model_context_events(session_id)
             .await
             .expect("context");
-        let followup_messages =
-            session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
+        let followup_messages = session_events_to_model_messages_with_limit(
+            &history,
+            state.startup_config.model.tool_output.context_chars,
+        );
         let followup_tokens = estimated_model_messages_tokens(&followup_messages);
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
@@ -61588,7 +61585,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Arc::new(Mutex::new(None)),
         );
 
-        let compacted = maybe_auto_compact_session_context(
+        let compacted = Box::pin(maybe_auto_compact_session_context(
             &state,
             session_id,
             &selection,
@@ -61604,7 +61601,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 },
                 previous_compacted_through_sequence: None,
             },
-        )
+        ))
         .await
         .expect("followup compaction")
         .expect("followup should compact");
@@ -62153,7 +62150,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         let incompatible_messages = session_events_to_model_messages_for_target(
             &history,
-            state.tool_output_context_chars,
+            state.startup_config.model.tool_output.context_chars,
             Some("different-provider"),
             Some("different-model"),
             None,
@@ -62167,7 +62164,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }));
         let incompatible_auth_messages = session_events_to_model_messages_for_target(
             &history,
-            state.tool_output_context_chars,
+            state.startup_config.model.tool_output.context_chars,
             Some("bcode.fake-provider"),
             Some("fake-model"),
             Some("profile-b"),
@@ -62188,7 +62185,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         let incompatible_format_messages = session_events_to_model_messages_for_target(
             &history,
-            state.tool_output_context_chars,
+            state.startup_config.model.tool_output.context_chars,
             Some("bcode.fake-provider"),
             Some("fake-model"),
             Some("profile-a"),
@@ -62879,7 +62876,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 observability: bcode_config::ObservabilityConfig::default(),
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
-                tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
@@ -62955,7 +62951,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             session_id,
             ToolFinishedEventInput {
                 tool_call_id: "call-image".to_owned(),
-                result: "x".repeat(state.tool_output_context_chars + 1),
+                result: "x".repeat(state.startup_config.model.tool_output.context_chars + 1),
                 is_error: false,
                 content: vec![ToolResultContent::ImageRef {
                     image: image.clone(),
@@ -63715,7 +63711,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 observability: bcode_config::ObservabilityConfig::default(),
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
-                tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),

@@ -158,6 +158,7 @@ pub async fn compact_session_context_with_limit(
     cancel_state: &TurnCancelState,
     progress_requirement: Option<CompactionProgressRequirement>,
 ) -> Result<CompactionCompletion, CompactionError> {
+    let config = state.session_config(session_id).await;
     compact_session_context_with_policy(
         state,
         session_id,
@@ -167,7 +168,7 @@ pub async fn compact_session_context_with_limit(
         cancel_state,
         progress_requirement,
         CompactionPlanningPolicy::Proactive {
-            keep_recent_tokens: usize::try_from(state.auto_compaction.keep_recent_tokens)
+            keep_recent_tokens: usize::try_from(config.model.compaction.keep_recent_tokens)
                 .unwrap_or(usize::MAX),
         },
     )
@@ -200,9 +201,10 @@ async fn compact_session_context_with_policy(
                 .collect()
         },
     );
+    let config = state.session_config(session_id).await;
     let plan = match structural_compaction_plan_with_policy(
         &transcript_history,
-        state.tool_output_context_chars,
+        config.model.tool_output.context_chars,
         planning_policy,
     ) {
         Ok(plan) => plan,
@@ -236,7 +238,7 @@ async fn compact_session_context_with_policy(
         plan.provider_native_messages,
         session_events_to_model_messages_with_limit(
             &plan.compactable_prefix,
-            state.tool_output_context_chars,
+            config.model.tool_output.context_chars,
         )
     );
     debug_assert_eq!(plan.summary_input, transcript.summary_input);
@@ -482,8 +484,9 @@ pub async fn compact_context_with_selected_backend(
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
+    let config = state.session_config(session_id).await;
     if matches!(
-        state.auto_compaction.backend,
+        config.model.compaction.backend,
         bcode_config::CompactionBackend::Local
     ) {
         return Ok(None);
@@ -505,7 +508,7 @@ pub async fn compact_context_with_selected_backend(
         .is_some_and(|capabilities| capabilities.native_compaction)
         && context_format.is_some();
     if !native_supported {
-        return match state.auto_compaction.backend {
+        return match config.model.compaction.backend {
             bcode_config::CompactionBackend::ProviderNative => Err(CompactionError::Provider(
                 "active provider surface does not support native context compaction".to_string(),
             )),
@@ -517,7 +520,7 @@ pub async fn compact_context_with_selected_backend(
     let model_id = model_id_for_provider_request(selection.model_id.as_deref());
     let messages = session_events_to_model_messages_for_target(
         history,
-        state.tool_output_context_chars,
+        config.model.tool_output.context_chars,
         Some(provider_plugin_id),
         Some(&model_id),
         selection.provider_context.auth_profile.as_deref(),
@@ -577,7 +580,7 @@ pub async fn compact_context_with_selected_backend(
         )),
         Err(error)
             if matches!(
-                state.auto_compaction.backend,
+                config.model.compaction.backend,
                 bcode_config::CompactionBackend::Auto
             ) =>
         {
@@ -739,9 +742,10 @@ pub async fn request_exceeds_compaction_capacity(
 ) -> Option<(u64, CompactionCapacity)> {
     let model_status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
     let context_window = model_status.context_window?;
+    let config = state.session_config(session_id).await;
     let capacity = compaction_capacity_tokens(
         context_window,
-        state.auto_compaction.proactive_threshold_percent,
+        config.model.compaction.proactive_threshold_percent,
         request.parameters.max_output_tokens,
         model_status.max_output_tokens,
     );
@@ -787,9 +791,10 @@ pub async fn maybe_auto_compact_session_context(
         return Ok(None);
     }
 
+    let config = state.session_config(session_id).await;
     let history = state.sessions.model_context_events(session_id).await?;
     let projected_context_chars =
-        projected_model_context_chars(&history, state.tool_output_context_chars);
+        projected_model_context_chars(&history, config.model.tool_output.context_chars);
     let projected_context_tokens = evaluation.candidate_input_tokens;
     let model_status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
     let Some(context_window_tokens) = model_status.context_window else {
@@ -808,7 +813,7 @@ pub async fn maybe_auto_compact_session_context(
         .await;
         return Ok(None);
     };
-    let threshold_percent = state.auto_compaction.proactive_threshold_percent;
+    let threshold_percent = config.model.compaction.proactive_threshold_percent;
     let capacity = compaction_capacity_tokens(
         context_window_tokens,
         threshold_percent,
@@ -817,7 +822,7 @@ pub async fn maybe_auto_compact_session_context(
     );
     ensure_compactable_current_turn(
         &history,
-        state.tool_output_context_chars,
+        config.model.tool_output.context_chars,
         capacity.available_input_tokens,
     )?;
     let threshold_tokens = capacity.threshold_tokens;
