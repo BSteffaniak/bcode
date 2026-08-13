@@ -349,6 +349,8 @@ pub struct ServerState {
     session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
+    startup_plugin_selection: bcode_plugin::PluginSelection,
+    default_plugin_ids: Vec<String>,
     session_search_enabled: bool,
     session_search_dirty: session_search::SessionSearchDirtyQueue,
     session_search_work: session_search::SessionSearchWorkScheduler,
@@ -359,6 +361,8 @@ pub struct ServerState {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
+    startup_config: bcode_config::BcodeConfig,
+    session_configs: Mutex<BTreeMap<SessionId, bcode_config::BcodeConfig>>,
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
     selected_reasoning: bcode_config::ReasoningConfig,
@@ -366,10 +370,8 @@ pub struct ServerState {
     provider_state: Mutex<ProviderStateStore>,
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
-    max_tool_rounds: Option<u32>,
     tool_execution: bcode_tool::ToolExecutionOptions,
     tool_output_context_chars: usize,
-    fallback_tool_argument_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
@@ -382,7 +384,6 @@ pub struct ServerState {
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_context_bytes: Option<usize>,
-    skill_preview_max_chars: usize,
     skill_prompt_options: SkillPromptCatalogOptions,
     skill_model_policy: bcode_config::SkillModelPolicyConfig,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
@@ -1378,9 +1379,12 @@ impl std::fmt::Debug for PendingToolExchange {
 
 struct ServerStateInit {
     model_catalog: Option<bcode_model_catalog::ModelCatalogResolver>,
+    startup_plugin_selection: bcode_plugin::PluginSelection,
+    default_plugin_ids: Vec<String>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
+    startup_config: bcode_config::BcodeConfig,
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
     selected_reasoning: bcode_config::ReasoningConfig,
@@ -1389,10 +1393,8 @@ struct ServerStateInit {
     observability: bcode_config::ObservabilityConfig,
     session_search_enabled: bool,
     trace_store: TraceStore,
-    max_tool_rounds: Option<u32>,
     tool_execution: bcode_tool::ToolExecutionOptions,
     tool_output_context_chars: usize,
-    fallback_tool_argument_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
@@ -1401,7 +1403,6 @@ struct ServerStateInit {
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_context_bytes: Option<usize>,
-    skill_preview_max_chars: usize,
     skill_prompt_options: SkillPromptCatalogOptions,
     skill_model_policy: bcode_config::SkillModelPolicyConfig,
     daemon_status: DaemonStatus,
@@ -1562,6 +1563,8 @@ impl ServerState {
             session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
+            startup_plugin_selection: init.startup_plugin_selection,
+            default_plugin_ids: init.default_plugin_ids,
             session_search_enabled: init.session_search_enabled,
             session_search_dirty: session_search::SessionSearchDirtyQueue::default(),
             session_search_work: session_search::SessionSearchWorkScheduler::default(),
@@ -1574,6 +1577,8 @@ impl ServerState {
             selected_provider_plugin_id: init.selected_provider_plugin_id,
             selected_model_id: init.selected_model_id,
             selected_provider_context: init.selected_provider_context,
+            startup_config: init.startup_config,
+            session_configs: Mutex::default(),
             prompt_cache_mode: init.prompt_cache_mode,
             conversation_reuse_mode: init.conversation_reuse_mode,
             selected_reasoning: init.selected_reasoning,
@@ -1581,10 +1586,8 @@ impl ServerState {
             provider_state: Mutex::new(init.provider_state),
             observability: init.observability,
             trace_store: init.trace_store,
-            max_tool_rounds: init.max_tool_rounds,
             tool_execution: init.tool_execution,
             tool_output_context_chars: init.tool_output_context_chars,
-            fallback_tool_argument_chars: init.fallback_tool_argument_chars,
             model_streaming: init.model_streaming,
             model_retry: init.model_retry,
             auto_compaction: init.auto_compaction,
@@ -1597,7 +1600,6 @@ impl ServerState {
             system_prompt: init.system_prompt,
             skills: init.skills,
             skill_context_bytes: init.skill_context_bytes,
-            skill_preview_max_chars: init.skill_preview_max_chars,
             skill_prompt_options: init.skill_prompt_options,
             skill_model_policy: init.skill_model_policy,
             active_skills: Mutex::default(),
@@ -1870,6 +1872,27 @@ impl ServerState {
             .await
             .get(&client_id)
             .cloned()
+    }
+
+    async fn set_session_config_from_runtime_context(
+        &self,
+        session_id: SessionId,
+        context: Option<&ClientRuntimeContext>,
+    ) {
+        let config = context
+            .and_then(|context| context.effective_config_toml.as_deref())
+            .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
+            .unwrap_or_else(|| self.startup_config.clone());
+        self.session_configs.lock().await.insert(session_id, config);
+    }
+
+    async fn session_config(&self, session_id: SessionId) -> bcode_config::BcodeConfig {
+        self.session_configs
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_else(|| self.startup_config.clone())
     }
 
     async fn client_working_directory(&self, client_id: ClientId) -> Option<PathBuf> {
@@ -3431,9 +3454,12 @@ async fn run_with_static_bundled_inner(
             model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::new(
                 bcode_model_catalog::RemoteCatalogOptions::default(),
             )?),
+            startup_plugin_selection: plugin_selection,
+            default_plugin_ids,
             selected_provider_plugin_id: resolved_model.provider_plugin_id,
             selected_model_id: resolved_model.model_id,
             selected_provider_context,
+            startup_config: config.clone(),
             prompt_cache_mode: config.model.effective_prompt_cache_mode(),
             conversation_reuse_mode: config.model.effective_conversation_reuse_mode(),
             selected_reasoning: resolved_model.reasoning.clone(),
@@ -3444,10 +3470,8 @@ async fn run_with_static_bundled_inner(
             observability: config.observability,
             session_search_enabled: config.session_search.enabled,
             trace_store: TraceStore::new(default_trace_store_dir()),
-            max_tool_rounds: config.model.effective_max_tool_rounds(),
             tool_execution: config.tools.execution.runtime_options(),
             tool_output_context_chars: config.model.tool_output.context_chars,
-            fallback_tool_argument_chars: config.model.tool_output.fallback_argument_chars.get(),
             model_streaming: config.model.streaming,
             model_retry: config.model.retry,
             auto_compaction: config.model.compaction,
@@ -3458,7 +3482,6 @@ async fn run_with_static_bundled_inner(
                 .skills
                 .max_context_bytes
                 .map(std::num::NonZeroUsize::get),
-            skill_preview_max_chars: config.skills.preview_max_chars.get(),
             skill_prompt_options: skill_prompt_options_from_config(&config.skills.prompt),
             skill_model_policy: config.skills.model_policy,
             skills,
@@ -5642,6 +5665,41 @@ async fn handle_permission_interaction_request(
 
 const MAX_CLIENT_INTERACTION_ADAPTERS: usize = 64;
 const MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES: usize = 128;
+const MAX_CLIENT_EFFECTIVE_CONFIG_BYTES: usize = 1024 * 1024;
+
+fn validate_client_effective_config(context: Option<&ClientRuntimeContext>) -> Result<(), String> {
+    let Some(contents) = context.and_then(|context| context.effective_config_toml.as_deref())
+    else {
+        return Ok(());
+    };
+    if contents.len() > MAX_CLIENT_EFFECTIVE_CONFIG_BYTES {
+        return Err("effective client config exceeds the 1 MiB transport limit".to_owned());
+    }
+    bcode_config::decode_effective_config(contents)
+        .map(|_| ())
+        .map_err(|error| format!("invalid effective client config: {error}"))
+}
+
+fn validate_client_plugin_selection(
+    state: &ServerState,
+    context: Option<&ClientRuntimeContext>,
+) -> Result<(), String> {
+    let Some(contents) = context.and_then(|context| context.effective_config_toml.as_deref())
+    else {
+        return Ok(());
+    };
+    let config = bcode_config::decode_effective_config(contents)
+        .map_err(|error| format!("invalid effective client config: {error}"))?;
+    let selection =
+        bcode_config::plugin_selection_with_default_plugin_ids(&config, &state.default_plugin_ids);
+    if selection == state.startup_plugin_selection {
+        return Ok(());
+    }
+    Err(format!(
+        "client effective plugin selection {:?} does not match daemon startup selection {:?}; restart the daemon with the desired plugin configuration",
+        selection, state.startup_plugin_selection
+    ))
+}
 
 fn validate_client_interaction_adapters(
     context: Option<&ClientRuntimeContext>,
@@ -5695,6 +5753,22 @@ async fn handle_update_client_runtime_context(
     writer: &SharedWriter,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<(), ServerError> {
+    if let Err(message) = validate_client_effective_config(runtime_context.as_ref()) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("invalid_client_config", message)),
+        )
+        .await;
+    }
+    if let Err(message) = validate_client_plugin_selection(state, runtime_context.as_ref()) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("incompatible_config", message)),
+        )
+        .await;
+    }
     if let Err(message) = validate_client_interaction_adapters(runtime_context.as_ref()) {
         return send_response(
             writer,
@@ -5800,6 +5874,22 @@ async fn handle_hello(
             writer,
             request_id,
             Response::Err(ErrorResponse::new("incompatible_build", message)),
+        )
+        .await;
+    }
+    if let Err(message) = validate_client_effective_config(hello.runtime_context.as_ref()) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("invalid_client_config", message)),
+        )
+        .await;
+    }
+    if let Err(message) = validate_client_plugin_selection(state, hello.runtime_context.as_ref()) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("incompatible_config", message)),
         )
         .await;
     }
@@ -18822,6 +18912,7 @@ struct ProviderErrorRetryContext<'a> {
     selection: &'a SessionModelSelection,
     provider_retry_rules: &'a [bcode_model::ProviderRetryRule],
     remote_catalog_retry_rules: &'a [bcode_model::ProviderRetryRule],
+    retry_config: &'a bcode_config::ModelRetryConfig,
     cancel_state: &'a TurnCancelState,
     phase: &'a Arc<Mutex<SessionRuntimePhase>>,
     compaction_decision: CompactionDecision,
@@ -19006,6 +19097,10 @@ async fn run_model_turn_inner(
     phase: &Arc<Mutex<SessionRuntimePhase>>,
 ) -> ModelTurnCompletion {
     let execution = turn_execution_options(trigger_event);
+    state
+        .set_session_config_from_runtime_context(session_id, runtime_context.as_ref())
+        .await;
+    let turn_config = state.session_config(session_id).await;
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
     let mut selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
@@ -19023,12 +19118,13 @@ async fn run_model_turn_inner(
     let compaction_decision = compaction_policy.decision;
     let provider_retry_rules = provider_retry_rules(state, provider_plugin_id.as_deref()).await;
     let remote_catalog_retry_rules =
-        remote_catalog_retry_rules(state, provider_plugin_id.as_deref()).await;
+        remote_catalog_retry_rules(provider_plugin_id.as_deref(), &turn_config.model.retry).await;
     let static_context = match prepare_static_model_turn_context(
         state,
         session_id,
         trigger_event.sequence,
         &execution,
+        &turn_config,
     )
     .await
     {
@@ -19079,6 +19175,7 @@ async fn run_model_turn_inner(
             &selection,
             &compaction_policy,
             &static_context,
+            &turn_config,
         )
         .await
         {
@@ -19145,6 +19242,7 @@ async fn run_model_turn_inner(
                     &selection,
                     &compaction_policy,
                     &static_context,
+                    &turn_config,
                 )
                 .await
                 {
@@ -19266,6 +19364,7 @@ async fn run_model_turn_inner(
             selection: &selection,
             provider_retry_rules: &provider_retry_rules,
             remote_catalog_retry_rules: &remote_catalog_retry_rules,
+            retry_config: &turn_config.model.retry,
             cancel_state: cancel_state.as_ref(),
             phase,
             compaction_decision,
@@ -19404,8 +19503,9 @@ async fn run_model_turn_inner(
             }
         }
         round = round.saturating_add(1);
-        if state.max_tool_rounds.is_some_and(|max| round > max) {
-            let max = state.max_tool_rounds.unwrap_or_default();
+        if let Some(max) = turn_config.model.effective_max_tool_rounds()
+            && round > max
+        {
             let message = format!(
                 "model tool-call round limit reached ({max}); remove [model].max_tool_rounds or set max_tool_rounds = 0 for unlimited rounds"
             );
@@ -19526,7 +19626,7 @@ async fn maybe_retry_after_provider_error(
     }
 
     if let Some(policy) = matching_provider_retry_policy(
-        state,
+        context.retry_config,
         error,
         context.selection,
         context.provider_retry_rules,
@@ -19574,53 +19674,48 @@ enum ProviderRetryPolicyKind {
 }
 
 fn matching_provider_retry_policy(
-    state: &ServerState,
+    retry_config: &bcode_config::ModelRetryConfig,
     error: &bcode_model::ProviderError,
     selection: &SessionModelSelection,
     provider_rules: &[bcode_model::ProviderRetryRule],
     remote_catalog_rules: &[bcode_model::ProviderRetryRule],
 ) -> Option<ProviderRetryPolicy> {
-    if !state.model_retry.enabled || is_context_length_provider_error(error) {
+    if !retry_config.enabled || is_context_length_provider_error(error) {
         return None;
     }
-    if state.model_retry.overload_enabled && is_overloaded_provider_error(error) {
+    if retry_config.overload_enabled && is_overloaded_provider_error(error) {
         return Some(ProviderRetryPolicy {
             id: "builtin.overload".to_string(),
             display_name: "overload".to_string(),
-            max_retries: (!state
-                .model_retry
+            max_retries: (!retry_config
                 .overload_retry_forever
-                .unwrap_or_else(|| state.model_retry.max_overload_retries.is_none()))
-            .then_some(state.model_retry.max_overload_retries)
+                .unwrap_or_else(|| retry_config.max_overload_retries.is_none()))
+            .then_some(retry_config.max_overload_retries)
             .flatten(),
-            initial_delay_ms: state.model_retry.overload_initial_delay_ms,
-            max_delay_ms: state.model_retry.overload_max_delay_ms,
+            initial_delay_ms: retry_config.overload_initial_delay_ms,
+            max_delay_ms: retry_config.overload_max_delay_ms,
             use_provider_retry_hint: true,
             kind: ProviderRetryPolicyKind::Overload,
         });
     }
-    if state.model_retry.no_progress_timeout_enabled && is_model_no_progress_timeout(error) {
+    if retry_config.no_progress_timeout_enabled && is_model_no_progress_timeout(error) {
         return Some(ProviderRetryPolicy {
             id: "builtin.no_progress_timeout".to_string(),
             display_name: "no-progress timeout".to_string(),
-            max_retries: (!state
-                .model_retry
+            max_retries: (!retry_config
                 .no_progress_timeout_retry_forever
-                .unwrap_or_else(|| state.model_retry.max_no_progress_timeout_retries.is_none()))
-            .then_some(state.model_retry.max_no_progress_timeout_retries)
+                .unwrap_or_else(|| retry_config.max_no_progress_timeout_retries.is_none()))
+            .then_some(retry_config.max_no_progress_timeout_retries)
             .flatten(),
-            initial_delay_ms: state.model_retry.no_progress_timeout_initial_delay_ms,
-            max_delay_ms: state.model_retry.no_progress_timeout_max_delay_ms,
+            initial_delay_ms: retry_config.no_progress_timeout_initial_delay_ms,
+            max_delay_ms: retry_config.no_progress_timeout_max_delay_ms,
             use_provider_retry_hint: false,
             kind: ProviderRetryPolicyKind::NoProgressTimeout,
         });
     }
 
-    let rules = effective_provider_retry_rules(
-        provider_rules,
-        remote_catalog_rules,
-        &state.model_retry.rules,
-    );
+    let rules =
+        effective_provider_retry_rules(provider_rules, remote_catalog_rules, &retry_config.rules);
     if let Some(policy) = rules
         .iter()
         .find(|rule| custom_retry_rule_matches(rule, error, selection))
@@ -19808,10 +19903,10 @@ async fn provider_retry_rules(
 }
 
 async fn remote_catalog_retry_rules(
-    state: &ServerState,
     provider_plugin_id: Option<&str>,
+    retry_config: &bcode_config::ModelRetryConfig,
 ) -> Vec<bcode_model::ProviderRetryRule> {
-    if !state.model_retry.remote_catalog_rules_enabled {
+    if !retry_config.remote_catalog_rules_enabled {
         return Vec::new();
     }
     let Some(provider_plugin_id) = provider_plugin_id else {
@@ -20285,7 +20380,7 @@ fn should_defer_visible_provider_error(
         || is_model_no_progress_timeout(error)
         || is_overloaded_provider_error(error)
         || selection.is_some_and(|selection| {
-            matching_provider_retry_policy(state, error, selection, &[], &[]).is_some()
+            matching_provider_retry_policy(&state.model_retry, error, selection, &[], &[]).is_some()
         })
 }
 
@@ -23015,11 +23110,13 @@ fn apply_turn_model_selection(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn prepare_static_model_turn_context(
     state: &ServerState,
     session_id: SessionId,
     trigger_event_sequence: u64,
     execution: &bcode_session_models::TurnExecutionOptions,
+    config: &bcode_config::BcodeConfig,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
     let agent_id = execution
         .agent_profile
@@ -23027,14 +23124,17 @@ async fn prepare_static_model_turn_context(
         .unwrap_or(session_agent_selection(state, session_id).await);
     let agent_context = agent_context(state, session_id, &agent_id).await;
     let working_directory = state.sessions.session_working_directory(session_id).await?;
-    let skill_catalog = if state.system_prompt.sections.skill_catalog {
+    let skill_catalog = if config.system_prompt.sections.skill_catalog {
         state.skills.as_ref().map_or_else(String::new, |registry| {
-            format_skill_catalog_for_prompt(&registry.list(), &state.skill_prompt_options)
+            format_skill_catalog_for_prompt(
+                &registry.list(),
+                &skill_prompt_options_from_config(&config.skills.prompt),
+            )
         })
     } else {
         String::new()
     };
-    let invariant_mode = state.invariants.enabled.then_some(state.invariants.mode);
+    let invariant_mode = config.invariants.enabled.then_some(config.invariants.mode);
     let full_fallback = state
         .invariant_full_fallback
         .lock()
@@ -23042,7 +23142,7 @@ async fn prepare_static_model_turn_context(
         .remove(&session_id);
     let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
         &working_directory,
-        &state.system_prompt,
+        &config.system_prompt,
         matches!(
             invariant_mode,
             Some(bcode_config::InvariantGuidanceMode::Full)
@@ -23084,7 +23184,10 @@ async fn prepare_static_model_turn_context(
         execution.skill_contexts.clone()
     };
     for skill_context in skill_contexts {
-        let preview = skill_context_preview(&skill_context.context, state.skill_preview_max_chars);
+        let preview = skill_context_preview(
+            &skill_context.context,
+            config.skills.preview_max_chars.get(),
+        );
         system_messages.push(ModelMessage {
             role: MessageRole::System,
             content: vec![ContentBlock::Text {
@@ -23133,6 +23236,7 @@ async fn build_model_turn_request(
     selection: &SessionModelSelection,
     compaction_policy: &AutomaticCompactionPolicy,
     static_context: &StaticModelTurnContext,
+    config: &bcode_config::BcodeConfig,
 ) -> Result<PreparedModelRequest, bcode_session::SessionError> {
     let metric_labels =
         model_request_metric_labels(session_id, provider_plugin_id, selected_model_id, round);
@@ -23161,13 +23265,13 @@ async fn build_model_turn_request(
     let convert_timer = state.metrics.timer();
     let mut messages = session_events_to_model_messages_for_target_with_limits(
         &history,
-        state.tool_output_context_chars,
+        config.model.tool_output.context_chars,
         provider_plugin_id,
         Some(&model_id_for_provider_request(selected_model_id)),
         selection.provider_context.auth_profile.as_deref(),
         context_format.map(|format| format.version),
         context_format.map(|format| format.compatibility_key.as_str()),
-        state.fallback_tool_argument_chars,
+        config.model.tool_output.fallback_argument_chars.get(),
     );
     state.metrics.record_histogram_with_labels(
         "model.request_build.convert_events_duration_ms",
@@ -23188,7 +23292,7 @@ async fn build_model_turn_request(
         metric_labels.clone(),
     );
     let prompt_cache_timer = state.metrics.timer();
-    let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
+    let prompt_cache = plan_prompt_cache(&mut messages, config.model.effective_prompt_cache_mode());
     state.metrics.record_histogram_with_labels(
         "model.request_build.prompt_cache_plan_duration_ms",
         prompt_cache_timer.elapsed_ms(),
@@ -23332,7 +23436,7 @@ async fn build_model_turn_request(
         provider_managed_context_request(
             compaction_policy.decision,
             status.context_window,
-            state.auto_compaction.proactive_threshold_percent,
+            config.model.compaction.proactive_threshold_percent,
             parameters.max_output_tokens,
             status.max_output_tokens,
         )
@@ -23365,8 +23469,10 @@ async fn build_model_turn_request(
         system_prompt: Some(system_prompt),
         messages,
         tools,
-        tool_call_policy: parallel_capabilities
-            .negotiate(state.tool_execution.parallel, bcode_model::ToolChoice::Auto),
+        tool_call_policy: parallel_capabilities.negotiate(
+            config.tools.execution.runtime_options().parallel,
+            bcode_model::ToolChoice::Auto,
+        ),
         structured_output: execution.structured_output.as_ref().map(|request| {
             bcode_model::StructuredOutputRequest {
                 name: bcode_session_models::structured_output_name(&request.name),
@@ -38642,6 +38748,50 @@ library = "test"
     }
 
     #[test]
+    fn client_runtime_config_transport_is_bounded_and_validated() {
+        let config = bcode_config::BcodeConfig::default();
+        let encoded = bcode_config::encode_effective_config(&config).expect("encode config");
+        let context = ClientRuntimeContext {
+            effective_config_toml: Some(Box::new(encoded)),
+            ..ClientRuntimeContext::default()
+        };
+        assert!(validate_client_effective_config(Some(&context)).is_ok());
+
+        let mut state = test_server_state(SessionManager::default());
+        state.startup_plugin_selection = bcode_config::plugin_selection_with_default_plugin_ids(
+            &config,
+            &state.default_plugin_ids,
+        );
+        assert!(validate_client_plugin_selection(&state, Some(&context)).is_ok());
+
+        let mut incompatible_config = config;
+        incompatible_config.plugins.enabled = BTreeSet::from(["extra.plugin".to_owned()]);
+        let incompatible = ClientRuntimeContext {
+            effective_config_toml: Some(
+                bcode_config::encode_effective_config(&incompatible_config)
+                    .expect("encode incompatible config")
+                    .into(),
+            ),
+            ..ClientRuntimeContext::default()
+        };
+        assert!(validate_client_plugin_selection(&state, Some(&incompatible)).is_err());
+
+        let invalid = ClientRuntimeContext {
+            effective_config_toml: Some(Box::new("[model\ninvalid".to_owned())),
+            ..ClientRuntimeContext::default()
+        };
+        assert!(validate_client_effective_config(Some(&invalid)).is_err());
+
+        let oversized = ClientRuntimeContext {
+            effective_config_toml: Some(Box::new(
+                "x".repeat(MAX_CLIENT_EFFECTIVE_CONFIG_BYTES + 1),
+            )),
+            ..ClientRuntimeContext::default()
+        };
+        assert!(validate_client_effective_config(Some(&oversized)).is_err());
+    }
+
+    #[test]
     fn interaction_adapter_advertisement_is_bounded_and_unique() {
         let adapter = bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
             producer_id: "example.plugin".to_owned(),
@@ -44220,7 +44370,8 @@ library = "test"
         let state = test_server_state(SessionManager::default());
         let selection = SessionModelSelection::default();
         assert!(
-            matching_provider_retry_policy(&state, &error, &selection, &[], &[]).is_none(),
+            matching_provider_retry_policy(&state.model_retry, &error, &selection, &[], &[])
+                .is_none(),
             "a non-retryable decode error must not match the generic transient policy"
         );
     }
@@ -44364,8 +44515,9 @@ library = "test"
             ..SessionModelSelection::default()
         };
 
-        let policy = matching_provider_retry_policy(&state, &error, &selection, &[], &[rule])
-            .expect("catalog retry pattern should match");
+        let policy =
+            matching_provider_retry_policy(&state.model_retry, &error, &selection, &[], &[rule])
+                .expect("catalog retry pattern should match");
 
         assert_eq!(
             policy.id,
@@ -44409,7 +44561,7 @@ library = "test"
         };
 
         let policy = matching_provider_retry_policy(
-            &state,
+            &state.model_retry,
             &error,
             &selection,
             &[],
@@ -44471,7 +44623,7 @@ library = "test"
         };
 
         let policy = matching_provider_retry_policy(
-            &state,
+            &state.model_retry,
             &error,
             &selection,
             &[],
@@ -44526,7 +44678,7 @@ library = "test"
 
         assert!(
             matching_provider_retry_policy(
-                &state,
+                &state.model_retry,
                 &error,
                 &SessionModelSelection::default(),
                 &[],
@@ -44677,8 +44829,9 @@ library = "test"
                 retry: None,
             };
 
-            let policy = matching_provider_retry_policy(&state, &error, &selection, &[], &[])
-                .expect("retryable server error should use transient policy");
+            let policy =
+                matching_provider_retry_policy(&state.model_retry, &error, &selection, &[], &[])
+                    .expect("retryable server error should use transient policy");
 
             assert_eq!(policy.id, "builtin.transient");
             assert_eq!(policy.max_retries, None);
@@ -44699,9 +44852,15 @@ library = "test"
             retry: None,
         };
         assert_eq!(
-            matching_provider_retry_policy(&state, &network_error, &selection, &[], &[])
-                .expect("retryable network error should use transient policy")
-                .id,
+            matching_provider_retry_policy(
+                &state.model_retry,
+                &network_error,
+                &selection,
+                &[],
+                &[]
+            )
+            .expect("retryable network error should use transient policy")
+            .id,
             "builtin.transient"
         );
     }
@@ -44751,7 +44910,8 @@ library = "test"
 
         for error in errors {
             assert!(
-                matching_provider_retry_policy(&state, &error, &selection, &[], &[]).is_none(),
+                matching_provider_retry_policy(&state.model_retry, &error, &selection, &[], &[])
+                    .is_none(),
                 "{} should not use transient policy",
                 error.code
             );
@@ -45029,7 +45189,7 @@ library = "test"
         let error = model_no_progress_timeout_error("timed out".to_string());
 
         let policy = matching_provider_retry_policy(
-            &state,
+            &state.model_retry,
             &error,
             &SessionModelSelection::default(),
             &[],
@@ -45052,7 +45212,7 @@ library = "test"
 
         assert!(
             matching_provider_retry_policy(
-                &state,
+                &state.model_retry,
                 &error,
                 &SessionModelSelection::default(),
                 &[],
@@ -45120,8 +45280,9 @@ library = "test"
             ..SessionModelSelection::default()
         };
 
-        let policy = matching_provider_retry_policy(&state, &error, &selection, &[], &[])
-            .expect("custom retry policy should match");
+        let policy =
+            matching_provider_retry_policy(&state.model_retry, &error, &selection, &[], &[])
+                .expect("custom retry policy should match");
 
         assert_eq!(policy.id, "custom.unsupported-content-type");
         assert_eq!(policy.max_retries, Some(2));
@@ -45162,7 +45323,10 @@ library = "test"
             ..SessionModelSelection::default()
         };
 
-        assert!(matching_provider_retry_policy(&state, &error, &selection, &[], &[]).is_none());
+        assert!(
+            matching_provider_retry_policy(&state.model_retry, &error, &selection, &[], &[])
+                .is_none()
+        );
     }
 
     #[test]
@@ -52874,9 +53038,12 @@ library = "test"
             plugins,
             ServerStateInit {
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
+                startup_plugin_selection: bcode_plugin::PluginSelection::default(),
+                default_plugin_ids: Vec::new(),
                 selected_provider_plugin_id: None,
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
+                startup_config: bcode_config::BcodeConfig::default(),
                 prompt_cache_mode: bcode_model::PromptCacheMode::Off,
                 conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
@@ -52885,10 +53052,8 @@ library = "test"
                 observability: bcode_config::ObservabilityConfig::default(),
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
-                max_tool_rounds: None,
                 tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
-                fallback_tool_argument_chars: 6_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
@@ -52896,7 +53061,6 @@ library = "test"
                 invariant_selector_model: None,
                 skills: None,
                 skill_context_bytes: Some(0),
-                skill_preview_max_chars: 2_000,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
@@ -62639,9 +62803,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
+                startup_plugin_selection: bcode_plugin::PluginSelection::default(),
+                default_plugin_ids: Vec::new(),
                 selected_provider_plugin_id: None,
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
+                startup_config: bcode_config::BcodeConfig::default(),
                 prompt_cache_mode: bcode_model::PromptCacheMode::default(),
                 conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
@@ -62650,10 +62817,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 observability: bcode_config::ObservabilityConfig::default(),
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
-                max_tool_rounds: None,
                 tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
-                fallback_tool_argument_chars: 6_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
@@ -62661,7 +62826,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 invariant_selector_model: None,
                 skills: None,
                 skill_context_bytes: Some(0),
-                skill_preview_max_chars: 2_000,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
@@ -63476,9 +63640,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
+                startup_plugin_selection: bcode_plugin::PluginSelection::default(),
+                default_plugin_ids: Vec::new(),
                 selected_provider_plugin_id: None,
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
+                startup_config: bcode_config::BcodeConfig::default(),
                 prompt_cache_mode: bcode_model::PromptCacheMode::default(),
                 conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
@@ -63487,10 +63654,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 observability: bcode_config::ObservabilityConfig::default(),
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
-                max_tool_rounds: None,
                 tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
-                fallback_tool_argument_chars: 6_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
@@ -63498,7 +63663,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 invariant_selector_model: None,
                 skills: None,
                 skill_context_bytes: Some(0),
-                skill_preview_max_chars: 2_000,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
@@ -63862,6 +64026,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &selection,
             &compaction_policy,
             &static_context,
+            &bcode_config::BcodeConfig::default(),
         )
         .await
         .expect("request builds");

@@ -347,7 +347,9 @@ fn current_runtime_context() -> ClientRuntimeContext {
             ..ClientRuntimeContext::default()
         };
     };
-    let effective_config_toml = bcode_config::encode_effective_config(&config).ok();
+    let effective_config_toml = bcode_config::encode_effective_config(&config)
+        .ok()
+        .map(Box::new);
     let mut env = CLIENT_RUNTIME_ENV_VARS
         .iter()
         .filter_map(|name| match std::env::var(name) {

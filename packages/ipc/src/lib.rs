@@ -1114,7 +1114,7 @@ pub struct ClientRuntimeContext {
     /// The IPC layer treats this as opaque portable data. The daemon's config owner validates and
     /// decodes it before use.
     #[serde(default)]
-    pub effective_config_toml: Option<String>,
+    pub effective_config_toml: Option<Box<String>>,
     #[serde(default)]
     pub selected_provider_plugin_id: Option<String>,
     #[serde(default)]
@@ -5748,6 +5748,7 @@ mod tests {
             build_fingerprint: BUILD_FINGERPRINT.to_owned(),
             runtime_context: Some(ClientRuntimeContext {
                 working_directory: Some(PathBuf::from("/tmp/client")),
+                effective_config_toml: None,
                 selected_provider_plugin_id: Some("bcode.openai-compatible".to_string()),
                 selected_model_id: Some("model".to_string()),
                 requested_model_id: None,
