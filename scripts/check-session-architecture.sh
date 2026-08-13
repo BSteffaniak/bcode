@@ -179,6 +179,7 @@ done
 for fixture in \
   packages/session/fixtures/migrations/unknown-future-event-kind-v39.json \
   packages/session/fixtures/migrations/current-schema-v43.json \
+  packages/session/fixtures/migrations/current-schema-v44.json \
   packages/session/fixtures/migrations/future-schema-v44.json \
   packages/session/fixtures/migrations/malformed-json-v39.json \
   packages/session/fixtures/migrations/mismatched-session-id-v39.json \

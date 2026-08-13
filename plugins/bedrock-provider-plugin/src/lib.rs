@@ -365,8 +365,18 @@ fn validate_declared_bedrock_features(
     request: &ModelTurnRequest,
     responses_surface: bool,
 ) -> Result<(), ProviderError> {
-    let unsupported =
-        request.explicitly_unsupported_features(&bedrock_feature_support_for(responses_surface));
+    let unsupported = request
+        .explicitly_unsupported_features(&bedrock_feature_support_for(responses_surface))
+        .into_iter()
+        .filter(|feature| {
+            !matches!(
+                feature,
+                bcode_model::RequestedModelFeature::MediaInput(
+                    bcode_model::MediaInputFeature::ImageReference
+                )
+            )
+        })
+        .collect::<Vec<_>>();
     unsupported.first().map_or(Ok(()), |feature| {
         Err(provider_error(
             "bedrock_feature_unsupported",
@@ -3558,6 +3568,7 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             is_default: default_model == Some(model_id.as_str()),
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: bedrock_model_capabilities(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -4307,6 +4318,7 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             display_name: candidate.display_name,
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: bedrock_model_capabilities(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -5987,6 +5999,77 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_messages_request_serializes_inline_tool_result_image() {
+        let mut request = test_model_turn_request();
+        request.messages = vec![ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "toolu_image".to_owned(),
+                    output: "image".to_owned(),
+                    is_error: false,
+                    content: vec![bcode_model::ToolResultContent::Image {
+                        image: bcode_model::ImageContent {
+                            mime_type: "image/png".to_owned(),
+                            data_base64: "AQID".to_owned(),
+                            metadata: bcode_model::ImageMetadata::default(),
+                        },
+                    }],
+                },
+            }],
+        }];
+
+        let value: serde_json::Value = serde_json::from_slice(
+            &build_anthropic_messages_request(&request).expect("request should serialize"),
+        )
+        .expect("request should be JSON");
+        assert_eq!(
+            value["messages"][0]["content"][0]["content"][1]["type"],
+            "image"
+        );
+        assert_eq!(
+            value["messages"][0]["content"][0]["content"][1]["source"]["data"],
+            "AQID"
+        );
+    }
+
+    #[test]
+    fn converse_request_serializes_inline_tool_result_image() {
+        let mut request = test_model_turn_request();
+        request.messages = vec![ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "toolu_image".to_owned(),
+                    output: "image".to_owned(),
+                    is_error: false,
+                    content: vec![bcode_model::ToolResultContent::Image {
+                        image: bcode_model::ImageContent {
+                            mime_type: "image/png".to_owned(),
+                            data_base64: "AQID".to_owned(),
+                            metadata: bcode_model::ImageMetadata::default(),
+                        },
+                    }],
+                },
+            }],
+        }];
+
+        let messages = model_messages_to_bedrock_messages(&request)
+            .expect("Converse request should serialize");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content().len(), 1);
+        let BedrockContentBlock::ToolResult(result) = &messages[0].content()[0] else {
+            panic!("tool result block");
+        };
+        assert!(
+            result
+                .content()
+                .iter()
+                .any(|content| matches!(content, ToolResultContentBlock::Image(_)))
+        );
+    }
+
+    #[test]
     fn anthropic_messages_request_serializes_tool_result_output() {
         let mut request = test_model_turn_request();
         request.messages = vec![ModelMessage {
@@ -7269,6 +7352,33 @@ mod tests {
             .expect_err("unknown required tool must fail");
         assert_eq!(error.code, "unknown_required_tool");
         assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+    }
+
+    #[test]
+    fn image_reference_tool_result_degrades_instead_of_failing_validation() {
+        let mut request = test_model_turn_request();
+        request.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "call-image".to_string(),
+                    output: "image returned".to_string(),
+                    is_error: false,
+                    content: vec![bcode_model::ToolResultContent::ImageRef {
+                        image: bcode_model::ImageRefContent {
+                            path: "/workspace/image.png".to_string(),
+                            mime_type: "image/png".to_string(),
+                            artifact_id: None,
+                            reference_key: None,
+                            metadata: bcode_model::ImageMetadata::default(),
+                        },
+                    }],
+                },
+            }],
+        }];
+
+        validate_bedrock_request(&request, false)
+            .expect("image references should use the adapter's text fallback");
     }
 
     fn test_model_turn_request() -> ModelTurnRequest {

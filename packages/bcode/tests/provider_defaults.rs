@@ -156,6 +156,7 @@ fn provider_registry_negotiates_parallel_only_when_provider_and_model_support_it
         is_default: true,
         context_window: None,
         max_output_tokens: None,
+        max_image_input_base64_bytes: None,
         capabilities: BTreeSet::from([
             ModelCapability::ToolCalls,
             ModelCapability::ParallelToolCalls,
@@ -230,6 +231,7 @@ fn selection_report_combines_registration_and_model_discovery_provenance() {
                     is_default: true,
                     context_window: None,
                     max_output_tokens: None,
+                    max_image_input_base64_bytes: None,
                     capabilities: BTreeSet::new(),
                     feature_support: ModelFeatureSupport::default(),
                     reasoning: None,

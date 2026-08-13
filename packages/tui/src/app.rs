@@ -1973,6 +1973,7 @@ impl BmuxApp {
                 is_default: false,
                 context_window: Some(context_window),
                 max_output_tokens: status.max_output_tokens,
+                max_image_input_base64_bytes: None,
                 capabilities: std::collections::BTreeSet::new(),
                 feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: status.reasoning.clone(),
@@ -7466,6 +7467,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "shared result".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -7538,6 +7540,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "shared failure".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -7587,6 +7590,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "shared result".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));

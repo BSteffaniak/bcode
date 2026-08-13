@@ -949,6 +949,9 @@ pub struct ModelInfo {
     pub context_window: Option<u32>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Maximum base64-encoded bytes accepted for one image input.
+    #[serde(default)]
+    pub max_image_input_base64_bytes: Option<u64>,
     #[serde(default)]
     pub capabilities: BTreeSet<ModelCapability>,
     /// Granular model claims. Missing claims are unknown and never guaranteed.
@@ -2357,6 +2360,10 @@ pub enum ToolResultContent {
 pub struct ImageRefContent {
     pub path: String,
     pub mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_key: Option<String>,
     #[serde(default)]
     pub metadata: ImageMetadata,
 }
@@ -3244,6 +3251,8 @@ mod tests {
                         image: super::ImageRefContent {
                             path: "artifact://image".to_string(),
                             mime_type: "image/png".to_string(),
+                            artifact_id: None,
+                            reference_key: None,
                             metadata: super::ImageMetadata::default(),
                         },
                     }],
@@ -3543,6 +3552,7 @@ mod tests {
                 is_default: false,
                 context_window: None,
                 max_output_tokens: None,
+                max_image_input_base64_bytes: None,
                 capabilities: std::collections::BTreeSet::new(),
                 feature_support: super::ModelFeatureSupport::default(),
                 reasoning: None,

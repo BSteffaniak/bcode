@@ -3772,6 +3772,8 @@ fn model_tool_result_content(
                 image: bcode_model::ImageRefContent {
                     path: image.path,
                     mime_type: image.mime_type,
+                    artifact_id: image.artifact_id,
+                    reference_key: image.reference_key,
                     metadata: model_image_metadata(image.metadata),
                 },
             }

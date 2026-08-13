@@ -5166,6 +5166,7 @@ mod tests {
                         result: Some(ToolInvocationResult::Json {
                             value: r#"{"opaque_result":true}"#.to_owned(),
                         }),
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -6362,6 +6363,7 @@ mod tests {
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -6511,6 +6513,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "written".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -6686,6 +6689,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "written".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -6789,6 +6793,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "written".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -6885,6 +6890,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "written".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -6929,6 +6935,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "canonical".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -7001,6 +7008,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "semantic".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -7410,6 +7418,7 @@ mod tests {
                         result: typed_result.then(|| ToolInvocationResult::Text {
                             text: "typed failure".to_owned(),
                         }),
+                        content: Vec::new(),
                     },
                 },
             ));
@@ -8230,6 +8239,7 @@ mod tests {
                         result: Some(ToolInvocationResult::Text {
                             text: format!("finished {invocation_id}"),
                         }),
+                        content: Vec::new(),
                     },
                 },
             ));
@@ -9329,6 +9339,7 @@ mod tests {
                             refs: Vec::new(),
                         }),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -9733,6 +9744,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "done".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         );
@@ -9898,6 +9910,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "done".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -10875,6 +10888,7 @@ mod tests {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ));
@@ -10943,6 +10957,7 @@ mod tests {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ));
@@ -11014,6 +11029,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "durable output".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));
@@ -11402,6 +11418,7 @@ mod tests {
                     result: Some(bcode_session_models::ToolInvocationResult::Text {
                         text: "done".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         ));

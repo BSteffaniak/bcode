@@ -549,6 +549,8 @@ mod tests {
                             image: bcode_model::ImageRefContent {
                                 path: "/tmp/shot.png".to_string(),
                                 mime_type: "image/png".to_string(),
+                                artifact_id: None,
+                                reference_key: None,
                                 metadata: bcode_model::ImageMetadata {
                                     width: Some(800),
                                     height: Some(600),
@@ -587,6 +589,8 @@ mod tests {
         let image = bcode_model::ImageRefContent {
             path: "/tmp/a.png".to_string(),
             mime_type: "image/png".to_string(),
+            artifact_id: None,
+            reference_key: None,
             metadata: bcode_model::ImageMetadata::default(),
         };
         let text = image_ref_text("call_9", &image);

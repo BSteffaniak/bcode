@@ -11,6 +11,7 @@
 
 pub(crate) mod context_accounting;
 pub(crate) mod context_compaction;
+mod image_input;
 mod invariant_guidance;
 mod model_ignores;
 mod request_routing;
@@ -23350,7 +23351,7 @@ async fn build_model_turn_request(
         true,
     )
     .await;
-    let request = ModelTurnRequest {
+    let mut request = ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
         model_id,
@@ -23385,6 +23386,8 @@ async fn build_model_turn_request(
     );
     let context_projection =
         projected_request_context(state, session_id, provider_plugin_id, &request).await;
+    image_input::hydrate_tool_result_images(state, session_id, provider_plugin_id, &mut request)
+        .await;
     Ok(PreparedModelRequest {
         request,
         context_projection,
@@ -28323,7 +28326,11 @@ fn session_events_to_sanitized_model_messages(
                                     tool_output_context_chars,
                                 ),
                                 is_error,
-                                content: tool_result_content_from_output(result),
+                                content: if record.content.is_empty() {
+                                    tool_result_content_from_output(result)
+                                } else {
+                                    model_tool_result_content(&record.content)
+                                },
                             },
                         },
                     );
@@ -28537,6 +28544,92 @@ fn working_directory_changed_message(
     )
 }
 
+fn session_tool_result_content(
+    content: &[ToolResultContent],
+) -> Vec<bcode_session_models::ToolResultContent> {
+    content
+        .iter()
+        .map(|content| match content {
+            ToolResultContent::Text { text } => {
+                bcode_session_models::ToolResultContent::Text { text: text.clone() }
+            }
+            ToolResultContent::Image { image } => bcode_session_models::ToolResultContent::Image {
+                image: bcode_session_models::ToolImageContent {
+                    mime_type: image.mime_type.clone(),
+                    data_base64: image.data_base64.clone(),
+                    metadata: session_image_metadata(&image.metadata),
+                },
+            },
+            ToolResultContent::ImageRef { image } => {
+                bcode_session_models::ToolResultContent::ImageRef {
+                    image: bcode_session_models::ToolImageRefContent {
+                        path: image.path.clone(),
+                        mime_type: image.mime_type.clone(),
+                        artifact_id: image.artifact_id.clone(),
+                        reference_key: image.reference_key.clone(),
+                        metadata: session_image_metadata(&image.metadata),
+                    },
+                }
+            }
+        })
+        .collect()
+}
+
+fn session_image_metadata(
+    metadata: &bcode_tool::ImageMetadata,
+) -> bcode_session_models::ToolImageMetadata {
+    bcode_session_models::ToolImageMetadata {
+        width: metadata.width,
+        height: metadata.height,
+        byte_len: metadata.byte_len,
+        source_path: metadata.source_path.clone(),
+    }
+}
+
+fn model_tool_result_content(
+    content: &[bcode_session_models::ToolResultContent],
+) -> Vec<bcode_model::ToolResultContent> {
+    content
+        .iter()
+        .map(|content| match content {
+            bcode_session_models::ToolResultContent::Text { text } => {
+                bcode_model::ToolResultContent::Text { text: text.clone() }
+            }
+            bcode_session_models::ToolResultContent::Image { image } => {
+                bcode_model::ToolResultContent::Image {
+                    image: bcode_model::ImageContent {
+                        mime_type: image.mime_type.clone(),
+                        data_base64: image.data_base64.clone(),
+                        metadata: model_session_image_metadata(&image.metadata),
+                    },
+                }
+            }
+            bcode_session_models::ToolResultContent::ImageRef { image } => {
+                bcode_model::ToolResultContent::ImageRef {
+                    image: bcode_model::ImageRefContent {
+                        path: image.path.clone(),
+                        mime_type: image.mime_type.clone(),
+                        artifact_id: image.artifact_id.clone(),
+                        reference_key: image.reference_key.clone(),
+                        metadata: model_session_image_metadata(&image.metadata),
+                    },
+                }
+            }
+        })
+        .collect()
+}
+
+fn model_session_image_metadata(
+    metadata: &bcode_session_models::ToolImageMetadata,
+) -> bcode_model::ImageMetadata {
+    bcode_model::ImageMetadata {
+        width: metadata.width,
+        height: metadata.height,
+        byte_len: metadata.byte_len,
+        source_path: metadata.source_path.clone(),
+    }
+}
+
 fn tool_result_content_from_output(output: &str) -> Vec<bcode_model::ToolResultContent> {
     let Some(marker_index) = output.find("\n\n[structured tool content attached]") else {
         return Vec::new();
@@ -28569,6 +28662,8 @@ fn parse_image_tool_content_note(line: &str) -> Option<ImageRefContent> {
     Some(ImageRefContent {
         path: source_path.clone(),
         mime_type: mime_type.unwrap_or_else(|| "image/png".to_string()),
+        artifact_id: None,
+        reference_key: None,
         metadata: ModelImageMetadata {
             width,
             height,
@@ -29087,6 +29182,7 @@ async fn append_tool_finished_event_inner(
                 invocation_id: tool_call_id.clone(),
                 model_output: model_output.clone(),
                 is_error,
+                content: session_tool_result_content(&content),
                 presentation,
                 result: semantic_result.clone(),
             },
@@ -38019,6 +38115,102 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn image_artifact_reader_hydrates_confined_finalized_bytes() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let session_id = sessions
+            .create_session(Some("image".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions.clone());
+        let artifact_root = default_session_artifact_dir(session_id);
+        let cancel_state = TurnCancelState::default();
+        let sink = SessionArtifactSink::new(artifact_root.clone(), "call-image", &cancel_state);
+        let resolution = sink
+            .write(
+                ToolArtifactWriteRequest {
+                    invocation_id: "call-image".to_owned(),
+                    artifact_id: "call-image-filesystem-image".to_owned(),
+                    content_type: "image/png".to_owned(),
+                    bytes: vec![1, 2, 3],
+                    metadata: serde_json::Value::Null,
+                },
+                test_artifact_scope("call-image").artifact_commit_guard(),
+            )
+            .await;
+        let ToolArtifactWriteResolution::Written { reference, .. } = resolution else {
+            panic!("artifact write");
+        };
+        let uri = reference["uri"].as_str().expect("artifact URI").to_owned();
+        sessions
+            .append_tool_invocation_result(
+                session_id,
+                bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-image".to_owned(),
+                    model_output: "image".to_owned(),
+                    is_error: false,
+                    content: Vec::new(),
+                    presentation: None,
+                    result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "call-image-filesystem-image".to_owned(),
+                            producer_plugin_id: "bcode.filesystem".to_owned(),
+                            schema: "bcode.filesystem.image".to_owned(),
+                            schema_version: 1,
+                            tool_call_id: Some("call-image".to_owned()),
+                            title: None,
+                            metadata: serde_json::Value::Null,
+                            refs: vec![bcode_session_models::ToolArtifactRef {
+                                key: "inline-image".to_owned(),
+                                content_type: Some("image/png".to_owned()),
+                                storage_uri: Some(uri),
+                                byte_len: Some(3),
+                                metadata: None,
+                            }],
+                        }),
+                    }),
+                },
+            )
+            .await
+            .expect("artifact result");
+
+        assert_eq!(
+            image_input::read_image_artifact(
+                &state,
+                session_id,
+                "call-image-filesystem-image",
+                "inline-image",
+                4,
+            )
+            .await
+            .expect("hydrate image"),
+            "AQID"
+        );
+        let history = sessions
+            .session_history(session_id)
+            .await
+            .expect("session history");
+        assert!(
+            !serde_json::to_string(&history)
+                .expect("history JSON")
+                .contains("AQID"),
+            "request-only base64 must not enter canonical session history"
+        );
+        let missing = image_input::read_image_artifact(
+            &state,
+            session_id,
+            "missing-artifact",
+            "inline-image",
+            4,
+        )
+        .await
+        .expect_err("missing artifact must degrade explicitly");
+        assert!(missing.contains("not found"));
+        remove_session_artifact_dir(&artifact_root).expect("artifact cleanup");
+    }
+
+    #[tokio::test]
     async fn session_artifact_sink_writes_bounded_owned_artifacts_transactionally() {
         let root = tempfile::tempdir().expect("artifact sink root");
         let cancel_state = TurnCancelState::default();
@@ -39227,6 +39419,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             )
@@ -39507,6 +39700,35 @@ library = "test"
         assert_increases(|request| {
             request.parameters.stop_sequences = vec!["stop sequence ".repeat(100)];
         });
+    }
+
+    #[test]
+    fn image_accounting_uses_dimensions() {
+        let baseline = request_for_accounting_tests();
+        let baseline_tokens = local_request_estimate(&baseline).tokens;
+        let mut reference = baseline;
+        reference.messages[0].content = vec![ContentBlock::ToolResult {
+            result: bcode_model::ToolResult {
+                call_id: "call-image".to_owned(),
+                output: "image".to_owned(),
+                is_error: false,
+                content: vec![bcode_model::ToolResultContent::ImageRef {
+                    image: bcode_model::ImageRefContent {
+                        path: "/workspace/image.png".to_owned(),
+                        mime_type: "image/png".to_owned(),
+                        artifact_id: Some("artifact".to_owned()),
+                        reference_key: Some("image".to_owned()),
+                        metadata: bcode_model::ImageMetadata {
+                            width: Some(750),
+                            height: Some(1),
+                            ..bcode_model::ImageMetadata::default()
+                        },
+                    },
+                }],
+            },
+        }];
+
+        assert!(local_request_estimate(&reference).tokens > baseline_tokens);
     }
 
     #[test]
@@ -41136,6 +41358,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 )
                 .await
@@ -42768,6 +42991,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -42798,6 +43022,7 @@ library = "test"
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         )];
@@ -42948,6 +43173,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ));
@@ -43535,6 +43761,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -43799,6 +44026,7 @@ library = "test"
                             is_error: false,
                             presentation: None,
                             result: None,
+                            content: Vec::new(),
                         },
                     },
                 ),
@@ -45187,6 +45415,7 @@ library = "test"
                 is_default: true,
                 context_window: Some(8_000),
                 max_output_tokens: Some(1_000),
+                max_image_input_base64_bytes: None,
                 capabilities: BTreeSet::new(),
                 feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
@@ -45202,6 +45431,7 @@ library = "test"
                 is_default: false,
                 context_window: Some(16_000),
                 max_output_tokens: Some(2_000),
+                max_image_input_base64_bytes: None,
                 capabilities: BTreeSet::new(),
                 feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
@@ -45396,6 +45626,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -45453,6 +45684,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -45534,6 +45766,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -45547,6 +45780,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -45618,6 +45852,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -45631,6 +45866,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -45644,6 +45880,7 @@ library = "test"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -62359,6 +62596,85 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(serde_json::from_str::<serde_json::Value>(&record.model_output).is_ok());
     }
 
+    #[tokio::test]
+    async fn tool_result_structured_content_survives_output_truncation() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("image content".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        let image = bcode_tool::ImageRefContent {
+            path: "/workspace/image.png".to_owned(),
+            mime_type: "image/png".to_owned(),
+            artifact_id: None,
+            reference_key: None,
+            metadata: bcode_tool::ImageMetadata {
+                width: Some(640),
+                height: Some(480),
+                byte_len: Some(42),
+                source_path: Some("/workspace/image.png".to_owned()),
+            },
+        };
+        let event = append_tool_finished_event_inner(
+            &state,
+            session_id,
+            ToolFinishedEventInput {
+                tool_call_id: "call-image".to_owned(),
+                result: "x".repeat(state.tool_output_context_chars + 1),
+                is_error: false,
+                content: vec![ToolResultContent::ImageRef {
+                    image: image.clone(),
+                }],
+                semantic_result: None,
+            },
+        )
+        .await
+        .expect("tool result event");
+        let SessionEventKind::ToolInvocationResultRecorded { record } = event.kind else {
+            panic!("expected tool result event");
+        };
+        assert!(matches!(
+            record.content.as_slice(),
+            [bcode_session_models::ToolResultContent::ImageRef { image: persisted }]
+                if persisted.path == image.path
+        ));
+
+        let messages = session_events_to_model_messages_with_limit(
+            &[
+                bcode_session_models::SessionEvent {
+                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    session_id,
+                    sequence: 1,
+                    timestamp_ms: 1,
+                    kind: SessionEventKind::ToolCallRequested {
+                        tool_call_id: "call-image".to_owned(),
+                        producer_plugin_id: None,
+                        tool_name: "filesystem.read".to_owned(),
+                        arguments_json: "{}".to_owned(),
+                        working_directory: None,
+                    },
+                    provenance: None,
+                },
+                bcode_session_models::SessionEvent {
+                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    session_id,
+                    sequence: 2,
+                    timestamp_ms: 2,
+                    kind: SessionEventKind::ToolInvocationResultRecorded { record },
+                    provenance: None,
+                },
+            ],
+            64,
+        );
+        assert!(messages.iter().any(|message| message.content.iter().any(|block| matches!(
+            block,
+            ContentBlock::ToolResult { result }
+                if matches!(result.content.as_slice(), [bcode_model::ToolResultContent::ImageRef { image }] if image.path == "/workspace/image.png")
+        ))));
+    }
+
     #[test]
     fn complete_artifact_recording_never_enters_model_prompt() {
         let session_id = SessionId::new();
@@ -62408,6 +62724,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                 }],
                             }),
                         }),
+                        content: Vec::new(),
                     },
                 },
             },
@@ -62451,6 +62768,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             },
@@ -62490,6 +62808,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -62503,6 +62822,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -62679,6 +62999,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),

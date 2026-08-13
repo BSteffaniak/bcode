@@ -146,6 +146,9 @@ pub struct ModelCatalogDefaults {
     /// Default maximum output tokens.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Default maximum base64-encoded bytes for one image input.
+    #[serde(default)]
+    pub max_image_input_base64_bytes: Option<u64>,
     /// Default capability metadata.
     #[serde(default)]
     pub capabilities: CatalogCapabilities,
@@ -193,6 +196,9 @@ pub struct ModelCatalogEntry {
     /// Maximum output tokens.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Maximum base64-encoded bytes for one image input.
+    #[serde(default)]
+    pub max_image_input_base64_bytes: Option<u64>,
     /// Provider-specific model family name.
     #[serde(default)]
     pub family: Option<String>,

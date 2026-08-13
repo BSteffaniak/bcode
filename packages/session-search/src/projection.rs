@@ -1977,6 +1977,7 @@ mod tests {
                             refs: Vec::new(),
                         }),
                     }),
+                    content: Vec::new(),
                 },
             },
         );
@@ -2191,6 +2192,7 @@ mod tests {
                             }],
                         }),
                     }),
+                    content: Vec::new(),
                 },
             },
         );
@@ -2224,6 +2226,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Json {
                         value: "{\"secret\":true}".to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         );

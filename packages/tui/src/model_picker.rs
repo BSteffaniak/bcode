@@ -785,6 +785,7 @@ mod tests {
             is_default: false,
             context_window,
             max_output_tokens: Some(16_000),
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::new(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,

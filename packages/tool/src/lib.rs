@@ -228,6 +228,10 @@ pub enum ToolResultContent {
 pub struct ImageRefContent {
     pub path: String,
     pub mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_key: Option<String>,
     #[serde(default)]
     pub metadata: ImageMetadata,
 }

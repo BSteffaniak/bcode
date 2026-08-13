@@ -28,7 +28,8 @@ pub fn local_request_estimate(
     ))
     .map_or(u64::MAX, |serialized| {
         estimated_tokens_from_chars(serialized.chars().count())
-    });
+    })
+    .saturating_add(image_tokens(&request.messages));
     bcode_session_models::LocalContextEstimate {
         tokens,
         algorithm_version: LOCAL_CONTEXT_ESTIMATOR_VERSION,
@@ -50,12 +51,56 @@ pub fn estimated_tokens_from_chars(chars: usize) -> u64 {
 }
 
 pub fn estimated_model_messages_tokens(messages: &[ModelMessage]) -> u64 {
-    serde_json::to_vec(messages).map_or(u64::MAX, |serialized| {
+    estimated_semantic_messages_tokens(messages)
+}
+
+fn estimated_semantic_messages_tokens(messages: &[ModelMessage]) -> u64 {
+    let structural = serde_json::to_vec(messages).map_or(u64::MAX, |serialized| {
         u64::try_from(serialized.len())
             .unwrap_or(u64::MAX)
             .saturating_add(3)
             / 4
-    })
+    });
+    structural.saturating_add(image_tokens(messages))
+}
+
+fn image_tokens(messages: &[ModelMessage]) -> u64 {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .map(|block| match block {
+            ContentBlock::Image { image } => image_metadata_tokens(&image.metadata),
+            ContentBlock::ToolResult { result } => result
+                .content
+                .iter()
+                .map(|content| match content {
+                    bcode_model::ToolResultContent::Image { image } => {
+                        image_metadata_tokens(&image.metadata)
+                    }
+                    bcode_model::ToolResultContent::ImageRef { image } => {
+                        image_metadata_tokens(&image.metadata)
+                    }
+                    bcode_model::ToolResultContent::Text { .. } => 0,
+                })
+                .sum(),
+            ContentBlock::Text { .. }
+            | ContentBlock::ToolCall { .. }
+            | ContentBlock::CachePoint { .. }
+            | ContentBlock::ProviderExtension { .. } => 0,
+        })
+        .sum()
+}
+
+fn image_metadata_tokens(metadata: &bcode_model::ImageMetadata) -> u64 {
+    metadata
+        .width
+        .zip(metadata.height)
+        .map_or(0, |(width, height)| {
+            u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_add(749)
+                / 750
+        })
 }
 
 pub fn model_message_context_chars(message: &ModelMessage) -> usize {
@@ -64,7 +109,11 @@ pub fn model_message_context_chars(message: &ModelMessage) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => text.chars().count(),
-            ContentBlock::Image { .. } | ContentBlock::CachePoint { .. } => 0,
+            ContentBlock::Image { image } => {
+                usize::try_from(image_metadata_tokens(&image.metadata).saturating_mul(4))
+                    .unwrap_or(usize::MAX)
+            }
+            ContentBlock::CachePoint { .. } => 0,
             ContentBlock::ToolCall { call } => {
                 call.name.chars().count() + call.arguments.to_string().chars().count()
             }

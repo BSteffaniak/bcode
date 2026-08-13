@@ -528,6 +528,7 @@ pub mod historical_event_families {
                     result: source
                         .semantic_result
                         .map(ToolInvocationResultDto::into_current),
+                    content: Vec::new(),
                 },
             }),
             metadata,

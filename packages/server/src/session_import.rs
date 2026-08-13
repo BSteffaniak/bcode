@@ -74,6 +74,7 @@ fn imported_session_event_kind(
                 is_error,
                 presentation: None,
                 result: Some(bcode_session_models::ToolInvocationResult::Text { text: result }),
+                content: Vec::new(),
             },
         },
         ImportableSessionEventKind::ModelUsage {

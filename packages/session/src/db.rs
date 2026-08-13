@@ -5735,6 +5735,7 @@ mod tests {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ))
@@ -5786,6 +5787,7 @@ mod tests {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ))
@@ -5993,6 +5995,7 @@ mod tests {
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),
@@ -6688,12 +6691,17 @@ mod tests {
             (
                 "current-schema-v43.json",
                 include_str!("../fixtures/migrations/current-schema-v43.json"),
+                ExpectedHistory::PersistedEventError,
+            ),
+            (
+                "current-schema-v44.json",
+                include_str!("../fixtures/migrations/current-schema-v44.json"),
                 ExpectedHistory::Sequences(&[0]),
             ),
             (
                 "future-schema-v44.json",
                 include_str!("../fixtures/migrations/future-schema-v44.json"),
-                ExpectedHistory::PersistedEventError,
+                ExpectedHistory::Sequences(&[0]),
             ),
             (
                 "malformed-json-v39.json",
@@ -8850,6 +8858,7 @@ mod tests {
                             }],
                         }),
                     }),
+                    content: Vec::new(),
                 },
             },
         ))
@@ -8995,6 +9004,7 @@ mod tests {
                         is_error,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ))

@@ -1375,6 +1375,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Json {
                         value: r#"{"ok":true}"#.to_owned(),
                     }),
+                    content: Vec::new(),
                 },
             },
         };

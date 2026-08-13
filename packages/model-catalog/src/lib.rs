@@ -5,9 +5,10 @@
 //! Model catalog loading, validation, and static artifact generation.
 
 use bcode_model::{
-    CapabilitySource, CapabilitySupport, ModelCacheCapability, ModelCacheInfo, ModelCapability,
-    ModelInfo, ModelMetadataSource, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
-    ModelReasoningCapabilitySource, ModelReasoningInfo, ModelTokenPrice, ToolChoiceMode,
+    CapabilitySource, CapabilitySupport, MediaInputFeature, ModelCacheCapability, ModelCacheInfo,
+    ModelCapability, ModelInfo, ModelMetadataSource, ModelPricingInfo, ModelPricingSource,
+    ModelPricingUnit, ModelReasoningCapabilitySource, ModelReasoningInfo, ModelTokenPrice,
+    ToolChoiceMode,
 };
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
@@ -393,6 +394,7 @@ impl ModelCatalogResolver {
                 is_default: false,
                 context_window: None,
                 max_output_tokens: None,
+                max_image_input_base64_bytes: None,
                 capabilities: std::collections::BTreeSet::new(),
                 feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
@@ -500,7 +502,13 @@ impl ModelCatalog {
 
     /// Enrich a provider-discovered model with catalog metadata.
     #[must_use]
-    pub fn enrich_model(&self, provider_id: &str, model: ModelInfo) -> ModelInfo {
+    pub fn enrich_model(&self, provider_id: &str, mut model: ModelInfo) -> ModelInfo {
+        if model.max_image_input_base64_bytes.is_none() {
+            model.max_image_input_base64_bytes = self
+                .provider(provider_id)
+                .and_then(|provider| provider.defaults.as_ref())
+                .and_then(|defaults| defaults.max_image_input_base64_bytes);
+        }
         if let Some(entry) = self.model(provider_id, &model.model_id) {
             enrich_from_entry(model, entry)
         } else {
@@ -867,6 +875,7 @@ fn model_info_from_catalog_entry_for_target(
             is_default: false,
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::new(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -890,12 +899,18 @@ fn enrich_from_defaults(mut model: ModelInfo, defaults: &ModelCatalogDefaults) -
         model.max_output_tokens = defaults.max_output_tokens;
         model.metadata_source = Some(ModelMetadataSource::ProviderDefault);
     }
+    if model.max_image_input_base64_bytes.is_none()
+        && defaults.max_image_input_base64_bytes.is_some()
+    {
+        model.max_image_input_base64_bytes = defaults.max_image_input_base64_bytes;
+        model.metadata_source = Some(ModelMetadataSource::ProviderDefault);
+    }
     model
         .capabilities
         .extend(capabilities_from_catalog(&defaults.capabilities));
-    apply_parallel_tool_feature_support(
+    apply_catalog_feature_support(
         &mut model,
-        defaults.capabilities.parallel_tool_calls,
+        &defaults.capabilities,
         CapabilitySource::BundledCatalog,
     );
     if model.cache.capabilities.is_empty() {
@@ -923,12 +938,17 @@ fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelIn
         model.max_output_tokens = entry.max_output_tokens;
         model.metadata_source = Some(catalog_source);
     }
+    if model.max_image_input_base64_bytes.is_none() && entry.max_image_input_base64_bytes.is_some()
+    {
+        model.max_image_input_base64_bytes = entry.max_image_input_base64_bytes;
+        model.metadata_source = Some(catalog_source);
+    }
     model
         .capabilities
         .extend(capabilities_from_catalog(&entry.capabilities));
-    apply_parallel_tool_feature_support(
+    apply_catalog_feature_support(
         &mut model,
-        entry.capabilities.parallel_tool_calls,
+        &entry.capabilities,
         if remote {
             CapabilitySource::ProviderApi
         } else {
@@ -1001,6 +1021,7 @@ fn model_info_from_catalog_entry(entry: &ModelCatalogEntry) -> ModelInfo {
         is_default: false,
         context_window: entry.context_window,
         max_output_tokens: entry.max_output_tokens,
+        max_image_input_base64_bytes: entry.max_image_input_base64_bytes,
         capabilities: capabilities_from_catalog(&entry.capabilities),
         feature_support: feature_support_from_catalog(
             &entry.capabilities,
@@ -1035,6 +1056,18 @@ fn feature_support_from_catalog(
     source: CapabilitySource,
 ) -> bcode_model::ModelFeatureSupport {
     let mut support = bcode_model::ModelFeatureSupport::default();
+    if capabilities.image_input {
+        support.media_input.extend([
+            (
+                MediaInputFeature::UserImage,
+                CapabilitySupport::Supported { source },
+            ),
+            (
+                MediaInputFeature::ToolResultImage,
+                CapabilitySupport::Supported { source },
+            ),
+        ]);
+    }
     if let Some(parallel) = capabilities.parallel_tool_calls {
         support.tool_choice.insert(
             ToolChoiceMode::Parallel,
@@ -1052,26 +1085,14 @@ fn feature_support_from_catalog(
     support
 }
 
-fn apply_parallel_tool_feature_support(
+fn apply_catalog_feature_support(
     model: &mut ModelInfo,
-    parallel: Option<bool>,
+    capabilities: &CatalogCapabilities,
     source: CapabilitySource,
 ) {
-    let Some(parallel) = parallel else {
-        return;
-    };
-    model.feature_support.tool_choice.insert(
-        ToolChoiceMode::Parallel,
-        if parallel {
-            CapabilitySupport::Supported { source }
-        } else {
-            CapabilitySupport::Unsupported {
-                source,
-                reason: "model catalog explicitly marks parallel tool calls unsupported"
-                    .to_string(),
-            }
-        },
-    );
+    let claims = feature_support_from_catalog(capabilities, source);
+    model.feature_support.tool_choice.extend(claims.tool_choice);
+    model.feature_support.media_input.extend(claims.media_input);
 }
 
 fn capabilities_from_catalog(
@@ -1080,6 +1101,9 @@ fn capabilities_from_catalog(
     let mut result = std::collections::BTreeSet::new();
     if capabilities.text_output {
         result.insert(ModelCapability::StreamingText);
+    }
+    if capabilities.image_input {
+        result.insert(ModelCapability::ImageInput);
     }
     if capabilities.tool_use {
         result.insert(ModelCapability::ToolCalls);
@@ -1495,6 +1519,7 @@ fn live_model_entry(
             .is_none()
             .then_some(live_model.max_output_tokens)
             .flatten(),
+        max_image_input_base64_bytes: None,
         family: None,
         provider_model_kind: None,
         replaced_by: None,
@@ -1769,6 +1794,7 @@ mod tests {
                             is_default: true,
                             context_window: None,
                             max_output_tokens: None,
+                            max_image_input_base64_bytes: None,
                             capabilities: std::collections::BTreeSet::new(),
                             feature_support: bcode_model::ModelFeatureSupport::default(),
                             reasoning: None,
@@ -1972,6 +1998,7 @@ mod tests {
             is_default: false,
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::default(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -2024,6 +2051,7 @@ mod tests {
             is_default: false,
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::from([ModelCapability::ToolCalls]),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -2198,6 +2226,7 @@ status = "stable"
             is_default: false,
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::new(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -2230,6 +2259,7 @@ status = "stable"
             is_default: false,
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::new(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -2263,6 +2293,7 @@ status = "stable"
                 is_default: false,
                 context_window: None,
                 max_output_tokens: None,
+                max_image_input_base64_bytes: None,
                 capabilities: std::collections::BTreeSet::new(),
                 feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
@@ -2300,6 +2331,7 @@ status = "stable"
                 is_default: false,
                 context_window: None,
                 max_output_tokens: None,
+                max_image_input_base64_bytes: None,
                 capabilities: std::collections::BTreeSet::new(),
                 feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
@@ -2319,6 +2351,31 @@ status = "stable"
     }
 
     #[test]
+    fn catalog_image_claims_are_explicit_and_non_vision_defaults_stay_unknown() {
+        let vision = CatalogCapabilities {
+            image_input: true,
+            ..CatalogCapabilities::default()
+        };
+        let vision_support =
+            feature_support_from_catalog(&vision, CapabilitySource::BundledCatalog);
+        assert!(
+            vision_support
+                .media_input(MediaInputFeature::ToolResultImage)
+                .is_guaranteed()
+        );
+        assert!(capabilities_from_catalog(&vision).contains(&ModelCapability::ImageInput));
+
+        let text_only = CatalogCapabilities::default();
+        let text_support =
+            feature_support_from_catalog(&text_only, CapabilitySource::BundledCatalog);
+        assert!(matches!(
+            text_support.media_input(MediaInputFeature::ToolResultImage),
+            CapabilitySupport::Unknown
+        ));
+        assert!(!capabilities_from_catalog(&text_only).contains(&ModelCapability::ImageInput));
+    }
+
+    #[test]
     fn bedrock_opus_5_uses_messages_with_adaptive_reasoning() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let discovered = bcode_model::ModelInfo {
@@ -2327,6 +2384,7 @@ status = "stable"
             is_default: false,
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::new(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -2337,6 +2395,20 @@ status = "stable"
             visibility: bcode_model::ModelVisibility::Visible,
         };
         let enriched = catalog.enrich_model("bedrock", discovered);
+        assert!(enriched.capabilities.contains(&ModelCapability::ImageInput));
+        assert!(
+            enriched
+                .feature_support
+                .media_input(MediaInputFeature::UserImage)
+                .is_guaranteed()
+        );
+        assert!(
+            enriched
+                .feature_support
+                .media_input(MediaInputFeature::ToolResultImage)
+                .is_guaranteed()
+        );
+        assert_eq!(enriched.max_image_input_base64_bytes, Some(5_242_880));
         assert_eq!(
             enriched.api_surface,
             Some(bcode_model::ModelApiSurface::Messages),
@@ -2368,6 +2440,7 @@ status = "stable"
             is_default: true,
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::new(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -2415,6 +2488,7 @@ status = "stable"
                 is_default: false,
                 context_window: None,
                 max_output_tokens: None,
+                max_image_input_base64_bytes: None,
                 capabilities: std::collections::BTreeSet::new(),
                 feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
@@ -2453,6 +2527,7 @@ status = "stable"
             is_default: false,
             context_window: None,
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::new(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
@@ -2545,6 +2620,7 @@ status = "stable"
                 is_default: true,
                 context_window: None,
                 max_output_tokens: None,
+                max_image_input_base64_bytes: None,
                 capabilities: std::collections::BTreeSet::new(),
                 feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
@@ -2651,6 +2727,7 @@ status = "stable"
             is_default: false,
             context_window: Some(360_000),
             max_output_tokens: None,
+            max_image_input_base64_bytes: None,
             capabilities: std::collections::BTreeSet::new(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,

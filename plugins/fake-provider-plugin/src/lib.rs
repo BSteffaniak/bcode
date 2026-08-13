@@ -1825,6 +1825,7 @@ fn models(has_context_window: bool, subset_reasoning: bool) -> ModelList {
             is_default: true,
             context_window: has_context_window.then_some(8_000),
             max_output_tokens: Some(1_000),
+            max_image_input_base64_bytes: None,
             capabilities: [
                 ModelCapability::StreamingText,
                 ModelCapability::ToolCalls,

@@ -291,7 +291,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 43;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 44;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -2253,6 +2253,53 @@ pub enum ToolInvocationResult {
     Artifact { artifact: Box<ToolArtifact> },
 }
 
+/// Structured model-visible content retained with a tool invocation result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultContent {
+    /// Plain text content.
+    Text { text: String },
+    /// Inline image bytes.
+    Image { image: ToolImageContent },
+    /// Durable image reference.
+    ImageRef { image: ToolImageRefContent },
+}
+
+/// Provider-neutral image reference retained in session history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolImageRefContent {
+    pub path: String,
+    pub mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_key: Option<String>,
+    #[serde(default)]
+    pub metadata: ToolImageMetadata,
+}
+
+/// Provider-neutral inline image retained in session history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolImageContent {
+    pub mime_type: String,
+    pub data_base64: String,
+    #[serde(default)]
+    pub metadata: ToolImageMetadata,
+}
+
+/// Image metadata retained independently of any renderer or provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolImageMetadata {
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub byte_len: Option<u64>,
+    #[serde(default)]
+    pub source_path: Option<String>,
+}
+
 /// Durable renderer-neutral terminal result of one tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationResultRecord {
@@ -2262,6 +2309,9 @@ pub struct ToolInvocationResultRecord {
     pub model_output: String,
     /// Whether the invocation reported an error.
     pub is_error: bool,
+    /// Structured model-visible content supplied by the tool owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ToolResultContent>,
     /// Latest retained plugin-owned presentation checkpoint at the terminal boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<bcode_tool_models::ToolPresentationUpdate>,
@@ -3624,6 +3674,7 @@ mod tests {
                         result: Some(ToolInvocationResult::Text {
                             text: "late".to_owned(),
                         }),
+                        content: Vec::new(),
                     },
                 },
             },

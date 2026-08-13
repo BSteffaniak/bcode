@@ -6220,6 +6220,7 @@ fn model_infos_from_items_without_catalog(
             display_name: model.id.clone(),
             context_window: provider_api_context_window(&model.metadata),
             max_output_tokens: provider_api_max_output_tokens(&model.metadata),
+            max_image_input_base64_bytes: None,
             capabilities: model_capabilities_for(&model),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
@@ -7748,6 +7749,7 @@ fn append_missing_model_items_from_ids(models: &mut Vec<ModelInfo>, model_ids: &
                 is_default: false,
                 context_window: None,
                 max_output_tokens: None,
+                max_image_input_base64_bytes: None,
                 capabilities: std::collections::BTreeSet::new(),
                 feature_support: bcode_model::ModelFeatureSupport::default(),
                 reasoning: None,
@@ -9360,6 +9362,8 @@ mod tests {
                         image: bcode_model::ImageRefContent {
                             path: "/tmp/image.png".to_string(),
                             mime_type: "image/png".to_string(),
+                            artifact_id: None,
+                            reference_key: None,
                             metadata: bcode_model::ImageMetadata {
                                 width: Some(100),
                                 height: Some(50),

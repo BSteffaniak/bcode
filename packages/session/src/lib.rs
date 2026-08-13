@@ -3210,6 +3210,7 @@ mod tests {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             )
             .await
@@ -4017,6 +4018,7 @@ mod tests {
                                 }],
                             }),
                         }),
+                        content: Vec::new(),
                     },
                 },
             )
@@ -4087,6 +4089,7 @@ mod tests {
                         result: Some(ToolInvocationResult::Artifact {
                             artifact: Box::new(artifact),
                         }),
+                        content: Vec::new(),
                     },
                 },
             },
@@ -4588,6 +4591,7 @@ mod tests {
                                     refs: Vec::new(),
                                 }),
                             }),
+                            content: Vec::new(),
                         },
                     },
                 )
@@ -5053,6 +5057,45 @@ mod tests {
     }
 
     #[test]
+    fn structured_tool_result_round_trips_through_bmux_codec() {
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: bcode_session_models::SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-image".to_owned(),
+                    model_output: "image".to_owned(),
+                    is_error: false,
+                    content: vec![bcode_session_models::ToolResultContent::ImageRef {
+                        image: bcode_session_models::ToolImageRefContent {
+                            path: "/workspace/image.png".to_owned(),
+                            mime_type: "image/png".to_owned(),
+                            artifact_id: Some("artifact".to_owned()),
+                            reference_key: Some("image".to_owned()),
+                            metadata: bcode_session_models::ToolImageMetadata {
+                                width: Some(640),
+                                height: Some(480),
+                                byte_len: Some(42),
+                                source_path: Some("/workspace/image.png".to_owned()),
+                            },
+                        },
+                    }],
+                    presentation: None,
+                    result: None,
+                },
+            },
+        };
+
+        let bytes = bmux_codec::to_vec(&event).expect("tool result should encode");
+        let decoded: SessionEvent =
+            bmux_codec::from_bytes(&bytes).expect("tool result should decode");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
     fn trace_event_round_trips_through_bmux_codec() {
         let mut metadata = BTreeMap::new();
         metadata.insert("conversation_hash".to_string(), "abc123".to_string());
@@ -5249,6 +5292,7 @@ mod tests {
             is_error: false,
             presentation: None,
             result: None,
+            content: Vec::new(),
         };
         let first = manager
             .append_tool_invocation_result(session.id, record)
@@ -5263,6 +5307,7 @@ mod tests {
                     is_error: true,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             )
             .await
@@ -5300,6 +5345,7 @@ mod tests {
             is_error: false,
             presentation: None,
             result: None,
+            content: Vec::new(),
         };
         let memory_first = memory_manager
             .append_tool_invocation_result(memory_session.id, memory_record.clone())
@@ -5368,6 +5414,7 @@ mod tests {
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             )
@@ -7427,6 +7474,10 @@ mod tests {
                 include_str!("../fixtures/migrations/current-schema-v43.json"),
             ),
             (
+                "current-schema-v44.json",
+                include_str!("../fixtures/migrations/current-schema-v44.json"),
+            ),
+            (
                 "future-schema-v44.json",
                 include_str!("../fixtures/migrations/future-schema-v44.json"),
             ),
@@ -8568,6 +8619,7 @@ mod tests {
                         payload: serde_json::json!({"must_not_persist": true}),
                     }),
                     result: None,
+                    content: Vec::new(),
                 },
             )
             .await;
@@ -9319,6 +9371,7 @@ mod tests {
                         is_error: false,
                         presentation: None,
                         result: None,
+                        content: Vec::new(),
                     },
                 },
             ),

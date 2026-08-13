@@ -674,6 +674,7 @@ mod tests {
                             refs: Vec::new(),
                         }),
                     }),
+                    content: Vec::new(),
                 },
             },
         );
@@ -735,6 +736,7 @@ mod tests {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ));
@@ -979,6 +981,7 @@ mod tests {
                             refs: Vec::new(),
                         }),
                     }),
+                    content: Vec::new(),
                 },
             },
         );
@@ -1573,6 +1576,7 @@ mod tests {
                             is_error: false,
                             presentation: None,
                             result: None,
+                            content: Vec::new(),
                         },
                     },
                 )),

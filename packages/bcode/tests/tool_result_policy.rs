@@ -42,6 +42,8 @@ async fn model_result_is_bounded_and_redacted_without_mutating_application_resul
                         image: ImageRefContent {
                             path: "/private/super-secret/image.png".to_string(),
                             mime_type: "image/png".to_string(),
+                            artifact_id: None,
+                            reference_key: None,
                             metadata: ImageMetadata {
                                 source_path: Some("/private/super-secret/source.png".to_string()),
                                 ..ImageMetadata::default()

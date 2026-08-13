@@ -2974,6 +2974,7 @@ fn transcript_renders_compact_tool_blocks_without_raw_arguments() {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ),
@@ -3096,6 +3097,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
                 is_error: false,
                 presentation: None,
                 result: None,
+                content: Vec::new(),
             },
         },
     ));
@@ -3217,6 +3219,7 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
                     columns: 80,
                     rows: 10,
                 })),
+                content: Vec::new(),
             },
         },
     )];
@@ -3259,6 +3262,7 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
                     columns: 80,
                     rows: 10,
                 })),
+                content: Vec::new(),
             },
         },
     )];
@@ -4147,6 +4151,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
                 is_error: false,
                 presentation: None,
                 result: None,
+                content: Vec::new(),
             },
         },
     ));
@@ -4268,6 +4273,7 @@ fn screenshot_scale_metadata_events_never_pollute_tool_frames_or_identity() {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ));
@@ -4552,6 +4558,7 @@ fn file_change_semantic_result_events(
                     summary: "wrote 2 bytes".to_owned(),
                     path: Some("file.txt".to_owned()),
                 })),
+                content: Vec::new(),
             },
         },
     ));
@@ -4583,6 +4590,7 @@ fn canonical_lifecycle_without_output_renders_final_result() {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ),
@@ -4629,6 +4637,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
                         columns: 80,
                         rows: 24,
                     })),
+                    content: Vec::new(),
                 },
             },
         ),
@@ -4691,6 +4700,7 @@ fn live_shell_result_replaces_request_block() {
                         stdout_bytes: Some(6),
                         stderr_bytes: Some(0),
                     })),
+                    content: Vec::new(),
                 },
             },
         ),
@@ -4735,6 +4745,7 @@ fn semantic_terminal_result_without_stream_renders_generic_artifact() {
                     columns: 80,
                     rows: 24,
                 })),
+                content: Vec::new(),
             },
         },
     )];
@@ -4773,6 +4784,7 @@ fn semantic_captured_shell_result_renders_generic_artifact() {
                     stdout_bytes: Some(16),
                     stderr_bytes: Some(16),
                 })),
+                content: Vec::new(),
             },
         },
     )];
@@ -4825,6 +4837,7 @@ fn legacy_terminal_result_renders_plain_tool_result() {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ),
@@ -4859,6 +4872,7 @@ fn semantic_text_result_renders_generic_tool_result() {
                 result: Some(ToolInvocationResult::Text {
                     text: "semantic text".to_owned(),
                 }),
+                content: Vec::new(),
             },
         },
     )];
@@ -5079,6 +5093,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         ));
@@ -5495,6 +5510,7 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
                         refs: Vec::new(),
                     }),
                 }),
+                content: Vec::new(),
             },
         },
     ));
@@ -6077,6 +6093,7 @@ fn live_question_artifact_renders_outcome_from_raw_metadata() {
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(question_outcome_artifact()),
                 }),
+                content: Vec::new(),
             },
         },
     ));
@@ -6104,6 +6121,7 @@ fn replayed_question_artifact_renders_outcome_from_raw_metadata() {
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(question_outcome_artifact()),
                 }),
+                content: Vec::new(),
             },
         },
     )];
@@ -6135,6 +6153,7 @@ fn live_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(shell_run_artifact()),
                 }),
+                content: Vec::new(),
             },
         },
     ));
@@ -6162,6 +6181,7 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(shell_run_artifact()),
                 }),
+                content: Vec::new(),
             },
         },
     )];
@@ -6210,6 +6230,7 @@ fn replayed_legacy_shell_artifact_does_not_read_files_during_render() {
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(artifact),
                 }),
+                content: Vec::new(),
             },
         },
     )];
@@ -6269,6 +6290,7 @@ fn canonical_generic_result_record_renders_filesystem_source_viewer() {
                         refs: Vec::new(),
                     }),
                 }),
+                content: Vec::new(),
             },
         },
     ));
@@ -6640,6 +6662,7 @@ fn same_raw_filesystem_events_render_same_live_and_replayed_tool_ui() {
                     result: Some(ToolInvocationResult::Artifact {
                         artifact: Box::new(filesystem_change_artifact()),
                     }),
+                    content: Vec::new(),
                 },
             },
         ),
@@ -6697,6 +6720,7 @@ fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(filesystem_change_artifact()),
                 }),
+                content: Vec::new(),
             },
         },
     ));
@@ -6726,6 +6750,7 @@ fn final_filesystem_artifact_renders_without_stream_fallback() {
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(filesystem_change_artifact()),
                 }),
+                content: Vec::new(),
             },
         },
     ));
@@ -6754,6 +6779,7 @@ fn replayed_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(filesystem_change_artifact()),
                 }),
+                content: Vec::new(),
             },
         },
     )];
@@ -6784,6 +6810,7 @@ fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_re
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(filesystem_change_artifact()),
                 }),
+                content: Vec::new(),
             },
         },
     )];
@@ -6849,6 +6876,7 @@ fn legacy_serialized_artifact_result_does_not_render_raw_json() {
                 is_error: false,
                 presentation: None,
                 result: None,
+                content: Vec::new(),
             },
         },
     )];
@@ -6898,6 +6926,7 @@ fn legacy_serialized_semantic_artifact_result_does_not_render_raw_json() {
                 is_error: false,
                 presentation: None,
                 result: None,
+                content: Vec::new(),
             },
         },
     )];
@@ -6940,6 +6969,7 @@ fn generic_artifact_fallback_projection_is_repeatable_and_non_mutating() {
                         refs: Vec::new(),
                     }),
                 }),
+                content: Vec::new(),
             },
         },
     )];

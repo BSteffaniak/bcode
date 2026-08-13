@@ -825,6 +825,7 @@ mod tests {
                         ],
                     }),
                 }),
+                content: Vec::new(),
             },
         };
         coordinator.observe_finalized_artifact(

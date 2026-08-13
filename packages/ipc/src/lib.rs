@@ -5414,6 +5414,7 @@ mod tests {
                     is_default: true,
                     context_window: Some(128_000),
                     max_output_tokens: Some(16_000),
+                    max_image_input_base64_bytes: None,
                     capabilities: BTreeSet::new(),
                     feature_support: bcode_model::ModelFeatureSupport::default(),
                     reasoning: None,
@@ -5503,6 +5504,7 @@ mod tests {
                     is_default: true,
                     context_window: Some(200_000),
                     max_output_tokens: Some(64_000),
+                    max_image_input_base64_bytes: None,
                     capabilities: BTreeSet::new(),
                     feature_support,
                     reasoning: None,
@@ -5906,6 +5908,7 @@ mod tests {
                     is_error: false,
                     presentation: None,
                     result: None,
+                    content: Vec::new(),
                 },
             },
         });
@@ -5960,6 +5963,7 @@ mod tests {
                     result: Some(ToolInvocationResult::Text {
                         text: "done".to_string(),
                     }),
+                    content: Vec::new(),
                 },
             },
             SessionEventKind::PermissionRequested {
@@ -6229,6 +6233,7 @@ mod tests {
                     is_error: false,
                     presentation: None,
                     result: Some(semantic_result),
+                    content: Vec::new(),
                 },
             },
         }

@@ -1226,6 +1226,7 @@ fn image_tool_response(
                 })),
             })
         });
+    let has_image_artifact = image_reference.is_some();
     let image_artifact = ToolInvocationResult::Artifact {
         artifact: Box::new(ToolArtifact {
             artifact_id: format!("{tool_call_id}-filesystem-image"),
@@ -1251,6 +1252,8 @@ fn image_tool_response(
             image: ImageRefContent {
                 path: path.display().to_string(),
                 mime_type: image.mime_type,
+                artifact_id: has_image_artifact.then(|| format!("{tool_call_id}-filesystem-image")),
+                reference_key: has_image_artifact.then(|| "inline-image".to_owned()),
                 metadata: ImageMetadata {
                     width: Some(image.width),
                     height: Some(image.height),
