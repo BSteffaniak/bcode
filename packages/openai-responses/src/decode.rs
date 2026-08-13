@@ -1024,6 +1024,60 @@ mod tests {
     }
 
     #[test]
+    fn tool_argument_deltas_preserve_realistic_fragment_order_after_start() {
+        let recorder = Recorder::default();
+        let mut calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let rename = |name: &str| name.replace('_', ".");
+        process_responses_output_item(
+            &serde_json::json!({
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_edit",
+                    "name": "filesystem_edit"
+                }
+            }),
+            &recorder,
+            &mut calls,
+            &mut saw_tool_call,
+            &rename,
+        );
+        for delta in [
+            r#"{"path":"src/lib.rs","old_text":"before""#,
+            r#", "new_text":"aft"#,
+            r#"er"}"#,
+        ] {
+            process_responses_function_arguments_delta(
+                &serde_json::json!({"output_index": 0, "delta": delta}),
+                &recorder,
+                &mut calls,
+            );
+        }
+        let events = recorder.events.borrow();
+        assert!(matches!(
+            events.first(),
+            Some(bcode_model::ProviderTurnEvent::ToolCallStarted { name, .. })
+                if name == "filesystem.edit"
+        ));
+        let deltas = events
+            .iter()
+            .filter_map(|event| match event {
+                bcode_model::ProviderTurnEvent::ToolCallDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deltas,
+            [
+                r#"{"path":"src/lib.rs","old_text":"before""#,
+                r#", "new_text":"aft"#,
+                r#"er"}"#,
+            ]
+        );
+    }
+
+    #[test]
     fn completed_tool_arguments_replace_accumulated_text() {
         let mut calls = BTreeMap::new();
         calls.insert(

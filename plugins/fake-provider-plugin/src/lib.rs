@@ -1474,37 +1474,57 @@ fn fake_tool_arguments_json(call: &ToolCall) -> String {
         "filesystem.edit" => &["path", "old_text", "new_text"],
         _ => return serde_json::to_string(&call.arguments).unwrap_or_default(),
     };
-    let mut ordered = serde_json::Map::new();
+    let mut fields = Vec::new();
     for key in ordered_keys {
         if let Some(value) = arguments.get(*key) {
-            ordered.insert((*key).to_owned(), value.clone());
+            fields.push(format!(
+                "{}:{}",
+                serde_json::to_string(key).unwrap_or_default(),
+                serde_json::to_string(value).unwrap_or_default()
+            ));
         }
     }
     for (key, value) in arguments {
-        if !ordered.contains_key(key) {
-            ordered.insert(key.clone(), value.clone());
+        if !ordered_keys.contains(&key.as_str()) {
+            fields.push(format!(
+                "{}:{}",
+                serde_json::to_string(key).unwrap_or_default(),
+                serde_json::to_string(value).unwrap_or_default()
+            ));
         }
     }
-    serde_json::to_string(&ordered).unwrap_or_default()
+    format!("{{{}}}", fields.join(","))
 }
 
-fn fake_tool_argument_split_index(call: &ToolCall, arguments: &str) -> usize {
-    let marker = match call.name.as_str() {
-        "filesystem.write" => "PTYFILESYSTEMFIRST",
-        "filesystem.edit" => "PTYFILESYSTEMSECOND",
-        _ => "",
+fn fake_tool_argument_split_indices(call: &ToolCall, arguments: &str) -> Vec<usize> {
+    let markers: &[&str] = match call.name.as_str() {
+        "filesystem.write" => &["PTYFILESYSTEMFIRST"],
+        "filesystem.edit" => &["PTYFILESYSTEMSECOND", "PTYFILESYSTEMEDI"],
+        _ => &[],
     };
-    if !marker.is_empty()
-        && let Some(index) = arguments.find(marker)
-    {
-        return index + marker.len();
+    let mut indices = markers
+        .iter()
+        .filter_map(|marker| {
+            arguments
+                .find(marker)
+                .map(|index| index.saturating_add(marker.len()))
+        })
+        .filter(|index| *index > 0 && *index < arguments.len())
+        .collect::<Vec<_>>();
+    if indices.is_empty() {
+        let split_target = arguments.len().saturating_mul(3) / 4;
+        let index = arguments
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index >= split_target)
+            .unwrap_or(arguments.len());
+        if index > 0 && index < arguments.len() {
+            indices.push(index);
+        }
     }
-    let split_target = arguments.len().saturating_mul(3) / 4;
-    arguments
-        .char_indices()
-        .map(|(index, _)| index)
-        .find(|index| *index >= split_target)
-        .unwrap_or(arguments.len())
+    indices.sort_unstable();
+    indices.dedup();
+    indices
 }
 
 fn dispatch_fake_reasoning_turn(
@@ -1600,8 +1620,13 @@ fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall, delta_delay: Option<Du
         name: call.name.clone(),
     });
     let arguments = fake_tool_arguments_json(&call);
-    let midpoint = fake_tool_argument_split_index(&call, &arguments);
-    let deltas = [&arguments[..midpoint], &arguments[midpoint..]];
+    let mut start = 0;
+    let mut deltas = Vec::new();
+    for end in fake_tool_argument_split_indices(&call, &arguments) {
+        deltas.push(&arguments[start..end]);
+        start = end;
+    }
+    deltas.push(&arguments[start..]);
     for delta in deltas {
         if !delta.is_empty() {
             turn.push(ProviderTurnEvent::ToolCallDelta {
@@ -2103,6 +2128,35 @@ mod tests {
             event,
             ProviderTurnEvent::ToolCallFinished { call: finished } if finished == &call
         )));
+    }
+
+    #[test]
+    fn fake_edit_turn_emits_old_text_then_partial_and_complete_new_text() {
+        let turn = FakeTurn::default();
+        let call = ToolCall {
+            id: "call-edit".to_owned(),
+            name: "filesystem.edit".to_owned(),
+            arguments: serde_json::json!({
+                "path": "pty-progressive.txt",
+                "old_text": "PTYFILESYSTEMSECOND",
+                "new_text": "PTYFILESYSTEMEDITED"
+            }),
+        };
+        finish_fake_tool_turn(&turn, call, None);
+        let deltas = turn
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::ToolCallDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas.len(), 3, "{deltas:?}");
+        assert!(deltas[0].contains("PTYFILESYSTEMSECOND"), "{deltas:?}");
+        assert!(!deltas[0].contains("new_text"));
+        assert!(deltas[1].contains("PTYFILESYSTEMEDI"));
+        assert!(!deltas[1].contains("TED"));
+        assert!(deltas[2].contains("TED"));
     }
 
     #[test]

@@ -154,11 +154,35 @@ fn request_draft_rows(
         );
     }
 
+    if operation == "edit"
+        && let (Some(path), Some(old_text)) = (path.as_deref(), old_text.as_deref())
+    {
+        let mut rows = card_header("Filesystem edit · assembling…");
+        push_path_kv(&mut rows, "path", Some(path), context);
+        push_kv(&mut rows, "received", number(payload, "argument_bytes"));
+        push_kv(&mut rows, "truncated", bool_text(payload, "truncated"));
+        push_kv(&mut rows, "state", Some("receiving original text"));
+        rows.push(Line::raw(""));
+        let theme = context.theme();
+        let options = SourcePreviewOptions::new(path, context.width())
+            .max_lines(20)
+            .line_prefix("  - ", theme.map_or_else(label, |theme| theme.diff.removed))
+            .source_style(theme.map_or_else(Style::new, |theme| theme.diff.text))
+            .truncated_message("  … original text preview truncated", label());
+        rows.extend(preview_lines_with_options(old_text, &options));
+        return rows;
+    }
+
     let mut rows = card_header(&format!("Filesystem {operation} · assembling…"));
     push_path_kv(&mut rows, "path", path.as_deref(), context);
     push_kv(&mut rows, "received", number(payload, "argument_bytes"));
     push_kv(&mut rows, "truncated", bool_text(payload, "truncated"));
-    push_kv(&mut rows, "state", Some("waiting for file content"));
+    let state = match (operation, path.is_some()) {
+        ("edit", true) => "waiting for original text",
+        ("write", true) => "waiting for file content",
+        _ => "waiting for file path",
+    };
+    push_kv(&mut rows, "state", Some(state));
     rows
 }
 
@@ -801,10 +825,16 @@ mod tests {
                 "after",
             ),
             (
+                "bcode.filesystem.request-draft.edit",
+                r#"{"path":"src/lib.rs","old_text":"before","new_text":""}"#,
+                false,
+                "before",
+            ),
+            (
                 "bcode.filesystem.request-draft.write",
                 "not-json-at-all",
                 true,
-                "waiting for file content",
+                "waiting for file path",
             ),
         ] {
             let payload = serde_json::json!({
@@ -826,6 +856,38 @@ mod tests {
             if truncated {
                 assert!(rendered.contains("yes"), "{rendered}");
             }
+        }
+    }
+
+    #[test]
+    fn progressive_edit_draft_renders_old_text_before_new_text_starts() {
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        for (preview, expected) in [
+            (r#"{"path":"src/lib.rs","old_text":"before"#, "before"),
+            (r#"{"path":"src/lib.rs","old_text":"before\nafter"#, "after"),
+        ] {
+            let payload = serde_json::json!({
+                "preview": preview,
+                "argument_bytes": preview.len(),
+                "truncated": false,
+            });
+            let rendered = request_draft_rows(
+                "bcode.filesystem.request-draft.edit",
+                &payload,
+                80,
+                &context,
+            )
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+            assert!(rendered.contains("receiving original text"), "{rendered}");
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains("waiting for file content"), "{rendered}");
         }
     }
 

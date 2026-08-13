@@ -3323,7 +3323,7 @@ mod tests {
                 ..bmux_tui_runtime::RuntimeConfig::default()
             },
         );
-        let draft = |revision, text: &str| {
+        let draft = |revision, operation, argument_bytes| {
             super::super::history_flow::SessionStreamUpdate::Event(Box::new(
                 bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
                     session_id,
@@ -3339,12 +3339,8 @@ mod tests {
                             placement: bcode_session_models::ToolContributionPlacement::Request,
                             generation: 1,
                             revision,
-                            operation:
-                                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
-                                    start_offset: 0,
-                                    text: text.to_owned(),
-                                },
-                            argument_bytes: text.len(),
+                            operation,
+                            argument_bytes,
                             truncated: false,
                         },
                     },
@@ -3363,15 +3359,36 @@ mod tests {
                 }),
             ))
         };
-        for update in [
-            draft(
-                1,
-                r#"{"path":"src/lib.rs","old_text":"before","new_text":"after"}"#,
-            ),
-            draft(
-                2,
-                r#"{"path":"src/lib.rs","old_text":"before","new_text":"after two"}"#,
-            ),
+        let fragments = [
+            r#"{"path":"src/lib.rs","#,
+            r#""old_text":"before""#,
+            r#", "new_text":"aft"#,
+            r#"er two"}"#,
+        ];
+        let mut offset: usize = 0;
+        let mut revision: u64 = 1;
+        let mut updates = Vec::new();
+        updates.push(draft(
+            revision,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: String::new(),
+            },
+            0,
+        ));
+        for fragment in fragments {
+            revision = revision.saturating_add(1);
+            offset = offset.saturating_add(fragment.len());
+            updates.push(draft(
+                revision,
+                bcode_session_models::ToolRequestDraftOperation::Append {
+                    offset: offset.saturating_sub(fragment.len()),
+                    text: fragment.to_owned(),
+                },
+                offset,
+            ));
+        }
+        updates.extend([
             durable(
                 1,
                 bcode_session_models::SessionEventKind::ToolCallRequested {
@@ -3396,7 +3413,8 @@ mod tests {
                     },
                 },
             ),
-        ] {
+        ]);
+        for update in updates {
             assert!(
                 handle
                     .try_send(super::BcodeRuntimeMessage::SessionStream(Box::new(update)))
@@ -3406,17 +3424,17 @@ mod tests {
         }
         let runtime_task = tokio::spawn(runtime.run());
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while handle.stats().frames_presented < 4 {
+            while handle.stats().frames_presented < 7 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("both edit draft and canonical handoff frames commit without external wakeup");
-        assert_eq!(handle.stats().frames_presented, 4);
+        .expect("fragmented edit drafts and canonical handoff commit without external wakeup");
+        assert_eq!(handle.stats().frames_presented, 7);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(
             handle.stats().frames_presented,
-            4,
+            7,
             "runtime remains idle after the edit handoff queue drains"
         );
         handle
@@ -3435,18 +3453,28 @@ mod tests {
             .expect("managed runtime exits")
             .expect("runtime task joins")
             .unwrap_or_else(|_| panic!("managed runtime succeeds"));
-        let first = output
+        let original = output
             .presenter
             .frames
             .iter()
-            .position(|frame| frame.text.contains("after") && !frame.text.contains("after two"))
-            .expect("first edit draft committed");
-        let second = output
+            .position(|frame| {
+                frame.text.contains("receiving original text")
+                    && frame.text.contains("before")
+                    && !frame.text.contains("new_text")
+            })
+            .expect("original edit text committed before replacement starts");
+        let partial = output
+            .presenter
+            .frames
+            .iter()
+            .position(|frame| frame.text.contains("aft") && !frame.text.contains("after two"))
+            .expect("partial replacement committed");
+        let complete = output
             .presenter
             .frames
             .iter()
             .position(|frame| frame.text.contains("after two"))
-            .expect("second edit draft committed");
+            .expect("complete replacement committed");
         let result = output
             .presenter
             .frames
@@ -3454,7 +3482,7 @@ mod tests {
             .position(|frame| frame.text.contains("edited src/lib.rs"))
             .expect("canonical edit result committed");
         assert!(
-            first < second && second < result,
+            original < partial && partial < complete && complete < result,
             "frames: {:?}",
             output.presenter.frames
         );
@@ -3485,7 +3513,7 @@ mod tests {
             1,
             "invocation identity changed across frames"
         );
-        assert_eq!(output.stats.frames_presented, 5);
+        assert_eq!(output.stats.frames_presented, 8);
     }
 
     #[tokio::test]

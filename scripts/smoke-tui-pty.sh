@@ -104,6 +104,7 @@ model_id = "fake-echo"
 
 [model.profiles.pty-smoke.settings]
 fake_stream_delta_delay_ms = "500"
+fake_tool_delta_delay_ms = "500"
 
 # Shared stream presentation is enabled explicitly in PTY acceptance so fake-provider
 # chunk delivery exercises the normal renderer-neutral smoothing path.
@@ -329,6 +330,8 @@ filesystem_final_after_draft = False
 filesystem_final_seen_before_draft = False
 filesystem_draft_identity_stable = True
 filesystem_edit_draft_before_finish = False
+filesystem_edit_old_text_before_new = False
+filesystem_edit_partial_new_before_finish = False
 filesystem_edit_second_draft_before_finish = False
 filesystem_edit_final_after_draft = False
 filesystem_edit_final_seen_before_draft = False
@@ -379,6 +382,7 @@ final_marker = b"FRESHFINALOUTPUT"
 filesystem_path_marker = b"pty-progressive.txt"
 filesystem_first_marker = b"PTYFILESYSTEMFIRST"
 filesystem_second_marker = b"PTYFILESYSTEMSECOND"
+filesystem_edit_partial_marker = b"PTYFILESYSTEMEDI"
 filesystem_edit_marker = b"PTYFILESYSTEMEDITED"
 assistant_prefix_marker = b"ASSISTANTPREFIX"
 assistant_suffix_marker = b"ASSISTANTSUFFIX"
@@ -515,11 +519,24 @@ while time.monotonic() < deadline:
                 b"editing file" in lower_screen
                 and filesystem_path_marker in screen
             )
-            filesystem_edit_second_draft = (
-                b"editing file" in lower_screen
-                and filesystem_path_marker in screen
+            filesystem_edit_old_only = (
+                b"receiving original text" in lower_screen
                 and filesystem_second_marker in screen
-                and filesystem_edit_marker in screen
+                and b"new_text" not in screen
+            )
+            edit_diff_lines = [
+                line
+                for line in screen.splitlines()
+                if filesystem_second_marker in line
+                and (b"+   " in line or b"+     " in line)
+            ]
+            filesystem_edit_partial_new = any(
+                filesystem_edit_partial_marker in line
+                and filesystem_edit_marker not in line
+                for line in edit_diff_lines
+            )
+            filesystem_edit_second_draft = any(
+                filesystem_edit_marker in line for line in edit_diff_lines
             )
             filesystem_edit_final = b"applied 1 replacement" in lower_screen
             if (
@@ -529,6 +546,14 @@ while time.monotonic() < deadline:
             ):
                 filesystem_edit_draft_before_finish = True
                 filesystem_edit_draft_identity_stable &= lower_screen.count(b"editing file") == 1
+            if filesystem_edit_old_only and not filesystem_edit_final:
+                filesystem_edit_draft_before_finish = True
+                filesystem_edit_old_text_before_new = True
+                filesystem_edit_draft_identity_stable &= lower_screen.count(b"filesystem edit") == 1
+            if filesystem_edit_partial_new and not filesystem_edit_final:
+                filesystem_edit_draft_before_finish = True
+                filesystem_edit_partial_new_before_finish = True
+                filesystem_edit_draft_identity_stable &= lower_screen.count(b"filesystem edit") == 1
             if filesystem_edit_second_draft and not filesystem_edit_final:
                 filesystem_edit_draft_before_finish = True
                 filesystem_edit_second_draft_before_finish = True
@@ -757,6 +782,8 @@ while time.monotonic() < deadline:
         and filesystem_second_draft_before_finish
         and filesystem_final_after_draft
         and filesystem_edit_draft_before_finish
+        and filesystem_edit_old_text_before_new
+        and filesystem_edit_partial_new_before_finish
         and filesystem_edit_second_draft_before_finish
         and filesystem_edit_final_after_draft
         and assistant_request_sent
@@ -869,6 +896,8 @@ checks = {
     "filesystem draft has one invocation presentation": filesystem_draft_identity_stable,
     "filesystem edit request sent": filesystem_edit_request_sent,
     "filesystem edit first draft visible before completion": filesystem_edit_draft_before_finish,
+    "filesystem edit old text visible before new text": filesystem_edit_old_text_before_new,
+    "filesystem edit partial new text visible before completion": filesystem_edit_partial_new_before_finish,
     "filesystem edit second draft visible before completion": filesystem_edit_second_draft_before_finish,
     "filesystem edit final did not precede draft": not filesystem_edit_final_seen_before_draft,
     "filesystem edit final visible after draft": filesystem_edit_final_after_draft,
