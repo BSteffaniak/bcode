@@ -11,9 +11,10 @@ use bcode_agent_policy::{
 };
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
-    AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
-    OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, OP_RESOLVE_POLICY_PROFILE_IDENTITY,
-    PolicyStatusResponse, ResolveAgentPolicyProfileIdentityRequest,
+    AgentInfo, AgentList, AgentListRequest, EvaluateToolCallRequest, EvaluateToolCallResponse,
+    OP_AGENT_CONTEXT, OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS,
+    OP_RESOLVE_POLICY_PROFILE_IDENTITY, PolicyStatusResponse,
+    ResolveAgentPolicyProfileIdentityRequest,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::Deserialize;
@@ -92,7 +93,7 @@ impl RustPlugin for DefaultAgentsPlugin {
             );
         }
         match context.request.operation.as_str() {
-            OP_LIST_AGENTS => json_response(&agent_list()),
+            OP_LIST_AGENTS => list_agents(&context.request),
             OP_AGENT_CONTEXT => agent_context(&context.request),
             OP_EVALUATE_TOOL_CALL => evaluate_tool(&context.request),
             OP_POLICY_STATUS => json_response(&policy_status()),
@@ -105,8 +106,29 @@ impl RustPlugin for DefaultAgentsPlugin {
     }
 }
 
-fn agent_list() -> AgentList {
-    let (config, _) = load_config();
+fn config_from_effective_toml(contents: Option<&str>) -> Option<bcode_config::BcodeConfig> {
+    contents.and_then(|contents| bcode_config::decode_effective_config(contents).ok())
+}
+
+fn policy_and_tools_from_effective_toml(
+    contents: Option<&str>,
+) -> Option<(AgentPermissionConfig, bcode_config::ToolsConfig)> {
+    config_from_effective_toml(contents).map(|config| {
+        (
+            AgentPermissionConfig {
+                agent: config.agent,
+            },
+            config.tools,
+        )
+    })
+}
+
+fn agent_list_with_config(effective_config_toml: Option<&str>) -> AgentList {
+    let config = config_from_effective_toml(effective_config_toml)
+        .map(|config| AgentPermissionConfig {
+            agent: config.agent,
+        })
+        .map_or_else(|| load_config().0, |config| config);
     let plan = agent_config(&config, PLAN_AGENT);
     let build = agent_config(&config, BUILD_AGENT);
     AgentList {
@@ -135,14 +157,26 @@ fn agent_list() -> AgentList {
     }
 }
 
+fn list_agents(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<AgentListRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    json_response(&agent_list_with_config(
+        request.effective_config_toml.as_deref().map(String::as_str),
+    ))
+}
+
 fn agent_context(request: &ServiceRequest) -> ServiceResponse {
     let request = match request.payload_json::<AgentContextRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    let (config, _) = load_config();
+    let (config, tools_config) = policy_and_tools_from_effective_toml(
+        request.effective_config_toml.as_deref().map(String::as_str),
+    )
+    .unwrap_or_else(|| (load_config().0, load_tools_config()));
     let mut agent = agent_config(&config, &request.agent_id);
-    let tools_config = load_tools_config();
     apply_tool_selection(&mut agent, &tools_config, &request.available_tools);
     let enabled_tools = Some(enabled_tools_from_available_metadata(
         active_tools_for(&agent),
@@ -233,9 +267,11 @@ fn evaluate_tool_request(
         request.cwd.as_deref().map(PathBuf::from).ok_or_else(|| {
             "tool policy requires an explicit session working directory".to_string()
         })?;
-    let (config, _) = load_config();
+    let (config, tools_config) = policy_and_tools_from_effective_toml(
+        request.effective_config_toml.as_deref().map(String::as_str),
+    )
+    .unwrap_or_else(|| (load_config().0, load_tools_config()));
     let mut agent = agent_config(&config, &request.agent_id);
-    let tools_config = load_tools_config();
     apply_tool_selection_for_evaluation(&mut agent, &tools_config, &request.tool_name);
     if let Some(pinned) = &request.policy_profile {
         let current = policy_profile_identity(&request.agent_id)?;

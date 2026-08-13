@@ -160,6 +160,7 @@ pub fn runtime_permission_request_to_profile_request(
         requires_permission: metadata.requires_permission,
         policy_profile: None,
         cwd: Some(cwd.to_string_lossy().into_owned()),
+        effective_config_toml: None,
     })
 }
 

@@ -46,7 +46,7 @@ pub mod session_search;
 
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
-    AgentInfo, AgentList, AgentPolicyProfileIdentity, EvaluateToolCallRequest,
+    AgentInfo, AgentList, AgentListRequest, AgentPolicyProfileIdentity, EvaluateToolCallRequest,
     EvaluateToolCallResponse, OP_AGENT_CONTEXT, OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS,
     OP_POLICY_STATUS, OP_RESOLVE_POLICY_PROFILE_IDENTITY, PolicyStatusResponse,
     ResolveAgentPolicyProfileIdentityRequest, ToolPolicyAuthorizationMetadata,
@@ -13104,7 +13104,7 @@ async fn handle_list_agents(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let agents = list_profiles(state).await;
+    let agents = list_profiles(state, None).await;
     send_response(
         writer,
         request_id,
@@ -16054,7 +16054,7 @@ async fn workflow_authoring_catalog_snapshot(
         .into_iter()
         .map(|action| (action.catalog_key(), action))
         .collect::<BTreeMap<_, _>>();
-    let profiles = list_profiles(state)
+    let profiles = list_profiles(state, None)
         .await
         .into_iter()
         .flat_map(|agent| std::iter::once(agent.id).chain(agent.aliases))
@@ -16807,6 +16807,11 @@ async fn start_workflow_run(
             OP_RESOLVE_POLICY_PROFILE_IDENTITY,
             &ResolveAgentPolicyProfileIdentityRequest {
                 profile_id: session_agent_selection(state, parent_session.id).await,
+                effective_config_toml: bcode_config::encode_effective_config(
+                    &state.session_config(parent_session.id).await,
+                )
+                .ok()
+                .map(Box::new),
             },
         )
         .await
@@ -22599,13 +22604,21 @@ fn append_missing_enabled_tool_diagnostics(
     }
 }
 
-async fn list_profiles(state: &ServerState) -> Vec<AgentInfo> {
+async fn list_profiles(
+    state: &ServerState,
+    config: Option<&bcode_config::BcodeConfig>,
+) -> Vec<AgentInfo> {
+    let request = AgentListRequest {
+        effective_config_toml: config
+            .and_then(|config| bcode_config::encode_effective_config(config).ok())
+            .map(Box::new),
+    };
     state
         .plugins
         .invoke_service_by_interface_json::<_, AgentList>(
             AGENT_PROFILE_INTERFACE_ID,
             OP_LIST_AGENTS,
-            &serde_json::json!({}),
+            &request,
         )
         .await
         .ok()
@@ -22616,7 +22629,7 @@ async fn warn_on_unregistered_agent_ids(state: &ServerState, configured_agent_id
     if configured_agent_ids.is_empty() {
         return;
     }
-    let registered: BTreeSet<String> = list_profiles(state)
+    let registered: BTreeSet<String> = list_profiles(state, None)
         .await
         .into_iter()
         .flat_map(|agent| std::iter::once(agent.id).chain(agent.aliases))
@@ -22645,10 +22658,13 @@ fn default_profiles() -> Vec<AgentInfo> {
 }
 
 async fn resolve_agent_id(state: &ServerState, agent_id: &str) -> Option<String> {
-    list_profiles(state).await.into_iter().find_map(|agent| {
-        (agent.id == agent_id || agent.aliases.iter().any(|alias| alias == agent_id))
-            .then_some(agent.id)
-    })
+    list_profiles(state, None)
+        .await
+        .into_iter()
+        .find_map(|agent| {
+            (agent.id == agent_id || agent.aliases.iter().any(|alias| alias == agent_id))
+                .then_some(agent.id)
+        })
 }
 
 async fn session_agent_selection(state: &ServerState, session_id: SessionId) -> String {
@@ -22659,7 +22675,7 @@ async fn session_agent_selection(state: &ServerState, session_id: SessionId) -> 
         if let Ok(Some(agent_id)) = state.sessions.current_agent_selection(session_id).await {
             agent_id
         } else {
-            default_agent_id(&list_profiles(state).await)
+            default_agent_id(&list_profiles(state, None).await)
         };
     state
         .session_agent_selections
@@ -22682,10 +22698,14 @@ async fn agent_context(
     session_id: SessionId,
     agent_id: &str,
 ) -> Option<AgentContextResponse> {
+    let config = state.session_config(session_id).await;
     let request = AgentContextRequest {
         session_id,
         agent_id: agent_id.to_string(),
         available_tools: collect_tool_definitions(state).await,
+        effective_config_toml: bcode_config::encode_effective_config(&config)
+            .ok()
+            .map(Box::new),
     };
     state
         .plugins
@@ -27738,6 +27758,7 @@ async fn evaluate_agent_tool_policy_with_metadata(
         .chain(metadata.permission_category.iter().cloned())
         .chain(metadata.aliases.iter().cloned())
         .collect();
+    let config = state.session_config(session_id).await;
     let request = EvaluateToolCallRequest {
         session_id,
         agent_id: agent_id.to_string(),
@@ -27747,6 +27768,9 @@ async fn evaluate_agent_tool_policy_with_metadata(
         requires_permission: metadata.requires_permission,
         policy_profile,
         cwd,
+        effective_config_toml: bcode_config::encode_effective_config(&config)
+            .ok()
+            .map(Box::new),
     };
     state
         .plugins

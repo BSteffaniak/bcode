@@ -55,6 +55,13 @@ pub struct AgentInfo {
     pub is_default: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentListRequest {
+    /// Fully resolved declarative configuration encoded as TOML by the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_config_toml: Option<Box<String>>,
+}
+
 /// Response returned by [`OP_LIST_AGENTS`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentList {
@@ -72,6 +79,9 @@ pub struct AgentContextRequest {
     /// Tool definitions discovered from currently loaded tool provider plugins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_tools: Vec<ToolDefinition>,
+    /// Fully resolved declarative configuration encoded as TOML by the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_config_toml: Option<Box<String>>,
 }
 
 /// Response returned by [`OP_AGENT_CONTEXT`].
@@ -352,6 +362,9 @@ pub struct EvaluateToolCallRequest {
     /// Host current working directory for path-boundary policy checks.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Fully resolved declarative configuration encoded as TOML by the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_config_toml: Option<Box<String>>,
 }
 
 /// Structured shell-policy diagnostic for permission prompts, traces, and debugging.
@@ -437,6 +450,8 @@ pub struct AgentPolicyProfileIdentity {
 #[serde(deny_unknown_fields)]
 pub struct ResolveAgentPolicyProfileIdentityRequest {
     pub profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_config_toml: Option<Box<String>>,
 }
 
 /// Construct and validate one normalized policy/profile identity.
