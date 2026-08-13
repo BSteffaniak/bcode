@@ -10757,6 +10757,7 @@ mod tests {
                     id: Some("provider-call-second".to_owned()),
                     name: Some("second_tool".to_owned()),
                     arguments: r#"{"position":2}"#.to_owned(),
+                    emitted_argument_bytes: 0,
                     started: true,
                 },
             ),
@@ -10766,6 +10767,7 @@ mod tests {
                     id: Some("provider-call-first".to_owned()),
                     name: Some("first_tool".to_owned()),
                     arguments: r#"{"position":1}"#.to_owned(),
+                    emitted_argument_bytes: 0,
                     started: true,
                 },
             ),
@@ -10807,6 +10809,7 @@ mod tests {
                 id: Some("provider-call-malformed".to_owned()),
                 name: Some("broken_tool".to_owned()),
                 arguments: r#"{"unterminated""#.to_owned(),
+                emitted_argument_bytes: 0,
                 started: true,
             },
         )]);
@@ -12037,6 +12040,7 @@ mod tests {
                 id: Some("call_partial".to_string()),
                 name: Some("filesystem_write".to_string()),
                 arguments: r#"{"path":"unterminated"#.to_string(),
+                emitted_argument_bytes: 0,
                 started: true,
             },
         )]);

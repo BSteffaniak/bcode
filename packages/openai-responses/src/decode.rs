@@ -17,6 +17,8 @@ pub struct ToolCallAccumulator {
     pub name: Option<String>,
     /// Accumulated serialized JSON arguments.
     pub arguments: String,
+    /// Number of accumulated argument bytes already emitted as normalized deltas.
+    pub emitted_argument_bytes: usize,
     /// Whether a start event was already reported.
     pub started: bool,
 }
@@ -246,6 +248,7 @@ pub fn process_responses_function_arguments_delta(
                 call_id: call_id.clone(),
                 delta: delta.to_string(),
             });
+            entry.emitted_argument_bytes = entry.arguments.len();
         }
     }
 }
@@ -361,6 +364,14 @@ pub fn process_responses_output_item(
             name: resolve_tool_name(name),
         });
         entry.started = true;
+    }
+    if entry.started
+        && entry.emitted_argument_bytes < entry.arguments.len()
+        && let Some(call_id) = entry.id.clone()
+    {
+        let delta = entry.arguments[entry.emitted_argument_bytes..].to_owned();
+        sink.push(bcode_model::ProviderTurnEvent::ToolCallDelta { call_id, delta });
+        entry.emitted_argument_bytes = entry.arguments.len();
     }
 }
 
@@ -916,11 +927,16 @@ mod tests {
 
         assert!(saw_tool_call);
         let events = recorder.events.borrow();
-        assert_eq!(events.len(), 1, "start must be reported exactly once");
+        assert_eq!(events.len(), 2, "start and arguments emit exactly once");
         assert!(matches!(
             &events[0],
             bcode_model::ProviderTurnEvent::ToolCallStarted { call_id, name }
                 if call_id == "call_1" && name == "original::provider_name"
+        ));
+        assert!(matches!(
+            &events[1],
+            bcode_model::ProviderTurnEvent::ToolCallDelta { call_id, delta }
+                if call_id == "call_1" && delta == "{}"
         ));
         assert_eq!(calls[&0].arguments, "{}");
     }
@@ -1021,6 +1037,68 @@ mod tests {
             &mut calls,
         );
         assert_eq!(recorder.events.borrow().len(), 1);
+    }
+
+    #[test]
+    fn arguments_accumulated_before_call_id_emit_once_when_start_becomes_correlatable() {
+        let recorder = Recorder::default();
+        let mut calls = BTreeMap::new();
+        process_responses_function_arguments_delta(
+            &serde_json::json!({"output_index": 0, "delta": "{\"new_text\":\"early"}),
+            &recorder,
+            &mut calls,
+        );
+        let mut saw_tool_call = false;
+        process_responses_output_item(
+            &serde_json::json!({
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_early",
+                    "name": "filesystem.edit"
+                }
+            }),
+            &recorder,
+            &mut calls,
+            &mut saw_tool_call,
+            &str::to_owned,
+        );
+        process_responses_output_item(
+            &serde_json::json!({
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_early",
+                    "name": "filesystem.edit"
+                }
+            }),
+            &recorder,
+            &mut calls,
+            &mut saw_tool_call,
+            &str::to_owned,
+        );
+        let events = recorder.events.borrow();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    bcode_model::ProviderTurnEvent::ToolCallStarted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    bcode_model::ProviderTurnEvent::ToolCallDelta { delta, .. } =>
+                        Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [r#"{"new_text":"early"#]
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ use bcode_tui_components::tool_card::{push_tool_card_detail, tool_card_header};
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use devicons::{FileIcon, Theme, icon_for_file};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 thread_local! {
     static ACTIVE_THEME: std::cell::Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const {
@@ -92,58 +93,47 @@ fn request_draft_rows(
         "write"
     };
     let preview = text(payload, "preview").unwrap_or_default();
-    let parsed = serde_json::from_str::<Value>(preview).ok();
-    let path = parsed
-        .as_ref()
-        .and_then(|arguments| text(arguments, "path"))
-        .map(ToOwned::to_owned)
-        .or_else(|| partial_json_string(preview, "path"));
+    let fields = partial_json_object_strings(preview);
+    let path = fields.get("path").cloned();
     let old_text = if operation == "edit" {
-        parsed
-            .as_ref()
-            .and_then(|arguments| text(arguments, "old_text"))
-            .map(ToOwned::to_owned)
-            .or_else(|| partial_json_string(preview, "old_text"))
+        fields.get("old_text").cloned()
     } else {
         Some(String::new())
     };
-    let new_text = parsed
-        .as_ref()
-        .and_then(|arguments| {
-            text(
-                arguments,
-                if operation == "edit" {
-                    "new_text"
-                } else {
-                    "contents"
-                },
-            )
+    let new_text = fields
+        .get(if operation == "edit" {
+            "new_text"
+        } else {
+            "contents"
         })
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            partial_json_string(
-                preview,
-                if operation == "edit" {
-                    "new_text"
-                } else {
-                    "contents"
-                },
-            )
-        });
+        .cloned();
 
-    if let (Some(path), Some(old_text), Some(new_text)) =
-        (path.as_deref(), old_text.as_deref(), new_text.as_deref())
-    {
+    let has_content = if operation == "edit" {
+        old_text.is_some() || new_text.is_some()
+    } else {
+        new_text.is_some()
+    };
+    if has_content {
+        let label_path = path.as_deref().unwrap_or("<path pending>");
+        let old_text = old_text.as_deref().unwrap_or_default();
+        let new_text = new_text.as_deref().unwrap_or_default();
         return file_change_rows(
             &serde_json::json!({
-                "path": path,
+                "path": label_path,
                 "old_text": old_text,
                 "new_text": new_text,
                 "title": format!("Filesystem {operation} · assembling…"),
                 "subtitle": if operation == "edit" {
-                    "line numbers pending execution"
-                } else {
+                    match (fields.contains_key("old_text"), fields.contains_key("new_text")) {
+                        (true, true) => "line numbers pending execution",
+                        (true, false) => "receiving original text · replacement pending",
+                        (false, true) => "receiving replacement text · original pending",
+                        (false, false) => "receiving edit content",
+                    }
+                } else if path.is_some() {
                     "new file preview"
+                } else {
+                    "new file preview · path pending"
                 },
                 "old_start_line": (operation == "write").then_some(1_u32),
                 "new_start_line": (operation == "write").then_some(1_u32),
@@ -152,25 +142,6 @@ fn request_draft_rows(
             }),
             context,
         );
-    }
-
-    if operation == "edit"
-        && let (Some(path), Some(old_text)) = (path.as_deref(), old_text.as_deref())
-    {
-        let mut rows = card_header("Filesystem edit · assembling…");
-        push_path_kv(&mut rows, "path", Some(path), context);
-        push_kv(&mut rows, "received", number(payload, "argument_bytes"));
-        push_kv(&mut rows, "truncated", bool_text(payload, "truncated"));
-        push_kv(&mut rows, "state", Some("receiving original text"));
-        rows.push(Line::raw(""));
-        let theme = context.theme();
-        let options = SourcePreviewOptions::new(path, context.width())
-            .max_lines(20)
-            .line_prefix("  - ", theme.map_or_else(label, |theme| theme.diff.removed))
-            .source_style(theme.map_or_else(Style::new, |theme| theme.diff.text))
-            .truncated_message("  … original text preview truncated", label());
-        rows.extend(preview_lines_with_options(old_text, &options));
-        return rows;
     }
 
     let mut rows = card_header(&format!("Filesystem {operation} · assembling…"));
@@ -186,13 +157,105 @@ fn request_draft_rows(
     rows
 }
 
-fn partial_json_string(input: &str, key: &str) -> Option<String> {
-    let key = serde_json::to_string(key).ok()?;
-    let tail = input.get(input.find(&key)?.saturating_add(key.len())..)?;
-    let tail = tail.trim_start();
-    let tail = tail.strip_prefix(':')?.trim_start();
-    let encoded = tail.strip_prefix('"')?;
-    decode_partial_json_string(encoded)
+fn partial_json_object_strings(input: &str) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+    let mut cursor = input
+        .char_indices()
+        .find(|(_, character)| !character.is_whitespace())
+        .map_or(input.len(), |(index, _)| index);
+    if input[cursor..].starts_with('{') {
+        cursor = cursor.saturating_add(1);
+    }
+    loop {
+        cursor = skip_json_whitespace(input, cursor);
+        if cursor >= input.len() || input[cursor..].starts_with('}') {
+            break;
+        }
+        let Some((key, after_key, true)) = parse_json_string_at(input, cursor) else {
+            break;
+        };
+        cursor = skip_json_whitespace(input, after_key);
+        if !input[cursor..].starts_with(':') {
+            break;
+        }
+        cursor = skip_json_whitespace(input, cursor.saturating_add(1));
+        if input[cursor..].starts_with('"') {
+            let Some((value, after_value, complete)) = parse_json_string_at(input, cursor) else {
+                break;
+            };
+            fields.insert(key, value);
+            cursor = after_value;
+            if !complete {
+                break;
+            }
+        } else {
+            cursor = skip_json_value(input, cursor);
+        }
+        cursor = skip_json_whitespace(input, cursor);
+        if input[cursor..].starts_with(',') {
+            cursor = cursor.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    fields
+}
+
+fn skip_json_whitespace(input: &str, cursor: usize) -> usize {
+    input[cursor..]
+        .char_indices()
+        .find(|(_, character)| !character.is_whitespace())
+        .map_or(input.len(), |(offset, _)| cursor.saturating_add(offset))
+}
+
+fn parse_json_string_at(input: &str, start: usize) -> Option<(String, usize, bool)> {
+    let encoded = input.get(start..)?.strip_prefix('"')?;
+    let mut escaped = false;
+    for (offset, character) in encoded.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => {
+                let end = start.saturating_add(1).saturating_add(offset);
+                let token = input.get(start..=end)?;
+                let value = serde_json::from_str::<String>(token).ok()?;
+                return Some((value, end.saturating_add(1), true));
+            }
+            _ => {}
+        }
+    }
+    decode_partial_json_string(encoded).map(|value| (value, input.len(), false))
+}
+
+fn skip_json_value(input: &str, start: usize) -> usize {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth = 0_u32;
+    for (offset, character) in input[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else {
+                match character {
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' | '[' => depth = depth.saturating_add(1),
+            '}' | ']' if depth > 0 => depth = depth.saturating_sub(1),
+            ',' | '}' if depth == 0 => return start.saturating_add(offset),
+            _ => {}
+        }
+    }
+    input.len()
 }
 
 fn decode_partial_json_string(encoded: &str) -> Option<String> {
@@ -860,6 +923,62 @@ mod tests {
     }
 
     #[test]
+    fn request_draft_renders_each_field_without_prerequisites_or_false_key_matches() {
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        for (schema, preview, expected, state, forbidden) in [
+            (
+                "bcode.filesystem.request-draft.edit",
+                r#"{"new_text":"replacement first"#,
+                "replacement first",
+                "original pending",
+                None,
+            ),
+            (
+                "bcode.filesystem.request-draft.edit",
+                r#"{"old_text":"original first"#,
+                "original first",
+                "replacement pending",
+                None,
+            ),
+            (
+                "bcode.filesystem.request-draft.write",
+                r#"{"contents":"body before path"#,
+                "body before path",
+                "path pending",
+                None,
+            ),
+            (
+                "bcode.filesystem.request-draft.edit",
+                r#"{"new_text":"contains \\"old_text\\": fake"#,
+                "contains",
+                "original pending",
+                Some("replacement pending"),
+            ),
+        ] {
+            let payload = serde_json::json!({
+                "preview": preview,
+                "argument_bytes": preview.len(),
+                "truncated": false,
+            });
+            let rendered = request_draft_rows(schema, &payload, 80, &context)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(rendered.contains(state), "{rendered}");
+            if let Some(forbidden) = forbidden {
+                assert!(!rendered.contains(forbidden), "{rendered}");
+            }
+            assert!(!rendered.contains("waiting for file content"), "{rendered}");
+        }
+    }
+
+    #[test]
     fn progressive_edit_draft_renders_old_text_before_new_text_starts() {
         let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
             80,
@@ -885,7 +1004,7 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-            assert!(rendered.contains("receiving original text"), "{rendered}");
+            assert!(rendered.contains("replacement pending"), "{rendered}");
             assert!(rendered.contains(expected), "{rendered}");
             assert!(!rendered.contains("waiting for file content"), "{rendered}");
         }
