@@ -12,8 +12,8 @@ use bcode_model::{
 };
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
-    CatalogProviderKind, LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogDefaults,
-    ModelCatalogEntry, ModelDeployment, ModelSupportTarget, ProviderCatalog,
+    CatalogProviderKind, LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogEntry,
+    ModelDeployment, ModelSupportTarget, ProviderCatalog,
 };
 use serde_json::json;
 use std::fmt::{Display, Formatter};
@@ -502,18 +502,13 @@ impl ModelCatalog {
 
     /// Enrich a provider-discovered model with catalog metadata.
     #[must_use]
-    pub fn enrich_model(&self, provider_id: &str, mut model: ModelInfo) -> ModelInfo {
-        if model.max_image_input_base64_bytes.is_none() {
-            model.max_image_input_base64_bytes = self
-                .provider(provider_id)
-                .and_then(|provider| provider.defaults.as_ref())
-                .and_then(|defaults| defaults.max_image_input_base64_bytes);
-        }
-        if let Some(entry) = self.model(provider_id, &model.model_id) {
+    pub fn enrich_model(&self, provider_id: &str, model: ModelInfo) -> ModelInfo {
+        let model = if let Some(entry) = self.model(provider_id, &model.model_id) {
             enrich_from_entry(model, entry)
         } else {
             model
-        }
+        };
+        self.enrich_image_limit_from_provider_defaults(provider_id, model)
     }
 
     /// Enrich a provider-discovered model with metadata resolved for an active serving target.
@@ -524,27 +519,37 @@ impl ModelCatalog {
         model: ModelInfo,
         target: &ModelSupportTarget,
     ) -> ModelInfo {
-        if let Some(entry) = self.model(provider_id, &model.model_id) {
+        let model = if let Some(entry) = self.model(provider_id, &model.model_id) {
             enrich_from_entry_for_target(model, entry, target)
         } else {
             model
-        }
+        };
+        self.enrich_image_limit_from_provider_defaults(provider_id, model)
     }
 
     /// Enrich a provider-discovered model with catalog metadata and provider defaults.
     #[must_use]
     pub fn enrich_model_with_defaults(&self, provider_id: &str, model: ModelInfo) -> ModelInfo {
-        if let Some(entry) = self.model(provider_id, &model.model_id) {
-            return enrich_from_entry(model, entry);
-        }
-        if let Some(defaults) = self
-            .provider(provider_id)
-            .and_then(|provider| provider.defaults.as_ref())
-        {
-            enrich_from_defaults(model, defaults)
+        let model = if let Some(entry) = self.model(provider_id, &model.model_id) {
+            enrich_from_entry(model, entry)
         } else {
             model
+        };
+        self.enrich_image_limit_from_provider_defaults(provider_id, model)
+    }
+
+    fn enrich_image_limit_from_provider_defaults(
+        &self,
+        provider_id: &str,
+        mut model: ModelInfo,
+    ) -> ModelInfo {
+        if model.max_image_input_base64_bytes.is_none() {
+            model.max_image_input_base64_bytes = self
+                .provider(provider_id)
+                .and_then(|provider| provider.defaults.as_ref())
+                .and_then(|defaults| defaults.max_image_input_base64_bytes);
         }
+        model
     }
 
     /// Convert all catalog entries for a provider into `ModelInfo` values.
@@ -819,23 +824,42 @@ fn enrich_from_entry_for_target(
     if model.max_output_tokens.is_none() {
         model.max_output_tokens = deployment
             .and_then(|deployment| deployment.max_output_tokens)
-            .or_else(|| {
-                legacy_target_match
-                    .then_some(entry.max_output_tokens)
-                    .flatten()
-            })
             .or(entry.max_output_tokens);
         if model.max_output_tokens.is_some() && model.metadata_source.is_none() {
+            model.metadata_source = Some(catalog_source);
+        }
+    }
+    if model.max_image_input_base64_bytes.is_none() {
+        model.max_image_input_base64_bytes = entry.max_image_input_base64_bytes;
+        if model.max_image_input_base64_bytes.is_some() && model.metadata_source.is_none() {
             model.metadata_source = Some(catalog_source);
         }
     }
     model
         .capabilities
         .extend(capabilities_from_catalog(&entry.capabilities));
+    apply_catalog_feature_support(
+        &mut model,
+        &entry.capabilities,
+        if remote {
+            CapabilitySource::ProviderApi
+        } else {
+            CapabilitySource::BundledCatalog
+        },
+    );
     if let Some(deployment) = deployment {
         model
             .capabilities
             .extend(capabilities_from_catalog(&deployment.capabilities));
+        apply_catalog_feature_support(
+            &mut model,
+            &deployment.capabilities,
+            if remote {
+                CapabilitySource::ProviderApi
+            } else {
+                CapabilitySource::BundledCatalog
+            },
+        );
     }
     if model.cache.capabilities.is_empty() {
         model.cache = cache_info_from_catalog(&entry.capabilities);
@@ -894,38 +918,6 @@ fn model_info_from_catalog_entry_for_target(
         entry,
         target,
     )
-}
-
-fn enrich_from_defaults(mut model: ModelInfo, defaults: &ModelCatalogDefaults) -> ModelInfo {
-    if model.context_window.is_none() && defaults.context_window.is_some() {
-        model.context_window = defaults.context_window;
-        model.metadata_source = Some(ModelMetadataSource::ProviderDefault);
-    }
-    if model.max_output_tokens.is_none() && defaults.max_output_tokens.is_some() {
-        model.max_output_tokens = defaults.max_output_tokens;
-        model.metadata_source = Some(ModelMetadataSource::ProviderDefault);
-    }
-    if model.max_image_input_base64_bytes.is_none()
-        && defaults.max_image_input_base64_bytes.is_some()
-    {
-        model.max_image_input_base64_bytes = defaults.max_image_input_base64_bytes;
-        model.metadata_source = Some(ModelMetadataSource::ProviderDefault);
-    }
-    model
-        .capabilities
-        .extend(capabilities_from_catalog(&defaults.capabilities));
-    apply_catalog_feature_support(
-        &mut model,
-        &defaults.capabilities,
-        CapabilitySource::BundledCatalog,
-    );
-    if model.cache.capabilities.is_empty() {
-        model.cache = cache_info_from_catalog(&defaults.capabilities);
-    }
-    if model.reasoning.is_none() {
-        model.reasoning = reasoning_from_catalog_parts(defaults.reasoning.as_ref(), None);
-    }
-    model
 }
 
 fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelInfo {
@@ -2528,6 +2520,49 @@ status = "stable"
         assert_eq!(
             reasoning.control,
             Some(bcode_model::ReasoningControl::Adaptive)
+        );
+    }
+
+    #[test]
+    fn bedrock_target_enrichment_preserves_image_contract_through_remote_metadata() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let discovered = bcode_model::ModelInfo {
+            model_id: "global.anthropic.claude-opus-5".to_owned(),
+            display_name: "remote Opus 5".to_owned(),
+            is_default: true,
+            context_window: Some(1_000_000),
+            max_output_tokens: Some(128_000),
+            max_image_input_base64_bytes: None,
+            capabilities: std::collections::BTreeSet::from([ModelCapability::ImageInput]),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: Some(ModelMetadataSource::RemoteCatalog),
+            pricing: None,
+            api_surface: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        };
+        let target =
+            ModelSupportTarget::new("bedrock", "aws_default_chain", "messages", None::<String>);
+
+        let merged = catalog.merge_provider_models_for_target(
+            "bedrock",
+            vec![discovered],
+            false,
+            Some(&target),
+        );
+        let opus = merged.first().expect("Opus 5 survives target enrichment");
+        assert_eq!(opus.max_image_input_base64_bytes, Some(5_242_880));
+        assert!(opus.capabilities.contains(&ModelCapability::ImageInput));
+        assert!(
+            opus.feature_support
+                .media_input(MediaInputFeature::ToolResultImage)
+                .is_guaranteed()
+        );
+        assert!(
+            opus.feature_support
+                .media_input(MediaInputFeature::UserImage)
+                .is_guaranteed()
         );
     }
 
