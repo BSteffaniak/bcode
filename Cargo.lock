@@ -1399,6 +1399,7 @@ dependencies = [
  "bcode_config",
  "bcode_model",
  "bcode_model_provider_runtime",
+ "bcode_openai_responses",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "clap",

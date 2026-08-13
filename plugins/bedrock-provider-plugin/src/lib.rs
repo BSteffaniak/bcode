@@ -285,22 +285,33 @@ async fn stream_bedrock_turn(
     }
 }
 
-fn validate_bedrock_request(request: &ModelTurnRequest) -> Result<(), ProviderError> {
-    if request.structured_output.is_some() {
+/// Validate a turn request against the capabilities of the selected Bedrock surface.
+///
+/// Several restrictions below are properties of Bedrock Converse and the Anthropic Messages
+/// surface, not of Bedrock as a whole. The Mantle `OpenAI` Responses surface natively supports
+/// reasoning summaries, structured outputs, and parallel tool calls, so those checks are scoped to
+/// the surfaces that actually reject them. Keeping this in one place avoids advertising a
+/// capability in the model catalog that the adapter then refuses.
+fn validate_bedrock_request(
+    request: &ModelTurnRequest,
+    transport: Option<BedrockTransport>,
+) -> Result<(), ProviderError> {
+    let responses_surface = transport == Some(BedrockTransport::MantleOpenAi);
+    if request.structured_output.is_some() && !responses_surface {
         return Err(provider_error(
             "bedrock_structured_output_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
             "Bedrock Converse does not provide provider-native JSON Schema enforcement",
         ));
     }
-    if request.parameters.reasoning_summary.is_some() {
+    if request.parameters.reasoning_summary.is_some() && !responses_surface {
         return Err(provider_error(
             "bedrock_reasoning_summary_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
             "Bedrock Anthropic extended thinking does not support provider-visible reasoning summaries",
         ));
     }
-    if request.tool_call_policy.parallel == Some(true) {
+    if request.tool_call_policy.parallel == Some(true) && !responses_surface {
         return Err(provider_error(
             "bedrock_parallel_tool_policy_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
@@ -339,12 +350,16 @@ fn validate_bedrock_request(request: &ModelTurnRequest) -> Result<(), ProviderEr
         ));
     }
     validate_bedrock_cache_ttl(request)?;
-    validate_declared_bedrock_features(request)?;
+    validate_declared_bedrock_features(request, transport)?;
     validate_tool_choice_registration(request)
 }
 
-fn validate_declared_bedrock_features(request: &ModelTurnRequest) -> Result<(), ProviderError> {
-    let unsupported = request.explicitly_unsupported_features(&bedrock_feature_support());
+fn validate_declared_bedrock_features(
+    request: &ModelTurnRequest,
+    transport: Option<BedrockTransport>,
+) -> Result<(), ProviderError> {
+    let unsupported =
+        request.explicitly_unsupported_features(&bedrock_feature_support_for(transport));
     unsupported.first().map_or(Ok(()), |feature| {
         Err(provider_error(
             "bedrock_feature_unsupported",
@@ -404,23 +419,16 @@ async fn stream_bedrock_turn_inner(
     turn: &TurnState,
     discovery: Arc<Mutex<DiscoveryCache>>,
 ) -> Result<StreamOutcome, ProviderError> {
-    validate_bedrock_request(request)?;
     let settings = Settings::resolve(Some(request));
     let transport = settings.transport.clone()?;
+    validate_bedrock_request(request, Some(transport))?;
     let selection = resolve_turn_model_selection(request, &settings, turn, &discovery).await?;
     let name_map = bedrock_tool_name_map(&request.tools);
     if transport == BedrockTransport::MantleAnthropic {
         return stream_mantle_anthropic_turn(request, &settings, &selection, turn, name_map).await;
     }
     if transport == BedrockTransport::MantleOpenAi {
-        // The Responses streaming adapter is not implemented yet. Fail closed rather than falling
-        // through to Converse, which cannot serve these models at all.
-        return Err(provider_error(
-            "bedrock_mantle_openai_unsupported",
-            ProviderErrorCategory::Config,
-            "Bedrock Mantle OpenAI (Responses) streaming is not implemented yet; \
-             use 'mantle_anthropic' or 'bedrock_runtime'",
-        ));
+        return stream_mantle_openai_turn(request, &settings, &selection, turn, name_map).await;
     }
     let client = bedrock_client(&settings).await;
     if request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Messages) {
@@ -559,6 +567,489 @@ async fn stream_mantle_anthropic_turn(
             "no usable Bedrock Mantle Anthropic model was available for the turn",
         )
     }))
+}
+
+/// Build the Mantle `OpenAI` Responses request body for one model.
+///
+/// Reuses the shared Responses projection so tool-protocol repair, instruction bundling, and
+/// content mapping behave identically to every other Responses deployment. Bedrock-specific
+/// concerns stay here: tool naming, and the fact that Mantle rejects `store` and
+/// `previous_response_id` because this adapter does not use server-side conversation reuse.
+fn build_mantle_openai_request(
+    request: &ModelTurnRequest,
+    model_id: &str,
+) -> Result<serde_json::Value, ProviderError> {
+    let input =
+        bcode_openai_responses::model_messages_to_responses_input(&request.messages, 0, &|name| {
+            bedrock_tool_name(name)
+        });
+    let instructions = bcode_openai_responses::response_instruction_bundle(
+        request.system_prompt.as_deref(),
+        &request.messages,
+    );
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| bcode_openai_responses::ResponsesTool {
+            r#type: "function",
+            name: bedrock_tool_name(&tool.name),
+            description: tool.description.clone(),
+            parameters: tool.input_schema.clone(),
+            strict: Some(false),
+        })
+        .collect::<Vec<_>>();
+    let typed = bcode_openai_responses::ResponsesRequest {
+        model: model_id.to_string(),
+        instructions,
+        input,
+        stream: true,
+        // This adapter never asks Mantle to persist responses; conversation reuse is rejected by
+        // `validate_bedrock_request`, so there is no prior response to continue from.
+        store: false,
+        previous_response_id: None,
+        context_management: Vec::new(),
+        tools,
+        tool_choice: mantle_openai_tool_choice(request)?,
+        parallel_tool_calls: (!request.tools.is_empty())
+            .then_some(request.tool_call_policy.parallel)
+            .flatten(),
+        text: request.structured_output.as_ref().map(|structured| {
+            bcode_openai_responses::ResponsesTextOptions {
+                format: Some(bcode_openai_responses::ResponsesTextFormat {
+                    r#type: "json_schema",
+                    name: structured.name.clone(),
+                    schema: structured.schema.clone(),
+                    strict: structured.strict,
+                }),
+                verbosity: "low",
+            }
+        }),
+        reasoning: mantle_openai_reasoning(request),
+        include: Vec::new(),
+        prompt_cache_key: None,
+        temperature: request.parameters.temperature,
+        max_output_tokens: request.parameters.max_output_tokens,
+        top_p: request.parameters.top_p,
+    };
+    serde_json::to_value(typed).map_err(|error| {
+        provider_error(
+            "bedrock_mantle_openai_request_encode_failed",
+            ProviderErrorCategory::InvalidRequest,
+            format!("failed to encode Bedrock Mantle OpenAI request: {error}"),
+        )
+    })
+}
+
+/// Reasoning controls for a Mantle `OpenAI` request, when the turn requested any.
+fn mantle_openai_reasoning(
+    request: &ModelTurnRequest,
+) -> Option<bcode_openai_responses::ResponsesReasoningOptions> {
+    let effort = request
+        .parameters
+        .reasoning_effort_value
+        .clone()
+        .or_else(|| {
+            request
+                .parameters
+                .reasoning_effort
+                .map(|effort| match effort {
+                    bcode_model::ReasoningEffort::Low => "low",
+                    bcode_model::ReasoningEffort::Medium => "medium",
+                    bcode_model::ReasoningEffort::High => "high",
+                })
+                .map(ToString::to_string)
+        });
+    let summary = request.parameters.reasoning_summary.clone();
+    (effort.is_some() || summary.is_some()).then_some(
+        bcode_openai_responses::ResponsesReasoningOptions {
+            effort,
+            summary,
+            context: None,
+        },
+    )
+}
+
+/// Translate the normalized tool-choice policy into the Responses `tool_choice` field.
+fn mantle_openai_tool_choice(
+    request: &ModelTurnRequest,
+) -> Result<Option<serde_json::Value>, ProviderError> {
+    if request.tools.is_empty() {
+        return match &request.tool_call_policy.choice {
+            ToolChoice::Auto | ToolChoice::None => Ok(None),
+            ToolChoice::Required | ToolChoice::Tool { .. } => Err(provider_error(
+                "tool_choice_without_tools",
+                ProviderErrorCategory::InvalidRequest,
+                "Bedrock tool choice requires at least one registered tool",
+            )),
+        };
+    }
+    Ok(match &request.tool_call_policy.choice {
+        ToolChoice::Auto => Some(serde_json::json!("auto")),
+        ToolChoice::None => Some(serde_json::json!("none")),
+        ToolChoice::Required => Some(serde_json::json!("required")),
+        ToolChoice::Tool { name } => Some(serde_json::json!({
+            "type": "function",
+            "name": bedrock_tool_name(name),
+        })),
+    })
+}
+
+async fn stream_mantle_openai_turn(
+    request: &ModelTurnRequest,
+    settings: &Settings,
+    selection: &ModelSelection,
+    turn: &TurnState,
+    name_map: BTreeMap<String, String>,
+) -> Result<StreamOutcome, ProviderError> {
+    let token = client_context_bearer_token(settings).ok_or_else(|| {
+        provider_error(
+            "bedrock_mantle_missing_bearer_token",
+            ProviderErrorCategory::Auth,
+            "Bedrock Mantle requires AWS_BEARER_TOKEN_BEDROCK or a mapped bearer_token credential",
+        )
+    })?;
+    let endpoint = mantle_endpoint(settings, MantleFlavor::OpenAi)?;
+    let client = if settings.force_http1 {
+        reqwest::Client::builder().http1_only().build()
+    } else {
+        reqwest::Client::builder().build()
+    }
+    .map_err(|error| mantle_network_error("client_build_failed", &error))?;
+    // The OpenAI surface authenticates with a bearer token rather than Anthropic's `x-api-key`.
+    let request_builder = client
+        .post(endpoint)
+        .bearer_auth(&token)
+        .header("accept", "text/event-stream")
+        .header("user-agent", "bcode/0.0.1");
+    let mut last_error = None;
+    for model_id in &selection.model_ids {
+        let response = request_builder
+            .try_clone()
+            .ok_or_else(|| {
+                provider_error(
+                    "bedrock_mantle_request_clone_failed",
+                    ProviderErrorCategory::ProviderInternal,
+                    "failed to prepare Bedrock Mantle request",
+                )
+            })?
+            .json(&build_mantle_openai_request(request, model_id)?)
+            .send()
+            .await
+            .map_err(|error| mantle_network_error("request_failed", &error))?;
+        if !response.status().is_success() {
+            let error = mantle_status_error(response).await;
+            let is_last = selection.model_ids.last().map(String::as_str) == Some(model_id);
+            if selection.explicit || is_last {
+                return Err(error);
+            }
+            last_error = Some(error);
+            continue;
+        }
+        return read_mantle_openai_stream(response, turn, &name_map).await;
+    }
+    Err(last_error.unwrap_or_else(|| {
+        provider_error(
+            "bedrock_mantle_openai_model_unavailable",
+            ProviderErrorCategory::Config,
+            "no usable Bedrock Mantle OpenAI model was available for the turn",
+        )
+    }))
+}
+
+/// Read a Mantle `OpenAI` Responses SSE stream to a terminal outcome.
+///
+/// Cancellation is checked before each read and raced against the chunk future, so a cancelled
+/// turn stops without waiting for the provider to finish.
+async fn read_mantle_openai_stream(
+    mut response: reqwest::Response,
+    turn: &TurnState,
+    name_map: &BTreeMap<String, String>,
+) -> Result<StreamOutcome, ProviderError> {
+    let sink = MantleTurnEventSink(turn);
+    let mut buffer = String::new();
+    let mut state = MantleOpenAiStreamState::default();
+    loop {
+        if turn.is_cancelled() {
+            return Ok(StreamOutcome::Cancelled);
+        }
+        let cancel_notify = turn.cancel_notify();
+        tokio::select! {
+            chunk = response.chunk() => {
+                let Some(chunk) = chunk
+                    .map_err(|error| mantle_network_error("stream_failed", &error))?
+                else {
+                    // The stream ended without reporting a terminal event.
+                    return Err(provider_error(
+                        "bedrock_mantle_openai_stream_incomplete",
+                        ProviderErrorCategory::ProviderInternal,
+                        "Bedrock Mantle OpenAI stream ended before reporting completion",
+                    ));
+                };
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                for line in bcode_openai_responses::drain_complete_stream_lines(&mut buffer) {
+                    if let Some(outcome) =
+                        process_mantle_openai_line(&line, &sink, &mut state, name_map)?
+                    {
+                        return Ok(outcome);
+                    }
+                }
+            }
+            () = cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+        }
+    }
+}
+
+/// Adapter letting the shared Responses decoder report events into the Bedrock turn runtime.
+#[derive(Debug, Clone, Copy)]
+struct MantleTurnEventSink<'a>(&'a TurnState);
+
+impl bcode_openai_responses::ResponsesEventSink for MantleTurnEventSink<'_> {
+    fn push(&self, event: ProviderTurnEvent) {
+        self.0.push(event);
+    }
+}
+
+/// Partial decode state for one Mantle `OpenAI` stream.
+#[derive(Default)]
+struct MantleOpenAiStreamState {
+    tool_calls: BTreeMap<u32, bcode_openai_responses::ToolCallAccumulator>,
+    reasoning_items: BTreeMap<u32, bcode_openai_responses::ReasoningItemAccumulator>,
+    saw_tool_call: bool,
+    saw_assistant_text: bool,
+}
+
+/// Route one decoded Responses stream line.
+///
+/// Dispatch and error categorization are Bedrock-owned; every per-event handler comes from the
+/// shared Responses crate. Returns `Some(outcome)` once the stream reaches a terminal state.
+#[allow(clippy::too_many_lines)]
+fn process_mantle_openai_line(
+    line: &str,
+    sink: &impl bcode_openai_responses::ResponsesEventSink,
+    state: &mut MantleOpenAiStreamState,
+    name_map: &BTreeMap<String, String>,
+) -> Result<Option<StreamOutcome>, ProviderError> {
+    use bcode_openai_responses as responses;
+
+    let event = match responses::classify_responses_stream_line(line)? {
+        responses::ResponsesStreamLine::Ignored => return Ok(None),
+        responses::ResponsesStreamLine::Done => {
+            if state.saw_tool_call {
+                finish_mantle_openai_tool_calls(sink, &state.tool_calls, name_map)?;
+                return Ok(Some(StreamOutcome::ToolCall));
+            }
+            return Ok(Some(StreamOutcome::Finished));
+        }
+        responses::ResponsesStreamLine::Event(event) => event,
+    };
+    match responses::responses_event_type(&event) {
+        "response.output_text.delta" | "response.refusal.delta" => {
+            if let Some(delta) = responses::responses_text_delta(&event) {
+                sink.push(ProviderTurnEvent::TextDelta {
+                    text: delta.to_string(),
+                });
+                state.saw_assistant_text = true;
+            }
+        }
+        "response.reasoning_summary_text.delta" => responses::process_responses_reasoning_delta(
+            &event,
+            sink,
+            &mut state.reasoning_items,
+            bcode_session_models::ReasoningContentKind::Summary,
+        ),
+        "response.reasoning_text.delta" => responses::process_responses_reasoning_delta(
+            &event,
+            sink,
+            &mut state.reasoning_items,
+            bcode_session_models::ReasoningContentKind::Raw,
+        ),
+        "response.reasoning_summary_text.done" => responses::process_responses_reasoning_done(
+            &event,
+            sink,
+            &mut state.reasoning_items,
+            bcode_session_models::ReasoningContentKind::Summary,
+        ),
+        "response.reasoning_text.done" => responses::process_responses_reasoning_done(
+            &event,
+            sink,
+            &mut state.reasoning_items,
+            bcode_session_models::ReasoningContentKind::Raw,
+        ),
+        "response.output_item.added" => {
+            responses::process_responses_output_item(
+                &event,
+                sink,
+                &mut state.tool_calls,
+                &mut state.saw_tool_call,
+                &|name| original_tool_name(name, name_map),
+            );
+            responses::process_responses_reasoning_output_item(
+                &event,
+                sink,
+                &mut state.reasoning_items,
+                false,
+            );
+        }
+        "response.output_item.done" => {
+            responses::process_responses_output_item(
+                &event,
+                sink,
+                &mut state.tool_calls,
+                &mut state.saw_tool_call,
+                &|name| original_tool_name(name, name_map),
+            );
+            if !state.saw_assistant_text
+                && let Some(text) = responses::responses_output_item_text(&event)
+            {
+                sink.push(ProviderTurnEvent::TextDelta { text });
+                state.saw_assistant_text = true;
+            }
+            responses::process_responses_reasoning_output_item(
+                &event,
+                sink,
+                &mut state.reasoning_items,
+                true,
+            );
+        }
+        "response.function_call_arguments.delta" => {
+            responses::process_responses_function_arguments_delta(
+                &event,
+                sink,
+                &mut state.tool_calls,
+            );
+        }
+        "response.function_call_arguments.done" => {
+            responses::process_responses_function_arguments_done(&event, &mut state.tool_calls);
+        }
+        "response.completed" => {
+            if let Some(usage) = mantle_openai_usage(&event) {
+                sink.push(ProviderTurnEvent::Usage { usage });
+            }
+            if state.saw_tool_call {
+                finish_mantle_openai_tool_calls(sink, &state.tool_calls, name_map)?;
+                return Ok(Some(StreamOutcome::ToolCall));
+            }
+            return Ok(Some(StreamOutcome::Finished));
+        }
+        "response.incomplete" => {
+            if let Some(usage) = mantle_openai_usage(&event) {
+                sink.push(ProviderTurnEvent::Usage { usage });
+            }
+            let reason = responses::responses_incomplete_reason(&event);
+            if reason == "max_output_tokens" {
+                if state.saw_tool_call {
+                    finish_mantle_openai_tool_calls(sink, &state.tool_calls, name_map)?;
+                }
+                return Ok(Some(StreamOutcome::MaxTokens));
+            }
+            return Err(provider_error(
+                "bedrock_mantle_openai_response_incomplete",
+                ProviderErrorCategory::ProviderInternal,
+                format!("Bedrock Mantle OpenAI response was incomplete: {reason}"),
+            ));
+        }
+        "response.failed" | "error" => return Err(mantle_openai_failed_error(&event)),
+        _ => {}
+    }
+    Ok(None)
+}
+
+/// Report every accumulated tool call as a finished call.
+fn finish_mantle_openai_tool_calls(
+    sink: &impl bcode_openai_responses::ResponsesEventSink,
+    tool_calls: &BTreeMap<u32, bcode_openai_responses::ToolCallAccumulator>,
+    name_map: &BTreeMap<String, String>,
+) -> Result<(), ProviderError> {
+    for accumulator in tool_calls.values() {
+        let id = accumulator.id.clone().ok_or_else(|| {
+            provider_error(
+                "bedrock_mantle_openai_missing_tool_call_id",
+                ProviderErrorCategory::ProviderInternal,
+                "Bedrock Mantle OpenAI emitted a tool call without an id",
+            )
+        })?;
+        let provider_name = accumulator.name.clone().ok_or_else(|| {
+            provider_error(
+                "bedrock_mantle_openai_missing_tool_call_name",
+                ProviderErrorCategory::ProviderInternal,
+                "Bedrock Mantle OpenAI emitted a tool call without a function name",
+            )
+        })?;
+        let name = original_tool_name(&provider_name, name_map);
+        let arguments =
+            bcode_openai_responses::parse_tool_arguments(&accumulator.arguments, &id, &name)?;
+        sink.push(ProviderTurnEvent::ToolCallFinished {
+            call: ToolCall {
+                id,
+                name,
+                arguments,
+            },
+        });
+    }
+    Ok(())
+}
+
+/// Normalized token usage reported by a Responses completion event.
+fn mantle_openai_usage(event: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = event
+        .get("response")
+        .unwrap_or(event)
+        .get("usage")?
+        .as_object()?;
+    let read = |key: &str| {
+        usage
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let reasoning = usage
+        .get("output_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    Some(TokenUsage {
+        input_tokens: read("input_tokens"),
+        output_tokens: read("output_tokens"),
+        total_tokens: read("total_tokens"),
+        cached_input_tokens: cached,
+        cache_write_input_tokens: None,
+        reasoning_tokens: reasoning,
+    })
+}
+
+/// Build the error reported by a `response.failed` or `error` stream event.
+///
+/// Bedrock owns this categorization: the shared crate deliberately does not interpret
+/// provider-specific error codes.
+fn mantle_openai_failed_error(event: &serde_json::Value) -> ProviderError {
+    let response = event.get("response");
+    let detail = event
+        .get("error")
+        .or_else(|| response.and_then(|response| response.get("error")));
+    let message = detail
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| event.get("message").and_then(serde_json::Value::as_str))
+        .unwrap_or("Bedrock Mantle OpenAI stream failed");
+    let code = detail
+        .and_then(|error| error.get("code").or_else(|| error.get("type")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("bedrock_mantle_openai_stream_failed");
+    let mut error = provider_error(
+        code,
+        ProviderErrorCategory::ProviderInternal,
+        message.to_string(),
+    );
+    error.request_id = response
+        .and_then(|response| response.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(Into::into);
+    error
 }
 
 /// One Bedrock Mantle API flavor.
@@ -2659,11 +3150,58 @@ fn resolve_configured_region(
     (None, RegionSource::AwsSdkDefaultChain)
 }
 
-fn bedrock_feature_support() -> bcode_model::ModelFeatureSupport {
+/// Capabilities whose support differs between the Converse and Responses surfaces.
+struct BedrockSurfaceCapabilities {
+    reasoning_summary: bcode_model::CapabilitySupport,
+    structured_output: bcode_model::CapabilitySupport,
+    parallel_tool_calls: bcode_model::CapabilitySupport,
+}
+
+impl BedrockSurfaceCapabilities {
+    /// Resolve the surface-varying capabilities for one transport.
+    fn for_transport(transport: Option<BedrockTransport>) -> Self {
+        use bcode_model::{CapabilitySource, CapabilitySupport};
+        let supported = || CapabilitySupport::Supported {
+            source: CapabilitySource::BundledCatalog,
+        };
+        let unsupported = |reason: &str| CapabilitySupport::Unsupported {
+            source: CapabilitySource::BundledCatalog,
+            reason: reason.to_string(),
+        };
+        if transport == Some(BedrockTransport::MantleOpenAi) {
+            return Self {
+                reasoning_summary: supported(),
+                structured_output: supported(),
+                parallel_tool_calls: supported(),
+            };
+        }
+        Self {
+            reasoning_summary: unsupported(
+                "Bedrock Anthropic extended thinking has no provider-visible reasoning summary",
+            ),
+            structured_output: unsupported("Bedrock Converse structured output is not implemented"),
+            parallel_tool_calls: unsupported(
+                "Bedrock model-specific parallel support is not guaranteed",
+            ),
+        }
+    }
+}
+
+/// Declared feature support for one Bedrock surface.
+///
+/// Several capabilities differ by surface: the Mantle `OpenAI` Responses surface supports reasoning
+/// summaries, JSON-schema structured output, and parallel tool calls, none of which Converse or the
+/// Anthropic Messages surface provide. Reporting one surface-independent matrix would either
+/// advertise capabilities Converse cannot serve or deny capabilities the catalog advertises for the
+/// `OpenAI` models.
+fn bedrock_feature_support_for(
+    transport: Option<BedrockTransport>,
+) -> bcode_model::ModelFeatureSupport {
     use bcode_model::{
         CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
         ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
     };
+    let surface = BedrockSurfaceCapabilities::for_transport(transport);
     let supported = || CapabilitySupport::Supported {
         source: CapabilitySource::BundledCatalog,
     };
@@ -2685,9 +3223,7 @@ fn bedrock_feature_support() -> bcode_model::ModelFeatureSupport {
         .map(|key| (key, supported()))
         .chain(std::iter::once((
             ModelParameterKey::ReasoningSummary,
-            unsupported(
-                "Bedrock Anthropic extended thinking has no provider-visible reasoning summary",
-            ),
+            surface.reasoning_summary,
         )))
         .collect(),
         structured_output: [
@@ -2695,22 +3231,14 @@ fn bedrock_feature_support() -> bcode_model::ModelFeatureSupport {
             StructuredOutputMode::StrictJsonSchema,
         ]
         .into_iter()
-        .map(|mode| {
-            (
-                mode,
-                unsupported("Bedrock Converse structured output is not implemented"),
-            )
-        })
+        .map(|mode| (mode, surface.structured_output.clone()))
         .collect(),
         tool_choice: [
             (ToolChoiceMode::Auto, supported()),
             (ToolChoiceMode::None, supported()),
             (ToolChoiceMode::Required, supported()),
             (ToolChoiceMode::Named, supported()),
-            (
-                ToolChoiceMode::Parallel,
-                unsupported("Bedrock model-specific parallel support is not guaranteed"),
-            ),
+            (ToolChoiceMode::Parallel, surface.parallel_tool_calls),
         ]
         .into_iter()
         .collect(),
@@ -2766,7 +3294,7 @@ fn capabilities() -> ProviderCapabilities {
         ]
         .into_iter()
         .collect(),
-        feature_support: bedrock_feature_support(),
+        feature_support: bedrock_feature_support_for(settings.transport.clone().ok()),
         auth_schemes: [
             "aws_default_chain".to_string(),
             "aws_credentials".to_string(),
@@ -4961,6 +5489,239 @@ mod tests {
     }
 
     #[test]
+    fn mantle_openai_request_uses_the_shared_responses_projection() {
+        let mut request = test_model_turn_request();
+        request.system_prompt = Some("be helpful".to_string());
+        request.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+
+        let value = build_mantle_openai_request(&request, "openai.test-model")
+            .expect("request should build");
+
+        assert_eq!(value["model"], "openai.test-model");
+        assert_eq!(value["stream"], true);
+        // This adapter rejects conversation reuse, so it must never ask Mantle to persist state.
+        assert_eq!(value["store"], false);
+        assert!(value.get("previous_response_id").is_none());
+        assert_eq!(value["instructions"], "be helpful");
+        // System content is carried out-of-band, so it must not also appear as an input item.
+        let input = value["input"].as_array().expect("input is an array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn mantle_openai_request_projects_tools_with_bedrock_names() {
+        let mut request = test_model_turn_request();
+        request.tools = vec![ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: "read a file".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+
+        let value =
+            build_mantle_openai_request(&request, "openai.test-model").expect("request builds");
+
+        let tools = value["tools"].as_array().expect("tools is an array");
+        assert_eq!(tools.len(), 1);
+        // Bedrock tool naming rules apply, so dots become underscores.
+        assert_eq!(tools[0]["name"], "filesystem_read");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(value["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn mantle_openai_request_rejects_tool_choice_without_tools() {
+        let mut request = test_model_turn_request();
+        request.tool_call_policy.choice = ToolChoice::Required;
+        assert_eq!(
+            build_mantle_openai_request(&request, "openai.test-model")
+                .unwrap_err()
+                .code,
+            "tool_choice_without_tools"
+        );
+    }
+
+    #[test]
+    fn mantle_openai_request_carries_reasoning_and_structured_output() {
+        let mut request = test_model_turn_request();
+        request.parameters.reasoning_effort_value = Some("xhigh".to_string());
+        request.parameters.reasoning_summary = Some("detailed".to_string());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+
+        let value =
+            build_mantle_openai_request(&request, "openai.test-model").expect("request builds");
+
+        assert_eq!(value["reasoning"]["effort"], "xhigh");
+        assert_eq!(value["reasoning"]["summary"], "detailed");
+        assert_eq!(value["text"]["format"]["type"], "json_schema");
+        assert_eq!(value["text"]["format"]["name"], "answer");
+        assert_eq!(value["text"]["format"]["strict"], true);
+    }
+
+    #[test]
+    fn responses_surface_permits_features_converse_cannot_serve() {
+        // These are Converse/Anthropic limitations, not Bedrock-wide ones. The catalog advertises
+        // reasoning summaries, structured outputs, and parallel tool calls for the OpenAI models,
+        // so validation must not reject them on the Responses surface.
+        let mut request = test_model_turn_request();
+        request.parameters.reasoning_summary = Some("detailed".to_string());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: false,
+        });
+        request.tool_call_policy.parallel = Some(true);
+
+        validate_bedrock_request(&request, Some(BedrockTransport::MantleOpenAi))
+            .expect("the Responses surface supports these features");
+
+        // The same request is still rejected on Converse.
+        for transport in [BedrockTransport::Runtime, BedrockTransport::MantleAnthropic] {
+            assert!(
+                validate_bedrock_request(&request, Some(transport)).is_err(),
+                "{transport:?} must still reject Converse-unsupported features"
+            );
+        }
+    }
+
+    #[test]
+    fn mantle_openai_stream_reports_text_then_completion() {
+        let turn = TurnState::default();
+        let sink = MantleTurnEventSink(&turn);
+        let mut state = MantleOpenAiStreamState::default();
+        let name_map = BTreeMap::new();
+
+        assert!(
+            process_mantle_openai_line(
+                r#"data: {"type":"response.output_text.delta","delta":"hi"}"#,
+                &sink,
+                &mut state,
+                &name_map,
+            )
+            .expect("delta decodes")
+            .is_none()
+        );
+        let outcome = process_mantle_openai_line(
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16,"output_tokens_details":{"reasoning_tokens":3}}}}"#,
+            &sink,
+            &mut state,
+            &name_map,
+        )
+        .expect("completion decodes")
+        .expect("completion is terminal");
+        assert_eq!(outcome, StreamOutcome::Finished);
+
+        let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::TextDelta { text } if text == "hi"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Usage { usage }
+                if usage.input_tokens == Some(11)
+                    && usage.output_tokens == Some(5)
+                    && usage.reasoning_tokens == Some(3)
+        )));
+    }
+
+    #[test]
+    fn mantle_openai_stream_finishes_tool_calls_with_original_names() {
+        let turn = TurnState::default();
+        let sink = MantleTurnEventSink(&turn);
+        let mut state = MantleOpenAiStreamState::default();
+        let name_map =
+            BTreeMap::from([("filesystem_read".to_string(), "filesystem.read".to_string())]);
+
+        for line in [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"filesystem_read"}}"#,
+            r#"data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"a.rs\"}"}"#,
+        ] {
+            assert!(
+                process_mantle_openai_line(line, &sink, &mut state, &name_map)
+                    .expect("line decodes")
+                    .is_none()
+            );
+        }
+
+        let outcome = process_mantle_openai_line(
+            r#"data: {"type":"response.completed","response":{}}"#,
+            &sink,
+            &mut state,
+            &name_map,
+        )
+        .expect("completion decodes")
+        .expect("completion is terminal");
+        assert_eq!(outcome, StreamOutcome::ToolCall);
+
+        let events = turn.drain();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ProviderTurnEvent::ToolCallFinished { call }
+                    if call.id == "call_1"
+                        && call.name == "filesystem.read"
+                        && call.arguments == serde_json::json!({"path": "a.rs"})
+            )),
+            "tool call must be reported with its original name and decoded arguments: {events:?}"
+        );
+    }
+
+    #[test]
+    fn mantle_openai_stream_maps_truncation_and_failure() {
+        let turn = TurnState::default();
+        let sink = MantleTurnEventSink(&turn);
+        let name_map = BTreeMap::new();
+
+        let mut truncated = MantleOpenAiStreamState::default();
+        let outcome = process_mantle_openai_line(
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            &sink,
+            &mut truncated,
+            &name_map,
+        )
+        .expect("incomplete decodes")
+        .expect("incomplete is terminal");
+        assert_eq!(outcome, StreamOutcome::MaxTokens);
+
+        // Any other incomplete reason is an error rather than a silent truncation.
+        let mut filtered = MantleOpenAiStreamState::default();
+        let error = process_mantle_openai_line(
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
+            &sink,
+            &mut filtered,
+            &name_map,
+        )
+        .expect_err("unexpected incomplete reasons must fail");
+        assert_eq!(error.code, "bedrock_mantle_openai_response_incomplete");
+        assert!(error.message.contains("content_filter"));
+
+        let mut failed = MantleOpenAiStreamState::default();
+        let error = process_mantle_openai_line(
+            r#"data: {"type":"response.failed","response":{"id":"resp_1","error":{"code":"server_error","message":"boom"}}}"#,
+            &sink,
+            &mut failed,
+            &name_map,
+        )
+        .expect_err("failures must propagate");
+        assert_eq!(error.code, "server_error");
+        assert_eq!(error.message, "boom");
+        assert_eq!(error.request_id.as_deref(), Some("resp_1"));
+    }
+
+    #[test]
     fn mantle_openai_endpoint_uses_the_documented_responses_path() {
         let mut settings = test_settings();
         // AWS documents this as `openai/v1/responses`, deliberately different from the
@@ -6099,7 +6860,8 @@ mod tests {
             }],
         });
 
-        let error = validate_bedrock_request(&request).expect_err("TTL must be rejected");
+        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
+            .expect_err("TTL must be rejected");
         assert_eq!(error.code, "bedrock_cache_ttl_unsupported");
     }
 
@@ -6109,7 +6871,7 @@ mod tests {
             CapabilitySupport, ModelFeatureSupport, ModelParameterKey, RequestedModelFeature,
             StructuredOutputMode,
         };
-        let provider = bedrock_feature_support();
+        let provider = bedrock_feature_support_for(Some(BedrockTransport::Runtime));
         assert!(provider.has_complete_inventory());
         assert!(
             provider
@@ -6154,22 +6916,25 @@ mod tests {
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         });
-        let error = validate_bedrock_request(&request).expect_err("schema mode must fail");
+        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
+            .expect_err("schema mode must fail");
         assert_eq!(error.category, ProviderErrorCategory::UnsupportedFeature);
 
         request.structured_output = None;
         request.parameters.reasoning_effort = Some(bcode_model::ReasoningEffort::High);
-        validate_bedrock_request(&request)
+        validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
             .expect("reasoning effort is now mapped to extended thinking");
 
         request.parameters = bcode_model::ModelParameters::default();
         request.parameters.reasoning_summary = Some("detailed".to_string());
-        let error = validate_bedrock_request(&request).expect_err("reasoning summary must fail");
+        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
+            .expect_err("reasoning summary must fail");
         assert_eq!(error.code, "bedrock_reasoning_summary_unsupported");
 
         request.parameters = bcode_model::ModelParameters::default();
         request.tool_call_policy.parallel = Some(true);
-        let error = validate_bedrock_request(&request).expect_err("parallel policy must fail");
+        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
+            .expect_err("parallel policy must fail");
         assert_eq!(error.code, "bedrock_parallel_tool_policy_unsupported");
     }
 
@@ -6302,12 +7067,14 @@ mod tests {
             "unsupported".to_string(),
             bcode_model::ProviderRequestValue::Bool(true),
         );
-        let error = validate_bedrock_request(&request).expect_err("provider option must fail");
+        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
+            .expect_err("provider option must fail");
         assert_eq!(error.code, "bedrock_provider_options_unsupported");
 
         request.provider_context.request.clear();
         request.conversation_reuse.mode = bcode_model::ConversationReuseMode::Auto;
-        let error = validate_bedrock_request(&request).expect_err("reuse must fail");
+        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
+            .expect_err("reuse must fail");
         assert_eq!(error.code, "bedrock_conversation_reuse_unsupported");
     }
 
