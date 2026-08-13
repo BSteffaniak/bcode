@@ -82,6 +82,14 @@ if rg -n 'surface_kind|viewport_offset|visible_logical_offset|interactive_surfac
   violations=1
 fi
 
+if rg -n 'bmux_(tui|tui_runtime|keyboard|text_edit)|crossterm|Terminal<|\b(Frame|Viewport|Cursor|HitMap|Damage)::' \
+  packages/session packages/session/models packages/session-view packages/session-view/models \
+  --glob '*.rs' --glob 'Cargo.toml' >/tmp/bcode-shared-renderer-native-dependencies.txt; then
+  echo "Runtime architecture violation: session and session-view layers must remain free of terminal/BMUX dependencies and presentation types." >&2
+  cat /tmp/bcode-shared-renderer-native-dependencies.txt >&2
+  violations=1
+fi
+
 if cargo tree -p bcode_question_plugin --no-default-features --features dynamic-export -e features \
   | rg 'bmux_(tui|keyboard|text_edit)|bcode_plugin_sdk feature "tui"' \
   >/tmp/bcode-question-dynamic-tui-dependencies.txt; then

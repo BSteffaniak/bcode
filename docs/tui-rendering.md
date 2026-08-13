@@ -189,6 +189,20 @@ Current visual adapters require rows, basic text styles, transcript title/timeou
 and artifact chunks. Interactive actions remain on the existing typed interaction/surface contracts;
 the serialized visual contract intentionally does not generalize into an interactive surface ABI.
 
+## Successful presentation ownership
+
+The managed BMUX runtime treats a successful terminal presentation as a generic lifecycle boundary.
+`BcodeRuntimePresenter` only draws and captures terminal-owned layout, hit-map, cursor, image, and
+commit statistics. After that presenter succeeds, `BcodeRuntimeModel` receives the runtime's neutral
+presentation-commit callback. Bcode may then release a TUI-owned paint barrier, apply one deferred
+semantic update, and request another cadence-limited frame through the normal runtime invalidation
+path. Failed presentations do not release paint barriers.
+
+This boundary must remain terminal-local. Provider deltas, session events, and `SessionView` continue
+to model renderer-neutral semantic revisions; they do not acquire frame, paint, damage, viewport, or
+BMUX runtime concepts. Conversely, BMUX knows only that a presentation committed and never learns
+Bcode session, tool, plugin, provider, or filesystem semantics.
+
 ## Smooth stream scheduling
 
 Configured live text smoothing remains semantic state in `SessionView`, not terminal rendering logic.

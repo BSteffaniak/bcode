@@ -1535,20 +1535,6 @@ impl BcodeRuntimeModel {
             event_task.abort();
         }
     }
-
-    /// Mark the currently accumulated semantic damage as successfully presented.
-    #[allow(dead_code)]
-    pub fn presentation_committed(&mut self, at: Instant) {
-        self.invalidation = super::invalidation::UiInvalidation::None;
-        self.last_presented_at = Some(at);
-        self.loop_state.mark_presentation_committed();
-        if self
-            .loop_state
-            .apply_deferred_session_stream_updates(&mut self.chat)
-        {
-            self.invalidation = super::invalidation::UiInvalidation::Structural;
-        }
-    }
 }
 
 /// Synchronous root presenter preserving Bcode frame, hit-map, cursor, and image commit ordering.
@@ -1584,7 +1570,6 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
         &mut self,
         program: &mut BcodeRuntimeModel,
     ) -> Result<bmux_tui_runtime::PresentReport, Self::Error> {
-        let started = Instant::now();
         let frame_interval = program.settings.bmux_runtime_config().frame_interval;
         let damage = std::mem::replace(
             &mut program.presentation_damage,
@@ -1604,7 +1589,6 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
         program.committed_hits = self.terminal.hits().clone();
         program.committed_area = self.terminal.area();
         program.committed_layout = layout;
-        program.presentation_committed(started);
         Ok(bmux_tui_runtime::PresentReport {
             changed_cells: draw_stats.changed_cells,
             full_repaint: draw_stats.full_repaint,
@@ -1615,6 +1599,26 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
 impl bmux_tui_runtime::Program for BcodeRuntimeModel {
     type Message = BcodeRuntimeMessage;
     type Error = TuiError;
+
+    fn presentation_committed(
+        &mut self,
+        _report: bmux_tui_runtime::PresentReport,
+    ) -> bmux_tui_runtime::Update<Self::Message> {
+        self.invalidation = super::invalidation::UiInvalidation::None;
+        self.last_presented_at = Some(Instant::now());
+        self.loop_state.mark_presentation_committed();
+        if self
+            .loop_state
+            .apply_deferred_session_stream_updates(&mut self.chat)
+        {
+            self.invalidation = super::invalidation::UiInvalidation::Structural;
+            self.presentation_damage = bmux_tui::damage::Damage::Full;
+            self.fast_temporal_presentation = false;
+            bmux_tui_runtime::Update::redraw()
+        } else {
+            bmux_tui_runtime::Update::none()
+        }
+    }
 
     #[allow(clippy::too_many_lines)]
     fn update(
@@ -2187,6 +2191,88 @@ mod tests {
         let loop_state =
             super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
         super::BcodeRuntimeModel::new(chat, settings, loop_state)
+    }
+
+    fn root_filesystem_plugin_host() -> bcode_plugin::PluginHost {
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+            bcode_filesystem_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("static filesystem plugin manifest should parse");
+        bcode_plugin::PluginHost::load_static_plugins(&selected)
+            .expect("static filesystem plugin should load")
+    }
+
+    #[derive(Debug)]
+    struct RecordedRootFrame {
+        text: String,
+        invocation_primary_items: usize,
+        invocation_item_ids: Vec<bcode_session_view_models::TranscriptViewItemId>,
+    }
+
+    struct RecordingRootPresenter {
+        frames: Vec<RecordedRootFrame>,
+    }
+
+    impl RecordingRootPresenter {
+        const fn new() -> Self {
+            Self { frames: Vec::new() }
+        }
+    }
+
+    impl bmux_tui_runtime::Presenter<super::BcodeRuntimeModel> for RecordingRootPresenter {
+        type Error = super::TuiError;
+
+        fn reset(&mut self, _reason: bmux_tui_runtime::ResetReason) {}
+
+        fn present(
+            &mut self,
+            program: &mut super::BcodeRuntimeModel,
+        ) -> Result<bmux_tui_runtime::PresentReport, Self::Error> {
+            let area = bmux_tui::geometry::Rect::new(0, 0, 100, 40);
+            let mut bytes = Vec::new();
+            let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+            program.presentation_damage = bmux_tui::damage::Damage::Full;
+            let report = bmux_tui_runtime::Presenter::present(
+                &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                program,
+            )?;
+            let text = terminal
+                .retained_buffer()
+                .map_or_else(String::new, |buffer| {
+                    (0..buffer.area().height)
+                        .filter_map(|row| buffer.row_symbols(row))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
+            let invocation_item_ids = program
+                .chat
+                .app
+                .session_view_snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.kind,
+                        bcode_session_view_models::TranscriptViewItemKind::ToolRequestDraft { .. }
+                            | bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { .. }
+                    )
+                })
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            let invocation_primary_items = invocation_item_ids.len();
+            self.frames.push(RecordedRootFrame {
+                text,
+                invocation_primary_items,
+                invocation_item_ids,
+            });
+            Ok(report)
+        }
     }
 
     #[tokio::test]
@@ -3042,6 +3128,367 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn managed_runtime_commits_progressive_filesystem_write_frames_without_external_wakeup() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut model = root_test_model();
+        model.chat.session_id = Some(session_id);
+        model.chat.app =
+            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        model
+            .chat
+            .app
+            .set_plugin_host(std::sync::Arc::new(root_filesystem_plugin_host()));
+        let config = bmux_tui_runtime::RuntimeConfig {
+            frame_interval: None,
+            ..bmux_tui_runtime::RuntimeConfig::default()
+        };
+        let (runtime, handle) =
+            bmux_tui_runtime::Runtime::new(model, RecordingRootPresenter::new(), config);
+        let draft = |revision, text: &str| {
+            super::super::history_flow::SessionStreamUpdate::Event(Box::new(
+                bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                        event: bcode_session_models::ToolRequestDraftEvent {
+                            output_position: None,
+                            turn_id: "turn-live".to_owned(),
+                            tool_call_id: "call-write".to_owned(),
+                            tool_name: "filesystem.write".to_owned(),
+                            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                            schema: "bcode.filesystem.request-draft.write".to_owned(),
+                            schema_version: 1,
+                            placement: bcode_session_models::ToolContributionPlacement::Request,
+                            generation: 1,
+                            revision,
+                            operation:
+                                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                                    start_offset: 0,
+                                    text: text.to_owned(),
+                                },
+                            argument_bytes: text.len(),
+                            truncated: false,
+                        },
+                    },
+                }),
+            ))
+        };
+        let durable = |sequence, kind| {
+            super::super::history_flow::SessionStreamUpdate::Event(Box::new(
+                bcode_ipc::Event::Session(bcode_session_models::SessionEvent {
+                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    sequence,
+                    timestamp_ms: sequence,
+                    session_id,
+                    provenance: None,
+                    kind,
+                }),
+            ))
+        };
+        for update in [
+            draft(1, r#"{"path":"src/lib.rs","contents":"first"}"#),
+            draft(2, r#"{"path":"src/lib.rs","contents":"first second"}"#),
+            durable(
+                1,
+                bcode_session_models::SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    tool_name: "filesystem.write".to_owned(),
+                    arguments_json: r#"{"path":"src/lib.rs","contents":"first second"}"#.to_owned(),
+                    working_directory: None,
+                },
+            ),
+            durable(
+                2,
+                bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-write".to_owned(),
+                        model_output: "wrote 12 bytes".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
+        ] {
+            assert!(
+                handle
+                    .try_send(super::BcodeRuntimeMessage::SessionStream(Box::new(update)))
+                    .is_ok(),
+                "session update fits"
+            );
+        }
+        let runtime_task = tokio::spawn(runtime.run());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handle.stats().frames_presented < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both draft and canonical handoff frames commit without external wakeup");
+        assert_eq!(handle.stats().frames_presented, 4);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            handle.stats().frames_presented,
+            4,
+            "runtime remains idle after the handoff queue drains"
+        );
+        handle
+            .try_send_terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke::with_modifiers(
+                    bmux_keyboard::KeyCode::Char('d'),
+                    bmux_keyboard::Modifiers {
+                        ctrl: true,
+                        ..bmux_keyboard::Modifiers::NONE
+                    },
+                ),
+            ))
+            .expect("exit input fits");
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(2), runtime_task)
+            .await
+            .expect("managed runtime exits")
+            .expect("runtime task joins")
+            .unwrap_or_else(|_| panic!("managed runtime succeeds"));
+        let first = output
+            .presenter
+            .frames
+            .iter()
+            .position(|frame| frame.text.contains("first") && !frame.text.contains("first second"))
+            .expect("first draft committed");
+        let second = output
+            .presenter
+            .frames
+            .iter()
+            .position(|frame| frame.text.contains("first second"))
+            .expect("second draft committed");
+        let result = output
+            .presenter
+            .frames
+            .iter()
+            .position(|frame| frame.text.contains("wrote 12 bytes"))
+            .expect("canonical result committed");
+        assert!(
+            first < second && second < result,
+            "frames: {:?}",
+            output.presenter.frames
+        );
+        assert_eq!(
+            output.presenter.frames[result]
+                .text
+                .matches("wrote 12 bytes")
+                .count(),
+            1
+        );
+        assert!(!output.presenter.frames[result].text.contains("assembling"));
+        assert!(
+            output
+                .presenter
+                .frames
+                .iter()
+                .all(|frame| frame.invocation_primary_items <= 1),
+            "more than one primary invocation item was rendered"
+        );
+        let invocation_ids = output
+            .presenter
+            .frames
+            .iter()
+            .flat_map(|frame| frame.invocation_item_ids.iter())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            invocation_ids.len(),
+            1,
+            "invocation identity changed across frames"
+        );
+        assert_eq!(output.stats.frames_presented, 5);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn managed_runtime_commits_progressive_filesystem_edit_frames_without_external_wakeup() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut model = root_test_model();
+        model.chat.session_id = Some(session_id);
+        model.chat.app =
+            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        model
+            .chat
+            .app
+            .set_plugin_host(std::sync::Arc::new(root_filesystem_plugin_host()));
+        let (runtime, handle) = bmux_tui_runtime::Runtime::new(
+            model,
+            RecordingRootPresenter::new(),
+            bmux_tui_runtime::RuntimeConfig {
+                frame_interval: None,
+                ..bmux_tui_runtime::RuntimeConfig::default()
+            },
+        );
+        let draft = |revision, text: &str| {
+            super::super::history_flow::SessionStreamUpdate::Event(Box::new(
+                bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                        event: bcode_session_models::ToolRequestDraftEvent {
+                            output_position: None,
+                            turn_id: "turn-edit".to_owned(),
+                            tool_call_id: "call-edit".to_owned(),
+                            tool_name: "filesystem.edit".to_owned(),
+                            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                            schema: "bcode.filesystem.request-draft.edit".to_owned(),
+                            schema_version: 1,
+                            placement: bcode_session_models::ToolContributionPlacement::Request,
+                            generation: 1,
+                            revision,
+                            operation:
+                                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                                    start_offset: 0,
+                                    text: text.to_owned(),
+                                },
+                            argument_bytes: text.len(),
+                            truncated: false,
+                        },
+                    },
+                }),
+            ))
+        };
+        let durable = |sequence, kind| {
+            super::super::history_flow::SessionStreamUpdate::Event(Box::new(
+                bcode_ipc::Event::Session(bcode_session_models::SessionEvent {
+                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    sequence,
+                    timestamp_ms: sequence,
+                    session_id,
+                    provenance: None,
+                    kind,
+                }),
+            ))
+        };
+        for update in [
+            draft(
+                1,
+                r#"{"path":"src/lib.rs","old_text":"before","new_text":"after"}"#,
+            ),
+            draft(
+                2,
+                r#"{"path":"src/lib.rs","old_text":"before","new_text":"after two"}"#,
+            ),
+            durable(
+                1,
+                bcode_session_models::SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-edit".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    tool_name: "filesystem.edit".to_owned(),
+                    arguments_json:
+                        r#"{"path":"src/lib.rs","old_text":"before","new_text":"after two"}"#
+                            .to_owned(),
+                    working_directory: None,
+                },
+            ),
+            durable(
+                2,
+                bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-edit".to_owned(),
+                        model_output: "edited src/lib.rs".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
+        ] {
+            assert!(
+                handle
+                    .try_send(super::BcodeRuntimeMessage::SessionStream(Box::new(update)))
+                    .is_ok(),
+                "session update fits"
+            );
+        }
+        let runtime_task = tokio::spawn(runtime.run());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handle.stats().frames_presented < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both edit draft and canonical handoff frames commit without external wakeup");
+        assert_eq!(handle.stats().frames_presented, 4);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            handle.stats().frames_presented,
+            4,
+            "runtime remains idle after the edit handoff queue drains"
+        );
+        handle
+            .try_send_terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke::with_modifiers(
+                    bmux_keyboard::KeyCode::Char('d'),
+                    bmux_keyboard::Modifiers {
+                        ctrl: true,
+                        ..bmux_keyboard::Modifiers::NONE
+                    },
+                ),
+            ))
+            .expect("exit input fits");
+        let output = tokio::time::timeout(std::time::Duration::from_secs(2), runtime_task)
+            .await
+            .expect("managed runtime exits")
+            .expect("runtime task joins")
+            .unwrap_or_else(|_| panic!("managed runtime succeeds"));
+        let first = output
+            .presenter
+            .frames
+            .iter()
+            .position(|frame| frame.text.contains("after") && !frame.text.contains("after two"))
+            .expect("first edit draft committed");
+        let second = output
+            .presenter
+            .frames
+            .iter()
+            .position(|frame| frame.text.contains("after two"))
+            .expect("second edit draft committed");
+        let result = output
+            .presenter
+            .frames
+            .iter()
+            .position(|frame| frame.text.contains("edited src/lib.rs"))
+            .expect("canonical edit result committed");
+        assert!(
+            first < second && second < result,
+            "frames: {:?}",
+            output.presenter.frames
+        );
+        assert_eq!(
+            output.presenter.frames[result]
+                .text
+                .matches("edited src/lib.rs")
+                .count(),
+            1
+        );
+        assert!(!output.presenter.frames[result].text.contains("assembling"));
+        assert!(
+            output
+                .presenter
+                .frames
+                .iter()
+                .all(|frame| frame.invocation_primary_items <= 1),
+            "more than one primary invocation item was rendered"
+        );
+        let invocation_ids = output
+            .presenter
+            .frames
+            .iter()
+            .flat_map(|frame| frame.invocation_item_ids.iter())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            invocation_ids.len(),
+            1,
+            "invocation identity changed across frames"
+        );
+        assert_eq!(output.stats.frames_presented, 5);
+    }
+
+    #[tokio::test]
     async fn root_request_draft_handoff_waits_for_committed_paint() {
         let session_id = bcode_session_models::SessionId::new();
         let mut chat = root_test_chat();
@@ -3101,10 +3548,16 @@ mod tests {
         let first = model.chat.app.session_view_snapshot().tools["call-write"]
             .request_draft
             .as_ref()
-            .expect("first draft painted");
+            .expect("first draft awaits presentation");
         assert!(first.preview.is_empty());
-
-        model.presentation_committed(std::time::Instant::now());
+        assert_eq!(
+            bmux_tui_runtime::Program::presentation_committed(
+                &mut model,
+                bmux_tui_runtime::PresentReport::default(),
+            )
+            .invalidation,
+            bmux_tui_runtime::Invalidation::Redraw
+        );
         let second = model.chat.app.session_view_snapshot().tools["call-write"]
             .request_draft
             .as_ref()
