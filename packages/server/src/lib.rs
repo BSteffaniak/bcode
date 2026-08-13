@@ -62676,6 +62676,69 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[test]
+    fn multi_turn_context_after_image_result_remains_buildable() {
+        let session_id = SessionId::new();
+        let client_id = ClientId::new();
+        let image_note = "image\n\n[structured tool content attached]\nimage 1: call_id=call-image mime=image/png 640x480 path=/workspace/image.png";
+        let history = vec![
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-image".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    tool_name: "filesystem.read".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 2,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-image".to_owned(),
+                        model_output: image_note.to_owned(),
+                        is_error: false,
+                        content: Vec::new(),
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                timestamp_ms: 3,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::UserMessage {
+                    client_id,
+                    text: "What else do you notice?".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            },
+        ];
+
+        let messages = session_events_to_model_messages_with_limit(&history, 4_096);
+        assert!(messages.iter().any(|message| matches!(
+            message.content.as_slice(),
+            [ContentBlock::ToolResult { result }]
+                if matches!(result.content.as_slice(), [bcode_model::ToolResultContent::ImageRef { image }] if image.path == "/workspace/image.png")
+        )));
+        assert!(messages.iter().any(|message| matches!(
+            message.content.as_slice(),
+            [ContentBlock::Text { text }] if text == "What else do you notice?"
+        )));
+    }
+
+    #[test]
     fn complete_artifact_recording_never_enters_model_prompt() {
         let session_id = SessionId::new();
         let secret = "recording-byte-secret-that-must-never-reach-the-model";

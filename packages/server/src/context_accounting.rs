@@ -117,7 +117,27 @@ pub fn model_message_context_chars(message: &ModelMessage) -> usize {
             ContentBlock::ToolCall { call } => {
                 call.name.chars().count() + call.arguments.to_string().chars().count()
             }
-            ContentBlock::ToolResult { result } => result.output.chars().count(),
+            ContentBlock::ToolResult { result } => result.output.chars().count().saturating_add(
+                usize::try_from(
+                    result
+                        .content
+                        .iter()
+                        .map(|content| match content {
+                            bcode_model::ToolResultContent::Image { image } => {
+                                image_metadata_tokens(&image.metadata)
+                            }
+                            bcode_model::ToolResultContent::ImageRef { image } => {
+                                image_metadata_tokens(&image.metadata)
+                            }
+                            bcode_model::ToolResultContent::Text { text } => {
+                                estimated_tokens_from_chars(text.chars().count())
+                            }
+                        })
+                        .sum::<u64>()
+                        .saturating_mul(4),
+                )
+                .unwrap_or(usize::MAX),
+            ),
             ContentBlock::ProviderExtension { value } => value.to_string().chars().count(),
         })
         .sum()
