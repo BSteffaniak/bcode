@@ -52845,6 +52845,88 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn client_runtime_configs_are_isolated_per_session_and_resume_replaces_non_sticky_config()
+    {
+        let sessions = SessionManager::default();
+        let first_session = sessions
+            .create_session(Some("first config".to_owned()), test_working_directory())
+            .await
+            .expect("first session")
+            .id;
+        let second_session = sessions
+            .create_session(Some("second config".to_owned()), test_working_directory())
+            .await
+            .expect("second session")
+            .id;
+        let state = test_server_state(sessions);
+        let context = |max_rounds: u32, accent: &str| {
+            let mut config = bcode_config::BcodeConfig::default();
+            config.model.max_tool_rounds = Some(max_rounds);
+            config.agent =
+                toml::from_str::<toml::Value>(&format!("[build]\naccent = {accent:?}\n"))
+                    .expect("agent config TOML")
+                    .try_into()
+                    .expect("agent config");
+            ClientRuntimeContext {
+                effective_config_toml: Some(Box::new(
+                    bcode_config::encode_effective_config(&config).expect("encode config"),
+                )),
+                ..ClientRuntimeContext::default()
+            }
+        };
+
+        let first_context = context(1, "#111111");
+        let second_context = context(2, "#222222");
+        state
+            .set_session_config_from_runtime_context(first_session, Some(&first_context))
+            .await;
+        state
+            .set_session_config_from_runtime_context(second_session, Some(&second_context))
+            .await;
+
+        let first = state.session_config(first_session).await;
+        let second = state.session_config(second_session).await;
+        assert_eq!(first.model.effective_max_tool_rounds(), Some(1));
+        assert_eq!(second.model.effective_max_tool_rounds(), Some(2));
+        assert_eq!(
+            first
+                .agent
+                .get("build")
+                .and_then(|agent| agent.accent.as_deref()),
+            Some("#111111")
+        );
+        assert_eq!(
+            second
+                .agent
+                .get("build")
+                .and_then(|agent| agent.accent.as_deref()),
+            Some("#222222")
+        );
+
+        let resumed_context = context(3, "#333333");
+        state
+            .set_session_config_from_runtime_context(first_session, Some(&resumed_context))
+            .await;
+        let resumed = state.session_config(first_session).await;
+        assert_eq!(resumed.model.effective_max_tool_rounds(), Some(3));
+        assert_eq!(
+            resumed
+                .agent
+                .get("build")
+                .and_then(|agent| agent.accent.as_deref()),
+            Some("#333333")
+        );
+        assert_eq!(
+            state
+                .session_config(second_session)
+                .await
+                .model
+                .effective_max_tool_rounds(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
     async fn client_runtime_model_and_provider_context_replace_non_sticky_daemon_default() {
         let sessions = SessionManager::default();
         let session_id = sessions
