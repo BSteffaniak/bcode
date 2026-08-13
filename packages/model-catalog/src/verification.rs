@@ -15,6 +15,8 @@ pub const DEFAULT_VERIFY_PROMPT: &str = "say ok";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 /// Default `ChatGPT` subscription Codex API endpoint.
 pub const DEFAULT_CHATGPT_CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+/// Default AWS region used when building a Bedrock Mantle endpoint.
+pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 
 /// Auth/transport mode used for verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,9 +200,9 @@ pub async fn run_verification(
 }
 
 fn validate_options(options: &VerificationOptions) -> Result<(), Box<dyn std::error::Error>> {
-    if options.provider != "openai" {
+    if !matches!(options.provider.as_str(), "openai" | "bedrock") {
         return Err(format!(
-            "provider `{}` is not supported yet; use --provider openai",
+            "provider `{}` is not supported yet; use --provider openai or --provider bedrock",
             options.provider
         )
         .into());
@@ -214,8 +216,20 @@ fn validate_options(options: &VerificationOptions) -> Result<(), Box<dyn std::er
 fn build_verifier(
     options: &VerificationOptions,
 ) -> Result<Box<dyn ModelVerifier + Send + Sync>, Box<dyn std::error::Error>> {
+    // Bedrock-hosted OpenAI models are reached through Mantle rather than the public OpenAI API,
+    // so provider selection picks the transport before auth mode is considered.
+    if options.provider == "bedrock" {
+        return BedrockMantleVerifier::from_env(options)
+            .map(|verifier| Box::new(verifier) as _)
+            .map_err(|_| {
+                "no Bedrock verifier auth found; set AWS_BEARER_TOKEN_BEDROCK to a Bedrock API key"
+                    .into()
+            });
+    }
     match options.auth_mode {
-        VerificationAuthMode::ApiKey => OpenAiApiKeyVerifier::from_env(options).map(|v| Box::new(v) as _),
+        VerificationAuthMode::ApiKey => {
+            OpenAiApiKeyVerifier::from_env(options).map(|v| Box::new(v) as _)
+        }
         VerificationAuthMode::Subscription => {
             ChatGptSubscriptionVerifier::from_env(options).map(|v| Box::new(v) as _)
         }
@@ -435,6 +449,71 @@ impl ModelVerifier for ChatGptSubscriptionVerifier {
     }
 }
 
+/// Verifier for `OpenAI` models hosted on the Amazon Bedrock Mantle endpoint.
+///
+/// Mantle serves these models on the `openai/v1/responses` path, which AWS documents as
+/// deliberately different from the `v1/responses` path used elsewhere. It also has no
+/// control-plane model listing for this surface, so discovery returns nothing and verification runs
+/// against catalog membership.
+#[derive(Debug, Clone)]
+struct BedrockMantleVerifier {
+    http: reqwest::Client,
+    endpoint: String,
+    bearer_token: String,
+}
+
+impl BedrockMantleVerifier {
+    fn from_env(options: &VerificationOptions) -> Result<Self, Box<dyn std::error::Error>> {
+        let bearer_token = std::env::var("AWS_BEARER_TOKEN_BEDROCK")?;
+        let endpoint = options.base_url.clone().map_or_else(
+            || {
+                let region = std::env::var("BCODE_BEDROCK_REGION")
+                    .or_else(|_| std::env::var("AWS_REGION"))
+                    .unwrap_or_else(|_| DEFAULT_BEDROCK_REGION.to_string());
+                format!("https://bedrock-mantle.{region}.api.aws/openai/v1/responses")
+            },
+            |base_url| format!("{}/responses", base_url.trim_end_matches('/')),
+        );
+        Ok(Self {
+            http: http_client(options.timeout_seconds)?,
+            endpoint,
+            bearer_token,
+        })
+    }
+}
+
+impl ModelVerifier for BedrockMantleVerifier {
+    fn verify_model<'a>(
+        &'a self,
+        model_id: &'a str,
+        request: &'a VerifyModelRequest,
+    ) -> Pin<Box<dyn Future<Output = VerificationResult> + Send + 'a>> {
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "model": model_id,
+                "input": request.prompt,
+                "max_output_tokens": 16,
+            });
+            post_json_verify(&self.http, &self.endpoint, &self.bearer_token, &body).await
+        })
+    }
+
+    fn discover_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+        // Mantle exposes no model listing for this surface; catalog membership is authoritative.
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn transport(&self) -> &'static str {
+        "bedrock_mantle_openai"
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
 fn http_client(timeout_seconds: u64) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_seconds))
@@ -588,4 +667,90 @@ fn unix_timestamp_string() -> String {
             |_| "0".to_string(),
             |duration| duration.as_secs().to_string(),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(provider: &str, base_url: Option<&str>) -> VerificationOptions {
+        VerificationOptions {
+            provider: provider.to_string(),
+            prompt: DEFAULT_VERIFY_PROMPT.to_string(),
+            max_models: None,
+            id_pattern: None,
+            catalog_only: false,
+            discovered_only: false,
+            dry_run: true,
+            output: None,
+            base_url: base_url.map(ToString::to_string),
+            timeout_seconds: 30,
+            concurrency: 1,
+            auth_mode: VerificationAuthMode::Auto,
+        }
+    }
+
+    #[test]
+    fn supported_providers_are_accepted_and_others_rejected() {
+        validate_options(&options("openai", None)).expect("openai is supported");
+        validate_options(&options("bedrock", None)).expect("bedrock is supported");
+
+        let error = validate_options(&options("anthropic", None))
+            .expect_err("unsupported providers must be rejected");
+        assert!(
+            error.to_string().contains("bedrock"),
+            "the error should name the supported providers: {error}"
+        );
+    }
+
+    #[test]
+    fn bedrock_verifier_targets_the_documented_mantle_responses_path() {
+        // AWS documents `openai/v1/responses`, which differs from the `v1/responses` path used by
+        // other models on the responses endpoint.
+        let verifier = BedrockMantleVerifier {
+            http: http_client(30).expect("client builds"),
+            endpoint: format!(
+                "https://bedrock-mantle.{DEFAULT_BEDROCK_REGION}.api.aws/openai/v1/responses"
+            ),
+            bearer_token: "token".to_string(),
+        };
+        assert_eq!(
+            verifier.endpoint(),
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses"
+        );
+        assert_eq!(verifier.transport(), "bedrock_mantle_openai");
+    }
+
+    #[test]
+    fn bedrock_verifier_reports_no_discoverable_models() {
+        // Mantle has no model listing for this surface, so catalog membership is authoritative and
+        // discovery must return empty rather than erroring.
+        let verifier = BedrockMantleVerifier {
+            http: http_client(30).expect("client builds"),
+            endpoint: "https://example.invalid/openai/v1/responses".to_string(),
+            bearer_token: "token".to_string(),
+        };
+        let discovered = futures_lite_block_on(verifier.discover_models());
+        assert_eq!(discovered, Ok(Vec::new()));
+    }
+
+    /// Minimal executor so this test does not pull in a runtime dependency.
+    fn futures_lite_block_on<T>(future: impl Future<Output = T>) -> T {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct NoopWaker;
+        impl Wake for NoopWaker {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+    }
 }

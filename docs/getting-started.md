@@ -45,7 +45,7 @@ Running `bcode` after setup opens the TUI. The client starts a matching local da
 The bundled distribution includes two provider integrations:
 
 * **OpenAI-compatible:** OpenAI API keys, ChatGPT browser or device-code login, xAI API keys, and configurable compatible endpoints.
-* **Amazon Bedrock:** models available through the Bedrock `ConverseStream` API and the active AWS credential chain.
+* **Amazon Bedrock:** models available through the Bedrock `ConverseStream` API and the active AWS credential chain, plus Anthropic and `OpenAI` models served through the Bedrock Mantle endpoint. See [Bedrock-hosted OpenAI models](bedrock-openai-models.md) for the GPT-5.6 tier and other `OpenAI` models.
 
 For OpenAI or ChatGPT authentication, the canonical CLI flow is:
 

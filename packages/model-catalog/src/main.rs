@@ -46,7 +46,10 @@ enum Command {
     Status,
     /// Verify catalog/provider models with a tiny live completion request.
     Verify {
-        /// Provider id to verify. Currently supports `openai`.
+        /// Provider id to verify. Supports `openai` and `bedrock`.
+        ///
+        /// `bedrock` verifies `OpenAI` models hosted on the Bedrock Mantle endpoint and requires
+        /// `AWS_BEARER_TOKEN_BEDROCK`.
         #[arg(long, default_value = "openai")]
         provider: String,
         /// Prompt sent to each model.
