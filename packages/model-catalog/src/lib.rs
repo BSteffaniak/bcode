@@ -799,6 +799,10 @@ fn enrich_from_entry_for_target(
             .supported_by
             .iter()
             .any(|supported| supported.matches(target));
+    // A target the entry does not declare must not erase documented limits. Target-specific values
+    // take precedence when present, then the entry's own documented values apply. Most catalog
+    // entries declare neither `deployments` nor `supported_by`, so without this fallback a
+    // target-aware merge would strip their limits and break context accounting.
     if model.context_window.is_none() {
         model.context_window = deployment
             .and_then(|deployment| deployment.context_window)
@@ -806,7 +810,8 @@ fn enrich_from_entry_for_target(
                 legacy_target_match
                     .then_some(entry.context_window)
                     .flatten()
-            });
+            })
+            .or(entry.context_window);
         if model.context_window.is_some() && model.metadata_source.is_none() {
             model.metadata_source = Some(catalog_source);
         }
@@ -818,7 +823,8 @@ fn enrich_from_entry_for_target(
                 legacy_target_match
                     .then_some(entry.max_output_tokens)
                     .flatten()
-            });
+            })
+            .or(entry.max_output_tokens);
         if model.max_output_tokens.is_some() && model.metadata_source.is_none() {
             model.metadata_source = Some(catalog_source);
         }
@@ -1763,6 +1769,61 @@ mod tests {
                 .unwrap_or_else(|| panic!("{model_id} should exist"));
             assert_eq!(entry.api_surface, None, "{model_id}");
         }
+    }
+
+    #[test]
+    fn non_matching_target_preserves_documented_entry_limits() {
+        // Regression guard: enriching through a target a model does not declare must not erase the
+        // entry's own documented limits. 146 of 157 Bedrock entries declare neither `deployments`
+        // nor `supported_by`, so a target-aware merge that only consults target-specific values
+        // silently dropped every Claude/Nova/Llama context window and broke context display.
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let responses_target = bcode_model_catalog_models::ModelSupportTarget::new(
+            "bedrock",
+            "bearer_token",
+            "responses",
+            Some("bcode"),
+        );
+
+        let discovered = vec![ModelInfo {
+            model_id: "us.anthropic.claude-sonnet-5-20250929-v1:0".to_string(),
+            display_name: "Claude Sonnet 5".to_string(),
+            is_default: true,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            api_surface: None,
+            visibility: ModelVisibility::Visible,
+            max_image_input_base64_bytes: None,
+        }];
+
+        let merged = catalog.merge_provider_models_for_target(
+            "bedrock",
+            discovered,
+            false,
+            Some(&responses_target),
+        );
+
+        let claude = merged
+            .first()
+            .expect("the discovered Claude model is preserved");
+        assert_eq!(
+            claude.context_window,
+            Some(1_000_000),
+            "a Claude model must keep its documented context window when enriched through a \
+             target it does not declare"
+        );
+        assert_eq!(claude.max_output_tokens, Some(128_000));
+        // The Messages surface must still be reported so routing stays correct.
+        assert_eq!(
+            claude.api_surface,
+            Some(bcode_model::ModelApiSurface::Messages)
+        );
     }
 
     #[test]
