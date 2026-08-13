@@ -296,11 +296,14 @@ async fn stream_bedrock_turn(
 /// reasoning summaries, structured outputs, and parallel tool calls, so those checks are scoped to
 /// the surfaces that actually reject them. Keeping this in one place avoids advertising a
 /// capability in the model catalog that the adapter then refuses.
+///
+/// `responses_surface` is resolved from the selected model's declared API surface (see
+/// [`uses_mantle_openai_surface`]), not from configuration, so a Responses-only model validates
+/// correctly on the default transport.
 fn validate_bedrock_request(
     request: &ModelTurnRequest,
-    transport: Option<BedrockTransport>,
+    responses_surface: bool,
 ) -> Result<(), ProviderError> {
-    let responses_surface = transport == Some(BedrockTransport::MantleOpenAi);
     if request.structured_output.is_some() && !responses_surface {
         return Err(provider_error(
             "bedrock_structured_output_unsupported",
@@ -354,16 +357,16 @@ fn validate_bedrock_request(
         ));
     }
     validate_bedrock_cache_ttl(request)?;
-    validate_declared_bedrock_features(request, transport)?;
+    validate_declared_bedrock_features(request, responses_surface)?;
     validate_tool_choice_registration(request)
 }
 
 fn validate_declared_bedrock_features(
     request: &ModelTurnRequest,
-    transport: Option<BedrockTransport>,
+    responses_surface: bool,
 ) -> Result<(), ProviderError> {
     let unsupported =
-        request.explicitly_unsupported_features(&bedrock_feature_support_for(transport));
+        request.explicitly_unsupported_features(&bedrock_feature_support_for(responses_surface));
     unsupported.first().map_or(Ok(()), |feature| {
         Err(provider_error(
             "bedrock_feature_unsupported",
@@ -425,14 +428,18 @@ async fn stream_bedrock_turn_inner(
 ) -> Result<StreamOutcome, ProviderError> {
     let settings = Settings::resolve(Some(request));
     let transport = settings.transport.clone()?;
-    validate_bedrock_request(request, Some(transport))?;
+    // The Responses surface is selected per model, not per configuration: the catalog declares
+    // `api_surface = "responses"` for models that exist only on Mantle, so they route correctly on
+    // the default transport. `BCODE_BEDROCK_TRANSPORT=mantle_openai` remains an explicit override.
+    let responses_surface = uses_mantle_openai_surface(request, transport);
+    validate_bedrock_request(request, responses_surface)?;
     let selection = resolve_turn_model_selection(request, &settings, turn, &discovery).await?;
     let name_map = bedrock_tool_name_map(&request.tools);
+    if responses_surface {
+        return stream_mantle_openai_turn(request, &settings, &selection, turn, name_map).await;
+    }
     if transport == BedrockTransport::MantleAnthropic {
         return stream_mantle_anthropic_turn(request, &settings, &selection, turn, name_map).await;
-    }
-    if transport == BedrockTransport::MantleOpenAi {
-        return stream_mantle_openai_turn(request, &settings, &selection, turn, name_map).await;
     }
     let client = bedrock_client(&settings).await;
     if request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Messages) {
@@ -571,6 +578,17 @@ async fn stream_mantle_anthropic_turn(
             "no usable Bedrock Mantle Anthropic model was available for the turn",
         )
     }))
+}
+
+/// Whether this turn should be served over the Mantle `OpenAI` Responses surface.
+///
+/// Routing follows the model rather than configuration: the catalog marks Mantle-only `OpenAI`
+/// models with `api_surface = "responses"`, so they work on the default transport with no
+/// environment variables. Selecting `mantle_openai` explicitly forces the surface for every model,
+/// which keeps the transport useful as an override and for local testing.
+fn uses_mantle_openai_surface(request: &ModelTurnRequest, transport: BedrockTransport) -> bool {
+    transport == BedrockTransport::MantleOpenAi
+        || request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Responses)
 }
 
 /// Support target describing the Bedrock Mantle `OpenAI` Responses deployment.
@@ -3175,8 +3193,8 @@ struct BedrockSurfaceCapabilities {
 }
 
 impl BedrockSurfaceCapabilities {
-    /// Resolve the surface-varying capabilities for one transport.
-    fn for_transport(transport: Option<BedrockTransport>) -> Self {
+    /// Resolve the surface-varying capabilities for a surface.
+    fn for_surface(responses_surface: bool) -> Self {
         use bcode_model::{CapabilitySource, CapabilitySupport};
         let supported = || CapabilitySupport::Supported {
             source: CapabilitySource::BundledCatalog,
@@ -3185,7 +3203,7 @@ impl BedrockSurfaceCapabilities {
             source: CapabilitySource::BundledCatalog,
             reason: reason.to_string(),
         };
-        if transport == Some(BedrockTransport::MantleOpenAi) {
+        if responses_surface {
             return Self {
                 reasoning_summary: supported(),
                 structured_output: supported(),
@@ -3211,14 +3229,12 @@ impl BedrockSurfaceCapabilities {
 /// Anthropic Messages surface provide. Reporting one surface-independent matrix would either
 /// advertise capabilities Converse cannot serve or deny capabilities the catalog advertises for the
 /// `OpenAI` models.
-fn bedrock_feature_support_for(
-    transport: Option<BedrockTransport>,
-) -> bcode_model::ModelFeatureSupport {
+fn bedrock_feature_support_for(responses_surface: bool) -> bcode_model::ModelFeatureSupport {
     use bcode_model::{
         CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
         ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
     };
-    let surface = BedrockSurfaceCapabilities::for_transport(transport);
+    let surface = BedrockSurfaceCapabilities::for_surface(responses_surface);
     let supported = || CapabilitySupport::Supported {
         source: CapabilitySource::BundledCatalog,
     };
@@ -3311,7 +3327,12 @@ fn capabilities() -> ProviderCapabilities {
         ]
         .into_iter()
         .collect(),
-        feature_support: bedrock_feature_support_for(settings.transport.clone().ok()),
+        feature_support: bedrock_feature_support_for(
+            settings
+                .transport
+                .as_ref()
+                .is_ok_and(|transport| *transport == BedrockTransport::MantleOpenAi),
+        ),
         auth_schemes: [
             "aws_default_chain".to_string(),
             "aws_credentials".to_string(),
@@ -3339,10 +3360,7 @@ impl BedrockProviderPlugin {
                 settings.model_ids.clone()
             };
             let models = model_infos_from_ids(&model_ids, settings.default_model.as_deref());
-            // The OpenAI Responses surface exists only on Mantle: those models are absent from
-            // `ListFoundationModels`, so without catalog expansion the picker would show only the
-            // single configured model. Ask the host to expand membership from catalog entries
-            // declaring support for this surface.
+            // An explicitly selected Mantle transport pins the surface, so expand only that one.
             let policy = if settings
                 .transport
                 .as_ref()
@@ -3373,7 +3391,7 @@ impl BedrockProviderPlugin {
                 ),
                 catalog: ModelCatalogHints {
                     policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
-                        provider_id: "bedrock".to_string(),
+                        provider_id: CATALOG_PROVIDER_ID.to_string(),
                         target: None,
                         authority: bcode_model::ModelListAuthority::Explicit,
                     },
@@ -3393,12 +3411,16 @@ impl BedrockProviderPlugin {
         };
         let mut models = discovered.models;
         apply_default_model_to_list(&mut models, settings.default_model.as_deref());
+        // Converse discovery cannot see Mantle-only models: AWS reports `bedrock-runtime: No` for
+        // the OpenAI Responses models, so `ListFoundationModels` omits them. Expand membership from
+        // the catalog so those models are selectable on the default transport, with no environment
+        // variables. Discovered Converse models are preserved and enriched as before.
         ModelList {
             models,
             catalog: ModelCatalogHints {
-                policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
-                    provider_id: "bedrock".to_string(),
-                    target: None,
+                policy: bcode_model::ModelCatalogPolicy::ExpandSupported {
+                    provider_id: CATALOG_PROVIDER_ID.to_string(),
+                    target: mantle_openai_support_hint(),
                     authority: bcode_model::ModelListAuthority::Authoritative,
                 },
             },
@@ -5617,13 +5639,13 @@ mod tests {
         });
         request.tool_call_policy.parallel = Some(true);
 
-        validate_bedrock_request(&request, Some(BedrockTransport::MantleOpenAi))
+        validate_bedrock_request(&request, true)
             .expect("the Responses surface supports these features");
 
         // The same request is still rejected on Converse.
         for transport in [BedrockTransport::Runtime, BedrockTransport::MantleAnthropic] {
             assert!(
-                validate_bedrock_request(&request, Some(transport)).is_err(),
+                validate_bedrock_request(&request, false).is_err(),
                 "{transport:?} must still reject Converse-unsupported features"
             );
         }
@@ -6893,8 +6915,7 @@ mod tests {
             }],
         });
 
-        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
-            .expect_err("TTL must be rejected");
+        let error = validate_bedrock_request(&request, false).expect_err("TTL must be rejected");
         assert_eq!(error.code, "bedrock_cache_ttl_unsupported");
     }
 
@@ -6904,7 +6925,7 @@ mod tests {
             CapabilitySupport, ModelFeatureSupport, ModelParameterKey, RequestedModelFeature,
             StructuredOutputMode,
         };
-        let provider = bedrock_feature_support_for(Some(BedrockTransport::Runtime));
+        let provider = bedrock_feature_support_for(false);
         assert!(provider.has_complete_inventory());
         assert!(
             provider
@@ -6949,25 +6970,24 @@ mod tests {
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         });
-        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
-            .expect_err("schema mode must fail");
+        let error = validate_bedrock_request(&request, false).expect_err("schema mode must fail");
         assert_eq!(error.category, ProviderErrorCategory::UnsupportedFeature);
 
         request.structured_output = None;
         request.parameters.reasoning_effort = Some(bcode_model::ReasoningEffort::High);
-        validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
+        validate_bedrock_request(&request, false)
             .expect("reasoning effort is now mapped to extended thinking");
 
         request.parameters = bcode_model::ModelParameters::default();
         request.parameters.reasoning_summary = Some("detailed".to_string());
-        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
-            .expect_err("reasoning summary must fail");
+        let error =
+            validate_bedrock_request(&request, false).expect_err("reasoning summary must fail");
         assert_eq!(error.code, "bedrock_reasoning_summary_unsupported");
 
         request.parameters = bcode_model::ModelParameters::default();
         request.tool_call_policy.parallel = Some(true);
-        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
-            .expect_err("parallel policy must fail");
+        let error =
+            validate_bedrock_request(&request, false).expect_err("parallel policy must fail");
         assert_eq!(error.code, "bedrock_parallel_tool_policy_unsupported");
     }
 
@@ -7100,14 +7120,13 @@ mod tests {
             "unsupported".to_string(),
             bcode_model::ProviderRequestValue::Bool(true),
         );
-        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
-            .expect_err("provider option must fail");
+        let error =
+            validate_bedrock_request(&request, false).expect_err("provider option must fail");
         assert_eq!(error.code, "bedrock_provider_options_unsupported");
 
         request.provider_context.request.clear();
         request.conversation_reuse.mode = bcode_model::ConversationReuseMode::Auto;
-        let error = validate_bedrock_request(&request, Some(BedrockTransport::Runtime))
-            .expect_err("reuse must fail");
+        let error = validate_bedrock_request(&request, false).expect_err("reuse must fail");
         assert_eq!(error.code, "bedrock_conversation_reuse_unsupported");
     }
 
@@ -7214,6 +7233,70 @@ mod tests {
                 .contains("model")
         );
         assert!(compatibility.unsupported_streaming_for(&key).is_empty());
+    }
+
+    #[test]
+    fn responses_models_route_and_list_without_any_configuration() {
+        // The catalog declares `api_surface = "responses"` for Mantle-only OpenAI models, so both
+        // routing and picker membership must work on the default transport with no environment
+        // variables. Requiring `BCODE_BEDROCK_TRANSPORT=mantle_openai` would hide clearly supported
+        // models behind configuration.
+        let default_transport = BedrockTransport::Runtime;
+
+        let mut responses_request = test_model_turn_request();
+        responses_request.provider_context.api_surface =
+            Some(bcode_model::ModelApiSurface::Responses);
+        assert!(
+            uses_mantle_openai_surface(&responses_request, default_transport),
+            "a Responses-surface model must route to Mantle OpenAI on the default transport"
+        );
+
+        // Converse models are unaffected.
+        let converse_request = test_model_turn_request();
+        assert!(!uses_mantle_openai_surface(
+            &converse_request,
+            default_transport
+        ));
+
+        // Messages-surface models still route to the Anthropic adapter, not Responses.
+        let mut messages_request = test_model_turn_request();
+        messages_request.provider_context.api_surface =
+            Some(bcode_model::ModelApiSurface::Messages);
+        assert!(!uses_mantle_openai_surface(
+            &messages_request,
+            default_transport
+        ));
+
+        // The explicit transport still forces the surface for any model.
+        assert!(uses_mantle_openai_surface(
+            &converse_request,
+            BedrockTransport::MantleOpenAi
+        ));
+
+        // Feature negotiation follows the surface, so reasoning summaries and structured output are
+        // accepted for a Responses model even on the default transport.
+        let mut rich = test_model_turn_request();
+        rich.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Responses);
+        rich.parameters.reasoning_summary = Some("detailed".to_string());
+        rich.tool_call_policy.parallel = Some(true);
+        let responses_surface = uses_mantle_openai_surface(&rich, default_transport);
+        validate_bedrock_request(&rich, responses_surface)
+            .expect("Responses models accept these features on the default transport");
+
+        // The default picker asks the host to expand the Responses models from the catalog.
+        let plugin = BedrockProviderPlugin::default();
+        let list = plugin.models(&ModelListRequest::default());
+        match &list.catalog.policy {
+            bcode_model::ModelCatalogPolicy::ExpandSupported {
+                provider_id,
+                target,
+                ..
+            } => {
+                assert_eq!(provider_id, "bedrock");
+                assert_eq!(target, &mantle_openai_support_hint());
+            }
+            other => panic!("the default picker must expand Responses models, got {other:?}"),
+        }
     }
 
     #[test]

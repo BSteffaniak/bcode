@@ -26,25 +26,19 @@ Converse and are marked unsupported in the model catalog.
 Per-region inference-profile prefixes (`us.`, `eu.`, `apac.`, `global.`) resolve to the same catalog
 entries, so `us.openai.gpt-5.6-sol` carries the same metadata as `openai.gpt-5.6-sol`.
 
-## Configure the transport
+## Configure
 
-Mantle has no control-plane model listing for this surface, so `ListFoundationModels` never returns
-the Responses-only models. Set the transport to `mantle_openai` and Bcode populates the model picker
-from catalog membership instead:
+No transport configuration is required. Routing follows the model: the catalog marks Mantle-only
+`OpenAI` models with `api_surface = "responses"`, so selecting one sends the turn to the Mantle
+Responses endpoint automatically, and `/model` / `/models` list all seven alongside the Converse
+models that `ListFoundationModels` reports.
+
+All you need is a Bedrock API key:
 
 ```sh
-export BCODE_BEDROCK_TRANSPORT=mantle_openai
-export BCODE_BEDROCK_MODEL=openai.gpt-5.6-sol
-export BCODE_BEDROCK_REGION=us-east-1
 export AWS_BEARER_TOKEN_BEDROCK="<Bedrock long-term API key>"
+export BCODE_BEDROCK_REGION=us-east-1   # optional; falls back to AWS_REGION, then us-east-1
 ```
-
-`BCODE_BEDROCK_MODEL` is still required — a turn needs a concrete model, and Bcode reports
-`bedrock_mantle_model_required` without one. It selects the default; `/model` and `/models` list all
-seven Responses models regardless.
-
-On the default `bedrock_runtime` transport, only the dual-surface `gpt-oss` models appear, because
-those are the only `OpenAI` models Bedrock's Converse control plane lists.
 
 Generate the API key from the Amazon Bedrock console. `AWS_BEARER_TOKEN_BEDROCK` is also accepted
 through Bcode's provider auth flow as the `bearer_token` credential, which is preferred over an
@@ -55,13 +49,20 @@ The endpoint defaults to `https://bedrock-mantle.<region>.api.aws/openai/v1` and
 from the `v1/responses` path other models use on the responses endpoint. Override the base URL with
 `BCODE_BEDROCK_MANTLE_BASE_URL` when needed; it must use HTTPS unless it points at a loopback host.
 
-### Transport values
+### Optional transport override
+
+`BCODE_BEDROCK_TRANSPORT` pins every model to one surface. This is an override for testing or
+unusual deployments — it is not required to use any supported model.
 
 | Value | Surface |
 | --- | --- |
-| `bedrock_runtime` (default), `runtime` | `ConverseStream` |
+| unset (default) | Per-model: Converse, Anthropic Messages, or `OpenAI` Responses, from the catalog |
+| `bedrock_runtime`, `runtime` | `ConverseStream` |
 | `mantle_anthropic`, `mantle` | Anthropic Messages on Mantle |
-| `mantle_openai` | `OpenAI` Responses on Mantle |
+| `mantle_openai` | `OpenAI` Responses on Mantle, for every model |
+
+When a Mantle transport is pinned, `BCODE_BEDROCK_MODEL` is required, because Mantle has no
+control-plane listing to discover a default from.
 
 ## Supported features
 
@@ -73,8 +74,9 @@ them per transport:
 * parallel tool calls
 * prompt caching
 
-Requesting these while `BCODE_BEDROCK_TRANSPORT` selects a Converse surface is still rejected, since
-those are genuine Converse limitations rather than Bedrock-wide ones.
+Requesting these while a Converse surface is selected is still rejected, since those are genuine
+Converse limitations rather than Bedrock-wide ones. Negotiation follows the selected model's surface,
+so a Responses model accepts them with no configuration.
 
 Provider-native conversation reuse is not used on this path: Bcode does not ask Mantle to persist
 responses, and `store` is always sent as `false`.
