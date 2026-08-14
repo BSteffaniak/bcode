@@ -8,7 +8,12 @@ python3 - <<'PY'
 from pathlib import Path
 
 shared = Path("packages/session-view/src/lib.rs").read_text()
-tui = "\n".join(path.read_text() for path in Path("packages/tui").rglob("*.rs"))
+tui = "\n".join(
+    path.read_text()
+    for path in Path("packages/tui").rglob("*.rs")
+    if path.name != "streaming_configurator.rs"
+)
+streaming_configurator = Path("packages/tui/src/streaming_configurator.rs").read_text()
 hyperchad = Path("packages/hyperchad/src/lib.rs").read_text()
 config = Path("packages/config/src/lib.rs").read_text()
 renderer_docs = Path("docs/renderer-architecture.md").read_text()
@@ -28,8 +33,15 @@ for forbidden in ("StreamingInterpolationCurve::Linear", "grapheme_indices(true)
     if forbidden in tui or forbidden in hyperchad:
         raise SystemExit(f"renderer owns shared interpolation behavior: {forbidden}")
 
+for forbidden in ("grapheme_indices(true)", ".graphemes(true)", "fn effective_rate"):
+    if forbidden in streaming_configurator:
+        raise SystemExit(f"streaming configurator duplicates shared presentation behavior: {forbidden}")
+
+for required in ("SessionView", "StreamingPresentationPolicy::immediate()"):
+    if required not in streaming_configurator:
+        raise SystemExit(f"streaming configurator does not reuse shared projection: {required}")
+
 for required in (
-    '"bcode.streaming_presentation"',
     "next_streaming_presentation_deadline",
     "advance_streaming_presentation",
 ):

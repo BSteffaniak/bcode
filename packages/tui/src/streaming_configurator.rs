@@ -5,7 +5,10 @@ use bcode_session_models::{
     SessionLiveEventKind, TextStreamOperation, TextStreamTerminalStatus, TextStreamUpdate,
 };
 use bcode_session_view::SessionView;
-use bcode_session_view_models::{StreamingPresentationPolicy, TranscriptViewItemKind};
+use bcode_session_view_models::{
+    StreamingInterpolationCurve, StreamingPresentationPolicy, TranscriptViewItemKind,
+};
+use bmux_keyboard::{KeyCode, KeyStroke};
 
 const TURN_ID: &str = "streaming-configurator-turn";
 const SEGMENT_ID: &str = "streaming-configurator-segment";
@@ -38,6 +41,252 @@ enum PlaybackPhase {
     Running,
     Paused,
     Completed,
+}
+
+/// Configurator setting row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingConfiguratorFocus {
+    /// Progressive presentation enabled toggle.
+    Enabled,
+    /// Interpolation curve.
+    Curve,
+    /// Nominal grapheme rate.
+    GraphemesPerSecond,
+    /// Maximum accepted-text backlog age.
+    MaxLag,
+    /// Apply declarative fallback by clearing the override.
+    Reset,
+}
+
+impl StreamingConfiguratorFocus {
+    const ALL: [Self; 5] = [
+        Self::Enabled,
+        Self::Curve,
+        Self::GraphemesPerSecond,
+        Self::MaxLag,
+        Self::Reset,
+    ];
+}
+
+/// Result of handling one configurator key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingConfiguratorOutcome {
+    /// State changed and the surface remains open.
+    Handled,
+    /// Apply the selected override and close.
+    Apply(StreamingPresentationPolicy),
+    /// Clear the override, apply the declarative fallback, and close.
+    Reset,
+    /// Close without changing active or persisted policy.
+    Cancel,
+    /// The key is not owned by the configurator.
+    Ignored,
+}
+
+/// Complete local state for the streaming configurator surface.
+pub struct StreamingConfiguratorState {
+    controller: StreamingPreviewController,
+    original_policy: StreamingPresentationPolicy,
+    override_policy: StreamingPresentationPolicy,
+    declarative_fallback: StreamingPresentationPolicy,
+    focus: StreamingConfiguratorFocus,
+    reset_pending: bool,
+}
+
+impl StreamingConfiguratorState {
+    /// Create configurator state from the effective and declarative policies.
+    #[must_use]
+    pub fn new(
+        now: Instant,
+        effective_policy: StreamingPresentationPolicy,
+        declarative_fallback: StreamingPresentationPolicy,
+    ) -> Self {
+        let effective_policy = effective_policy.normalized();
+        Self {
+            controller: StreamingPreviewController::new(now, effective_policy),
+            original_policy: effective_policy,
+            override_policy: effective_policy,
+            declarative_fallback: declarative_fallback.normalized(),
+            focus: StreamingConfiguratorFocus::Enabled,
+            reset_pending: false,
+        }
+    }
+
+    /// Return the preview controller.
+    #[must_use]
+    pub const fn controller(&self) -> &StreamingPreviewController {
+        &self.controller
+    }
+
+    /// Return the selected policy or declarative fallback when reset is pending.
+    #[must_use]
+    pub const fn selected_policy(&self) -> StreamingPresentationPolicy {
+        if self.reset_pending {
+            self.declarative_fallback
+        } else {
+            self.override_policy
+        }
+    }
+
+    /// Return the active focus row.
+    #[must_use]
+    pub const fn focus(&self) -> StreamingConfiguratorFocus {
+        self.focus
+    }
+
+    /// Return whether Apply will clear the user-state override.
+    #[must_use]
+    pub const fn reset_pending(&self) -> bool {
+        self.reset_pending
+    }
+
+    /// Return the policy that was active when the surface opened.
+    #[must_use]
+    pub const fn original_policy(&self) -> StreamingPresentationPolicy {
+        self.original_policy
+    }
+
+    /// Return the earliest controller deadline.
+    #[must_use]
+    pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        self.controller.next_deadline(now)
+    }
+
+    /// Advance due preview work.
+    pub fn advance(&mut self, now: Instant) -> bool {
+        self.controller.advance(now)
+    }
+
+    /// Handle one keyboard input event.
+    pub fn handle_key(&mut self, stroke: KeyStroke, now: Instant) -> StreamingConfiguratorOutcome {
+        match stroke.key {
+            KeyCode::Up => {
+                self.move_focus(-1);
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::Down => {
+                self.move_focus(1);
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::Left => {
+                self.adjust(-1, stroke.modifiers.shift, now);
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::Right => {
+                self.adjust(1, stroke.modifiers.shift, now);
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::Space => {
+                self.adjust(1, false, now);
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::Char('r') => {
+                self.controller.restart(now);
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::Char('p') => {
+                if self.controller.is_paused() {
+                    self.controller.resume(now);
+                } else {
+                    self.controller.pause(now);
+                }
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::Enter if self.reset_pending => StreamingConfiguratorOutcome::Reset,
+            KeyCode::Enter => StreamingConfiguratorOutcome::Apply(self.selected_policy()),
+            KeyCode::Escape => StreamingConfiguratorOutcome::Cancel,
+            _ => StreamingConfiguratorOutcome::Ignored,
+        }
+    }
+
+    fn move_focus(&mut self, delta: isize) {
+        let current = StreamingConfiguratorFocus::ALL
+            .iter()
+            .position(|focus| *focus == self.focus)
+            .unwrap_or_default();
+        let len = StreamingConfiguratorFocus::ALL.len();
+        let next = if delta < 0 {
+            current.checked_sub(1).unwrap_or(len - 1)
+        } else {
+            (current + 1) % len
+        };
+        self.focus = StreamingConfiguratorFocus::ALL[next];
+    }
+
+    fn adjust(&mut self, direction: i32, coarse: bool, now: Instant) {
+        if self.focus == StreamingConfiguratorFocus::Reset {
+            self.reset_pending = !self.reset_pending;
+            let policy = self.selected_policy();
+            let _ = self.controller.set_policy(policy);
+            return;
+        }
+        self.reset_pending = false;
+        let mut policy = self.override_policy;
+        match self.focus {
+            StreamingConfiguratorFocus::Enabled => policy.enabled = !policy.enabled,
+            StreamingConfiguratorFocus::Curve => {
+                policy.curve = cycle_curve(policy.curve, direction);
+            }
+            StreamingConfiguratorFocus::GraphemesPerSecond => {
+                let step = if coarse { 100 } else { 25 };
+                policy.graphemes_per_second = adjust_u32(
+                    policy.graphemes_per_second,
+                    direction,
+                    step,
+                    StreamingPresentationPolicy::MAX_GRAPHEMES_PER_SECOND,
+                );
+            }
+            StreamingConfiguratorFocus::MaxLag => {
+                let step = if coarse { 100 } else { 10 };
+                policy.max_lag_ms = adjust_u64(
+                    policy.max_lag_ms,
+                    direction,
+                    step,
+                    StreamingPresentationPolicy::MAX_LAG_MS,
+                );
+            }
+            StreamingConfiguratorFocus::Reset => {}
+        }
+        let became_smoothing =
+            self.override_policy.is_immediate() && !policy.normalized().is_immediate();
+        self.override_policy = policy.normalized();
+        let _ = self.controller.set_policy(self.override_policy);
+        if became_smoothing && self.controller.is_completed() {
+            self.controller.restart(now);
+        }
+    }
+}
+
+const fn cycle_curve(
+    curve: StreamingInterpolationCurve,
+    direction: i32,
+) -> StreamingInterpolationCurve {
+    match (curve, direction < 0) {
+        (StreamingInterpolationCurve::Linear, false) => StreamingInterpolationCurve::EaseIn,
+        (StreamingInterpolationCurve::EaseIn, false) => StreamingInterpolationCurve::EaseOut,
+        (StreamingInterpolationCurve::EaseOut, false) => StreamingInterpolationCurve::EaseInOut,
+        (StreamingInterpolationCurve::EaseInOut, false) => StreamingInterpolationCurve::Linear,
+        (StreamingInterpolationCurve::Linear, true) => StreamingInterpolationCurve::EaseInOut,
+        (StreamingInterpolationCurve::EaseIn, true) => StreamingInterpolationCurve::Linear,
+        (StreamingInterpolationCurve::EaseOut, true) => StreamingInterpolationCurve::EaseIn,
+        (StreamingInterpolationCurve::EaseInOut, true) => StreamingInterpolationCurve::EaseOut,
+    }
+}
+
+fn adjust_u32(value: u32, direction: i32, step: u32, maximum: u32) -> u32 {
+    if direction < 0 {
+        value.saturating_sub(step)
+    } else {
+        value.saturating_add(step).min(maximum)
+    }
+}
+
+fn adjust_u64(value: u64, direction: i32, step: u64, maximum: u64) -> u64 {
+    if direction < 0 {
+        value.saturating_sub(step)
+    } else {
+        value.saturating_add(step).min(maximum)
+    }
 }
 
 /// Bounded deterministic controller for the streaming configurator preview.
@@ -293,6 +542,84 @@ fn projected_text(view: &SessionView) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configurator_controls_normalize_cycle_and_preserve_cancel_baseline() {
+        let now = Instant::now();
+        let original = StreamingPresentationPolicy::default();
+        let fallback = StreamingPresentationPolicy {
+            enabled: false,
+            ..original
+        };
+        let mut state = StreamingConfiguratorState::new(now, original, fallback);
+        assert_eq!(state.original_policy(), original);
+        assert_eq!(state.focus(), StreamingConfiguratorFocus::Enabled);
+        assert_eq!(
+            state.handle_key(KeyStroke::simple(KeyCode::Space), now),
+            StreamingConfiguratorOutcome::Handled
+        );
+        assert!(!state.selected_policy().enabled);
+        assert_eq!(state.original_policy(), original);
+
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Right), now);
+        assert_eq!(
+            state.selected_policy().curve,
+            StreamingInterpolationCurve::EaseIn
+        );
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Left), now);
+        assert_eq!(
+            state.selected_policy().curve,
+            StreamingInterpolationCurve::Linear
+        );
+
+        for _ in 0..3 {
+            let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        }
+        assert_eq!(state.focus(), StreamingConfiguratorFocus::Reset);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Space), now);
+        assert!(state.reset_pending());
+        assert_eq!(state.selected_policy(), fallback.normalized());
+        assert_eq!(
+            state.handle_key(KeyStroke::simple(KeyCode::Enter), now),
+            StreamingConfiguratorOutcome::Reset
+        );
+        assert_eq!(
+            state.handle_key(KeyStroke::simple(KeyCode::Escape), now),
+            StreamingConfiguratorOutcome::Cancel
+        );
+    }
+
+    #[test]
+    fn numeric_controls_use_fine_and_coarse_bounded_steps() {
+        let now = Instant::now();
+        let mut state = StreamingConfiguratorState::new(
+            now,
+            StreamingPresentationPolicy::default(),
+            StreamingPresentationPolicy::default(),
+        );
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Right), now);
+        assert_eq!(state.selected_policy().graphemes_per_second, 325);
+        let coarse = KeyStroke::with_modifiers(
+            KeyCode::Right,
+            bmux_keyboard::Modifiers {
+                shift: true,
+                ..bmux_keyboard::Modifiers::NONE
+            },
+        );
+        let _ = state.handle_key(coarse, now);
+        assert_eq!(state.selected_policy().graphemes_per_second, 425);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        for _ in 0..20 {
+            let _ = state.handle_key(coarse, now);
+        }
+        assert_eq!(
+            state.selected_policy().max_lag_ms,
+            StreamingPresentationPolicy::MAX_LAG_MS
+        );
+    }
 
     #[test]
     fn deterministic_preview_is_bounded_monotonic_and_converges() {
