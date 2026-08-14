@@ -901,6 +901,283 @@ pub struct SessionForkResult {
     pub draft: Option<String>,
 }
 
+/// Current portable session-derivation contract version.
+pub const SESSION_DERIVATION_CONTRACT_VERSION: u32 = 1;
+/// Maximum UTF-8 bytes accepted for a derivation producer namespace.
+pub const MAX_SESSION_DERIVATION_PRODUCER_BYTES: usize = 128;
+/// Maximum UTF-8 bytes accepted for a derivation operation kind.
+pub const MAX_SESSION_DERIVATION_KIND_BYTES: usize = 128;
+/// Maximum UTF-8 bytes accepted for a derivation idempotency key.
+pub const MAX_SESSION_DERIVATION_IDEMPOTENCY_KEY_BYTES: usize = 256;
+/// Maximum UTF-8 bytes accepted for an initial destination composer draft.
+pub const MAX_SESSION_DERIVATION_DRAFT_BYTES: usize = 1024 * 1024;
+/// Maximum prompt candidates returned by one bounded query.
+pub const MAX_SESSION_DERIVATION_PROMPT_CANDIDATES: usize = 200;
+/// Maximum UTF-8 bytes retained in one prompt candidate preview.
+pub const MAX_SESSION_DERIVATION_PROMPT_PREVIEW_BYTES: usize = 8 * 1024;
+
+/// Unique identity of one retry-safe session-derivation operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionDerivationOperationId(pub Uuid);
+
+impl SessionDerivationOperationId {
+    /// Generate a new operation identifier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for SessionDerivationOperationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Display for SessionDerivationOperationId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, formatter)
+    }
+}
+
+/// Stable bounded snapshot of a source session used to pin derivation semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDerivationSourceSnapshot {
+    /// Contract version used to interpret this snapshot.
+    pub version: u32,
+    /// Source session identity.
+    pub session_id: SessionId,
+    /// Opaque current-format source generation.
+    pub generation: u64,
+    /// Latest canonical event sequence included by this snapshot, or zero for no events.
+    pub latest_sequence: u64,
+    /// Source display title captured for optional presentation and lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Canonical source working directory.
+    pub working_directory: PathBuf,
+}
+
+/// Producer-owned, renderer-neutral lineage attached to a derived session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDerivationLineage {
+    /// Stable producer namespace, such as a plugin id.
+    pub producer: String,
+    /// Namespaced producer-owned operation kind. Core stores but does not interpret this value.
+    pub operation_kind: String,
+    /// Optional source event selected by the producer for its workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_source_sequence: Option<u64>,
+}
+
+/// Request to derive one destination session from a stable source snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDerivationRequest {
+    /// Contract version used to interpret this request.
+    pub version: u32,
+    /// Stable operation identity used for status, cancellation, and duplicate delivery.
+    pub operation_id: SessionDerivationOperationId,
+    /// Producer-scoped idempotency key. Identical retries return the same terminal operation;
+    /// conflicting payloads using this key fail closed.
+    pub idempotency_key: String,
+    /// Exact source snapshot selected by the caller.
+    pub source: SessionDerivationSourceSnapshot,
+    /// Inclusive source sequence copied into the destination, or zero for an empty prefix.
+    pub cutoff_sequence: u64,
+    /// Optional destination display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_name: Option<String>,
+    /// Optional authoritative initial composer draft for the destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_draft: Option<String>,
+    /// Portable producer-owned lineage.
+    pub lineage: SessionDerivationLineage,
+}
+
+/// Stable validation failures for portable derivation requests.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SessionDerivationRequestError {
+    /// The contract version is not supported by this build.
+    #[error("unsupported session derivation contract version {actual}; expected {expected}")]
+    UnsupportedVersion { actual: u32, expected: u32 },
+    /// A required bounded string is empty.
+    #[error("session derivation {field} must not be empty")]
+    Empty { field: &'static str },
+    /// A bounded string exceeds its contract limit.
+    #[error("session derivation {field} contains {actual} bytes; maximum is {maximum}")]
+    TooLarge {
+        field: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
+    /// The requested cutoff is outside the selected source snapshot.
+    #[error("session derivation cutoff {cutoff} exceeds source snapshot sequence {latest}")]
+    CutoffAfterSnapshot { cutoff: u64, latest: u64 },
+    /// A producer-selected source event lies outside the selected source snapshot.
+    #[error("selected source sequence {selected} exceeds source snapshot sequence {latest}")]
+    SelectedSequenceAfterSnapshot { selected: u64, latest: u64 },
+}
+
+impl SessionDerivationRequest {
+    /// Validate version, bounds, and source/cutoff consistency before side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable error for unsupported versions, invalid bounds, or inconsistent source
+    /// sequences.
+    pub fn validate(&self) -> Result<(), SessionDerivationRequestError> {
+        if self.version != SESSION_DERIVATION_CONTRACT_VERSION {
+            return Err(SessionDerivationRequestError::UnsupportedVersion {
+                actual: self.version,
+                expected: SESSION_DERIVATION_CONTRACT_VERSION,
+            });
+        }
+        if self.source.version != SESSION_DERIVATION_CONTRACT_VERSION {
+            return Err(SessionDerivationRequestError::UnsupportedVersion {
+                actual: self.source.version,
+                expected: SESSION_DERIVATION_CONTRACT_VERSION,
+            });
+        }
+        validate_derivation_string(
+            "idempotency key",
+            &self.idempotency_key,
+            MAX_SESSION_DERIVATION_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_derivation_string(
+            "lineage producer",
+            &self.lineage.producer,
+            MAX_SESSION_DERIVATION_PRODUCER_BYTES,
+        )?;
+        validate_derivation_string(
+            "lineage operation kind",
+            &self.lineage.operation_kind,
+            MAX_SESSION_DERIVATION_KIND_BYTES,
+        )?;
+        if let Some(draft) = &self.initial_draft
+            && draft.len() > MAX_SESSION_DERIVATION_DRAFT_BYTES
+        {
+            return Err(SessionDerivationRequestError::TooLarge {
+                field: "initial draft",
+                actual: draft.len(),
+                maximum: MAX_SESSION_DERIVATION_DRAFT_BYTES,
+            });
+        }
+        if self.cutoff_sequence > self.source.latest_sequence {
+            return Err(SessionDerivationRequestError::CutoffAfterSnapshot {
+                cutoff: self.cutoff_sequence,
+                latest: self.source.latest_sequence,
+            });
+        }
+        if let Some(selected) = self.lineage.selected_source_sequence
+            && selected > self.source.latest_sequence
+        {
+            return Err(
+                SessionDerivationRequestError::SelectedSequenceAfterSnapshot {
+                    selected,
+                    latest: self.source.latest_sequence,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+const fn validate_derivation_string(
+    field: &'static str,
+    value: &str,
+    maximum: usize,
+) -> Result<(), SessionDerivationRequestError> {
+    if value.is_empty() {
+        return Err(SessionDerivationRequestError::Empty { field });
+    }
+    if value.len() > maximum {
+        return Err(SessionDerivationRequestError::TooLarge {
+            field,
+            actual: value.len(),
+            maximum,
+        });
+    }
+    Ok(())
+}
+
+/// Bounded query for user prompt candidates in a stable source snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDerivationPromptQuery {
+    /// Source snapshot generation the result must still match.
+    pub generation: u64,
+    /// Return candidates strictly before this sequence when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sequence: Option<u64>,
+    /// Maximum candidates requested, bounded by `MAX_SESSION_DERIVATION_PROMPT_CANDIDATES`.
+    pub limit: usize,
+}
+
+/// One bounded user prompt candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDerivationPromptCandidate {
+    /// Canonical user-message event sequence.
+    pub sequence: u64,
+    /// Canonical event timestamp.
+    pub timestamp_ms: u64,
+    /// Bounded UTF-8 prompt preview.
+    pub preview: String,
+    /// Whether the preview omits source text.
+    pub truncated: bool,
+}
+
+/// One bounded page of user prompt candidates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDerivationPromptPage {
+    pub session_id: SessionId,
+    pub generation: u64,
+    pub candidates: Vec<SessionDerivationPromptCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_sequence: Option<u64>,
+    pub has_more: bool,
+}
+
+/// Durable derivation operation phase exposed to application clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDerivationPhase {
+    Validating,
+    Copying,
+    Finalizing,
+    Publishing,
+}
+
+/// Bounded monotonic progress for one derivation operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDerivationProgress {
+    pub phase: SessionDerivationPhase,
+    pub copied_events: u64,
+    pub copied_bytes: u64,
+    pub source_cutoff_sequence: u64,
+}
+
+/// Stable terminal result for one derivation operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SessionDerivationTerminalOutcome {
+    Succeeded { session: Box<SessionSummary> },
+    Cancelled,
+    Failed { code: String, message: String },
+}
+
+/// Point-in-time status of one retry-safe derivation operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDerivationOperationSnapshot {
+    pub version: u32,
+    pub operation_id: SessionDerivationOperationId,
+    /// Monotonic operation-local revision used to reject stale updates.
+    pub revision: u64,
+    pub progress: SessionDerivationProgress,
+    /// Once present, this authoritative terminal outcome never changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<SessionDerivationTerminalOutcome>,
+}
+
 /// Direction for paged session history reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3082,6 +3359,100 @@ pub enum SessionEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn derivation_request() -> SessionDerivationRequest {
+        SessionDerivationRequest {
+            version: SESSION_DERIVATION_CONTRACT_VERSION,
+            operation_id: SessionDerivationOperationId::new(),
+            idempotency_key: "operation-1".to_owned(),
+            source: SessionDerivationSourceSnapshot {
+                version: SESSION_DERIVATION_CONTRACT_VERSION,
+                session_id: SessionId::new(),
+                generation: 42,
+                latest_sequence: 24,
+                title: Some("source".to_owned()),
+                working_directory: PathBuf::from("/workspace"),
+            },
+            cutoff_sequence: 19,
+            destination_name: Some("derived".to_owned()),
+            initial_draft: Some("edit this prompt".to_owned()),
+            lineage: SessionDerivationLineage {
+                producer: "bcode.session-derivation".to_owned(),
+                operation_kind: "bcode.session-derivation/fork".to_owned(),
+                selected_source_sequence: Some(20),
+            },
+        }
+    }
+
+    #[test]
+    fn session_derivation_contract_round_trips_and_validates() {
+        let request = derivation_request();
+        request.validate().expect("valid derivation request");
+        let encoded = serde_json::to_value(&request).expect("serialize derivation request");
+        let decoded: SessionDerivationRequest =
+            serde_json::from_value(encoded).expect("deserialize derivation request");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn session_derivation_contract_rejects_future_versions_and_invalid_bounds() {
+        let mut request = derivation_request();
+        request.version += 1;
+        assert!(matches!(
+            request.validate(),
+            Err(SessionDerivationRequestError::UnsupportedVersion { .. })
+        ));
+
+        let mut request = derivation_request();
+        request.cutoff_sequence = request.source.latest_sequence + 1;
+        assert!(matches!(
+            request.validate(),
+            Err(SessionDerivationRequestError::CutoffAfterSnapshot { .. })
+        ));
+
+        let mut request = derivation_request();
+        request.idempotency_key.clear();
+        assert!(matches!(
+            request.validate(),
+            Err(SessionDerivationRequestError::Empty {
+                field: "idempotency key"
+            })
+        ));
+
+        let mut request = derivation_request();
+        request.initial_draft = Some("x".repeat(MAX_SESSION_DERIVATION_DRAFT_BYTES + 1));
+        assert!(matches!(
+            request.validate(),
+            Err(SessionDerivationRequestError::TooLarge {
+                field: "initial draft",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn derivation_progress_and_terminal_outcomes_are_explicit() {
+        let snapshot = SessionDerivationOperationSnapshot {
+            version: SESSION_DERIVATION_CONTRACT_VERSION,
+            operation_id: SessionDerivationOperationId::new(),
+            revision: 7,
+            progress: SessionDerivationProgress {
+                phase: SessionDerivationPhase::Publishing,
+                copied_events: 19,
+                copied_bytes: 4_096,
+                source_cutoff_sequence: 19,
+            },
+            outcome: Some(SessionDerivationTerminalOutcome::Cancelled),
+        };
+        let encoded = serde_json::to_value(&snapshot).expect("serialize operation snapshot");
+        assert_eq!(encoded["outcome"]["status"], "cancelled");
+        assert_eq!(
+            serde_json::from_value::<SessionDerivationOperationSnapshot>(encoded)
+                .expect("deserialize operation snapshot"),
+            snapshot
+        );
+    }
 
     #[test]
     fn assistant_live_segment_identity_round_trips() {

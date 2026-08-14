@@ -2509,6 +2509,7 @@ dependencies = [
  "bcode_tool_models",
  "serde",
  "serde_json",
+ "thiserror 2.0.19",
  "uuid",
 ]
 
