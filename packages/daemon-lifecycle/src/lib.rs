@@ -2108,7 +2108,10 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                 )
                 .env(BCODE_EXECUTABLE_DIGEST_ENV, executable_digest)
                 .env("BCODE_DAEMON_LOG", &log_path)
-                .kill_on_drop(true)
+                // Readiness owns the child only until startup succeeds. The daemon must remain
+                // detached after this future returns; cancellation uses endpoint occupancy to
+                // prevent a competing bind rather than killing a potentially ready daemon.
+                .kill_on_drop(false)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::from(log_file))
                 .stderr(std::process::Stdio::from(stderr_log))
