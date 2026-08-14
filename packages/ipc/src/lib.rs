@@ -825,6 +825,11 @@ pub enum Request {
         after_sequence: Option<u64>,
         limit: usize,
     },
+    /// Return bounded workflow live notifications after one canonical sequence.
+    WorkflowLiveEventCatchUp {
+        after_sequence: u64,
+        limit: usize,
+    },
     CompactSession {
         session_id: SessionId,
     },
@@ -2955,11 +2960,18 @@ pub enum ResponsePayload {
     WorkflowEventHistory {
         events: Vec<bcode_workflow_store::WorkflowEventRow>,
     },
+    WorkflowLiveEventCatchUp {
+        page: bcode_workflow_view_models::WorkflowLiveEventPage,
+    },
     RuntimeWorkHistory {
         events: Vec<SessionEvent>,
     },
     RuntimeWorkSubscribed,
-    WorkflowRunsSubscribed,
+    /// Subscription watermark. No event with a sequence at or below this value will be published
+    /// by this connection's live subscription; clients use it to detect the first gap.
+    WorkflowRunsSubscribed {
+        after_sequence: u64,
+    },
     ComposerDraft {
         draft: Option<String>,
     },
@@ -4518,6 +4530,11 @@ mod tests {
                 after_sequence: Some(10),
                 limit: 25,
             },
+            Request::WorkflowLiveEventCatchUp {
+                after_sequence: 10,
+                limit: 25,
+            },
+            Request::SubscribeWorkflowRuns,
         ];
         for request in requests {
             let encoded = encode_request(&request).expect("encode request");

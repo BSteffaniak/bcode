@@ -792,6 +792,18 @@ impl RuntimeWorkWatcher {
 #[derive(Debug)]
 pub struct WorkflowRunWatcher {
     connection: ClientConnection,
+    sequence: bcode_workflow_view_models::WorkflowLiveSequence,
+}
+
+/// Outcome of receiving one workflow live notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowRunWatchEvent {
+    /// Canonical state changed; refetch this run's bounded projection.
+    Changed(bcode_workflow_view_models::WorkflowLiveEvent),
+    /// Delivery skipped beyond the bounded catch-up window; replace bounded snapshots.
+    ResyncRequired,
+    /// A future event contract was received and cannot be interpreted.
+    UnsupportedVersion { version: u32 },
 }
 
 impl WorkflowRunWatcher {
@@ -800,17 +812,51 @@ impl WorkflowRunWatcher {
     /// # Errors
     ///
     /// Returns an error when the daemon connection closes or the event cannot be decoded.
-    pub async fn next_event(
-        &mut self,
-    ) -> Result<bcode_workflow_view_models::WorkflowLiveEvent, ClientError> {
+    pub async fn next_event(&mut self) -> Result<WorkflowRunWatchEvent, ClientError> {
         loop {
-            match self.connection.recv_event().await? {
-                Event::Workflow(event) => return Ok(event),
+            let event = match self.connection.recv_event().await? {
+                Event::Workflow(event) => event,
                 Event::Session(_)
                 | Event::SessionLive(_)
                 | Event::RuntimeWork(_)
                 | Event::SessionViewResyncRequired { .. }
-                | Event::SessionCatalogUpdated { .. } => {}
+                | Event::SessionCatalogUpdated { .. } => continue,
+            };
+            match self.sequence.observe(&event) {
+                bcode_workflow_view_models::WorkflowLiveEventDisposition::Refetch => {
+                    return Ok(WorkflowRunWatchEvent::Changed(event));
+                }
+                bcode_workflow_view_models::WorkflowLiveEventDisposition::Duplicate => {}
+                bcode_workflow_view_models::WorkflowLiveEventDisposition::UnsupportedVersion => {
+                    return Ok(WorkflowRunWatchEvent::UnsupportedVersion {
+                        version: event.version,
+                    });
+                }
+                bcode_workflow_view_models::WorkflowLiveEventDisposition::Gap => {
+                    let after_sequence = self.sequence.last_observed().unwrap_or(0);
+                    let page = self
+                        .connection
+                        .workflow_live_event_catch_up(after_sequence, 256)
+                        .await?;
+                    if page.resync_required {
+                        return Ok(WorkflowRunWatchEvent::ResyncRequired);
+                    }
+                    for caught_up in page.events {
+                        match self.sequence.observe(&caught_up) {
+                            bcode_workflow_view_models::WorkflowLiveEventDisposition::Refetch
+                            | bcode_workflow_view_models::WorkflowLiveEventDisposition::Duplicate => {}
+                            bcode_workflow_view_models::WorkflowLiveEventDisposition::Gap => {
+                                return Ok(WorkflowRunWatchEvent::ResyncRequired);
+                            }
+                            bcode_workflow_view_models::WorkflowLiveEventDisposition::UnsupportedVersion => {
+                                return Ok(WorkflowRunWatchEvent::UnsupportedVersion {
+                                    version: caught_up.version,
+                                });
+                            }
+                        }
+                    }
+                    return Ok(WorkflowRunWatchEvent::Changed(event));
+                }
             }
         }
     }
@@ -1043,8 +1089,13 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the subscription.
     pub async fn watch_workflow_runs(&self) -> Result<WorkflowRunWatcher, ClientError> {
         let mut connection = self.connect("bcode-workflow-runs").await?;
-        connection.subscribe_workflow_runs().await?;
-        Ok(WorkflowRunWatcher { connection })
+        let after_sequence = connection.subscribe_workflow_runs().await?;
+        Ok(WorkflowRunWatcher {
+            connection,
+            sequence: bcode_workflow_view_models::WorkflowLiveSequence::from_last_observed(
+                after_sequence,
+            ),
+        })
     }
 
     /// Check whether the local server accepts requests.
@@ -4743,6 +4794,31 @@ impl ClientConnection {
         }
     }
 
+    /// Return a bounded page of workflow live notifications after one global sequence.
+    ///
+    /// A page marked `resync_required` must be replaced with bounded catalog/run snapshots rather
+    /// than repeatedly paging and claiming durable stream resume.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn workflow_live_event_catch_up(
+        &mut self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<bcode_workflow_view_models::WorkflowLiveEventPage, ClientError> {
+        match self
+            .send_request(Request::WorkflowLiveEventCatchUp {
+                after_sequence,
+                limit,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowLiveEventCatchUp { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Subscribe this connection to workflow-run canonical-state notifications.
     ///
     /// The stream is live-only and does not imply durable resume. Obtain bounded snapshots through
@@ -4751,9 +4827,9 @@ impl ClientConnection {
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn subscribe_workflow_runs(&mut self) -> Result<(), ClientError> {
+    pub async fn subscribe_workflow_runs(&mut self) -> Result<u64, ClientError> {
         match self.send_request(Request::SubscribeWorkflowRuns).await? {
-            ResponsePayload::WorkflowRunsSubscribed => Ok(()),
+            ResponsePayload::WorkflowRunsSubscribed { after_sequence } => Ok(after_sequence),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

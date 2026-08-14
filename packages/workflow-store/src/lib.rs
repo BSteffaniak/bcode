@@ -8454,6 +8454,47 @@ impl WorkflowStore {
         }))
     }
 
+    /// Return the latest canonical workflow event sequence across all runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database query fails.
+    pub fn latest_global_event_sequence(&self) -> Result<u64, WorkflowStoreError> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(event_seq), 0) FROM workflow_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(WorkflowStoreError::from)
+    }
+
+    /// Return a bounded ordered page of canonical workflow event positions across all runs.
+    ///
+    /// This post-commit query is intended for live notification publication. It does not load event
+    /// payloads or mutate canonical/derived state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the limit is invalid or the database query fails.
+    pub fn event_positions_after(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, String, u64)>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT event_seq, run_id, created_at_ms FROM workflow_events \
+             WHERE event_seq > ?1 ORDER BY event_seq LIMIT ?2",
+        )?;
+        statement
+            .query_map((after_sequence, limit), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkflowStoreError::from)
+    }
+
     /// Return the latest canonical event sequence and timestamp for one workflow run.
     ///
     /// # Errors
@@ -15482,6 +15523,26 @@ mod tests {
             .event_history("run-1", Some(events[0].event_seq), 1)
             .expect("paged events");
         assert_eq!(page[0].event_type, "activation_created");
+        assert_eq!(
+            store
+                .latest_global_event_sequence()
+                .expect("latest sequence"),
+            events.last().expect("last event").event_seq
+        );
+        let positions = store
+            .event_positions_after(events[0].event_seq, 2)
+            .expect("event positions");
+        assert_eq!(
+            positions
+                .iter()
+                .map(|(sequence, run_id, _)| (*sequence, run_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (events[1].event_seq, "run-1"),
+                (events[2].event_seq, "run-1")
+            ]
+        );
+        assert!(store.event_positions_after(0, 0).is_err());
         assert!(store.list_runs(0).is_err());
         assert!(store.event_history("run-1", None, 1_001).is_err());
     }

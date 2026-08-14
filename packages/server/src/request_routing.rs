@@ -583,6 +583,10 @@ pub enum RuntimeAndModelRequest {
         after_sequence: Option<u64>,
         limit: usize,
     },
+    WorkflowLiveEventCatchUp {
+        after_sequence: u64,
+        limit: usize,
+    },
     ListRuntimeWork {
         session_id: SessionId,
     },
@@ -1212,6 +1216,15 @@ impl RoutedRequest {
                 after_sequence,
                 limit,
             })),
+            Request::WorkflowLiveEventCatchUp {
+                after_sequence,
+                limit,
+            } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowLiveEventCatchUp {
+                    after_sequence,
+                    limit,
+                }))
+            }
             Request::CompactSession { session_id } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::CompactSession {
                     session_id,

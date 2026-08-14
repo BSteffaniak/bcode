@@ -29,7 +29,15 @@ pub struct WorkflowLiveEvent {
     pub changed_at_ms: u64,
 }
 
-/// Result of applying a workflow live notification to client observation state.
+/// Bounded page of ordered workflow live notifications used only for gap catch-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLiveEventPage {
+    pub events: Vec<WorkflowLiveEvent>,
+    /// More canonical events exist than fit in this bounded page; replace from a fresh snapshot.
+    pub resync_required: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowLiveEventDisposition {
     /// This is the next unseen sequence; refetch the bounded run projection.
@@ -52,6 +60,14 @@ pub struct WorkflowLiveSequence {
 }
 
 impl WorkflowLiveSequence {
+    /// Start ephemeral observation from a snapshot/subscription watermark.
+    #[must_use]
+    pub const fn from_last_observed(last_observed: u64) -> Self {
+        Self {
+            last_observed: Some(last_observed),
+        }
+    }
+
     /// Observe one notification without mutating state for duplicates, gaps, or future versions.
     #[must_use]
     pub const fn observe(&mut self, event: &WorkflowLiveEvent) -> WorkflowLiveEventDisposition {

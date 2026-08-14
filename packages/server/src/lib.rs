@@ -413,6 +413,7 @@ pub struct ServerState {
     client_forwarders: Mutex<BTreeMap<ClientId, Vec<JoinHandle<()>>>>,
     event_clients: Mutex<BTreeMap<ClientId, CatalogEventSubscription>>,
     workflow_event_clients: Mutex<BTreeMap<ClientId, ClientEventSink>>,
+    workflow_event_forwarder_started: std::sync::atomic::AtomicBool,
     catalog_events_started: std::sync::atomic::AtomicBool,
     idle_shutdown_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
@@ -1617,6 +1618,7 @@ impl ServerState {
             client_forwarders: Mutex::default(),
             event_clients: Mutex::default(),
             workflow_event_clients: Mutex::default(),
+            workflow_event_forwarder_started: std::sync::atomic::AtomicBool::new(false),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             idle_shutdown_started: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
@@ -2151,6 +2153,67 @@ impl ServerState {
             loop {
                 state.session_search_dirty.notified().await;
                 session_search::process_dirty_sessions(&state).await;
+            }
+        });
+    }
+
+    fn start_workflow_event_forwarder(self: &Arc<Self>) {
+        if self
+            .workflow_event_forwarder_started
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut after_sequence = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .latest_global_event_sequence()
+                .unwrap_or(0);
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut shutdown = state.shutdown.subscribe();
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = shutdown.recv() => break,
+                }
+                loop {
+                    let page = state
+                        .workflow_store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .event_positions_after(after_sequence, 256);
+                    let positions = match page {
+                        Ok(positions) => positions,
+                        Err(error) => {
+                            tracing::warn!(%error, "workflow event publication query failed");
+                            break;
+                        }
+                    };
+                    if positions.is_empty() {
+                        break;
+                    }
+                    let page_len = positions.len();
+                    for (event_sequence, run_id, changed_at_ms) in positions {
+                        broadcast_workflow_event(
+                            &state,
+                            bcode_workflow_view_models::WorkflowLiveEvent {
+                                version: bcode_workflow_view_models::WORKFLOW_LIVE_EVENT_VERSION,
+                                run_id,
+                                event_sequence,
+                                changed_at_ms,
+                            },
+                        )
+                        .await;
+                        after_sequence = event_sequence;
+                    }
+                    if page_len < 256 {
+                        break;
+                    }
+                }
             }
         });
     }
@@ -3517,6 +3580,7 @@ async fn run_with_static_bundled_inner(
         "server state constructed"
     );
     state.start_catalog_event_forwarder();
+    state.start_workflow_event_forwarder();
     state.start_session_search_ingestion();
     state.model_catalog.spawn_refresh();
     interrupt_stale_ralph_runs_best_effort(&state);
@@ -4070,6 +4134,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ResolveWorkflowMutationApproval { .. } => "resolve_workflow_mutation_approval",
         Request::WorkflowAttemptHistory { .. } => "workflow_attempt_history",
         Request::WorkflowEventHistory { .. } => "workflow_event_history",
+        Request::WorkflowLiveEventCatchUp { .. } => "workflow_live_event_catch_up",
         Request::SubscribeRuntimeWork { .. } => "subscribe_runtime_work",
         Request::SubscribeWorkflowRuns => "subscribe_workflow_runs",
         Request::SubscribeCatalogUpdates => "subscribe_catalog_updates",
@@ -5457,6 +5522,13 @@ async fn handle_workflow_run_request(
             limit,
         } => {
             handle_workflow_event_history(request_id, state, writer, run_id, after_sequence, limit)
+                .await
+        }
+        RuntimeAndModelRequest::WorkflowLiveEventCatchUp {
+            after_sequence,
+            limit,
+        } => {
+            handle_workflow_live_event_catch_up(request_id, state, writer, after_sequence, limit)
                 .await
         }
         RuntimeAndModelRequest::ListRuntimeWork { session_id } => {
@@ -16940,27 +17012,11 @@ async fn start_workflow_run(
     })
 }
 
-async fn broadcast_workflow_update(state: &ServerState, run_id: &str) {
-    let Some((event_sequence, changed_at_ms)) = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .latest_event_position(run_id)
-        .map_err(|error| {
-            tracing::warn!(run_id, %error, "failed to read workflow event position");
-            error
-        })
-        .ok()
-        .flatten()
-    else {
-        return;
-    };
-    let event = Event::Workflow(bcode_workflow_view_models::WorkflowLiveEvent {
-        version: bcode_workflow_view_models::WORKFLOW_LIVE_EVENT_VERSION,
-        run_id: run_id.to_string(),
-        event_sequence,
-        changed_at_ms,
-    });
+async fn broadcast_workflow_event(
+    state: &ServerState,
+    event: bcode_workflow_view_models::WorkflowLiveEvent,
+) {
+    let event = Event::Workflow(event);
     let mut sends = JoinSet::new();
     for sink in state.workflow_event_sinks().await {
         let event = event.clone();
@@ -17047,7 +17103,6 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
     finish_terminal_workflow_runtime_work(state, run_id).await?;
-    broadcast_workflow_update(state, run_id).await;
     Ok(())
 }
 
@@ -18162,6 +18217,56 @@ async fn handle_workflow_event_history(
     .await
 }
 
+async fn handle_workflow_live_event_catch_up(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    after_sequence: u64,
+    limit: usize,
+) -> Result<(), ServerError> {
+    if limit == 0 || limit > 1_000 {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow live catch-up limit must be in 1..=1000".to_string(),
+        )
+        .into());
+    }
+    let (positions, latest_sequence) = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            store.event_positions_after(after_sequence, limit)?,
+            store.latest_global_event_sequence()?,
+        )
+    };
+    let resync_required = positions
+        .last()
+        .is_some_and(|(event_sequence, _, _)| *event_sequence < latest_sequence);
+    let events = positions
+        .into_iter()
+        .map(|(event_sequence, run_id, changed_at_ms)| {
+            bcode_workflow_view_models::WorkflowLiveEvent {
+                version: bcode_workflow_view_models::WORKFLOW_LIVE_EVENT_VERSION,
+                run_id,
+                event_sequence,
+                changed_at_ms,
+            }
+        })
+        .collect();
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowLiveEventCatchUp {
+            page: bcode_workflow_view_models::WorkflowLiveEventPage {
+                events,
+                resync_required,
+            },
+        }),
+    )
+    .await
+}
+
 async fn handle_cancel_runtime_work(
     request_id: u64,
     client_id: ClientId,
@@ -18298,10 +18403,15 @@ async fn handle_subscribe_workflow_runs(
         client_id,
         ClientEventSink::new(client_id, writer.clone(), state.metrics.clone()),
     );
+    let after_sequence = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .latest_global_event_sequence()?;
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::WorkflowRunsSubscribed),
+        Response::Ok(ResponsePayload::WorkflowRunsSubscribed { after_sequence }),
     )
     .await
 }
