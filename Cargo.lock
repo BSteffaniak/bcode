@@ -1474,6 +1474,7 @@ dependencies = [
  "bcode_question_plugin",
  "bcode_ralph_plugin",
  "bcode_read_plugin",
+ "bcode_session_derivation_plugin",
  "bcode_shell_plugin",
  "bcode_skills_plugin",
  "bcode_tantivy_session_search_plugin",

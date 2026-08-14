@@ -11854,6 +11854,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
@@ -12604,6 +12605,15 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 event.sequence, kind
             );
         }
+        SessionEventKind::SessionDerived {
+            source_session_id,
+            producer,
+            operation_kind,
+            ..
+        } => println!(
+            "#{} session derived from {source_session_id} by {producer} ({operation_kind})",
+            event.sequence
+        ),
         SessionEventKind::ExecutionSessionCreated {
             provenance,
             visibility,
