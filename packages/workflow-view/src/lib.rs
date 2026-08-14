@@ -2,68 +2,79 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Normalization from server-owned workflow data into portable semantic projections.
+//! Normalization of portable workflow application data into semantic projections.
 
 use std::collections::BTreeMap;
 
-use bcode_workflow_store::{
-    AttemptSummary, RunStatus, StoredWorkflowDefinition, WaitingActivation,
-    WorkflowActivationSummary, WorkflowExecutionSessionLink, WorkflowMutationApproval,
-    WorkflowOutputSummary, WorkflowRunSummary,
-};
 use bcode_workflow_view_models::{
     WORKFLOW_VIEW_VERSION, WorkflowAttemptView, WorkflowCatalogView, WorkflowChildSessionView,
     WorkflowDescendantRunView, WorkflowEdgeView, WorkflowMutationApprovalView, WorkflowNodeKind,
     WorkflowNodeStatus, WorkflowNodeView, WorkflowOutputValue, WorkflowOutputView,
     WorkflowProjectionHealth, WorkflowRunListItem, WorkflowRunStatus, WorkflowRunView,
-    WorkflowTerminalView, WorkflowWaitKind, WorkflowWaitView,
+    WorkflowTerminalView, WorkflowWaitView,
 };
 
-/// Canonical validated value supplied by the application boundary for projection.
+/// Portable definition source needed to project a workflow graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedWorkflowOutput {
-    pub output_id: String,
-    pub checksum_sha256: String,
-    pub value: serde_json::Value,
+pub struct WorkflowDefinitionProjectionInput {
+    pub definition_json: String,
 }
 
-/// Complete bounded server-owned input needed to project one workflow run.
-pub struct WorkflowRunProjectionInput<'a> {
-    pub run: &'a WorkflowRunSummary,
-    pub definition: &'a StoredWorkflowDefinition,
-    pub activations: &'a [WorkflowActivationSummary],
-    pub waits: &'a [WaitingActivation],
-    pub mutation_approvals: &'a [WorkflowMutationApproval],
-    pub attempts: &'a [AttemptSummary],
-    pub outputs: &'a [WorkflowOutputSummary],
-    pub resolved_outputs: &'a [ResolvedWorkflowOutput],
-    pub descendant_runs: &'a [bcode_workflow_store::WorkflowDescendantRunSummary],
-    pub child_sessions: &'a [WorkflowExecutionSessionLink],
+/// Portable activation state needed to project one node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowActivationProjectionInput {
+    pub node_id: String,
+    pub activation_id: String,
+    pub status: String,
+}
+
+/// Canonical validated output supplied by the application boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowOutputProjectionInput {
+    pub output_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub schema_id: String,
+    pub schema_version: u32,
+    pub checksum_sha256: String,
+    pub value: Option<serde_json::Value>,
+    pub artifact_reference: Option<String>,
+    pub created_at_ms: u64,
+}
+
+/// Complete bounded portable input needed to project one workflow run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunProjectionInput {
+    pub run: WorkflowRunListItem,
+    pub terminal_output_id: Option<String>,
+    pub definition: WorkflowDefinitionProjectionInput,
+    pub activations: Vec<WorkflowActivationProjectionInput>,
+    pub waits: Vec<WorkflowWaitView>,
+    pub mutation_approvals: Vec<WorkflowMutationApprovalView>,
+    pub attempts: Vec<WorkflowAttemptView>,
+    pub outputs: Vec<WorkflowOutputProjectionInput>,
+    pub descendant_runs: Vec<WorkflowDescendantRunView>,
+    pub child_sessions: Vec<WorkflowChildSessionView>,
 }
 
 /// Build a bounded portable workflow catalog.
 #[must_use]
-pub fn project_catalog(runs: &[WorkflowRunSummary]) -> WorkflowCatalogView {
+pub const fn project_catalog(runs: Vec<WorkflowRunListItem>) -> WorkflowCatalogView {
     WorkflowCatalogView {
         version: WORKFLOW_VIEW_VERSION,
-        runs: runs.iter().map(project_run_item).collect(),
+        runs,
     }
 }
 
-/// Build a portable semantic projection from bounded server-owned state.
+/// Build a portable semantic projection from bounded application data.
 ///
-/// Malformed stored definitions produce a degraded projection rather than silently guessing graph
+/// Malformed definitions produce a degraded projection rather than silently guessing graph
 /// semantics. Canonical run identity and bounded runtime state remain visible.
 #[allow(clippy::too_many_lines)]
 #[must_use]
-pub fn project_run(input: &WorkflowRunProjectionInput<'_>) -> WorkflowRunView {
-    let resolved = input
-        .resolved_outputs
-        .iter()
-        .map(|output| (output.output_id.as_str(), output))
-        .collect::<BTreeMap<_, _>>();
+pub fn project_run(input: WorkflowRunProjectionInput) -> WorkflowRunView {
     let latest_activations = input.activations.iter().fold(
-        BTreeMap::<&str, &WorkflowActivationSummary>::new(),
+        BTreeMap::<&str, &WorkflowActivationProjectionInput>::new(),
         |mut latest, activation| {
             latest.entry(&activation.node_id).or_insert(activation);
             latest
@@ -110,87 +121,38 @@ pub fn project_run(input: &WorkflowRunProjectionInput<'_>) -> WorkflowRunView {
         ),
     };
 
+    let terminal = project_terminal(input.run.status, input.terminal_output_id);
     WorkflowRunView {
         version: WORKFLOW_VIEW_VERSION,
-        run: project_run_item(input.run),
+        run: input.run,
         nodes,
         edges,
-        waits: input.waits.iter().map(project_wait).collect(),
-        mutation_approvals: input
-            .mutation_approvals
-            .iter()
-            .map(|approval| WorkflowMutationApprovalView {
-                approval_id: approval.approval_id.clone(),
-                node_id: approval.node_id.clone(),
-                activation_id: approval.activation_id.clone(),
-                requested_at_ms: approval.requested_at_ms,
-                expires_at_ms: approval.expires_at_ms,
-            })
-            .collect(),
-        attempts: input.attempts.iter().map(project_attempt).collect(),
+        waits: input.waits,
+        mutation_approvals: input.mutation_approvals,
+        attempts: input.attempts,
         outputs: input
             .outputs
-            .iter()
-            .map(|output| {
-                let value = resolved.get(output.output_id.as_str()).map_or(
-                    WorkflowOutputValue::Unresolved,
-                    |resolved| WorkflowOutputValue::Resolved {
-                        value: resolved.value.clone(),
-                    },
-                );
-                WorkflowOutputView {
-                    output_id: output.output_id.clone(),
-                    node_id: output.node_id.clone(),
-                    activation_id: output.activation_id.clone(),
-                    schema_id: output.schema_id.clone(),
-                    schema_version: output.schema_version,
-                    checksum_sha256: output.checksum_sha256.clone(),
-                    value,
-                    artifact_reference: output.artifact_reference.clone(),
-                    created_at_ms: output.created_at_ms,
-                }
+            .into_iter()
+            .map(|output| WorkflowOutputView {
+                output_id: output.output_id,
+                node_id: output.node_id,
+                activation_id: output.activation_id,
+                schema_id: output.schema_id,
+                schema_version: output.schema_version,
+                checksum_sha256: output.checksum_sha256,
+                value: output
+                    .value
+                    .map_or(WorkflowOutputValue::Unresolved, |value| {
+                        WorkflowOutputValue::Resolved { value }
+                    }),
+                artifact_reference: output.artifact_reference,
+                created_at_ms: output.created_at_ms,
             })
             .collect(),
-        descendant_runs: input
-            .descendant_runs
-            .iter()
-            .map(|descendant| WorkflowDescendantRunView {
-                run: project_run_item(&descendant.run),
-                parent_run_id: descendant.link.parent_run_id.clone(),
-                parent_node_id: descendant.link.parent_node_id.clone(),
-                depth: descendant.link.depth,
-            })
-            .collect(),
-        child_sessions: input
-            .child_sessions
-            .iter()
-            .map(|link| WorkflowChildSessionView {
-                node_id: link.node_id.clone(),
-                activation_id: link.activation_id.clone(),
-                attempt: link.attempt,
-                session_id: link.session_id.clone(),
-            })
-            .collect(),
-        terminal: project_terminal(input.run),
+        descendant_runs: input.descendant_runs,
+        child_sessions: input.child_sessions,
+        terminal,
         health,
-    }
-}
-
-fn project_run_item(run: &WorkflowRunSummary) -> WorkflowRunListItem {
-    WorkflowRunListItem {
-        run_id: run.run_id.clone(),
-        definition_id: run.definition_id.clone(),
-        definition_version: run.definition_version,
-        status: match run.status {
-            RunStatus::Running => WorkflowRunStatus::Running,
-            RunStatus::Paused => WorkflowRunStatus::Paused,
-            RunStatus::Completed => WorkflowRunStatus::Completed,
-            RunStatus::Failed => WorkflowRunStatus::Failed,
-            RunStatus::Cancelled => WorkflowRunStatus::Cancelled,
-            RunStatus::RepairRequired => WorkflowRunStatus::RepairRequired,
-        },
-        created_at_ms: run.created_at_ms,
-        updated_at_ms: run.updated_at_ms,
     }
 }
 
@@ -226,41 +188,123 @@ fn project_node_status(status: &str) -> WorkflowNodeStatus {
     }
 }
 
-fn project_wait(wait: &WaitingActivation) -> WorkflowWaitView {
-    WorkflowWaitView {
-        node_id: wait.node_id.clone(),
-        activation_id: wait.activation_id.clone(),
-        kind: match wait.kind {
-            bcode_workflow_store::WorkflowWaitKind::Input => WorkflowWaitKind::Input,
-            bcode_workflow_store::WorkflowWaitKind::Approval => WorkflowWaitKind::Approval,
-        },
-        input: wait.input.clone(),
-        requested_at_ms: wait.requested_at_ms,
+fn project_terminal(
+    status: WorkflowRunStatus,
+    terminal_output_id: Option<String>,
+) -> Option<WorkflowTerminalView> {
+    match status {
+        WorkflowRunStatus::Running | WorkflowRunStatus::Paused => None,
+        WorkflowRunStatus::Completed => {
+            terminal_output_id.map(|output_id| WorkflowTerminalView::Completed { output_id })
+        }
+        WorkflowRunStatus::Failed => Some(WorkflowTerminalView::Failed),
+        WorkflowRunStatus::Cancelled => Some(WorkflowTerminalView::Cancelled),
+        WorkflowRunStatus::RepairRequired => Some(WorkflowTerminalView::RepairRequired),
     }
 }
 
-fn project_attempt(attempt: &AttemptSummary) -> WorkflowAttemptView {
-    WorkflowAttemptView {
-        node_id: attempt.node_id.clone(),
-        activation_id: attempt.activation_id.clone(),
-        attempt: attempt.attempt,
-        dispatch_identity: attempt.dispatch_identity.clone(),
-        status: attempt.status.clone(),
-        has_receipt: attempt.has_receipt,
-        prepared_at_ms: attempt.prepared_at_ms,
-        terminal_at_ms: attempt.terminal_at_ms,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn project_terminal(run: &WorkflowRunSummary) -> Option<WorkflowTerminalView> {
-    match run.status {
-        RunStatus::Running | RunStatus::Paused => None,
-        RunStatus::Completed => run
-            .terminal_output_id
-            .clone()
-            .map(|output_id| WorkflowTerminalView::Completed { output_id }),
-        RunStatus::Failed => Some(WorkflowTerminalView::Failed),
-        RunStatus::Cancelled => Some(WorkflowTerminalView::Cancelled),
-        RunStatus::RepairRequired => Some(WorkflowTerminalView::RepairRequired),
+    #[test]
+    fn node_status_projection_is_exhaustive_for_current_states() {
+        let cases = [
+            ("pending", WorkflowNodeStatus::Pending),
+            ("running", WorkflowNodeStatus::Running),
+            ("waiting_input", WorkflowNodeStatus::WaitingInput),
+            ("waiting_approval", WorkflowNodeStatus::WaitingApproval),
+            (
+                "waiting_mutation_approval",
+                WorkflowNodeStatus::WaitingMutationApproval,
+            ),
+            ("completed", WorkflowNodeStatus::Completed),
+            ("failed", WorkflowNodeStatus::Failed),
+            ("cancelled", WorkflowNodeStatus::Cancelled),
+            ("skipped", WorkflowNodeStatus::Skipped),
+            ("repair_required", WorkflowNodeStatus::RepairRequired),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(project_node_status(source), expected);
+        }
+        assert_eq!(
+            project_node_status("future_state"),
+            WorkflowNodeStatus::Unknown("future_state".to_string())
+        );
+    }
+
+    #[test]
+    fn terminal_projection_is_stable_for_every_run_state() {
+        assert_eq!(project_terminal(WorkflowRunStatus::Running, None), None);
+        assert_eq!(project_terminal(WorkflowRunStatus::Paused, None), None);
+        assert_eq!(
+            project_terminal(WorkflowRunStatus::Completed, Some("output-1".to_string())),
+            Some(WorkflowTerminalView::Completed {
+                output_id: "output-1".to_string()
+            })
+        );
+        assert_eq!(project_terminal(WorkflowRunStatus::Completed, None), None);
+        assert_eq!(
+            project_terminal(WorkflowRunStatus::Failed, None),
+            Some(WorkflowTerminalView::Failed)
+        );
+        assert_eq!(
+            project_terminal(WorkflowRunStatus::Cancelled, None),
+            Some(WorkflowTerminalView::Cancelled)
+        );
+        assert_eq!(
+            project_terminal(WorkflowRunStatus::RepairRequired, None),
+            Some(WorkflowTerminalView::RepairRequired)
+        );
+    }
+
+    #[test]
+    fn malformed_definition_is_degraded_and_output_absence_is_explicit() {
+        let view = project_run(WorkflowRunProjectionInput {
+            run: WorkflowRunListItem {
+                run_id: "run-1".to_string(),
+                definition_id: "definition-1".to_string(),
+                definition_version: 1,
+                status: WorkflowRunStatus::Running,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            },
+            terminal_output_id: None,
+            definition: WorkflowDefinitionProjectionInput {
+                definition_json: "not-json".to_string(),
+            },
+            activations: Vec::new(),
+            waits: vec![WorkflowWaitView {
+                node_id: "input".to_string(),
+                activation_id: "activation-1".to_string(),
+                kind: bcode_workflow_view_models::WorkflowWaitKind::Input,
+                input: None,
+                requested_at_ms: 3,
+            }],
+            mutation_approvals: Vec::new(),
+            attempts: Vec::new(),
+            outputs: vec![WorkflowOutputProjectionInput {
+                output_id: "output-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: "activation-2".to_string(),
+                schema_id: "review/v1".to_string(),
+                schema_version: 1,
+                checksum_sha256: "checksum".to_string(),
+                value: None,
+                artifact_reference: None,
+                created_at_ms: 4,
+            }],
+            descendant_runs: Vec::new(),
+            child_sessions: Vec::new(),
+        });
+        assert!(matches!(
+            view.health,
+            WorkflowProjectionHealth::Degraded { .. }
+        ));
+        assert_eq!(
+            view.waits[0].kind,
+            bcode_workflow_view_models::WorkflowWaitKind::Input
+        );
+        assert_eq!(view.outputs[0].value, WorkflowOutputValue::Unresolved);
     }
 }

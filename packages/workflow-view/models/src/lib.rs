@@ -9,6 +9,74 @@ use serde::{Deserialize, Serialize};
 /// Current workflow projection schema version.
 pub const WORKFLOW_VIEW_VERSION: u32 = 1;
 
+/// Current workflow live-event contract version.
+pub const WORKFLOW_LIVE_EVENT_VERSION: u32 = 1;
+
+/// Notification that canonical state for one workflow run changed.
+///
+/// This event deliberately carries no projected state. Consumers refetch a bounded
+/// [`WorkflowRunView`] so notification delivery cannot become a second source of truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLiveEvent {
+    /// Live-event schema version. Unknown versions must not be interpreted as this version.
+    pub version: u32,
+    /// Run whose canonical state changed.
+    pub run_id: String,
+    /// Monotonic canonical event sequence within the run.
+    pub event_sequence: u64,
+    /// Time the canonical event was persisted.
+    pub changed_at_ms: u64,
+}
+
+/// Result of applying a workflow live notification to client observation state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowLiveEventDisposition {
+    /// This is the next unseen sequence; refetch the bounded run projection.
+    Refetch,
+    /// This sequence was already observed and is safe to ignore.
+    Duplicate,
+    /// One or more sequences are missing; perform bounded catch-up or resync.
+    Gap,
+    /// The event uses an unsupported future contract version.
+    UnsupportedVersion,
+}
+
+/// Ephemeral sequence tracker for a single subscribed workflow run.
+///
+/// This does not imply durable resume. It exists only for duplicate and gap detection within a
+/// live subscription; reconnecting clients obtain a fresh bounded snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowLiveSequence {
+    last_observed: Option<u64>,
+}
+
+impl WorkflowLiveSequence {
+    /// Observe one notification without mutating state for duplicates, gaps, or future versions.
+    #[must_use]
+    pub const fn observe(&mut self, event: &WorkflowLiveEvent) -> WorkflowLiveEventDisposition {
+        if event.version != WORKFLOW_LIVE_EVENT_VERSION {
+            return WorkflowLiveEventDisposition::UnsupportedVersion;
+        }
+        match self.last_observed {
+            Some(last) if event.event_sequence <= last => WorkflowLiveEventDisposition::Duplicate,
+            Some(last) if event.event_sequence != last.saturating_add(1) => {
+                WorkflowLiveEventDisposition::Gap
+            }
+            _ => {
+                self.last_observed = Some(event.event_sequence);
+                WorkflowLiveEventDisposition::Refetch
+            }
+        }
+    }
+
+    /// Return the latest contiguous sequence observed during this live subscription.
+    #[must_use]
+    pub const fn last_observed(&self) -> Option<u64> {
+        self.last_observed
+    }
+}
+
 /// Bounded catalog snapshot of durable workflow runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -221,4 +289,47 @@ pub enum WorkflowProjectionHealth {
     Degraded { reason: String },
     RepairRequired { reason: String },
     UnsupportedVersion { version: u32 },
+}
+
+#[cfg(test)]
+mod live_event_tests {
+    use super::*;
+
+    fn event(version: u32, event_sequence: u64) -> WorkflowLiveEvent {
+        WorkflowLiveEvent {
+            version,
+            run_id: "run-1".to_string(),
+            event_sequence,
+            changed_at_ms: event_sequence,
+        }
+    }
+
+    #[test]
+    fn live_sequence_detects_duplicates_gaps_and_future_versions() {
+        let mut sequence = WorkflowLiveSequence::default();
+        assert_eq!(
+            sequence.observe(&event(WORKFLOW_LIVE_EVENT_VERSION, 4)),
+            WorkflowLiveEventDisposition::Refetch
+        );
+        assert_eq!(sequence.last_observed(), Some(4));
+        assert_eq!(
+            sequence.observe(&event(WORKFLOW_LIVE_EVENT_VERSION, 4)),
+            WorkflowLiveEventDisposition::Duplicate
+        );
+        assert_eq!(
+            sequence.observe(&event(WORKFLOW_LIVE_EVENT_VERSION, 6)),
+            WorkflowLiveEventDisposition::Gap
+        );
+        assert_eq!(sequence.last_observed(), Some(4));
+        assert_eq!(
+            sequence.observe(&event(WORKFLOW_LIVE_EVENT_VERSION + 1, 5)),
+            WorkflowLiveEventDisposition::UnsupportedVersion
+        );
+        assert_eq!(sequence.last_observed(), Some(4));
+        assert_eq!(
+            sequence.observe(&event(WORKFLOW_LIVE_EVENT_VERSION, 5)),
+            WorkflowLiveEventDisposition::Refetch
+        );
+        assert_eq!(sequence.last_observed(), Some(5));
+    }
 }

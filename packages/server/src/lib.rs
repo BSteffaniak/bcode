@@ -17277,36 +17277,113 @@ async fn handle_workflow_run_view(
                 ))
             })?;
         let outputs = store.output_summaries(&run_id, limit)?;
-        let resolved_outputs = store
+        let output_values = store
             .validated_outputs(&run_id, limit)?
             .into_iter()
-            .map(|output| bcode_workflow_view::ResolvedWorkflowOutput {
-                checksum_sha256: outputs
-                    .iter()
-                    .find(|summary| summary.output_id == output.output_id)
-                    .map(|summary| summary.checksum_sha256.clone())
-                    .expect("validated output has a matching bounded summary"),
-                output_id: output.output_id,
-                value: output.value,
-            })
-            .collect::<Vec<_>>();
+            .map(|output| (output.output_id, output.value))
+            .collect::<BTreeMap<_, _>>();
         let activations = store.activations_for_run(&run_id, limit)?;
         let waits = store.waiting_activations(&run_id, limit)?;
         let mutation_approvals = store.pending_mutation_approvals(&run_id, limit)?;
         let attempts = store.attempt_history(&run_id, None, limit)?;
         let descendant_runs = store.descendant_run_summaries(&run_id, limit)?;
         let child_sessions = store.execution_session_links_for_run(&run_id, limit)?;
-        bcode_workflow_view::project_run(&bcode_workflow_view::WorkflowRunProjectionInput {
-            run: &run,
-            definition: &definition,
-            activations: &activations,
-            waits: &waits,
-            mutation_approvals: &mutation_approvals,
-            attempts: &attempts,
-            outputs: &outputs,
-            resolved_outputs: &resolved_outputs,
-            descendant_runs: &descendant_runs,
-            child_sessions: &child_sessions,
+        bcode_workflow_view::project_run(bcode_workflow_view::WorkflowRunProjectionInput {
+            run: workflow_run_list_item(&run),
+            terminal_output_id: run.terminal_output_id,
+            definition: bcode_workflow_view::WorkflowDefinitionProjectionInput {
+                definition_json: definition.definition_json,
+            },
+            activations: activations
+                .into_iter()
+                .map(
+                    |activation| bcode_workflow_view::WorkflowActivationProjectionInput {
+                        node_id: activation.node_id,
+                        activation_id: activation.activation_id,
+                        status: activation.status,
+                    },
+                )
+                .collect(),
+            waits: waits
+                .into_iter()
+                .map(|wait| bcode_workflow_view_models::WorkflowWaitView {
+                    node_id: wait.node_id,
+                    activation_id: wait.activation_id,
+                    kind: match wait.kind {
+                        bcode_workflow_store::WorkflowWaitKind::Input => {
+                            bcode_workflow_view_models::WorkflowWaitKind::Input
+                        }
+                        bcode_workflow_store::WorkflowWaitKind::Approval => {
+                            bcode_workflow_view_models::WorkflowWaitKind::Approval
+                        }
+                    },
+                    input: wait.input,
+                    requested_at_ms: wait.requested_at_ms,
+                })
+                .collect(),
+            mutation_approvals: mutation_approvals
+                .into_iter()
+                .map(
+                    |approval| bcode_workflow_view_models::WorkflowMutationApprovalView {
+                        approval_id: approval.approval_id,
+                        node_id: approval.node_id,
+                        activation_id: approval.activation_id,
+                        requested_at_ms: approval.requested_at_ms,
+                        expires_at_ms: approval.expires_at_ms,
+                    },
+                )
+                .collect(),
+            attempts: attempts
+                .into_iter()
+                .map(|attempt| bcode_workflow_view_models::WorkflowAttemptView {
+                    node_id: attempt.node_id,
+                    activation_id: attempt.activation_id,
+                    attempt: attempt.attempt,
+                    dispatch_identity: attempt.dispatch_identity,
+                    status: attempt.status,
+                    has_receipt: attempt.has_receipt,
+                    prepared_at_ms: attempt.prepared_at_ms,
+                    terminal_at_ms: attempt.terminal_at_ms,
+                })
+                .collect(),
+            outputs: outputs
+                .into_iter()
+                .map(
+                    |output| bcode_workflow_view::WorkflowOutputProjectionInput {
+                        value: output_values.get(&output.output_id).cloned(),
+                        output_id: output.output_id,
+                        node_id: output.node_id,
+                        activation_id: output.activation_id,
+                        schema_id: output.schema_id,
+                        schema_version: output.schema_version,
+                        checksum_sha256: output.checksum_sha256,
+                        artifact_reference: output.artifact_reference,
+                        created_at_ms: output.created_at_ms,
+                    },
+                )
+                .collect(),
+            descendant_runs: descendant_runs
+                .into_iter()
+                .map(
+                    |descendant| bcode_workflow_view_models::WorkflowDescendantRunView {
+                        run: workflow_run_list_item(&descendant.run),
+                        parent_run_id: descendant.link.parent_run_id,
+                        parent_node_id: descendant.link.parent_node_id,
+                        depth: descendant.link.depth,
+                    },
+                )
+                .collect(),
+            child_sessions: child_sessions
+                .into_iter()
+                .map(
+                    |link| bcode_workflow_view_models::WorkflowChildSessionView {
+                        node_id: link.node_id,
+                        activation_id: link.activation_id,
+                        attempt: link.attempt,
+                        session_id: link.session_id,
+                    },
+                )
+                .collect(),
         })
     };
     send_response(
@@ -17317,6 +17394,38 @@ async fn handle_workflow_run_view(
         }),
     )
     .await
+}
+
+fn workflow_run_list_item(
+    run: &bcode_workflow_store::WorkflowRunSummary,
+) -> bcode_workflow_view_models::WorkflowRunListItem {
+    bcode_workflow_view_models::WorkflowRunListItem {
+        run_id: run.run_id.clone(),
+        definition_id: run.definition_id.clone(),
+        definition_version: run.definition_version,
+        status: match run.status {
+            bcode_workflow_store::RunStatus::Running => {
+                bcode_workflow_view_models::WorkflowRunStatus::Running
+            }
+            bcode_workflow_store::RunStatus::Paused => {
+                bcode_workflow_view_models::WorkflowRunStatus::Paused
+            }
+            bcode_workflow_store::RunStatus::Completed => {
+                bcode_workflow_view_models::WorkflowRunStatus::Completed
+            }
+            bcode_workflow_store::RunStatus::Failed => {
+                bcode_workflow_view_models::WorkflowRunStatus::Failed
+            }
+            bcode_workflow_store::RunStatus::Cancelled => {
+                bcode_workflow_view_models::WorkflowRunStatus::Cancelled
+            }
+            bcode_workflow_store::RunStatus::RepairRequired => {
+                bcode_workflow_view_models::WorkflowRunStatus::RepairRequired
+            }
+        },
+        created_at_ms: run.created_at_ms,
+        updated_at_ms: run.updated_at_ms,
+    }
 }
 
 async fn handle_workflow_catalog_view(
@@ -17331,7 +17440,7 @@ async fn handle_workflow_catalog_view(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .list_runs(limit)?;
-        bcode_workflow_view::project_catalog(&runs)
+        bcode_workflow_view::project_catalog(runs.iter().map(workflow_run_list_item).collect())
     };
     send_response(
         writer,

@@ -2913,7 +2913,6 @@ name = "bcode_workflow_view"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_workflow",
- "bcode_workflow_store",
  "bcode_workflow_view_models",
  "serde_json",
 ]
