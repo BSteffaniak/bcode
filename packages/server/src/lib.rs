@@ -89,7 +89,7 @@ use bcode_plugin::{
 use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
 use bcode_session::{
-    AppendToolCallRequestedInput, CatalogLoadStatus, SessionManager,
+    AppendToolCallRequestedInput, CatalogLoadStatus, SessionError, SessionManager,
     lease::SessionLeaseOwnerContext,
 };
 use bcode_session_models::ExecutionSessionProvenance;
@@ -33350,6 +33350,99 @@ async fn handle_list_plugin_contributions(
     .await
 }
 
+fn command_plugin_bridge(sessions: SessionManager) -> PluginInvocationBridge {
+    let runtime = tokio::runtime::Handle::current();
+    PluginInvocationBridge::new(move |request, cancellation| {
+        let ServiceBridgeRequest::InvokeService(request) = request else {
+            return Err(
+                "command invocation bridge supports nested application services only".to_owned(),
+            );
+        };
+        if request.interface_id != bcode_plugin_sdk::SESSION_DERIVATION_INTERFACE_ID {
+            return Ok(ServiceBridgeResponse::Service(
+                bcode_tool::ToolInvocationServiceResolution::Unsupported,
+            ));
+        }
+        if cancellation.is_cancelled() {
+            return Ok(ServiceBridgeResponse::Service(
+                bcode_tool::ToolInvocationServiceResolution::Cancelled,
+            ));
+        }
+        let sessions = sessions.clone();
+        let response = runtime.block_on(async move {
+            dispatch_session_derivation_bridge(&sessions, request.payload).await
+        });
+        Ok(ServiceBridgeResponse::Service(response))
+    })
+}
+
+async fn dispatch_session_derivation_bridge(
+    sessions: &SessionManager,
+    payload: serde_json::Value,
+) -> bcode_tool::ToolInvocationServiceResolution {
+    let request = match serde_json::from_value::<bcode_plugin_sdk::SessionDerivationServiceRequest>(
+        payload,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "invalid_session_derivation_request".to_owned(),
+                message: error.to_string(),
+            };
+        }
+    };
+    let result: Result<bcode_plugin_sdk::SessionDerivationServiceResponse, SessionError> =
+        match request {
+            bcode_plugin_sdk::SessionDerivationServiceRequest::Snapshot { session_id } => sessions
+                .session_derivation_snapshot(session_id)
+                .await
+                .map(
+                    |snapshot| bcode_plugin_sdk::SessionDerivationServiceResponse::Snapshot {
+                        snapshot,
+                    },
+                ),
+            bcode_plugin_sdk::SessionDerivationServiceRequest::Prompts { session_id, query } => {
+                sessions
+                    .session_derivation_prompt_candidates(session_id, query)
+                    .await
+                    .map(
+                        |page| bcode_plugin_sdk::SessionDerivationServiceResponse::Prompts { page },
+                    )
+            }
+            bcode_plugin_sdk::SessionDerivationServiceRequest::Derive { request } => {
+                sessions.derive_session(*request).await.map(|outcome| {
+                    bcode_plugin_sdk::SessionDerivationServiceResponse::Derived { outcome }
+                })
+            }
+            bcode_plugin_sdk::SessionDerivationServiceRequest::Status { operation_id } => sessions
+                .session_derivation_status(operation_id)
+                .await
+                .map(
+                    |snapshot| bcode_plugin_sdk::SessionDerivationServiceResponse::Status {
+                        snapshot,
+                    },
+                ),
+            bcode_plugin_sdk::SessionDerivationServiceRequest::Cancel { operation_id } => Ok(
+                bcode_plugin_sdk::SessionDerivationServiceResponse::CancellationRequested {
+                    accepted: sessions.cancel_session_derivation(operation_id).await,
+                },
+            ),
+        };
+    match result {
+        Ok(response) => match serde_json::to_value(response) {
+            Ok(payload) => bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+            Err(error) => bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "session_derivation_response_encode_failed".to_owned(),
+                message: error.to_string(),
+            },
+        },
+        Err(error) => bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "session_derivation_failed".to_owned(),
+            message: error.to_string(),
+        },
+    }
+}
+
 async fn handle_invoke_plugin_service(
     request_id: u64,
     state: &ServerState,
@@ -33362,15 +33455,17 @@ async fn handle_invoke_plugin_service(
     let plugin_id = plugin_id.to_string();
     let interface_id = interface_id.to_string();
     let labels = plugin_service_metric_labels(Some(&plugin_id), &interface_id, &operation);
+    let invocation = state.plugins.invoke_service_with_bridge_scoped(
+        &plugin_id,
+        interface_id,
+        operation,
+        payload,
+        bcode_plugin::PluginInvocationScope::Global,
+        Some(command_plugin_bridge(state.sessions.clone())),
+    );
     let response = state
         .metrics
-        .time_result_async(
-            "plugin.service",
-            labels,
-            state
-                .plugins
-                .invoke_service(&plugin_id, interface_id, operation, payload),
-        )
+        .time_result_async("plugin.service", labels, invocation)
         .await;
     send_plugin_service_response(writer, request_id, response).await
 }

@@ -1370,38 +1370,7 @@ impl SessionManager {
         name: Option<String>,
         working_directory: PathBuf,
     ) -> Result<SessionSummary, SessionError> {
-        self.create_session_with_execution(name, working_directory, None)
-            .await
-    }
-
-    async fn create_session_with_execution(
-        &self,
-        name: Option<String>,
-        working_directory: PathBuf,
-        execution: Option<ExecutionSessionProvenance>,
-    ) -> Result<SessionSummary, SessionError> {
-        validate_execution_session_provenance(execution.as_ref())?;
-        if let Some(provenance) = &execution {
-            match provenance.context_mode {
-                ExecutionSessionContextMode::FreshIsolated => {}
-                ExecutionSessionContextMode::FixedGenerationFork => {
-                    return self
-                        .clone_execution_session_at_generation(
-                            provenance.clone(),
-                            name,
-                            working_directory,
-                        )
-                        .await;
-                }
-                ExecutionSessionContextMode::SharedSequential => {
-                    return Err(SessionError::InvalidExecutionSessionProvenance(
-                        "shared-sequential execution reuses the parent session and must not create a child"
-                            .to_string(),
-                    ));
-                }
-            }
-        }
-        self.create_session_record(name, working_directory, execution)
+        self.create_session_record(name, working_directory, None)
             .await
     }
 
@@ -1513,45 +1482,6 @@ impl SessionManager {
         Ok(summary)
     }
 
-    async fn clone_execution_session_at_generation(
-        &self,
-        provenance: ExecutionSessionProvenance,
-        name: Option<String>,
-        working_directory: PathBuf,
-    ) -> Result<SessionSummary, SessionError> {
-        let expected = provenance
-            .parent_generation
-            .expect("validated fixed-generation provenance has a generation");
-        let source = self.session_summary(provenance.parent_session_id).await?;
-        let expected_working_directory = normalize_working_directory(&working_directory);
-        if normalize_working_directory(&source.working_directory) != expected_working_directory {
-            return Err(SessionError::InvalidExecutionSessionProvenance(
-                "fixed-generation child working directory must match its parent or declared worktree"
-                    .to_string(),
-            ));
-        }
-        let current = self
-            .current_session_generation(provenance.parent_session_id)
-            .await?;
-        if current != expected {
-            return Err(SessionError::CloneGenerationChanged {
-                session_id: provenance.parent_session_id,
-                expected,
-                current,
-            });
-        }
-        let mut request = Self::execution_derivation_request(name, &provenance, &source, expected);
-        request.destination_working_directory = Some(working_directory);
-        let outcome = self.derive_execution_session(request, provenance).await?;
-        let bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { session } = outcome
-        else {
-            return Err(SessionError::InvalidExecutionSessionProvenance(
-                "fixed-generation derivation did not succeed".to_owned(),
-            ));
-        };
-        Ok(*session)
-    }
-
     /// Admit one shared-session execution under an exclusive per-parent permit.
     ///
     /// The returned permit must remain alive for the full execution. This is the only supported
@@ -1614,7 +1544,8 @@ impl SessionManager {
                 ));
             }
         };
-        self.create_session_with_execution(name, working_directory, Some(provenance))
+        validate_execution_session_provenance(Some(&provenance))?;
+        self.create_session_record(name, working_directory, Some(provenance))
             .await
     }
 
@@ -1636,7 +1567,8 @@ impl SessionManager {
         provenance.context_mode = ExecutionSessionContextMode::FreshIsolated;
         provenance.parent_generation = None;
         self.session_summary(provenance.parent_session_id).await?;
-        self.create_session_with_execution(name, worktree_directory.to_path_buf(), Some(provenance))
+        validate_execution_session_provenance(Some(&provenance))?;
+        self.create_session_record(name, worktree_directory.to_path_buf(), Some(provenance))
             .await
     }
 
@@ -1670,8 +1602,27 @@ impl SessionManager {
                 ));
             }
         };
-        self.create_session_with_execution(name, working_directory, Some(provenance))
-            .await
+        let current = self
+            .current_session_generation(provenance.parent_session_id)
+            .await?;
+        if current != parent_generation {
+            return Err(SessionError::CloneGenerationChanged {
+                session_id: provenance.parent_session_id,
+                expected: parent_generation,
+                current,
+            });
+        }
+        let mut request =
+            Self::execution_derivation_request(name, &provenance, &parent, parent_generation);
+        request.destination_working_directory = Some(working_directory);
+        let outcome = self.derive_execution_session(request, provenance).await?;
+        let bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { session } = outcome
+        else {
+            return Err(SessionError::InvalidExecutionSessionProvenance(
+                "fixed-generation derivation did not succeed".to_owned(),
+            ));
+        };
+        Ok(*session)
     }
 
     /// Clone a background execution session from one previously admitted exact parent generation.

@@ -2,9 +2,8 @@
 
 use crate::{SessionError, SessionManager, normalize_session_name};
 use bcode_session_models::{
-    ExecutionSessionProvenance, SessionEvent, SessionEventKind, SessionEventProvenance,
-    SessionForkKind, SessionForkResult, SessionForkSummary, SessionHistoryDirection,
-    SessionHistoryQuery, SessionId, SessionSummary,
+    SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind, SessionForkResult,
+    SessionForkSummary, SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionSummary,
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -166,20 +165,8 @@ impl SessionManager {
         events: Vec<SessionEvent>,
         marker: SessionEventKind,
     ) -> Result<SessionSummary, SessionError> {
-        self.copy_session_events_with_execution(name, working_directory, events, marker, None)
-            .await
-    }
-
-    pub(crate) async fn copy_session_events_with_execution(
-        &self,
-        name: Option<String>,
-        working_directory: PathBuf,
-        events: Vec<SessionEvent>,
-        marker: SessionEventKind,
-        execution: Option<ExecutionSessionProvenance>,
-    ) -> Result<SessionSummary, SessionError> {
         let session = self
-            .create_session_record(name, working_directory, execution)
+            .create_session_record(name, working_directory, None)
             .await?;
         let handle = self.session_handle(session.id).await?;
         let mut sequence_map = BTreeMap::new();

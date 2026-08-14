@@ -20,6 +20,57 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+/// Versioned application service for generic session derivation operations.
+pub const SESSION_DERIVATION_INTERFACE_ID: &str = "bcode.session-derivation/v1";
+pub const OP_SESSION_DERIVATION_SNAPSHOT: &str = "snapshot";
+pub const OP_SESSION_DERIVATION_PROMPTS: &str = "prompts";
+pub const OP_SESSION_DERIVE: &str = "derive";
+pub const OP_SESSION_DERIVATION_STATUS: &str = "status";
+pub const OP_SESSION_DERIVATION_CANCEL: &str = "cancel";
+
+/// Typed request envelope for the generic session-derivation application service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum SessionDerivationServiceRequest {
+    Snapshot {
+        session_id: bcode_session_models::SessionId,
+    },
+    Prompts {
+        session_id: bcode_session_models::SessionId,
+        query: bcode_session_models::SessionDerivationPromptQuery,
+    },
+    Derive {
+        request: Box<bcode_session_models::SessionDerivationRequest>,
+    },
+    Status {
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    },
+    Cancel {
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    },
+}
+
+/// Typed response envelope for the generic session-derivation application service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SessionDerivationServiceResponse {
+    Snapshot {
+        snapshot: bcode_session_models::SessionDerivationSourceSnapshot,
+    },
+    Prompts {
+        page: bcode_session_models::SessionDerivationPromptPage,
+    },
+    Derived {
+        outcome: bcode_session_models::SessionDerivationTerminalOutcome,
+    },
+    Status {
+        snapshot: bcode_session_models::SessionDerivationOperationSnapshot,
+    },
+    CancellationRequested {
+        accepted: bool,
+    },
+}
+
 /// Versioned interface for plugin-owned active session status contributions.
 pub const SESSION_STATUS_INTERFACE_ID: &str = "bcode.session-status/v1";
 /// Operation used to query one plugin's status contribution for a session.

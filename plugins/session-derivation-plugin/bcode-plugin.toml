@@ -1,0 +1,17 @@
+id      = "bcode.session-derivation"
+name    = "Bcode Session Derivation Plugin"
+version = "0.0.1"
+
+categories = ["session", "commands"]
+
+[[services]]
+class        = "control"
+description  = "Plugin-owned session fork and clone commands"
+interface_id = "bcode.command/v1"
+name         = "Session Derivation Commands"
+
+[runtime]
+abi_version  = 3
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_session_derivation_plugin.dylib"
+type         = "native"
