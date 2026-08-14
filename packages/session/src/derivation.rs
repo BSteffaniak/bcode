@@ -8,9 +8,12 @@ use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionEventProvenance, SessionHistoryCursor,
     SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionSummary,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -18,6 +21,17 @@ use std::sync::{
 
 const DERIVATION_EVENT_PAGE_SIZE: usize = 256;
 const STAGING_DIRECTORY: &str = ".derivation-staging";
+const OPERATION_DIRECTORY: &str = ".derivation-operations";
+const OPERATION_RECEIPT_FILE: &str = "operation.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableDerivationOperation {
+    schema_version: u32,
+    request_fingerprint: String,
+    request: SessionDerivationRequest,
+    destination_id: SessionId,
+    snapshot: SessionDerivationOperationSnapshot,
+}
 
 impl SessionManager {
     /// Derive a new session from one exact bounded source prefix.
@@ -39,6 +53,23 @@ impl SessionManager {
             .validate()
             .map_err(|error| SessionError::InvalidDerivationRequest(error.to_string()))?;
         let fingerprint = derivation_request_fingerprint(&request)?;
+        let root = self
+            .session_store_root()
+            .ok_or(SessionError::DerivationRequiresPersistentStore)?;
+        let receipt_path = derivation_receipt_path(&root, request.operation_id);
+        if receipt_path.exists() {
+            let durable = read_derivation_receipt(&receipt_path)?;
+            if durable.request_fingerprint != fingerprint {
+                return Err(SessionError::DerivationOperationConflict(
+                    request.operation_id,
+                ));
+            }
+            if let Some(outcome) = durable.snapshot.outcome {
+                return Ok(outcome);
+            }
+            cleanup_interrupted_derivation(&root, &durable)?;
+        }
+        let destination_id = SessionId::new();
         let cancellation = {
             let mut operations = self.derivation_operations.lock().await;
             if let Some(existing) = operations.get(&request.operation_id) {
@@ -59,13 +90,19 @@ impl SessionManager {
                 request.operation_id,
                 crate::DerivationOperationState {
                     request_fingerprint: fingerprint,
+                    request: request.clone(),
+                    destination_id,
                     snapshot: initial_operation_snapshot(&request),
                     cancellation: Arc::clone(&cancellation),
                 },
             );
             cancellation
         };
-        let result = self.derive_session_inner(&request, &cancellation).await;
+        self.persist_derivation_operation(request.operation_id)
+            .await?;
+        let result = self
+            .derive_session_inner(&request, destination_id, &cancellation)
+            .await;
         let outcome = match result {
             Ok(summary) => SessionDerivationTerminalOutcome::Succeeded {
                 session: Box::new(summary),
@@ -81,18 +118,19 @@ impl SessionManager {
                         message: error.to_string(),
                     },
                 )
-                .await;
+                .await?;
                 return Err(error);
             }
         };
         self.finish_derivation_operation(request.operation_id, outcome.clone())
-            .await;
+            .await?;
         Ok(outcome)
     }
 
     async fn derive_session_inner(
         &self,
         request: &SessionDerivationRequest,
+        destination_id: SessionId,
         cancellation: &AtomicBool,
     ) -> Result<SessionSummary, SessionError> {
         ensure_not_cancelled(request.operation_id, cancellation)?;
@@ -116,7 +154,6 @@ impl SessionManager {
         let root = self
             .session_store_root()
             .ok_or(SessionError::DerivationRequiresPersistentStore)?;
-        let destination_id = SessionId::new();
         let staging_root = root
             .join(STAGING_DIRECTORY)
             .join(request.operation_id.to_string());
@@ -131,6 +168,7 @@ impl SessionManager {
         }
         let summary = result?;
         ensure_not_cancelled(request.operation_id, cancellation)?;
+        sync_staged_session(&staged_session_paths(&staging_root, destination_id))?;
         self.update_derivation_progress(
             request.operation_id,
             SessionDerivationPhase::Publishing,
@@ -144,8 +182,9 @@ impl SessionManager {
             let _cleanup = std::fs::remove_dir_all(&staging_root);
             return Err(SessionError::DerivationPublicationConflict(destination_id));
         }
-        std::fs::rename(&staged_dir, &canonical_dir)?;
-        let _cleanup = std::fs::remove_dir_all(&staging_root);
+        fs::rename(&staged_dir, &canonical_dir)?;
+        File::open(&root)?.sync_all()?;
+        let _cleanup = fs::remove_dir_all(&staging_root);
         self.adopt_derived_session(summary.clone()).await?;
         Ok(summary)
     }
@@ -159,12 +198,24 @@ impl SessionManager {
         &self,
         operation_id: SessionDerivationOperationId,
     ) -> Result<SessionDerivationOperationSnapshot, SessionError> {
-        self.derivation_operations
-            .lock()
-            .await
-            .get(&operation_id)
-            .map(|state| state.snapshot.clone())
-            .ok_or(SessionError::DerivationOperationNotFound(operation_id))
+        let live_snapshot = {
+            self.derivation_operations
+                .lock()
+                .await
+                .get(&operation_id)
+                .map(|state| state.snapshot.clone())
+        };
+        if let Some(snapshot) = live_snapshot {
+            return Ok(snapshot);
+        }
+        let root = self
+            .session_store_root()
+            .ok_or(SessionError::DerivationRequiresPersistentStore)?;
+        let path = derivation_receipt_path(&root, operation_id);
+        if path.exists() {
+            return Ok(read_derivation_receipt(&path)?.snapshot);
+        }
+        Err(SessionError::DerivationOperationNotFound(operation_id))
     }
 
     /// Request cancellation for a running derivation operation.
@@ -186,6 +237,27 @@ impl SessionManager {
         true
     }
 
+    async fn persist_derivation_operation(
+        &self,
+        operation_id: SessionDerivationOperationId,
+    ) -> Result<(), SessionError> {
+        let operations = self.derivation_operations.lock().await;
+        let state = operations
+            .get(&operation_id)
+            .ok_or(SessionError::DerivationOperationNotFound(operation_id))?;
+        let durable = DurableDerivationOperation {
+            schema_version: SESSION_DERIVATION_CONTRACT_VERSION,
+            request_fingerprint: state.request_fingerprint.clone(),
+            request: state.request.clone(),
+            destination_id: state.destination_id,
+            snapshot: state.snapshot.clone(),
+        };
+        let root = self
+            .session_store_root()
+            .ok_or(SessionError::DerivationRequiresPersistentStore)?;
+        write_derivation_receipt(&derivation_receipt_path(&root, operation_id), &durable)
+    }
+
     async fn update_derivation_progress(
         &self,
         operation_id: SessionDerivationOperationId,
@@ -205,13 +277,14 @@ impl SessionManager {
             state.snapshot.progress.copied_events = copied_events;
             state.snapshot.progress.copied_bytes = copied_bytes;
         }
+        let _persisted = self.persist_derivation_operation(operation_id).await;
     }
 
     async fn finish_derivation_operation(
         &self,
         operation_id: SessionDerivationOperationId,
         outcome: SessionDerivationTerminalOutcome,
-    ) {
+    ) -> Result<(), SessionError> {
         if let Some(state) = self
             .derivation_operations
             .lock()
@@ -222,6 +295,7 @@ impl SessionManager {
             state.snapshot.revision = state.snapshot.revision.saturating_add(1);
             state.snapshot.outcome = Some(outcome);
         }
+        self.persist_derivation_operation(operation_id).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -385,6 +459,85 @@ impl SessionManager {
         self.inner.lock().await.sessions.insert(summary.id, handle);
         Ok(())
     }
+}
+
+fn staged_session_paths(staging_root: &Path, destination_id: SessionId) -> Vec<PathBuf> {
+    let directory = db::session_dir_path(staging_root, destination_id);
+    vec![
+        directory.join("session.db"),
+        directory.join("manifest.json"),
+    ]
+}
+
+fn sync_staged_session(paths: &[PathBuf]) -> Result<(), SessionError> {
+    for path in paths {
+        File::open(path)?.sync_all()?;
+    }
+    if let Some(directory) = paths.first().and_then(|path| path.parent()) {
+        File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn derivation_receipt_path(root: &Path, operation_id: SessionDerivationOperationId) -> PathBuf {
+    root.join(OPERATION_DIRECTORY)
+        .join(operation_id.to_string())
+        .join(OPERATION_RECEIPT_FILE)
+}
+
+fn write_derivation_receipt(
+    path: &Path,
+    operation: &DurableDerivationOperation,
+) -> Result<(), SessionError> {
+    let parent = path.parent().ok_or_else(|| {
+        SessionError::DerivationIo(std::io::Error::other("derivation receipt has no parent"))
+    })?;
+    fs::create_dir_all(parent)?;
+    let temp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(operation)
+        .map_err(|error| SessionError::DerivationSerialization(error.to_string()))?;
+    let mut file = File::create(&temp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(&temp, path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn read_derivation_receipt(path: &Path) -> Result<DurableDerivationOperation, SessionError> {
+    let bytes = fs::read(path)?;
+    let operation: DurableDerivationOperation = serde_json::from_slice(&bytes)
+        .map_err(|error| SessionError::DerivationSerialization(error.to_string()))?;
+    if operation.schema_version != SESSION_DERIVATION_CONTRACT_VERSION {
+        return Err(SessionError::InvalidDerivationRequest(format!(
+            "unsupported durable derivation operation version {}",
+            operation.schema_version
+        )));
+    }
+    Ok(operation)
+}
+
+fn cleanup_interrupted_derivation(
+    root: &Path,
+    operation: &DurableDerivationOperation,
+) -> Result<(), SessionError> {
+    let staging = root
+        .join(STAGING_DIRECTORY)
+        .join(operation.request.operation_id.to_string());
+    if staging.exists() {
+        fs::remove_dir_all(staging)?;
+    }
+    let canonical = db::session_dir_path(root, operation.destination_id);
+    if canonical.exists() {
+        return Err(SessionError::DerivationPublicationConflict(
+            operation.destination_id,
+        ));
+    }
+    fs::remove_file(derivation_receipt_path(
+        root,
+        operation.request.operation_id,
+    ))?;
+    Ok(())
 }
 
 fn derivation_request_fingerprint(

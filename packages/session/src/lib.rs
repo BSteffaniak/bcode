@@ -570,6 +570,8 @@ pub struct SessionManager {
 #[derive(Debug)]
 pub(crate) struct DerivationOperationState {
     pub(crate) request_fingerprint: String,
+    pub(crate) request: bcode_session_models::SessionDerivationRequest,
+    pub(crate) destination_id: SessionId,
     pub(crate) snapshot: bcode_session_models::SessionDerivationOperationSnapshot,
     pub(crate) cancellation: Arc<AtomicBool>,
 }
@@ -6662,6 +6664,19 @@ mod tests {
             !manager
                 .cancel_session_derivation(request.operation_id)
                 .await
+        );
+        let restored = SessionManager::persistent(&root).expect("restored manager");
+        let restored_status = restored
+            .session_derivation_status(request.operation_id)
+            .await
+            .expect("durable terminal status");
+        assert_eq!(restored_status.outcome.as_ref(), Some(&outcome));
+        assert_eq!(
+            restored
+                .derive_session(request.clone())
+                .await
+                .expect("durable identical retry"),
+            outcome
         );
         let mut conflicting = request;
         conflicting.destination_name = Some("different".to_owned());
