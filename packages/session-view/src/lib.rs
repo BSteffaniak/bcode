@@ -257,8 +257,11 @@ impl PendingTextDestination {
 struct PendingTextPresentation {
     target: String,
     presented_bytes: usize,
-    started_at: Instant,
-    deadline: Instant,
+    paced_from: Instant,
+    presented_since_pace: usize,
+    remaining_graphemes: usize,
+    graphemes_per_second: u32,
+    max_lag: Duration,
     destination: PendingTextDestination,
 }
 
@@ -267,14 +270,19 @@ impl PendingTextPresentation {
         target: String,
         presented_bytes: usize,
         now: Instant,
+        graphemes_per_second: u32,
         max_lag: Duration,
         destination: PendingTextDestination,
     ) -> Self {
+        let remaining_graphemes = target[presented_bytes..].graphemes(true).count();
         Self {
             target,
             presented_bytes,
-            started_at: now,
-            deadline: now.checked_add(max_lag).unwrap_or(now),
+            paced_from: now,
+            presented_since_pace: 0,
+            remaining_graphemes,
+            graphemes_per_second,
+            max_lag,
             destination,
         }
     }
@@ -283,29 +291,57 @@ impl PendingTextPresentation {
         &mut self,
         target: String,
         now: Instant,
+        graphemes_per_second: u32,
         max_lag: Duration,
         destination: PendingTextDestination,
     ) {
+        let _ = now;
         self.target = target;
-        self.started_at = now;
-        self.deadline = now.checked_add(max_lag).unwrap_or(now);
+        self.remaining_graphemes = self
+            .presented_since_pace
+            .saturating_add(self.target[self.presented_bytes..].graphemes(true).count());
+        self.graphemes_per_second = graphemes_per_second;
+        self.max_lag = max_lag;
         self.destination = destination;
     }
 
-    fn due_bytes(&self, now: Instant, curve: StreamingInterpolationCurve) -> usize {
+    fn effective_rate(&self) -> u128 {
+        let lag_nanos = self.max_lag.as_nanos().max(1);
+        let catch_up_rate = u128::try_from(self.remaining_graphemes)
+            .unwrap_or(u128::MAX)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(lag_nanos.saturating_sub(1))
+            .checked_div(lag_nanos)
+            .unwrap_or(u128::MAX);
+        u128::from(self.graphemes_per_second)
+            .max(catch_up_rate)
+            .max(1)
+    }
+
+    fn due_graphemes(&self, now: Instant, curve: StreamingInterpolationCurve) -> usize {
         const SCALE: u128 = 1_000_000;
-        if now >= self.deadline {
-            return self.target.len();
+        let elapsed_nanos = now.saturating_duration_since(self.paced_from).as_nanos();
+        let rate = self.effective_rate();
+        let linear_due = rate
+            .saturating_mul(elapsed_nanos)
+            .checked_div(1_000_000_000)
+            .unwrap_or(u128::MAX);
+        let total_remaining = self.remaining_graphemes;
+        if total_remaining == 0 {
+            return 0;
         }
-        let duration = self.deadline.saturating_duration_since(self.started_at);
-        if duration.is_zero() {
-            return self.target.len();
+        let linear_due = usize::try_from(linear_due)
+            .unwrap_or(total_remaining)
+            .min(total_remaining);
+        if rate <= u128::from(self.graphemes_per_second)
+            || curve == StreamingInterpolationCurve::Linear
+        {
+            return linear_due;
         }
-        let elapsed = now.saturating_duration_since(self.started_at);
-        let progress = elapsed
-            .as_nanos()
+        let progress = u128::try_from(linear_due)
+            .unwrap_or(u128::MAX)
             .saturating_mul(SCALE)
-            .checked_div(duration.as_nanos().max(1))
+            .checked_div(u128::try_from(total_remaining).unwrap_or(u128::MAX).max(1))
             .unwrap_or(SCALE)
             .min(SCALE);
         let cubic = |value: u128| {
@@ -327,49 +363,52 @@ impl PendingTextPresentation {
                 cubic(progress).saturating_mul(4).min(SCALE)
             }
             StreamingInterpolationCurve::EaseInOut => SCALE.saturating_sub(
-                cubic(SCALE.saturating_sub(progress).saturating_mul(2))
-                    .checked_div(2)
-                    .unwrap_or(0),
+                cubic(SCALE.saturating_sub(progress))
+                    .saturating_mul(4)
+                    .min(SCALE),
             ),
         };
-        let remaining_graphemes = self.target[self.presented_bytes..].graphemes(true).count();
-        if remaining_graphemes == 0 {
-            return self.target.len();
-        }
-        let due_graphemes = usize::try_from(
-            u128::try_from(remaining_graphemes)
+        usize::try_from(
+            u128::try_from(total_remaining)
                 .unwrap_or(u128::MAX)
                 .saturating_mul(curved)
                 .checked_div(SCALE)
                 .unwrap_or(0),
         )
-        .unwrap_or(remaining_graphemes)
-        .min(remaining_graphemes);
-        if due_graphemes == 0 {
+        .unwrap_or(total_remaining)
+        .min(total_remaining)
+    }
+
+    fn due_bytes(&self, now: Instant, curve: StreamingInterpolationCurve) -> usize {
+        let total_due = self.due_graphemes(now, curve);
+        let newly_due = total_due.saturating_sub(self.presented_since_pace);
+        if newly_due == 0 {
             return self.presented_bytes;
         }
         self.target[self.presented_bytes..]
             .grapheme_indices(true)
-            .nth(due_graphemes)
+            .nth(newly_due)
             .map_or(self.target.len(), |(offset, _)| {
                 self.presented_bytes + offset
             })
     }
 
+    fn record_presented(&mut self, bytes: usize) {
+        let newly_presented = self.target[self.presented_bytes..bytes]
+            .graphemes(true)
+            .count();
+        self.presented_bytes = bytes;
+        self.presented_since_pace = self.presented_since_pace.saturating_add(newly_presented);
+    }
+
     fn next_deadline(&self, now: Instant) -> Instant {
-        let remaining = self.target[self.presented_bytes..].graphemes(true).count();
-        if remaining <= 1 {
-            return self.deadline;
-        }
-        let remaining_u32 = u32::try_from(remaining).unwrap_or(u32::MAX).max(1);
-        let interval = self
-            .deadline
-            .saturating_duration_since(now)
-            .checked_div(remaining_u32)
-            .unwrap_or(Duration::from_millis(1));
-        now.checked_add(interval.max(Duration::from_millis(1)))
-            .unwrap_or(now)
-            .min(self.deadline)
+        let interval_nanos = 1_000_000_000_u128
+            .saturating_add(self.effective_rate().saturating_sub(1))
+            .checked_div(self.effective_rate())
+            .unwrap_or(1)
+            .max(1_000_000);
+        let interval = Duration::from_nanos(u64::try_from(interval_nanos).unwrap_or(u64::MAX));
+        now.checked_add(interval).unwrap_or(now)
     }
 }
 
@@ -501,7 +540,7 @@ impl SessionView {
             };
             let text = pending.target[..due_bytes].to_owned();
             let destination = pending.destination.clone();
-            pending.presented_bytes = due_bytes;
+            pending.record_presented(due_bytes);
             changed |= self.replace_presented_text(&id, &text, &destination);
         }
         self.pending_text_presentations
@@ -3670,9 +3709,6 @@ impl SessionView {
                 state.status = TextStreamViewStatus::Terminal(*status);
                 self.last_text_stream_updates
                     .insert(id.clone(), update.clone());
-                if let Some(pending) = self.pending_text_presentations.remove(&id) {
-                    let _ = self.replace_presented_text(&id, &pending.target, &pending.destination);
-                }
                 if let Some(item) = self
                     .snapshot
                     .transcript
@@ -3745,6 +3781,7 @@ impl SessionView {
             return;
         }
         let max_lag = Duration::from_millis(self.streaming_presentation_policy.max_lag_ms);
+        let rate = self.streaming_presentation_policy.graphemes_per_second;
         if current_bytes == 0 {
             let first_bytes = target
                 .grapheme_indices(true)
@@ -3754,7 +3791,14 @@ impl SessionView {
             if first_bytes < target.len() {
                 self.pending_text_presentations.insert(
                     stream_id,
-                    PendingTextPresentation::new(target, first_bytes, now, max_lag, destination),
+                    PendingTextPresentation::new(
+                        target,
+                        first_bytes,
+                        now,
+                        rate,
+                        max_lag,
+                        destination,
+                    ),
                 );
             }
             return;
@@ -3762,10 +3806,10 @@ impl SessionView {
         self.pending_text_presentations
             .entry(stream_id)
             .and_modify(|pending| {
-                pending.rebase(target.clone(), now, max_lag, destination.clone());
+                pending.rebase(target.clone(), now, rate, max_lag, destination.clone());
             })
             .or_insert_with(|| {
-                PendingTextPresentation::new(target, current_bytes, now, max_lag, destination)
+                PendingTextPresentation::new(target, current_bytes, now, rate, max_lag, destination)
             });
     }
 
@@ -3821,6 +3865,7 @@ impl SessionView {
             return;
         }
         let max_lag = Duration::from_millis(self.streaming_presentation_policy.max_lag_ms);
+        let rate = self.streaming_presentation_policy.graphemes_per_second;
         if current_bytes == 0 {
             let first_bytes = target
                 .grapheme_indices(true)
@@ -3831,7 +3876,14 @@ impl SessionView {
             if first_bytes < target.len() {
                 self.pending_text_presentations.insert(
                     id,
-                    PendingTextPresentation::new(target, first_bytes, now, max_lag, destination),
+                    PendingTextPresentation::new(
+                        target,
+                        first_bytes,
+                        now,
+                        rate,
+                        max_lag,
+                        destination,
+                    ),
                 );
             }
             return;
@@ -3839,10 +3891,10 @@ impl SessionView {
         self.pending_text_presentations
             .entry(id)
             .and_modify(|pending| {
-                pending.rebase(target.clone(), now, max_lag, destination.clone());
+                pending.rebase(target.clone(), now, rate, max_lag, destination.clone());
             })
             .or_insert_with(|| {
-                PendingTextPresentation::new(target, current_bytes, now, max_lag, destination)
+                PendingTextPresentation::new(target, current_bytes, now, rate, max_lag, destination)
             });
     }
 
@@ -3971,6 +4023,33 @@ impl SessionView {
             .is_some_and(|state| state.status == TextStreamViewStatus::Degraded)
         {
             return;
+        }
+        if let Some(pending) = self.pending_text_presentations.get_mut(&id) {
+            if text.starts_with(&pending.target) {
+                text.clone_into(&mut pending.target);
+                pending.remaining_graphemes = pending.presented_since_pace.saturating_add(
+                    pending.target[pending.presented_bytes..]
+                        .graphemes(true)
+                        .count(),
+                );
+                if let Some(item) = self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == id)
+                {
+                    item.sequence = (sequence != 0).then_some(sequence).or(item.sequence);
+                    item.timestamp_ms = timestamp_ms.or(item.timestamp_ms);
+                    item.streaming = false;
+                }
+                return;
+            }
+            let pending = self
+                .pending_text_presentations
+                .remove(&id)
+                .expect("pending exists");
+            let _ = self.replace_presented_text(&id, &pending.target, &pending.destination);
         }
         if self.finish_split_streaming_message(kind) {
             return;
@@ -4697,11 +4776,11 @@ mod tests {
         let next_deadline = view
             .next_streaming_presentation_deadline(append_started)
             .expect("presentation deadline");
-        let terminal_deadline = view
+        let pending = view
             .pending_text_presentations
             .get(&id)
-            .expect("pending presentation")
-            .deadline;
+            .expect("pending presentation");
+        let terminal_deadline = pending.paced_from + pending.max_lag;
         assert!(next_deadline <= terminal_deadline);
         assert!(
             terminal_deadline.saturating_duration_since(append_started)
@@ -4765,17 +4844,17 @@ mod tests {
     #[test]
     fn interpolation_curves_have_deterministic_relative_progress() {
         let started = Instant::now();
-        let deadline = started + Duration::from_millis(100);
         let target = "abcdefghij".to_owned();
-        let pending = PendingTextPresentation {
+        let pending = PendingTextPresentation::new(
             target,
-            presented_bytes: 0,
-            started_at: started,
-            deadline,
-            destination: PendingTextDestination::Transcript {
+            0,
+            started,
+            10,
+            Duration::from_millis(100),
+            PendingTextDestination::Transcript {
                 turn_id: "turn-1".to_owned(),
             },
-        };
+        );
         let midpoint = started + Duration::from_millis(50);
         let linear = pending.due_bytes(midpoint, StreamingInterpolationCurve::Linear);
         let ease_in = pending.due_bytes(midpoint, StreamingInterpolationCurve::EaseIn);
@@ -4786,7 +4865,10 @@ mod tests {
         assert_eq!(ease_out, 8);
         assert_eq!(ease_in_out, 5);
         assert_eq!(
-            pending.due_bytes(deadline, StreamingInterpolationCurve::EaseIn),
+            pending.due_bytes(
+                started + Duration::from_millis(100),
+                StreamingInterpolationCurve::EaseIn,
+            ),
             10
         );
     }

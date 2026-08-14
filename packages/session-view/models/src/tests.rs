@@ -505,6 +505,10 @@ fn streaming_presentation_policy_has_stable_defaults_and_wire_values() {
     assert!(default.enabled);
     assert_eq!(default.curve, StreamingInterpolationCurve::Linear);
     assert_eq!(
+        default.graphemes_per_second,
+        StreamingPresentationPolicy::DEFAULT_GRAPHEMES_PER_SECOND
+    );
+    assert_eq!(
         default.max_lag_ms,
         StreamingPresentationPolicy::DEFAULT_MAX_LAG_MS
     );
@@ -528,10 +532,15 @@ fn streaming_presentation_policy_has_stable_defaults_and_wire_values() {
     }
 
     let normalized = StreamingPresentationPolicy {
+        graphemes_per_second: u32::MAX,
         max_lag_ms: u64::MAX,
         ..StreamingPresentationPolicy::default()
     }
     .normalized();
+    assert_eq!(
+        normalized.graphemes_per_second,
+        StreamingPresentationPolicy::MAX_GRAPHEMES_PER_SECOND
+    );
     assert_eq!(
         normalized.max_lag_ms,
         StreamingPresentationPolicy::MAX_LAG_MS

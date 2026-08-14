@@ -1942,10 +1942,13 @@ pub struct PresentationStreamingConfig {
     /// Smooth accepted live text into progressive visible prefixes.
     #[serde(default = "default_streaming_presentation_enabled")]
     pub enabled: bool,
-    /// Curve used to distribute visible progress over the lag budget.
+    /// Curve used to shape catch-up when the accepted-text backlog exceeds the nominal rate.
     #[serde(default)]
     pub curve: StreamingInterpolationCurveConfig,
-    /// Maximum nominal age of hidden accepted text in milliseconds.
+    /// Nominal number of grapheme clusters exposed per second.
+    #[serde(default = "default_streaming_presentation_graphemes_per_second")]
+    pub graphemes_per_second: u32,
+    /// Maximum age of the accepted-text presentation backlog in milliseconds.
     #[serde(default = "default_streaming_presentation_max_lag_ms")]
     pub max_lag_ms: u64,
 }
@@ -1970,6 +1973,7 @@ impl PresentationStreamingConfig {
                     bcode_session_view_models::StreamingInterpolationCurve::EaseInOut
                 }
             },
+            graphemes_per_second: self.graphemes_per_second,
             max_lag_ms: self.max_lag_ms,
         }
         .normalized()
@@ -1981,6 +1985,7 @@ impl Default for PresentationStreamingConfig {
         Self {
             enabled: default_streaming_presentation_enabled(),
             curve: StreamingInterpolationCurveConfig::default(),
+            graphemes_per_second: default_streaming_presentation_graphemes_per_second(),
             max_lag_ms: default_streaming_presentation_max_lag_ms(),
         }
     }
@@ -1988,6 +1993,10 @@ impl Default for PresentationStreamingConfig {
 
 const fn default_streaming_presentation_enabled() -> bool {
     true
+}
+
+const fn default_streaming_presentation_graphemes_per_second() -> u32 {
+    bcode_session_view_models::StreamingPresentationPolicy::DEFAULT_GRAPHEMES_PER_SECOND
 }
 
 const fn default_streaming_presentation_max_lag_ms() -> u64 {
@@ -5914,6 +5923,12 @@ fn write_presentation_toml(output: &mut String, presentation: PresentationConfig
         toml_string(streaming_curve_name(streaming.curve))
     )
     .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "graphemes_per_second = {}",
+        streaming.graphemes_per_second
+    )
+    .expect("writing to string should not fail");
     writeln!(output, "max_lag_ms = {}", streaming.max_lag_ms)
         .expect("writing to string should not fail");
     output.push('\n');
@@ -7440,6 +7455,7 @@ scheme = "api_key"
             default.curve,
             super::StreamingInterpolationCurveConfig::Linear
         );
+        assert_eq!(default.graphemes_per_second, 300);
         assert_eq!(default.max_lag_ms, 40);
         assert_eq!(
             default.policy(),
@@ -7451,6 +7467,7 @@ scheme = "api_key"
 [presentation.streaming]
 enabled = false
 curve = "ease_in_out"
+graphemes_per_second = 50000
 max_lag_ms = 5000
 "#,
         )
@@ -7462,6 +7479,10 @@ max_lag_ms = 5000
             bcode_session_view_models::StreamingInterpolationCurve::EaseInOut
         );
         assert_eq!(
+            policy.graphemes_per_second,
+            bcode_session_view_models::StreamingPresentationPolicy::MAX_GRAPHEMES_PER_SECOND
+        );
+        assert_eq!(
             policy.max_lag_ms,
             bcode_session_view_models::StreamingPresentationPolicy::MAX_LAG_MS
         );
@@ -7470,6 +7491,10 @@ max_lag_ms = 5000
         assert!(rendered.contains("[presentation.streaming]"), "{rendered}");
         assert!(rendered.contains("enabled = false"), "{rendered}");
         assert!(rendered.contains("curve = \"ease_in_out\""), "{rendered}");
+        assert!(
+            rendered.contains("graphemes_per_second = 50000"),
+            "{rendered}"
+        );
         assert!(rendered.contains("max_lag_ms = 5000"), "{rendered}");
         let reparsed: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
         assert_eq!(reparsed.presentation, config.presentation);

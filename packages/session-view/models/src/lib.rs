@@ -46,17 +46,24 @@ pub enum StreamingInterpolationCurve {
 pub struct StreamingPresentationPolicy {
     /// Whether accepted live text should be exposed progressively.
     pub enabled: bool,
-    /// Curve used to distribute visible progress over the lag budget.
+    /// Curve used to shape catch-up when the accepted-text backlog exceeds the nominal rate.
     pub curve: StreamingInterpolationCurve,
-    /// Maximum nominal age of hidden accepted text in milliseconds.
+    /// Nominal number of grapheme clusters exposed per second.
+    #[serde(default = "default_streaming_graphemes_per_second")]
+    pub graphemes_per_second: u32,
+    /// Maximum age of the accepted-text presentation backlog in milliseconds.
     pub max_lag_ms: u64,
 }
 
 impl StreamingPresentationPolicy {
-    /// Default maximum nominal presentation lag.
+    /// Default nominal presentation rate in grapheme clusters per second.
+    pub const DEFAULT_GRAPHEMES_PER_SECOND: u32 = 300;
+    /// Largest accepted nominal presentation rate from configuration.
+    pub const MAX_GRAPHEMES_PER_SECOND: u32 = 10_000;
+    /// Default maximum presentation backlog age.
     pub const DEFAULT_MAX_LAG_MS: u64 = 40;
-    /// Largest accepted presentation lag from configuration.
-    pub const MAX_LAG_MS: u64 = 250;
+    /// Largest accepted presentation backlog age from configuration.
+    pub const MAX_LAG_MS: u64 = 1_000;
 
     /// Return an immediate whole-chunk presentation policy.
     #[must_use]
@@ -64,6 +71,7 @@ impl StreamingPresentationPolicy {
         Self {
             enabled: false,
             curve: StreamingInterpolationCurve::Linear,
+            graphemes_per_second: 0,
             max_lag_ms: 0,
         }
     }
@@ -71,12 +79,15 @@ impl StreamingPresentationPolicy {
     /// Return whether this policy exposes accepted text immediately.
     #[must_use]
     pub const fn is_immediate(self) -> bool {
-        !self.enabled || self.max_lag_ms == 0
+        !self.enabled || self.graphemes_per_second == 0 || self.max_lag_ms == 0
     }
 
-    /// Return this policy with its lag bounded to the supported range.
+    /// Return this policy with its rate and lag bounded to supported ranges.
     #[must_use]
     pub const fn normalized(mut self) -> Self {
+        if self.graphemes_per_second > Self::MAX_GRAPHEMES_PER_SECOND {
+            self.graphemes_per_second = Self::MAX_GRAPHEMES_PER_SECOND;
+        }
         if self.max_lag_ms > Self::MAX_LAG_MS {
             self.max_lag_ms = Self::MAX_LAG_MS;
         }
@@ -84,11 +95,16 @@ impl StreamingPresentationPolicy {
     }
 }
 
+const fn default_streaming_graphemes_per_second() -> u32 {
+    StreamingPresentationPolicy::DEFAULT_GRAPHEMES_PER_SECOND
+}
+
 impl Default for StreamingPresentationPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
             curve: StreamingInterpolationCurve::Linear,
+            graphemes_per_second: Self::DEFAULT_GRAPHEMES_PER_SECOND,
             max_lag_ms: Self::DEFAULT_MAX_LAG_MS,
         }
     }

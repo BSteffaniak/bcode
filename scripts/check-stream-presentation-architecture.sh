@@ -29,7 +29,7 @@ for forbidden in ("StreamingInterpolationCurve::Linear", "grapheme_indices(true)
         raise SystemExit(f"renderer owns shared interpolation behavior: {forbidden}")
 
 for required in (
-    "streaming_presentation:",
+    '"bcode.streaming_presentation"',
     "next_streaming_presentation_deadline",
     "advance_streaming_presentation",
 ):
@@ -48,7 +48,12 @@ for required in (
 if "mpsc::channel::<ScopedSnapshotUpdate>" in hyperchad:
     raise SystemExit("HyperChad canonical watch processing can block on animation channel capacity")
 
-for required in ("PresentationStreamingConfig", "max_lag_ms", "streaming.policy()"):
+for required in (
+    "PresentationStreamingConfig",
+    "graphemes_per_second",
+    "max_lag_ms",
+    "streaming.policy()",
+):
     if required not in config:
         raise SystemExit(f"shared stream configuration missing: {required}")
 
@@ -56,7 +61,7 @@ for required in ("accepted live assistant", "max_lag_ms", "per opaque render sco
     if required not in renderer_docs:
         raise SystemExit(f"renderer architecture documentation missing: {required}")
 
-for required in ("Smooth stream scheduling", "max_lag_ms = 40", "respects `[tui.render].max_fps`"):
+for required in ("Smooth stream scheduling", "graphemes_per_second = 300", "bounded to 1000 ms"):
     if required not in tui_docs:
         raise SystemExit(f"TUI scheduling documentation missing: {required}")
 

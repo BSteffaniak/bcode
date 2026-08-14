@@ -1488,10 +1488,12 @@ impl BcodeRuntimeModel {
             }
             "bcode.streaming_presentation" => {
                 if self.chat.app.advance_streaming_presentation(now) {
-                    super::invalidation::UiInvalidation::Paint
-                } else {
-                    super::invalidation::UiInvalidation::None
+                    return (
+                        super::invalidation::UiInvalidation::Paint,
+                        vec![super::app::TemporalDamage::Transcript],
+                    );
                 }
+                super::invalidation::UiInvalidation::None
             }
             "bcode.draft_save" => {
                 super::chat_loop::start_draft_save(&mut self.chat, &mut self.draft_autosave);

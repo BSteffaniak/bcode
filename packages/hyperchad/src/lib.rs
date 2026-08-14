@@ -2205,6 +2205,7 @@ mod tests {
                     serde_json::from_value::<StreamingPresentationPolicy>(serde_json::json!({
                         "enabled": true,
                         "curve": curve,
+                        "graphemes_per_second": 300,
                         "max_lag_ms": 40
                     }))
                     .expect("serialized stream policy")
