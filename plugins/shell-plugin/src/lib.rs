@@ -55,6 +55,12 @@ const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
+const DAEMON_PRIVATE_ENV_VARS: &[&str] = &[
+    "BCODE_IPC_ENDPOINT",
+    "BCODE_IPC_ENDPOINT_NAMESPACE",
+    "BCODE_DAEMON_LOG",
+    "BCODE_EXECUTABLE_DIGEST",
+];
 
 /// shell plugin.
 #[derive(Default)]
@@ -764,6 +770,10 @@ fn execute_workflow_command(
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         inherit_environment: plan.environment.inherit,
         environment: plan.environment.set.clone(),
+        remove_environment: DAEMON_PRIVATE_ENV_VARS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
     };
     let cancellation = context.cancellation.clone();
     let cancellation_wait = Duration::from_millis(command.timeout_ms);
@@ -1634,6 +1644,9 @@ fn run_terminal_shell_command_inner(
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
+    for name in DAEMON_PRIVATE_ENV_VARS {
+        command.env_remove(name);
+    }
 
     let mut child = pair
         .slave

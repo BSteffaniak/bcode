@@ -2016,6 +2016,14 @@ pub enum DaemonStartError {
         /// Recent daemon log excerpt.
         recent_log: String,
     },
+    /// A live process occupies the target endpoint but did not complete a compatible handshake.
+    #[error(
+        "daemon endpoint {endpoint} is occupied by a live process that did not become ready; refusing to start a competing daemon"
+    )]
+    EndpointOccupied {
+        /// Display form of the occupied endpoint.
+        endpoint: String,
+    },
     /// Another process held the namespace startup lock beyond the bounded startup window.
     #[error("timed out waiting for daemon startup coordination lock at {}", lock_path.display())]
     StartupCoordinationTimeout {
@@ -2037,7 +2045,9 @@ impl DaemonStartError {
                     || recent_log.contains("Address already in use")
             }
             Self::Io(error) => error.kind() == std::io::ErrorKind::AddrInUse,
-            Self::Lifecycle(_) | Self::StartupCoordinationTimeout { .. } => false,
+            Self::Lifecycle(_)
+            | Self::EndpointOccupied { .. }
+            | Self::StartupCoordinationTimeout { .. } => false,
         }
     }
 }
@@ -2098,6 +2108,7 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                 )
                 .env(BCODE_EXECUTABLE_DIGEST_ENV, executable_digest)
                 .env("BCODE_DAEMON_LOG", &log_path)
+                .kill_on_drop(true)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::from(log_file))
                 .stderr(std::process::Stdio::from(stderr_log))
@@ -2154,6 +2165,16 @@ where
         print_daemon_status(options, "server already running");
         return Ok(());
     };
+    if endpoint_has_listener(&options.endpoint).await {
+        if wait_for_existing_daemon(&options.endpoint).await {
+            drop(lock);
+            print_daemon_status(options, "server already running");
+            return Ok(());
+        }
+        return Err(DaemonStartError::EndpointOccupied {
+            endpoint: format!("{:?}", options.endpoint),
+        });
+    }
     let image_use_guard = DaemonImageUseGuard::acquire(&bcode_config::default_state_dir())?;
     cleanup_stale_endpoint(&options.endpoint)?;
     if ping_ready(&options.endpoint).await {
@@ -2382,6 +2403,22 @@ async fn wait_for_existing_daemon(endpoint: &IpcEndpoint) -> bool {
     false
 }
 
+#[cfg(unix)]
+async fn endpoint_has_listener(endpoint: &IpcEndpoint) -> bool {
+    let Some(path) = endpoint.as_unix_socket() else {
+        return false;
+    };
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || unix_socket_has_listener(&path))
+        .await
+        .unwrap_or(true)
+}
+
+#[cfg(not(unix))]
+const async fn endpoint_has_listener(_endpoint: &IpcEndpoint) -> bool {
+    false
+}
+
 fn remove_stale_plugin_state(
     state_dir: &Path,
     namespace: &str,
@@ -2535,6 +2572,39 @@ mod startup_lock_tests {
         assert!(!stale_path.exists());
         fs::remove_file(live_path).expect("live socket cleanup");
         fs::remove_dir_all(root).expect("socket directory cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn occupied_unresponsive_endpoint_does_not_start_competing_daemon() {
+        let root = PathBuf::from(format!(
+            "/tmp/bcode-do-{}-{}",
+            std::process::id(),
+            unix_time_millis().expect("time")
+        ));
+        fs::create_dir_all(&root).expect("socket directory");
+        let socket_path = root.join("bcode-occupied.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind occupied endpoint");
+        let options = EnsureDaemonOptions {
+            endpoint: IpcEndpoint::unix_socket(socket_path.clone()),
+            quiet: true,
+            log_path: root.join("daemon.log"),
+        };
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_starts = std::sync::Arc::clone(&starts);
+        let error = ensure_daemon_running_with_start(&options, move |_| {
+            observed_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await
+        .expect_err("occupied endpoint must block startup");
+
+        assert!(matches!(error, DaemonStartError::EndpointOccupied { .. }));
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(listener);
+        fs::remove_file(socket_path).expect("socket cleanup");
+        fs::remove_dir_all(root).expect("directory cleanup");
     }
 
     #[tokio::test]

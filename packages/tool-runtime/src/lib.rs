@@ -41,6 +41,8 @@ pub struct ProcessExecutionRequest {
     pub inherit_environment: bool,
     /// Explicit environment entries applied after inheritance/clear policy.
     pub environment: BTreeMap<String, String>,
+    /// Environment variable names removed after inheritance and explicit entries.
+    pub remove_environment: Vec<String>,
 }
 
 /// Captured process output stream bytes.
@@ -325,6 +327,9 @@ async fn run_process_inner(
         command.env_clear();
     }
     command.envs(request.environment);
+    for name in request.remove_environment {
+        command.env_remove(name);
+    }
     if let Some(cwd) = request.cwd {
         command.current_dir(cwd);
     }
@@ -623,6 +628,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn removed_environment_is_not_visible_to_child() {
+        let runtime = ToolExecutionRuntime::new(1);
+        let mut environment = BTreeMap::new();
+        environment.insert("BCODE_PRIVATE_TEST".to_owned(), "private".to_owned());
+        let result = runtime
+            .run_process(ProcessExecutionRequest {
+                program: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf %s \"${BCODE_PRIVATE_TEST-unset}\"".to_owned(),
+                ],
+                cwd: None,
+                timeout: Some(Duration::from_secs(1)),
+                max_output_bytes: 1024,
+                inherit_environment: true,
+                environment,
+                remove_environment: vec!["BCODE_PRIVATE_TEST".to_owned()],
+            })
+            .await
+            .expect("process returns output");
+        assert_eq!(result.stdout.bytes, b"unset");
+    }
+
+    #[tokio::test]
     async fn process_timeout_is_recorded() {
         let runtime = ToolExecutionRuntime::new(1);
         let result = runtime
@@ -634,6 +663,7 @@ mod tests {
                 max_output_bytes: 1024,
                 inherit_environment: true,
                 environment: BTreeMap::new(),
+                remove_environment: Vec::new(),
             })
             .await
             .expect("process returns timeout result");
@@ -663,6 +693,7 @@ mod tests {
                             max_output_bytes: 1024,
                             inherit_environment: true,
                             environment: BTreeMap::new(),
+                            remove_environment: Vec::new(),
                         },
                         &cancellation,
                     )
@@ -724,6 +755,7 @@ mod tests {
                         max_output_bytes: 1024,
                         inherit_environment: true,
                         environment: BTreeMap::new(),
+                        remove_environment: Vec::new(),
                     },
                     &task_cancellation,
                 )
@@ -754,6 +786,7 @@ mod tests {
                 max_output_bytes: 1024,
                 inherit_environment: true,
                 environment: BTreeMap::new(),
+                remove_environment: Vec::new(),
             })
             .await
             .expect("normal exit");
@@ -770,6 +803,7 @@ mod tests {
                 max_output_bytes: 1024,
                 inherit_environment: true,
                 environment: BTreeMap::new(),
+                remove_environment: Vec::new(),
             })
             .await
             .expect("signal termination");
@@ -793,6 +827,7 @@ mod tests {
                 max_output_bytes: 3,
                 inherit_environment: true,
                 environment: BTreeMap::new(),
+                remove_environment: Vec::new(),
             })
             .await
             .expect("process returns output");
