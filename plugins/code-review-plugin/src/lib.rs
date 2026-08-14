@@ -217,6 +217,8 @@ fn diff_toggle_command() -> CommandContribution {
         category: Some("diff".to_string()),
         surfaces: std::collections::BTreeSet::from([CommandSurface::Palette]),
         slash: None,
+        arguments: Vec::new(),
+        session: bcode_command::CommandSessionRequirement::Optional,
         execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.code_review".to_string(),

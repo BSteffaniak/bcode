@@ -94,6 +94,8 @@ fn open_picker_command() -> CommandContribution {
         category: Some("eval".to_string()),
         surfaces: BTreeSet::from([CommandSurface::Palette]),
         slash: None,
+        arguments: Vec::new(),
+        session: bcode_command::CommandSessionRequirement::Optional,
         execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_string(),
@@ -113,6 +115,8 @@ fn open_latest_command() -> CommandContribution {
         category: Some("eval".to_string()),
         surfaces: BTreeSet::from([CommandSurface::Palette]),
         slash: None,
+        arguments: Vec::new(),
+        session: bcode_command::CommandSessionRequirement::Optional,
         execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_string(),
@@ -368,6 +372,7 @@ pattern = "ok"
             payload: serde_json::to_vec(&InvokeCommandRequest {
                 command_id: command_id.to_string(),
                 args: std::collections::BTreeMap::new(),
+                context: None,
             })
             .expect("request json"),
         }

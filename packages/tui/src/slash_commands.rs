@@ -771,6 +771,7 @@ pub async fn execute_resolved(
             arguments,
         }),
         slash_registry::SlashResolution::PluginCommand(contribution) => {
+            let contribution = *contribution;
             Ok(SlashCommandOutcome::PluginCommand {
                 action: contribution.action,
                 execution: contribution.execution,

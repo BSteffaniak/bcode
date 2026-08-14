@@ -208,6 +208,8 @@ fn command_contributions() -> Vec<CommandContribution> {
             name: id.to_string(),
             aliases: BTreeSet::new(),
         }),
+        arguments: Vec::new(),
+        session: bcode_command::CommandSessionRequirement::Optional,
         execution: bcode_command::CommandExecution::Immediate,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_string(),
@@ -909,8 +911,15 @@ async fn describe_or_instantiate_template(
             );
         }
     }
-    if let Some(session_id) = request.args.get("session_id") {
-        options.insert("session_id".to_string(), serde_json::json!(session_id));
+    if let Some(session_id) = request
+        .context
+        .as_ref()
+        .and_then(|context| context.session_id)
+    {
+        options.insert(
+            "session_id".to_string(),
+            serde_json::json!(session_id.to_string()),
+        );
     }
     if let Some(configuration) = request.args.get("configuration") {
         let configuration_schema = template.authoring_document.as_ref().map_or_else(
@@ -1320,6 +1329,7 @@ mod tests {
                 ("parent_session_generation".to_string(), "7".to_string()),
                 ("input".to_string(), r#"{"subject":"change"}"#.to_string()),
             ]),
+            context: None,
         };
         let start = package_export_start_request(&request).expect("start request");
         assert_eq!(start.package_export.package_id, "example/package");
@@ -1340,6 +1350,7 @@ mod tests {
                 ),
                 ("input".to_string(), r#"{"subject":"change"}"#.to_string()),
             ]),
+            context: None,
         };
         assert_eq!(
             optional_json_arg(&request, "configuration")
@@ -1356,6 +1367,7 @@ mod tests {
         let invalid = InvokeCommandRequest {
             command_id: "workflow.package-start".to_string(),
             args: BTreeMap::from([("input".to_string(), "not-json".to_string())]),
+            context: None,
         };
         assert!(optional_json_arg(&invalid, "input").is_err());
         let oversized = InvokeCommandRequest {
@@ -1364,6 +1376,7 @@ mod tests {
                 "input".to_string(),
                 "x".repeat(bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES + 1),
             )]),
+            context: None,
         };
         assert!(optional_json_arg(&oversized, "input").is_err());
     }
@@ -1373,6 +1386,7 @@ mod tests {
         let request = InvokeCommandRequest {
             command_id: "workflow.run".to_string(),
             args: BTreeMap::new(),
+            context: None,
         };
         assert_eq!(
             required_arg(&request, "definition_id").expect_err("missing argument"),

@@ -11,6 +11,7 @@
 mod bpdl_contract_tests;
 
 use bcode_model::ReasoningEffort;
+use bcode_session_models::SessionId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,12 +43,25 @@ pub struct CommandList {
     pub commands: Vec<CommandInfo>,
 }
 
+/// Canonical application context supplied by the host for command invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandInvocationContext {
+    /// Active canonical session, when the command was invoked from one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// Canonical session or launch working directory selected by the host.
+    pub working_directory: std::path::PathBuf,
+}
+
 /// Request payload for `OP_INVOKE_COMMAND`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvokeCommandRequest {
     pub command_id: String,
     #[serde(default)]
     pub args: BTreeMap<String, String>,
+    /// Trusted application context supplied independently from user arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<CommandInvocationContext>,
 }
 
 /// Response from command invocation.
@@ -197,6 +211,48 @@ pub struct SlashCommandContribution {
     pub aliases: BTreeSet<String>,
 }
 
+/// Whether a command may be invoked without an active session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandSessionRequirement {
+    /// The command supports invocation with or without an active session.
+    #[default]
+    Optional,
+    /// The command requires canonical active-session context.
+    Required,
+    /// The command is only applicable when no session is active.
+    Absent,
+}
+
+/// Portable command argument value kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandArgumentKind {
+    /// Arbitrary UTF-8 text.
+    String,
+    /// Boolean text parsed by the command owner.
+    Boolean,
+    /// Signed integer text parsed by the command owner.
+    Integer,
+    /// JSON text validated by the command owner.
+    Json,
+}
+
+/// One named command argument declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandArgumentContribution {
+    /// Stable argument name.
+    pub name: String,
+    /// Portable value kind.
+    pub kind: CommandArgumentKind,
+    /// Whether invocation requires the argument.
+    #[serde(default)]
+    pub required: bool,
+    /// Optional user-facing description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// Registry contribution for a user-visible command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandContribution {
@@ -219,6 +275,12 @@ pub struct CommandContribution {
     /// name separate from `id` allows stable namespaced command identities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slash: Option<SlashCommandContribution>,
+    /// Portable user argument declarations in presentation order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<CommandArgumentContribution>,
+    /// Active-session applicability requirement.
+    #[serde(default)]
+    pub session: CommandSessionRequirement,
     /// Host scheduling class.
     #[serde(default)]
     pub execution: CommandExecution,
@@ -239,6 +301,8 @@ impl CommandContribution {
             category: Some(category.to_owned()),
             surfaces: BTreeSet::from([CommandSurface::Palette]),
             slash: None,
+            arguments: Vec::new(),
+            session: CommandSessionRequirement::Optional,
             execution: CommandExecution::Normal,
             owner: CommandOwner::Host,
             action: CommandAction::Host {
@@ -487,6 +551,8 @@ mod tests {
                 name: "example".to_owned(),
                 aliases: BTreeSet::from(["ex".to_owned()]),
             }),
+            arguments: Vec::new(),
+            session: CommandSessionRequirement::Optional,
             execution: CommandExecution::Immediate,
             owner: CommandOwner::Host,
             action: CommandAction::Host {
@@ -501,6 +567,29 @@ mod tests {
     }
 
     #[test]
+    fn command_invocation_context_is_separate_from_user_arguments() {
+        let session_id = SessionId::new();
+        let request = InvokeCommandRequest {
+            command_id: "bcode.example.open".to_owned(),
+            args: BTreeMap::from([("target".to_owned(), "user input".to_owned())]),
+            context: Some(CommandInvocationContext {
+                session_id: Some(session_id),
+                working_directory: std::path::PathBuf::from("/workspace"),
+            }),
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["args"]["target"], "user input");
+        assert_eq!(value["context"]["session_id"], session_id.to_string());
+        assert!(value["args"].get("session_id").is_none());
+        assert!(value["args"].get("cwd").is_none());
+        assert_eq!(
+            serde_json::from_value::<InvokeCommandRequest>(value).expect("deserialize request"),
+            request
+        );
+    }
+
+    #[test]
     fn registry_filters_commands_by_surface() {
         let mut registry = CommandRegistry::new();
         registry.register(CommandContribution {
@@ -510,6 +599,8 @@ mod tests {
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Palette]),
             slash: None,
+            arguments: Vec::new(),
+            session: CommandSessionRequirement::Optional,
             execution: CommandExecution::Normal,
             owner: CommandOwner::Host,
             action: CommandAction::Host {
@@ -526,6 +617,8 @@ mod tests {
                 name: "example".to_owned(),
                 aliases: BTreeSet::new(),
             }),
+            arguments: Vec::new(),
+            session: CommandSessionRequirement::Optional,
             execution: CommandExecution::Normal,
             owner: CommandOwner::Host,
             action: CommandAction::Host {

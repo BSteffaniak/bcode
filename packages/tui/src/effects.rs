@@ -1868,10 +1868,6 @@ impl TuiEffect {
                 session_id,
             } => {
                 let mut args = BTreeMap::new();
-                args.insert("cwd".to_owned(), working_directory.display().to_string());
-                if let Some(session_id) = session_id {
-                    args.insert("session_id".to_owned(), session_id.to_string());
-                }
                 if let Some(arguments) = arguments.filter(|value| !value.is_empty()) {
                     args.insert("arguments".to_owned(), arguments);
                 }
@@ -1879,6 +1875,10 @@ impl TuiEffect {
                     let payload = serde_json::to_vec(&bcode_command::InvokeCommandRequest {
                         command_id,
                         args,
+                        context: Some(bcode_command::CommandInvocationContext {
+                            session_id,
+                            working_directory,
+                        }),
                     })?;
                     let response = client
                         .invoke_plugin_service(

@@ -52,6 +52,8 @@ fn open_dashboard_command() -> CommandContribution {
             name: "metrics".to_owned(),
             aliases: BTreeSet::new(),
         }),
+        arguments: Vec::new(),
+        session: bcode_command::CommandSessionRequirement::Optional,
         execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_owned(),
@@ -88,11 +90,15 @@ fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
                     }));
                 }
             }
-            if let Some(session_id) = request.args.get("session_id") {
+            if let Some(session_id) = request
+                .context
+                .as_ref()
+                .and_then(|context| context.session_id)
+            {
                 filters.push(serde_json::json!({
                     "target": { "label": "session_id" },
                     "op": "equals",
-                    "value": session_id,
+                    "value": session_id.to_string(),
                 }));
             }
             if !filters.is_empty() {

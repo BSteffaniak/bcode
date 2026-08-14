@@ -281,7 +281,12 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             .to_string_lossy()
             .into_owned();
         args.insert("workspace_snapshot".to_string(), workspace_snapshot);
-        let response = execute_command(InvokeCommandRequest { command_id, args }).await?;
+        let response = execute_command(InvokeCommandRequest {
+            command_id,
+            args,
+            context: None,
+        })
+        .await?;
         if let Some(message) = response.message {
             println!("{message}");
         }

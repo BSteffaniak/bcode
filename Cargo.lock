@@ -1605,6 +1605,7 @@ name = "bcode_command"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_model",
+ "bcode_session_models",
  "bmux_plugin_schema",
  "serde",
  "serde_json",

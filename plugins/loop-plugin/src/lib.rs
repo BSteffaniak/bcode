@@ -115,6 +115,8 @@ fn command(id: &str, title: &str, description: &str) -> CommandContribution {
             name: id.to_owned(),
             aliases: BTreeSet::new(),
         }),
+        arguments: Vec::new(),
+        session: bcode_command::CommandSessionRequirement::Optional,
         execution: bcode_command::CommandExecution::Immediate,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_owned(),

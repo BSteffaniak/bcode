@@ -134,6 +134,8 @@ mod tests {
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Palette]),
             slash: None,
+            arguments: Vec::new(),
+            session: bcode_command::CommandSessionRequirement::Optional,
             execution: bcode_command::CommandExecution::Normal,
             owner: CommandOwner::Plugin {
                 plugin_id: "bcode.example".to_string(),
@@ -185,6 +187,8 @@ mod tests {
                 name: "hidden".to_owned(),
                 aliases: BTreeSet::new(),
             }),
+            arguments: Vec::new(),
+            session: bcode_command::CommandSessionRequirement::Optional,
             execution: bcode_command::CommandExecution::Normal,
             owner: CommandOwner::Plugin {
                 plugin_id: "bcode.example".to_string(),

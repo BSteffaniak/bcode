@@ -107,6 +107,8 @@ fn worktree_command(id: &str, title: &str, description: &str) -> CommandContribu
         category: Some("worktree".to_string()),
         surfaces: std::collections::BTreeSet::from([CommandSurface::Palette]),
         slash: None,
+        arguments: Vec::new(),
+        session: bcode_command::CommandSessionRequirement::Optional,
         execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.worktree".to_string(),
@@ -276,10 +278,14 @@ fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
 }
 
 fn list_worktrees_command(request: &InvokeCommandRequest) -> ServiceResponse {
-    let Some(cwd) = request.args.get("cwd").map(PathBuf::from) else {
+    let Some(cwd) = request
+        .context
+        .as_ref()
+        .map(|context| context.working_directory.clone())
+    else {
         return ServiceResponse::error(
             "worktree_cwd_required",
-            "worktree commands require an explicit cwd",
+            "worktree commands require canonical working-directory context",
         );
     };
     match bcode_worktree::list_worktrees(&cwd) {

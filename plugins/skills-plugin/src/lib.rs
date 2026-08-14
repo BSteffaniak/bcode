@@ -102,6 +102,8 @@ fn skills_command(id: &str, title: &str, description: &str) -> CommandContributi
         category: Some("skills".to_string()),
         surfaces: std::collections::BTreeSet::from([CommandSurface::Palette]),
         slash: None,
+        arguments: Vec::new(),
+        session: bcode_command::CommandSessionRequirement::Optional,
         execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.skills".to_string(),

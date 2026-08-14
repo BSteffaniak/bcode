@@ -371,6 +371,8 @@ mod tests {
                     aliases: BTreeSet::new(),
                 }),
             surfaces,
+            arguments: Vec::new(),
+            session: bcode_command::CommandSessionRequirement::Optional,
             execution: CommandExecution::Immediate,
             owner: CommandOwner::Plugin {
                 plugin_id: "bcode.loop".to_owned(),

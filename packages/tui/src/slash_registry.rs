@@ -297,7 +297,7 @@ pub enum SlashResolution {
         arguments: String,
     },
     /// Command resolved to a plugin-owned slash contribution.
-    PluginCommand(CommandContribution),
+    PluginCommand(Box<CommandContribution>),
     /// Command did not resolve to any known slash command.
     Unknown,
 }
@@ -375,7 +375,7 @@ pub async fn resolve(
         .into_iter()
         .find(|candidate| candidate.matches_slash_name(command))
     {
-        return Ok(SlashResolution::PluginCommand(contribution));
+        return Ok(SlashResolution::PluginCommand(Box::new(contribution)));
     }
     let skills = client.list_skills().await?;
     let Some(skill) = skills
