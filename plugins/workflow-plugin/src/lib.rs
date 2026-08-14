@@ -256,7 +256,19 @@ pub(crate) async fn execute_command(
                 "runs".to_string(),
                 serde_json::to_value(&runs).map_err(|error| error.to_string())?,
             );
-            format!("{} durable workflow runs", runs.len())
+            let mutation_approvals = client
+                .list_all_workflow_mutation_approvals(QUERY_LIMIT)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "mutation_approvals".to_string(),
+                serde_json::to_value(&mutation_approvals).map_err(|error| error.to_string())?,
+            );
+            format!(
+                "{} durable workflow runs · {} pending mutation approvals",
+                runs.len(),
+                mutation_approvals.len()
+            )
         }
         "workflow.list" => {
             let definitions = client

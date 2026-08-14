@@ -413,6 +413,9 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         WorkflowCommand::InspectRun { run_id, limit } => {
             print_json(&client.inspect_workflow_run(run_id, limit).await?)?;
         }
+        WorkflowCommand::RunOutput { run_id, limit } => {
+            print_json(&client.workflow_run_outputs(run_id, limit).await?)?;
+        }
         WorkflowCommand::ProvideInput {
             run_id,
             node_id,
@@ -2660,6 +2663,13 @@ enum WorkflowCommand {
     },
     /// Return one bounded public run inspection including canonical output and descendants.
     InspectRun {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Return bounded canonical validated output values for one run.
+    RunOutput {
         #[arg(long)]
         run_id: String,
         #[arg(long, default_value_t = 100)]

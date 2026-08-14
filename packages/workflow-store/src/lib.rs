@@ -4274,6 +4274,64 @@ impl WorkflowStore {
             .map_err(WorkflowStoreError::from)
     }
 
+    /// Return bounded validated output values without replaying workflow history.
+    ///
+    /// Values are read from the canonical output rows and checksum-verified before being returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity/limit validation, JSON decoding, checksum verification, or
+    /// the bounded query fails.
+    pub fn validated_outputs(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ValidatedOutput>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT output_id, run_id, node_id, activation_id, schema_id, schema_version, \
+             value_json, artifact_reference, checksum_sha256, created_at_ms \
+             FROM workflow_outputs WHERE run_id = ?1 \
+             ORDER BY created_at_ms, output_id LIMIT ?2",
+        )?;
+        let rows = statement.query_map((run_id, limit), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, u64>(9)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let row = row?;
+            if sha256_hex(row.6.as_bytes()) != row.8 {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "workflow output checksum is inconsistent: {}",
+                    row.0
+                )));
+            }
+            Ok(ValidatedOutput {
+                output_id: row.0,
+                run_id: row.1,
+                node_id: row.2,
+                activation_id: row.3,
+                schema_id: row.4,
+                schema_version: row.5,
+                value: serde_json::from_str(&row.6)?,
+                artifact_reference: row.7,
+                created_at_ms: row.9,
+            })
+        })
+        .collect()
+    }
+
     /// Return bounded typed repeat outcomes without replaying workflow history.
     ///
     /// # Errors
@@ -5177,6 +5235,56 @@ impl WorkflowStore {
                 })
             }
         }
+    }
+
+    /// Load bounded pending mutation approval requests across all workflow runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid limit or malformed durable state.
+    pub fn pending_mutation_approvals_all(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkflowMutationApproval>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT approval_id, run_id, node_id, activation_id, scope_json, requested_at_ms, \
+             expires_at_ms FROM workflow_mutation_approvals WHERE status = 'pending' \
+             ORDER BY requested_at_ms, approval_id LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, Option<u64>>(6)?,
+                ))
+            })?
+            .map(|row| {
+                let (
+                    approval_id,
+                    run_id,
+                    node_id,
+                    activation_id,
+                    scope_json,
+                    requested_at_ms,
+                    expires_at_ms,
+                ) = row?;
+                Ok(WorkflowMutationApproval {
+                    approval_id,
+                    run_id,
+                    node_id,
+                    activation_id,
+                    scope: serde_json::from_str(&scope_json)?,
+                    requested_at_ms,
+                    expires_at_ms,
+                })
+            })
+            .collect()
     }
 
     /// Load the owning run and request timestamp for one exact mutation approval without mutating it.

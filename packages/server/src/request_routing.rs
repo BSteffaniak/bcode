@@ -473,6 +473,15 @@ pub enum RuntimeAndModelRequest {
         run_id: String,
         limit: usize,
     },
+    /// Return one bounded renderer-neutral workflow run projection.
+    WorkflowRunView {
+        run_id: String,
+        limit: usize,
+    },
+    /// Return one bounded renderer-neutral workflow run catalog.
+    WorkflowCatalogView {
+        limit: usize,
+    },
     /// Return one bounded durable workflow run summary.
     WorkflowRunStatus {
         run_id: String,
@@ -493,6 +502,11 @@ pub enum RuntimeAndModelRequest {
     },
     /// List bounded durable workflow run summaries.
     ListWorkflowRuns {
+        limit: usize,
+    },
+    /// Return bounded canonical validated output values for one workflow run.
+    WorkflowRunOutputs {
+        run_id: String,
         limit: usize,
     },
     /// Request durable cancellation of one workflow run.
@@ -542,6 +556,10 @@ pub enum RuntimeAndModelRequest {
         node_id: String,
         activation_id: String,
         approved: bool,
+    },
+    /// List bounded pending durable mutation approvals across all workflow runs.
+    ListWorkflowMutationApprovalsAll {
+        limit: usize,
     },
     /// List bounded pending durable mutation approvals for one workflow run.
     ListWorkflowMutationApprovals {
@@ -1057,6 +1075,17 @@ impl RoutedRequest {
                     limit,
                 }))
             }
+            Request::WorkflowRunView { run_id, limit } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowRunView {
+                    run_id,
+                    limit,
+                }))
+            }
+            Request::WorkflowCatalogView { limit } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowCatalogView {
+                    limit,
+                }))
+            }
             Request::WorkflowRunStatus { run_id } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowRunStatus {
                     run_id,
@@ -1075,6 +1104,12 @@ impl RoutedRequest {
             ),
             Request::ListWorkflowRuns { limit } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ListWorkflowRuns { limit }))
+            }
+            Request::WorkflowRunOutputs { run_id, limit } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowRunOutputs {
+                    run_id,
+                    limit,
+                }))
             }
             Request::DoctorWorkflowRun { run_id, limit } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::DoctorWorkflowRun {
@@ -1143,6 +1178,9 @@ impl RoutedRequest {
                 activation_id,
                 approved,
             })),
+            Request::ListWorkflowMutationApprovalsAll { limit } => Self::RuntimeAndModel(Box::new(
+                RuntimeAndModelRequest::ListWorkflowMutationApprovalsAll { limit },
+            )),
             Request::ListWorkflowMutationApprovals { run_id, limit } => Self::RuntimeAndModel(
                 Box::new(RuntimeAndModelRequest::ListWorkflowMutationApprovals { run_id, limit }),
             ),

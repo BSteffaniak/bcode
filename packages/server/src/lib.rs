@@ -4025,11 +4025,14 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
         Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
         Request::InspectWorkflowRun { .. } => "inspect_workflow_run",
+        Request::WorkflowRunView { .. } => "workflow_run_view",
+        Request::WorkflowCatalogView { .. } => "workflow_catalog_view",
         Request::WorkflowRunStatus { .. } => "workflow_run_status",
         Request::AssociatedWorkflowRun { .. } => "associated_workflow_run",
         Request::InspectAssociatedWorkflowRun { .. } => "inspect_associated_workflow_run",
         Request::ControlAssociatedWorkflowRun { .. } => "control_associated_workflow_run",
         Request::ListWorkflowRuns { .. } => "list_workflow_runs",
+        Request::WorkflowRunOutputs { .. } => "workflow_run_outputs",
         Request::CancelWorkflowRun { .. } => "cancel_workflow_run",
         Request::PauseWorkflowRun { .. } => "pause_workflow_run",
         Request::ResumeWorkflowRun { .. } => "resume_workflow_run",
@@ -4039,6 +4042,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowWaits { .. } => "list_workflow_waits",
         Request::ProvideWorkflowInput { .. } => "provide_workflow_input",
         Request::ResolveWorkflowApproval { .. } => "resolve_workflow_approval",
+        Request::ListWorkflowMutationApprovalsAll { .. } => "list_workflow_mutation_approvals_all",
         Request::ListWorkflowMutationApprovals { .. } => "list_workflow_mutation_approvals",
         Request::ResolveWorkflowMutationApproval { .. } => "resolve_workflow_mutation_approval",
         Request::WorkflowAttemptHistory { .. } => "workflow_attempt_history",
@@ -5300,6 +5304,12 @@ async fn handle_workflow_run_request(
         RuntimeAndModelRequest::InspectWorkflowRun { run_id, limit } => {
             handle_inspect_workflow_run(request_id, state, writer, run_id, limit).await
         }
+        RuntimeAndModelRequest::WorkflowRunView { run_id, limit } => {
+            handle_workflow_run_view(request_id, state, writer, run_id, limit).await
+        }
+        RuntimeAndModelRequest::WorkflowCatalogView { limit } => {
+            handle_workflow_catalog_view(request_id, state, writer, limit).await
+        }
         RuntimeAndModelRequest::WorkflowRunStatus { run_id } => {
             handle_workflow_run_status(request_id, state, writer, run_id).await
         }
@@ -5314,6 +5324,9 @@ async fn handle_workflow_run_request(
         }
         RuntimeAndModelRequest::ListWorkflowRuns { limit } => {
             handle_list_workflow_runs(request_id, state, writer, limit).await
+        }
+        RuntimeAndModelRequest::WorkflowRunOutputs { run_id, limit } => {
+            handle_workflow_run_outputs(request_id, state, writer, run_id, limit).await
         }
         RuntimeAndModelRequest::CancelWorkflowRun { run_id } => {
             handle_cancel_workflow_run(request_id, state, writer, run_id).await
@@ -5387,6 +5400,9 @@ async fn handle_workflow_run_request(
                 approved,
             )
             .await
+        }
+        RuntimeAndModelRequest::ListWorkflowMutationApprovalsAll { limit } => {
+            handle_list_workflow_mutation_approvals_all(request_id, state, writer, limit).await
         }
         RuntimeAndModelRequest::ListWorkflowMutationApprovals { run_id, limit } => {
             handle_list_workflow_mutation_approvals(request_id, state, writer, run_id, limit).await
@@ -17237,6 +17253,94 @@ async fn handle_inspect_workflow_run(
     .await
 }
 
+async fn handle_workflow_run_view(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let view = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let run = store.run_summary(&run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}"))
+        })?;
+        let definition = store
+            .definition(&run.definition_id, run.definition_version)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow definition not found: {} v{}",
+                    run.definition_id, run.definition_version
+                ))
+            })?;
+        let outputs = store.output_summaries(&run_id, limit)?;
+        let resolved_outputs = store
+            .validated_outputs(&run_id, limit)?
+            .into_iter()
+            .map(|output| bcode_workflow_view::ResolvedWorkflowOutput {
+                checksum_sha256: outputs
+                    .iter()
+                    .find(|summary| summary.output_id == output.output_id)
+                    .map(|summary| summary.checksum_sha256.clone())
+                    .expect("validated output has a matching bounded summary"),
+                output_id: output.output_id,
+                value: output.value,
+            })
+            .collect::<Vec<_>>();
+        let activations = store.activations_for_run(&run_id, limit)?;
+        let waits = store.waiting_activations(&run_id, limit)?;
+        let mutation_approvals = store.pending_mutation_approvals(&run_id, limit)?;
+        let attempts = store.attempt_history(&run_id, None, limit)?;
+        let descendant_runs = store.descendant_run_summaries(&run_id, limit)?;
+        let child_sessions = store.execution_session_links_for_run(&run_id, limit)?;
+        bcode_workflow_view::project_run(&bcode_workflow_view::WorkflowRunProjectionInput {
+            run: &run,
+            definition: &definition,
+            activations: &activations,
+            waits: &waits,
+            mutation_approvals: &mutation_approvals,
+            attempts: &attempts,
+            outputs: &outputs,
+            resolved_outputs: &resolved_outputs,
+            descendant_runs: &descendant_runs,
+            child_sessions: &child_sessions,
+        })
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunView {
+            view: Box::new(view),
+        }),
+    )
+    .await
+}
+
+async fn handle_workflow_catalog_view(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let view = {
+        let runs = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .list_runs(limit)?;
+        bcode_workflow_view::project_catalog(&runs)
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowCatalogView { view }),
+    )
+    .await
+}
+
 async fn handle_workflow_run_status(
     request_id: u64,
     state: &ServerState,
@@ -17393,6 +17497,52 @@ async fn handle_list_workflow_runs(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowRunList { runs }),
+    )
+    .await
+}
+
+async fn handle_workflow_run_outputs(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let outputs = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let summaries = store.output_summaries(&run_id, limit)?;
+        let checksums = summaries
+            .into_iter()
+            .map(|output| (output.output_id, output.checksum_sha256))
+            .collect::<BTreeMap<_, _>>();
+        store
+            .validated_outputs(&run_id, limit)?
+            .into_iter()
+            .map(|output| bcode_ipc::WorkflowOutputInspection {
+                version: bcode_ipc::WORKFLOW_OUTPUT_INSPECTION_VERSION,
+                checksum_sha256: checksums
+                    .get(&output.output_id)
+                    .cloned()
+                    .expect("validated output has a matching bounded summary"),
+                output_id: output.output_id,
+                run_id: output.run_id,
+                node_id: output.node_id,
+                activation_id: output.activation_id,
+                schema_id: output.schema_id,
+                schema_version: output.schema_version,
+                value: output.value,
+                artifact_reference: output.artifact_reference,
+                created_at_ms: output.created_at_ms,
+            })
+            .collect()
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunOutputs { outputs }),
     )
     .await
 }
@@ -17661,6 +17811,25 @@ async fn handle_resolve_workflow_approval(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
+    )
+    .await
+}
+
+async fn handle_list_workflow_mutation_approvals_all(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let approvals = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending_mutation_approvals_all(limit)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals }),
     )
     .await
 }

@@ -3677,6 +3677,43 @@ impl BcodeClient {
         }
     }
 
+    /// Return one bounded renderer-neutral workflow run projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn workflow_run_view(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<bcode_workflow_view_models::WorkflowRunView, ClientError> {
+        match self
+            .send_request(Request::WorkflowRunView { run_id, limit })
+            .await?
+        {
+            ResponsePayload::WorkflowRunView { view } => Ok(*view),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return one bounded renderer-neutral workflow run catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn workflow_catalog_view(
+        &self,
+        limit: usize,
+    ) -> Result<bcode_workflow_view_models::WorkflowCatalogView, ClientError> {
+        match self
+            .send_request(Request::WorkflowCatalogView { limit })
+            .await?
+        {
+            ResponsePayload::WorkflowCatalogView { view } => Ok(view),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List bounded durable workflow run summaries.
     ///
     /// # Errors
@@ -3691,6 +3728,25 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowRunList { runs } => Ok(runs),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return bounded canonical validated output values for one workflow run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn workflow_run_outputs(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<Vec<bcode_ipc::WorkflowOutputInspection>, ClientError> {
+        match self
+            .send_request(Request::WorkflowRunOutputs { run_id, limit })
+            .await?
+        {
+            ResponsePayload::WorkflowRunOutputs { outputs } => Ok(outputs),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -3834,6 +3890,24 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowWaitResolved { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List bounded pending mutation approvals across all workflow runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn list_all_workflow_mutation_approvals(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow_store::WorkflowMutationApproval>, ClientError> {
+        match self
+            .send_request(Request::ListWorkflowMutationApprovalsAll { limit })
+            .await?
+        {
+            ResponsePayload::WorkflowMutationApprovalList { approvals } => Ok(approvals),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

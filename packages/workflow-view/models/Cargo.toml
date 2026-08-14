@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Renderer-neutral workflow view models for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "workflow", "view", "models"]
+license     = { workspace = true }
+name        = "bcode_workflow_view_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

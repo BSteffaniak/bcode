@@ -713,6 +713,15 @@ pub enum Request {
         run_id: String,
         limit: usize,
     },
+    /// Return one bounded renderer-neutral workflow run projection.
+    WorkflowRunView {
+        run_id: String,
+        limit: usize,
+    },
+    /// Return one bounded renderer-neutral workflow run catalog.
+    WorkflowCatalogView {
+        limit: usize,
+    },
     /// Return one bounded durable workflow run summary.
     WorkflowRunStatus {
         run_id: String,
@@ -733,6 +742,11 @@ pub enum Request {
     },
     /// List bounded durable workflow run summaries.
     ListWorkflowRuns {
+        limit: usize,
+    },
+    /// Return bounded canonical validated output values for one workflow run.
+    WorkflowRunOutputs {
+        run_id: String,
         limit: usize,
     },
     /// Run one bounded non-mutating workflow doctor inspection.
@@ -782,6 +796,10 @@ pub enum Request {
         node_id: String,
         activation_id: String,
         approved: bool,
+    },
+    /// List bounded pending durable mutation approvals across all workflow runs.
+    ListWorkflowMutationApprovalsAll {
+        limit: usize,
     },
     /// List bounded pending durable mutation approvals for one workflow run.
     ListWorkflowMutationApprovals {
@@ -2412,6 +2430,27 @@ pub struct WorkflowDefinitionRegistrationRequest {
 /// Current bounded canonical terminal-output inspection contract version.
 pub const WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION: u32 = 1;
 
+/// Current bounded validated workflow-output inspection contract version.
+pub const WORKFLOW_OUTPUT_INSPECTION_VERSION: u32 = 1;
+
+/// Bounded canonical validated workflow output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowOutputInspection {
+    pub version: u32,
+    pub output_id: String,
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub schema_id: String,
+    pub schema_version: u32,
+    pub checksum_sha256: String,
+    pub value: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_reference: Option<String>,
+    pub created_at_ms: u64,
+}
+
 /// Bounded canonical terminal value exposed through normal workflow inspection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2853,6 +2892,12 @@ pub enum ResponsePayload {
     WorkflowRunInspection {
         inspection: Box<WorkflowRunInspection>,
     },
+    WorkflowRunView {
+        view: Box<bcode_workflow_view_models::WorkflowRunView>,
+    },
+    WorkflowCatalogView {
+        view: bcode_workflow_view_models::WorkflowCatalogView,
+    },
     WorkflowRunStatus {
         run: Option<bcode_workflow_store::WorkflowRunSummary>,
     },
@@ -2868,6 +2913,9 @@ pub enum ResponsePayload {
     },
     WorkflowRunList {
         runs: Vec<bcode_workflow_store::WorkflowRunSummary>,
+    },
+    WorkflowRunOutputs {
+        outputs: Vec<WorkflowOutputInspection>,
     },
     WorkflowDoctorReport {
         report: bcode_workflow_store::WorkflowDoctorReport,
@@ -4376,6 +4424,11 @@ mod tests {
                 run_id: "run-1".to_string(),
                 limit: 25,
             },
+            Request::WorkflowRunView {
+                run_id: "run-1".to_string(),
+                limit: 25,
+            },
+            Request::WorkflowCatalogView { limit: 25 },
             Request::WorkflowRunStatus {
                 run_id: "run-1".to_string(),
             },
@@ -4403,6 +4456,10 @@ mod tests {
                 action: WorkflowRunControlAction::Pause,
             },
             Request::ListWorkflowRuns { limit: 25 },
+            Request::WorkflowRunOutputs {
+                run_id: "run-1".to_string(),
+                limit: 25,
+            },
             Request::CancelWorkflowRun {
                 run_id: "run-1".to_string(),
             },
@@ -4434,6 +4491,7 @@ mod tests {
                 activation_id: "activation-2".to_string(),
                 approved: true,
             },
+            Request::ListWorkflowMutationApprovalsAll { limit: 25 },
             Request::ListWorkflowMutationApprovals {
                 run_id: "run-1".to_string(),
                 limit: 25,

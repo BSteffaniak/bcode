@@ -41,6 +41,8 @@ bcode_skill_models = { workspace = true }
 bcode_tool = { workspace = true }
 bcode_workflow = { workspace = true }
 bcode_workflow_store = { workspace = true }
+bcode_workflow_view = { workspace = true }
+bcode_workflow_view_models = { workspace = true }
 bcode_worktree = { workspace = true }
 bcode_worktree_models = { workspace = true }
 futures = { workspace = true }

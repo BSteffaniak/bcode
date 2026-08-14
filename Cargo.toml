@@ -95,6 +95,8 @@ members = [
     "packages/vim-edit",
     "packages/workflow",
     "packages/workflow-store",
+    "packages/workflow-view",
+    "packages/workflow-view/models",
     "packages/worktree",
     "packages/worktree/models",
     "plugins/worktree-plugin",
@@ -204,6 +206,8 @@ bcode_web_search_plugin                 = { version = "0.0.1-alpha.0", default-f
 bcode_workflow                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow" }
 bcode_workflow_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/workflow-plugin" }
 bcode_workflow_store                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow-store" }
+bcode_workflow_view                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow-view" }
+bcode_workflow_view_models              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow-view/models" }
 bcode_worktree                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree" }
 bcode_worktree_models                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree/models" }
 bcode_worktree_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/worktree-plugin" }

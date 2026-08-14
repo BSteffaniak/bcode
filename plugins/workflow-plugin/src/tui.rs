@@ -698,40 +698,44 @@ fn append_mutation_approvals(
     options: &serde_json::Value,
     selected_approval: usize,
 ) {
-    let Some(approvals) = mutation_approvals(options) else {
-        return;
-    };
-    lines.push(format!("Mutation approvals ({})", approvals.len()));
-    for (index, value) in approvals.iter().enumerate() {
-        let scope = value.get("scope").unwrap_or(&serde_json::Value::Null);
-        let marker = if index == selected_approval { ">" } else { " " };
-        lines.push(format!(
-            "{marker} {} · {} / {} v{} · {} · workspace {} · mutating",
-            text(value, "approval_id"),
-            text(scope, "plugin_id"),
-            text(scope, "block_id"),
-            number(scope, "block_version"),
-            text(scope, "operation"),
-            text(scope, "workspace_snapshot")
-        ));
-        lines.push(format!(
-            "    immutable input {} · checksum {}",
-            compact_json(scope.get("input_summary")),
-            short_checksum(text(scope, "input_checksum_sha256"))
-        ));
-        lines.push(format!(
-            "    resources {} · reconciliation {}{}",
-            compact_json(scope.get("resource_claims")),
-            text(scope, "reconciliation"),
-            if text(scope, "reconciliation") == "repair_required" {
-                " (ambiguous accepted execution requires explicit repair)"
-            } else {
-                ""
+    match mutation_approvals(options) {
+        Some(approvals) => {
+            lines.push(format!("Mutation approvals ({})", approvals.len()));
+            for (index, value) in approvals.iter().enumerate() {
+                let scope = value.get("scope").unwrap_or(&serde_json::Value::Null);
+                let marker = if index == selected_approval { ">" } else { " " };
+                lines.push(format!(
+                    "{marker} {} · {} / {} v{} · {} · workspace {} · mutating",
+                    text(value, "approval_id"),
+                    text(scope, "plugin_id"),
+                    text(scope, "block_id"),
+                    number(scope, "block_version"),
+                    text(scope, "operation"),
+                    text(scope, "workspace_snapshot")
+                ));
+                lines.push(format!(
+                    "    immutable input {} · checksum {}",
+                    compact_json(scope.get("input_summary")),
+                    short_checksum(text(scope, "input_checksum_sha256"))
+                ));
+                lines.push(format!(
+                    "    resources {} · reconciliation {}{}",
+                    compact_json(scope.get("resource_claims")),
+                    text(scope, "reconciliation"),
+                    if text(scope, "reconciliation") == "repair_required" {
+                        " (ambiguous accepted execution requires explicit repair)"
+                    } else {
+                        ""
+                    }
+                ));
             }
-        ));
-    }
-    if !approvals.is_empty() {
-        lines.push("  ↑/↓ select · a approve exact request · d deny exact request".to_string());
+            if !approvals.is_empty() {
+                lines.push(
+                    "  ↑/↓ select · a approve exact request · d deny exact request".to_string(),
+                );
+            }
+        }
+        None => lines.push("Mutation approvals unavailable".to_string()),
     }
 }
 
@@ -882,6 +886,21 @@ mod tests {
             mutation_approval_command(&options, 0, false).as_deref(),
             Some("/workflow deny-mutation approval_id=mutation-1")
         );
+    }
+
+    #[test]
+    fn status_lines_distinguish_empty_approvals_from_unavailable_data() {
+        let loaded = surface_lines(
+            &serde_json::json!({"command_id": "workflow.status", "mutation_approvals": []}),
+            0,
+        )
+        .join("\n");
+        assert!(loaded.contains("Mutation approvals (0)"));
+        assert!(!loaded.contains("Mutation approvals unavailable"));
+
+        let unavailable =
+            surface_lines(&serde_json::json!({"command_id": "workflow.status"}), 0).join("\n");
+        assert!(unavailable.contains("Mutation approvals unavailable"));
     }
 
     #[test]

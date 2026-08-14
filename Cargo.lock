@@ -1556,6 +1556,7 @@ dependencies = [
  "bcode_tool",
  "bcode_workflow",
  "bcode_workflow_store",
+ "bcode_workflow_view_models",
  "serde_json",
  "sshenv_vault",
  "thiserror 2.0.19",
@@ -1918,6 +1919,7 @@ dependencies = [
  "bcode_tool",
  "bcode_workflow",
  "bcode_workflow_store",
+ "bcode_workflow_view_models",
  "bcode_worktree_models",
  "bmux_codec",
  "bmux_ipc",
@@ -2419,6 +2421,8 @@ dependencies = [
  "bcode_workflow",
  "bcode_workflow_plugin",
  "bcode_workflow_store",
+ "bcode_workflow_view",
+ "bcode_workflow_view_models",
  "bcode_worktree",
  "bcode_worktree_models",
  "futures 0.3.33",
@@ -2902,6 +2906,24 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+]
+
+[[package]]
+name = "bcode_workflow_view"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_workflow",
+ "bcode_workflow_store",
+ "bcode_workflow_view_models",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_workflow_view_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
