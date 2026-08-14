@@ -441,6 +441,12 @@ pub fn bundled_host_palette_commands() -> Vec<CommandContribution> {
             "List themes and show preview/apply commands",
             "theme",
         ),
+        CommandContribution::host_palette(
+            "streaming.configure",
+            "Streaming: Configure",
+            "Compare raw provider chunks and tune smoothed presentation",
+            "streaming",
+        ),
         CommandContribution::host_palette("help", "Help", "Show TUI help", "help"),
         CommandContribution::host_palette(
             "session.rename",

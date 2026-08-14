@@ -221,6 +221,7 @@ pub struct ChatLoopState {
     pub(super) permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     theme_picker: Option<super::theme_picker::ThemePickerState>,
+    streaming_configurator: Option<super::streaming_configurator::StreamingConfiguratorState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     session_fork_dialog: Option<super::session_fork_dialog::SessionForkDialog>,
     fork_prompt_picker: Option<RootForkPromptPicker>,
@@ -271,6 +272,7 @@ impl ChatLoopState {
             permission_dialog: None,
             thinking_dialog: None,
             theme_picker: None,
+            streaming_configurator: None,
             timeline_dialog: None,
             session_fork_dialog: None,
             fork_prompt_picker: None,
@@ -303,6 +305,62 @@ impl ChatLoopState {
                 bcode_session_view_models::StreamingPresentationPolicy::default(),
             streaming_presentation_override: None,
             frame_index: 0,
+        }
+    }
+
+    pub fn streaming_configurator_deadline(&self, now: Instant) -> Option<Instant> {
+        self.streaming_configurator
+            .as_ref()
+            .and_then(|configurator| configurator.next_deadline(now))
+    }
+
+    pub fn advance_streaming_configurator(&mut self, now: Instant) -> bool {
+        self.streaming_configurator
+            .as_mut()
+            .is_some_and(|configurator| configurator.advance(now))
+    }
+
+    pub fn open_streaming_configurator(&mut self, chat: &mut ActiveChat) {
+        let effective = self
+            .streaming_presentation_override
+            .unwrap_or(self.declarative_streaming_policy);
+        self.streaming_configurator = Some(
+            super::streaming_configurator::StreamingConfiguratorState::new(
+                Instant::now(),
+                effective,
+                self.declarative_streaming_policy,
+            ),
+        );
+        chat.app.set_status("streaming configurator".to_owned());
+    }
+
+    pub fn handle_streaming_configurator_key(
+        &mut self,
+        chat: &mut ActiveChat,
+        stroke: KeyStroke,
+    ) -> bool {
+        let Some(configurator) = self.streaming_configurator.as_mut() else {
+            return false;
+        };
+        match configurator.handle_key(stroke, Instant::now()) {
+            super::streaming_configurator::StreamingConfiguratorOutcome::Handled => true,
+            super::streaming_configurator::StreamingConfiguratorOutcome::Apply(policy) => {
+                self.streaming_configurator = None;
+                self.request_streaming_presentation_override(chat, policy);
+                true
+            }
+            super::streaming_configurator::StreamingConfiguratorOutcome::Reset => {
+                self.streaming_configurator = None;
+                self.request_clear_streaming_presentation_override(chat);
+                true
+            }
+            super::streaming_configurator::StreamingConfiguratorOutcome::Cancel => {
+                self.streaming_configurator = None;
+                chat.app
+                    .set_status("streaming presentation changes canceled".to_owned());
+                true
+            }
+            super::streaming_configurator::StreamingConfiguratorOutcome::Ignored => false,
         }
     }
 
@@ -3382,6 +3440,9 @@ fn apply_root_slash_command_outcome(
             chat.app.set_status("theme preview cancelled".to_owned());
         }
         SlashCommandOutcome::OpenThemePicker => loop_state.open_theme_picker(chat),
+        SlashCommandOutcome::OpenStreamingConfigurator => {
+            loop_state.open_streaming_configurator(chat);
+        }
         SlashCommandOutcome::ShowThemeCatalog => {
             let markdown = super::slash_commands::format_theme_catalog_markdown(
                 &super::theme::catalog_view(&mut chat.app),
@@ -4406,6 +4467,13 @@ pub fn draw_chat_frame<W: Write>(
         }
         if let Some(palette) = &mut loop_state.palette {
             command_palette_render::render_palette(palette, frame, theme);
+        }
+        if let Some(configurator) = &loop_state.streaming_configurator {
+            super::streaming_configurator_render::render_streaming_configurator(
+                configurator,
+                frame,
+                theme,
+            );
         }
         if let Some(picker) = &mut loop_state.theme_picker {
             super::theme_picker_render::render_theme_picker(picker, frame, theme);

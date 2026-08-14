@@ -56,6 +56,8 @@ pub enum SlashCommandOutcome {
     CancelThemePreview,
     /// Open the interactive theme picker.
     OpenThemePicker,
+    /// Open the interactive streaming presentation configurator.
+    OpenStreamingConfigurator,
     /// Show the theme catalog as durable transcript content.
     ShowThemeCatalog,
     /// Open worktree create dialog.
@@ -869,6 +871,7 @@ async fn execute_builtin(
             Ok(SlashCommandOutcome::CompactContext { session_id })
         }
         "theme" => Ok(theme_command(parts)),
+        "streaming" => Ok(SlashCommandOutcome::OpenStreamingConfigurator),
         "model" | "models" if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
         "auth-pool" | "subscriptions" if parts.len() == 1 => Ok(SlashCommandOutcome::PickAuthPool),
         "model" | "set-model" if parts.len() > 1 => {

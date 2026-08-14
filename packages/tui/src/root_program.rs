@@ -49,6 +49,8 @@ pub enum BcodeRuntimeMessage {
     DraftSaveDue,
     /// Interactive-surface retry deadline.
     InteractionRetryDue,
+    /// Streaming-configurator source or shared-presentation deadline.
+    StreamingConfiguratorDue,
     /// Streaming-presentation interpolation deadline.
     StreamingPresentationDue,
     /// Client telemetry flush deadline.
@@ -61,6 +63,9 @@ impl BcodeRuntimeMessage {
         match self {
             Self::MarkdownProjectionCompleted(_) => Some(bmux_tui_runtime::MessageKey::new(
                 "bcode.markdown_projection",
+            )),
+            Self::StreamingConfiguratorDue => Some(bmux_tui_runtime::MessageKey::new(
+                "bcode.streaming_configurator",
             )),
             Self::StreamingPresentationDue => Some(bmux_tui_runtime::MessageKey::new(
                 "bcode.streaming_presentation",
@@ -229,6 +234,7 @@ pub struct BcodeRuntimeModel {
 enum RootTimer {
     Invalidations,
     ArtifactRetry,
+    StreamingConfigurator,
     StreamingPresentation,
     DraftSave,
     InteractiveSurfaceRetry,
@@ -241,6 +247,7 @@ impl RootTimer {
         bmux_tui_runtime::TimerId::new(match self {
             Self::Invalidations => "bcode.invalidations",
             Self::ArtifactRetry => "bcode.artifact_retry",
+            Self::StreamingConfigurator => "bcode.streaming_configurator",
             Self::StreamingPresentation => "bcode.streaming_presentation",
             Self::DraftSave => "bcode.draft_save",
             Self::InteractiveSurfaceRetry => "bcode.interactive_surface_retry",
@@ -906,6 +913,12 @@ impl BcodeRuntimeModel {
                 if self.loop_state.permission_dialog.is_some() {
                     return self.handle_permission_key(stroke);
                 }
+                if self
+                    .loop_state
+                    .handle_streaming_configurator_key(&mut self.chat, stroke)
+                {
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 match self
                     .loop_state
                     .handle_timeline_dialog_key(&mut self.chat, stroke)
@@ -1254,6 +1267,9 @@ impl BcodeRuntimeModel {
                     }
                 }
                 "theme.select" => self.loop_state.open_theme_picker(&mut self.chat),
+                "streaming.configure" => {
+                    self.loop_state.open_streaming_configurator(&mut self.chat);
+                }
                 "help" => {
                     self.chat.push_presentation_note(
                         "bcode.host",
@@ -1413,6 +1429,10 @@ impl BcodeRuntimeModel {
                 self.loop_state.next_artifact_retry_at(),
             ),
             (
+                RootTimer::StreamingConfigurator,
+                self.loop_state.streaming_configurator_deadline(now),
+            ),
+            (
                 RootTimer::StreamingPresentation,
                 self.chat.app.next_streaming_presentation_deadline(now),
             ),
@@ -1511,6 +1531,13 @@ impl BcodeRuntimeModel {
             "bcode.artifact_retry" => {
                 self.loop_state.start_due_artifact_fetches(now);
                 super::invalidation::UiInvalidation::None
+            }
+            "bcode.streaming_configurator" => {
+                if self.loop_state.advance_streaming_configurator(now) {
+                    super::invalidation::UiInvalidation::Structural
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
             }
             "bcode.streaming_presentation" => {
                 if self.chat.app.advance_streaming_presentation(now) {
@@ -1819,6 +1846,18 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Invalidations(keys)) => {
                 self.chat.app.handle_invalidations(&keys, Instant::now())
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(
+                BcodeRuntimeMessage::StreamingConfiguratorDue,
+            ) => {
+                if self
+                    .loop_state
+                    .advance_streaming_configurator(Instant::now())
+                {
+                    super::invalidation::UiInvalidation::Structural
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
             }
             bmux_tui_runtime::RuntimeEvent::Message(
                 BcodeRuntimeMessage::StreamingPresentationDue,

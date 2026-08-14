@@ -11,9 +11,10 @@ shared = Path("packages/session-view/src/lib.rs").read_text()
 tui = "\n".join(
     path.read_text()
     for path in Path("packages/tui").rglob("*.rs")
-    if path.name != "streaming_configurator.rs"
+    if path.name not in ("streaming_configurator.rs", "streaming_configurator_render.rs")
 )
 streaming_configurator = Path("packages/tui/src/streaming_configurator.rs").read_text()
+streaming_configurator_render = Path("packages/tui/src/streaming_configurator_render.rs").read_text()
 hyperchad = Path("packages/hyperchad/src/lib.rs").read_text()
 config = Path("packages/config/src/lib.rs").read_text()
 renderer_docs = Path("docs/renderer-architecture.md").read_text()
@@ -34,7 +35,7 @@ for forbidden in ("StreamingInterpolationCurve::Linear", "grapheme_indices(true)
         raise SystemExit(f"renderer owns shared interpolation behavior: {forbidden}")
 
 for forbidden in ("grapheme_indices(true)", ".graphemes(true)", "fn effective_rate"):
-    if forbidden in streaming_configurator:
+    if forbidden in streaming_configurator or forbidden in streaming_configurator_render:
         raise SystemExit(f"streaming configurator duplicates shared presentation behavior: {forbidden}")
 
 for required in ("SessionView", "StreamingPresentationPolicy::immediate()"):

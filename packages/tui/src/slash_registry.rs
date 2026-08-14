@@ -54,6 +54,7 @@ const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "compact" },
     BuiltinSlashCommand { name: "model" },
     BuiltinSlashCommand { name: "theme" },
+    BuiltinSlashCommand { name: "streaming" },
     BuiltinSlashCommand { name: "models" },
     BuiltinSlashCommand { name: "set-model" },
     BuiltinSlashCommand { name: "provider" },
@@ -115,6 +116,10 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     SlashCompletion {
         command: "/theme",
         description: "Open interactive theme picker",
+    },
+    SlashCompletion {
+        command: "/streaming",
+        description: "Compare and tune streaming presentation",
     },
     SlashCompletion {
         command: "/theme preview ",
