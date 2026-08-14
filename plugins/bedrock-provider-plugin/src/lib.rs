@@ -2381,14 +2381,14 @@ fn build_anthropic_messages_request_value(
                     .tools
                     .iter()
                     .map(|tool| {
-                        let mut projected = serde_json::json!({
+                        let projected = serde_json::json!({
                             "name": bedrock_tool_name(&tool.name),
                             "description": tool.description,
                             "input_schema": bedrock_tool_input_schema(tool)?,
                         });
-                        if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict) {
-                            projected["strict"] = serde_json::Value::Bool(true);
-                        }
+                        // Bedrock's Anthropic Messages schema does not accept the `strict` tool
+                        // property. Capability negotiation keeps strict mode off for this surface;
+                        // omit it here defensively even if an older host sends a strict request.
                         Ok(projected)
                     })
                     .collect::<Result<Vec<_>, ProviderError>>()?,
@@ -3486,13 +3486,20 @@ fn bedrock_structured_output_support(
     }
 }
 
-const fn bedrock_strict_tool_schema_support(
+fn bedrock_strict_tool_schema_support(
     responses_surface: bool,
+    messages_surface: bool,
 ) -> bcode_model::CapabilitySupport {
     use bcode_model::{
         CapabilityFidelity, CapabilityMechanism, CapabilitySource, CapabilitySupport,
     };
-    if responses_surface {
+    if messages_surface {
+        CapabilitySupport::Unsupported {
+            source: CapabilitySource::BundledCatalog,
+            reason: "the Bedrock Anthropic Messages tool schema does not accept strict enforcement"
+                .to_string(),
+        }
+    } else if responses_surface {
         CapabilitySupport::supported(CapabilitySource::BundledCatalog)
     } else {
         CapabilitySupport::Supported {
@@ -3589,7 +3596,7 @@ fn bedrock_feature_support_for_surface(
             (ToolSchemaMode::Permissive, supported()),
             (
                 ToolSchemaMode::Strict,
-                bedrock_strict_tool_schema_support(responses_surface),
+                bedrock_strict_tool_schema_support(responses_surface, messages_surface),
             ),
         ]
         .into_iter()
@@ -6489,6 +6496,29 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_messages_request_omits_unsupported_strict_tool_property() {
+        let mut request = test_model_turn_request();
+        request.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Messages);
+        request.tools = vec![ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: "read a file".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.tool_schema_mode = Some(bcode_model::ToolSchemaMode::Strict);
+
+        let body = build_anthropic_messages_request_value(&request)
+            .expect("Messages request should serialize without strict tool metadata");
+
+        assert!(
+            body["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .all(|tool| tool.get("strict").is_none())
+        );
+    }
+
+    #[test]
     fn anthropic_messages_request_serializes_tools_and_adaptive_thinking() {
         let mut request = test_model_turn_request();
         request.messages = vec![ModelMessage {
@@ -7675,6 +7705,10 @@ mod tests {
                 fidelity: CapabilityFidelity::Reduced,
                 ..
             }
+        ));
+        assert!(matches!(
+            messages.tool_schema(bcode_model::ToolSchemaMode::Strict),
+            CapabilitySupport::Unsupported { .. }
         ));
 
         let responses = bedrock_feature_support_for_surface(true, false, false);
