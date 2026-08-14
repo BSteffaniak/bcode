@@ -305,6 +305,11 @@ impl PendingTextPresentation {
         self.destination = destination;
     }
 
+    fn adopt_policy(&mut self, policy: StreamingPresentationPolicy) {
+        self.graphemes_per_second = policy.graphemes_per_second;
+        self.max_lag = Duration::from_millis(policy.max_lag_ms);
+    }
+
     fn effective_rate(&self) -> u128 {
         let lag_nanos = self.max_lag.as_nanos().max(1);
         let catch_up_rate = u128::try_from(self.remaining_graphemes)
@@ -507,6 +512,9 @@ impl SessionView {
         self.streaming_presentation_policy = policy;
         if policy.is_immediate() {
             return self.flush_pending_text_presentations();
+        }
+        for pending in self.pending_text_presentations.values_mut() {
+            pending.adopt_policy(policy);
         }
         false
     }
@@ -4749,6 +4757,86 @@ mod tests {
         assert_eq!(
             transcript_item_text(view.snapshot(), &id),
             Some("legacy delta")
+        );
+    }
+
+    #[test]
+    fn live_policy_changes_update_existing_backlog_without_hiding_text() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        let initial = StreamingPresentationPolicy {
+            graphemes_per_second: 5,
+            max_lag_ms: 1_000,
+            ..StreamingPresentationPolicy::default()
+        };
+        assert!(!view.set_streaming_presentation_policy(initial));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "abcdefghijklmnopqrstuvwxyz".to_owned(),
+                },
+            },
+        ));
+        let visible_before = transcript_item_text(view.snapshot(), &id)
+            .expect("visible prefix")
+            .to_owned();
+        let pace_anchor = view.pending_text_presentations[&id].paced_from;
+        let changed = StreamingPresentationPolicy {
+            curve: StreamingInterpolationCurve::EaseInOut,
+            graphemes_per_second: 900,
+            max_lag_ms: 10,
+            ..initial
+        };
+        assert!(!view.set_streaming_presentation_policy(changed));
+        let pending = &view.pending_text_presentations[&id];
+        assert_eq!(pending.paced_from, pace_anchor);
+        assert_eq!(pending.graphemes_per_second, 900);
+        assert_eq!(pending.max_lag, Duration::from_millis(10));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some(visible_before.as_str())
+        );
+        assert!(view.advance_streaming_presentation(pace_anchor + Duration::from_millis(11)));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("abcdefghijklmnopqrstuvwxyz")
+        );
+    }
+
+    #[test]
+    fn immediate_policy_flushes_and_reenabling_never_hides_text() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "whole accepted target".to_owned(),
+                },
+            },
+        ));
+        assert!(view.set_streaming_presentation_policy(StreamingPresentationPolicy::immediate()));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("whole accepted target")
+        );
+        assert!(view.pending_text_presentations.is_empty());
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("whole accepted target")
         );
     }
 

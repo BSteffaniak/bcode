@@ -4868,16 +4868,81 @@ pub fn default_tui_state_path_with_environment(environment: &impl ConfigEnvironm
     default_state_dir_with_environment(environment).join("tui.toml")
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct TuiState {
     #[serde(default)]
     theme: TuiThemeState,
+    #[serde(default)]
+    presentation: TuiPresentationState,
+    #[serde(flatten)]
+    extra: BTreeMap<String, toml::Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct TuiThemeState {
     #[serde(default)]
     name: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct TuiPresentationState {
+    #[serde(default)]
+    streaming: Option<TuiStreamingState>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct TuiStreamingState {
+    enabled: bool,
+    curve: bcode_session_view_models::StreamingInterpolationCurve,
+    graphemes_per_second: u32,
+    max_lag_ms: u64,
+    #[serde(flatten)]
+    extra: BTreeMap<String, toml::Value>,
+}
+
+impl TuiStreamingState {
+    fn policy(&self) -> bcode_session_view_models::StreamingPresentationPolicy {
+        bcode_session_view_models::StreamingPresentationPolicy {
+            enabled: self.enabled,
+            curve: self.curve,
+            graphemes_per_second: self.graphemes_per_second,
+            max_lag_ms: self.max_lag_ms,
+        }
+        .normalized()
+    }
+}
+
+impl From<bcode_session_view_models::StreamingPresentationPolicy> for TuiStreamingState {
+    fn from(policy: bcode_session_view_models::StreamingPresentationPolicy) -> Self {
+        let policy = policy.normalized();
+        Self {
+            enabled: policy.enabled,
+            curve: policy.curve,
+            graphemes_per_second: policy.graphemes_per_second,
+            max_lag_ms: policy.max_lag_ms,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+fn load_tui_state_from(path: &Path) -> Result<TuiState, ConfigError> {
+    if !path.exists() {
+        return Ok(TuiState::default());
+    }
+    let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str::<TuiState>(&raw).map_err(|source| ConfigError::Composition {
+        message: format!(
+            "failed to parse TUI state {}: {source}",
+            display_from_current_dir(path)
+        ),
+    })
 }
 
 /// Load the globally selected interactive TUI theme.
@@ -4895,20 +4960,7 @@ pub fn load_tui_theme_selection() -> Result<Option<String>, ConfigError> {
 ///
 /// Returns an error when the state file exists but cannot be read or parsed.
 pub fn load_tui_theme_selection_from(path: &Path) -> Result<Option<String>, ConfigError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let state = toml::from_str::<TuiState>(&raw).map_err(|source| ConfigError::Composition {
-        message: format!(
-            "failed to parse TUI state {}: {source}",
-            display_from_current_dir(path)
-        ),
-    })?;
-    Ok(state.theme.name)
+    Ok(load_tui_state_from(path)?.theme.name)
 }
 
 /// Persist the globally selected interactive TUI theme to user state.
@@ -4922,14 +4974,10 @@ pub fn set_tui_theme_selection(name: &str) -> Result<PathBuf, ConfigError> {
             message: "theme name must not be empty".to_owned(),
         });
     }
-    write_tui_state(
-        &default_tui_state_path(),
-        &TuiState {
-            theme: TuiThemeState {
-                name: Some(name.to_owned()),
-            },
-        },
-    )
+    let path = default_tui_state_path();
+    let mut state = load_tui_state_from(&path)?;
+    state.theme.name = Some(name.to_owned());
+    write_tui_state(&path, &state)
 }
 
 /// Clear the globally selected interactive TUI theme.
@@ -4938,7 +4986,61 @@ pub fn set_tui_theme_selection(name: &str) -> Result<PathBuf, ConfigError> {
 ///
 /// Returns an error when the state cannot be written.
 pub fn clear_tui_theme_selection() -> Result<PathBuf, ConfigError> {
-    write_tui_state(&default_tui_state_path(), &TuiState::default())
+    let path = default_tui_state_path();
+    let mut state = load_tui_state_from(&path)?;
+    state.theme.name = None;
+    write_tui_state(&path, &state)
+}
+
+/// Load the interactive TUI streaming-presentation override.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_streaming_presentation_override()
+-> Result<Option<bcode_session_view_models::StreamingPresentationPolicy>, ConfigError> {
+    load_tui_streaming_presentation_override_from(&default_tui_state_path())
+}
+
+/// Load the interactive streaming-presentation override from a specific state path.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_streaming_presentation_override_from(
+    path: &Path,
+) -> Result<Option<bcode_session_view_models::StreamingPresentationPolicy>, ConfigError> {
+    Ok(load_tui_state_from(path)?
+        .presentation
+        .streaming
+        .as_ref()
+        .map(TuiStreamingState::policy))
+}
+
+/// Persist the normalized interactive TUI streaming-presentation override.
+///
+/// # Errors
+///
+/// Returns an error when the state cannot be read or written.
+pub fn set_tui_streaming_presentation_override(
+    policy: bcode_session_view_models::StreamingPresentationPolicy,
+) -> Result<PathBuf, ConfigError> {
+    let path = default_tui_state_path();
+    let mut state = load_tui_state_from(&path)?;
+    state.presentation.streaming = Some(policy.into());
+    write_tui_state(&path, &state)
+}
+
+/// Clear the interactive TUI streaming-presentation override.
+///
+/// # Errors
+///
+/// Returns an error when the state cannot be read or written.
+pub fn clear_tui_streaming_presentation_override() -> Result<PathBuf, ConfigError> {
+    let path = default_tui_state_path();
+    let mut state = load_tui_state_from(&path)?;
+    state.presentation.streaming = None;
+    write_tui_state(&path, &state)
 }
 
 fn write_tui_state(path: &Path, state: &TuiState) -> Result<PathBuf, ConfigError> {
@@ -7035,12 +7137,15 @@ mod tests {
         RuntimeAuthSubscriptionPool, RuntimeAuthSubscriptions, TuiAccentTransitionCurve,
         TuiAgentAccentPolicy, TuiInteractionOffscreenFocus, TuiInteractionPlacement,
         TuiMouseConfig, TuiRenderConfig, TuiThemeVariant, TuiVisualAdapterConfig,
-        clear_tui_theme_selection, default_config_paths_from, default_permissions_state_path,
-        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
-        load_runtime_auth_subscriptions, load_tui_theme_selection_from, merge_config_values,
+        clear_tui_streaming_presentation_override, clear_tui_theme_selection,
+        default_config_paths_from, default_permissions_state_path, load_config_from_paths,
+        load_config_from_paths_with_overrides, load_permissions_state_from,
+        load_runtime_auth_subscriptions, load_tui_streaming_presentation_override_from,
+        load_tui_theme_selection_from, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
         register_runtime_auth_subscription, set_openai_compatible_sshenv_auth_method,
-        set_tui_theme_selection, upsert_agent_permission_rule, validate_config,
+        set_tui_streaming_presentation_override, set_tui_theme_selection,
+        upsert_agent_permission_rule, validate_config,
     };
     use bcode_agent_policy_models::Action;
     use bcode_plugin::{PluginSelection, PluginSelectionMode};
@@ -7591,6 +7696,75 @@ enabled = false
         );
         restore_env(BCODE_CONFIG_ENV, previous_config);
         restore_env("BCODE_TUI_STATE", previous_state);
+    }
+
+    #[test]
+    fn tui_state_updates_preserve_sibling_and_unknown_fields() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_path = temp.path().join("tui.toml");
+        std::fs::write(
+            &state_path,
+            "future = 'kept'\n[theme]\nname = 'bcode-dark'\naccent = 'kept'\n[presentation]\nfuture = 7\n",
+        )
+        .expect("state should be written");
+        let previous_state = std::env::var_os("BCODE_TUI_STATE");
+        // SAFETY: tests that mutate process configuration are serialized by ENV_LOCK.
+        unsafe { std::env::set_var("BCODE_TUI_STATE", &state_path) };
+
+        let policy = bcode_session_view_models::StreamingPresentationPolicy {
+            enabled: true,
+            curve: bcode_session_view_models::StreamingInterpolationCurve::EaseInOut,
+            graphemes_per_second: 20_000,
+            max_lag_ms: 2_000,
+        };
+        set_tui_streaming_presentation_override(policy).expect("streaming state should write");
+        assert_eq!(
+            load_tui_streaming_presentation_override_from(&state_path)
+                .expect("streaming state should load"),
+            Some(policy.normalized())
+        );
+        set_tui_theme_selection("bcode-light").expect("theme should update");
+        let contents = std::fs::read_to_string(&state_path).expect("state should read");
+        assert!(contents.contains("future = \"kept\""), "{contents}");
+        assert!(contents.contains("accent = \"kept\""), "{contents}");
+        assert!(contents.contains("future = 7"), "{contents}");
+        assert_eq!(
+            load_tui_streaming_presentation_override_from(&state_path)
+                .expect("streaming state should survive theme update"),
+            Some(policy.normalized())
+        );
+        clear_tui_theme_selection().expect("theme should clear");
+        assert_eq!(
+            load_tui_streaming_presentation_override_from(&state_path)
+                .expect("streaming state should survive theme clear"),
+            Some(policy.normalized())
+        );
+        set_tui_theme_selection("bcode-light").expect("theme should update again");
+
+        clear_tui_streaming_presentation_override().expect("streaming state should clear");
+        assert_eq!(
+            load_tui_theme_selection_from(&state_path).expect("theme should survive clear"),
+            Some("bcode-light".to_owned())
+        );
+        assert_eq!(
+            load_tui_streaming_presentation_override_from(&state_path)
+                .expect("streaming state should load"),
+            None
+        );
+        restore_env("BCODE_TUI_STATE", previous_state);
+    }
+
+    #[test]
+    fn malformed_tui_state_fails_closed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_path = temp.path().join("tui.toml");
+        std::fs::write(
+            &state_path,
+            "[presentation.streaming]\ncurve = 'future_curve'\n",
+        )
+        .expect("state should be written");
+        assert!(load_tui_streaming_presentation_override_from(&state_path).is_err());
     }
 
     #[test]
