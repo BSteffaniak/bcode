@@ -15,6 +15,7 @@ use bcode_client::{BcodeClient, ClientError};
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
+    SlashCommandContribution,
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::tui::{
@@ -110,6 +111,10 @@ fn command(id: &str, title: &str, description: &str) -> CommandContribution {
         description: Some(description.to_owned()),
         category: Some("automation".to_owned()),
         surfaces: BTreeSet::from([CommandSurface::Palette, CommandSurface::Slash]),
+        slash: Some(SlashCommandContribution {
+            name: id.to_owned(),
+            aliases: BTreeSet::new(),
+        }),
         execution: bcode_command::CommandExecution::Immediate,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_owned(),

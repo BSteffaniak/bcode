@@ -101,6 +101,7 @@ fn skills_command(id: &str, title: &str, description: &str) -> CommandContributi
         description: Some(description.to_string()),
         category: Some("skills".to_string()),
         surfaces: std::collections::BTreeSet::from([CommandSurface::Palette]),
+        slash: None,
         execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.skills".to_string(),

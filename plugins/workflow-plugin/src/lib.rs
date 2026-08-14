@@ -12,6 +12,7 @@ pub mod tui;
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
+    SlashCommandContribution,
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::{OP_SESSION_STATUS, SESSION_STATUS_INTERFACE_ID};
@@ -203,6 +204,10 @@ fn command_contributions() -> Vec<CommandContribution> {
         description: Some(description.to_string()),
         category: Some("workflow".to_string()),
         surfaces: BTreeSet::from([CommandSurface::Palette, CommandSurface::Slash]),
+        slash: Some(SlashCommandContribution {
+            name: id.to_string(),
+            aliases: BTreeSet::new(),
+        }),
         execution: bcode_command::CommandExecution::Immediate,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_string(),

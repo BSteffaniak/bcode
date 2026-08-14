@@ -321,12 +321,15 @@ fn plugin_slash_items(
     contributions
         .into_iter()
         .filter(|contribution| contribution.supports_surface(&CommandSurface::Slash))
-        .filter(|contribution| !slash_registry::is_builtin_command_name(&contribution.id))
-        .map(|contribution| {
+        .filter_map(|contribution| {
+            let slash_name = contribution.slash_name()?.to_owned();
+            if slash_registry::is_builtin_command_name(&slash_name) {
+                return None;
+            }
             let description = contribution
                 .description
                 .unwrap_or_else(|| contribution.title.clone());
-            item(format!("/{}", contribution.id), description)
+            Some(item(format!("/{slash_name}"), description))
         })
         .collect()
 }
@@ -351,6 +354,7 @@ mod tests {
     use super::{filter_items, plugin_slash_items, static_items};
     use bcode_command::{
         CommandAction, CommandContribution, CommandExecution, CommandOwner, CommandSurface,
+        SlashCommandContribution,
     };
     use std::collections::BTreeSet;
 
@@ -360,6 +364,12 @@ mod tests {
             title: "Loop".to_owned(),
             description: Some("Start a deterministic prompt loop".to_owned()),
             category: Some("automation".to_owned()),
+            slash: surfaces
+                .contains(&CommandSurface::Slash)
+                .then(|| SlashCommandContribution {
+                    name: id.to_owned(),
+                    aliases: BTreeSet::new(),
+                }),
             surfaces,
             execution: CommandExecution::Immediate,
             owner: CommandOwner::Plugin {
@@ -374,10 +384,15 @@ mod tests {
 
     #[test]
     fn plugin_slash_contributions_are_visible_and_selectable() {
-        let items = plugin_slash_items([contribution(
-            "loop",
+        let mut contribution = contribution(
+            "bcode.loop.start",
             BTreeSet::from([CommandSurface::Slash, CommandSurface::Palette]),
-        )]);
+        );
+        contribution.slash = Some(SlashCommandContribution {
+            name: "loop".to_owned(),
+            aliases: BTreeSet::new(),
+        });
+        let items = plugin_slash_items([contribution]);
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].command(), "/loop");

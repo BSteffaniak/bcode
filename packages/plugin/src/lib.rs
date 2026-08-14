@@ -5497,6 +5497,7 @@ library = "libcommands.dylib"
                 description: Some("Run an example command".to_string()),
                 category: Some("example".to_string()),
                 surfaces: BTreeSet::from([bcode_command::CommandSurface::Palette]),
+                slash: None,
                 execution: bcode_command::CommandExecution::Normal,
                 owner: bcode_command::CommandOwner::Plugin {
                     plugin_id: "bcode.commands".to_string(),

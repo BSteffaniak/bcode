@@ -187,6 +187,16 @@ pub enum CommandExecution {
     Immediate,
 }
 
+/// Slash-command discovery metadata owned by a command contribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommandContribution {
+    /// Primary user-facing name without a leading slash.
+    pub name: String,
+    /// Additional user-facing names without leading slashes.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub aliases: BTreeSet<String>,
+}
+
 /// Registry contribution for a user-visible command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandContribution {
@@ -203,6 +213,12 @@ pub struct CommandContribution {
     /// Surfaces this command appears on.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub surfaces: BTreeSet<CommandSurface>,
+    /// Slash-command names contributed by this command.
+    ///
+    /// Contributions on the slash surface must provide this metadata. Keeping the user-facing
+    /// name separate from `id` allows stable namespaced command identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slash: Option<SlashCommandContribution>,
     /// Host scheduling class.
     #[serde(default)]
     pub execution: CommandExecution,
@@ -222,6 +238,7 @@ impl CommandContribution {
             description: Some(description.to_owned()),
             category: Some(category.to_owned()),
             surfaces: BTreeSet::from([CommandSurface::Palette]),
+            slash: None,
             execution: CommandExecution::Normal,
             owner: CommandOwner::Host,
             action: CommandAction::Host {
@@ -234,6 +251,24 @@ impl CommandContribution {
     #[must_use]
     pub fn supports_surface(&self, surface: &CommandSurface) -> bool {
         self.surfaces.contains(surface)
+    }
+
+    /// Return the contributed slash name when this command supports the slash surface.
+    #[must_use]
+    pub fn slash_name(&self) -> Option<&str> {
+        self.supports_surface(&CommandSurface::Slash)
+            .then(|| self.slash.as_ref().map(|slash| slash.name.as_str()))
+            .flatten()
+    }
+
+    /// Return whether this contribution owns the supplied slash name or alias.
+    #[must_use]
+    pub fn matches_slash_name(&self, name: &str) -> bool {
+        self.slash_name().is_some_and(|primary| primary == name)
+            || self
+                .slash
+                .as_ref()
+                .is_some_and(|slash| slash.aliases.contains(name))
     }
 }
 
@@ -441,6 +476,31 @@ mod tests {
     }
 
     #[test]
+    fn slash_metadata_decouples_user_facing_name_from_command_identity() {
+        let contribution = CommandContribution {
+            id: "bcode.example.open".to_owned(),
+            title: "Example".to_owned(),
+            description: None,
+            category: None,
+            surfaces: BTreeSet::from([CommandSurface::Slash]),
+            slash: Some(SlashCommandContribution {
+                name: "example".to_owned(),
+                aliases: BTreeSet::from(["ex".to_owned()]),
+            }),
+            execution: CommandExecution::Immediate,
+            owner: CommandOwner::Host,
+            action: CommandAction::Host {
+                route: "example".to_owned(),
+            },
+        };
+
+        assert_eq!(contribution.slash_name(), Some("example"));
+        assert!(contribution.matches_slash_name("example"));
+        assert!(contribution.matches_slash_name("ex"));
+        assert!(!contribution.matches_slash_name("bcode.example.open"));
+    }
+
+    #[test]
     fn registry_filters_commands_by_surface() {
         let mut registry = CommandRegistry::new();
         registry.register(CommandContribution {
@@ -449,6 +509,7 @@ mod tests {
             description: None,
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Palette]),
+            slash: None,
             execution: CommandExecution::Normal,
             owner: CommandOwner::Host,
             action: CommandAction::Host {
@@ -461,6 +522,10 @@ mod tests {
             description: None,
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Slash]),
+            slash: Some(SlashCommandContribution {
+                name: "example".to_owned(),
+                aliases: BTreeSet::new(),
+            }),
             execution: CommandExecution::Normal,
             owner: CommandOwner::Host,
             action: CommandAction::Host {

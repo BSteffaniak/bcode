@@ -167,6 +167,7 @@ fn model_command(id: &str, title: &str, description: &str, category: &str) -> Co
         description: Some(description.to_string()),
         category: Some(category.to_string()),
         surfaces: std::collections::BTreeSet::from([CommandSurface::Palette]),
+        slash: None,
         execution: bcode_command::CommandExecution::Normal,
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.model".to_string(),

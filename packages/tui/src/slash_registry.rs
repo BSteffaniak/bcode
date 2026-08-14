@@ -1,7 +1,7 @@
 //! Slash command registry metadata for the TUI.
 
 use bcode_client::BcodeClient;
-use bcode_command::{CommandContribution, CommandSurface};
+use bcode_command::CommandContribution;
 use bcode_skill_models::SkillId;
 
 /// Static metadata for a builtin slash command name.
@@ -373,9 +373,7 @@ pub async fn resolve(
     if let Some(contribution) = contributions
         .command_contributions
         .into_iter()
-        .find(|candidate| {
-            candidate.supports_surface(&CommandSurface::Slash) && candidate.id == command
-        })
+        .find(|candidate| candidate.matches_slash_name(command))
     {
         return Ok(SlashResolution::PluginCommand(contribution));
     }

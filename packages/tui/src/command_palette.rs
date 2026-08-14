@@ -133,6 +133,7 @@ mod tests {
             description: None,
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Palette]),
+            slash: None,
             execution: bcode_command::CommandExecution::Normal,
             owner: CommandOwner::Plugin {
                 plugin_id: "bcode.example".to_string(),
@@ -180,6 +181,10 @@ mod tests {
             description: None,
             category: None,
             surfaces: BTreeSet::from([CommandSurface::Slash]),
+            slash: Some(bcode_command::SlashCommandContribution {
+                name: "hidden".to_owned(),
+                aliases: BTreeSet::new(),
+            }),
             execution: bcode_command::CommandExecution::Normal,
             owner: CommandOwner::Plugin {
                 plugin_id: "bcode.example".to_string(),

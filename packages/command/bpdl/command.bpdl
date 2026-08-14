@@ -48,6 +48,8 @@ interface command-registry-query {
         description: string?,
         category: string?,
         surfaces: list<command-surface>,
+        slash_name: string?,
+        slash_aliases: list<string>,
         owner: command-owner,
         action: command-action,
     }
@@ -70,6 +72,8 @@ interface command-registry-command {
         title: string,
         description: string?,
         category: string?,
+        slash_name: string?,
+        slash_aliases: list<string>,
     }
 
     record register-command-input {
