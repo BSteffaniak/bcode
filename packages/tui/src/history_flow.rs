@@ -378,6 +378,7 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
             _ => None,
         },
         BcodeEvent::RuntimeWork(_)
+        | BcodeEvent::Workflow(_)
         | BcodeEvent::SessionViewResyncRequired { .. }
         | BcodeEvent::SessionCatalogUpdated { .. } => None,
     }
@@ -391,6 +392,7 @@ async fn flush_superseded_progress(
     events.sort_by_key(|event| match event {
         BcodeEvent::Session(event) | BcodeEvent::RuntimeWork(event) => event.sequence,
         BcodeEvent::SessionLive(_)
+        | BcodeEvent::Workflow(_)
         | BcodeEvent::SessionViewResyncRequired { .. }
         | BcodeEvent::SessionCatalogUpdated { .. } => 0,
     });

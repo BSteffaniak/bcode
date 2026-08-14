@@ -966,6 +966,8 @@ pub enum Request {
     SubscribeRuntimeWork {
         session_id: SessionId,
     },
+    /// Subscribe this connection to workflow-run change notifications.
+    SubscribeWorkflowRuns,
     SubscribeCatalogUpdates,
     AttachSessionProjectionWindow {
         session_id: SessionId,
@@ -2957,6 +2959,7 @@ pub enum ResponsePayload {
         events: Vec<SessionEvent>,
     },
     RuntimeWorkSubscribed,
+    WorkflowRunsSubscribed,
     ComposerDraft {
         draft: Option<String>,
     },
@@ -3120,6 +3123,8 @@ pub enum Event {
     Session(SessionEvent),
     SessionLive(SessionLiveEvent),
     RuntimeWork(SessionEvent),
+    /// Notification that canonical state for one workflow run changed.
+    Workflow(bcode_workflow_view_models::WorkflowLiveEvent),
     /// Local/client signal that a reattached session view needs one bounded snapshot refresh.
     SessionViewResyncRequired {
         session_id: SessionId,

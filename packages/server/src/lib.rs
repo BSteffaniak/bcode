@@ -412,6 +412,7 @@ pub struct ServerState {
     attached_client_sessions: Mutex<BTreeMap<ClientId, SessionId>>,
     client_forwarders: Mutex<BTreeMap<ClientId, Vec<JoinHandle<()>>>>,
     event_clients: Mutex<BTreeMap<ClientId, CatalogEventSubscription>>,
+    workflow_event_clients: Mutex<BTreeMap<ClientId, ClientEventSink>>,
     catalog_events_started: std::sync::atomic::AtomicBool,
     idle_shutdown_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
@@ -526,6 +527,7 @@ const fn client_event_kind(event: &Event) -> &'static str {
         Event::Session(_) => "session",
         Event::SessionLive(_) => "session_live",
         Event::RuntimeWork(_) => "runtime_work",
+        Event::Workflow(_) => "workflow",
         Event::SessionViewResyncRequired { .. } => "session_view_resync_required",
         Event::SessionCatalogUpdated { .. } => "session_catalog_updated",
     }
@@ -1614,6 +1616,7 @@ impl ServerState {
             attached_client_sessions: Mutex::default(),
             client_forwarders: Mutex::default(),
             event_clients: Mutex::default(),
+            workflow_event_clients: Mutex::default(),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             idle_shutdown_started: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
@@ -1642,6 +1645,7 @@ impl ServerState {
             .await
             .remove(&client_id);
         self.unregister_catalog_event_client(client_id).await;
+        self.workflow_event_clients.lock().await.remove(&client_id);
     }
 
     async fn resolve_exchanges_without_consumers(&self) {
@@ -2270,6 +2274,25 @@ impl ServerState {
                 }
             }
         });
+    }
+
+    async fn workflow_event_sinks(&self) -> Vec<ClientEventSink> {
+        self.workflow_event_clients
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    async fn unregister_workflow_event_clients(&self, client_ids: &[ClientId]) {
+        if client_ids.is_empty() {
+            return;
+        }
+        let mut clients = self.workflow_event_clients.lock().await;
+        for client_id in client_ids {
+            clients.remove(client_id);
+        }
     }
 
     async fn catalog_event_sinks(&self) -> Vec<ClientEventSink> {
@@ -4048,6 +4071,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::WorkflowAttemptHistory { .. } => "workflow_attempt_history",
         Request::WorkflowEventHistory { .. } => "workflow_event_history",
         Request::SubscribeRuntimeWork { .. } => "subscribe_runtime_work",
+        Request::SubscribeWorkflowRuns => "subscribe_workflow_runs",
         Request::SubscribeCatalogUpdates => "subscribe_catalog_updates",
         Request::SetComposerDraft { .. } => "set_composer_draft",
         Request::ComposerDraft { .. } => "composer_draft",
@@ -5443,6 +5467,9 @@ async fn handle_workflow_run_request(
         }
         RuntimeAndModelRequest::SubscribeRuntimeWork { session_id } => {
             handle_subscribe_runtime_work(request_id, client_id, state, writer, session_id).await
+        }
+        RuntimeAndModelRequest::SubscribeWorkflowRuns => {
+            handle_subscribe_workflow_runs(request_id, client_id, state, writer).await
         }
         RuntimeAndModelRequest::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
@@ -16913,6 +16940,49 @@ async fn start_workflow_run(
     })
 }
 
+async fn broadcast_workflow_update(state: &ServerState, run_id: &str) {
+    let Some((event_sequence, changed_at_ms)) = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .latest_event_position(run_id)
+        .map_err(|error| {
+            tracing::warn!(run_id, %error, "failed to read workflow event position");
+            error
+        })
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let event = Event::Workflow(bcode_workflow_view_models::WorkflowLiveEvent {
+        version: bcode_workflow_view_models::WORKFLOW_LIVE_EVENT_VERSION,
+        run_id: run_id.to_string(),
+        event_sequence,
+        changed_at_ms,
+    });
+    let mut sends = JoinSet::new();
+    for sink in state.workflow_event_sinks().await {
+        let event = event.clone();
+        sends.spawn(async move {
+            let client_id = sink.client_id();
+            (client_id, sink.send(event).await)
+        });
+    }
+    let mut disconnected = Vec::new();
+    while let Some(result) = sends.join_next().await {
+        match result {
+            Ok((_client_id, Ok(()))) => {}
+            Ok((client_id, Err(error))) => {
+                tracing::debug!(%client_id, %error, "workflow event client disconnected");
+                disconnected.push(client_id);
+            }
+            Err(error) => tracing::warn!(%error, "workflow event send task failed"),
+        }
+    }
+    state.unregister_workflow_event_clients(&disconnected).await;
+}
+
 async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
     let started_at = std::time::Instant::now();
     let store_path = state
@@ -16977,6 +17047,7 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
     finish_terminal_workflow_runtime_work(state, run_id).await?;
+    broadcast_workflow_update(state, run_id).await;
     Ok(())
 }
 
@@ -17253,6 +17324,7 @@ async fn handle_inspect_workflow_run(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_workflow_run_view(
     request_id: u64,
     state: &ServerState,
@@ -17288,6 +17360,7 @@ async fn handle_workflow_run_view(
         let attempts = store.attempt_history(&run_id, None, limit)?;
         let descendant_runs = store.descendant_run_summaries(&run_id, limit)?;
         let child_sessions = store.execution_session_links_for_run(&run_id, limit)?;
+        drop(store);
         bcode_workflow_view::project_run(bcode_workflow_view::WorkflowRunProjectionInput {
             run: workflow_run_list_item(&run),
             terminal_output_id: run.terminal_output_id,
@@ -18211,6 +18284,24 @@ async fn handle_subscribe_runtime_work(
         writer,
         request_id,
         Response::Ok(ResponsePayload::RuntimeWorkSubscribed),
+    )
+    .await
+}
+
+async fn handle_subscribe_workflow_runs(
+    request_id: u64,
+    client_id: ClientId,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    state.workflow_event_clients.lock().await.insert(
+        client_id,
+        ClientEventSink::new(client_id, writer.clone(), state.metrics.clone()),
+    );
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunsSubscribed),
     )
     .await
 }

@@ -698,6 +698,7 @@ impl SessionCatalogWatcher {
                 | Event::Session(_)
                 | Event::SessionLive(_)
                 | Event::RuntimeWork(_)
+                | Event::Workflow(_)
                 | Event::SessionViewResyncRequired { .. } => {}
             }
         }
@@ -753,7 +754,9 @@ impl SessionWatcher {
                 } if required == self.initial_session_id() => {
                     return Ok(SessionWatchEvent::ResyncRequired);
                 }
-                Event::SessionCatalogUpdated { .. } | Event::SessionViewResyncRequired { .. } => {}
+                Event::SessionCatalogUpdated { .. }
+                | Event::Workflow(_)
+                | Event::SessionViewResyncRequired { .. } => {}
             }
         }
     }
@@ -777,6 +780,35 @@ impl RuntimeWorkWatcher {
                 Event::RuntimeWork(event) => return Ok(event),
                 Event::Session(_)
                 | Event::SessionLive(_)
+                | Event::Workflow(_)
+                | Event::SessionViewResyncRequired { .. }
+                | Event::SessionCatalogUpdated { .. } => {}
+            }
+        }
+    }
+}
+
+/// Event-driven workflow-run watcher.
+#[derive(Debug)]
+pub struct WorkflowRunWatcher {
+    connection: ClientConnection,
+}
+
+impl WorkflowRunWatcher {
+    /// Wait for the next workflow canonical-state notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon connection closes or the event cannot be decoded.
+    pub async fn next_event(
+        &mut self,
+    ) -> Result<bcode_workflow_view_models::WorkflowLiveEvent, ClientError> {
+        loop {
+            match self.connection.recv_event().await? {
+                Event::Workflow(event) => return Ok(event),
+                Event::Session(_)
+                | Event::SessionLive(_)
+                | Event::RuntimeWork(_)
                 | Event::SessionViewResyncRequired { .. }
                 | Event::SessionCatalogUpdated { .. } => {}
             }
@@ -1002,6 +1034,17 @@ impl BcodeClient {
         let mut connection = self.connect("bcode-runtime-work").await?;
         connection.subscribe_runtime_work(session_id).await?;
         Ok(RuntimeWorkWatcher { connection })
+    }
+
+    /// Create an event-driven watcher for workflow-run canonical-state notifications.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the subscription.
+    pub async fn watch_workflow_runs(&self) -> Result<WorkflowRunWatcher, ClientError> {
+        let mut connection = self.connect("bcode-workflow-runs").await?;
+        connection.subscribe_workflow_runs().await?;
+        Ok(WorkflowRunWatcher { connection })
     }
 
     /// Check whether the local server accepts requests.
@@ -4696,6 +4739,21 @@ impl ClientConnection {
     pub async fn subscribe_catalog_updates(&mut self) -> Result<(), ClientError> {
         match self.send_request(Request::SubscribeCatalogUpdates).await? {
             ResponsePayload::CatalogUpdatesSubscribed => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Subscribe this connection to workflow-run canonical-state notifications.
+    ///
+    /// The stream is live-only and does not imply durable resume. Obtain bounded snapshots through
+    /// [`Self::workflow_catalog_view`] and [`Self::workflow_run_view`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn subscribe_workflow_runs(&mut self) -> Result<(), ClientError> {
+        match self.send_request(Request::SubscribeWorkflowRuns).await? {
+            ResponsePayload::WorkflowRunsSubscribed => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

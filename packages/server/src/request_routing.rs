@@ -593,6 +593,7 @@ pub enum RuntimeAndModelRequest {
     SubscribeRuntimeWork {
         session_id: SessionId,
     },
+    SubscribeWorkflowRuns,
     CompactSession {
         session_id: SessionId,
     },
@@ -1453,6 +1454,9 @@ impl RoutedRequest {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SubscribeRuntimeWork {
                     session_id,
                 }))
+            }
+            Request::SubscribeWorkflowRuns => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SubscribeWorkflowRuns))
             }
             Request::SubscribeCatalogUpdates => {
                 Self::SessionLifecycle(SessionLifecycleRequest::SubscribeCatalogUpdates)

@@ -8454,6 +8454,27 @@ impl WorkflowStore {
         }))
     }
 
+    /// Return the latest canonical event sequence and timestamp for one workflow run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity or database failure.
+    pub fn latest_event_position(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<(u64, u64)>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        self.connection
+            .query_row(
+                "SELECT event_seq, created_at_ms FROM workflow_events WHERE run_id = ?1 \
+                 ORDER BY event_seq DESC LIMIT 1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(WorkflowStoreError::from)
+    }
+
     /// Return bounded activations for one run without event replay.
     ///
     /// # Errors

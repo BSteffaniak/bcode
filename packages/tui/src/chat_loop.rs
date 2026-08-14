@@ -4865,6 +4865,7 @@ fn absorb_bcode_event(
         BcodeEvent::Session(_)
         | BcodeEvent::SessionLive(_)
         | BcodeEvent::RuntimeWork(_)
+        | BcodeEvent::Workflow(_)
         | BcodeEvent::SessionViewResyncRequired { .. }
         | BcodeEvent::SessionCatalogUpdated { .. } => false,
     }

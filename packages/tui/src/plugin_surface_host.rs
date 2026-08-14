@@ -864,6 +864,7 @@ async fn stream_plugin_session_view_inner(
                     BcodeEvent::Session(_)
                     | BcodeEvent::SessionLive(_)
                     | BcodeEvent::RuntimeWork(_)
+                    | BcodeEvent::Workflow(_)
                     | BcodeEvent::SessionViewResyncRequired { .. }
                     | BcodeEvent::SessionCatalogUpdated { .. } => false,
                 };
