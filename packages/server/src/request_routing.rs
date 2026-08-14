@@ -145,6 +145,12 @@ pub enum SessionLifecycleRequest {
     DeriveSession {
         request: Box<bcode_session_models::SessionDerivationRequest>,
     },
+    SessionDerivationStatus {
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    },
+    CancelSessionDerivation {
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    },
     /// Explicit complete-history request for export/debug/history commands only.
     ///
     /// This request may force the server to read every canonical event for the session.
@@ -1468,6 +1474,16 @@ impl RoutedRequest {
             }
             Request::DeriveSession { request } => {
                 Self::SessionLifecycle(SessionLifecycleRequest::DeriveSession { request })
+            }
+            Request::SessionDerivationStatus { operation_id } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::SessionDerivationStatus {
+                    operation_id,
+                })
+            }
+            Request::CancelSessionDerivation { operation_id } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::CancelSessionDerivation {
+                    operation_id,
+                })
             }
             Request::RefreshSessionCatalog {
                 working_directory,

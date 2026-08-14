@@ -85,7 +85,10 @@ use state::{SessionLiveEventBroker, SessionLoadStatusKind, SessionState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64},
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub use store::{SessionStore, SessionStoreError};
 use store_executor::SessionStoreExecutor;
@@ -481,6 +484,18 @@ pub enum SessionError {
     /// A portable derivation request failed contract validation.
     #[error("invalid session derivation request: {0}")]
     InvalidDerivationRequest(String),
+    /// A retry reused an operation identity with different canonical request facts.
+    #[error("conflicting duplicate session derivation operation: {0}")]
+    DerivationOperationConflict(bcode_session_models::SessionDerivationOperationId),
+    /// The requested derivation operation does not exist in this daemon lifecycle.
+    #[error("session derivation operation not found: {0}")]
+    DerivationOperationNotFound(bcode_session_models::SessionDerivationOperationId),
+    /// Derivation operation facts could not be serialized safely.
+    #[error("session derivation serialization failed: {0}")]
+    DerivationSerialization(String),
+    /// A running derivation was cancelled before canonical publication.
+    #[error("session derivation operation cancelled: {0}")]
+    DerivationCancelled(bcode_session_models::SessionDerivationOperationId),
     /// Atomic publication found an unexpected canonical destination.
     #[error("derived session publication conflict: {0}")]
     DerivationPublicationConflict(SessionId),
@@ -544,7 +559,19 @@ pub struct SessionManager {
     catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
     mutation_tx: broadcast::Sender<SessionMutationCommitted>,
     shared_execution_locks: Arc<Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>>,
+    derivation_operations: Arc<
+        Mutex<
+            BTreeMap<bcode_session_models::SessionDerivationOperationId, DerivationOperationState>,
+        >,
+    >,
     metrics: MetricsRegistry,
+}
+
+#[derive(Debug)]
+pub(crate) struct DerivationOperationState {
+    pub(crate) request_fingerprint: String,
+    pub(crate) snapshot: bcode_session_models::SessionDerivationOperationSnapshot,
+    pub(crate) cancellation: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -594,6 +621,7 @@ impl Default for SessionManager {
             catalog_status_rx,
             mutation_tx: broadcast::channel(1024).0,
             shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            derivation_operations: Arc::new(Mutex::new(BTreeMap::new())),
             metrics: MetricsRegistry::default(),
         }
     }
@@ -704,6 +732,7 @@ impl SessionManager {
             catalog_status_rx,
             mutation_tx,
             shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            derivation_operations: Arc::new(Mutex::new(BTreeMap::new())),
             metrics,
         }
     }
@@ -6615,7 +6644,31 @@ mod tests {
                 selected_source_sequence: None,
             },
         };
-        let outcome = manager.derive_session(request).await.expect("derive");
+        let outcome = manager
+            .derive_session(request.clone())
+            .await
+            .expect("derive");
+        let duplicate = manager
+            .derive_session(request.clone())
+            .await
+            .expect("idempotent duplicate");
+        assert_eq!(duplicate, outcome);
+        let status = manager
+            .session_derivation_status(request.operation_id)
+            .await
+            .expect("terminal status");
+        assert_eq!(status.outcome.as_ref(), Some(&outcome));
+        assert!(
+            !manager
+                .cancel_session_derivation(request.operation_id)
+                .await
+        );
+        let mut conflicting = request;
+        conflicting.destination_name = Some("different".to_owned());
+        assert!(matches!(
+            manager.derive_session(conflicting).await,
+            Err(SessionError::DerivationOperationConflict(_))
+        ));
         let bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { session } = outcome
         else {
             panic!("expected success");

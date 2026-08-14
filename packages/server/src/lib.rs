@@ -4054,6 +4054,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionDerivationSnapshot { .. } => "session_derivation_snapshot",
         Request::SessionDerivationPrompts { .. } => "session_derivation_prompts",
         Request::DeriveSession { .. } => "derive_session",
+        Request::SessionDerivationStatus { .. } => "session_derivation_status",
+        Request::CancelSessionDerivation { .. } => "cancel_session_derivation",
         Request::RefreshSessionCatalog { .. } => "refresh_session_catalog",
         Request::AttachSessionProjectionWindow { .. } => "attach_session_projection_window",
         Request::ListPendingToolExchanges => "list_pending_tool_exchanges",
@@ -4504,6 +4506,12 @@ async fn handle_request_inner(
         }
         SessionLifecycleRequest::DeriveSession { request } => {
             handle_derive_session(request_id, state, writer, *request).await
+        }
+        SessionLifecycleRequest::SessionDerivationStatus { operation_id } => {
+            handle_session_derivation_status(request_id, state, writer, operation_id).await
+        }
+        SessionLifecycleRequest::CancelSessionDerivation { operation_id } => {
+            handle_cancel_session_derivation(request_id, state, writer, operation_id).await
         }
         SessionLifecycleRequest::SessionHistory { session_id } => {
             handle_session_history(request_id, client_id, state, writer, session_id).await
@@ -9713,6 +9721,50 @@ async fn handle_derive_session(
             .await
         }
     }
+}
+
+async fn handle_session_derivation_status(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    operation_id: bcode_session_models::SessionDerivationOperationId,
+) -> Result<(), ServerError> {
+    match state.sessions.session_derivation_status(operation_id).await {
+        Ok(snapshot) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionDerivationStatus { snapshot }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_derivation_status_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_cancel_session_derivation(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    operation_id: bcode_session_models::SessionDerivationOperationId,
+) -> Result<(), ServerError> {
+    let accepted = state.sessions.cancel_session_derivation(operation_id).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionDerivationCancellationRequested { accepted }),
+    )
+    .await
 }
 
 /// Handle an explicit full-history request.

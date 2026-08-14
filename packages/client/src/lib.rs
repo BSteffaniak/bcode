@@ -4617,6 +4617,42 @@ impl BcodeClient {
         }
     }
 
+    /// Return the latest derivation operation status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the operation is unknown.
+    pub async fn session_derivation_status(
+        &self,
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    ) -> Result<bcode_session_models::SessionDerivationOperationSnapshot, ClientError> {
+        match self
+            .send_request(Request::SessionDerivationStatus { operation_id })
+            .await?
+        {
+            ResponsePayload::SessionDerivationStatus { snapshot } => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Request cancellation of one running derivation operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn cancel_session_derivation(
+        &self,
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    ) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::CancelSessionDerivation { operation_id })
+            .await?
+        {
+            ResponsePayload::SessionDerivationCancellationRequested { accepted } => Ok(accepted),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Invoke a loaded daemon plugin service by explicit plugin ID.
     ///
     /// # Errors

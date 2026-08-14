@@ -970,6 +970,12 @@ pub enum Request {
     DeriveSession {
         request: Box<SessionDerivationRequest>,
     },
+    SessionDerivationStatus {
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    },
+    CancelSessionDerivation {
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    },
     RefreshSessionCatalog {
         #[serde(default)]
         working_directory: Option<PathBuf>,
@@ -2749,6 +2755,12 @@ pub enum ResponsePayload {
     },
     SessionDerived {
         outcome: SessionDerivationTerminalOutcome,
+    },
+    SessionDerivationStatus {
+        snapshot: bcode_session_models::SessionDerivationOperationSnapshot,
+    },
+    SessionDerivationCancellationRequested {
+        accepted: bool,
     },
     SessionCatalogRefreshed {
         sessions: Vec<SessionSummary>,
