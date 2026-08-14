@@ -86,7 +86,6 @@ pub enum StreamingConfiguratorOutcome {
 /// Complete local state for the streaming configurator surface.
 pub struct StreamingConfiguratorState {
     controller: StreamingPreviewController,
-    original_policy: StreamingPresentationPolicy,
     override_policy: StreamingPresentationPolicy,
     declarative_fallback: StreamingPresentationPolicy,
     focus: StreamingConfiguratorFocus,
@@ -104,7 +103,6 @@ impl StreamingConfiguratorState {
         let effective_policy = effective_policy.normalized();
         Self {
             controller: StreamingPreviewController::new(now, effective_policy),
-            original_policy: effective_policy,
             override_policy: effective_policy,
             declarative_fallback: declarative_fallback.normalized(),
             focus: StreamingConfiguratorFocus::Enabled,
@@ -138,12 +136,6 @@ impl StreamingConfiguratorState {
     #[must_use]
     pub const fn reset_pending(&self) -> bool {
         self.reset_pending
-    }
-
-    /// Return the policy that was active when the surface opened.
-    #[must_use]
-    pub const fn original_policy(&self) -> StreamingPresentationPolicy {
-        self.original_policy
     }
 
     /// Return the earliest controller deadline.
@@ -328,12 +320,6 @@ impl StreamingPreviewController {
         }
     }
 
-    /// Return the complete deterministic sample text.
-    #[must_use]
-    pub fn final_text() -> String {
-        SAMPLE_CHUNKS.iter().map(|(_, chunk)| *chunk).collect()
-    }
-
     /// Return the raw preview's currently visible text.
     #[must_use]
     pub fn raw_text(&self) -> &str {
@@ -344,12 +330,6 @@ impl StreamingPreviewController {
     #[must_use]
     pub fn smoothed_text(&self) -> &str {
         projected_text(&self.smoothed)
-    }
-
-    /// Return the selected normalized smoothing policy.
-    #[must_use]
-    pub const fn selected_policy(&self) -> StreamingPresentationPolicy {
-        self.selected_policy
     }
 
     /// Return the number of source chunks already accepted.
@@ -552,14 +532,12 @@ mod tests {
             ..original
         };
         let mut state = StreamingConfiguratorState::new(now, original, fallback);
-        assert_eq!(state.original_policy(), original);
         assert_eq!(state.focus(), StreamingConfiguratorFocus::Enabled);
         assert_eq!(
             state.handle_key(KeyStroke::simple(KeyCode::Space), now),
             StreamingConfiguratorOutcome::Handled
         );
         assert!(!state.selected_policy().enabled);
-        assert_eq!(state.original_policy(), original);
 
         let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
         let _ = state.handle_key(KeyStroke::simple(KeyCode::Right), now);
@@ -640,10 +618,11 @@ mod tests {
             controller.delivered_chunks(),
             StreamingPreviewController::total_chunks()
         );
-        assert_eq!(
-            controller.raw_text(),
-            StreamingPreviewController::final_text()
-        );
+        let expected = SAMPLE_CHUNKS
+            .iter()
+            .map(|(_, chunk)| *chunk)
+            .collect::<String>();
+        assert_eq!(controller.raw_text(), expected);
         assert_eq!(controller.smoothed_text(), controller.raw_text());
     }
 
