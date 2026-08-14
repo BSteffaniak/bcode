@@ -4874,6 +4874,280 @@ mod tests {
     }
 
     #[test]
+    fn pacing_anchor_survives_target_extension() {
+        let started = Instant::now();
+        let destination = PendingTextDestination::Transcript {
+            turn_id: "turn-1".to_owned(),
+        };
+        let mut pending = PendingTextPresentation::new(
+            "abcdef".to_owned(),
+            1,
+            started,
+            10,
+            Duration::from_secs(1),
+            destination.clone(),
+        );
+
+        pending.record_presented(pending.due_bytes(
+            started + Duration::from_millis(200),
+            StreamingInterpolationCurve::Linear,
+        ));
+        let paced_from = pending.paced_from;
+        pending.rebase(
+            "abcdefghijkl".to_owned(),
+            started + Duration::from_millis(200),
+            10,
+            Duration::from_secs(1),
+            destination,
+        );
+
+        assert_eq!(pending.paced_from, paced_from);
+        assert_eq!(
+            pending.due_bytes(
+                started + Duration::from_millis(300),
+                StreamingInterpolationCurve::Linear,
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn backlog_catch_up_reaches_target_within_ceiling() {
+        let started = Instant::now();
+        let target = "x".repeat(2_000);
+        let pending = PendingTextPresentation::new(
+            target.clone(),
+            0,
+            started,
+            1,
+            Duration::from_millis(StreamingPresentationPolicy::MAX_LAG_MS),
+            PendingTextDestination::Transcript {
+                turn_id: "turn-1".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            pending.due_bytes(
+                started + Duration::from_millis(StreamingPresentationPolicy::MAX_LAG_MS),
+                StreamingInterpolationCurve::Linear,
+            ),
+            target.len()
+        );
+    }
+
+    #[test]
+    fn pacing_reveals_only_complete_grapheme_clusters() {
+        let started = Instant::now();
+        let target = "👩🏽‍💻e\u{301}終";
+        let pending = PendingTextPresentation::new(
+            target.to_owned(),
+            0,
+            started,
+            3,
+            Duration::from_secs(1),
+            PendingTextDestination::Transcript {
+                turn_id: "turn-1".to_owned(),
+            },
+        );
+
+        let first = pending.due_bytes(
+            started + Duration::from_millis(334),
+            StreamingInterpolationCurve::Linear,
+        );
+        let second = pending.due_bytes(
+            started + Duration::from_millis(667),
+            StreamingInterpolationCurve::Linear,
+        );
+        assert_eq!(&target[..first], "👩🏽‍💻");
+        assert_eq!(&target[..second], "👩🏽‍💻e\u{301}");
+        assert_eq!(
+            pending.due_bytes(
+                started + Duration::from_secs(1),
+                StreamingInterpolationCurve::Linear,
+            ),
+            target.len()
+        );
+    }
+
+    #[test]
+    fn durable_segment_mid_pace_preserves_visible_prefix_and_exact_target() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "durable target".to_owned(),
+                },
+            },
+        ));
+        let visible_before = transcript_item_text(view.snapshot(), &id)
+            .expect("visible assistant prefix")
+            .to_owned();
+
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-1".to_owned(),
+                segment_order: 0,
+                text: "durable target extended".to_owned(),
+            },
+        ));
+
+        let visible_after = transcript_item_text(view.snapshot(), &id)
+            .expect("visible assistant prefix after durable event");
+        assert_eq!(visible_after, visible_before);
+        let pending = view
+            .pending_text_presentations
+            .get(&id)
+            .expect("durable target remains paced");
+        assert_eq!(pending.target, "durable target extended");
+        let deadline = pending.paced_from + pending.max_lag;
+        assert!(view.advance_streaming_presentation(deadline));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("durable target extended")
+        );
+    }
+
+    #[test]
+    fn zero_rate_policy_presents_immediately() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(
+            !view.set_streaming_presentation_policy(StreamingPresentationPolicy {
+                enabled: true,
+                graphemes_per_second: 0,
+                ..StreamingPresentationPolicy::default()
+            })
+        );
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "whole chunk".to_owned(),
+                },
+            },
+        ));
+
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("whole chunk")
+        );
+        assert!(view.pending_text_presentations.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_replaces_pending_presentation_immediately() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "pending text".to_owned(),
+                },
+            },
+        ));
+        assert!(view.pending_text_presentations.contains_key(&id));
+
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 2,
+                revision: 2,
+                operation: bcode_session_models::TextStreamOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "hydrated checkpoint".to_owned(),
+                    total_bytes: "hydrated checkpoint".len(),
+                    truncated: false,
+                },
+            },
+        ));
+
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("hydrated checkpoint")
+        );
+        assert!(!view.pending_text_presentations.contains_key(&id));
+    }
+
+    #[test]
+    fn stream_terminal_keeps_committed_text_pacing_until_turn_finish() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "committed output".to_owned(),
+                },
+            },
+        ));
+        let visible_before_terminal = transcript_item_text(view.snapshot(), &id)
+            .expect("visible prefix")
+            .to_owned();
+
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 2,
+                revision: 2,
+                operation: bcode_session_models::TextStreamOperation::Terminal {
+                    status: bcode_session_models::TextStreamTerminalStatus::Completed,
+                },
+            },
+        ));
+
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some(visible_before_terminal.as_str())
+        );
+        assert!(view.pending_text_presentations.contains_key(&id));
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn-1".to_owned(),
+                outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                message: None,
+            },
+        ));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("committed output")
+        );
+        assert!(!view.pending_text_presentations.contains_key(&id));
+    }
+
+    #[test]
     fn policy_disable_flushes_pending_text_immediately() {
         let session_id = SessionId::new();
         let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
