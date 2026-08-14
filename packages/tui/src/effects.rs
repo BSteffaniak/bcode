@@ -109,6 +109,13 @@ pub enum TuiEffect {
     },
     /// Clear the interactive theme selection and restore the configured default.
     ClearThemeSelection,
+    /// Persist one interactive streaming-presentation policy to user state.
+    PersistStreamingPresentation {
+        /// Normalized renderer-neutral presentation policy.
+        policy: bcode_session_view_models::StreamingPresentationPolicy,
+    },
+    /// Clear the interactive streaming-presentation override.
+    ClearStreamingPresentation,
     /// Reconcile auth security status for a loaded config.
     ReconcileAuthSecurity {
         /// Loaded configuration.
@@ -485,11 +492,21 @@ pub enum TuiEffectResult {
         config: Box<Result<bcode_config::BcodeConfig, String>>,
         /// Global interactive theme selection load result.
         theme_selection: Result<Option<String>, String>,
+        /// Global interactive streaming-presentation override load result.
+        streaming_presentation:
+            Result<Option<bcode_session_view_models::StreamingPresentationPolicy>, String>,
     },
     /// Durable TUI theme state update completed.
     ThemeSelectionPersisted {
         /// Stable base theme id requested by the user, or none when cleared.
         name: Option<String>,
+        /// State write result.
+        result: Result<std::path::PathBuf, String>,
+    },
+    /// Durable streaming-presentation state update completed.
+    StreamingPresentationPersisted {
+        /// Policy requested by the user, or none when cleared.
+        policy: Option<bcode_session_view_models::StreamingPresentationPolicy>,
         /// State write result.
         result: Result<std::path::PathBuf, String>,
     },
@@ -885,6 +902,7 @@ impl TuiEffectResult {
             }
             Self::ConfigLoaded { .. }
             | Self::ThemeSelectionPersisted { .. }
+            | Self::StreamingPresentationPersisted { .. }
             | Self::AuthSecurityReconciled { .. }
             | Self::SlashPaletteLoaded { .. }
             | Self::CommandPaletteLoaded { .. }
@@ -977,6 +995,7 @@ enum EffectKey {
     SessionOpen,
     Config,
     ThemeSelection,
+    StreamingPresentation,
     AuthSecurity,
     DraftStatus,
     SessionStatus,
@@ -1180,6 +1199,8 @@ impl TuiEffect {
             Self::LoadConfig
             | Self::PersistThemeSelection { .. }
             | Self::ClearThemeSelection
+            | Self::PersistStreamingPresentation { .. }
+            | Self::ClearStreamingPresentation
             | Self::ReconcileAuthSecurity { .. }
             | Self::LoadOlderHistory { .. }
             | Self::LoadNewerHistory { .. }
@@ -1247,6 +1268,8 @@ impl TuiEffect {
             | Self::LoadConfig
             | Self::PersistThemeSelection { .. }
             | Self::ClearThemeSelection
+            | Self::PersistStreamingPresentation { .. }
+            | Self::ClearStreamingPresentation
             | Self::ReconcileAuthSecurity { .. }
             | Self::LoadSessionModelStatus { .. }
             | Self::LoadPluginStatus { .. }
@@ -1455,6 +1478,9 @@ impl TuiEffect {
             Self::PersistThemeSelection { .. } | Self::ClearThemeSelection => {
                 EffectKey::ThemeSelection
             }
+            Self::PersistStreamingPresentation { .. } | Self::ClearStreamingPresentation => {
+                EffectKey::StreamingPresentation
+            }
             Self::ReconcileAuthSecurity { .. } => EffectKey::AuthSecurity,
             Self::LoadDraftStatus { .. } => EffectKey::DraftStatus,
             Self::LoadSessionStatus { .. } => EffectKey::SessionStatus,
@@ -1560,6 +1586,8 @@ impl TuiEffect {
                 config: Box::new(bcode_config::load_config().map_err(|error| error.to_string())),
                 theme_selection: bcode_config::load_tui_theme_selection()
                     .map_err(|error| error.to_string()),
+                streaming_presentation: bcode_config::load_tui_streaming_presentation_override()
+                    .map_err(|error| error.to_string()),
             },
             Self::PersistThemeSelection { name } => TuiEffectResult::ThemeSelectionPersisted {
                 result: bcode_config::set_tui_theme_selection(&name)
@@ -1570,6 +1598,18 @@ impl TuiEffect {
                 result: bcode_config::clear_tui_theme_selection()
                     .map_err(|error| error.to_string()),
                 name: None,
+            },
+            Self::PersistStreamingPresentation { policy } => {
+                TuiEffectResult::StreamingPresentationPersisted {
+                    result: bcode_config::set_tui_streaming_presentation_override(policy)
+                        .map_err(|error| error.to_string()),
+                    policy: Some(policy.normalized()),
+                }
+            }
+            Self::ClearStreamingPresentation => TuiEffectResult::StreamingPresentationPersisted {
+                result: bcode_config::clear_tui_streaming_presentation_override()
+                    .map_err(|error| error.to_string()),
+                policy: None,
             },
             Self::ReconcileAuthSecurity { config } => TuiEffectResult::AuthSecurityReconciled {
                 status: session_flow::auth_security_status(&config),

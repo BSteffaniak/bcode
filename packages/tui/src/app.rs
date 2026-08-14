@@ -1397,9 +1397,17 @@ impl BmuxApp {
 
     /// Apply renderer-neutral presentation configuration.
     pub fn apply_presentation_config(&mut self, config: bcode_config::PresentationConfig) -> bool {
+        self.apply_streaming_presentation_policy(config.streaming.policy())
+    }
+
+    /// Apply one normalized renderer-neutral streaming-presentation policy.
+    pub fn apply_streaming_presentation_policy(
+        &mut self,
+        policy: bcode_session_view_models::StreamingPresentationPolicy,
+    ) -> bool {
         let changed = self
             .session_view
-            .set_streaming_presentation_policy(config.streaming.policy());
+            .set_streaming_presentation_policy(policy.normalized());
         if changed {
             let _ = self.apply_session_view_terminal_adapter();
         }
@@ -4807,6 +4815,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::SessionRenamed { .. }
         | SessionEventKind::SessionImported { .. }
         | SessionEventKind::SessionForked { .. }
+        | SessionEventKind::SessionDerived { .. }
         | SessionEventKind::ExecutionSessionCreated { .. }
         | SessionEventKind::SkillActivated { .. }
         | SessionEventKind::SkillDeactivated { .. }

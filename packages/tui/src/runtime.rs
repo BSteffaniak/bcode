@@ -109,6 +109,8 @@ struct InitializedTui {
     client: BcodeClient,
     settings: chat_loop::TuiRuntimeSettings,
     chat: session_flow::ActiveChat,
+    declarative_streaming_policy: bcode_session_view_models::StreamingPresentationPolicy,
+    streaming_presentation_override: Option<bcode_session_view_models::StreamingPresentationPolicy>,
 }
 
 fn initialize_tui(
@@ -117,6 +119,7 @@ fn initialize_tui(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
 ) -> InitializedTui {
     let config = bcode_config::load_config();
+    let streaming_presentation_override = bcode_config::load_tui_streaming_presentation_override();
     let client = config
         .as_ref()
         .map_or_else(
@@ -168,11 +171,28 @@ fn initialize_tui(
         opening_session_anchor_sequence: None,
         pending_effects: TuiEffectQueue::default(),
     };
+    let mut declarative_streaming_policy =
+        bcode_session_view_models::StreamingPresentationPolicy::default();
+    let mut effective_streaming_override = None;
     match config {
         Ok(config) => {
             settings.apply_tui_config(&config.tui);
             chat.app.apply_tui_config(config.tui.clone());
-            let _ = chat.app.apply_presentation_config(config.presentation);
+            declarative_streaming_policy = config.presentation.streaming.policy();
+            match streaming_presentation_override {
+                Ok(streaming_override) => {
+                    effective_streaming_override = streaming_override;
+                    let effective = streaming_override.unwrap_or(declarative_streaming_policy);
+                    let _ = chat.app.apply_streaming_presentation_policy(effective);
+                }
+                Err(error) => {
+                    let _ = chat
+                        .app
+                        .apply_streaming_presentation_policy(declarative_streaming_policy);
+                    chat.app
+                        .set_status(format!("TUI streaming state unavailable: {error}"));
+                }
+            }
             chat.start_effect(TuiEffect::ReconcileAuthSecurity {
                 config: Box::new(config),
             });
@@ -197,6 +217,8 @@ fn initialize_tui(
         client,
         settings,
         chat,
+        declarative_streaming_policy,
+        streaming_presentation_override: effective_streaming_override,
     }
 }
 
@@ -209,11 +231,13 @@ async fn run_root<W: Write>(
         .client
         .clone()
         .with_daemon_availability(DaemonAvailability::RequireRunning);
-    let loop_state = chat_loop::ChatLoopState::new(
+    let mut loop_state = chat_loop::ChatLoopState::new(
         &initialized.client,
         &passive_client,
         initialized.settings.metrics_enabled(),
     );
+    loop_state.declarative_streaming_policy = initialized.declarative_streaming_policy;
+    loop_state.streaming_presentation_override = initialized.streaming_presentation_override;
     let mut model =
         root_program::BcodeRuntimeModel::new(initialized.chat, initialized.settings, loop_state);
     if let StartupTuiAction::OpenRalphHome { repo_path } = startup_action {

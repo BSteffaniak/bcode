@@ -250,6 +250,9 @@ pub struct ChatLoopState {
     telemetry: super::telemetry::TuiTelemetry,
     runtime_stats: super::runtime_adapter::RuntimeStatsRecorder,
     request_draft_handoff: RequestDraftHandoff,
+    pub(super) declarative_streaming_policy: bcode_session_view_models::StreamingPresentationPolicy,
+    pub(super) streaming_presentation_override:
+        Option<bcode_session_view_models::StreamingPresentationPolicy>,
     frame_index: u64,
 }
 
@@ -296,8 +299,28 @@ impl ChatLoopState {
             telemetry: super::telemetry::TuiTelemetry::new(passive_client.clone(), metrics_enabled),
             runtime_stats: super::runtime_adapter::RuntimeStatsRecorder::default(),
             request_draft_handoff: RequestDraftHandoff::default(),
+            declarative_streaming_policy:
+                bcode_session_view_models::StreamingPresentationPolicy::default(),
+            streaming_presentation_override: None,
             frame_index: 0,
         }
+    }
+
+    pub fn request_streaming_presentation_override(
+        &mut self,
+        chat: &mut ActiveChat,
+        policy: bcode_session_view_models::StreamingPresentationPolicy,
+    ) {
+        let policy = policy.normalized();
+        let _ = chat.app.apply_streaming_presentation_policy(policy);
+        chat.replace_effect(TuiEffect::PersistStreamingPresentation { policy });
+    }
+
+    pub fn request_clear_streaming_presentation_override(&mut self, chat: &mut ActiveChat) {
+        let _ = chat
+            .app
+            .apply_streaming_presentation_policy(self.declarative_streaming_policy);
+        chat.replace_effect(TuiEffect::ClearStreamingPresentation);
     }
 
     pub fn mark_presentation_committed(&mut self) {
@@ -2217,8 +2240,16 @@ pub fn apply_effect_result(
         TuiEffectResult::ConfigLoaded {
             config,
             theme_selection,
+            streaming_presentation,
         } => {
-            apply_config_result(settings, chat, loop_state, *config, theme_selection);
+            apply_config_result(
+                settings,
+                chat,
+                loop_state,
+                *config,
+                theme_selection,
+                streaming_presentation,
+            );
         }
         TuiEffectResult::ThemeSelectionPersisted { name, result } => match result {
             Ok(path) => {
@@ -2248,6 +2279,25 @@ pub fn apply_effect_result(
                 chat.app
                     .set_status(format!("could not save theme {action}: {error}"));
             }
+        },
+        TuiEffectResult::StreamingPresentationPersisted { policy, result } => match result {
+            Ok(path) => {
+                loop_state.streaming_presentation_override = policy;
+                let effective = policy.unwrap_or(loop_state.declarative_streaming_policy);
+                let _ = chat.app.apply_streaming_presentation_policy(effective);
+                let action = if policy.is_some() {
+                    "streaming presentation saved"
+                } else {
+                    "streaming presentation override cleared"
+                };
+                chat.app.set_status(format!(
+                    "{action} in {}",
+                    bcode_plugin_sdk::path::display_from_current_dir(&path)
+                ));
+            }
+            Err(error) => chat
+                .app
+                .set_status(format!("could not update streaming presentation: {error}")),
         },
         TuiEffectResult::AuthSecurityReconciled { status } => {
             apply_auth_security_result(chat, status);
@@ -2793,6 +2843,10 @@ pub fn apply_config_result(
     loop_state: &mut ChatLoopState,
     config: Result<bcode_config::BcodeConfig, String>,
     theme_selection: Result<Option<String>, String>,
+    streaming_presentation: Result<
+        Option<bcode_session_view_models::StreamingPresentationPolicy>,
+        String,
+    >,
 ) {
     match config {
         Ok(config) => {
@@ -2838,7 +2892,23 @@ pub fn apply_config_result(
             if let Some(surface) = loop_state.interactive_surface.as_mut() {
                 surface.update_keymap(&settings.keymap);
             }
-            let _ = chat.app.apply_presentation_config(config.presentation);
+            loop_state.declarative_streaming_policy = config.presentation.streaming.policy();
+            match streaming_presentation {
+                Ok(streaming_override) => {
+                    loop_state.streaming_presentation_override = streaming_override;
+                    let effective =
+                        streaming_override.unwrap_or(loop_state.declarative_streaming_policy);
+                    let _ = chat.app.apply_streaming_presentation_policy(effective);
+                }
+                Err(error) => {
+                    loop_state.streaming_presentation_override = None;
+                    let _ = chat.app.apply_streaming_presentation_policy(
+                        loop_state.declarative_streaming_policy,
+                    );
+                    chat.app
+                        .set_status(format!("TUI streaming state unavailable: {error}"));
+                }
+            }
             chat.replace_effect(TuiEffect::ReconcileAuthSecurity {
                 config: Box::new(config),
             });

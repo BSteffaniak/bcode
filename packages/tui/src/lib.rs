@@ -85,6 +85,7 @@ pub(crate) mod slash_palette;
 pub(crate) mod slash_palette_render;
 pub(crate) mod slash_registry;
 pub(crate) mod startup_action;
+pub(crate) mod streaming_configurator;
 pub(crate) mod telemetry;
 pub(crate) mod temporal;
 #[cfg(test)]
