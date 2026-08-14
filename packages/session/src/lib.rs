@@ -59,13 +59,17 @@ pub use attachment::{
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_session_models::{
     ClientId, EXECUTION_SESSION_PROVENANCE_VERSION, ExecutionSessionContextMode,
-    ExecutionSessionProvenance, ProjectionWindow, ProjectionWindowRequest, SessionEvent,
-    SessionEventKind, SessionEventProvenance, SessionForkKind, SessionHistoryAroundQuery,
-    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
-    SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionInspectionPage,
-    SessionInspectionQuery, SessionLiveEvent, SessionLiveEventKind, SessionMigrationProgress,
-    SessionMigrationStage, SessionOpenOperationId, SessionOpenOperationSnapshot,
-    SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource, SessionVisibility,
+    ExecutionSessionProvenance, MAX_SESSION_DERIVATION_PROMPT_CANDIDATES,
+    MAX_SESSION_DERIVATION_PROMPT_PREVIEW_BYTES, ProjectionWindow, ProjectionWindowRequest,
+    SESSION_DERIVATION_CONTRACT_VERSION, SessionDerivationPromptCandidate,
+    SessionDerivationPromptPage, SessionDerivationPromptQuery, SessionDerivationSourceSnapshot,
+    SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind,
+    SessionHistoryAroundQuery, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
+    SessionHistoryWindow, SessionId, SessionImportSummary, SessionInputHistoryEntry,
+    SessionInspectionPage, SessionInspectionQuery, SessionLiveEvent, SessionLiveEventKind,
+    SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
+    SessionOpenOperationSnapshot, SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource,
+    SessionVisibility,
 };
 pub use catalog::{
     CatalogLoadStatus, SessionCatalogEntry, SessionCatalogLoadStatus, SessionHealth,
@@ -458,12 +462,48 @@ pub enum SessionError {
         expected: u64,
         current: u64,
     },
+    /// A bounded derivation prompt query exceeded its portable contract limit.
+    #[error("session derivation prompt limit {actual} exceeds maximum {maximum}")]
+    DerivationPromptLimit { actual: usize, maximum: usize },
+    /// A bounded derivation read no longer matches the selected source generation.
+    #[error(
+        "session derivation source generation changed: {session_id} expected={expected} current={current}"
+    )]
+    DerivationGenerationChanged {
+        session_id: SessionId,
+        expected: u64,
+        current: u64,
+    },
     /// Background execution-session provenance is malformed or inconsistent.
     #[error("invalid execution session provenance: {0}")]
     InvalidExecutionSessionProvenance(String),
     /// Session is owned by another daemon or cannot be leased.
     #[error(transparent)]
     Lease(#[from] lease::SessionLeaseError),
+}
+
+fn session_derivation_prompt_candidate(
+    entry: &SessionInputHistoryEntry,
+) -> SessionDerivationPromptCandidate {
+    let (preview, truncated) =
+        bounded_utf8_prefix(&entry.text, MAX_SESSION_DERIVATION_PROMPT_PREVIEW_BYTES);
+    SessionDerivationPromptCandidate {
+        sequence: entry.sequence,
+        timestamp_ms: entry.timestamp_ms,
+        preview,
+        truncated,
+    }
+}
+
+fn bounded_utf8_prefix(value: &str, maximum_bytes: usize) -> (String, bool) {
+    if value.len() <= maximum_bytes {
+        return (value.to_owned(), false);
+    }
+    let mut end = maximum_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    (value[..end].to_owned(), true)
 }
 
 /// Input for appending a tool-call request event.
@@ -2340,6 +2380,87 @@ impl SessionManager {
             .await
     }
 
+    /// Capture a bounded stable snapshot of one current source session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist or a bounded tail read
+    /// fails.
+    pub async fn session_derivation_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionDerivationSourceSnapshot, SessionError> {
+        let summary = self.session_summary(session_id).await?;
+        let generation = self.current_session_generation(session_id).await?;
+        Ok(SessionDerivationSourceSnapshot {
+            version: SESSION_DERIVATION_CONTRACT_VERSION,
+            session_id,
+            generation,
+            latest_sequence: generation,
+            title: Some(summary.display_title().to_owned()),
+            working_directory: summary.working_directory,
+        })
+    }
+
+    /// Return a bounded newest-first page of prompt candidates pinned to one source generation.
+    ///
+    /// Candidate previews are UTF-8 safe and bounded. The generation is checked before and after
+    /// the bounded projection read so concurrent source mutation fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source does not exist, the requested limit exceeds the portable
+    /// bound, or the source generation differs from the requested generation.
+    pub async fn session_derivation_prompt_candidates(
+        &self,
+        session_id: SessionId,
+        query: SessionDerivationPromptQuery,
+    ) -> Result<SessionDerivationPromptPage, SessionError> {
+        if query.limit > MAX_SESSION_DERIVATION_PROMPT_CANDIDATES {
+            return Err(SessionError::DerivationPromptLimit {
+                actual: query.limit,
+                maximum: MAX_SESSION_DERIVATION_PROMPT_CANDIDATES,
+            });
+        }
+        let before = self.current_session_generation(session_id).await?;
+        if before != query.generation {
+            return Err(SessionError::DerivationGenerationChanged {
+                session_id,
+                expected: query.generation,
+                current: before,
+            });
+        }
+        let fetch_limit = query.limit.saturating_add(1);
+        let history = self
+            .session_handle(session_id)
+            .await?
+            .input_history_page(query.before_sequence, fetch_limit)
+            .await?;
+        let has_more = history.len() > query.limit;
+        let candidates = history
+            .into_iter()
+            .take(query.limit)
+            .map(|entry| session_derivation_prompt_candidate(&entry))
+            .collect::<Vec<_>>();
+        let after = self.current_session_generation(session_id).await?;
+        if after != query.generation {
+            return Err(SessionError::DerivationGenerationChanged {
+                session_id,
+                expected: query.generation,
+                current: after,
+            });
+        }
+        Ok(SessionDerivationPromptPage {
+            session_id,
+            generation: query.generation,
+            next_before_sequence: has_more
+                .then(|| candidates.last().map(|candidate| candidate.sequence))
+                .flatten(),
+            candidates,
+            has_more,
+        })
+    }
+
     /// Return user-submitted prompts for input-history navigation.
     ///
     /// # Errors
@@ -2714,8 +2835,9 @@ mod tests {
     };
     use bcode_metrics::MetricsRegistry;
     use bcode_session_models::{
-        ExecutionSessionContextMode, ExecutionSessionProvenance, SessionSummary,
-        SessionTitleSource, SessionVisibility,
+        ExecutionSessionContextMode, ExecutionSessionProvenance,
+        MAX_SESSION_DERIVATION_PROMPT_CANDIDATES, MAX_SESSION_DERIVATION_PROMPT_PREVIEW_BYTES,
+        SessionDerivationPromptQuery, SessionSummary, SessionTitleSource, SessionVisibility,
     };
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -6442,6 +6564,101 @@ mod tests {
         assert!(!encoded.contains("encrypted_content"));
         assert!(!encoded.contains("provider_state"));
         assert!(!encoded.contains("encrypted-sentinel-do-not-expose"));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn derivation_snapshot_and_prompt_candidates_are_bounded_and_generation_pinned() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("source".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        manager
+            .append_user_message(session.id, ClientId::new(), "first".to_owned())
+            .await
+            .expect("first prompt");
+        manager
+            .append_user_message(
+                session.id,
+                ClientId::new(),
+                "é".repeat(MAX_SESSION_DERIVATION_PROMPT_PREVIEW_BYTES),
+            )
+            .await
+            .expect("large prompt");
+
+        let snapshot = manager
+            .session_derivation_snapshot(session.id)
+            .await
+            .expect("snapshot");
+        let first_page = manager
+            .session_derivation_prompt_candidates(
+                session.id,
+                SessionDerivationPromptQuery {
+                    generation: snapshot.generation,
+                    before_sequence: None,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("first page");
+        assert_eq!(first_page.candidates.len(), 1);
+        assert!(first_page.candidates[0].truncated);
+        assert!(
+            first_page.candidates[0]
+                .preview
+                .is_char_boundary(first_page.candidates[0].preview.len())
+        );
+        assert!(first_page.has_more);
+        let second_page = manager
+            .session_derivation_prompt_candidates(
+                session.id,
+                SessionDerivationPromptQuery {
+                    generation: snapshot.generation,
+                    before_sequence: first_page.next_before_sequence,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("second page");
+        assert_eq!(second_page.candidates[0].preview, "first");
+        assert!(!second_page.has_more);
+
+        manager
+            .append_assistant_message(session.id, "changed".to_owned())
+            .await
+            .expect("source mutation");
+        assert!(matches!(
+            manager
+                .session_derivation_prompt_candidates(
+                    session.id,
+                    SessionDerivationPromptQuery {
+                        generation: snapshot.generation,
+                        before_sequence: None,
+                        limit: 1,
+                    },
+                )
+                .await,
+            Err(SessionError::DerivationGenerationChanged { .. })
+        ));
+        assert!(matches!(
+            manager
+                .session_derivation_prompt_candidates(
+                    session.id,
+                    SessionDerivationPromptQuery {
+                        generation: manager
+                            .current_session_generation(session.id)
+                            .await
+                            .expect("generation"),
+                        before_sequence: None,
+                        limit: MAX_SESSION_DERIVATION_PROMPT_CANDIDATES + 1,
+                    },
+                )
+                .await,
+            Err(SessionError::DerivationPromptLimit { .. })
+        ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

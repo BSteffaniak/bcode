@@ -2181,6 +2181,29 @@ impl SessionDb {
         rows.iter().map(input_history_entry_from_row).collect()
     }
 
+    /// Return one bounded newest-first page from the input-history projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bounded projection query fails.
+    pub async fn input_history_page(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> SessionDbResult<Vec<SessionInputHistoryEntry>> {
+        let mut select = self
+            .db
+            .select("input_messages")
+            .columns(&["event_seq", "created_at_ms", "text"])
+            .sort("input_seq", SortDirection::Desc)
+            .limit(limit);
+        if let Some(before_sequence) = before_sequence {
+            select = select.where_lt("event_seq", seq_to_value(before_sequence));
+        }
+        let rows = select.execute(&**self.db).await?;
+        rows.iter().map(input_history_entry_from_row).collect()
+    }
+
     /// Return `(created_at_ms, updated_at_ms)` from stored event activity timestamps.
     ///
     /// # Errors

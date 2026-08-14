@@ -421,6 +421,19 @@ impl SessionHandle {
         self.send(SessionCommand::InputHistory).await?
     }
 
+    pub async fn input_history_page(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
+        self.send(|reply| SessionCommand::InputHistoryPage {
+            before_sequence,
+            limit,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn current_context_epoch(&self) -> Result<u64, SessionError> {
         self.send(SessionCommand::CurrentContextEpoch).await?
     }
@@ -627,6 +640,11 @@ enum SessionCommand {
         reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
     },
     InputHistory(oneshot::Sender<Result<Vec<SessionInputHistoryEntry>, SessionError>>),
+    InputHistoryPage {
+        before_sequence: Option<u64>,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<SessionInputHistoryEntry>, SessionError>>,
+    },
     CurrentContextEpoch(oneshot::Sender<Result<u64, SessionError>>),
     CurrentRequestContextOccupancy(
         oneshot::Sender<
@@ -855,6 +873,13 @@ impl SessionActor {
             }
             SessionCommand::InputHistory(reply) => {
                 let _ = reply.send(self.input_history().await);
+            }
+            SessionCommand::InputHistoryPage {
+                before_sequence,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(self.input_history_page(before_sequence, limit).await);
             }
             SessionCommand::CurrentContextEpoch(reply) => {
                 let result = if let Ok(Some(db)) = self.existing_session_db().await {
@@ -1749,6 +1774,37 @@ impl SessionActor {
         }
         if self.store.is_some() {
             return Err(SessionError::NotFound(self.state.summary.id));
+        }
+        Err(SessionError::NotFound(self.state.summary.id))
+    }
+
+    async fn input_history_page(
+        &mut self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
+        if let Some(db) = self.existing_session_db().await? {
+            let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
+            let checkpoint = db
+                .materialized_projection_checkpoint(MaterializedProjection::InputHistory)
+                .await?;
+            if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
+                return Ok(db.input_history_page(before_sequence, limit).await?);
+            }
+            return Err(SessionError::ProjectionStale {
+                session_id: self.state.summary.id,
+                projection: "input_history",
+                checkpoint,
+                expected: expected_last_sequence,
+            });
+        }
+        if let Some(events) = &self.state.events {
+            return Ok(input_history_from_events(events)
+                .into_iter()
+                .rev()
+                .filter(|entry| before_sequence.is_none_or(|before| entry.sequence < before))
+                .take(limit)
+                .collect());
         }
         Err(SessionError::NotFound(self.state.summary.id))
     }
