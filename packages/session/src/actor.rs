@@ -272,6 +272,14 @@ impl SessionHandle {
         .await?
     }
 
+    pub(crate) async fn append_event_batch_with_provenance(
+        &self,
+        events: Vec<(SessionEventKind, Option<SessionEventProvenance>, u64)>,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.send(|reply| SessionCommand::AppendEventBatch { events, reply })
+            .await?
+    }
+
     pub async fn append_tool_invocation_result(
         &self,
         record: bcode_session_models::ToolInvocationResultRecord,
@@ -584,6 +592,10 @@ enum SessionCommand {
         activity_timestamp_ms: u64,
         reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
     },
+    AppendEventBatch {
+        events: Vec<(SessionEventKind, Option<SessionEventProvenance>, u64)>,
+        reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
+    },
     AppendToolInvocationResult {
         record: bcode_session_models::ToolInvocationResultRecord,
         activity_timestamp_ms: u64,
@@ -766,6 +778,9 @@ impl SessionActor {
                         .await,
                 );
             }
+            SessionCommand::AppendEventBatch { events, reply } => {
+                let _ = reply.send(self.append_event_batch(events).await);
+            }
             SessionCommand::AppendToolInvocationResult {
                 record,
                 activity_timestamp_ms,
@@ -821,6 +836,7 @@ impl SessionActor {
     async fn handle_read_command(&mut self, command: SessionCommand) -> bool {
         match command {
             SessionCommand::AppendEvent { .. }
+            | SessionCommand::AppendEventBatch { .. }
             | SessionCommand::AppendToolInvocationResult { .. }
             | SessionCommand::AppendUserMessage { .. }
             | SessionCommand::Attach { .. }
@@ -1289,6 +1305,67 @@ impl SessionActor {
             activity_timestamp_ms,
         )
         .await
+    }
+
+    async fn append_event_batch(
+        &mut self,
+        events: Vec<(SessionEventKind, Option<SessionEventProvenance>, u64)>,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.ensure_ownership()?;
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
+        for (kind, _, _) in &events {
+            crate::ensure_durable_session_event_kind(kind, metrics.as_ref())?;
+        }
+        let Some(store) = self.store.clone() else {
+            let mut persisted = Vec::with_capacity(events.len());
+            for (kind, provenance, activity_timestamp_ms) in events {
+                let event_timestamp_ms = provenance
+                    .as_ref()
+                    .and_then(|provenance| provenance.source_timestamp_ms)
+                    .unwrap_or(activity_timestamp_ms);
+                let mut event = self.state.build_next_event(kind, event_timestamp_ms);
+                event.provenance = provenance;
+                self.state
+                    .apply_persisted_event(event.clone(), activity_timestamp_ms);
+                persisted.push(event);
+            }
+            self.refresh_snapshot();
+            return Ok(persisted);
+        };
+        let _write_guard =
+            crate::lease::acquire_session_write_lock(&store.root_path(), self.state.summary.id)?;
+        let db = self.session_db_for_write().await?;
+        self.refresh_state_from_db_for_write(&db).await?;
+        let mut built = Vec::with_capacity(events.len());
+        let mut preview = self.state.clone();
+        for (kind, provenance, activity_timestamp_ms) in events {
+            let event_timestamp_ms = provenance
+                .as_ref()
+                .and_then(|provenance| provenance.source_timestamp_ms)
+                .unwrap_or(activity_timestamp_ms);
+            let mut event = preview.build_next_event(kind, event_timestamp_ms);
+            event.provenance = provenance;
+            preview.apply_persisted_event(event.clone(), activity_timestamp_ms);
+            built.push((event, Some(event_timestamp_ms)));
+        }
+        db.append_event_batch(&built).await?;
+        for (event, activity_timestamp_ms) in &built {
+            self.state.apply_persisted_event(
+                event.clone(),
+                activity_timestamp_ms.unwrap_or(event.timestamp_ms),
+            );
+            self.retire_live_text_checkpoint_for_durable_event(&event.kind);
+            if let Some(metrics) = &metrics {
+                crate::record_session_event_domain_metrics(metrics, event);
+            }
+        }
+        self.update_manifest_and_schedule_catalog().await;
+        self.state.load_status = SessionLoadStatusKind::Current;
+        self.refresh_snapshot();
+        Ok(built.into_iter().map(|(event, _)| event).collect())
     }
 
     async fn append_event(

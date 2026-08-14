@@ -2043,6 +2043,38 @@ impl SessionDb {
         self.append_event_with_activity_timestamp(event, None).await
     }
 
+    /// Append one bounded contiguous event batch and update all projections atomically.
+    ///
+    /// The entire batch uses one database transaction. Every event is validated against canonical
+    /// and projection state produced by the preceding event in the same transaction. An empty
+    /// batch is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writer compatibility, event ordering, serialization, projection
+    /// updates, postconditions, or commit fail. Any error rolls back the complete batch.
+    pub(crate) async fn append_event_batch(
+        &self,
+        events: &[(SessionEvent, Option<u64>)],
+    ) -> SessionDbResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin_transaction().await?;
+        validate_storage_writer_contract(&*tx).await?;
+        for (event, activity_timestamp_ms) in events {
+            validate_append_preconditions_without_writer(&*tx, event).await?;
+            insert_event(&*tx, event, *activity_timestamp_ms).await?;
+            project_materialized_event(&*tx, event).await?;
+            project_model_context_event(&*tx, event).await?;
+            project_context_occupancy_event(&*tx, event).await?;
+            project_turn_receipt(&*tx, event).await?;
+            validate_append_postconditions(&*tx, event).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Append an event with the manager-assigned activity timestamp.
     ///
     /// # Errors
@@ -5629,6 +5661,87 @@ mod tests {
             .await
             .expect("raw rows should remain");
         assert_eq!(raw_rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn append_event_batch_is_atomic_and_updates_projections() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let events = vec![
+            (
+                event(
+                    session_id,
+                    0,
+                    SessionEventKind::SessionCreated {
+                        name: Some("batch".to_owned()),
+                        working_directory: temp_dir.path().to_path_buf(),
+                    },
+                ),
+                Some(10),
+            ),
+            (
+                event(
+                    session_id,
+                    1,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: "hello".to_owned(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                ),
+                Some(11),
+            ),
+            (
+                event(
+                    session_id,
+                    2,
+                    SessionEventKind::AssistantMessage {
+                        text: "hi".to_owned(),
+                    },
+                ),
+                Some(12),
+            ),
+        ];
+        db.append_event_batch(&events).await.expect("batch append");
+        assert_eq!(db.all_events().await.expect("history").len(), 3);
+        assert_eq!(db.input_history().await.expect("input history").len(), 1);
+        assert_eq!(
+            db.materialized_projection_checkpoint(MaterializedProjection::Transcript)
+                .await
+                .expect("checkpoint"),
+            Some(2)
+        );
+
+        let invalid = vec![
+            (
+                event(
+                    session_id,
+                    3,
+                    SessionEventKind::AssistantMessage {
+                        text: "rolled back".to_owned(),
+                    },
+                ),
+                None,
+            ),
+            (
+                event(
+                    session_id,
+                    5,
+                    SessionEventKind::AssistantMessage {
+                        text: "gap".to_owned(),
+                    },
+                ),
+                None,
+            ),
+        ];
+        assert!(db.append_event_batch(&invalid).await.is_err());
+        assert_eq!(
+            db.all_events().await.expect("history after rollback").len(),
+            3
+        );
     }
 
     #[tokio::test]

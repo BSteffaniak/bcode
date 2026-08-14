@@ -2628,6 +2628,19 @@ pub fn apply_effect_result(
                         bcode_command::CommandEffect::ToggleSurface { surface_id } => chat
                             .app
                             .set_status(format!("surface toggle requested: {surface_id}")),
+                        bcode_command::CommandEffect::OpenSession { session_id, focus } => {
+                            super::session_flow::start_switch_session(
+                                chat,
+                                session_id,
+                                super::session_flow::initial_transcript_window_request(
+                                    bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+                                ),
+                            );
+                            if focus == bcode_command::SessionOpenFocus::Composer {
+                                chat.app
+                                    .set_status("session opened; composer ready".to_owned());
+                            }
+                        }
                         bcode_command::CommandEffect::OpenPluginSurface {
                             surface_kind,
                             instance_id,

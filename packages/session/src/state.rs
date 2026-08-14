@@ -58,7 +58,7 @@ impl LiveTextStreamKey {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionState {
     pub(crate) summary: SessionSummary,
     pub(crate) working_directory: PathBuf,

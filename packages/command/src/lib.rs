@@ -128,6 +128,25 @@ pub enum CommandEffect {
         #[serde(default)]
         options: serde_json::Value,
     },
+    /// Open one canonical session through the host application boundary.
+    OpenSession {
+        /// Canonical destination session identity.
+        session_id: SessionId,
+        /// Optional frontend-neutral focus request.
+        #[serde(default)]
+        focus: SessionOpenFocus,
+    },
+}
+
+/// Frontend-neutral focus target applied after opening a session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOpenFocus {
+    /// Let the frontend choose its ordinary session focus.
+    #[default]
+    Default,
+    /// Focus the session composer when supported.
+    Composer,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]

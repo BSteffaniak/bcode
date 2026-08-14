@@ -8,6 +8,8 @@ use bcode_session_models::{
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
+const COPY_BATCH_EVENTS: usize = 256;
+
 impl SessionManager {
     /// Fork a session from a selected user prompt into a new session.
     ///
@@ -181,19 +183,28 @@ impl SessionManager {
             .await?;
         let handle = self.session_handle(session.id).await?;
         let mut sequence_map = BTreeMap::new();
+        let mut next_destination_sequence = self.current_session_generation(session.id).await? + 1;
+        let mut pending = Vec::with_capacity(COPY_BATCH_EVENTS);
         for event in events {
             if !is_copyable_fork_event(&event.kind) {
                 continue;
             }
             let kind = rewrite_copied_event_kind(event.kind.clone(), &sequence_map);
-            let copied = handle
-                .append_event_with_provenance(
-                    kind,
-                    Some(copy_event_provenance(&event)),
-                    self.next_activity_timestamp_ms(),
-                )
-                .await?;
-            sequence_map.insert(event.sequence, copied.sequence);
+            pending.push((
+                kind,
+                Some(copy_event_provenance(&event)),
+                self.next_activity_timestamp_ms(),
+            ));
+            sequence_map.insert(event.sequence, next_destination_sequence);
+            next_destination_sequence = next_destination_sequence.saturating_add(1);
+            if pending.len() == COPY_BATCH_EVENTS {
+                handle
+                    .append_event_batch_with_provenance(std::mem::take(&mut pending))
+                    .await?;
+            }
+        }
+        if !pending.is_empty() {
+            handle.append_event_batch_with_provenance(pending).await?;
         }
         let marker_event = handle
             .append_event(marker.clone(), self.next_activity_timestamp_ms())
