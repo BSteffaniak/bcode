@@ -11860,6 +11860,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::InertHistory { .. } => "inert_history",
+        SessionEventKind::SessionDerived { .. } => "session_derived",
     }
 }
 
@@ -12640,7 +12641,7 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::InertHistory { event_type, .. } => {
             println!("#{} legacy event: {event_type}", event.sequence);
         }
-        SessionEventKind::TraceEvent { .. } => {}
+        SessionEventKind::TraceEvent { .. } | SessionEventKind::SessionDerived { .. } => {}
     }
 }
 
@@ -14206,6 +14207,26 @@ mod web_command_tests {
             assert!(rendered.contains("schema 39"));
             assert!(rendered.contains("upgrade Bcode"));
         }
+    }
+
+    #[test]
+    fn workflow_run_output_command_parses_bounded_identity() {
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "workflow",
+            "run-output",
+            "--run-id",
+            "run-1",
+            "--limit",
+            "25",
+        ])
+        .expect("run output command");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Workflow {
+                command: WorkflowCommand::RunOutput { run_id, limit }
+            }) if run_id == "run-1" && limit == 25
+        ));
     }
 
     #[test]

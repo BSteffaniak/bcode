@@ -985,6 +985,18 @@ async fn stream_plugin_workflow_views(
     sender: mpsc::Sender<PluginTuiSurfaceUpdate>,
     redraw: InvalidationSignal,
 ) {
+    let mut watcher = match client.watch_workflow_runs().await {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            let _ = sender
+                .send(PluginTuiSurfaceUpdate::Disconnected {
+                    message: error.to_string(),
+                })
+                .await;
+            redraw.request();
+            return;
+        }
+    };
     let catalog = match client.workflow_catalog_view(1_000).await {
         Ok(catalog) => catalog,
         Err(error) => {
@@ -1033,21 +1045,28 @@ async fn stream_plugin_workflow_views(
     }
     redraw.request();
 
-    let mut watcher = match client.watch_workflow_runs().await {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            let _ = sender
-                .send(PluginTuiSurfaceUpdate::Disconnected {
-                    message: error.to_string(),
-                })
-                .await;
-            redraw.request();
-            return;
-        }
-    };
     loop {
         match watcher.next_event().await {
             Ok(bcode_client::WorkflowRunWatchEvent::Changed(event)) => {
+                let catalog = match client.workflow_catalog_view(1_000).await {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        let _ = sender
+                            .send(PluginTuiSurfaceUpdate::Disconnected {
+                                message: error.to_string(),
+                            })
+                            .await;
+                        redraw.request();
+                        return;
+                    }
+                };
+                if sender
+                    .send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
                 match client.workflow_run_view(event.run_id, 1_000).await {
                     Ok(view) => {
                         if sender

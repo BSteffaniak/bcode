@@ -1430,4 +1430,122 @@ mod tests {
             PluginTuiAction::OpenSession { .. }
         ));
     }
+    #[test]
+    fn projected_control_center_handles_navigation_pause_mutation_and_input() {
+        let mut surface = projected_surface();
+        let second = surface.runs.get("run-1").expect("first run").clone();
+        let mut second_item = second.run.clone();
+        second_item.run_id = "run-2".to_string();
+        second_item.status = bcode_workflow_view_models::WorkflowRunStatus::Paused;
+        let mut second = second;
+        second.run = second_item.clone();
+        second.waits = vec![bcode_workflow_view_models::WorkflowWaitView {
+            node_id: "input".to_string(),
+            activation_id: "input-activation".to_string(),
+            kind: bcode_workflow_view_models::WorkflowWaitKind::Input,
+            input: None,
+            requested_at_ms: 4,
+        }];
+        second.mutation_approvals =
+            vec![bcode_workflow_view_models::WorkflowMutationApprovalView {
+                approval_id: "mutation-1".to_string(),
+                node_id: "mutate".to_string(),
+                activation_id: "mutation-activation".to_string(),
+                requested_at_ms: 4,
+                expires_at_ms: None,
+            }];
+        surface
+            .catalog
+            .as_mut()
+            .expect("catalog")
+            .runs
+            .push(second_item);
+        surface.runs.insert("run-2".to_string(), second);
+
+        let key =
+            |character| Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char(character)));
+        assert_eq!(surface.selected_run, 0);
+        assert_eq!(
+            surface.handle_control_center_event(&key('l')),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.selected_run, 1);
+        assert!(matches!(
+            surface.handle_control_center_event(&key('p')),
+            PluginTuiAction::InvokePluginCommand { ref command_id, .. }
+                if command_id == "workflow.resume"
+        ));
+        assert!(matches!(
+            surface.handle_control_center_event(&key('d')),
+            PluginTuiAction::InvokePluginCommand { ref command_id, .. }
+                if command_id == "workflow.deny-mutation"
+        ));
+        assert_eq!(
+            surface.handle_control_center_event(&key('i')),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.input_buffer.as_deref(), Some(""));
+        for character in ['{', '"', 'o', 'k', '"', ':', 't', 'r', 'u', 'e', '}'] {
+            assert_eq!(
+                surface.handle_control_center_event(&key(character)),
+                PluginTuiAction::Redraw
+            );
+        }
+        let submit = surface.handle_control_center_event(&Event::Key(
+            bmux_keyboard::KeyStroke::simple(KeyCode::Enter),
+        ));
+        assert!(matches!(
+            submit,
+            PluginTuiAction::InvokePluginCommand {
+                ref command_id,
+                arguments: Some(ref arguments),
+                ..
+            } if command_id == "workflow.provide-input" && arguments.contains("value={\"ok\":true}")
+        ));
+        assert!(surface.input_buffer.is_none());
+
+        surface.input_buffer = Some("discard".to_string());
+        assert_eq!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Escape
+            ),)),
+            PluginTuiAction::Redraw
+        );
+        assert!(surface.input_buffer.is_none());
+        assert_eq!(
+            surface.handle_control_center_event(&key('l')),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.selected_run, 1, "run navigation stays bounded");
+    }
+
+    #[test]
+    fn projected_updates_replace_authoritative_state_and_surface_degradation() {
+        let mut surface = projected_surface();
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        surface.attach_updates(receiver);
+        sender
+            .try_send(PluginTuiSurfaceUpdate::ResyncRequired)
+            .expect("resync update");
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert!(surface.live_status.contains("resync required"));
+
+        sender
+            .try_send(PluginTuiSurfaceUpdate::Disconnected {
+                message: "offline".to_string(),
+            })
+            .expect("disconnect update");
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert!(surface.live_status.contains("offline"));
+    }
+
+    struct TestHost;
+
+    impl PluginTuiHost for TestHost {
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+
+        fn request_redraw(&self) {}
+    }
 }

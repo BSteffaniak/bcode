@@ -794,13 +794,21 @@ pub(crate) async fn execute_command(
         }
         command => return Err(format!("unsupported workflow command '{command}'")),
     };
-    Ok(InvokeCommandResponse {
-        success: true,
-        message: Some(message),
-        updated_model: None,
-        updated_provider: None,
-        updated_thinking: None,
-        effects: vec![CommandEffect::OpenPluginSurface {
+    let effects = if matches!(
+        request.command_id.as_str(),
+        "workflow.pause"
+            | "workflow.resume"
+            | "workflow.cancel"
+            | "workflow.retry-node"
+            | "workflow.approve"
+            | "workflow.deny"
+            | "workflow.provide-input"
+            | "workflow.approve-mutation"
+            | "workflow.deny-mutation"
+    ) {
+        Vec::new()
+    } else {
+        vec![CommandEffect::OpenPluginSurface {
             surface_kind: if matches!(
                 request.command_id.as_str(),
                 "workflow.template-describe" | "workflow.template-instantiate"
@@ -818,7 +826,15 @@ pub(crate) async fn execute_command(
                 "workflow-status".to_string()
             },
             options: serde_json::Value::Object(options),
-        }],
+        }]
+    };
+    Ok(InvokeCommandResponse {
+        success: true,
+        message: Some(message),
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects,
     })
 }
 
