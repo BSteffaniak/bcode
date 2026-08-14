@@ -462,6 +462,8 @@ impl InteractiveSurfaceState {
         let outcome = match self.surface.handle_event(event, &self.host) {
             PluginTuiAction::None => InteractiveSurfaceEventOutcome::Ignored,
             PluginTuiAction::Redraw
+            | PluginTuiAction::SubscribeWorkflowRuns
+            | PluginTuiAction::InvokePluginCommand { .. }
             | PluginTuiAction::OpenSession { .. }
             | PluginTuiAction::OpenSurface { .. } => InteractiveSurfaceEventOutcome::Consumed,
             PluginTuiAction::Close { outcome } => InteractiveSurfaceEventOutcome::Resolved(

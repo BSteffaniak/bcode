@@ -8,7 +8,8 @@ use bcode_ipc::Event as BcodeEvent;
 use bcode_plugin_sdk::tui::{
     PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest, PluginSessionViewUpdate,
     PluginStructuredGenerationFuture, PluginStructuredGenerationRequest, PluginTask, PluginTuiHost,
-    PluginTuiHostError, PluginWorkflowAuthoringCatalogFuture, PluginWorkflowAuthoringDraft,
+    PluginTuiHostError, PluginTuiSurfaceUpdate, PluginTuiSurfaceUpdateReceiver,
+    PluginWorkflowAuthoringCatalogFuture, PluginWorkflowAuthoringDraft,
     PluginWorkflowAuthoringDraftFuture, PluginWorkflowAuthoringEditFuture,
     PluginWorkflowAuthoringEditResult, PluginWorkflowAuthoringPreviewFuture,
     PluginWorkflowAuthoringPublishFuture, PluginWorkflowAuthoringPublishResult,
@@ -977,4 +978,130 @@ mod tests {
         assert!(!source.contains(concat!("super::terminal_", "events")));
         assert!(!source.contains(concat!("Terminal<", "&mut")));
     }
+}
+
+async fn stream_plugin_workflow_views(
+    client: BcodeClient,
+    sender: mpsc::Sender<PluginTuiSurfaceUpdate>,
+    redraw: InvalidationSignal,
+) {
+    let catalog = match client.workflow_catalog_view(1_000).await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let _ = sender
+                .send(PluginTuiSurfaceUpdate::Disconnected {
+                    message: error.to_string(),
+                })
+                .await;
+            redraw.request();
+            return;
+        }
+    };
+    let run_ids = catalog
+        .runs
+        .iter()
+        .map(|run| run.run_id.clone())
+        .collect::<Vec<_>>();
+    if sender
+        .send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    for run_id in run_ids {
+        match client.workflow_run_view(run_id, 1_000).await {
+            Ok(view) => {
+                if sender
+                    .send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = sender
+                    .send(PluginTuiSurfaceUpdate::Disconnected {
+                        message: error.to_string(),
+                    })
+                    .await;
+                redraw.request();
+                return;
+            }
+        }
+    }
+    redraw.request();
+
+    let mut watcher = match client.watch_workflow_runs().await {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            let _ = sender
+                .send(PluginTuiSurfaceUpdate::Disconnected {
+                    message: error.to_string(),
+                })
+                .await;
+            redraw.request();
+            return;
+        }
+    };
+    loop {
+        match watcher.next_event().await {
+            Ok(bcode_client::WorkflowRunWatchEvent::Changed(event)) => {
+                match client.workflow_run_view(event.run_id, 1_000).await {
+                    Ok(view) => {
+                        if sender
+                            .send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        redraw.request();
+                    }
+                    Err(error) => {
+                        let _ = sender
+                            .send(PluginTuiSurfaceUpdate::Disconnected {
+                                message: error.to_string(),
+                            })
+                            .await;
+                        redraw.request();
+                        return;
+                    }
+                }
+            }
+            Ok(bcode_client::WorkflowRunWatchEvent::ResyncRequired) => {
+                let _ = sender.send(PluginTuiSurfaceUpdate::ResyncRequired).await;
+                redraw.request();
+                return;
+            }
+            Ok(bcode_client::WorkflowRunWatchEvent::UnsupportedVersion { version }) => {
+                let _ = sender
+                    .send(PluginTuiSurfaceUpdate::Disconnected {
+                        message: format!("unsupported workflow live-event version {version}"),
+                    })
+                    .await;
+                redraw.request();
+                return;
+            }
+            Err(error) => {
+                let _ = sender
+                    .send(PluginTuiSurfaceUpdate::Disconnected {
+                        message: error.to_string(),
+                    })
+                    .await;
+                redraw.request();
+                return;
+            }
+        }
+    }
+}
+
+pub fn subscribe_workflow_views(
+    client: BcodeClient,
+    redraw: InvalidationSignal,
+) -> PluginTuiSurfaceUpdateReceiver {
+    let (sender, receiver) = mpsc::channel(64);
+    tokio::spawn(stream_plugin_workflow_views(client, sender, redraw));
+    receiver
 }

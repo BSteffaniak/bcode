@@ -536,6 +536,32 @@ impl BcodeRuntimeModel {
                         .app
                         .set_status(format!("surface toggle requested: {surface_id}"));
                 }
+                bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns => {
+                    let updates = super::plugin_surface_host::subscribe_workflow_views(
+                        self.loop_state.foreground_client(),
+                        self.loop_state
+                            .root_plugin_surface_invalidation()
+                            .expect("plugin surface invalidation"),
+                    );
+                    self.loop_state.attach_root_plugin_surface_updates(updates);
+                }
+                bcode_plugin_sdk::tui::PluginTuiAction::InvokePluginCommand {
+                    plugin_id,
+                    command_id,
+                    arguments,
+                } => {
+                    self.chat
+                        .replace_effect(super::effects::TuiEffect::InvokePluginCommand {
+                            plugin_id,
+                            command_id,
+                            arguments,
+                            working_directory: self
+                                .settings
+                                .launch_working_directory()
+                                .to_path_buf(),
+                            session_id: self.chat.session_id,
+                        });
+                }
                 bcode_plugin_sdk::tui::PluginTuiAction::RunCommand { command } => {
                     self.chat.app.replace_composer_with(&command);
                     self.loop_state.close_root_plugin_surface();
@@ -1868,6 +1894,34 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         self.chat
                             .app
                             .set_status(format!("surface toggle requested: {surface_id}"));
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns) => {
+                        let updates = super::plugin_surface_host::subscribe_workflow_views(
+                            self.loop_state.foreground_client(),
+                            self.loop_state
+                                .root_plugin_surface_invalidation()
+                                .expect("plugin surface invalidation"),
+                        );
+                        self.loop_state.attach_root_plugin_surface_updates(updates);
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::InvokePluginCommand {
+                        plugin_id,
+                        command_id,
+                        arguments,
+                    }) => {
+                        self.chat
+                            .replace_effect(super::effects::TuiEffect::InvokePluginCommand {
+                                plugin_id,
+                                command_id,
+                                arguments,
+                                working_directory: self
+                                    .settings
+                                    .launch_working_directory()
+                                    .to_path_buf(),
+                                session_id: self.chat.session_id,
+                            });
                         super::invalidation::UiInvalidation::Structural
                     }
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::RunCommand { command }) => {

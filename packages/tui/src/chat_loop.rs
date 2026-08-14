@@ -861,6 +861,15 @@ impl ChatLoopState {
         }
     }
 
+    pub fn attach_root_plugin_surface_updates(
+        &mut self,
+        updates: bcode_plugin_sdk::tui::PluginTuiSurfaceUpdateReceiver,
+    ) {
+        if let Some(surface) = self.plugin_surface.as_mut() {
+            surface.surface.attach_updates(updates);
+        }
+    }
+
     pub fn close_root_plugin_surface_with_outcome(
         &mut self,
         outcome: Option<serde_json::Value>,

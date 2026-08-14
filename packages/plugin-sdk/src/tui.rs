@@ -806,7 +806,25 @@ pub struct PluginTuiSurfaceOutcome {
     pub set_session_working_directory: Option<String>,
 }
 
-/// Actions a native TUI surface can return to the host.
+/// Renderer-neutral update delivered to a plugin-owned surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginTuiSurfaceUpdate {
+    /// Replace workflow presentation from one authoritative bounded projection.
+    WorkflowRun(Box<bcode_workflow_view_models::WorkflowRunView>),
+    /// Replace workflow catalog presentation from one authoritative bounded projection.
+    WorkflowCatalog(bcode_workflow_view_models::WorkflowCatalogView),
+    /// The observer requires bounded snapshot replacement.
+    ResyncRequired,
+    /// Live observation stopped or entered a degraded state.
+    Disconnected { message: String },
+}
+
+/// Sender retained by a host observer for one plugin surface.
+pub type PluginTuiSurfaceUpdateSender = mpsc::Sender<PluginTuiSurfaceUpdate>;
+
+/// Receiver owned by one plugin surface.
+pub type PluginTuiSurfaceUpdateReceiver = mpsc::Receiver<PluginTuiSurfaceUpdate>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginTuiAction {
     /// No host action is needed.
@@ -819,6 +837,14 @@ pub enum PluginTuiAction {
     OpenSession { session_id: SessionId },
     /// Open another registered surface.
     OpenSurface { surface_id: String },
+    /// Subscribe this retained surface to bounded workflow snapshots and live invalidation.
+    SubscribeWorkflowRuns,
+    /// Invoke a plugin-owned command through the host application without closing this surface.
+    InvokePluginCommand {
+        plugin_id: String,
+        command_id: String,
+        arguments: Option<String>,
+    },
     /// Run a host command.
     RunCommand { command: String },
 }
@@ -1328,6 +1354,11 @@ pub trait PluginTuiSurface: Send {
 
     /// Handle routed terminal input.
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction;
+
+    /// Attach a renderer-neutral update stream to this retained surface.
+    ///
+    /// The default drops the stream, preserving compatibility for static surfaces.
+    fn attach_updates(&mut self, _updates: PluginTuiSurfaceUpdateReceiver) {}
 
     /// Notify a retained surface that native-session navigation finished or failed.
     fn session_navigation_finished(&mut self, _session_id: SessionId, _result: Result<(), String>) {

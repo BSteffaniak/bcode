@@ -65240,4 +65240,145 @@ event_symbol = "bcode_plugin_handle_event_v1"
             false
         ));
     }
+    #[tokio::test]
+    async fn workflow_live_transport_publishes_commits_bounds_catch_up_and_cleans_disconnects() {
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "integer".to_string(),
+            schema: serde_json::json!({"type": "integer"}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "live-events".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "task".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "task".to_string(),
+                    name: "task".to_string(),
+                    kind: bcode_workflow::NodeKind::Task,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::Value::Null,
+                },
+            )]),
+            entries: vec!["task".to_string()],
+            exits: vec!["task".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("live-events", 1, &definition)
+            .expect("definition");
+        let new_run = |run_id: &str, created_at_ms: u64| bcode_workflow_store::NewWorkflowRun {
+            run_id: run_id.to_string(),
+            definition_id: "live-events".to_string(),
+            definition_version: 1,
+            workspace_snapshot: "snapshot".to_string(),
+            parent_session_id: None,
+            parent_session_generation: None,
+            binding: None,
+            authored_provenance: None,
+            input: Some(serde_json::json!(1)),
+            created_at_ms,
+            authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                version: 1,
+                provider_id: "test-policy".to_string(),
+                profile_id: "build".to_string(),
+                policy_digest_sha256: "a".repeat(64),
+            },
+            authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+            limits: bcode_workflow_store::WorkflowRunLimits::default(),
+        };
+        store.create_run(&new_run("run-1", 1)).expect("first run");
+
+        let mut state = test_server_state(SessionManager::default());
+        state.workflow_store = StdMutex::new(store);
+        let state = Arc::new(state);
+        state.start_workflow_event_forwarder();
+
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("client handler");
+                });
+            }
+        });
+
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut watcher = client.watch_workflow_runs().await.expect("watcher");
+        let disconnected_watcher = client.watch_workflow_runs().await.expect("second watcher");
+        assert_eq!(state.workflow_event_clients.lock().await.len(), 2);
+        drop(disconnected_watcher);
+
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request_cancellation_tree("run-1", 2)
+            .expect("cancellation event");
+        let observed = tokio::time::timeout(Duration::from_secs(2), watcher.next_event())
+            .await
+            .expect("workflow notification timeout")
+            .expect("workflow notification");
+        let bcode_client::WorkflowRunWatchEvent::Changed(event) = observed else {
+            panic!("expected changed notification");
+        };
+        assert_eq!(event.run_id, "run-1");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.workflow_event_clients.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed subscriber isolated and unregistered");
+
+        let watermark = event.event_sequence;
+        {
+            let mut store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.create_run(&new_run("run-2", 3)).expect("second run");
+            store.create_run(&new_run("run-3", 4)).expect("third run");
+        }
+        let mut connection = client
+            .connect("workflow-catch-up-test")
+            .await
+            .expect("connection");
+        let page = connection
+            .workflow_live_event_catch_up(watermark, 1)
+            .await
+            .expect("bounded catch-up");
+        assert_eq!(page.events.len(), 1);
+        assert!(page.resync_required);
+
+        drop(watcher);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.workflow_event_clients.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnected subscriber cleanup");
+        drop(connection);
+        server.abort();
+    }
 }

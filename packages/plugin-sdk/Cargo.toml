@@ -18,6 +18,7 @@ bcode_session_models       = { workspace = true }
 bcode_session_view_models  = { workspace = true }
 bcode_tool                 = { workspace = true }
 bcode_workflow             = { workspace = true }
+bcode_workflow_view_models = { workspace = true }
 bmux_keyboard              = { workspace = true, optional = true }
 bmux_text_edit             = { workspace = true, optional = true }
 bmux_tui                   = { workspace = true, optional = true }

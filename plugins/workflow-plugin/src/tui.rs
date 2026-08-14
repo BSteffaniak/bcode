@@ -3,6 +3,7 @@
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
     PluginTuiSurfaceFactory, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
+    PluginTuiSurfaceUpdate, PluginTuiSurfaceUpdateReceiver,
 };
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
@@ -163,6 +164,11 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 options: request.options,
                 selected_approval: 0,
                 text_view: TextViewState::new(),
+                updates: None,
+                catalog: None,
+                runs: std::collections::BTreeMap::new(),
+                live_status: "loading live workflow state".to_string(),
+                subscription_requested: false,
             }) as BoxedPluginTuiSurface)
         })
     }
@@ -173,6 +179,11 @@ struct WorkflowStatusSurface {
     options: serde_json::Value,
     selected_approval: usize,
     text_view: TextViewState,
+    updates: Option<PluginTuiSurfaceUpdateReceiver>,
+    catalog: Option<bcode_workflow_view_models::WorkflowCatalogView>,
+    runs: std::collections::BTreeMap<String, bcode_workflow_view_models::WorkflowRunView>,
+    live_status: String,
+    subscription_requested: bool,
 }
 
 struct WorkflowSurfaceTheme {
@@ -230,10 +241,14 @@ impl WorkflowStatusSurface {
         let pane_state = PaneState::new(area);
         pane.render(&pane_state, frame);
         let content = pane.inner_area(&pane_state);
-        let rows = surface_lines(&self.options, self.selected_approval)
-            .into_iter()
-            .map(|row| Line::from_spans(vec![Span::styled(row, theme.text)]))
-            .collect::<Vec<_>>();
+        let rows = if self.catalog.is_some() {
+            workflow_view_lines(self.catalog.as_ref(), &self.runs, &self.live_status)
+        } else {
+            surface_lines(&self.options, self.selected_approval)
+        }
+        .into_iter()
+        .map(|row| Line::from_spans(vec![Span::styled(row, theme.text)]))
+        .collect::<Vec<_>>();
         TextView::new(&rows)
             .policy(TextViewPolicy::bare())
             .styles(TextViewStyles {
@@ -268,6 +283,46 @@ impl PluginTuiSurface for WorkflowStatusSurface {
         self.render_themed(area, frame, theme);
     }
 
+    fn attach_updates(&mut self, updates: PluginTuiSurfaceUpdateReceiver) {
+        self.updates = Some(updates);
+        self.live_status = "subscribed".to_string();
+    }
+
+    fn poll(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if !self.subscription_requested {
+            self.subscription_requested = true;
+            return PluginTuiAction::SubscribeWorkflowRuns;
+        }
+        let Some(updates) = self.updates.as_mut() else {
+            return PluginTuiAction::None;
+        };
+        let mut changed = false;
+        while let Ok(update) = updates.try_recv() {
+            changed = true;
+            match update {
+                PluginTuiSurfaceUpdate::WorkflowCatalog(catalog) => {
+                    self.catalog = Some(catalog);
+                    self.live_status = "live".to_string();
+                }
+                PluginTuiSurfaceUpdate::WorkflowRun(view) => {
+                    self.runs.insert(view.run.run_id.clone(), *view);
+                    self.live_status = "live".to_string();
+                }
+                PluginTuiSurfaceUpdate::ResyncRequired => {
+                    self.live_status = "resync required; reopen /workflow".to_string();
+                }
+                PluginTuiSurfaceUpdate::Disconnected { message } => {
+                    self.live_status = format!("live updates unavailable: {message}");
+                }
+            }
+        }
+        if changed {
+            PluginTuiAction::Redraw
+        } else {
+            PluginTuiAction::None
+        }
+    }
+
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
         let approval_count =
             mutation_approvals(&self.options).map_or(0, <[serde_json::Value]>::len);
@@ -289,14 +344,91 @@ impl PluginTuiSurface for WorkflowStatusSurface {
             }
             Event::Key(key) if matches!(key.key, KeyCode::Char('a' | 'd')) => {
                 let approve = key.key == KeyCode::Char('a');
-                mutation_approval_command(&self.options, self.selected_approval, approve)
-                    .map_or(PluginTuiAction::None, |command| {
-                        PluginTuiAction::RunCommand { command }
-                    })
+                mutation_approval_command(&self.options, self.selected_approval, approve).map_or(
+                    PluginTuiAction::None,
+                    |command| {
+                        let mut parts = command.splitn(3, ' ');
+                        let _prefix = parts.next();
+                        let action = parts.next().unwrap_or_default();
+                        let arguments = parts.next().map(str::to_string);
+                        PluginTuiAction::InvokePluginCommand {
+                            plugin_id: "bcode.workflow".to_string(),
+                            command_id: format!("workflow.{action}"),
+                            arguments,
+                        }
+                    },
+                )
             }
             _ => PluginTuiAction::None,
         }
     }
+}
+
+fn workflow_view_lines(
+    catalog: Option<&bcode_workflow_view_models::WorkflowCatalogView>,
+    runs: &std::collections::BTreeMap<String, bcode_workflow_view_models::WorkflowRunView>,
+    live_status: &str,
+) -> Vec<String> {
+    let mut lines = vec![
+        "Workflow control center".to_string(),
+        format!("Live status · {live_status}"),
+        String::new(),
+    ];
+    let Some(catalog) = catalog else {
+        lines.push("Loading workflow catalog…".to_string());
+        return lines;
+    };
+    lines.push(format!("Runs ({})", catalog.runs.len()));
+    for item in &catalog.runs {
+        lines.push(format!(
+            "  {} · {} v{} · {:?}",
+            item.run_id, item.definition_id, item.definition_version, item.status
+        ));
+        if let Some(run) = runs.get(&item.run_id) {
+            lines.push(format!("    Nodes ({})", run.nodes.len()));
+            for node in &run.nodes {
+                lines.push(format!(
+                    "      {} · {:?} · {:?}",
+                    node.node_id, node.kind, node.status
+                ));
+            }
+            lines.push(format!("    Waits ({})", run.waits.len()));
+            lines.push(format!(
+                "    Mutation approvals ({})",
+                run.mutation_approvals.len()
+            ));
+            lines.push(format!("    Attempts ({})", run.attempts.len()));
+            lines.push(format!("    Outputs ({})", run.outputs.len()));
+            for output in &run.outputs {
+                lines.push(format!(
+                    "      {} · {} v{} · {}",
+                    output.node_id,
+                    output.schema_id,
+                    output.schema_version,
+                    match &output.value {
+                        bcode_workflow_view_models::WorkflowOutputValue::Resolved { value } => {
+                            value.to_string()
+                        }
+                        bcode_workflow_view_models::WorkflowOutputValue::Unresolved => {
+                            "unresolved".to_string()
+                        }
+                    }
+                ));
+            }
+            if let Some(terminal) = &run.terminal {
+                lines.push(format!("    Terminal · {terminal:?}"));
+            }
+            if !matches!(
+                run.health,
+                bcode_workflow_view_models::WorkflowProjectionHealth::Current
+            ) {
+                lines.push(format!("    Health · {:?}", run.health));
+            }
+        } else {
+            lines.push("    Loading bounded run projection…".to_string());
+        }
+    }
+    lines
 }
 
 fn next_action(activation: &serde_json::Value) -> &'static str {
