@@ -224,6 +224,54 @@ impl SessionManager {
         Ok(summary)
     }
 
+    /// Explicitly clean a bounded number of interrupted nonterminal derivation staging roots.
+    ///
+    /// Terminal receipts and canonical destination directories are never removed. Missing,
+    /// malformed, future-version, or ambiguous receipts fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operation ledger cannot be read safely or cleanup fails.
+    pub fn cleanup_interrupted_session_derivations(
+        &self,
+        max_operations: usize,
+    ) -> Result<usize, SessionError> {
+        let root = self
+            .session_store_root()
+            .ok_or(SessionError::DerivationRequiresPersistentStore)?;
+        let operation_root = root.join(OPERATION_DIRECTORY);
+        if !operation_root.exists() || max_operations == 0 {
+            return Ok(0);
+        }
+        let mut entries = fs::read_dir(&operation_root)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        let mut cleaned = 0;
+        for entry in entries.into_iter().take(max_operations) {
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let receipt = entry.path().join(OPERATION_RECEIPT_FILE);
+            let operation = read_derivation_receipt(&receipt)?;
+            if operation.snapshot.outcome.is_some() {
+                continue;
+            }
+            let canonical = db::session_dir_path(&root, operation.destination_id);
+            if canonical.exists() {
+                return Err(SessionError::DerivationPublicationConflict(
+                    operation.destination_id,
+                ));
+            }
+            let staging = root
+                .join(STAGING_DIRECTORY)
+                .join(operation.request.operation_id.to_string());
+            if staging.exists() {
+                fs::remove_dir_all(staging)?;
+                cleaned += 1;
+            }
+        }
+        Ok(cleaned)
+    }
+
     /// Return the latest immutable-aware status snapshot for one derivation operation.
     ///
     /// # Errors

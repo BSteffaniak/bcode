@@ -20,6 +20,7 @@ use bcode_session_models::{
 };
 use bcode_tool::{ToolInvocationServiceRequest, ToolInvocationServiceResolution};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 const PLUGIN_ID: &str = "bcode.session-derivation";
 const FORK_COMMAND_ID: &str = "session-derivation.fork";
@@ -93,6 +94,7 @@ fn command(id: &str, slash_name: &str, title: &str, description: &str) -> Comman
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn invoke_command(
     context: &NativeServiceContext,
     request: InvokeCommandRequest,
@@ -125,9 +127,11 @@ fn invoke_command(
                 .get("sequence")
                 .and_then(|value| value.parse::<u64>().ok())
             else {
-                return ServiceResponse::error(
-                    "prompt_sequence_required",
-                    "fork currently requires `sequence=<user-message-sequence>`; the generic selection surface is not yet available",
+                return prompt_selection_fallback(
+                    context,
+                    &request.command_id,
+                    session_id,
+                    snapshot.generation,
                 );
             };
             ("fork", sequence.saturating_sub(1), Some(sequence), "fork")
@@ -142,6 +146,24 @@ fn invoke_command(
             .as_ref()
             .map(|title| format!("[{default_prefix}] {title}"))
     });
+    let authoritative_draft = match selected_source_sequence {
+        Some(sequence) => match call_derivation_service(
+            context,
+            &request.command_id,
+            SessionDerivationServiceRequest::Prompt {
+                session_id,
+                generation: snapshot.generation,
+                sequence,
+            },
+        ) {
+            Ok(SessionDerivationServiceResponse::Prompt { text }) => Some(text),
+            Ok(_) => {
+                return ServiceResponse::error("unexpected_response", "unexpected prompt response");
+            }
+            Err(error) => return ServiceResponse::error("prompt_failed", error),
+        },
+        None => None,
+    };
     let derive = SessionDerivationRequest {
         version: SESSION_DERIVATION_CONTRACT_VERSION,
         operation_id: SessionDerivationOperationId::new(),
@@ -151,7 +173,7 @@ fn invoke_command(
         cutoff_sequence,
         destination_working_directory: None,
         destination_name,
-        initial_draft: args.get("draft").cloned(),
+        initial_draft: authoritative_draft,
         lineage: SessionDerivationLineage {
             producer: PLUGIN_ID.to_owned(),
             operation_kind: format!("{PLUGIN_ID}/{operation_kind}"),
@@ -190,6 +212,54 @@ fn invoke_command(
             } else {
                 SessionOpenFocus::Default
             },
+        }],
+    })
+}
+
+fn prompt_selection_fallback(
+    context: &NativeServiceContext,
+    invocation_id: &str,
+    session_id: bcode_session_models::SessionId,
+    generation: u64,
+) -> ServiceResponse {
+    let page = match call_derivation_service(
+        context,
+        invocation_id,
+        SessionDerivationServiceRequest::Prompts {
+            session_id,
+            query: bcode_session_models::SessionDerivationPromptQuery {
+                generation,
+                before_sequence: None,
+                limit: 50,
+            },
+        },
+    ) {
+        Ok(SessionDerivationServiceResponse::Prompts { page }) => page,
+        Ok(_) => {
+            return ServiceResponse::error(
+                "unexpected_response",
+                "unexpected prompt page response",
+            );
+        }
+        Err(error) => return ServiceResponse::error("prompts_failed", error),
+    };
+    if page.candidates.is_empty() {
+        return ServiceResponse::error("no_prompts", "no user prompts are available to fork");
+    }
+    let mut text = String::from("Select a prompt sequence and run `/fork sequence=<n>`:\n\n");
+    for candidate in page.candidates {
+        let preview = candidate.preview.replace('\n', " ");
+        let _ = writeln!(text, "* `{}` — {}", candidate.sequence, preview);
+    }
+    json_response(&InvokeCommandResponse {
+        success: true,
+        message: Some("Select a prompt to fork".to_owned()),
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects: vec![CommandEffect::AppendText {
+            text,
+            format: bcode_command::CommandTextFormat::Markdown,
         }],
     })
 }

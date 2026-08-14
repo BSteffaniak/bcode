@@ -33350,30 +33350,23 @@ async fn handle_list_plugin_contributions(
     .await
 }
 
-fn command_plugin_bridge(sessions: SessionManager) -> PluginInvocationBridge {
-    let runtime = tokio::runtime::Handle::current();
-    PluginInvocationBridge::new(move |request, cancellation| {
-        let ServiceBridgeRequest::InvokeService(request) = request else {
-            return Err(
-                "command invocation bridge supports nested application services only".to_owned(),
-            );
-        };
-        if request.interface_id != bcode_plugin_sdk::SESSION_DERIVATION_INTERFACE_ID {
-            return Ok(ServiceBridgeResponse::Service(
-                bcode_tool::ToolInvocationServiceResolution::Unsupported,
-            ));
-        }
-        if cancellation.is_cancelled() {
-            return Ok(ServiceBridgeResponse::Service(
-                bcode_tool::ToolInvocationServiceResolution::Cancelled,
-            ));
-        }
-        let sessions = sessions.clone();
-        let response = runtime.block_on(async move {
-            dispatch_session_derivation_bridge(&sessions, request.payload).await
-        });
-        Ok(ServiceBridgeResponse::Service(response))
-    })
+async fn resolve_command_plugin_bridge_request(
+    sessions: &SessionManager,
+    request: ServiceBridgeRequest,
+) -> Result<ServiceBridgeResponse, String> {
+    let ServiceBridgeRequest::InvokeService(request) = request else {
+        return Err(
+            "command invocation bridge supports nested application services only".to_owned(),
+        );
+    };
+    if request.interface_id != bcode_plugin_sdk::SESSION_DERIVATION_INTERFACE_ID {
+        return Ok(ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Unsupported,
+        ));
+    }
+    Ok(ServiceBridgeResponse::Service(
+        dispatch_session_derivation_bridge(sessions, request.payload).await,
+    ))
 }
 
 async fn dispatch_session_derivation_bridge(
@@ -33409,6 +33402,14 @@ async fn dispatch_session_derivation_bridge(
                         |page| bcode_plugin_sdk::SessionDerivationServiceResponse::Prompts { page },
                     )
             }
+            bcode_plugin_sdk::SessionDerivationServiceRequest::Prompt {
+                session_id,
+                generation,
+                sequence,
+            } => sessions
+                .session_derivation_prompt(session_id, generation, sequence)
+                .await
+                .map(|text| bcode_plugin_sdk::SessionDerivationServiceResponse::Prompt { text }),
             bcode_plugin_sdk::SessionDerivationServiceRequest::Derive { request } => {
                 sessions.derive_session(*request).await.map(|outcome| {
                     bcode_plugin_sdk::SessionDerivationServiceResponse::Derived { outcome }
@@ -33455,17 +33456,35 @@ async fn handle_invoke_plugin_service(
     let plugin_id = plugin_id.to_string();
     let interface_id = interface_id.to_string();
     let labels = plugin_service_metric_labels(Some(&plugin_id), &interface_id, &operation);
+    let (bridge, mut bridge_requests) = server_plugin_bridge();
     let invocation = state.plugins.invoke_service_with_bridge_scoped(
         &plugin_id,
         interface_id,
         operation,
         payload,
         bcode_plugin::PluginInvocationScope::Global,
-        Some(command_plugin_bridge(state.sessions.clone())),
+        Some(bridge),
     );
     let response = state
         .metrics
-        .time_result_async("plugin.service", labels, invocation)
+        .time_result_async("plugin.service", labels, async {
+            tokio::pin!(invocation);
+            loop {
+                tokio::select! {
+                    result = &mut invocation => break result,
+                    bridge_call = bridge_requests.recv() => {
+                        let Some(bridge_call) = bridge_call else {
+                            continue;
+                        };
+                        let response = resolve_command_plugin_bridge_request(
+                            &state.sessions,
+                            bridge_call.request,
+                        ).await;
+                        let _ = bridge_call.response.send(response);
+                    }
+                }
+            }
+        })
         .await;
     send_plugin_service_response(writer, request_id, response).await
 }

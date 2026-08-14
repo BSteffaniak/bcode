@@ -468,6 +468,12 @@ pub enum SessionError {
     /// A bounded derivation prompt query exceeded its portable contract limit.
     #[error("session derivation prompt limit {actual} exceeds maximum {maximum}")]
     DerivationPromptLimit { actual: usize, maximum: usize },
+    /// The selected derivation prompt does not identify a canonical user message.
+    #[error("session derivation prompt not found: {session_id} sequence={sequence}")]
+    DerivationPromptNotFound {
+        session_id: SessionId,
+        sequence: u64,
+    },
     /// A bounded derivation read no longer matches the selected source generation.
     #[error(
         "session derivation source generation changed: {session_id} expected={expected} current={current}"
@@ -2433,6 +2439,55 @@ impl SessionManager {
             candidates,
             has_more,
         })
+    }
+
+    /// Return the complete selected user prompt pinned to one source generation.
+    ///
+    /// This is a bounded one-event canonical read. It is separate from preview paging so a
+    /// renderer never turns truncated presentation text into authoritative draft state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the generation changed or the selected sequence is not a user
+    /// message.
+    pub async fn session_derivation_prompt(
+        &self,
+        session_id: SessionId,
+        generation: u64,
+        sequence: u64,
+    ) -> Result<String, SessionError> {
+        let before = self.current_session_generation(session_id).await?;
+        if before != generation {
+            return Err(SessionError::DerivationGenerationChanged {
+                session_id,
+                expected: generation,
+                current: before,
+            });
+        }
+        let event = self
+            .session_events_range(session_id, sequence, sequence, 1)
+            .await?
+            .into_iter()
+            .next();
+        let Some(SessionEvent {
+            kind: SessionEventKind::UserMessage { text, .. },
+            ..
+        }) = event
+        else {
+            return Err(SessionError::DerivationPromptNotFound {
+                session_id,
+                sequence,
+            });
+        };
+        let after = self.current_session_generation(session_id).await?;
+        if after != generation {
+            return Err(SessionError::DerivationGenerationChanged {
+                session_id,
+                expected: generation,
+                current: after,
+            });
+        }
+        Ok(text)
     }
 
     /// Return user-submitted prompts for input-history navigation.

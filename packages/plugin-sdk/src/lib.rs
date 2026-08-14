@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 /// Versioned application service for generic session derivation operations.
 pub const SESSION_DERIVATION_INTERFACE_ID: &str = "bcode.session-derivation/v1";
 pub const OP_SESSION_DERIVATION_SNAPSHOT: &str = "snapshot";
+pub const OP_SESSION_DERIVATION_PROMPT: &str = "prompt";
 pub const OP_SESSION_DERIVATION_PROMPTS: &str = "prompts";
 pub const OP_SESSION_DERIVE: &str = "derive";
 pub const OP_SESSION_DERIVATION_STATUS: &str = "status";
@@ -38,6 +39,11 @@ pub enum SessionDerivationServiceRequest {
     Prompts {
         session_id: bcode_session_models::SessionId,
         query: bcode_session_models::SessionDerivationPromptQuery,
+    },
+    Prompt {
+        session_id: bcode_session_models::SessionId,
+        generation: u64,
+        sequence: u64,
     },
     Derive {
         request: Box<bcode_session_models::SessionDerivationRequest>,
@@ -59,6 +65,9 @@ pub enum SessionDerivationServiceResponse {
     },
     Prompts {
         page: bcode_session_models::SessionDerivationPromptPage,
+    },
+    Prompt {
+        text: String,
     },
     Derived {
         outcome: bcode_session_models::SessionDerivationTerminalOutcome,
