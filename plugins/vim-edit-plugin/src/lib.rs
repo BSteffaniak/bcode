@@ -470,6 +470,32 @@ fn tool_vim_edit_with_nvim_executable_for_test(
     )
 }
 
+fn parse_vim_edit_tool_request(arguments: serde_json::Value) -> Result<VimEditToolRequest, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "arguments must be an object".to_owned())?;
+    let has_path = object.contains_key("path");
+    let has_steps = object.contains_key("steps");
+    let has_files = object.contains_key("files");
+
+    if has_files && (has_path || has_steps) {
+        return Err("provide either files or path with steps, not both forms".to_owned());
+    }
+    if has_files {
+        if object
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            return Err("files must contain at least one entry".to_owned());
+        }
+    } else if !has_path || !has_steps {
+        return Err("provide either files or both path and steps".to_owned());
+    }
+
+    serde_json::from_value(arguments).map_err(|error| error.to_string())
+}
+
 fn tool_vim_edit_with_nvim_executable(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
@@ -479,9 +505,11 @@ fn tool_vim_edit_with_nvim_executable(
     nvim_executable: Option<PathBuf>,
     presentation: PrimaryPresentationPublisher,
 ) -> ToolInvocationResponse {
-    let request = match serde_json::from_value::<VimEditToolRequest>(arguments.clone()) {
+    let request = match parse_vim_edit_tool_request(arguments.clone()) {
         Ok(request) => request,
-        Err(error) => return tool_json_error(&error),
+        Err(error) => {
+            return vim_edit_error_response(None, format!("invalid vim edit request: {error}"));
+        }
     };
 
     match request {
@@ -979,46 +1007,21 @@ fn vim_edit_step_schema() -> serde_json::Value {
 fn vim_edit_input_schema() -> serde_json::Value {
     json!({
         "type": "object",
-        "oneOf": [
-            {
-                "required": ["path", "steps"],
-                "properties": {
-                    "path": { "type": "string" },
-                    "steps": {
-                        "type": "array",
-                        "items": vim_edit_step_schema()
-                    }
-                }
-            },
-            {
-                "required": ["files"],
-                "properties": {
-                    "files": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "required": ["path", "steps"],
-                            "properties": {
-                                "path": { "type": "string" },
-                                "steps": {
-                                    "type": "array",
-                                    "items": vim_edit_step_schema()
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        ],
+        "description": "Provide either path with steps for a single file, or files for an ordered multi-file edit.",
         "properties": {
-            "path": { "type": "string" },
+            "path": {
+                "type": "string",
+                "description": "Single-file path; use with steps and omit files."
+            },
             "steps": {
                 "type": "array",
+                "description": "Single-file edit steps; use with path and omit files.",
                 "items": vim_edit_step_schema()
             },
             "files": {
                 "type": "array",
+                "minItems": 1,
+                "description": "Ordered multi-file edits; omit path and top-level steps.",
                 "items": {
                     "type": "object",
                     "required": ["path", "steps"],
@@ -1064,10 +1067,6 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
     ServiceResponse::json(value)
         .unwrap_or_else(|error| ServiceResponse::error("serialization_failed", error.to_string()))
-}
-
-fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
-    vim_edit_error_response(None, format!("invalid vim edit request: {error}"))
 }
 
 fn playback_tool_response<T: serde::Serialize>(
@@ -1351,6 +1350,41 @@ mod tests {
             .expect_err("descriptor mismatch");
 
         assert!(error.contains("path count does not match"));
+    }
+
+    #[test]
+    fn tool_schema_avoids_unsupported_root_combinators() {
+        let schema = vim_edit_input_schema();
+        assert_eq!(
+            schema.get("type").and_then(serde_json::Value::as_str),
+            Some("object")
+        );
+        for keyword in ["oneOf", "allOf", "anyOf"] {
+            assert!(schema.get(keyword).is_none(), "unexpected root {keyword}");
+        }
+        assert!(schema.pointer("/properties/steps/items/oneOf").is_some());
+        assert_eq!(
+            schema
+                .pointer("/properties/files/minItems")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_missing_request_shapes() {
+        for (arguments, expected) in [
+            (
+                json!({"path": "a.txt", "steps": [], "files": [{"path": "b.txt", "steps": []}]}),
+                "not both forms",
+            ),
+            (json!({"path": "a.txt"}), "both path and steps"),
+            (json!({}), "either files or both path and steps"),
+            (json!({"files": []}), "at least one entry"),
+        ] {
+            let error = parse_vim_edit_tool_request(arguments).expect_err("shape must fail");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
     }
 
     #[test]

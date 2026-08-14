@@ -2215,6 +2215,33 @@ struct BedrockConverseRequest {
     additional_model_request_fields: Option<Document>,
 }
 
+fn bedrock_tool_input_schema(tool: &ToolDefinition) -> Result<&serde_json::Value, ProviderError> {
+    let Some(schema) = tool.input_schema.as_object() else {
+        return Err(provider_error(
+            "bedrock_tool_schema_invalid",
+            ProviderErrorCategory::InvalidRequest,
+            format!(
+                "Bedrock tool '{}' input schema must be an object",
+                tool.name
+            ),
+        ));
+    };
+    if let Some(keyword) = ["oneOf", "allOf", "anyOf"]
+        .into_iter()
+        .find(|keyword| schema.contains_key(*keyword))
+    {
+        return Err(provider_error(
+            "bedrock_tool_schema_unsupported",
+            ProviderErrorCategory::InvalidRequest,
+            format!(
+                "Bedrock tool '{}' input schema uses unsupported top-level {keyword}",
+                tool.name
+            ),
+        ));
+    }
+    Ok(&tool.input_schema)
+}
+
 fn build_anthropic_messages_request_value(
     request: &ModelTurnRequest,
 ) -> Result<serde_json::Map<String, serde_json::Value>, ProviderError> {
@@ -2248,13 +2275,13 @@ fn build_anthropic_messages_request_value(
                     .tools
                     .iter()
                     .map(|tool| {
-                        serde_json::json!({
+                        Ok(serde_json::json!({
                             "name": bedrock_tool_name(&tool.name),
                             "description": tool.description,
-                            "input_schema": tool.input_schema,
-                        })
+                            "input_schema": bedrock_tool_input_schema(tool)?,
+                        }))
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>, ProviderError>>()?,
             ),
         );
         body.insert("tool_choice".to_string(), anthropic_tool_choice(request)?);
@@ -2844,7 +2871,7 @@ fn model_tools_to_bedrock_tool_config(
                 .name(bedrock_tool_name(&tool.name))
                 .description(tool.description.clone())
                 .input_schema(ToolInputSchema::Json(json_value_to_document(
-                    &tool.input_schema,
+                    bedrock_tool_input_schema(tool)?,
                 )))
                 .build()
                 .map(Tool::ToolSpec)
@@ -5957,6 +5984,41 @@ mod tests {
             env: BTreeMap::new(),
             config_source: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn anthropic_messages_rejects_unsupported_tool_schema_with_tool_name() {
+        let mut request = test_model_turn_request();
+        request.tools = vec![ToolDefinition {
+            name: "custom.choice".to_string(),
+            description: "choose".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "oneOf": [{"required": ["left"]}, {"required": ["right"]}]
+            }),
+        }];
+
+        let error = build_anthropic_messages_request(&request)
+            .expect_err("unsupported root combinator must fail locally");
+        assert_eq!(error.code, "bedrock_tool_schema_unsupported");
+        assert!(error.message.contains("custom.choice"));
+        assert!(error.message.contains("oneOf"));
+    }
+
+    #[test]
+    fn converse_rejects_unsupported_tool_schema_with_tool_name() {
+        let mut request = test_model_turn_request();
+        request.tools = vec![ToolDefinition {
+            name: "custom.choice".to_string(),
+            description: "choose".to_string(),
+            input_schema: serde_json::json!({"anyOf": [{"type": "object"}]}),
+        }];
+
+        let error = model_tools_to_bedrock_tool_config(&request)
+            .expect_err("unsupported root combinator must fail locally");
+        assert_eq!(error.code, "bedrock_tool_schema_unsupported");
+        assert!(error.message.contains("custom.choice"));
+        assert!(error.message.contains("anyOf"));
     }
 
     #[test]
