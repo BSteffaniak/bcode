@@ -70,6 +70,7 @@ pub enum TranscriptFrameInput {
     Resize(u16, u16),
     ScrollUp(usize),
     AdvanceStreaming(std::time::Duration),
+    AssertNoPendingStreaming,
     Observe,
 }
 
@@ -126,6 +127,14 @@ impl TranscriptFrameSequence {
                     assert!(
                         self.app
                             .advance_streaming_presentation(deadline + after_deadline)
+                    );
+                }
+                TranscriptFrameInput::AssertNoPendingStreaming => {
+                    assert!(
+                        self.app
+                            .next_streaming_presentation_deadline(std::time::Instant::now())
+                            .is_none(),
+                        "frame step requires streaming presentation to be stopped"
                     );
                 }
                 TranscriptFrameInput::Observe => {}
@@ -227,6 +236,71 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[test]
+    fn cancelled_default_stream_stops_presentation_and_keeps_exact_text() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        assert!(!app.apply_presentation_config(bcode_config::PresentationConfig::default()));
+        let accepted = "cancelled multi-paragraph output\n\nwith an exact final prefix";
+        let frames = TranscriptFrameSequence::new(app, 80, 24).run([
+            TranscriptFrameStep {
+                label: "stream-start",
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                        output_position: None,
+                        turn_id: "turn-cancelled".to_owned(),
+                        segment_id: "segment-1".to_owned(),
+                        segment_order: 0,
+                        update: TextStreamUpdate {
+                            generation: 0,
+                            first_revision: 1,
+                            revision: 1,
+                            operation: TextStreamOperation::Append {
+                                expected_offset: 0,
+                                text: accepted.to_owned(),
+                            },
+                        },
+                    },
+                }),
+            },
+            TranscriptFrameStep {
+                label: "turn-cancelled",
+                input: TranscriptFrameInput::Durable(durable(
+                    session_id,
+                    1,
+                    SessionEventKind::ModelTurnFinished {
+                        turn_id: "turn-cancelled".to_owned(),
+                        outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+                        message: None,
+                    },
+                )),
+            },
+            TranscriptFrameStep {
+                label: "presentation-stopped",
+                input: TranscriptFrameInput::AssertNoPendingStreaming,
+            },
+        ]);
+
+        assert_eq!(frames.len(), 3);
+        assert!(!frames[0].text.contains("cancelled multi-paragraph output"));
+        assert!(
+            frames[1].text.contains("cancelled multi-paragraph output"),
+            "{}",
+            frames[1].text
+        );
+        assert!(
+            frames[1].text.contains("with an exact final prefix"),
+            "{}",
+            frames[1].text
+        );
+        assert_eq!(
+            frames[1].observation.semantic_items,
+            frames[2].observation.semantic_items
+        );
+        assert_eq!(frames[1].text, frames[2].text);
     }
 
     #[test]
