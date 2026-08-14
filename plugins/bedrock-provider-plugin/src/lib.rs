@@ -1398,12 +1398,12 @@ async fn stream_bedrock_messages_model(
                 .structured_output
                 .as_ref()
                 .expect("checked structured output");
-            let synthetic = SyntheticStructuredOutput::new(structured);
+            let synthetic = SyntheticStructuredOutput::new(structured, !request.tools.is_empty())?;
             let mut fallback = request.clone();
             fallback.structured_output = None;
             fallback.tools.push(synthetic.tool());
             fallback.tool_schema_mode = None;
-            fallback.tool_call_policy.choice = ToolChoice::Auto;
+            fallback.tool_call_policy.choice = ToolChoice::Required;
             fallback.tool_call_policy.parallel = Some(false);
             turn.push(ProviderTurnEvent::Warning {
                 message: "Bedrock model rejected native structured output; retrying with adapter-mediated schema enforcement"
@@ -3454,13 +3454,93 @@ impl BedrockSurfaceCapabilities {
 /// advertise capabilities Converse cannot serve or deny capabilities the catalog advertises for the
 /// `OpenAI` models.
 fn bedrock_feature_support_for(responses_surface: bool) -> bcode_model::ModelFeatureSupport {
+    bedrock_feature_support_for_surface(responses_surface, false, false)
+}
+
+fn bedrock_structured_output_support(
+    responses_surface: bool,
+    messages_surface: bool,
+    unsupported: bool,
+) -> bcode_model::CapabilitySupport {
+    use bcode_model::{
+        CapabilityFidelity, CapabilityMechanism, CapabilitySource, CapabilitySupport,
+    };
+    if unsupported {
+        CapabilitySupport::Unsupported {
+            source: CapabilitySource::BundledCatalog,
+            reason: "the selected Bedrock surface does not support provider-native JSON Schema enforcement"
+                .to_string(),
+        }
+    } else if responses_surface {
+        CapabilitySupport::supported(CapabilitySource::BundledCatalog)
+    } else {
+        CapabilitySupport::Supported {
+            source: CapabilitySource::BundledCatalog,
+            mechanism: if messages_surface {
+                CapabilityMechanism::AdapterMediated
+            } else {
+                CapabilityMechanism::Native
+            },
+            fidelity: CapabilityFidelity::Reduced,
+        }
+    }
+}
+
+const fn bedrock_strict_tool_schema_support(
+    responses_surface: bool,
+) -> bcode_model::CapabilitySupport {
+    use bcode_model::{
+        CapabilityFidelity, CapabilityMechanism, CapabilitySource, CapabilitySupport,
+    };
+    if responses_surface {
+        CapabilitySupport::supported(CapabilitySource::BundledCatalog)
+    } else {
+        CapabilitySupport::Supported {
+            source: CapabilitySource::BundledCatalog,
+            mechanism: CapabilityMechanism::Native,
+            fidelity: CapabilityFidelity::Reduced,
+        }
+    }
+}
+
+fn bedrock_prompt_cache_support(
+    supported: impl Fn() -> bcode_model::CapabilitySupport,
+) -> std::collections::BTreeMap<bcode_model::PromptCacheFeature, bcode_model::CapabilitySupport> {
+    use bcode_model::{CapabilitySource, CapabilitySupport, PromptCacheFeature};
+    [
+        PromptCacheFeature::ConversationPrefix,
+        PromptCacheFeature::ExplicitSystem,
+        PromptCacheFeature::ExplicitTools,
+        PromptCacheFeature::ExplicitMessage,
+    ]
+    .into_iter()
+    .map(|feature| (feature, supported()))
+    .chain(std::iter::once((
+        PromptCacheFeature::Ttl,
+        CapabilitySupport::Unsupported {
+            source: CapabilitySource::BundledCatalog,
+            reason: "Bedrock cache points do not accept a portable TTL".to_string(),
+        },
+    )))
+    .collect()
+}
+
+fn bedrock_feature_support_for_surface(
+    responses_surface: bool,
+    messages_surface: bool,
+    structured_output_unsupported: bool,
+) -> bcode_model::ModelFeatureSupport {
     use bcode_model::{
         CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
-        ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
-        ToolSchemaMode,
+        ModelParameterKey, StructuredOutputMode, ToolChoiceMode, ToolSchemaMode,
     };
     let surface = BedrockSurfaceCapabilities::for_surface(responses_surface);
     let supported = || CapabilitySupport::supported(CapabilitySource::BundledCatalog);
+    let structured_output = bedrock_structured_output_support(
+        responses_surface,
+        messages_surface,
+        structured_output_unsupported,
+    );
     let unsupported = |reason: &str| CapabilitySupport::Unsupported {
         source: CapabilitySource::BundledCatalog,
         reason: reason.to_string(),
@@ -3487,7 +3567,14 @@ fn bedrock_feature_support_for(responses_surface: bool) -> bcode_model::ModelFea
             StructuredOutputMode::StrictJsonSchema,
         ]
         .into_iter()
-        .map(|mode| (mode, surface.structured_output.clone()))
+        .map(|mode| {
+            let support = if surface.structured_output.is_guaranteed() {
+                structured_output.clone()
+            } else {
+                surface.structured_output.clone()
+            };
+            (mode, support)
+        })
         .collect(),
         tool_choice: [
             (ToolChoiceMode::Auto, supported()),
@@ -3500,23 +3587,14 @@ fn bedrock_feature_support_for(responses_surface: bool) -> bcode_model::ModelFea
         .collect(),
         tool_schema: [
             (ToolSchemaMode::Permissive, supported()),
-            (ToolSchemaMode::Strict, supported()),
+            (
+                ToolSchemaMode::Strict,
+                bedrock_strict_tool_schema_support(responses_surface),
+            ),
         ]
         .into_iter()
         .collect(),
-        prompt_cache: [
-            PromptCacheFeature::ConversationPrefix,
-            PromptCacheFeature::ExplicitSystem,
-            PromptCacheFeature::ExplicitTools,
-            PromptCacheFeature::ExplicitMessage,
-        ]
-        .into_iter()
-        .map(|feature| (feature, supported()))
-        .chain(std::iter::once((
-            PromptCacheFeature::Ttl,
-            unsupported("Bedrock cache points do not accept a portable TTL"),
-        )))
-        .collect(),
+        prompt_cache: bedrock_prompt_cache_support(supported),
         media_input: [
             (MediaInputFeature::UserImage, supported()),
             (
@@ -3544,6 +3622,12 @@ fn bedrock_feature_support_for(responses_surface: bool) -> bcode_model::ModelFea
 
 fn capabilities_for_context(context: &bcode_model::ProviderRequestContext) -> ProviderCapabilities {
     let settings = Settings::resolve_from_context(context);
+    let transport = settings.transport.as_ref().copied().ok();
+    let responses_surface = transport == Some(BedrockTransport::MantleOpenAi)
+        || context.api_surface == Some(bcode_model::ModelApiSurface::Responses);
+    let messages_surface =
+        !responses_surface && context.api_surface == Some(bcode_model::ModelApiSurface::Messages);
+    let structured_output_unsupported = transport == Some(BedrockTransport::MantleAnthropic);
     ProviderCapabilities {
         provider_id: PROVIDER_ID.to_string(),
         display_name: "Amazon Bedrock".to_string(),
@@ -3556,11 +3640,10 @@ fn capabilities_for_context(context: &bcode_model::ProviderRequestContext) -> Pr
         ]
         .into_iter()
         .collect(),
-        feature_support: bedrock_feature_support_for(
-            settings
-                .transport
-                .as_ref()
-                .is_ok_and(|transport| *transport == BedrockTransport::MantleOpenAi),
+        feature_support: bedrock_feature_support_for_surface(
+            responses_surface,
+            messages_surface,
+            structured_output_unsupported,
         ),
         auth_schemes: [
             "aws_default_chain".to_string(),
@@ -5793,18 +5876,19 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_messages_adapter_fallback_preserves_tool_compatibility() {
+    fn anthropic_messages_adapter_fallback_forces_synthetic_tool() {
         let structured = bcode_model::StructuredOutputRequest {
             name: "answer".to_string(),
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         };
-        let synthetic = SyntheticStructuredOutput::new(&structured);
+        let synthetic = SyntheticStructuredOutput::new(&structured, false)
+            .expect("tool-free synthetic output should be supported");
         let mut request = test_model_turn_request();
         request.structured_output = None;
         request.tools.push(synthetic.tool());
         request.tool_schema_mode = None;
-        request.tool_call_policy.choice = ToolChoice::Auto;
+        request.tool_call_policy.choice = ToolChoice::Required;
         request.tool_call_policy.parallel = Some(false);
         let body = build_anthropic_messages_request_value(&request)
             .expect("fallback Messages request should build");
@@ -5820,7 +5904,7 @@ mod tests {
                 .iter()
                 .all(|tool| tool.get("strict").is_none())
         );
-        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tool_choice"]["type"], "any");
         assert!(body.get("output_config").is_none());
     }
 
@@ -5855,7 +5939,8 @@ mod tests {
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         };
-        let synthetic = SyntheticStructuredOutput::new(&structured);
+        let synthetic = SyntheticStructuredOutput::new(&structured, false)
+            .expect("tool-free synthetic output should be supported");
         let tool = synthetic.tool();
         let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), Some(synthetic));
         let turn = TurnState::default();
@@ -7563,6 +7648,49 @@ mod tests {
             bcode_model::NegotiatedFeatureSupport::Unknown {
                 scope: bcode_model::CapabilityScope::Model
             }
+        ));
+    }
+
+    #[test]
+    fn bedrock_structured_output_capabilities_report_surface_fidelity() {
+        use bcode_model::{
+            CapabilityFidelity, CapabilityMechanism, CapabilitySupport, StructuredOutputMode,
+        };
+
+        let converse = bedrock_feature_support_for_surface(false, false, false);
+        assert!(matches!(
+            converse.structured_output(StructuredOutputMode::StrictJsonSchema),
+            CapabilitySupport::Supported {
+                mechanism: CapabilityMechanism::Native,
+                fidelity: CapabilityFidelity::Reduced,
+                ..
+            }
+        ));
+
+        let messages = bedrock_feature_support_for_surface(false, true, false);
+        assert!(matches!(
+            messages.structured_output(StructuredOutputMode::StrictJsonSchema),
+            CapabilitySupport::Supported {
+                mechanism: CapabilityMechanism::AdapterMediated,
+                fidelity: CapabilityFidelity::Reduced,
+                ..
+            }
+        ));
+
+        let responses = bedrock_feature_support_for_surface(true, false, false);
+        assert!(matches!(
+            responses.structured_output(StructuredOutputMode::StrictJsonSchema),
+            CapabilitySupport::Supported {
+                mechanism: CapabilityMechanism::Native,
+                fidelity: CapabilityFidelity::Exact,
+                ..
+            }
+        ));
+
+        let unsupported = bedrock_feature_support_for_surface(false, false, true);
+        assert!(matches!(
+            unsupported.structured_output(StructuredOutputMode::StrictJsonSchema),
+            CapabilitySupport::Unsupported { .. }
         ));
     }
 

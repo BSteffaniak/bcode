@@ -1936,6 +1936,7 @@ dependencies = [
  "bcode_client",
  "bcode_command",
  "bcode_ipc",
+ "bcode_model_schema",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_workflow",

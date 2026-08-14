@@ -36,13 +36,27 @@ pub struct SyntheticStructuredOutput {
 
 impl SyntheticStructuredOutput {
     /// Construct a provider-local structured-output constraint.
-    #[must_use]
-    pub fn new(request: &StructuredOutputRequest) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when real tools are present, because forcing the synthetic tool would
+    /// suppress or compete with authorized host tool execution.
+    pub fn new(
+        request: &StructuredOutputRequest,
+        has_real_tools: bool,
+    ) -> Result<Self, ProviderError> {
+        if has_real_tools {
+            return Err(simple_provider_error(
+                "structured_output_emulation_requires_tool_free_round",
+                ProviderErrorCategory::UnsupportedFeature,
+                "structured-output emulation requires a tool-free provider round",
+            ));
+        }
+        Ok(Self {
             tool_name: format!("bcode_structured_{}", request.name),
             output_name: request.name.clone(),
             schema: request.schema.clone(),
-        }
+        })
     }
 
     /// Return whether a provider tool name identifies this synthetic result tool.
@@ -1224,7 +1238,8 @@ mod output_position_tests {
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         };
-        let helper = SyntheticStructuredOutput::new(&request);
+        let helper = SyntheticStructuredOutput::new(&request, false)
+            .expect("tool-free synthetic output should be supported");
         let tool = helper.tool();
         assert_eq!(tool.input_schema, request.schema);
         let text = helper
@@ -1235,6 +1250,22 @@ mod output_position_tests {
             })
             .expect("synthetic call should become text");
         assert_eq!(text, r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn synthetic_structured_output_rejects_real_tools() {
+        let request = StructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        };
+        let error = SyntheticStructuredOutput::new(&request, true)
+            .expect_err("real tools must not compete with the synthetic constraint");
+        assert_eq!(
+            error.code,
+            "structured_output_emulation_requires_tool_free_round"
+        );
+        assert_eq!(error.category, ProviderErrorCategory::UnsupportedFeature);
     }
 
     #[test]

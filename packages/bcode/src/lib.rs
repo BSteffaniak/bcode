@@ -7417,60 +7417,8 @@ impl Agent {
             request.tool_call_policy.choice.clone(),
         );
         #[cfg(feature = "embedded-plugins")]
-        if let (Some(plugins), Some(provider_plugin_id)) =
-            (self.plugins.as_ref(), self.provider_plugin_id.as_deref())
-        {
-            let provider_capabilities = plugins
-                .invoke_service_json_scoped::<ProviderCapabilitiesRequest, ProviderCapabilities>(
-                    provider_plugin_id,
-                    MODEL_PROVIDER_INTERFACE_ID,
-                    bcode_model::OP_CAPABILITIES,
-                    &ProviderCapabilitiesRequest {
-                        provider_context: request.provider_context.clone(),
-                        selected_model_id: Some(request.model_id.clone()),
-                    },
-                    bcode_plugin::PluginInvocationScope::Global,
-                )
-                .await
-                .ok();
-            let model = plugins
-                .invoke_service_json_scoped::<bcode_model::ModelListRequest, ModelList>(
-                    provider_plugin_id,
-                    MODEL_PROVIDER_INTERFACE_ID,
-                    OP_MODELS,
-                    &bcode_model::ModelListRequest {
-                        provider_context: self.provider_context.clone(),
-                        selected_model_id: Some(self.model_id.clone()),
-                    },
-                    bcode_plugin::PluginInvocationScope::Global,
-                )
-                .await
-                .ok()
-                .and_then(|models| {
-                    models
-                        .models
-                        .into_iter()
-                        .find(|model| model.model_id == self.model_id)
-                });
-            let parallel_feature = RequestedModelFeature::ToolChoice(ToolChoiceMode::Parallel);
-            let parallel_guaranteed = provider_capabilities
-                .as_ref()
-                .zip(model.as_ref())
-                .is_some_and(|(provider, model)| {
-                    provider
-                        .feature_support
-                        .negotiate(&model.feature_support, parallel_feature)
-                        .is_guaranteed()
-                });
-            request.tool_call_policy = bcode_model::ParallelToolCallCapabilities {
-                provider: Some(parallel_guaranteed),
-                model: Some(parallel_guaranteed),
-                runtime: true,
-            }
-            .negotiate(
-                self.execution_options.parallel,
-                request.tool_call_policy.choice.clone(),
-            );
+        if let Some(policy) = self.embedded_parallel_tool_policy(&request).await {
+            request.tool_call_policy = policy;
         }
         let default_invoker = SdkToolInvoker {
             handlers: self.inline_tool_handlers.clone(),
@@ -7512,6 +7460,62 @@ impl Agent {
             return Err(error);
         }
         result.map_err(Into::into)
+    }
+
+    #[cfg(feature = "embedded-plugins")]
+    async fn embedded_parallel_tool_policy(
+        &self,
+        request: &AgentTurnRequest,
+    ) -> Option<bcode_model::ToolCallRequestPolicy> {
+        let plugins = self.plugins.as_ref()?;
+        let provider_plugin_id = self.provider_plugin_id.as_deref()?;
+        let provider = plugins
+            .invoke_service_json_scoped::<ProviderCapabilitiesRequest, ProviderCapabilities>(
+                provider_plugin_id,
+                MODEL_PROVIDER_INTERFACE_ID,
+                bcode_model::OP_CAPABILITIES,
+                &ProviderCapabilitiesRequest {
+                    provider_context: request.provider_context.clone(),
+                    selected_model_id: Some(request.model_id.clone()),
+                },
+                bcode_plugin::PluginInvocationScope::Global,
+            )
+            .await
+            .ok()?;
+        let model = plugins
+            .invoke_service_json_scoped::<bcode_model::ModelListRequest, ModelList>(
+                provider_plugin_id,
+                MODEL_PROVIDER_INTERFACE_ID,
+                OP_MODELS,
+                &bcode_model::ModelListRequest {
+                    provider_context: request.provider_context.clone(),
+                    selected_model_id: Some(request.model_id.clone()),
+                },
+                bcode_plugin::PluginInvocationScope::Global,
+            )
+            .await
+            .ok()?
+            .models
+            .into_iter()
+            .find(|model| model.model_id == request.model_id)?;
+        let parallel = provider
+            .feature_support
+            .negotiate(
+                &model.feature_support,
+                RequestedModelFeature::ToolChoice(ToolChoiceMode::Parallel),
+            )
+            .is_guaranteed();
+        Some(
+            bcode_model::ParallelToolCallCapabilities {
+                provider: Some(parallel),
+                model: Some(parallel),
+                runtime: true,
+            }
+            .negotiate(
+                self.execution_options.parallel,
+                request.tool_call_policy.choice.clone(),
+            ),
+        )
     }
 
     fn permission_context(&self) -> RuntimePermissionContext {

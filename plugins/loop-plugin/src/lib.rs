@@ -1369,6 +1369,22 @@ fn legacy_state_root() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn bedrock_schema_dialect_for_test() -> bcode_model_schema::SchemaDialect {
+        use bcode_model_schema::{ObjectPropertyPolicy, SchemaDialect, UnsupportedKeywordPolicy};
+        SchemaDialect {
+            object_properties: ObjectPropertyPolicy::RequireAllAndClose,
+            unsupported_keywords: std::collections::BTreeMap::from([
+                ("minimum".to_string(), UnsupportedKeywordPolicy::Remove),
+                ("maximum".to_string(), UnsupportedKeywordPolicy::Remove),
+                ("multipleOf".to_string(), UnsupportedKeywordPolicy::Remove),
+                ("minLength".to_string(), UnsupportedKeywordPolicy::Remove),
+                ("maxLength".to_string(), UnsupportedKeywordPolicy::Remove),
+            ]),
+            accepted_min_items: std::collections::BTreeSet::from([0, 1]),
+            ..SchemaDialect::default()
+        }
+    }
+
     #[derive(Debug, Default)]
     struct TestHost {
         request: std::sync::Mutex<Option<PluginWorkflowStartRequest>>,
@@ -1735,6 +1751,12 @@ mod tests {
         assert!(definition.nodes["loop.implementation"].configuration["structured_output"]
             ["schema"]["schema"]["properties"]["evidence"]["minItems"]
             .is_null());
+        for node_id in ["loop.implementation", "loop.evaluation"] {
+            let schema =
+                &definition.nodes[node_id].configuration["structured_output"]["schema"]["schema"];
+            bcode_model_schema::normalize(schema, &bedrock_schema_dialect_for_test())
+                .unwrap_or_else(|error| panic!("{node_id} schema must fit Bedrock: {error}"));
+        }
         assert!(
             definition.nodes["loop.implementation"].configuration["tools"].is_null(),
             "implementation keeps the current session's unrestricted tool policy"
