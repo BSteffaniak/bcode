@@ -164,6 +164,9 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 options: request.options,
                 selected_approval: 0,
                 text_view: TextViewState::new(),
+                selected_run: 0,
+                selected_node: 0,
+                input_buffer: None,
                 updates: None,
                 catalog: None,
                 runs: std::collections::BTreeMap::new(),
@@ -179,6 +182,9 @@ struct WorkflowStatusSurface {
     options: serde_json::Value,
     selected_approval: usize,
     text_view: TextViewState,
+    selected_run: usize,
+    selected_node: usize,
+    input_buffer: Option<String>,
     updates: Option<PluginTuiSurfaceUpdateReceiver>,
     catalog: Option<bcode_workflow_view_models::WorkflowCatalogView>,
     runs: std::collections::BTreeMap<String, bcode_workflow_view_models::WorkflowRunView>,
@@ -219,6 +225,185 @@ impl WorkflowSurfaceTheme {
 }
 
 impl WorkflowStatusSurface {
+    fn selected_run_view(&self) -> Option<&bcode_workflow_view_models::WorkflowRunView> {
+        let run_id = self
+            .catalog
+            .as_ref()?
+            .runs
+            .get(self.selected_run)?
+            .run_id
+            .as_str();
+        self.runs.get(run_id)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_control_center_event(&mut self, event: &Event) -> PluginTuiAction {
+        let Event::Key(key) = event else {
+            return PluginTuiAction::None;
+        };
+        if let Some(buffer) = self.input_buffer.as_mut() {
+            match key.key {
+                KeyCode::Escape => {
+                    self.input_buffer = None;
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char(character) => {
+                    buffer.push(character);
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Enter => {
+                    let value = std::mem::take(buffer);
+                    self.input_buffer = None;
+                    let Some(run) = self.selected_run_view() else {
+                        return PluginTuiAction::None;
+                    };
+                    let Some(wait) = run.waits.iter().find(|wait| {
+                        wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Input
+                    }) else {
+                        return PluginTuiAction::None;
+                    };
+                    return plugin_command(
+                        "workflow.provide-input",
+                        format!(
+                            "run_id={} node_id={} activation_id={} value={value}",
+                            run.run.run_id, wait.node_id, wait.activation_id
+                        ),
+                    );
+                }
+                _ => return PluginTuiAction::None,
+            }
+        }
+        let run_count = self
+            .catalog
+            .as_ref()
+            .map_or(0, |catalog| catalog.runs.len());
+        match key.key {
+            KeyCode::Escape | KeyCode::Char('q') => PluginTuiAction::Close { outcome: None },
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.selected_run = self.selected_run.saturating_sub(1);
+                self.selected_node = 0;
+                PluginTuiAction::Redraw
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if run_count > 0 {
+                    self.selected_run = (self.selected_run + 1).min(run_count - 1);
+                    self.selected_node = 0;
+                }
+                PluginTuiAction::Redraw
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selected_node = self.selected_node.saturating_sub(1);
+                PluginTuiAction::Redraw
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let node_count = self.selected_run_view().map_or(0, |run| run.nodes.len());
+                if node_count > 0 {
+                    self.selected_node = (self.selected_node + 1).min(node_count - 1);
+                }
+                PluginTuiAction::Redraw
+            }
+            KeyCode::Char('p') => self
+                .selected_run_view()
+                .map_or(PluginTuiAction::None, |run| {
+                    let command = if run.run.status
+                        == bcode_workflow_view_models::WorkflowRunStatus::Paused
+                    {
+                        "workflow.resume"
+                    } else {
+                        "workflow.pause"
+                    };
+                    plugin_command(command, format!("run_id={}", run.run.run_id))
+                }),
+            KeyCode::Char('c') => self
+                .selected_run_view()
+                .map_or(PluginTuiAction::None, |run| {
+                    plugin_command("workflow.cancel", format!("run_id={}", run.run.run_id))
+                }),
+            KeyCode::Char('a' | 'd') => {
+                let approve = key.key == KeyCode::Char('a');
+                let Some(run) = self.selected_run_view() else {
+                    return PluginTuiAction::None;
+                };
+                if let Some(approval) = run.mutation_approvals.first() {
+                    return plugin_command(
+                        if approve {
+                            "workflow.approve-mutation"
+                        } else {
+                            "workflow.deny-mutation"
+                        },
+                        format!("approval_id={}", approval.approval_id),
+                    );
+                }
+                let Some(wait) = run.waits.iter().find(|wait| {
+                    wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Approval
+                }) else {
+                    return PluginTuiAction::None;
+                };
+                plugin_command(
+                    if approve {
+                        "workflow.approve"
+                    } else {
+                        "workflow.deny"
+                    },
+                    format!(
+                        "run_id={} node_id={} activation_id={}",
+                        run.run.run_id, wait.node_id, wait.activation_id
+                    ),
+                )
+            }
+            KeyCode::Char('i') => {
+                if self.selected_run_view().is_some_and(|run| {
+                    run.waits.iter().any(|wait| {
+                        wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Input
+                    })
+                }) {
+                    self.input_buffer = Some(String::new());
+                    PluginTuiAction::Redraw
+                } else {
+                    PluginTuiAction::None
+                }
+            }
+            KeyCode::Char('r') => {
+                let Some(run) = self.selected_run_view() else {
+                    return PluginTuiAction::None;
+                };
+                let selected_node = run.nodes.get(self.selected_node);
+                let Some(attempt) = run.attempts.iter().rev().find(|attempt| {
+                    selected_node.is_some_and(|node| node.node_id == attempt.node_id)
+                        && attempt.status == "failed"
+                }) else {
+                    return PluginTuiAction::None;
+                };
+                plugin_command(
+                    "workflow.retry-node",
+                    format!(
+                        "run_id={} node_id={} activation_id={} failed_attempt={}",
+                        run.run.run_id, attempt.node_id, attempt.activation_id, attempt.attempt
+                    ),
+                )
+            }
+            KeyCode::Char('o') => self
+                .selected_run_view()
+                .map_or(PluginTuiAction::None, |run| {
+                    run.child_sessions
+                        .first()
+                        .map_or(PluginTuiAction::None, |session| {
+                            session
+                                .session_id
+                                .parse()
+                                .map_or(PluginTuiAction::None, |session_id| {
+                                    PluginTuiAction::OpenSession { session_id }
+                                })
+                        })
+                }),
+            _ => PluginTuiAction::None,
+        }
+    }
+
     fn render_themed(
         &self,
         area: Rect,
@@ -242,7 +427,14 @@ impl WorkflowStatusSurface {
         pane.render(&pane_state, frame);
         let content = pane.inner_area(&pane_state);
         let rows = if self.catalog.is_some() {
-            workflow_view_lines(self.catalog.as_ref(), &self.runs, &self.live_status)
+            workflow_view_lines(
+                self.catalog.as_ref(),
+                &self.runs,
+                &self.live_status,
+                self.selected_run,
+                self.selected_node,
+                self.input_buffer.as_deref(),
+            )
         } else {
             surface_lines(&self.options, self.selected_approval)
         }
@@ -324,6 +516,9 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.catalog.is_some() {
+            return self.handle_control_center_event(event);
+        }
         let approval_count =
             mutation_approvals(&self.options).map_or(0, <[serde_json::Value]>::len);
         match event {
@@ -368,6 +563,9 @@ fn workflow_view_lines(
     catalog: Option<&bcode_workflow_view_models::WorkflowCatalogView>,
     runs: &std::collections::BTreeMap<String, bcode_workflow_view_models::WorkflowRunView>,
     live_status: &str,
+    selected_run: usize,
+    selected_node: usize,
+    input_buffer: Option<&str>,
 ) -> Vec<String> {
     let mut lines = vec![
         "Workflow control center".to_string(),
@@ -379,16 +577,22 @@ fn workflow_view_lines(
         return lines;
     };
     lines.push(format!("Runs ({})", catalog.runs.len()));
-    for item in &catalog.runs {
+    for (run_index, item) in catalog.runs.iter().enumerate() {
+        let run_marker = if run_index == selected_run { ">" } else { " " };
         lines.push(format!(
-            "  {} · {} v{} · {:?}",
+            "{run_marker} {} · {} v{} · {:?}",
             item.run_id, item.definition_id, item.definition_version, item.status
         ));
         if let Some(run) = runs.get(&item.run_id) {
             lines.push(format!("    Nodes ({})", run.nodes.len()));
-            for node in &run.nodes {
+            for (node_index, node) in run.nodes.iter().enumerate() {
+                let node_marker = if run_index == selected_run && node_index == selected_node {
+                    "▶"
+                } else {
+                    " "
+                };
                 lines.push(format!(
-                    "      {} · {:?} · {:?}",
+                    "    {node_marker} {} · {:?} · {:?}",
                     node.node_id, node.kind, node.status
                 ));
             }
@@ -428,7 +632,25 @@ fn workflow_view_lines(
             lines.push("    Loading bounded run projection…".to_string());
         }
     }
+    lines.push(String::new());
+    if let Some(input) = input_buffer {
+        lines.push(format!("Input JSON › {input}"));
+        lines.push("Enter submit · Esc cancel".to_string());
+    } else {
+        lines.push(
+            "←/→ run · ↑/↓ node · p pause/resume · c cancel · r retry · a/d approval · i input · o session"
+                .to_string(),
+        );
+    }
     lines
+}
+
+fn plugin_command(command_id: &str, arguments: String) -> PluginTuiAction {
+    PluginTuiAction::InvokePluginCommand {
+        plugin_id: "bcode.workflow".to_string(),
+        command_id: command_id.to_string(),
+        arguments: Some(arguments),
+    }
 }
 
 fn next_action(activation: &serde_json::Value) -> &'static str {
@@ -1092,5 +1314,120 @@ mod tests {
                 .join("\n")
                 .contains("Resolve diagnostics and provide valid configuration before start")
         );
+    }
+    fn projected_surface() -> WorkflowStatusSurface {
+        let run = bcode_workflow_view_models::WorkflowRunView {
+            version: 1,
+            run: bcode_workflow_view_models::WorkflowRunListItem {
+                run_id: "run-1".to_string(),
+                definition_id: "review".to_string(),
+                definition_version: 1,
+                status: bcode_workflow_view_models::WorkflowRunStatus::Running,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            },
+            nodes: vec![bcode_workflow_view_models::WorkflowNodeView {
+                node_id: "reviewer".to_string(),
+                name: "Reviewer".to_string(),
+                kind: bcode_workflow_view_models::WorkflowNodeKind::Agent,
+                activation_id: Some("activation-1".to_string()),
+                status: bcode_workflow_view_models::WorkflowNodeStatus::Failed,
+            }],
+            edges: Vec::new(),
+            waits: vec![bcode_workflow_view_models::WorkflowWaitView {
+                node_id: "approval".to_string(),
+                activation_id: "approval-activation".to_string(),
+                kind: bcode_workflow_view_models::WorkflowWaitKind::Approval,
+                input: None,
+                requested_at_ms: 2,
+            }],
+            mutation_approvals: Vec::new(),
+            attempts: vec![bcode_workflow_view_models::WorkflowAttemptView {
+                node_id: "reviewer".to_string(),
+                activation_id: "activation-1".to_string(),
+                attempt: 2,
+                dispatch_identity: "dispatch-2".to_string(),
+                status: "failed".to_string(),
+                has_receipt: true,
+                prepared_at_ms: 2,
+                terminal_at_ms: Some(3),
+            }],
+            outputs: vec![bcode_workflow_view_models::WorkflowOutputView {
+                output_id: "output-1".to_string(),
+                node_id: "reviewer".to_string(),
+                activation_id: "activation-1".to_string(),
+                schema_id: "bcode.review.result/v1".to_string(),
+                schema_version: 1,
+                checksum_sha256: "checksum".to_string(),
+                value: bcode_workflow_view_models::WorkflowOutputValue::Resolved {
+                    value: serde_json::json!({"verdict":"fail","findings":["issue"]}),
+                },
+                artifact_reference: None,
+                created_at_ms: 3,
+            }],
+            descendant_runs: Vec::new(),
+            child_sessions: vec![bcode_workflow_view_models::WorkflowChildSessionView {
+                node_id: "reviewer".to_string(),
+                activation_id: "activation-1".to_string(),
+                attempt: 2,
+                session_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            }],
+            terminal: None,
+            health: bcode_workflow_view_models::WorkflowProjectionHealth::Current,
+        };
+        WorkflowStatusSurface {
+            options: serde_json::Value::Null,
+            selected_approval: 0,
+            text_view: TextViewState::new(),
+            selected_run: 0,
+            selected_node: 0,
+            input_buffer: None,
+            updates: None,
+            catalog: Some(bcode_workflow_view_models::WorkflowCatalogView {
+                version: 1,
+                runs: vec![run.run.clone()],
+            }),
+            runs: std::collections::BTreeMap::from([("run-1".to_string(), run)]),
+            live_status: "live".to_string(),
+            subscription_requested: true,
+        }
+    }
+
+    #[test]
+    fn projected_control_center_renders_typed_results_and_routes_actions() {
+        let mut surface = projected_surface();
+        let rendered = workflow_view_lines(
+            surface.catalog.as_ref(),
+            &surface.runs,
+            &surface.live_status,
+            0,
+            0,
+            None,
+        )
+        .join("\n");
+        assert!(rendered.contains("bcode.review.result/v1"));
+        assert!(rendered.contains("findings"));
+        assert!(rendered.contains("issue"));
+        assert!(matches!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char('c')))),
+            PluginTuiAction::InvokePluginCommand { ref command_id, .. }
+                if command_id == "workflow.cancel"
+        ));
+        assert!(matches!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char('r')))),
+            PluginTuiAction::InvokePluginCommand { ref command_id, .. }
+                if command_id == "workflow.retry-node"
+        ));
+        assert!(matches!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char('a')))),
+            PluginTuiAction::InvokePluginCommand { ref command_id, .. }
+                if command_id == "workflow.approve"
+        ));
+        assert!(matches!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Char('o')
+            ))),
+            PluginTuiAction::OpenSession { .. }
+        ));
     }
 }
