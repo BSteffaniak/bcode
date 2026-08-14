@@ -135,6 +135,16 @@ pub enum SessionLifecycleRequest {
         /// Require the cloned history snapshot to end at this generation.
         expected_generation: Option<u64>,
     },
+    SessionDerivationSnapshot {
+        session_id: SessionId,
+    },
+    SessionDerivationPrompts {
+        session_id: SessionId,
+        query: bcode_session_models::SessionDerivationPromptQuery,
+    },
+    DeriveSession {
+        request: Box<bcode_session_models::SessionDerivationRequest>,
+    },
     /// Explicit complete-history request for export/debug/history commands only.
     ///
     /// This request may force the server to read every canonical event for the session.
@@ -1445,6 +1455,20 @@ impl RoutedRequest {
                 name,
                 expected_generation,
             }),
+            Request::SessionDerivationSnapshot { session_id } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::SessionDerivationSnapshot {
+                    session_id,
+                })
+            }
+            Request::SessionDerivationPrompts { session_id, query } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::SessionDerivationPrompts {
+                    session_id,
+                    query,
+                })
+            }
+            Request::DeriveSession { request } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::DeriveSession { request })
+            }
             Request::RefreshSessionCatalog {
                 working_directory,
                 sources,

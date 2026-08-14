@@ -4051,6 +4051,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ImportExternalSession { .. } => "import_external_session",
         Request::ForkSession { .. } => "fork_session",
         Request::CloneSession { .. } => "clone_session",
+        Request::SessionDerivationSnapshot { .. } => "session_derivation_snapshot",
+        Request::SessionDerivationPrompts { .. } => "session_derivation_prompts",
+        Request::DeriveSession { .. } => "derive_session",
         Request::RefreshSessionCatalog { .. } => "refresh_session_catalog",
         Request::AttachSessionProjectionWindow { .. } => "attach_session_projection_window",
         Request::ListPendingToolExchanges => "list_pending_tool_exchanges",
@@ -4492,6 +4495,15 @@ async fn handle_request_inner(
                 expected_generation,
             )
             .await
+        }
+        SessionLifecycleRequest::SessionDerivationSnapshot { session_id } => {
+            handle_session_derivation_snapshot(request_id, state, writer, session_id).await
+        }
+        SessionLifecycleRequest::SessionDerivationPrompts { session_id, query } => {
+            handle_session_derivation_prompts(request_id, state, writer, session_id, query).await
+        }
+        SessionLifecycleRequest::DeriveSession { request } => {
+            handle_derive_session(request_id, state, writer, *request).await
         }
         SessionLifecycleRequest::SessionHistory { session_id } => {
             handle_session_history(request_id, client_id, state, writer, session_id).await
@@ -9605,6 +9617,98 @@ async fn handle_fork_session(
                 writer,
                 request_id,
                 Response::Err(ErrorResponse::new("session_fork_failed", error.to_string())),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_session_derivation_snapshot(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    match state.sessions.session_derivation_snapshot(session_id).await {
+        Ok(snapshot) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionDerivationSnapshot { snapshot }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_derivation_snapshot_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_session_derivation_prompts(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    query: bcode_session_models::SessionDerivationPromptQuery,
+) -> Result<(), ServerError> {
+    match state
+        .sessions
+        .session_derivation_prompt_candidates(session_id, query)
+        .await
+    {
+        Ok(page) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionDerivationPrompts { page }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_derivation_prompts_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_derive_session(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: bcode_session_models::SessionDerivationRequest,
+) -> Result<(), ServerError> {
+    match state.sessions.derive_session(request).await {
+        Ok(outcome) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionDerived { outcome }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_derivation_failed",
+                    error.to_string(),
+                )),
             )
             .await
         }
@@ -33423,6 +33527,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",

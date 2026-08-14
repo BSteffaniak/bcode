@@ -8,7 +8,9 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
+    ClientId, ProjectionWindowRequest, RuntimeWorkKind, RuntimeWorkStatus,
+    SessionDerivationPromptPage, SessionDerivationPromptQuery, SessionDerivationRequest,
+    SessionDerivationSourceSnapshot, SessionDerivationTerminalOutcome, SessionEvent,
     SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
     SessionId, SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery,
     SessionLiveEvent, SessionOpenOperationId, SessionOpenOperationSnapshot, SessionSummary, WorkId,
@@ -954,6 +956,19 @@ pub enum Request {
         /// Require the cloned history snapshot to end at this generation.
         #[serde(default)]
         expected_generation: Option<u64>,
+    },
+    /// Capture one bounded source snapshot for generic session derivation.
+    SessionDerivationSnapshot {
+        session_id: SessionId,
+    },
+    /// Read one bounded prompt-candidate page pinned to a source generation.
+    SessionDerivationPrompts {
+        session_id: SessionId,
+        query: SessionDerivationPromptQuery,
+    },
+    /// Execute one versioned generic session derivation request.
+    DeriveSession {
+        request: Box<SessionDerivationRequest>,
     },
     RefreshSessionCatalog {
         #[serde(default)]
@@ -2725,6 +2740,15 @@ pub enum ResponsePayload {
     SessionForked {
         session: SessionSummary,
         draft: Option<String>,
+    },
+    SessionDerivationSnapshot {
+        snapshot: SessionDerivationSourceSnapshot,
+    },
+    SessionDerivationPrompts {
+        page: SessionDerivationPromptPage,
+    },
+    SessionDerived {
+        outcome: SessionDerivationTerminalOutcome,
     },
     SessionCatalogRefreshed {
         sessions: Vec<SessionSummary>,

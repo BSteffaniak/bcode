@@ -213,6 +213,7 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SessionImported { .. }
         | SessionEventKind::SessionForked { .. }
+        | SessionEventKind::SessionDerived { .. }
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::ReasoningChanged { .. }
         | SessionEventKind::ToolExchangeRequested { .. }
@@ -441,6 +442,7 @@ pub fn project_event(
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SessionImported { .. }
         | SessionEventKind::SessionForked { .. }
+        | SessionEventKind::SessionDerived { .. }
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::ReasoningChanged { .. }
         | SessionEventKind::ToolExchangeRequested { .. }

@@ -356,6 +356,16 @@ enum PersistedSessionEventKind {
         forked_at_ms: u64,
         kind: SessionForkKind,
     },
+    SessionDerived {
+        source_session_id: SessionId,
+        source_generation: u64,
+        source_cutoff_sequence: u64,
+        producer: String,
+        operation_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_source_sequence: Option<u64>,
+        derived_at_ms: u64,
+    },
     /// Durable marker for Ralph loop lifecycle events relevant to this session.
     RalphLifecycle {
         loop_name: String,
@@ -818,6 +828,23 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 forked_at_ms: *forked_at_ms,
                 kind: *kind,
             },
+            SessionEventKind::SessionDerived {
+                source_session_id,
+                source_generation,
+                source_cutoff_sequence,
+                producer,
+                operation_kind,
+                selected_source_sequence,
+                derived_at_ms,
+            } => Self::SessionDerived {
+                source_session_id: *source_session_id,
+                source_generation: *source_generation,
+                source_cutoff_sequence: *source_cutoff_sequence,
+                producer: producer.clone(),
+                operation_kind: operation_kind.clone(),
+                selected_source_sequence: *selected_source_sequence,
+                derived_at_ms: *derived_at_ms,
+            },
             SessionEventKind::RalphLifecycle {
                 loop_name,
                 state_dir,
@@ -1152,6 +1179,23 @@ impl PersistedSessionEventKind {
                 source_prompt_sequence,
                 forked_at_ms,
                 kind,
+            },
+            Self::SessionDerived {
+                source_session_id,
+                source_generation,
+                source_cutoff_sequence,
+                producer,
+                operation_kind,
+                selected_source_sequence,
+                derived_at_ms,
+            } => SessionEventKind::SessionDerived {
+                source_session_id,
+                source_generation,
+                source_cutoff_sequence,
+                producer,
+                operation_kind,
+                selected_source_sequence,
+                derived_at_ms,
             },
             Self::RalphLifecycle {
                 loop_name,

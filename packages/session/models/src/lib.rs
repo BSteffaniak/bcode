@@ -291,7 +291,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 45;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 46;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -411,6 +411,7 @@ pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'sta
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
@@ -3217,6 +3218,17 @@ pub enum SessionEventKind {
         source_prompt_sequence: Option<u64>,
         forked_at_ms: u64,
         kind: SessionForkKind,
+    },
+    /// Current generic provenance marker for a session derived from a stable source prefix.
+    SessionDerived {
+        source_session_id: SessionId,
+        source_generation: u64,
+        source_cutoff_sequence: u64,
+        producer: String,
+        operation_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_source_sequence: Option<u64>,
+        derived_at_ms: u64,
     },
     /// Durable marker for Ralph loop lifecycle events relevant to this session.
     RalphLifecycle {

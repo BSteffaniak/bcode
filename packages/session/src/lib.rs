@@ -33,6 +33,7 @@ pub(crate) mod db_projection_row;
 pub(crate) mod db_row;
 pub(crate) mod db_runtime_work;
 pub(crate) mod db_validation;
+mod derivation;
 mod fork;
 pub mod lease;
 mod manifest;
@@ -474,6 +475,18 @@ pub enum SessionError {
         expected: u64,
         current: u64,
     },
+    /// Generic derivation requests require the canonical persistent session store.
+    #[error("session derivation requires a persistent session store")]
+    DerivationRequiresPersistentStore,
+    /// A portable derivation request failed contract validation.
+    #[error("invalid session derivation request: {0}")]
+    InvalidDerivationRequest(String),
+    /// Atomic publication found an unexpected canonical destination.
+    #[error("derived session publication conflict: {0}")]
+    DerivationPublicationConflict(SessionId),
+    /// Filesystem staging or atomic adoption failed.
+    #[error("session derivation filesystem error: {0}")]
+    DerivationIo(#[from] std::io::Error),
     /// Background execution-session provenance is malformed or inconsistent.
     #[error("invalid execution session provenance: {0}")]
     InvalidExecutionSessionProvenance(String),
@@ -6565,6 +6578,73 @@ mod tests {
         assert!(!encoded.contains("provider_state"));
         assert!(!encoded.contains("encrypted-sentinel-do-not-expose"));
 
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn derivation_builds_staged_destination_and_publishes_atomically() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let source = manager
+            .create_session(Some("source".to_owned()), test_working_directory())
+            .await
+            .expect("source");
+        manager
+            .append_user_message(source.id, ClientId::new(), "prompt".to_owned())
+            .await
+            .expect("prompt");
+        manager
+            .append_assistant_message(source.id, "answer".to_owned())
+            .await
+            .expect("answer");
+        let snapshot = manager
+            .session_derivation_snapshot(source.id)
+            .await
+            .expect("snapshot");
+        let request = bcode_session_models::SessionDerivationRequest {
+            version: bcode_session_models::SESSION_DERIVATION_CONTRACT_VERSION,
+            operation_id: bcode_session_models::SessionDerivationOperationId::new(),
+            idempotency_key: "derive-1".to_owned(),
+            source: snapshot.clone(),
+            cutoff_sequence: snapshot.latest_sequence,
+            destination_name: Some("derived".to_owned()),
+            initial_draft: Some("next prompt".to_owned()),
+            lineage: bcode_session_models::SessionDerivationLineage {
+                producer: "bcode.test".to_owned(),
+                operation_kind: "bcode.test/clone".to_owned(),
+                selected_source_sequence: None,
+            },
+        };
+        let outcome = manager.derive_session(request).await.expect("derive");
+        let bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { session } = outcome
+        else {
+            panic!("expected success");
+        };
+        assert_eq!(session.name.as_deref(), Some("derived"));
+        assert!(db::session_db_path(&root, session.id).exists());
+        assert_eq!(
+            manager
+                .session_composer_draft(session.id)
+                .await
+                .expect("draft")
+                .as_deref(),
+            Some("next prompt")
+        );
+        let history = manager.session_history(session.id).await.expect("history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::SessionDerived {
+                source_session_id,
+                source_generation,
+                producer,
+                operation_kind,
+                ..
+            } if *source_session_id == source.id
+                && *source_generation == snapshot.generation
+                && producer == "bcode.test"
+                && operation_kind == "bcode.test/clone"
+        )));
+        assert!(!root.join(".derivation-staging").join("derive-1").exists());
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

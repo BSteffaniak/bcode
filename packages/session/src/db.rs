@@ -1356,6 +1356,16 @@ impl SessionDb {
         })
     }
 
+    /// Close this session database through the abstract database lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if backend-specific graceful shutdown fails.
+    pub(crate) async fn close(&self) -> SessionDbResult<()> {
+        self.db.close().await?;
+        Ok(())
+    }
+
     /// Return the current composer draft, if one is persisted for this session.
     ///
     /// # Errors

@@ -23,10 +23,12 @@ use bcode_ipc::{
     send_envelope,
 };
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-    SessionForkResult, SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery,
-    SessionHistoryWindow, SessionId, SessionInputHistoryEntry, SessionInspectionPage,
-    SessionInspectionQuery, SessionSummary, WorkId,
+    ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionDerivationPromptPage,
+    SessionDerivationPromptQuery, SessionDerivationRequest, SessionDerivationSourceSnapshot,
+    SessionDerivationTerminalOutcome, SessionEvent, SessionEventKind, SessionForkResult,
+    SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
+    SessionId, SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery,
+    SessionSummary, WorkId,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::{BTreeMap, VecDeque};
@@ -4553,6 +4555,64 @@ impl BcodeClient {
     pub async fn plugin_contributions(&self) -> Result<PluginContributions, ClientError> {
         match self.send_request(Request::ListPluginContributions).await? {
             ResponsePayload::PluginContributions { contributions } => Ok(contributions),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Capture a bounded stable source snapshot for generic derivation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the source cannot be read boundedly.
+    pub async fn session_derivation_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionDerivationSourceSnapshot, ClientError> {
+        match self
+            .send_request(Request::SessionDerivationSnapshot { session_id })
+            .await?
+        {
+            ResponsePayload::SessionDerivationSnapshot { snapshot } => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read one bounded generation-pinned page of derivation prompt candidates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, the generation changed, or the query is
+    /// invalid.
+    pub async fn session_derivation_prompts(
+        &self,
+        session_id: SessionId,
+        query: SessionDerivationPromptQuery,
+    ) -> Result<SessionDerivationPromptPage, ClientError> {
+        match self
+            .send_request(Request::SessionDerivationPrompts { session_id, query })
+            .await?
+        {
+            ResponsePayload::SessionDerivationPrompts { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Execute one generic session derivation request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or derivation fails.
+    pub async fn derive_session(
+        &self,
+        request: SessionDerivationRequest,
+    ) -> Result<SessionDerivationTerminalOutcome, ClientError> {
+        match self
+            .send_request(Request::DeriveSession {
+                request: Box::new(request),
+            })
+            .await?
+        {
+            ResponsePayload::SessionDerived { outcome } => Ok(outcome),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
