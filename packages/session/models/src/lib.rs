@@ -972,6 +972,17 @@ pub struct SessionDerivationLineage {
     pub selected_source_sequence: Option<u64>,
 }
 
+/// Source consistency policy for one derivation request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDerivationSourcePolicy {
+    /// The canonical source tail must remain exactly equal to the captured generation.
+    #[default]
+    ExactGeneration,
+    /// The selected immutable prefix must exist; later append-only source events are permitted.
+    StablePrefix,
+}
+
 /// Request to derive one destination session from a stable source snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDerivationRequest {
@@ -984,8 +995,14 @@ pub struct SessionDerivationRequest {
     pub idempotency_key: String,
     /// Exact source snapshot selected by the caller.
     pub source: SessionDerivationSourceSnapshot,
+    /// Source consistency policy.
+    #[serde(default)]
+    pub source_policy: SessionDerivationSourcePolicy,
     /// Inclusive source sequence copied into the destination, or zero for an empty prefix.
     pub cutoff_sequence: u64,
+    /// Optional destination working directory override authorized by the calling application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_working_directory: Option<PathBuf>,
     /// Optional destination display name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_name: Option<String>,
@@ -3385,7 +3402,9 @@ mod tests {
                 title: Some("source".to_owned()),
                 working_directory: PathBuf::from("/workspace"),
             },
+            source_policy: SessionDerivationSourcePolicy::ExactGeneration,
             cutoff_sequence: 19,
+            destination_working_directory: None,
             destination_name: Some("derived".to_owned()),
             initial_draft: Some("edit this prompt".to_owned()),
             lineage: SessionDerivationLineage {

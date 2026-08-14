@@ -64,13 +64,12 @@ use bcode_session_models::{
     MAX_SESSION_DERIVATION_PROMPT_PREVIEW_BYTES, ProjectionWindow, ProjectionWindowRequest,
     SESSION_DERIVATION_CONTRACT_VERSION, SessionDerivationPromptCandidate,
     SessionDerivationPromptPage, SessionDerivationPromptQuery, SessionDerivationSourceSnapshot,
-    SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind,
-    SessionHistoryAroundQuery, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
-    SessionHistoryWindow, SessionId, SessionImportSummary, SessionInputHistoryEntry,
-    SessionInspectionPage, SessionInspectionQuery, SessionLiveEvent, SessionLiveEventKind,
-    SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
-    SessionOpenOperationSnapshot, SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource,
-    SessionVisibility,
+    SessionEvent, SessionEventKind, SessionEventProvenance, SessionHistoryAroundQuery,
+    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
+    SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionInspectionPage,
+    SessionInspectionQuery, SessionLiveEvent, SessionLiveEventKind, SessionMigrationProgress,
+    SessionMigrationStage, SessionOpenOperationId, SessionOpenOperationSnapshot,
+    SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource, SessionVisibility,
 };
 pub use catalog::{
     CatalogLoadStatus, SessionCatalogEntry, SessionCatalogLoadStatus, SessionHealth,
@@ -1531,8 +1530,9 @@ impl SessionManager {
                     .to_string(),
             ));
         }
-        let events = self.session_history(provenance.parent_session_id).await?;
-        let current = events.last().map_or(0, |event| event.sequence);
+        let current = self
+            .current_session_generation(provenance.parent_session_id)
+            .await?;
         if current != expected {
             return Err(SessionError::CloneGenerationChanged {
                 session_id: provenance.parent_session_id,
@@ -1540,24 +1540,16 @@ impl SessionManager {
                 current,
             });
         }
-        let marker = SessionEventKind::SessionForked {
-            source_session_id: provenance.parent_session_id,
-            source_title: Some(source.display_title().to_string()),
-            source_cutoff_sequence: events.last().map(|event| event.sequence),
-            source_prompt_sequence: None,
-            forked_at_ms: self.next_activity_timestamp_ms(),
-            kind: SessionForkKind::Clone,
+        let mut request = Self::execution_derivation_request(name, &provenance, &source, expected);
+        request.destination_working_directory = Some(working_directory);
+        let outcome = self.derive_execution_session(request, provenance).await?;
+        let bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { session } = outcome
+        else {
+            return Err(SessionError::InvalidExecutionSessionProvenance(
+                "fixed-generation derivation did not succeed".to_owned(),
+            ));
         };
-        let session = self
-            .copy_session_events_with_execution(
-                name,
-                working_directory,
-                events,
-                marker,
-                Some(provenance),
-            )
-            .await?;
-        Ok(session)
+        Ok(*session)
     }
 
     /// Admit one shared-session execution under an exclusive per-parent permit.
@@ -1717,37 +1709,28 @@ impl SessionManager {
                 ));
             }
         };
-        let mut events = self.session_history(provenance.parent_session_id).await?;
-        let current = events.last().map_or(0, |event| event.sequence);
-        if parent_generation > current
-            || (parent_generation > 0
-                && !events
-                    .iter()
-                    .any(|event| event.sequence == parent_generation))
-        {
+        let current = self
+            .current_session_generation(provenance.parent_session_id)
+            .await?;
+        if parent_generation > current {
             return Err(SessionError::CloneGenerationChanged {
                 session_id: provenance.parent_session_id,
                 expected: parent_generation,
                 current,
             });
         }
-        events.retain(|event| event.sequence <= parent_generation);
-        let marker = SessionEventKind::SessionForked {
-            source_session_id: provenance.parent_session_id,
-            source_title: Some(parent.display_title().to_string()),
-            source_cutoff_sequence: events.last().map(|event| event.sequence),
-            source_prompt_sequence: None,
-            forked_at_ms: self.next_activity_timestamp_ms(),
-            kind: SessionForkKind::Clone,
+        let mut request =
+            Self::execution_derivation_request(name, &provenance, &parent, parent_generation);
+        request.source_policy = bcode_session_models::SessionDerivationSourcePolicy::StablePrefix;
+        request.destination_working_directory = Some(working_directory);
+        let outcome = self.derive_execution_session(request, provenance).await?;
+        let bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { session } = outcome
+        else {
+            return Err(SessionError::InvalidExecutionSessionProvenance(
+                "pinned-generation derivation did not succeed".to_owned(),
+            ));
         };
-        self.copy_session_events_with_execution(
-            name,
-            working_directory,
-            events,
-            marker,
-            Some(provenance),
-        )
-        .await
+        Ok(*session)
     }
 
     /// Clone a fixed-generation execution session into an explicitly declared worktree.
@@ -1766,8 +1749,10 @@ impl SessionManager {
         provenance.context_mode = ExecutionSessionContextMode::FixedGenerationFork;
         provenance.parent_generation = Some(parent_generation);
         let working_directory = worktree_directory.to_path_buf();
-        let events = self.session_history(provenance.parent_session_id).await?;
-        let current = events.last().map_or(0, |event| event.sequence);
+        let source = self.session_summary(provenance.parent_session_id).await?;
+        let current = self
+            .current_session_generation(provenance.parent_session_id)
+            .await?;
         if current != parent_generation {
             return Err(SessionError::CloneGenerationChanged {
                 session_id: provenance.parent_session_id,
@@ -1775,23 +1760,17 @@ impl SessionManager {
                 current,
             });
         }
-        let source = self.session_summary(provenance.parent_session_id).await?;
-        let marker = SessionEventKind::SessionForked {
-            source_session_id: provenance.parent_session_id,
-            source_title: Some(source.display_title().to_string()),
-            source_cutoff_sequence: events.last().map(|event| event.sequence),
-            source_prompt_sequence: None,
-            forked_at_ms: self.next_activity_timestamp_ms(),
-            kind: SessionForkKind::Clone,
+        let mut request =
+            Self::execution_derivation_request(name, &provenance, &source, parent_generation);
+        request.destination_working_directory = Some(working_directory);
+        let outcome = self.derive_execution_session(request, provenance).await?;
+        let bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { session } = outcome
+        else {
+            return Err(SessionError::InvalidExecutionSessionProvenance(
+                "worktree fixed-generation derivation did not succeed".to_owned(),
+            ));
         };
-        self.copy_session_events_with_execution(
-            name,
-            working_directory,
-            events,
-            marker,
-            Some(provenance),
-        )
-        .await
+        Ok(*session)
     }
 
     /// Set or clear a persisted composer draft for a session.
@@ -6613,6 +6592,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn derivation_builds_staged_destination_and_publishes_atomically() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -6637,7 +6617,9 @@ mod tests {
             operation_id: bcode_session_models::SessionDerivationOperationId::new(),
             idempotency_key: "derive-1".to_owned(),
             source: snapshot.clone(),
+            source_policy: bcode_session_models::SessionDerivationSourcePolicy::ExactGeneration,
             cutoff_sequence: snapshot.latest_sequence,
+            destination_working_directory: None,
             destination_name: Some("derived".to_owned()),
             initial_draft: Some("next prompt".to_owned()),
             lineage: bcode_session_models::SessionDerivationLineage {
@@ -10020,7 +10002,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn two_fixed_generation_reviewers_have_independent_transcripts() {
-        let manager = SessionManager::default();
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
         let parent = manager
             .create_session(Some("parent".to_string()), test_working_directory())
             .await
@@ -10314,7 +10297,8 @@ mod tests {
 
     #[tokio::test]
     async fn fixed_generation_execution_session_copies_exact_parent_snapshot() {
-        let manager = SessionManager::default();
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
         let parent = manager
             .create_session(Some("parent".to_string()), test_working_directory())
             .await

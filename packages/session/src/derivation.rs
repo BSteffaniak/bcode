@@ -1,12 +1,15 @@
 //! Generic bounded session derivation mechanics.
 
-use crate::{SessionError, SessionManager, db};
+use crate::{
+    ExecutionSessionProvenance, SessionError, SessionManager, db,
+    validate_execution_session_provenance,
+};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, SESSION_DERIVATION_CONTRACT_VERSION,
     SessionDerivationOperationId, SessionDerivationOperationSnapshot, SessionDerivationPhase,
-    SessionDerivationProgress, SessionDerivationRequest, SessionDerivationTerminalOutcome,
-    SessionEvent, SessionEventKind, SessionEventProvenance, SessionHistoryCursor,
-    SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionSummary,
+    SessionDerivationProgress, SessionDerivationRequest, SessionDerivationSourcePolicy,
+    SessionDerivationTerminalOutcome, SessionEvent, SessionEventKind, SessionEventProvenance,
+    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionSummary,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -45,9 +48,32 @@ impl SessionManager {
     ///
     /// Returns an error for invalid requests, source-generation changes, incompatible source
     /// history, persistence failures, validation failures, or publication conflicts.
+    pub async fn derive_execution_session(
+        &self,
+        request: SessionDerivationRequest,
+        provenance: ExecutionSessionProvenance,
+    ) -> Result<SessionDerivationTerminalOutcome, SessionError> {
+        validate_execution_session_provenance(Some(&provenance))?;
+        self.derive_session_with_execution(request, Some(provenance))
+            .await
+    }
+
+    /// Derive a new session from one exact bounded source prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when derivation validation or persistence fails.
     pub async fn derive_session(
         &self,
         request: SessionDerivationRequest,
+    ) -> Result<SessionDerivationTerminalOutcome, SessionError> {
+        self.derive_session_with_execution(request, None).await
+    }
+
+    async fn derive_session_with_execution(
+        &self,
+        request: SessionDerivationRequest,
+        execution: Option<ExecutionSessionProvenance>,
     ) -> Result<SessionDerivationTerminalOutcome, SessionError> {
         request
             .validate()
@@ -101,7 +127,7 @@ impl SessionManager {
         self.persist_derivation_operation(request.operation_id)
             .await?;
         let result = self
-            .derive_session_inner(&request, destination_id, &cancellation)
+            .derive_session_inner(&request, destination_id, &cancellation, execution.as_ref())
             .await;
         let outcome = match result {
             Ok(summary) => SessionDerivationTerminalOutcome::Succeeded {
@@ -132,6 +158,7 @@ impl SessionManager {
         request: &SessionDerivationRequest,
         destination_id: SessionId,
         cancellation: &AtomicBool,
+        execution: Option<&ExecutionSessionProvenance>,
     ) -> Result<SessionSummary, SessionError> {
         ensure_not_cancelled(request.operation_id, cancellation)?;
         self.update_derivation_progress(
@@ -144,7 +171,9 @@ impl SessionManager {
         let source_generation = self
             .current_session_generation(request.source.session_id)
             .await?;
-        if source_generation != request.source.generation {
+        if request.source_policy == SessionDerivationSourcePolicy::ExactGeneration
+            && source_generation != request.source.generation
+        {
             return Err(SessionError::DerivationGenerationChanged {
                 session_id: request.source.session_id,
                 expected: request.source.generation,
@@ -161,7 +190,13 @@ impl SessionManager {
             std::fs::remove_dir_all(&staging_root)?;
         }
         let result = self
-            .build_staged_derivation(request, destination_id, &staging_root, cancellation)
+            .build_staged_derivation(
+                request,
+                destination_id,
+                &staging_root,
+                cancellation,
+                execution,
+            )
             .await;
         if result.is_err() {
             let _cleanup = std::fs::remove_dir_all(&staging_root);
@@ -298,6 +333,45 @@ impl SessionManager {
         self.persist_derivation_operation(operation_id).await
     }
 
+    pub(crate) fn execution_derivation_request(
+        name: Option<String>,
+        provenance: &ExecutionSessionProvenance,
+        source: &SessionSummary,
+        generation: u64,
+    ) -> bcode_session_models::SessionDerivationRequest {
+        let operation_id = bcode_session_models::SessionDerivationOperationId::new();
+        bcode_session_models::SessionDerivationRequest {
+            version: bcode_session_models::SESSION_DERIVATION_CONTRACT_VERSION,
+            operation_id,
+            idempotency_key: format!(
+                "execution:{}:{}:{}:{}:{}",
+                provenance.owner,
+                provenance.run_id,
+                provenance.node_id,
+                provenance.activation_id.as_deref().unwrap_or("none"),
+                provenance.attempt
+            ),
+            source: bcode_session_models::SessionDerivationSourceSnapshot {
+                version: bcode_session_models::SESSION_DERIVATION_CONTRACT_VERSION,
+                session_id: provenance.parent_session_id,
+                generation,
+                latest_sequence: generation,
+                title: Some(source.display_title().to_owned()),
+                working_directory: source.working_directory.clone(),
+            },
+            source_policy: bcode_session_models::SessionDerivationSourcePolicy::ExactGeneration,
+            cutoff_sequence: generation,
+            destination_working_directory: None,
+            destination_name: name,
+            initial_draft: None,
+            lineage: bcode_session_models::SessionDerivationLineage {
+                producer: provenance.owner.clone(),
+                operation_kind: "bcode.execution/fixed-generation".to_owned(),
+                selected_source_sequence: None,
+            },
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn build_staged_derivation(
         &self,
@@ -305,6 +379,7 @@ impl SessionManager {
         destination_id: SessionId,
         staging_root: &Path,
         cancellation: &AtomicBool,
+        execution: Option<&ExecutionSessionProvenance>,
     ) -> Result<SessionSummary, SessionError> {
         let db = db::SessionDb::initialize_turso_in_root(destination_id, staging_root).await?;
         let created_at_ms = self.next_activity_timestamp_ms();
@@ -317,12 +392,31 @@ impl SessionManager {
             provenance: None,
             kind: SessionEventKind::SessionCreated {
                 name: request.destination_name.clone(),
-                working_directory: request.source.working_directory.clone(),
+                working_directory: request
+                    .destination_working_directory
+                    .clone()
+                    .unwrap_or_else(|| request.source.working_directory.clone()),
             },
         };
         db.append_event_batch(&[(created, Some(created_at_ms))])
             .await?;
         destination_sequence += 1;
+        if let Some(provenance) = execution {
+            let execution_event = SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: destination_sequence,
+                timestamp_ms: created_at_ms,
+                session_id: destination_id,
+                provenance: None,
+                kind: SessionEventKind::ExecutionSessionCreated {
+                    provenance: Box::new(provenance.clone()),
+                    visibility: bcode_session_models::SessionVisibility::Background,
+                },
+            };
+            db.append_event_batch(&[(execution_event, Some(created_at_ms))])
+                .await?;
+            destination_sequence += 1;
+        }
 
         let mut sequence_map = BTreeMap::new();
         let mut cursor = None;
@@ -405,7 +499,9 @@ impl SessionManager {
         let current_generation = self
             .current_session_generation(request.source.session_id)
             .await?;
-        if current_generation != request.source.generation {
+        if request.source_policy == SessionDerivationSourcePolicy::ExactGeneration
+            && current_generation != request.source.generation
+        {
             db.close().await?;
             return Err(SessionError::DerivationGenerationChanged {
                 session_id: request.source.session_id,
