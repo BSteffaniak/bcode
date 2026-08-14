@@ -291,7 +291,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 44;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 45;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///

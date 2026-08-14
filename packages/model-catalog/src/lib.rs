@@ -8,7 +8,7 @@ use bcode_model::{
     CapabilitySource, CapabilitySupport, MediaInputFeature, ModelCacheCapability, ModelCacheInfo,
     ModelCapability, ModelInfo, ModelMetadataSource, ModelPricingInfo, ModelPricingSource,
     ModelPricingUnit, ModelReasoningCapabilitySource, ModelReasoningInfo, ModelTokenPrice,
-    ToolChoiceMode,
+    StructuredOutputMode, ToolChoiceMode, ToolSchemaMode,
 };
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
@@ -1066,6 +1066,27 @@ fn feature_support_from_catalog(
             ),
         ]);
     }
+    if capabilities.tool_use {
+        support.tool_schema.extend([
+            (
+                ToolSchemaMode::Permissive,
+                CapabilitySupport::supported(source),
+            ),
+            (ToolSchemaMode::Strict, CapabilitySupport::supported(source)),
+        ]);
+    }
+    if capabilities.structured_outputs {
+        support.structured_output.extend([
+            (
+                StructuredOutputMode::JsonSchema,
+                CapabilitySupport::supported(source),
+            ),
+            (
+                StructuredOutputMode::StrictJsonSchema,
+                CapabilitySupport::supported(source),
+            ),
+        ]);
+    }
     if let Some(parallel) = capabilities.parallel_tool_calls {
         support.tool_choice.insert(
             ToolChoiceMode::Parallel,
@@ -1089,6 +1110,11 @@ fn apply_catalog_feature_support(
     source: CapabilitySource,
 ) {
     let claims = feature_support_from_catalog(capabilities, source);
+    model
+        .feature_support
+        .structured_output
+        .extend(claims.structured_output);
+    model.feature_support.tool_schema.extend(claims.tool_schema);
     model.feature_support.tool_choice.extend(claims.tool_choice);
     model.feature_support.media_input.extend(claims.media_input);
 }
@@ -2401,6 +2427,50 @@ status = "stable"
                 "{model_id} must remain visible (Converse-compatible)"
             );
         }
+    }
+
+    #[test]
+    fn catalog_structured_output_claims_are_explicit_and_disabled_defaults_stay_unknown() {
+        let structured = CatalogCapabilities {
+            structured_outputs: true,
+            ..CatalogCapabilities::default()
+        };
+        let structured_support =
+            feature_support_from_catalog(&structured, CapabilitySource::BundledCatalog);
+        assert!(
+            structured_support
+                .structured_output(StructuredOutputMode::JsonSchema)
+                .is_guaranteed()
+        );
+        assert!(
+            structured_support
+                .structured_output(StructuredOutputMode::StrictJsonSchema)
+                .is_guaranteed()
+        );
+
+        assert!(matches!(
+            structured_support.tool_schema(ToolSchemaMode::Strict),
+            CapabilitySupport::Unknown
+        ));
+
+        let tools = CatalogCapabilities {
+            tool_use: true,
+            ..CatalogCapabilities::default()
+        };
+        let tool_support = feature_support_from_catalog(&tools, CapabilitySource::BundledCatalog);
+        assert!(
+            tool_support
+                .tool_schema(ToolSchemaMode::Strict)
+                .is_guaranteed()
+        );
+
+        let disabled = CatalogCapabilities::default();
+        let disabled_support =
+            feature_support_from_catalog(&disabled, CapabilitySource::BundledCatalog);
+        assert!(matches!(
+            disabled_support.structured_output(StructuredOutputMode::StrictJsonSchema),
+            CapabilitySupport::Unknown
+        ));
     }
 
     #[test]

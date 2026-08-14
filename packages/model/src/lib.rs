@@ -2126,6 +2126,39 @@ impl ParallelToolCallCapabilities {
     }
 }
 
+/// Capabilities resolved jointly from the active provider surface and selected model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedModelFeatureCapabilities {
+    /// Structured-output support for the requested mode, when requested.
+    pub structured_output: Option<NegotiatedFeatureSupport>,
+    /// Strict tool-schema support when tools are present.
+    pub strict_tool_schema: Option<NegotiatedFeatureSupport>,
+}
+
+impl ResolvedModelFeatureCapabilities {
+    /// Return whether the requested structured-output mode is guaranteed.
+    #[must_use]
+    pub const fn structured_output_is_guaranteed(&self) -> bool {
+        matches!(
+            self.structured_output,
+            Some(NegotiatedFeatureSupport::Guaranteed { .. })
+        )
+    }
+
+    /// Return strict tool-schema policy only when both scopes guarantee it.
+    #[must_use]
+    pub const fn tool_schema_mode(&self) -> Option<ToolSchemaMode> {
+        if matches!(
+            self.strict_tool_schema,
+            Some(NegotiatedFeatureSupport::Guaranteed { .. })
+        ) {
+            Some(ToolSchemaMode::Strict)
+        } else {
+            None
+        }
+    }
+}
+
 /// Start a provider model turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
@@ -3287,6 +3320,38 @@ mod tests {
                 mechanism: super::CapabilityMechanism::AdapterMediated,
                 fidelity: super::CapabilityFidelity::Reduced,
             }
+        );
+    }
+
+    #[test]
+    fn resolved_feature_capabilities_require_guarantees_for_provider_policy() {
+        let unknown = super::ResolvedModelFeatureCapabilities {
+            structured_output: Some(super::NegotiatedFeatureSupport::Unknown {
+                scope: super::CapabilityScope::Model,
+            }),
+            strict_tool_schema: Some(super::NegotiatedFeatureSupport::Unsupported {
+                scope: super::CapabilityScope::Provider,
+                source: super::CapabilitySource::BundledCatalog,
+                reason: "unsupported".to_string(),
+            }),
+        };
+        assert!(!unknown.structured_output_is_guaranteed());
+        assert_eq!(unknown.tool_schema_mode(), None);
+
+        let guaranteed = super::NegotiatedFeatureSupport::Guaranteed {
+            provider_source: super::CapabilitySource::BundledCatalog,
+            model_source: super::CapabilitySource::ProviderApi,
+            mechanism: super::CapabilityMechanism::Native,
+            fidelity: super::CapabilityFidelity::Exact,
+        };
+        let resolved = super::ResolvedModelFeatureCapabilities {
+            structured_output: Some(guaranteed.clone()),
+            strict_tool_schema: Some(guaranteed),
+        };
+        assert!(resolved.structured_output_is_guaranteed());
+        assert_eq!(
+            resolved.tool_schema_mode(),
+            Some(super::ToolSchemaMode::Strict)
         );
     }
 

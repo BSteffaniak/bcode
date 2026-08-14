@@ -36,27 +36,19 @@ pub struct SyntheticStructuredOutput {
 
 impl SyntheticStructuredOutput {
     /// Construct a provider-local structured-output constraint.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when real tools are present, because forcing the synthetic tool would
-    /// suppress or compete with authorized host tool execution.
-    pub fn new(
-        request: &StructuredOutputRequest,
-        has_real_tools: bool,
-    ) -> Result<Self, ProviderError> {
-        if has_real_tools {
-            return Err(simple_provider_error(
-                "structured_output_emulation_requires_tool_free_round",
-                ProviderErrorCategory::UnsupportedFeature,
-                "structured-output emulation requires a tool-free provider round",
-            ));
-        }
-        Ok(Self {
+    #[must_use]
+    pub fn new(request: &StructuredOutputRequest) -> Self {
+        Self {
             tool_name: format!("bcode_structured_{}", request.name),
             output_name: request.name.clone(),
             schema: request.schema.clone(),
-        })
+        }
+    }
+
+    /// Return whether a provider tool name identifies this synthetic result tool.
+    #[must_use]
+    pub fn matches_tool_name(&self, name: &str) -> bool {
+        name == self.tool_name
     }
 
     /// Return the provider-facing synthetic tool definition.
@@ -1226,13 +1218,13 @@ mod output_position_tests {
     }
 
     #[test]
-    fn synthetic_structured_output_is_tool_free_and_intercepts_completed_call() {
+    fn synthetic_structured_output_intercepts_completed_call() {
         let request = StructuredOutputRequest {
             name: "answer".to_string(),
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         };
-        let helper = SyntheticStructuredOutput::new(&request, false).expect("tool-free helper");
+        let helper = SyntheticStructuredOutput::new(&request);
         let tool = helper.tool();
         assert_eq!(tool.input_schema, request.schema);
         let text = helper
@@ -1243,7 +1235,6 @@ mod output_position_tests {
             })
             .expect("synthetic call should become text");
         assert_eq!(text, r#"{"ok":true}"#);
-        assert!(SyntheticStructuredOutput::new(&request, true).is_err());
     }
 
     #[test]

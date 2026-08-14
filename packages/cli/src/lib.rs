@@ -8117,7 +8117,17 @@ async fn set_session_model(
 }
 
 async fn model_capabilities() -> Result<(), CliError> {
-    let response = call_model_provider_service(bcode_model::OP_CAPABILITIES).await?;
+    let config = bcode_config::load_config()?;
+    let selection = config.resolved_model_selection();
+    let request = bcode_model::ProviderCapabilitiesRequest {
+        provider_context: configured_provider_context(&config),
+        selected_model_id: selection.selected_model_id,
+    };
+    let response = call_model_provider_service_payload(
+        bcode_model::OP_CAPABILITIES,
+        serde_json::to_vec(&request)?,
+    )
+    .await?;
     if let Some(error) = response.error {
         println!("ERROR\t{}\t{}", error.code, error.message);
         return Ok(());

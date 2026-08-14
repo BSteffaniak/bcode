@@ -23524,6 +23524,34 @@ async fn build_model_turn_request(
         true,
     )
     .await;
+    let desired_structured_output =
+        execution
+            .structured_output
+            .as_ref()
+            .map(|request| bcode_model::StructuredOutputRequest {
+                name: bcode_session_models::structured_output_name(&request.name),
+                schema: request.schema.clone(),
+                strict: request.strict,
+            });
+    let resolved_features = resolve_model_feature_capabilities(
+        state,
+        provider_plugin_id,
+        &model_id,
+        &provider_context,
+        desired_structured_output.as_ref(),
+        !tools.is_empty(),
+    )
+    .await;
+    let structured_output = if desired_structured_output.is_some()
+        && !resolved_features.structured_output_is_guaranteed()
+    {
+        return Err(bcode_session::SessionError::EventSerialization(
+            "requested structured output is not guaranteed by the selected provider surface and model"
+                .to_string(),
+        ));
+    } else {
+        desired_structured_output
+    };
     let mut request = ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
@@ -23536,14 +23564,8 @@ async fn build_model_turn_request(
             config.tools.execution.runtime_options().parallel,
             bcode_model::ToolChoice::Auto,
         ),
-        tool_schema_mode: None,
-        structured_output: execution.structured_output.as_ref().map(|request| {
-            bcode_model::StructuredOutputRequest {
-                name: bcode_session_models::structured_output_name(&request.name),
-                schema: request.schema.clone(),
-                strict: request.strict,
-            }
-        }),
+        tool_schema_mode: resolved_features.tool_schema_mode(),
+        structured_output,
         context_management,
         parameters,
         prompt_cache,
@@ -23564,7 +23586,7 @@ async fn build_model_turn_request(
         projected_request_context(state, session_id, provider_plugin_id, &request).await;
     image_input::hydrate_tool_result_images(state, session_id, provider_plugin_id, &mut request)
         .await;
-    append_negotiated_feature_fidelity_events(state, session_id, provider_plugin_id, &request)
+    append_negotiated_feature_fidelity_events(state, session_id, &request, &resolved_features)
         .await;
     Ok(PreparedModelRequest {
         request,
@@ -23935,16 +23957,18 @@ fn supported_reasoning_value<'a>(
     (supported.is_empty() || supported.iter().any(|value| value == requested)).then_some(requested)
 }
 
-async fn append_negotiated_feature_fidelity_events(
+async fn resolve_model_feature_capabilities(
     state: &ServerState,
-    session_id: SessionId,
     provider_plugin_id: Option<&str>,
-    request: &ModelTurnRequest,
-) {
+    selected_model_id: &str,
+    provider_context: &bcode_model::ProviderRequestContext,
+    structured_output: Option<&bcode_model::StructuredOutputRequest>,
+    has_tools: bool,
+) -> bcode_model::ResolvedModelFeatureCapabilities {
     let Some(provider_plugin_id) = provider_plugin_id else {
-        return;
+        return bcode_model::ResolvedModelFeatureCapabilities::default();
     };
-    let Ok(provider) = state
+    let provider = state
         .plugins
         .invoke_service_json::<
             bcode_model::ProviderCapabilitiesRequest,
@@ -23954,36 +23978,82 @@ async fn append_negotiated_feature_fidelity_events(
             bcode_model::MODEL_PROVIDER_INTERFACE_ID,
             bcode_model::OP_CAPABILITIES,
             &bcode_model::ProviderCapabilitiesRequest {
-                provider_context: request.provider_context.clone(),
-                selected_model_id: Some(request.model_id.clone()),
+                provider_context: provider_context.clone(),
+                selected_model_id: Some(selected_model_id.to_owned()),
             },
         )
         .await
-    else {
-        return;
-    };
-    let Ok(models) = resolved_provider_models(
+        .ok();
+    let model = resolved_provider_models(
         state,
-        Some(provider_plugin_id.to_string()),
+        Some(provider_plugin_id.to_owned()),
         bcode_model::ModelListRequest {
-            provider_context: request.provider_context.clone(),
-            selected_model_id: Some(request.model_id.clone()),
+            provider_context: provider_context.clone(),
+            selected_model_id: Some(selected_model_id.to_owned()),
         },
     )
     .await
-    else {
-        return;
+    .ok()
+    .and_then(|models| {
+        models
+            .models
+            .into_iter()
+            .find(|model| model.model_id == selected_model_id)
+    });
+    let Some((provider, model)) = provider.as_ref().zip(model.as_ref()) else {
+        return bcode_model::ResolvedModelFeatureCapabilities::default();
     };
-    let Some(model) = models
-        .models
-        .into_iter()
-        .find(|model| model.model_id == request.model_id)
-    else {
-        return;
-    };
-    for (feature, support) in
-        request.negotiate_requested_features(&provider.feature_support, &model.feature_support)
+    let structured_output = structured_output.map(|request| {
+        provider.feature_support.negotiate(
+            &model.feature_support,
+            bcode_model::RequestedModelFeature::StructuredOutput(if request.strict {
+                bcode_model::StructuredOutputMode::StrictJsonSchema
+            } else {
+                bcode_model::StructuredOutputMode::JsonSchema
+            }),
+        )
+    });
+    let strict_tool_schema = has_tools.then(|| {
+        provider.feature_support.negotiate(
+            &model.feature_support,
+            bcode_model::RequestedModelFeature::ToolSchema(bcode_model::ToolSchemaMode::Strict),
+        )
+    });
+    bcode_model::ResolvedModelFeatureCapabilities {
+        structured_output,
+        strict_tool_schema,
+    }
+}
+
+async fn append_negotiated_feature_fidelity_events(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &ModelTurnRequest,
+    resolved: &bcode_model::ResolvedModelFeatureCapabilities,
+) {
+    let mut negotiated = Vec::new();
+    if let (Some(structured), Some(support)) = (
+        request.structured_output.as_ref(),
+        resolved.structured_output.as_ref(),
+    ) {
+        negotiated.push((
+            bcode_model::RequestedModelFeature::StructuredOutput(if structured.strict {
+                bcode_model::StructuredOutputMode::StrictJsonSchema
+            } else {
+                bcode_model::StructuredOutputMode::JsonSchema
+            }),
+            support,
+        ));
+    }
+    if let Some(mode) = request.tool_schema_mode
+        && let Some(support) = resolved.strict_tool_schema.as_ref()
     {
+        negotiated.push((
+            bcode_model::RequestedModelFeature::ToolSchema(mode),
+            support,
+        ));
+    }
+    for (feature, support) in negotiated {
         let bcode_model::NegotiatedFeatureSupport::Guaranteed {
             mechanism,
             fidelity,

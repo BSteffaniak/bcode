@@ -17,7 +17,7 @@ use bcode_agent_runtime::{
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, OP_CANCEL_TURN,
     OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
-    PollTurnEventsRequest, PollTurnEventsResponse, StartTurnResponse,
+    PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilitiesRequest, StartTurnResponse,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 #[cfg(feature = "embedded-plugins")]
@@ -4081,11 +4081,14 @@ impl ProviderRegistry {
     ) -> Result<Self> {
         let provider_plugin_id = provider_plugin_id.into();
         let capabilities = plugins
-            .invoke_service_json_scoped::<(), ProviderCapabilities>(
+            .invoke_service_json_scoped::<ProviderCapabilitiesRequest, ProviderCapabilities>(
                 &provider_plugin_id,
                 MODEL_PROVIDER_INTERFACE_ID,
                 OP_CAPABILITIES,
-                &(),
+                &ProviderCapabilitiesRequest {
+                    provider_context: provider_context.clone(),
+                    selected_model_id: selected_model_id.clone(),
+                },
                 bcode_plugin::PluginInvocationScope::Global,
             )
             .await
@@ -4659,7 +4662,7 @@ impl Bcode {
                 provider_plugin_id.as_ref(),
                 MODEL_PROVIDER_INTERFACE_ID,
                 OP_CAPABILITIES,
-                &serde_json::Value::Null,
+                &ProviderCapabilitiesRequest::default(),
                 bcode_plugin::PluginInvocationScope::Global,
             )
             .await
@@ -7418,11 +7421,14 @@ impl Agent {
             (self.plugins.as_ref(), self.provider_plugin_id.as_deref())
         {
             let provider_capabilities = plugins
-                .invoke_service_json_scoped::<(), ProviderCapabilities>(
+                .invoke_service_json_scoped::<ProviderCapabilitiesRequest, ProviderCapabilities>(
                     provider_plugin_id,
                     MODEL_PROVIDER_INTERFACE_ID,
                     bcode_model::OP_CAPABILITIES,
-                    &(),
+                    &ProviderCapabilitiesRequest {
+                        provider_context: request.provider_context.clone(),
+                        selected_model_id: Some(request.model_id.clone()),
+                    },
                     bcode_plugin::PluginInvocationScope::Global,
                 )
                 .await

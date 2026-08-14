@@ -149,6 +149,7 @@ Minimum expected validation once Rust crates exist:
 - `scripts/check-loop-runtime-architecture.sh` for generic runtime, turn scheduling, cancellation, plugin/tool domain isolation, or `/loop` changes
 - `scripts/check-model-catalog-architecture.sh` for model catalog/provider resolution changes
 - `scripts/check-context-accounting-architecture.sh` for model request context estimation, provider usage, occupancy, or context display changes
+- `scripts/check-structured-output-architecture.sh` for structured output, strict tool schemas, capability fidelity, schema dialects, or provider-side structured-output adaptation
 - `scripts/check-plugin-auth-architecture.sh` for plugin auth contracts, registration, profile resolution, vault custody, secret delivery, or runtime auth metadata changes
 - `scripts/check-tui-theme-architecture.sh` for terminal theme definitions, resolved presentation, themed components, or TUI/plugin visual migration
 - relevant `cargo test` commands for changed packages

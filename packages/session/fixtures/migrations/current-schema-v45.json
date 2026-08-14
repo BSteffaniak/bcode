@@ -1,0 +1,1 @@
+{"schema_version":45,"sequence":0,"timestamp_ms":1700000000000,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"model_feature_fidelity_negotiated":{"turn_id":"turn-1","feature":{"version":1,"family":"structured_output","feature":"strict_json_schema","mechanism":"native","fidelity":"exact"}}}}

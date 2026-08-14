@@ -6696,12 +6696,22 @@ mod tests {
             (
                 "current-schema-v44.json",
                 include_str!("../fixtures/migrations/current-schema-v44.json"),
+                ExpectedHistory::PersistedEventError,
+            ),
+            (
+                "current-schema-v45.json",
+                include_str!("../fixtures/migrations/current-schema-v45.json"),
                 ExpectedHistory::Sequences(&[0]),
             ),
             (
                 "future-schema-v44.json",
                 include_str!("../fixtures/migrations/future-schema-v44.json"),
-                ExpectedHistory::Sequences(&[0]),
+                ExpectedHistory::PersistedEventError,
+            ),
+            (
+                "future-schema-v46.json",
+                include_str!("../fixtures/migrations/future-schema-v46.json"),
+                ExpectedHistory::PersistedEventError,
             ),
             (
                 "malformed-json-v39.json",

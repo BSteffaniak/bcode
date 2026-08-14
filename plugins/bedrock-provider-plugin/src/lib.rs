@@ -39,8 +39,8 @@ use bcode_model::{
     ToolCall, ToolChoice, ToolDefinition, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
-    ProviderRuntime, StreamOutcome, TurnState, TurnStore, provider_error, retry_hint_from_body,
-    sanitize_provider_diagnostic,
+    ProviderRuntime, StreamOutcome, SyntheticStructuredOutput, TurnState, TurnStore,
+    provider_error, retry_hint_from_body, sanitize_provider_diagnostic,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1321,7 +1321,7 @@ async fn read_mantle_anthropic_stream(
     name_map: BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut decoder = MantleSseDecoder::default();
-    let mut accumulator = AnthropicMessagesAccumulator::new(name_map);
+    let mut accumulator = AnthropicMessagesAccumulator::new(name_map, None);
     loop {
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
@@ -1386,6 +1386,51 @@ async fn stream_bedrock_messages_model(
     turn: &TurnState,
     name_map: BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
+    match send_bedrock_messages_request(request, client, model_id, turn, name_map.clone(), None)
+        .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(error)
+            if request.structured_output.is_some()
+                && bedrock_messages_native_structured_output_rejected(&error) =>
+        {
+            let structured = request
+                .structured_output
+                .as_ref()
+                .expect("checked structured output");
+            let synthetic = SyntheticStructuredOutput::new(structured);
+            let mut fallback = request.clone();
+            fallback.structured_output = None;
+            fallback.tools.push(synthetic.tool());
+            fallback.tool_schema_mode = None;
+            fallback.tool_call_policy.choice = ToolChoice::Auto;
+            fallback.tool_call_policy.parallel = Some(false);
+            turn.push(ProviderTurnEvent::Warning {
+                message: "Bedrock model rejected native structured output; retrying with adapter-mediated schema enforcement"
+                    .to_string(),
+            });
+            send_bedrock_messages_request(
+                &fallback,
+                client,
+                model_id,
+                turn,
+                name_map,
+                Some(synthetic),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn send_bedrock_messages_request(
+    request: &ModelTurnRequest,
+    client: &Client,
+    model_id: &str,
+    turn: &TurnState,
+    name_map: BTreeMap<String, String>,
+    synthetic: Option<SyntheticStructuredOutput>,
+) -> Result<StreamOutcome, ProviderError> {
     let body = build_anthropic_messages_request(request)?;
     let response = client
         .invoke_model_with_response_stream()
@@ -1396,7 +1441,15 @@ async fn stream_bedrock_messages_model(
         .send()
         .await
         .map_err(|error| bedrock_messages_sdk_error(&error))?;
-    read_anthropic_messages_stream(response.body, turn, name_map).await
+    read_anthropic_messages_stream(response.body, turn, name_map, synthetic).await
+}
+
+fn bedrock_messages_native_structured_output_rejected(error: &ProviderError) -> bool {
+    error.category == ProviderErrorCategory::InvalidRequest
+        && error
+            .provider_message
+            .as_deref()
+            .is_some_and(|message| message.contains("output_config.format"))
 }
 
 /// Outcome of a single per-model Converse attempt.
@@ -1590,8 +1643,9 @@ async fn read_anthropic_messages_stream(
     >,
     turn: &TurnState,
     name_map: BTreeMap<String, String>,
+    synthetic: Option<SyntheticStructuredOutput>,
 ) -> Result<StreamOutcome, ProviderError> {
-    let mut accumulator = AnthropicMessagesAccumulator::new(name_map);
+    let mut accumulator = AnthropicMessagesAccumulator::new(name_map, synthetic);
     loop {
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
@@ -1647,6 +1701,9 @@ struct AnthropicMessagesAccumulator {
     tool_calls: BTreeMap<u32, ToolCallAccumulator>,
     reasoning_blocks: BTreeMap<u32, String>,
     saw_tool_call: bool,
+    synthetic_output_emitted: bool,
+    synthetic_call_indexes: BTreeSet<u32>,
+    synthetic: Option<SyntheticStructuredOutput>,
     /// Normalized stop reason reported by the provider on `message_delta`.
     ///
     /// Anthropic reports `max_tokens` here when the output budget is exhausted. Without it a
@@ -1656,11 +1713,17 @@ struct AnthropicMessagesAccumulator {
 }
 
 impl AnthropicMessagesAccumulator {
-    const fn new(name_map: BTreeMap<String, String>) -> Self {
+    const fn new(
+        name_map: BTreeMap<String, String>,
+        synthetic: Option<SyntheticStructuredOutput>,
+    ) -> Self {
         Self {
             tool_calls: BTreeMap::new(),
             reasoning_blocks: BTreeMap::new(),
             saw_tool_call: false,
+            synthetic_output_emitted: false,
+            synthetic_call_indexes: BTreeSet::new(),
+            synthetic,
             stop_reason: None,
             name_map,
         }
@@ -1706,19 +1769,27 @@ impl AnthropicMessagesAccumulator {
             Some("tool_use") => {
                 let id = required_event_string(block, "id")?;
                 let name = required_event_string(block, "name")?;
-                self.saw_tool_call = true;
+                let synthetic = self
+                    .synthetic
+                    .as_ref()
+                    .is_some_and(|constraint| constraint.matches_tool_name(&name));
+                if synthetic {
+                    self.synthetic_call_indexes.insert(index);
+                } else {
+                    self.saw_tool_call = true;
+                    turn.push(ProviderTurnEvent::ToolCallStarted {
+                        call_id: id.clone(),
+                        name: original_tool_name(&name, &self.name_map),
+                    });
+                }
                 self.tool_calls.insert(
                     index,
                     ToolCallAccumulator {
-                        id: Some(id.clone()),
-                        name: Some(name.clone()),
+                        id: Some(id),
+                        name: Some(name),
                         arguments: String::new(),
                     },
                 );
-                turn.push(ProviderTurnEvent::ToolCallStarted {
-                    call_id: id,
-                    name: original_tool_name(&name, &self.name_map),
-                });
             }
             Some("thinking" | "redacted_thinking") => {
                 self.reasoning_blocks.insert(index, String::new());
@@ -1762,7 +1833,9 @@ impl AnthropicMessagesAccumulator {
                     && let Some(tool) = self.tool_calls.get_mut(&index)
                 {
                     tool.arguments.push_str(json);
-                    if let Some(call_id) = &tool.id {
+                    if !self.synthetic_call_indexes.contains(&index)
+                        && let Some(call_id) = &tool.id
+                    {
                         turn.push(ProviderTurnEvent::ToolCallDelta {
                             call_id: call_id.clone(),
                             delta: json.to_string(),
@@ -1829,13 +1902,25 @@ impl AnthropicMessagesAccumulator {
                     )
                 })?
             };
-            turn.push(ProviderTurnEvent::ToolCallFinished {
-                call: ToolCall {
-                    id,
-                    name: original_tool_name(&name, &self.name_map),
-                    arguments,
-                },
-            });
+            let call = ToolCall {
+                id,
+                name: original_tool_name(&name, &self.name_map),
+                arguments,
+            };
+            if self.synthetic_call_indexes.remove(&index) {
+                let constraint = self.synthetic.as_ref().ok_or_else(|| {
+                    provider_error(
+                        "missing_structured_output_constraint",
+                        ProviderErrorCategory::ProviderInternal,
+                        "synthetic structured output call had no matching constraint",
+                    )
+                })?;
+                let text = constraint.completed_text(&call)?;
+                turn.push(ProviderTurnEvent::TextDelta { text });
+                self.synthetic_output_emitted = true;
+            } else {
+                turn.push(ProviderTurnEvent::ToolCallFinished { call });
+            }
         }
         if self.reasoning_blocks.remove(&index).is_some() {
             turn.push(ProviderTurnEvent::ReasoningActivity {
@@ -1898,7 +1983,9 @@ impl AnthropicMessagesAccumulator {
         if matches!(self.stop_reason, Some(StopReason::MaxTokens)) {
             return StreamOutcome::MaxTokens;
         }
-        if self.saw_tool_call {
+        if self.synthetic_output_emitted {
+            StreamOutcome::Finished
+        } else if self.saw_tool_call {
             StreamOutcome::ToolCall
         } else {
             StreamOutcome::Finished
@@ -2294,11 +2381,15 @@ fn build_anthropic_messages_request_value(
                     .tools
                     .iter()
                     .map(|tool| {
-                        Ok(serde_json::json!({
+                        let mut projected = serde_json::json!({
                             "name": bedrock_tool_name(&tool.name),
                             "description": tool.description,
                             "input_schema": bedrock_tool_input_schema(tool)?,
-                        }))
+                        });
+                        if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict) {
+                            projected["strict"] = serde_json::Value::Bool(true);
+                        }
+                        Ok(projected)
                     })
                     .collect::<Result<Vec<_>, ProviderError>>()?,
             ),
@@ -5702,8 +5793,115 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_messages_adapter_fallback_preserves_tool_compatibility() {
+        let structured = bcode_model::StructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        };
+        let synthetic = SyntheticStructuredOutput::new(&structured);
+        let mut request = test_model_turn_request();
+        request.structured_output = None;
+        request.tools.push(synthetic.tool());
+        request.tool_schema_mode = None;
+        request.tool_call_policy.choice = ToolChoice::Auto;
+        request.tool_call_policy.parallel = Some(false);
+        let body = build_anthropic_messages_request_value(&request)
+            .expect("fallback Messages request should build");
+        assert!(
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty())
+        );
+        assert!(
+            body["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .all(|tool| tool.get("strict").is_none())
+        );
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn bedrock_messages_native_structured_output_rejection_is_narrow() {
+        let mut error = provider_error(
+            "bedrock_messages_request_failed",
+            ProviderErrorCategory::InvalidRequest,
+            "output_config.format: Extra inputs are not permitted",
+        );
+        error.provider_message = Some(
+            "output_config.format: Extra inputs are not permitted"
+                .to_string()
+                .into_boxed_str(),
+        );
+        assert!(bedrock_messages_native_structured_output_rejected(&error));
+        error.provider_message = Some("invalid max_tokens".to_string().into_boxed_str());
+        assert!(!bedrock_messages_native_structured_output_rejected(&error));
+        error.category = ProviderErrorCategory::Network;
+        error.provider_message = Some(
+            "output_config.format: Extra inputs are not permitted"
+                .to_string()
+                .into_boxed_str(),
+        );
+        assert!(!bedrock_messages_native_structured_output_rejected(&error));
+    }
+
+    #[test]
+    fn anthropic_messages_synthetic_output_is_intercepted_as_text() {
+        let structured = bcode_model::StructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        };
+        let synthetic = SyntheticStructuredOutput::new(&structured);
+        let tool = synthetic.tool();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), Some(synthetic));
+        let turn = TurnState::default();
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "id": "synthetic", "name": tool.name}
+                }),
+                &turn,
+            )
+            .expect("synthetic tool starts");
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"ok\":true}"}
+                }),
+                &turn,
+            )
+            .expect("synthetic arguments stream");
+        accumulator
+            .process(
+                &serde_json::json!({"type": "content_block_stop", "index": 0}),
+                &turn,
+            )
+            .expect("synthetic tool finishes");
+        let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::TextDelta { text } if text == "{\"ok\":true}"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ToolCallStarted { .. }
+                | ProviderTurnEvent::ToolCallDelta { .. }
+                | ProviderTurnEvent::ToolCallFinished { .. }
+        )));
+        assert_eq!(accumulator.finish(), StreamOutcome::Finished);
+    }
+
+    #[test]
     fn anthropic_messages_error_event_is_normalized() {
-        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new());
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
         let turn = TurnState::default();
         let event = serde_json::json!({
             "type": "error",
@@ -6412,10 +6610,10 @@ mod tests {
     #[test]
     fn anthropic_messages_accumulator_emits_text_tools_and_usage() {
         let turn = TurnState::default();
-        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::from([(
-            "shell_run".to_string(),
-            "shell.run".to_string(),
-        )]));
+        let mut accumulator = AnthropicMessagesAccumulator::new(
+            BTreeMap::from([("shell_run".to_string(), "shell.run".to_string())]),
+            None,
+        );
         accumulator
             .process(
                 &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}),
@@ -6458,7 +6656,7 @@ mod tests {
     #[test]
     fn anthropic_messages_exact_input_tokens_include_cache_reads_and_writes() {
         let turn = TurnState::default();
-        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new());
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
 
         accumulator
             .process(
@@ -6492,7 +6690,7 @@ mod tests {
     #[test]
     fn anthropic_messages_omits_exact_input_tokens_without_input_count() {
         let turn = TurnState::default();
-        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new());
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
 
         accumulator
             .process(
@@ -6584,10 +6782,10 @@ mod tests {
         // tokens mid-JSON, and Anthropic reports `max_tokens`. Reporting `ToolCall` here would
         // claim a tool call that was never completed, which the runtime cannot execute.
         let turn = TurnState::default();
-        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::from([(
-            "shell_run".to_string(),
-            "shell.run".to_string(),
-        )]));
+        let mut accumulator = AnthropicMessagesAccumulator::new(
+            BTreeMap::from([("shell_run".to_string(), "shell.run".to_string())]),
+            None,
+        );
         accumulator
             .process(
                 &serde_json::json!({
@@ -6636,10 +6834,10 @@ mod tests {
     #[test]
     fn anthropic_messages_completed_tool_call_still_reports_tool_call() {
         let turn = TurnState::default();
-        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::from([(
-            "shell_run".to_string(),
-            "shell.run".to_string(),
-        )]));
+        let mut accumulator = AnthropicMessagesAccumulator::new(
+            BTreeMap::from([("shell_run".to_string(), "shell.run".to_string())]),
+            None,
+        );
         accumulator
             .process(
                 &serde_json::json!({
@@ -6693,7 +6891,7 @@ mod tests {
 
     #[test]
     fn anthropic_messages_unknown_stop_reason_is_not_interpreted() {
-        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new());
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
         accumulator.record_message_delta_stop_reason(&serde_json::json!({
             "type": "message_delta",
             "delta": {"stop_reason": "some_future_reason"},

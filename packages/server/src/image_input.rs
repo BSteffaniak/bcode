@@ -85,11 +85,17 @@ async fn resolve_image_input_support(
 ) -> Option<(bool, u64)> {
     let provider = state
         .plugins
-        .invoke_service_json::<(), bcode_model::ProviderCapabilities>(
+        .invoke_service_json::<
+            bcode_model::ProviderCapabilitiesRequest,
+            bcode_model::ProviderCapabilities,
+        >(
             provider_plugin_id?,
             bcode_model::MODEL_PROVIDER_INTERFACE_ID,
             bcode_model::OP_CAPABILITIES,
-            &(),
+            &bcode_model::ProviderCapabilitiesRequest {
+                provider_context: provider_context.clone(),
+                selected_model_id: Some(model_id.to_owned()),
+            },
         )
         .await
         .ok()?;
