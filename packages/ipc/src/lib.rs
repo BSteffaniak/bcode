@@ -3993,8 +3993,8 @@ fn socket_path_with_digest(base: &Path, digest: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ModelTurnOutcome, SessionEventKind, SessionForkKind,
-        SessionForkResult, SessionId, SessionSummary, SessionTraceEvent, ToolInvocationResult,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ModelTurnOutcome, SessionEventKind, SessionId,
+        SessionSummary, SessionTraceEvent, ToolInvocationResult,
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
@@ -5371,65 +5371,6 @@ mod tests {
     }
 
     #[test]
-    fn fork_session_request_and_response_round_trip() {
-        let source_session_id: SessionId = "00000000-0000-0000-0000-000000000001"
-            .parse()
-            .expect("source session id should parse");
-        let request = Request::ForkSession {
-            source_session_id,
-            prompt_sequence: 42,
-            name: Some("[fork] source".to_owned()),
-        };
-
-        let encoded = encode(&request).expect("request should encode");
-        let decoded: Request = decode(&encoded).expect("request should decode");
-
-        assert_eq!(decoded, request);
-
-        let session = test_session_summary("[fork] source");
-        let response = Response::Ok(ResponsePayload::SessionForked {
-            session,
-            draft: Some("selected prompt".to_owned()),
-        });
-
-        let encoded = encode(&response).expect("response should encode");
-        let decoded: Response = decode(&encoded).expect("response should decode");
-
-        assert_eq!(decoded, response);
-        let Response::Ok(ResponsePayload::SessionForked { session, draft }) = decoded else {
-            panic!("decoded response should be session_forked");
-        };
-        assert_eq!(session.name.as_deref(), Some("[fork] source"));
-        assert_eq!(draft.as_deref(), Some("selected prompt"));
-    }
-
-    #[test]
-    fn clone_session_request_and_result_round_trip() {
-        let source_session_id: SessionId = "00000000-0000-0000-0000-000000000001"
-            .parse()
-            .expect("source session id should parse");
-        let request = Request::CloneSession {
-            source_session_id,
-            name: Some("[clone] source".to_owned()),
-            expected_generation: Some(42),
-        };
-
-        let encoded = encode(&request).expect("request should encode");
-        let decoded: Request = decode(&encoded).expect("request should decode");
-
-        assert_eq!(decoded, request);
-
-        let result = SessionForkResult {
-            session: test_session_summary("[clone] source"),
-            draft: None,
-        };
-        let encoded = encode(&result).expect("result should encode");
-        let decoded: SessionForkResult = decode(&encoded).expect("result should decode");
-
-        assert_eq!(decoded, result);
-    }
-
-    #[test]
     fn attached_projection_window_round_trips() {
         let session_id = SessionId::new();
         let response = Response::Ok(ResponsePayload::Attached {
@@ -5445,7 +5386,6 @@ mod tests {
                 updated_at_ms: 20,
                 working_directory: "/tmp/bcode-window-test".into(),
                 import: None,
-                fork: None,
                 execution: None,
             },
             history: Vec::new(),
@@ -5485,7 +5425,6 @@ mod tests {
             updated_at_ms: 20,
             working_directory: "/tmp/bcode-ipc-test".into(),
             import: None,
-            fork: None,
             execution: None,
         };
         let response = Response::Ok(ResponsePayload::Attached {
@@ -5803,7 +5742,6 @@ mod tests {
             updated_at_ms: 20,
             working_directory: "/tmp/bcode-ipc-test".into(),
             import: None,
-            fork: None,
             execution: None,
         }
     }
@@ -6030,7 +5968,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn sample_session_event_kinds(session_id: SessionId) -> Vec<SessionEventKind> {
+    fn sample_session_event_kinds(_session_id: SessionId) -> Vec<SessionEventKind> {
         vec![
             SessionEventKind::SessionCreated {
                 name: Some("session".to_string()),
@@ -6261,14 +6199,6 @@ mod tests {
                 source_display_name: "Source".to_string(),
                 external_session_id: "external".to_string(),
                 imported_at_ms: 1,
-            },
-            SessionEventKind::SessionForked {
-                source_session_id: session_id,
-                source_title: Some("source".to_string()),
-                source_cutoff_sequence: Some(1),
-                source_prompt_sequence: Some(1),
-                forked_at_ms: 1,
-                kind: SessionForkKind::Fork,
             },
         ]
     }

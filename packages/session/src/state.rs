@@ -5,8 +5,8 @@ use crate::{
     title_from_first_prompt,
 };
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionEventKind, SessionForkSummary,
-    SessionImportSummary, SessionTitleSource,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionEventKind, SessionImportSummary,
+    SessionTitleSource,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -187,7 +187,6 @@ impl SessionState {
                 updated_at_ms,
                 working_directory: working_directory.clone(),
                 import: None,
-                fork: None,
                 execution: state.execution.map(|provenance| {
                     Box::new(bcode_session_models::ExecutionSessionSummary {
                         provenance,
@@ -322,23 +321,6 @@ impl SessionState {
                     self.summary.name.clone_from(&self.summary.derived_title);
                     self.summary.title_source = SessionTitleSource::Imported;
                 }
-            }
-            SessionEventKind::SessionForked {
-                source_session_id,
-                source_title,
-                source_cutoff_sequence,
-                source_prompt_sequence,
-                forked_at_ms,
-                kind,
-            } => {
-                self.summary.fork = Some(SessionForkSummary {
-                    source_session_id: *source_session_id,
-                    source_title: source_title.clone(),
-                    source_cutoff_sequence: *source_cutoff_sequence,
-                    source_prompt_sequence: *source_prompt_sequence,
-                    forked_at_ms: *forked_at_ms,
-                    kind: *kind,
-                });
             }
             SessionEventKind::UserMessage { text, .. } => {
                 self.has_user_message = true;

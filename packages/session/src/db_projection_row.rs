@@ -58,7 +58,6 @@ pub fn session_summary_from_catalog_row(
         updated_at_ms: required_i64(row, "updated_at_ms").map(i64_to_u64)?,
         working_directory,
         import: None,
-        fork: None,
         execution: None,
     })
 }

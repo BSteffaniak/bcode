@@ -78,30 +78,28 @@ pub fn apply_plugin_surface_outcome(
         let (text, format) = text.into_parts();
         chat.push_presentation_note(plugin_id.to_owned(), text, format);
     }
-    if let Some(action) = outcome.invoke_command {
-        if let bcode_command::CommandAction::Plugin {
+    if let Some(bcode_command::CommandAction::Plugin {
+        plugin_id,
+        command_id,
+    }) = outcome.invoke_command
+    {
+        let arguments = outcome
+            .command_args
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let working_directory = chat.app.working_directory().map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            std::path::Path::to_path_buf,
+        );
+        chat.start_effect(TuiEffect::InvokePluginCommand {
             plugin_id,
             command_id,
-        } = action
-        {
-            let arguments = outcome
-                .command_args
-                .into_iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let working_directory = chat.app.working_directory().map_or_else(
-                || std::env::current_dir().unwrap_or_default(),
-                std::path::Path::to_path_buf,
-            );
-            chat.start_effect(TuiEffect::InvokePluginCommand {
-                plugin_id,
-                command_id,
-                arguments: Some(arguments),
-                working_directory,
-                session_id: chat.session_id,
-            });
-        }
+            arguments: Some(arguments),
+            working_directory,
+            session_id: chat.session_id,
+        });
     }
     if let Some(path) = outcome.set_session_working_directory {
         if let Some(session_id) = chat.app.session_id() {

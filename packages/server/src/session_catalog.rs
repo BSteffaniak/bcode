@@ -675,7 +675,6 @@ fn importable_to_summary(
             external_session_id: summary.external_session_id,
             imported_at_ms: 0,
         }),
-        fork: None,
         execution: None,
     }
 }

@@ -144,7 +144,6 @@ impl SessionStore {
                 updated_at_ms: 0,
                 working_directory: self.root.clone(),
                 import: None,
-                fork: None,
                 execution: None,
             });
         }

@@ -436,7 +436,6 @@ mod tests {
             updated_at_ms: 1,
             working_directory: std::path::PathBuf::new(),
             import: None,
-            fork: None,
             execution: None,
         };
         let presentation = completion.presentation_with_summaries(std::slice::from_ref(&summary));

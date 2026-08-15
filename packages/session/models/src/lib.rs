@@ -410,7 +410,6 @@ pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'sta
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
-        SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
@@ -825,8 +824,6 @@ pub struct SessionSummary {
     #[serde(default)]
     pub import: Option<SessionImportSummary>,
     #[serde(default)]
-    pub fork: Option<SessionForkSummary>,
-    #[serde(default)]
     pub execution: Option<Box<ExecutionSessionSummary>>,
 }
 
@@ -866,40 +863,6 @@ pub struct SessionImportSummary {
     pub source_display_name: String,
     pub external_session_id: String,
     pub imported_at_ms: u64,
-}
-
-/// Durable fork/clone operation kind for session provenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionForkKind {
-    /// A new session copied from a source session up to a selected prompt.
-    Fork,
-    /// A new session copied from the full source session history.
-    Clone,
-}
-
-/// Display/provenance metadata for forked or cloned sessions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionForkSummary {
-    pub source_session_id: SessionId,
-    #[serde(default)]
-    pub source_title: Option<String>,
-    #[serde(default)]
-    pub source_cutoff_sequence: Option<u64>,
-    #[serde(default)]
-    pub source_prompt_sequence: Option<u64>,
-    pub forked_at_ms: u64,
-    pub kind: SessionForkKind,
-}
-
-/// Result of creating a forked or cloned session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionForkResult {
-    /// Newly created session summary.
-    pub session: SessionSummary,
-    /// Draft text the caller may install in the composer after attaching.
-    #[serde(default)]
-    pub draft: Option<String>,
 }
 
 /// Current portable session-derivation contract version.
@@ -3223,18 +3186,6 @@ pub enum SessionEventKind {
         source_display_name: String,
         external_session_id: String,
         imported_at_ms: u64,
-    },
-    /// Durable provenance marker for sessions forked or cloned from another session.
-    SessionForked {
-        source_session_id: SessionId,
-        #[serde(default)]
-        source_title: Option<String>,
-        #[serde(default)]
-        source_cutoff_sequence: Option<u64>,
-        #[serde(default)]
-        source_prompt_sequence: Option<u64>,
-        forked_at_ms: u64,
-        kind: SessionForkKind,
     },
     /// Current generic provenance marker for a session derived from a stable source prefix.
     SessionDerived {

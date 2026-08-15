@@ -11861,7 +11861,6 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
-        SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
@@ -12603,16 +12602,6 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             event.sequence,
             message.as_deref().unwrap_or("")
         ),
-        SessionEventKind::SessionForked {
-            source_session_id,
-            kind,
-            ..
-        } => {
-            println!(
-                "#{} session {:?} from {source_session_id}",
-                event.sequence, kind
-            );
-        }
         SessionEventKind::SessionDerived {
             source_session_id,
             source_generation,

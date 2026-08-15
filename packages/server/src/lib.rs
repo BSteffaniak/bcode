@@ -33575,7 +33575,6 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
-        SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
@@ -35161,7 +35160,6 @@ mod tests {
             updated_at_ms: 0,
             working_directory: workspace.path().to_path_buf(),
             import: None,
-            fork: None,
             execution: None,
         };
         assert_eq!(

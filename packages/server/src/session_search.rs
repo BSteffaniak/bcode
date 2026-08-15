@@ -1405,25 +1405,6 @@ fn canonical_generation_fingerprint(summary: &bcode_session_models::SessionSumma
     } else {
         digest.update(b"native\0");
     }
-    if let Some(fork) = &summary.fork {
-        digest.update(b"fork\0");
-        digest.update(fork.source_session_id.to_string().as_bytes());
-        digest.update(
-            fork.source_cutoff_sequence
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        digest.update(
-            fork.source_prompt_sequence
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        digest.update(fork.forked_at_ms.to_le_bytes());
-        digest.update(match fork.kind {
-            bcode_session_models::SessionForkKind::Fork => b"fork".as_slice(),
-            bcode_session_models::SessionForkKind::Clone => b"clone".as_slice(),
-        });
-    }
     format!("{:x}", digest.finalize())
 }
 
@@ -3671,7 +3652,6 @@ pub(crate) mod tests {
                 external_session_id: "source-native-id".to_owned(),
                 imported_at_ms: 30,
             }),
-            fork: None,
             execution: None,
         };
         let record = bcode_session_search::SessionSearchRecord {
@@ -3736,7 +3716,6 @@ pub(crate) mod tests {
             updated_at_ms: 20,
             working_directory: std::path::PathBuf::new(),
             import: None,
-            fork: None,
             execution: None,
         };
         let native = canonical_generation_fingerprint(&summary);
@@ -3754,15 +3733,6 @@ pub(crate) mod tests {
         });
         let imported = canonical_generation_fingerprint(&summary);
         assert_ne!(imported, native);
-        summary.fork = Some(bcode_session_models::SessionForkSummary {
-            source_session_id: SessionId::new(),
-            source_title: None,
-            source_cutoff_sequence: Some(4),
-            source_prompt_sequence: Some(2),
-            forked_at_ms: 40,
-            kind: bcode_session_models::SessionForkKind::Fork,
-        });
-        assert_ne!(canonical_generation_fingerprint(&summary), imported);
     }
 
     #[tokio::test]
@@ -3988,7 +3958,6 @@ pub(crate) mod tests {
             updated_at_ms: 10,
             working_directory: "/tmp".into(),
             import: None,
-            fork: None,
             execution: None,
         };
         let second = bcode_session_models::SessionSummary {
@@ -4002,7 +3971,6 @@ pub(crate) mod tests {
             updated_at_ms: 20,
             working_directory: "/tmp".into(),
             import: None,
-            fork: None,
             execution: None,
         };
         let results = vec![

@@ -212,7 +212,6 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::ModelFeatureFidelityNegotiated { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SessionImported { .. }
-        | SessionEventKind::SessionForked { .. }
         | SessionEventKind::SessionDerived { .. }
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::ReasoningChanged { .. }
@@ -441,7 +440,6 @@ pub fn project_event(
         | SessionEventKind::ModelFeatureFidelityNegotiated { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SessionImported { .. }
-        | SessionEventKind::SessionForked { .. }
         | SessionEventKind::SessionDerived { .. }
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::ReasoningChanged { .. }

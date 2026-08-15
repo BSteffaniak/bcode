@@ -62,13 +62,6 @@ pub enum SlashCommandOutcome {
     ShowThemeCatalog,
     /// Open worktree create dialog.
     OpenWorktreeCreateDialog,
-    /// Open fork session wizard.
-    OpenForkSessionWizard,
-    /// Clone a session.
-    CloneSession {
-        session_id: SessionId,
-        name: Option<String>,
-    },
     /// Set the model for the next draft session.
     SetLocalModel {
         provider_plugin_id: Option<String>,

@@ -2877,7 +2877,6 @@ mod tests {
                 updated_at_ms: 1,
                 working_directory: std::path::PathBuf::from("/tmp"),
                 import: None,
-                fork: None,
                 execution: None,
             },
             history: Vec::new(),

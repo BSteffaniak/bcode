@@ -495,10 +495,7 @@ impl SessionManager {
                 if !is_copyable_derivation_event(&source_event.kind) {
                     continue;
                 }
-                let kind = crate::fork::rewrite_copied_event_kind(
-                    source_event.kind.clone(),
-                    &sequence_map,
-                );
+                let kind = rewrite_derived_event_kind(source_event.kind.clone(), &sequence_map);
                 copied_bytes = copied_bytes.saturating_add(
                     u64::try_from(
                         serde_json::to_vec(&source_event)
@@ -736,6 +733,35 @@ fn write_staged_manifest(root: &Path, summary: &SessionSummary) -> Result<(), Se
     Ok(())
 }
 
+pub fn rewrite_derived_event_kind(
+    kind: SessionEventKind,
+    sequence_map: &BTreeMap<u64, u64>,
+) -> SessionEventKind {
+    match kind {
+        SessionEventKind::ContextCompacted {
+            summary,
+            compacted_through_sequence,
+        } => SessionEventKind::ContextCompacted {
+            summary,
+            compacted_through_sequence: sequence_map
+                .get(&compacted_through_sequence)
+                .copied()
+                .unwrap_or(compacted_through_sequence),
+        },
+        SessionEventKind::ProviderContextCompacted {
+            snapshot,
+            compacted_through_sequence,
+        } => SessionEventKind::ProviderContextCompacted {
+            snapshot,
+            compacted_through_sequence: sequence_map
+                .get(&compacted_through_sequence)
+                .copied()
+                .unwrap_or(compacted_through_sequence),
+        },
+        other => other,
+    }
+}
+
 fn copy_event_provenance(event: &SessionEvent) -> SessionEventProvenance {
     SessionEventProvenance {
         source_event_id: Some(event.sequence.to_string()),
@@ -753,7 +779,6 @@ const fn is_copyable_derivation_event(kind: &SessionEventKind) -> bool {
         SessionEventKind::SessionCreated { .. }
             | SessionEventKind::ClientAttached { .. }
             | SessionEventKind::ClientDetached { .. }
-            | SessionEventKind::SessionForked { .. }
             | SessionEventKind::SessionDerived { .. }
             | SessionEventKind::ExecutionSessionCreated { .. }
     )

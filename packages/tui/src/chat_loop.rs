@@ -135,12 +135,6 @@ struct RootPluginSurface {
     pending_session_navigation: Option<bcode_session_models::SessionId>,
 }
 
-struct RootForkPromptPicker {
-    session_id: bcode_session_models::SessionId,
-    submission: super::session_fork_dialog::SessionForkDialogSubmission,
-    picker: super::session_fork_flow::ForkPromptPicker,
-}
-
 struct RootModelPicker {
     provider_plugin_id: Option<String>,
     picker: super::model_picker::ModelPickerApp,
@@ -151,24 +145,6 @@ pub enum AuthPoolPickerRootOutcome {
     Cancel,
     Promote { pool: String, profile: String },
     Clear { pool: String },
-}
-
-pub enum SessionForkRootOutcome {
-    Handled,
-    Canceled,
-    LoadPrompts {
-        session_id: bcode_session_models::SessionId,
-        submission: super::session_fork_dialog::SessionForkDialogSubmission,
-    },
-    CreateClone {
-        session_id: bcode_session_models::SessionId,
-        submission: super::session_fork_dialog::SessionForkDialogSubmission,
-    },
-    CreateFork {
-        session_id: bcode_session_models::SessionId,
-        submission: super::session_fork_dialog::SessionForkDialogSubmission,
-        prompt: super::session_fork_flow::ForkPromptCandidate,
-    },
 }
 
 pub enum SessionPickerRootOutcome {
@@ -223,8 +199,6 @@ pub struct ChatLoopState {
     theme_picker: Option<super::theme_picker::ThemePickerState>,
     streaming_configurator: Option<super::streaming_configurator::StreamingConfiguratorState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
-    session_fork_dialog: Option<super::session_fork_dialog::SessionForkDialog>,
-    fork_prompt_picker: Option<RootForkPromptPicker>,
     plugin_surface: Option<RootPluginSurface>,
     provider_picker: Option<super::provider_picker::ProviderPickerApp>,
     model_picker: Option<RootModelPicker>,
@@ -274,8 +248,6 @@ impl ChatLoopState {
             theme_picker: None,
             streaming_configurator: None,
             timeline_dialog: None,
-            session_fork_dialog: None,
-            fork_prompt_picker: None,
             plugin_surface: None,
             provider_picker: None,
             model_picker: None,
@@ -327,8 +299,6 @@ impl ChatLoopState {
         self.thinking_dialog = None;
         self.theme_picker = None;
         self.timeline_dialog = None;
-        self.session_fork_dialog = None;
-        self.fork_prompt_picker = None;
         self.provider_picker = None;
         self.model_picker = None;
         self.auth_pool_picker = None;
@@ -978,83 +948,6 @@ impl ChatLoopState {
 
     pub fn close_root_plugin_surface(&mut self) {
         self.plugin_surface = None;
-    }
-
-    pub fn open_session_fork_dialog(&mut self, chat: &mut ActiveChat) {
-        let Some(session_id) = chat.session_id else {
-            chat.app.set_status("No active session".to_owned());
-            return;
-        };
-        let source_title = chat
-            .app
-            .session_title()
-            .map_or_else(|| session_id.to_string(), ToString::to_string);
-        self.session_fork_dialog = Some(super::session_fork_dialog::SessionForkDialog::new(
-            super::session_fork_dialog::SessionForkDialogMode::Fork,
-            &format!("[fork] {source_title}"),
-        ));
-        chat.app.set_status("configure session fork".to_owned());
-    }
-
-    pub const fn has_session_fork_flow(&self) -> bool {
-        self.session_fork_dialog.is_some() || self.fork_prompt_picker.is_some()
-    }
-
-    pub fn handle_session_fork_event(
-        &mut self,
-        chat: &ActiveChat,
-        event: &Event,
-        keymap: &super::keymap::BmuxKeyMap,
-    ) -> SessionForkRootOutcome {
-        if let Some(dialog) = self.session_fork_dialog.as_mut() {
-            match dialog.handle_event(event, keymap) {
-                super::session_fork_dialog::SessionForkDialogOutcome::Handled => {
-                    return SessionForkRootOutcome::Handled;
-                }
-                super::session_fork_dialog::SessionForkDialogOutcome::Canceled => {
-                    self.session_fork_dialog = None;
-                    return SessionForkRootOutcome::Canceled;
-                }
-                super::session_fork_dialog::SessionForkDialogOutcome::Submit(submission) => {
-                    self.session_fork_dialog = None;
-                    let session_id = chat.session_id.expect("fork dialog has active session");
-                    if submission.mode == super::session_fork_dialog::SessionForkDialogMode::Clone {
-                        return SessionForkRootOutcome::CreateClone {
-                            session_id,
-                            submission,
-                        };
-                    }
-                    return SessionForkRootOutcome::LoadPrompts {
-                        session_id,
-                        submission,
-                    };
-                }
-            }
-        }
-        let picker = self
-            .fork_prompt_picker
-            .as_mut()
-            .expect("fork flow has dialog or prompt picker");
-        if let Event::Key(stroke) = event {
-            match picker.picker.handle_key(*stroke) {
-                super::session_fork_flow::ForkPromptPickerOutcome::Handled
-                | super::session_fork_flow::ForkPromptPickerOutcome::Ignored => {}
-                super::session_fork_flow::ForkPromptPickerOutcome::Canceled => {
-                    self.fork_prompt_picker = None;
-                    return SessionForkRootOutcome::Canceled;
-                }
-                super::session_fork_flow::ForkPromptPickerOutcome::Select(prompt) => {
-                    let outcome = SessionForkRootOutcome::CreateFork {
-                        session_id: picker.session_id,
-                        submission: picker.submission.clone(),
-                        prompt,
-                    };
-                    self.fork_prompt_picker = None;
-                    return outcome;
-                }
-            }
-        }
-        SessionForkRootOutcome::Handled
     }
 
     pub const fn has_model_picker(&self) -> bool {
@@ -1794,9 +1687,6 @@ impl ChatLoopState {
         }
         if self.has_session_picker() {
             return BcodeRuntimeScreen::SessionPicker;
-        }
-        if self.has_session_fork_flow() {
-            return BcodeRuntimeScreen::SessionFork;
         }
         if self.has_ralph_start_dialog() {
             return BcodeRuntimeScreen::RalphStart;
@@ -2603,28 +2493,6 @@ pub fn apply_effect_result(
                 report_nonfatal_tui_error(chat, &format!("Ralph {action:?} action failed"), &error);
             }
         },
-        TuiEffectResult::ForkPromptsLoaded {
-            session_id,
-            submission,
-            result,
-        } => match result {
-            Ok(prompts) if prompts.is_empty() => {
-                chat.app
-                    .set_status("No user prompts available to fork".to_owned());
-            }
-            Ok(prompts) => {
-                loop_state.fork_prompt_picker = Some(RootForkPromptPicker {
-                    session_id,
-                    submission,
-                    picker: super::session_fork_flow::ForkPromptPicker::new(prompts),
-                });
-                chat.app
-                    .set_status("select the prompt to edit in the fork".to_owned());
-            }
-            Err(error) => {
-                report_nonfatal_tui_error(chat, "Fork prompt history unavailable", &error);
-            }
-        },
         TuiEffectResult::ModelProvidersLoaded { result } => match result {
             Ok(providers) if providers.len() > 1 => {
                 loop_state.provider_picker =
@@ -2800,36 +2668,6 @@ pub fn apply_effect_result(
         },
         TuiEffectResult::SubmitMessage { message, result } => {
             apply_submit_message_result(chat, &message, *result);
-        }
-        TuiEffectResult::ForkSession {
-            switch_after_create,
-            install_draft,
-            draft,
-            initial_window_request,
-            result,
-        } => {
-            apply_fork_session_result(
-                chat,
-                switch_after_create,
-                install_draft,
-                draft,
-                initial_window_request,
-                result,
-            );
-        }
-        TuiEffectResult::CloneSession {
-            switch_after_create,
-            install_draft,
-            initial_window_request,
-            result,
-        } => {
-            apply_clone_session_result(
-                chat,
-                switch_after_create,
-                install_draft,
-                initial_window_request,
-                result,
-            );
         }
         TuiEffectResult::SkillAction {
             action,
@@ -3407,23 +3245,8 @@ fn apply_root_slash_command_outcome(
                 }),
             });
         }
-        SlashCommandOutcome::CloneSession { session_id, name } => {
-            chat.start_effect(TuiEffect::CloneSession {
-                session_id,
-                name,
-                switch_after_create: true,
-                install_draft: true,
-                initial_window_request: super::history_flow::initial_transcript_window_request(
-                    bmux_tui::geometry::Rect::new(0, 0, 80, 24),
-                ),
-            });
-            chat.app.set_status("cloning session…".to_owned());
-        }
         SlashCommandOutcome::OpenWorktreeCreateDialog => {
             loop_state.open_worktree_create_dialog(chat);
-        }
-        SlashCommandOutcome::OpenForkSessionWizard => {
-            loop_state.open_session_fork_dialog(chat);
         }
         SlashCommandOutcome::PreviewTheme { theme_id } => {
             if chat.app.preview_theme(&theme_id) {
@@ -3628,77 +3451,6 @@ fn ensure_session_stream_after_foreground_wake(chat: &mut ActiveChat) {
             0, 0, 80, 24,
         )),
     );
-}
-
-fn apply_fork_session_result(
-    chat: &mut ActiveChat,
-    switch_after_create: bool,
-    install_draft: bool,
-    draft: Option<String>,
-    initial_window_request: bcode_session_models::ProjectionWindowRequest,
-    result: Result<bcode_session_models::SessionForkResult, ClientError>,
-) {
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            daemon_issue::report_client_issue(&mut chat.app, "session fork failed", &error);
-            return;
-        }
-    };
-    let draft = result.draft.or(draft);
-    if switch_after_create {
-        let new_session_id = result.session.id;
-        session_flow::start_switch_session(chat, new_session_id, initial_window_request);
-        if install_draft {
-            if let Some(draft) = draft.as_deref() {
-                chat.app.replace_composer_with(draft);
-            }
-        } else {
-            chat.app.replace_composer_with("");
-        }
-        chat.app
-            .set_status("forked session and switched".to_owned());
-    } else {
-        chat.app.apply_session_summary(&result.session);
-        if install_draft {
-            if let Some(draft) = draft.as_deref() {
-                chat.app.replace_composer_with(draft);
-            }
-        } else {
-            chat.app.replace_composer_with("");
-        }
-        chat.app
-            .set_status(format!("forked session {}", result.session.id));
-    }
-}
-
-fn apply_clone_session_result(
-    chat: &mut ActiveChat,
-    switch_after_create: bool,
-    install_draft: bool,
-    initial_window_request: bcode_session_models::ProjectionWindowRequest,
-    result: Result<bcode_session_models::SessionForkResult, ClientError>,
-) {
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            daemon_issue::report_client_issue(&mut chat.app, "session clone failed", &error);
-            return;
-        }
-    };
-    if !install_draft {
-        chat.app.replace_composer_with("");
-    }
-    if switch_after_create {
-        let new_session_id = result.session.id;
-        session_flow::start_switch_session(chat, new_session_id, initial_window_request);
-        chat.app
-            .set_status("cloned session and switched".to_owned());
-    } else {
-        chat.app.apply_session_summary(&result.session);
-        chat.app
-            .set_status(format!("cloned session {}", result.session.id));
-    }
 }
 
 fn apply_skill_action_result(
@@ -4533,17 +4285,6 @@ pub fn draw_chat_frame<W: Write>(
                 area,
                 frame,
                 Some(render::plugin_theme_for_app(&chat.app)),
-            );
-        }
-        if let Some(dialog) = &mut loop_state.session_fork_dialog {
-            super::session_fork_dialog_render::render_dialog(dialog, frame, theme);
-        }
-        if let Some(picker) = &loop_state.fork_prompt_picker {
-            super::session_fork_flow::render_prompt_picker(
-                frame,
-                picker.picker.prompts(),
-                picker.picker.selected(),
-                theme,
             );
         }
         if let Some(picker) = &mut loop_state.provider_picker {

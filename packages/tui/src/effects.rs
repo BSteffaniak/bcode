@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, VecDeque};
 use bcode_client::{BcodeClient, ClientError, MessageAcceptance, SessionList};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
 use bcode_session_models::{
-    ProjectionWindowRequest, SessionForkResult, SessionHistoryCursor, SessionHistoryDirection,
-    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary, WorkId,
+    ProjectionWindowRequest, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
+    SessionHistoryQuery, SessionId, SessionSummary, WorkId,
 };
 use bcode_session_view::execute_session_view_action;
 use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
@@ -252,13 +252,6 @@ pub enum TuiEffect {
         /// Active session context.
         session_id: Option<SessionId>,
     },
-    /// Load bounded recent prompts before root fork selection.
-    LoadForkPrompts {
-        /// Session being forked.
-        session_id: SessionId,
-        /// Dialog submission retained across loading.
-        submission: super::session_fork_dialog::SessionForkDialogSubmission,
-    },
     /// Load model providers before opening the root model picker.
     LoadModelProviders,
     /// Load portable auth-pool status before opening the subscription picker.
@@ -311,36 +304,6 @@ pub enum TuiEffect {
     SubmitMessage {
         /// Submit request.
         request: Box<SubmitMessageRequest>,
-    },
-    /// Fork a session from a prompt.
-    ForkSession {
-        /// Source session id.
-        session_id: SessionId,
-        /// Prompt sequence to fork from.
-        prompt_sequence: u64,
-        /// Optional new session name.
-        name: Option<String>,
-        /// Draft text to install after completion.
-        draft: Option<String>,
-        /// Whether to switch to the forked session.
-        switch_after_create: bool,
-        /// Whether to install draft text.
-        install_draft: bool,
-        /// Initial transcript window when switching.
-        initial_window_request: ProjectionWindowRequest,
-    },
-    /// Clone a session.
-    CloneSession {
-        /// Source session id.
-        session_id: SessionId,
-        /// Optional new session name.
-        name: Option<String>,
-        /// Whether to switch to the cloned session.
-        switch_after_create: bool,
-        /// Whether to keep current draft text.
-        install_draft: bool,
-        /// Initial transcript window when switching.
-        initial_window_request: ProjectionWindowRequest,
     },
     /// Perform a skill action for a session.
     SkillAction {
@@ -657,15 +620,6 @@ pub enum TuiEffectResult {
         /// Opened surface or error.
         result: Result<bcode_plugin_sdk::tui::BoxedPluginTuiSurface, TuiError>,
     },
-    /// Recent fork prompts loaded.
-    ForkPromptsLoaded {
-        /// Session being forked.
-        session_id: SessionId,
-        /// Dialog submission retained across loading.
-        submission: super::session_fork_dialog::SessionForkDialogSubmission,
-        /// Bounded recent prompts.
-        result: Result<Vec<super::session_fork_flow::ForkPromptCandidate>, TuiError>,
-    },
     /// Model providers for the root picker loaded.
     ModelProvidersLoaded {
         /// Loaded plugin service summaries.
@@ -731,30 +685,6 @@ pub enum TuiEffectResult {
         message: String,
         /// Submit result.
         result: Box<Result<SubmitMessageResult, ClientError>>,
-    },
-    /// Session fork completed.
-    ForkSession {
-        /// Whether to switch to the forked session.
-        switch_after_create: bool,
-        /// Whether to install draft text.
-        install_draft: bool,
-        /// Fallback draft text.
-        draft: Option<String>,
-        /// Initial transcript window when switching.
-        initial_window_request: ProjectionWindowRequest,
-        /// Fork result.
-        result: Result<SessionForkResult, ClientError>,
-    },
-    /// Session clone completed.
-    CloneSession {
-        /// Whether to switch to the cloned session.
-        switch_after_create: bool,
-        /// Whether to keep current draft text.
-        install_draft: bool,
-        /// Initial transcript window when switching.
-        initial_window_request: ProjectionWindowRequest,
-        /// Clone result.
-        result: Result<SessionForkResult, ClientError>,
     },
     /// Skill action completed.
     SkillAction {
@@ -882,8 +812,6 @@ impl TuiEffectResult {
             }
             Self::PermissionList { result } => DaemonObservation::from_client_result(result),
             Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
-            Self::ForkSession { result, .. } => DaemonObservation::from_client_result(result),
-            Self::CloneSession { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillAction { result, .. } => DaemonObservation::from_client_result(result),
             Self::SetSessionModel { result, .. } => DaemonObservation::from_client_result(result),
             Self::SetSessionReasoning { result, .. } => {
@@ -923,7 +851,6 @@ impl TuiEffectResult {
             Self::RalphAction { result, .. } => DaemonObservation::from_tui_result(result),
             Self::RalphStarted { result } => DaemonObservation::from_tui_result(result),
             Self::PluginSurfaceOpened { result, .. } => DaemonObservation::from_tui_result(result),
-            Self::ForkPromptsLoaded { result, .. } => DaemonObservation::from_tui_result(result),
             Self::ModelProvidersLoaded { result } => DaemonObservation::from_client_result(result),
             Self::AuthPoolPickerLoaded { result } => DaemonObservation::from_client_result(result),
             Self::AuthPoolPreferenceSet { result, .. } => {
@@ -1019,7 +946,6 @@ enum EffectKey {
     RalphAction,
     RalphStart,
     PluginSurface,
-    ForkPrompts,
     ModelProviders,
     ModelPicker,
     AuthPoolPicker,
@@ -1029,8 +955,6 @@ enum EffectKey {
     ThinkingDialog,
     TimelineJump,
     PluginCommand(String, String),
-    ForkSession(SessionId),
-    CloneSession(SessionId),
     SubmitMessage(usize),
     SkillAction(SkillId),
     SetSessionModel(SessionId),
@@ -1101,30 +1025,6 @@ impl TuiEffect {
             },
             Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
                 agents: Err(client_error.to_string()),
-            },
-            Self::ForkSession {
-                switch_after_create,
-                install_draft,
-                draft,
-                initial_window_request,
-                ..
-            } => TuiEffectResult::ForkSession {
-                switch_after_create,
-                install_draft,
-                draft,
-                initial_window_request,
-                result: Err(client_error),
-            },
-            Self::CloneSession {
-                switch_after_create,
-                install_draft,
-                initial_window_request,
-                ..
-            } => TuiEffectResult::CloneSession {
-                switch_after_create,
-                install_draft,
-                initial_window_request,
-                result: Err(client_error),
             },
             Self::SubmitMessage { request } => TuiEffectResult::SubmitMessage {
                 message: request.message,
@@ -1223,7 +1123,6 @@ impl TuiEffect {
             | Self::RalphAction { .. }
             | Self::RalphStart { .. }
             | Self::OpenPluginSurface { .. }
-            | Self::LoadForkPrompts { .. }
             | Self::LoadModelProviders
             | Self::LoadAuthPoolPicker
             | Self::SetAuthPoolPreference { .. }
@@ -1247,8 +1146,6 @@ impl TuiEffect {
             | Self::LoadDraftStatus { .. }
             | Self::LoadSessionStatus { .. }
             | Self::LoadAgentCatalog
-            | Self::ForkSession { .. }
-            | Self::CloneSession { .. }
             | Self::SubmitMessage { .. }
             | Self::SkillAction { .. }
             | Self::SetSessionModel { .. }
@@ -1294,7 +1191,6 @@ impl TuiEffect {
             | Self::RalphAction { .. }
             | Self::RalphStart { .. }
             | Self::OpenPluginSurface { .. }
-            | Self::LoadForkPrompts { .. }
             | Self::LoadModelProviders
             | Self::LoadAuthPoolPicker
             | Self::SetAuthPoolPreference { .. }
@@ -1508,7 +1404,6 @@ impl TuiEffect {
             Self::RalphAction { .. } => EffectKey::RalphAction,
             Self::RalphStart { .. } => EffectKey::RalphStart,
             Self::OpenPluginSurface { .. } => EffectKey::PluginSurface,
-            Self::LoadForkPrompts { .. } => EffectKey::ForkPrompts,
             Self::LoadModelProviders => EffectKey::ModelProviders,
             Self::LoadAuthPoolPicker => EffectKey::AuthPoolPicker,
             Self::SetAuthPoolPreference { .. } => EffectKey::AuthPoolPreference,
@@ -1522,8 +1417,6 @@ impl TuiEffect {
                 command_id,
                 ..
             } => EffectKey::PluginCommand(plugin_id.clone(), command_id.clone()),
-            Self::ForkSession { session_id, .. } => EffectKey::ForkSession(*session_id),
-            Self::CloneSession { session_id, .. } => EffectKey::CloneSession(*session_id),
             Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
             Self::SkillAction { request } => EffectKey::SkillAction(request.skill_id.clone()),
             Self::SetSessionModel { session_id, .. } => EffectKey::SetSessionModel(*session_id),
@@ -1843,15 +1736,6 @@ impl TuiEffect {
                 .await;
                 TuiEffectResult::PluginSurfaceOpened { plugin_id, result }
             }
-            Self::LoadForkPrompts {
-                session_id,
-                submission,
-            } => TuiEffectResult::ForkPromptsLoaded {
-                session_id,
-                submission,
-                result: super::session_fork_flow::load_recent_user_prompts(&client, session_id)
-                    .await,
-            },
             Self::LoadModelProviders => TuiEffectResult::ModelProvidersLoaded {
                 result: client.plugin_services().await.map(|services| {
                     services
@@ -1941,55 +1825,6 @@ impl TuiEffect {
                 .await;
                 TuiEffectResult::PluginCommandInvoked { plugin_id, result }
             }
-            Self::ForkSession {
-                session_id,
-                prompt_sequence,
-                name,
-                draft,
-                switch_after_create,
-                install_draft,
-                initial_window_request,
-            } => TuiEffectResult::ForkSession {
-                switch_after_create,
-                install_draft,
-                draft,
-                initial_window_request,
-                result: match execute_session_view_action(
-                    &client,
-                    SessionViewAction::ForkSession {
-                        session_id,
-                        prompt_sequence,
-                        name,
-                    },
-                )
-                .await
-                {
-                    Ok(SessionViewActionOutcome::SessionForked { fork }) => Ok(*fork),
-                    Ok(_) => Err(ClientError::UnexpectedResponse),
-                    Err(error) => Err(error),
-                },
-            },
-            Self::CloneSession {
-                session_id,
-                name,
-                switch_after_create,
-                install_draft,
-                initial_window_request,
-            } => TuiEffectResult::CloneSession {
-                switch_after_create,
-                install_draft,
-                initial_window_request,
-                result: match execute_session_view_action(
-                    &client,
-                    SessionViewAction::CloneSession { session_id, name },
-                )
-                .await
-                {
-                    Ok(SessionViewActionOutcome::SessionCloned { fork }) => Ok(*fork),
-                    Ok(_) => Err(ClientError::UnexpectedResponse),
-                    Err(error) => Err(error),
-                },
-            },
             Self::SubmitMessage { request } => run_submit_message(&client, *request).await,
             Self::SkillAction { request } => run_skill_action(&client, *request).await,
             Self::SetSessionModel {

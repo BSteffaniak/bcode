@@ -433,7 +433,6 @@ fn semantic_component_identities_are_stable_bounded_and_order_independent() {
                 updated_at_ms: 1,
                 working_directory: "/tmp".into(),
                 import: None,
-                fork: None,
                 execution: None,
             })
             .collect::<Vec<_>>();
@@ -1102,7 +1101,6 @@ fn session_navigation_marks_selected_active_and_idle_sessions() {
         updated_at_ms: 42,
         working_directory: "/tmp/selected".into(),
         import: None,
-        fork: None,
         execution: None,
     };
     let idle = bcode_session_models::SessionSummary {
@@ -1215,7 +1213,6 @@ fn opaque_session_context_is_propagated_to_navigation() {
         updated_at_ms: 1,
         working_directory: "/tmp/project".into(),
         import: None,
-        fork: None,
         execution: None,
     };
     let rendered = format!(

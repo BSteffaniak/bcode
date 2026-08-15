@@ -4814,7 +4814,6 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ModelTurnCancelRequested { .. }
         | SessionEventKind::SessionRenamed { .. }
         | SessionEventKind::SessionImported { .. }
-        | SessionEventKind::SessionForked { .. }
         | SessionEventKind::SessionDerived { .. }
         | SessionEventKind::ExecutionSessionCreated { .. }
         | SessionEventKind::SkillActivated { .. }

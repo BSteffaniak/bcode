@@ -626,67 +626,6 @@ impl BcodeRuntimeModel {
             }
             return super::invalidation::UiInvalidation::Structural;
         }
-        if self.loop_state.has_session_fork_flow() {
-            match self.loop_state.handle_session_fork_event(
-                &self.chat,
-                &event,
-                self.settings.keymap(),
-            ) {
-                super::chat_loop::SessionForkRootOutcome::Handled => {}
-                super::chat_loop::SessionForkRootOutcome::Canceled => {
-                    self.chat.app.set_status("fork canceled".to_owned());
-                }
-                super::chat_loop::SessionForkRootOutcome::LoadPrompts {
-                    session_id,
-                    submission,
-                } => {
-                    self.chat
-                        .replace_effect(super::effects::TuiEffect::LoadForkPrompts {
-                            session_id,
-                            submission,
-                        });
-                    self.chat.app.set_status("loading fork prompts…".to_owned());
-                }
-                super::chat_loop::SessionForkRootOutcome::CreateClone {
-                    session_id,
-                    submission,
-                } => {
-                    self.chat
-                        .start_effect(super::effects::TuiEffect::CloneSession {
-                            session_id,
-                            name: submission.name,
-                            switch_after_create: submission.switch_after_create,
-                            install_draft: submission.install_draft,
-                            initial_window_request:
-                                super::history_flow::initial_transcript_window_request(
-                                    self.committed_area,
-                                ),
-                        });
-                    self.chat.app.set_status("cloning session…".to_owned());
-                }
-                super::chat_loop::SessionForkRootOutcome::CreateFork {
-                    session_id,
-                    submission,
-                    prompt,
-                } => {
-                    self.chat
-                        .start_effect(super::effects::TuiEffect::ForkSession {
-                            session_id,
-                            prompt_sequence: prompt.sequence,
-                            name: submission.name,
-                            draft: Some(prompt.text),
-                            switch_after_create: submission.switch_after_create,
-                            install_draft: submission.install_draft,
-                            initial_window_request:
-                                super::history_flow::initial_transcript_window_request(
-                                    self.committed_area,
-                                ),
-                        });
-                    self.chat.app.set_status("forking session…".to_owned());
-                }
-            }
-            return super::invalidation::UiInvalidation::Structural;
-        }
         if self.loop_state.has_auth_pool_picker() {
             match self.loop_state.handle_auth_pool_picker_event(&event) {
                 super::chat_loop::AuthPoolPickerRootOutcome::Continue => {}
@@ -1235,25 +1174,6 @@ impl BcodeRuntimeModel {
                     self.loop_state.open_session_picker(&mut self.chat);
                 }
                 "session.search" => self.loop_state.open_session_search(&mut self.chat),
-                "session.fork" => self.loop_state.open_session_fork_dialog(&mut self.chat),
-                "session.clone" => {
-                    if let Some(session_id) = self.chat.session_id {
-                        self.chat
-                            .start_effect(super::effects::TuiEffect::CloneSession {
-                                session_id,
-                                name: None,
-                                switch_after_create: true,
-                                install_draft: true,
-                                initial_window_request:
-                                    super::history_flow::initial_transcript_window_request(
-                                        self.committed_area,
-                                    ),
-                            });
-                        self.chat.app.set_status("cloning session…".to_owned());
-                    } else {
-                        self.chat.app.set_status("No active session".to_owned());
-                    }
-                }
                 "turn.cancel" => {
                     super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
                 }
@@ -2214,7 +2134,6 @@ pub enum BcodeRuntimeScreen {
     /// Skill selection and invocation flow.
     SkillPicker,
     /// Session fork/create flow.
-    SessionFork,
     /// Worktree creation flow.
     WorktreeCreate,
     /// Ralph loop creation flow.

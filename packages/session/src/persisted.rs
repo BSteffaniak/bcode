@@ -8,8 +8,8 @@
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderContextSnapshot,
     RequestContextObservation, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-    SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
-    TurnAdmissionMetadata, WorkId, current_unix_timestamp_ms,
+    SessionEventProvenance, SessionId, SessionTokenUsage, SessionTraceEvent, TurnAdmissionMetadata,
+    WorkId, current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
@@ -343,18 +343,6 @@ enum PersistedSessionEventKind {
         source_display_name: String,
         external_session_id: String,
         imported_at_ms: u64,
-    },
-    /// Durable provenance marker for sessions forked or cloned from another session.
-    SessionForked {
-        source_session_id: SessionId,
-        #[serde(default)]
-        source_title: Option<String>,
-        #[serde(default)]
-        source_cutoff_sequence: Option<u64>,
-        #[serde(default)]
-        source_prompt_sequence: Option<u64>,
-        forked_at_ms: u64,
-        kind: SessionForkKind,
     },
     SessionDerived {
         source_session_id: SessionId,
@@ -813,21 +801,6 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 external_session_id: external_session_id.clone(),
                 imported_at_ms: *imported_at_ms,
             },
-            SessionEventKind::SessionForked {
-                source_session_id,
-                source_title,
-                source_cutoff_sequence,
-                source_prompt_sequence,
-                forked_at_ms,
-                kind,
-            } => Self::SessionForked {
-                source_session_id: *source_session_id,
-                source_title: source_title.clone(),
-                source_cutoff_sequence: *source_cutoff_sequence,
-                source_prompt_sequence: *source_prompt_sequence,
-                forked_at_ms: *forked_at_ms,
-                kind: *kind,
-            },
             SessionEventKind::SessionDerived {
                 source_session_id,
                 source_generation,
@@ -1164,21 +1137,6 @@ impl PersistedSessionEventKind {
                 source_display_name,
                 external_session_id,
                 imported_at_ms,
-            },
-            Self::SessionForked {
-                source_session_id,
-                source_title,
-                source_cutoff_sequence,
-                source_prompt_sequence,
-                forked_at_ms,
-                kind,
-            } => SessionEventKind::SessionForked {
-                source_session_id,
-                source_title,
-                source_cutoff_sequence,
-                source_prompt_sequence,
-                forked_at_ms,
-                kind,
             },
             Self::SessionDerived {
                 source_session_id,
