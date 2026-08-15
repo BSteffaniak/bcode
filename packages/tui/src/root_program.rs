@@ -569,6 +569,9 @@ impl BcodeRuntimeModel {
                 bcode_plugin_sdk::tui::PluginTuiAction::SelectWorkflowRun { run_id } => {
                     self.loop_state.request_root_workflow_run(run_id);
                 }
+                bcode_plugin_sdk::tui::PluginTuiAction::LoadMoreWorkflowRuns { cursor } => {
+                    self.loop_state.request_more_root_workflow_runs(cursor);
+                }
                 bcode_plugin_sdk::tui::PluginTuiAction::InvokePluginCommand {
                     plugin_id,
                     command_id,
@@ -2393,6 +2396,12 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     }
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::SelectWorkflowRun { run_id }) => {
                         self.loop_state.request_root_workflow_run(run_id);
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::LoadMoreWorkflowRuns {
+                        cursor,
+                    }) => {
+                        self.loop_state.request_more_root_workflow_runs(cursor);
                         super::invalidation::UiInvalidation::Structural
                     }
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::InvokePluginCommand {

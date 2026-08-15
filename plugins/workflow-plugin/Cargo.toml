@@ -25,8 +25,11 @@ bcode_workflow_view_models = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_tui = { workspace = true }
 bmux_tui_components = { workspace = true, features = [
+    "action-row",
     "key-hint-bar",
     "pane",
+    "table",
+    "tab-bar",
     "text-view",
 ] }
 clap = { workspace = true, features = ["derive", "std"] }

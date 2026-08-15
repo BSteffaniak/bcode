@@ -11,7 +11,12 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
 use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
+use bmux_tui_components::tab_bar::{TabBar, TabBarState, TabBarStyles, TabItem};
+use bmux_tui_components::table::{
+    Table, TableAlign, TableColumn, TableRow, TableState, TableStyles,
+};
 use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -172,6 +177,7 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 selected_output_id: None,
                 selected_child_session_id: None,
                 detail_loading_run_id: None,
+                active_detail_tab: 0,
                 input_buffer: None,
                 updates: None,
                 catalog: None,
@@ -196,6 +202,7 @@ struct WorkflowStatusSurface {
     selected_output_id: Option<String>,
     selected_child_session_id: Option<String>,
     detail_loading_run_id: Option<String>,
+    active_detail_tab: usize,
     input_buffer: Option<String>,
     updates: Option<PluginTuiSurfaceUpdateReceiver>,
     catalog: Option<bcode_workflow_view_models::WorkflowCatalogView>,
@@ -204,10 +211,17 @@ struct WorkflowStatusSurface {
     subscription_requested: bool,
 }
 
+#[derive(Clone, Copy)]
 struct WorkflowSurfaceTheme {
     canvas: Style,
     text: Style,
+    muted: Style,
     focused: Style,
+    selected: Style,
+    info: Style,
+    success: Style,
+    warning: Style,
+    error: Style,
     component: bmux_tui_components::theme::ComponentTheme,
 }
 
@@ -219,7 +233,13 @@ impl WorkflowSurfaceTheme {
                 Self {
                     canvas: component.canvas,
                     text: component.text,
+                    muted: component.muted,
                     focused: component.focused,
+                    selected: component.selected,
+                    info: component.info,
+                    success: component.success,
+                    warning: component.warning,
+                    error: component.error,
                     component,
                 }
             },
@@ -228,7 +248,13 @@ impl WorkflowSurfaceTheme {
                 Self {
                     canvas: theme.canvas,
                     text: theme.text,
+                    muted: theme.muted,
                     focused: theme.focused,
+                    selected: theme.selection,
+                    info: component.info,
+                    success: component.success,
+                    warning: component.warning,
+                    error: component.error,
                     component,
                 }
             },
@@ -247,6 +273,297 @@ impl WorkflowStatusSurface {
             .nodes
             .iter()
             .find(|node| node.node_id == node_id)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_workspace(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
+        let Some(catalog) = self.catalog.as_ref() else {
+            return;
+        };
+        if area.height < 4 || area.width < 24 {
+            return;
+        }
+        let header = Rect::new(area.x, area.y, area.width, 2.min(area.height));
+        let footer_height = 1.min(area.height.saturating_sub(header.height));
+        let body = Rect::new(
+            area.x,
+            area.y.saturating_add(header.height),
+            area.width,
+            area.height
+                .saturating_sub(header.height)
+                .saturating_sub(footer_height),
+        );
+        let footer = Rect::new(
+            area.x,
+            area.bottom().saturating_sub(footer_height),
+            area.width,
+            footer_height,
+        );
+        self.render_workspace_header(header, frame, theme, catalog);
+        if area.width >= 112 {
+            let catalog_width = area.width.saturating_mul(28) / 100;
+            let inspector_width = area.width.saturating_mul(30) / 100;
+            let graph_width = body
+                .width
+                .saturating_sub(catalog_width)
+                .saturating_sub(inspector_width);
+            let catalog_area = Rect::new(body.x, body.y, catalog_width, body.height);
+            let graph_area = Rect::new(catalog_area.right(), body.y, graph_width, body.height);
+            let inspector_area =
+                Rect::new(graph_area.right(), body.y, inspector_width, body.height);
+            self.render_catalog(catalog_area, frame, theme, catalog);
+            self.render_graph(graph_area, frame, theme);
+            self.render_inspector(inspector_area, frame, theme, false);
+        } else if area.width >= 72 {
+            let catalog_width = area.width.saturating_mul(38) / 100;
+            let catalog_area = Rect::new(body.x, body.y, catalog_width, body.height);
+            let detail_area = Rect::new(
+                catalog_area.right(),
+                body.y,
+                body.width.saturating_sub(catalog_width),
+                body.height,
+            );
+            self.render_catalog(catalog_area, frame, theme, catalog);
+            self.render_inspector(detail_area, frame, theme, true);
+        } else {
+            self.render_narrow_page(body, frame, theme, catalog);
+        }
+        let hints = [
+            KeyHint::new("←/→", "run"),
+            KeyHint::new("↑/↓", "node"),
+            KeyHint::new("Tab", "section"),
+            KeyHint::new("m", "more"),
+            KeyHint::new("?", "help"),
+        ];
+        KeyHintBar::new(&hints)
+            .styles(KeyHintBarStyles {
+                key: theme.focused,
+                label: theme.text,
+                separator: theme.muted,
+                disabled: theme.muted,
+                background: theme.canvas,
+            })
+            .render(footer, frame);
+    }
+
+    fn render_workspace_header(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: WorkflowSurfaceTheme,
+        catalog: &bcode_workflow_view_models::WorkflowCatalogView,
+    ) {
+        let active = catalog
+            .runs
+            .iter()
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    bcode_workflow_view_models::WorkflowRunStatus::Running
+                        | bcode_workflow_view_models::WorkflowRunStatus::Paused
+                )
+            })
+            .count();
+        let attention = catalog
+            .runs
+            .iter()
+            .filter(|run| run.attention.needs_attention())
+            .count();
+        let failed = catalog
+            .runs
+            .iter()
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    bcode_workflow_view_models::WorkflowRunStatus::Failed
+                        | bcode_workflow_view_models::WorkflowRunStatus::RepairRequired
+                )
+            })
+            .count();
+        let completed = catalog
+            .runs
+            .iter()
+            .filter(|run| run.status == bcode_workflow_view_models::WorkflowRunStatus::Completed)
+            .count();
+        frame.write_line(
+            Rect::new(area.x, area.y, area.width, 1),
+            &Line::from_spans(vec![
+                Span::styled(" Workflows  ", theme.focused.add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{}  ", self.live_status), theme.info),
+                Span::styled(format!("active {active}  "), theme.info),
+                Span::styled(format!("attention {attention}  "), theme.warning),
+                Span::styled(format!("failed {failed}  "), theme.error),
+                Span::styled(format!("completed {completed}"), theme.success),
+            ]),
+        );
+        if area.height > 1 {
+            frame.write_line(
+                Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+                &Line::from_spans(vec![Span::styled(
+                    format!(
+                        " Filter: {:?}  Sort: {:?}  Showing {}{}",
+                        catalog.filter,
+                        catalog.sort,
+                        catalog.runs.len(),
+                        if catalog.has_more { "+" } else { "" }
+                    ),
+                    theme.muted,
+                )]),
+            );
+        }
+    }
+
+    fn render_catalog(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: WorkflowSurfaceTheme,
+        catalog: &bcode_workflow_view_models::WorkflowCatalogView,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+        let columns = [
+            TableColumn::new("Run").flex(3).align(TableAlign::Left),
+            TableColumn::new("Status").flex(2).align(TableAlign::Left),
+        ];
+        let rows = catalog
+            .runs
+            .iter()
+            .map(|run| {
+                let attention = if run.attention.needs_attention() {
+                    " !"
+                } else {
+                    ""
+                };
+                TableRow::rich(vec![
+                    Line::from(run.display_title.clone()),
+                    Line::from(format!("{:?}{attention}", run.status)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let selected = self
+            .selected_run_id
+            .as_deref()
+            .and_then(|run_id| catalog.runs.iter().position(|run| run.run_id == run_id));
+        Table::new(&columns, &rows)
+            .styles(TableStyles {
+                header: theme.focused,
+                row: theme.text,
+                selected: theme.selected,
+                selected_column: theme.selected,
+                selected_cell: theme.warning,
+                hovered: theme.focused,
+                disabled: theme.muted,
+                separator: theme.component.border,
+                empty: theme.muted,
+            })
+            .render(area, &TableState::new(selected), frame);
+    }
+
+    fn render_graph(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
+        let pane = Pane::new()
+            .title(Line::from("Execution graph"))
+            .padding(Insets::new(1, 1, 1, 1))
+            .styles(PaneStyles {
+                background: Some(theme.canvas),
+                border: theme.component.border,
+                focused_border: theme.focused,
+            });
+        let state = PaneState::new(area);
+        pane.render(&state, frame);
+        let inner = pane.inner_area(&state);
+        let lines = self.selected_run_view().map_or_else(
+            || vec![Line::from("Loading selected run…")],
+            |run| {
+                run.nodes
+                    .iter()
+                    .map(|node| {
+                        let marker =
+                            if self.selected_node_id.as_deref() == Some(node.node_id.as_str()) {
+                                "▶"
+                            } else {
+                                " "
+                            };
+                        let style = workflow_node_style(&node.status, theme);
+                        Line::from_spans(vec![Span::styled(
+                            format!("{marker} {}  {:?}", node.name, node.status),
+                            style,
+                        )])
+                    })
+                    .collect()
+            },
+        );
+        TextView::new(&lines)
+            .policy(TextViewPolicy::bare())
+            .styles(TextViewStyles {
+                text: theme.text,
+                empty: theme.muted,
+                background: theme.canvas,
+            })
+            .render(inner, &self.text_view, frame);
+    }
+
+    fn render_inspector(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: WorkflowSurfaceTheme,
+        tabbed: bool,
+    ) {
+        let tabs = [
+            TabItem::new("overview", "Overview"),
+            TabItem::new("outputs", "Outputs"),
+            TabItem::new("attempts", "Attempts"),
+            TabItem::new("actions", "Actions"),
+        ];
+        let tab_height = u16::from(tabbed || area.width < 44);
+        if tab_height > 0 {
+            TabBar::new(&tabs)
+                .styles(TabBarStyles {
+                    normal: theme.muted,
+                    selected: theme.selected,
+                    focused: theme.focused,
+                    hovered: theme.focused,
+                    pressed: theme.selected,
+                    disabled: theme.muted,
+                    separator: theme.component.border,
+                })
+                .render(
+                    Rect::new(area.x, area.y, area.width, tab_height),
+                    &TabBarState::new(Some(self.active_detail_tab)),
+                    frame,
+                );
+        }
+        let content = Rect::new(
+            area.x,
+            area.y.saturating_add(tab_height),
+            area.width,
+            area.height.saturating_sub(tab_height),
+        );
+        let lines = inspector_lines(self.selected_run_view(), self.active_detail_tab);
+        TextView::new(&lines)
+            .policy(TextViewPolicy::bare())
+            .styles(TextViewStyles {
+                text: theme.text,
+                empty: theme.muted,
+                background: theme.canvas,
+            })
+            .render(content, &self.text_view, frame);
+    }
+
+    fn render_narrow_page(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: WorkflowSurfaceTheme,
+        catalog: &bcode_workflow_view_models::WorkflowCatalogView,
+    ) {
+        match self.active_detail_tab {
+            0 => self.render_catalog(area, frame, theme, catalog),
+            1 => self.render_graph(area, frame, theme),
+            _ => self.render_inspector(area, frame, theme, true),
+        }
     }
 
     fn select_adjacent_run(&mut self, offset: isize) -> PluginTuiAction {
@@ -348,6 +665,17 @@ impl WorkflowStatusSurface {
             KeyCode::Right | KeyCode::Char('l') => self.select_adjacent_run(1),
             KeyCode::Up | KeyCode::Char('k') => self.select_adjacent_node(-1),
             KeyCode::Down | KeyCode::Char('j') => self.select_adjacent_node(1),
+            KeyCode::Char('m') => self
+                .catalog
+                .as_ref()
+                .and_then(|catalog| catalog.next_cursor.clone())
+                .map_or(PluginTuiAction::None, |cursor| {
+                    PluginTuiAction::LoadMoreWorkflowRuns { cursor }
+                }),
+            KeyCode::Tab => {
+                self.active_detail_tab = (self.active_detail_tab + 1) % 4;
+                PluginTuiAction::Redraw
+            }
             KeyCode::Char('p') => self
                 .selected_run_view()
                 .map_or(PluginTuiAction::None, |run| {
@@ -468,21 +796,14 @@ impl WorkflowStatusSurface {
         let pane_state = PaneState::new(area);
         pane.render(&pane_state, frame);
         let content = pane.inner_area(&pane_state);
-        let rows = if self.catalog.is_some() {
-            workflow_view_lines(
-                self.catalog.as_ref(),
-                &self.runs,
-                &self.live_status,
-                self.selected_run_id.as_deref(),
-                self.selected_node_id.as_deref(),
-                self.input_buffer.as_deref(),
-            )
-        } else {
-            surface_lines(&self.options, self.selected_approval)
+        if self.catalog.is_some() {
+            self.render_workspace(content, frame, theme);
+            return;
         }
-        .into_iter()
-        .map(|row| Line::from_spans(vec![Span::styled(row, theme.text)]))
-        .collect::<Vec<_>>();
+        let rows = surface_lines(&self.options, self.selected_approval)
+            .into_iter()
+            .map(|row| Line::from_spans(vec![Span::styled(row, theme.text)]))
+            .collect::<Vec<_>>();
         TextView::new(&rows)
             .policy(TextViewPolicy::bare())
             .styles(TextViewStyles {
@@ -545,6 +866,32 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                         .filter(|run_id| catalog.runs.iter().any(|run| &run.run_id == run_id))
                         .or_else(|| catalog.runs.first().map(|run| run.run_id.clone()));
                     self.catalog = Some(catalog);
+                    self.live_status = "live".to_string();
+                }
+                PluginTuiSurfaceUpdate::WorkflowCatalogPage(page) => {
+                    if let Err(error) = page.validate_version() {
+                        self.live_status = error.to_string();
+                        continue;
+                    }
+                    if let Some(catalog) = self.catalog.as_mut()
+                        && catalog.filter == page.filter
+                        && catalog.sort == page.sort
+                        && catalog.search == page.search
+                    {
+                        let known = catalog
+                            .runs
+                            .iter()
+                            .map(|run| run.run_id.clone())
+                            .collect::<BTreeSet<_>>();
+                        let additions = page
+                            .runs
+                            .into_iter()
+                            .filter(|run| !known.contains(&run.run_id))
+                            .collect::<Vec<_>>();
+                        catalog.runs.extend(additions);
+                        catalog.next_cursor = page.next_cursor;
+                        catalog.has_more = page.has_more;
+                    }
                     self.live_status = "live".to_string();
                 }
                 PluginTuiSurfaceUpdate::WorkflowRun(view) => {
@@ -702,6 +1049,97 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 }
 
+const fn workflow_node_style(
+    status: &bcode_workflow_view_models::WorkflowNodeStatus,
+    theme: WorkflowSurfaceTheme,
+) -> Style {
+    match status {
+        bcode_workflow_view_models::WorkflowNodeStatus::Running
+        | bcode_workflow_view_models::WorkflowNodeStatus::Pending => theme.info,
+        bcode_workflow_view_models::WorkflowNodeStatus::Completed => theme.success,
+        bcode_workflow_view_models::WorkflowNodeStatus::WaitingInput
+        | bcode_workflow_view_models::WorkflowNodeStatus::WaitingApproval
+        | bcode_workflow_view_models::WorkflowNodeStatus::WaitingMutationApproval => theme.warning,
+        bcode_workflow_view_models::WorkflowNodeStatus::Failed
+        | bcode_workflow_view_models::WorkflowNodeStatus::RepairRequired => theme.error,
+        bcode_workflow_view_models::WorkflowNodeStatus::NotStarted
+        | bcode_workflow_view_models::WorkflowNodeStatus::Cancelled
+        | bcode_workflow_view_models::WorkflowNodeStatus::Skipped
+        | bcode_workflow_view_models::WorkflowNodeStatus::Unknown(_) => theme.muted,
+    }
+}
+
+fn inspector_lines(
+    run: Option<&bcode_workflow_view_models::WorkflowRunView>,
+    tab: usize,
+) -> Vec<Line> {
+    let Some(run) = run else {
+        return vec![Line::from("Loading selected run…")];
+    };
+    match tab {
+        0 => vec![
+            Line::from(run.run.display_title.clone()),
+            Line::from(format!("Run: {}", run.run.run_id)),
+            Line::from(format!("Status: {:?}", run.run.status)),
+            Line::from(format!(
+                "Progress: {}/{} completed · {} active · {} blocked",
+                run.run.progress.completed,
+                run.run.progress.total_nodes,
+                run.run.progress.active,
+                run.run.progress.blocked
+            )),
+            Line::from(format!(
+                "Definition: {} v{}",
+                run.run.definition_id, run.run.definition_version
+            )),
+            Line::from(format!("Health: {:?}", run.health)),
+        ],
+        1 => run
+            .outputs
+            .iter()
+            .flat_map(|output| {
+                let value = match &output.value {
+                    bcode_workflow_view_models::WorkflowOutputValue::Resolved { value } => {
+                        value.to_string()
+                    }
+                    bcode_workflow_view_models::WorkflowOutputValue::Unresolved => {
+                        "unresolved".to_string()
+                    }
+                };
+                [
+                    Line::from(format!("{} · {}", output.node_id, output.schema_id)),
+                    Line::from(value),
+                ]
+            })
+            .collect(),
+        2 => run
+            .attempts
+            .iter()
+            .map(|attempt| {
+                Line::from(format!(
+                    "#{} {} · {}",
+                    attempt.attempt, attempt.node_id, attempt.status
+                ))
+            })
+            .collect(),
+        _ => run
+            .actions
+            .iter()
+            .map(|action| {
+                Line::from(format!(
+                    "{:?}{}",
+                    action.kind,
+                    action
+                        .unavailable_reason
+                        .as_ref()
+                        .map_or(String::new(), |reason| format!(" · {reason}"))
+                ))
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_lines)]
 fn workflow_view_lines(
     catalog: Option<&bcode_workflow_view_models::WorkflowCatalogView>,
@@ -811,7 +1249,7 @@ fn workflow_view_lines(
         lines.push("Enter submit · Esc cancel".to_string());
     } else {
         lines.push(
-            "←/→ run · ↑/↓ node · p pause/resume · c cancel · r retry · a/d approval · i input · o session"
+            "←/→ run · ↑/↓ node · m more · p pause/resume · c cancel · r retry · a/d approval · i input · o session"
                 .to_string(),
         );
     }
@@ -1581,6 +2019,7 @@ mod tests {
             selected_output_id: Some("output-1".to_string()),
             selected_child_session_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
             detail_loading_run_id: None,
+            active_detail_tab: 0,
             input_buffer: None,
             updates: None,
             catalog: Some(bcode_workflow_view_models::WorkflowCatalogView {

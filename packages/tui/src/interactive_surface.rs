@@ -464,6 +464,7 @@ impl InteractiveSurfaceState {
             PluginTuiAction::Redraw
             | PluginTuiAction::SubscribeWorkflowRuns
             | PluginTuiAction::SelectWorkflowRun { .. }
+            | PluginTuiAction::LoadMoreWorkflowRuns { .. }
             | PluginTuiAction::InvokePluginCommand { .. }
             | PluginTuiAction::OpenSession { .. }
             | PluginTuiAction::OpenSurface { .. } => InteractiveSurfaceEventOutcome::Consumed,

@@ -819,6 +819,8 @@ pub enum PluginTuiSurfaceUpdate {
     WorkflowRun(Box<bcode_workflow_view_models::WorkflowRunView>),
     /// Replace workflow catalog presentation from one authoritative bounded projection.
     WorkflowCatalog(bcode_workflow_view_models::WorkflowCatalogView),
+    /// Append one exact continuation page to the current catalog query.
+    WorkflowCatalogPage(bcode_workflow_view_models::WorkflowCatalogView),
     /// Report that selected-run detail is being fetched.
     WorkflowRunLoading { run_id: String },
     /// Select one exact run whose bounded detail should be loaded by the host.
@@ -851,6 +853,10 @@ pub enum PluginTuiAction {
     SubscribeWorkflowRuns,
     /// Load bounded detail for one exact selected workflow run.
     SelectWorkflowRun { run_id: String },
+    /// Request another bounded workflow catalog page.
+    LoadMoreWorkflowRuns {
+        cursor: bcode_workflow_view_models::WorkflowCatalogCursor,
+    },
     /// Invoke a plugin-owned command through the host application without closing this surface.
     InvokePluginCommand {
         plugin_id: String,

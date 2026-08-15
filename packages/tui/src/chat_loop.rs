@@ -147,6 +147,12 @@ pub enum AuthPoolPickerRootOutcome {
     Clear { pool: String },
 }
 
+#[derive(Debug)]
+pub enum WorkflowViewRequest {
+    SelectRun(String),
+    LoadMore(bcode_workflow_view_models::WorkflowCatalogCursor),
+}
+
 pub enum SessionPickerRootOutcome {
     Unhandled,
     Handled,
@@ -207,7 +213,7 @@ pub struct ChatLoopState {
     streaming_configurator: Option<super::streaming_configurator::StreamingConfiguratorState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     plugin_surface: Option<RootPluginSurface>,
-    workflow_view_requests: Option<tokio::sync::mpsc::Sender<String>>,
+    workflow_view_requests: Option<tokio::sync::mpsc::Sender<WorkflowViewRequest>>,
     provider_picker: Option<super::provider_picker::ProviderPickerApp>,
     model_picker: Option<RootModelPicker>,
     auth_pool_picker: Option<super::auth_pool_picker::AuthPoolPickerApp>,
@@ -979,7 +985,7 @@ impl ChatLoopState {
     pub fn attach_root_plugin_surface_updates(
         &mut self,
         updates: bcode_plugin_sdk::tui::PluginTuiSurfaceUpdateReceiver,
-        workflow_view_requests: tokio::sync::mpsc::Sender<String>,
+        workflow_view_requests: tokio::sync::mpsc::Sender<WorkflowViewRequest>,
     ) {
         self.workflow_view_requests = Some(workflow_view_requests);
         if let Some(surface) = self.plugin_surface.as_mut() {
@@ -989,7 +995,16 @@ impl ChatLoopState {
 
     pub fn request_root_workflow_run(&self, run_id: String) {
         if let Some(requests) = &self.workflow_view_requests {
-            let _ = requests.try_send(run_id);
+            let _ = requests.try_send(WorkflowViewRequest::SelectRun(run_id));
+        }
+    }
+
+    pub fn request_more_root_workflow_runs(
+        &self,
+        cursor: bcode_workflow_view_models::WorkflowCatalogCursor,
+    ) {
+        if let Some(requests) = &self.workflow_view_requests {
+            let _ = requests.try_send(WorkflowViewRequest::LoadMore(cursor));
         }
     }
 
