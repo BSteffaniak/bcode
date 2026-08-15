@@ -786,6 +786,34 @@ impl BcodeRuntimeModel {
             }
             return super::invalidation::UiInvalidation::Structural;
         }
+        if self.loop_state.has_working_directory_dialog() {
+            match self
+                .loop_state
+                .handle_working_directory_dialog_event(self.settings.keymap(), &event)
+            {
+                super::chat_loop::WorkingDirectoryDialogRootOutcome::Apply(path) => {
+                    let Some(session_id) = self.chat.session_id else {
+                        self.chat.app.set_status("no active session".to_owned());
+                        return super::invalidation::UiInvalidation::Structural;
+                    };
+                    self.chat
+                        .start_effect(super::effects::TuiEffect::AttachWorktree {
+                            session_id,
+                            path,
+                        });
+                }
+                super::chat_loop::WorkingDirectoryDialogRootOutcome::Canceled => {
+                    self.chat
+                        .app
+                        .set_status("working directory change canceled".to_owned());
+                }
+                super::chat_loop::WorkingDirectoryDialogRootOutcome::Handled => {}
+                super::chat_loop::WorkingDirectoryDialogRootOutcome::Unhandled => {
+                    unreachable!("working-directory dialog was present")
+                }
+            }
+            return super::invalidation::UiInvalidation::Structural;
+        }
         if self.loop_state.has_worktree_create_dialog() {
             match self
                 .loop_state
@@ -2132,7 +2160,8 @@ pub enum BcodeRuntimeScreen {
     ModelPicker,
     /// Skill selection and invocation flow.
     SkillPicker,
-    /// Session fork/create flow.
+    /// Session working-directory change flow.
+    WorkingDirectory,
     /// Worktree creation flow.
     WorktreeCreate,
     /// Ralph loop creation flow.

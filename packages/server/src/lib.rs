@@ -6754,6 +6754,33 @@ async fn handle_subscribe_catalog_updates(
     .await
 }
 
+async fn validate_session_working_directory(
+    working_directory: &std::path::Path,
+) -> Result<PathBuf, (&'static str, String)> {
+    let metadata = tokio::fs::metadata(working_directory)
+        .await
+        .map_err(|error| {
+            (
+                "session_working_directory_unavailable",
+                format!("session working directory is not accessible: {error}"),
+            )
+        })?;
+    if !metadata.is_dir() {
+        return Err((
+            "session_working_directory_not_directory",
+            "session working directory path is not a directory".to_owned(),
+        ));
+    }
+    tokio::fs::canonicalize(working_directory)
+        .await
+        .map_err(|error| {
+            (
+                "session_working_directory_unavailable",
+                format!("session working directory cannot be resolved: {error}"),
+            )
+        })
+}
+
 async fn handle_change_session_working_directory(
     request_id: u64,
     state: &ServerState,
@@ -6772,6 +6799,17 @@ async fn handle_change_session_working_directory(
         )
         .await;
     }
+    let working_directory = match validate_session_working_directory(&working_directory).await {
+        Ok(path) => path,
+        Err((code, message)) => {
+            return send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(code, message)),
+            )
+            .await;
+        }
+    };
     if state.session_has_active_turn(session_id).await {
         return send_response(
             writer,
@@ -34902,6 +34940,38 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn working_directory_validation_rejects_files_and_missing_paths() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let file = root.path().join("file");
+        std::fs::write(&file, "content").expect("test file");
+        assert_eq!(
+            super::validate_session_working_directory(&file)
+                .await
+                .expect_err("file must be rejected")
+                .0,
+            "session_working_directory_not_directory"
+        );
+        assert_eq!(
+            super::validate_session_working_directory(&root.path().join("missing"))
+                .await
+                .expect_err("missing path must be rejected")
+                .0,
+            "session_working_directory_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn working_directory_validation_canonicalizes_directories() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        assert_eq!(
+            super::validate_session_working_directory(root.path())
+                .await
+                .expect("directory is valid"),
+            std::fs::canonicalize(root.path()).expect("canonical directory")
+        );
+    }
+
     use super::*;
     static WORKFLOW_RUNTIME_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

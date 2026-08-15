@@ -109,6 +109,8 @@ pub(crate) mod transcript_markdown_cache;
 pub(crate) mod transcript_projection;
 pub(crate) mod transcript_resident_window;
 pub(crate) mod transcript_viewport;
+pub(crate) mod working_directory_dialog;
+pub(crate) mod working_directory_dialog_render;
 pub(crate) mod wt_create_dialog;
 pub(crate) mod wt_create_dialog_render;
 

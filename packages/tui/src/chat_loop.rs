@@ -156,6 +156,13 @@ pub enum SessionPickerRootOutcome {
     SearchHit(bcode_session_search::HydratedSessionSearchHit),
 }
 
+pub enum WorkingDirectoryDialogRootOutcome {
+    Unhandled,
+    Handled,
+    Canceled,
+    Apply(std::path::PathBuf),
+}
+
 pub enum WorktreeCreateDialogRootOutcome {
     Unhandled,
     Handled,
@@ -204,6 +211,7 @@ pub struct ChatLoopState {
     model_picker: Option<RootModelPicker>,
     auth_pool_picker: Option<super::auth_pool_picker::AuthPoolPickerApp>,
     skill_picker: Option<super::skill_picker::SkillPickerApp>,
+    working_directory_dialog: Option<super::working_directory_dialog::WorkingDirectoryDialog>,
     worktree_create_dialog: Option<super::wt_create_dialog::WorktreeCreateDialog>,
     ralph_start_dialog: Option<super::ralph_start_dialog::RalphStartDialog>,
     interactive_surface: Option<InteractiveSurfaceState>,
@@ -253,6 +261,7 @@ impl ChatLoopState {
             model_picker: None,
             auth_pool_picker: None,
             skill_picker: None,
+            working_directory_dialog: None,
             worktree_create_dialog: None,
             ralph_start_dialog: None,
             interactive_surface: None,
@@ -303,6 +312,7 @@ impl ChatLoopState {
         self.model_picker = None;
         self.auth_pool_picker = None;
         self.skill_picker = None;
+        self.working_directory_dialog = None;
         self.worktree_create_dialog = None;
         self.ralph_start_dialog = None;
         self.session_picker = None;
@@ -1137,6 +1147,57 @@ impl ChatLoopState {
         Some(action)
     }
 
+    pub const fn has_working_directory_dialog(&self) -> bool {
+        self.working_directory_dialog.is_some()
+    }
+
+    pub fn open_working_directory_dialog(&mut self, chat: &mut ActiveChat) {
+        let Some(working_directory) = chat.app.working_directory() else {
+            chat.app
+                .set_status("no active session working directory".to_owned());
+            return;
+        };
+        self.working_directory_dialog =
+            Some(super::working_directory_dialog::WorkingDirectoryDialog::new(working_directory));
+        chat.app.set_status("change working directory".to_owned());
+    }
+
+    pub fn handle_working_directory_dialog_event(
+        &mut self,
+        keymap: &super::keymap::BmuxKeyMap,
+        event: &Event,
+    ) -> WorkingDirectoryDialogRootOutcome {
+        let Some(dialog) = self.working_directory_dialog.as_mut() else {
+            return WorkingDirectoryDialogRootOutcome::Unhandled;
+        };
+        match dialog.handle_event(event, keymap) {
+            super::working_directory_dialog::WorkingDirectoryDialogOutcome::Handled => {
+                WorkingDirectoryDialogRootOutcome::Handled
+            }
+            super::working_directory_dialog::WorkingDirectoryDialogOutcome::Canceled => {
+                self.working_directory_dialog = None;
+                WorkingDirectoryDialogRootOutcome::Canceled
+            }
+            super::working_directory_dialog::WorkingDirectoryDialogOutcome::Apply(path) => {
+                WorkingDirectoryDialogRootOutcome::Apply(path)
+            }
+        }
+    }
+
+    pub fn apply_working_directory_dialog_result(
+        &mut self,
+        result: &Result<bcode_session_models::SessionSummary, ClientError>,
+    ) {
+        match result {
+            Ok(_) => self.working_directory_dialog = None,
+            Err(error) => {
+                if let Some(dialog) = &mut self.working_directory_dialog {
+                    dialog.set_submission_error(format!("Unable to change directory: {error}"));
+                }
+            }
+        }
+    }
+
     pub fn open_worktree_create_dialog(&mut self, chat: &mut ActiveChat) {
         let current_session_id = chat.app.session_id();
         let default_name = current_session_id.map_or_else(
@@ -1725,6 +1786,9 @@ impl ChatLoopState {
         }
         if self.has_ralph_start_dialog() {
             return BcodeRuntimeScreen::RalphStart;
+        }
+        if self.has_working_directory_dialog() {
+            return BcodeRuntimeScreen::WorkingDirectory;
         }
         if self.has_worktree_create_dialog() {
             return BcodeRuntimeScreen::WorktreeCreate;
@@ -2754,6 +2818,7 @@ pub fn apply_effect_result(
             apply_compact_context_result(chat, session_id, result);
         }
         TuiEffectResult::AttachWorktree { path, result } => {
+            loop_state.apply_working_directory_dialog_result(&result);
             apply_attach_worktree_result(chat, &path, result);
         }
         TuiEffectResult::CreateWorktree { result } => {
@@ -3280,6 +3345,9 @@ fn apply_root_slash_command_outcome(
                 }),
             });
         }
+        SlashCommandOutcome::OpenWorkingDirectoryDialog => {
+            loop_state.open_working_directory_dialog(chat);
+        }
         SlashCommandOutcome::OpenWorktreeCreateDialog => {
             loop_state.open_worktree_create_dialog(chat);
         }
@@ -3615,11 +3683,17 @@ fn apply_attach_worktree_result(
     match result {
         Ok(session) => {
             chat.app.apply_session_summary(&session);
-            chat.app
-                .set_status(format!("worktree: {}", display_from_current_dir(path)));
+            chat.app.set_status(format!(
+                "working directory: {}",
+                display_from_current_dir(path)
+            ));
         }
         Err(error) => {
-            daemon_issue::report_client_issue(&mut chat.app, "worktree attach failed", &error);
+            daemon_issue::report_client_issue(
+                &mut chat.app,
+                "working directory change failed",
+                &error,
+            );
         }
     }
 }
@@ -4342,6 +4416,9 @@ pub fn draw_chat_frame<W: Write>(
         }
         if let Some(dialog) = &mut loop_state.ralph_start_dialog {
             super::ralph_start_dialog_render::render_dialog(dialog, frame, theme);
+        }
+        if let Some(dialog) = &mut loop_state.working_directory_dialog {
+            super::working_directory_dialog_render::render_dialog(dialog, frame, theme);
         }
         if let Some(dialog) = &mut loop_state.worktree_create_dialog {
             super::wt_create_dialog_render::render_dialog(dialog, frame, theme);

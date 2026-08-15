@@ -187,7 +187,7 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
     BuiltinCommandSpec {
         id: BuiltinCommandId::Cwd,
         names: &["cwd"],
-        completions: &[completion!("/cwd ", "Set session working directory")],
+        completions: &[completion!("/cwd", "Change session working directory")],
     },
     BuiltinCommandSpec {
         id: BuiltinCommandId::Worktree,
@@ -437,10 +437,9 @@ mod tests {
     }
 
     #[test]
-    fn cwd_is_discoverable_with_a_path_argument() {
+    fn cwd_opens_an_interactive_command() {
         assert!(static_completions().any(|completion| {
-            completion.command() == "/cwd "
-                && completion.description().contains("working directory")
+            completion.command() == "/cwd" && completion.description().contains("working directory")
         }));
         assert_eq!(
             builtin_command("cwd").map(BuiltinSlashCommand::id),

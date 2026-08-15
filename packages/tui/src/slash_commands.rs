@@ -60,7 +60,9 @@ pub enum SlashCommandOutcome {
     OpenStreamingConfigurator,
     /// Show the theme catalog as durable transcript content.
     ShowThemeCatalog,
-    /// Open worktree create dialog.
+    /// Open the session working-directory dialog.
+    OpenWorkingDirectoryDialog,
+    /// Open the worktree creation dialog.
     OpenWorktreeCreateDialog,
     /// Set the model for the next draft session.
     SetLocalModel {
@@ -496,21 +498,6 @@ fn resolve_working_directory_path(base: &std::path::Path, path: PathBuf) -> Path
     }
 }
 
-fn cwd_command(
-    session_id: SessionId,
-    working_directory: &std::path::Path,
-    parts: &[&str],
-) -> SlashCommandOutcome {
-    if parts.len() <= 1 {
-        return SlashCommandOutcome::Handled("usage: /cwd <path>".to_owned());
-    }
-    let requested_path = parts.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
-    SlashCommandOutcome::AttachWorktree {
-        session_id,
-        path: resolve_working_directory_path(working_directory, PathBuf::from(requested_path)),
-    }
-}
-
 fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
     match parts.get(1).copied() {
         Some("ui" | "home") => SlashCommandOutcome::OpenRalphHome,
@@ -934,12 +921,15 @@ async fn execute_builtin(
             )))
         }
         BuiltinCommandId::Cwd => {
-            let Some(session_id) = session_id else {
+            if session_id.is_none() {
                 return Ok(SlashCommandOutcome::Handled(
                     "cwd requires an active session".to_owned(),
                 ));
-            };
-            Ok(cwd_command(session_id, context.working_directory, parts))
+            }
+            if parts.len() > 1 {
+                return Ok(SlashCommandOutcome::Handled("usage: /cwd".to_owned()));
+            }
+            Ok(SlashCommandOutcome::OpenWorkingDirectoryDialog)
         }
         BuiltinCommandId::Worktree => {
             worktree_command(client, session_id, context.working_directory, parts).await
@@ -1287,24 +1277,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn relative_session_paths_resolve_against_the_active_working_directory() {
+    #[tokio::test]
+    async fn cwd_builtin_opens_dialog_and_rejects_direct_arguments() {
+        let client = BcodeClient::default_endpoint();
         let session_id = SessionId::new();
-        let base = std::path::Path::new("/workspace/project");
+        let context = SlashExecutionContext {
+            working_directory: std::path::Path::new("/workspace"),
+            current_agent_id: "build",
+            reasoning_display_mode: bcode_config::TuiThinkingMode::All,
+            reasoning_visible: true,
+        };
+        let outcome = execute_builtin(
+            &client,
+            Some(session_id),
+            context,
+            "/cwd",
+            &["/cwd"],
+            slash_registry::BuiltinCommandId::Cwd,
+        )
+        .await
+        .expect("local cwd command");
+        assert_eq!(outcome, SlashCommandOutcome::OpenWorkingDirectoryDialog);
 
+        let outcome = execute_builtin(
+            &client,
+            Some(session_id),
+            context,
+            "/cwd /tmp",
+            &["/cwd", "/tmp"],
+            slash_registry::BuiltinCommandId::Cwd,
+        )
+        .await
+        .expect("local cwd command");
         assert_eq!(
-            cwd_command(session_id, base, &["/cwd", "../worktree"]),
-            SlashCommandOutcome::AttachWorktree {
-                session_id,
-                path: base.join("../worktree"),
-            }
-        );
-        assert_eq!(
-            cwd_command(session_id, base, &["/cwd", "/tmp/absolute"]),
-            SlashCommandOutcome::AttachWorktree {
-                session_id,
-                path: std::path::PathBuf::from("/tmp/absolute"),
-            }
+            outcome,
+            SlashCommandOutcome::Handled("usage: /cwd".to_owned())
         );
     }
 
