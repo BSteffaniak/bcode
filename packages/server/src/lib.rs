@@ -33247,8 +33247,22 @@ async fn handle_list_plugin_contributions(
     .await
 }
 
+fn command_invocation_session(
+    interface_id: &str,
+    operation: &str,
+    payload: &[u8],
+) -> Option<SessionId> {
+    (interface_id == bcode_command::COMMAND_INTERFACE_ID
+        && operation == bcode_command::OP_INVOKE_COMMAND)
+        .then(|| serde_json::from_slice::<bcode_command::InvokeCommandRequest>(payload).ok())
+        .flatten()
+        .and_then(|request| request.context)
+        .and_then(|context| context.session_id)
+}
+
 async fn resolve_command_plugin_bridge_request(
     sessions: &SessionManager,
+    authorized_session_id: Option<SessionId>,
     request: ServiceBridgeRequest,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<ServiceBridgeResponse, String> {
@@ -33262,6 +33276,23 @@ async fn resolve_command_plugin_bridge_request(
             bcode_tool::ToolInvocationServiceResolution::Unsupported,
         ));
     }
+    let Some(authorized_session_id) = authorized_session_id else {
+        return Ok(ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "session_context_required".to_owned(),
+                message: "session derivation requires canonical command session context".to_owned(),
+            },
+        ));
+    };
+    if !derivation_request_targets_session(&request.payload, authorized_session_id) {
+        return Ok(ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "session_scope_mismatch".to_owned(),
+                message: "session derivation request does not match authorized command session"
+                    .to_owned(),
+            },
+        ));
+    }
     if cancellation.is_cancelled() {
         return Ok(ServiceBridgeResponse::Service(
             bcode_tool::ToolInvocationServiceResolution::Cancelled,
@@ -33270,6 +33301,26 @@ async fn resolve_command_plugin_bridge_request(
     Ok(ServiceBridgeResponse::Service(
         dispatch_session_derivation_bridge(sessions, request.payload, cancellation).await,
     ))
+}
+
+fn derivation_request_targets_session(payload: &serde_json::Value, session_id: SessionId) -> bool {
+    serde_json::from_value::<bcode_plugin_sdk::SessionDerivationServiceRequest>(payload.clone())
+        .is_ok_and(|request| match request {
+            bcode_plugin_sdk::SessionDerivationServiceRequest::Snapshot { session_id: target }
+            | bcode_plugin_sdk::SessionDerivationServiceRequest::Prompts {
+                session_id: target,
+                ..
+            }
+            | bcode_plugin_sdk::SessionDerivationServiceRequest::Prompt {
+                session_id: target,
+                ..
+            } => target == session_id,
+            bcode_plugin_sdk::SessionDerivationServiceRequest::Derive { request } => {
+                request.source.session_id == session_id
+            }
+            bcode_plugin_sdk::SessionDerivationServiceRequest::Status { .. }
+            | bcode_plugin_sdk::SessionDerivationServiceRequest::Cancel { .. } => true,
+        })
 }
 
 async fn dispatch_session_derivation_bridge(
@@ -33384,6 +33435,7 @@ async fn handle_invoke_plugin_service(
     let plugin_id = plugin_id.to_string();
     let interface_id = interface_id.to_string();
     let labels = plugin_service_metric_labels(Some(&plugin_id), &interface_id, &operation);
+    let authorized_session_id = command_invocation_session(&interface_id, &operation, &payload);
     let (bridge, mut bridge_requests) = server_plugin_bridge();
     let invocation = state.plugins.invoke_service_with_bridge_scoped(
         &plugin_id,
@@ -33407,6 +33459,7 @@ async fn handle_invoke_plugin_service(
                             };
                             let response = resolve_command_plugin_bridge_request(
                                 &state.sessions,
+                                authorized_session_id,
                                 bridge_call.request,
                                 &bridge_call.cancellation,
                             ).await;

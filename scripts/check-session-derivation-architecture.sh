@@ -26,4 +26,9 @@ if rg -n 'session_history\(' packages/session/src/derivation.rs plugins/session-
     fail 'derivation uses an unbounded full-history API'
 fi
 
+if rg -n 'bcode_(ipc|server|tui)|SessionDb|session_db_path|\.derivation-staging' \
+  packages/plugin-sdk/src/lib.rs packages/command/src/lib.rs plugins/session-derivation-plugin/src/lib.rs; then
+    fail 'portable command/derivation contracts contain daemon, persistence, or TUI implementation types'
+fi
+
 printf 'session derivation architecture checks passed\n'
