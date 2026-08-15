@@ -7634,7 +7634,8 @@ impl Agent {
                 .parallel_tool_capabilities
                 .negotiate(self.execution_options.parallel, self.tool_choice.clone()),
             structured_output: None,
-            parameters: self.parameters.clone(),
+            structured_output_execution: bcode_model::CapabilityExecution::Direct,
+
             metadata: self.metadata.clone(),
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,

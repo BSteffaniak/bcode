@@ -258,6 +258,8 @@ pub struct AgentTurnRequest {
     pub tool_call_policy: bcode_model::ToolCallRequestPolicy,
     /// Provider-native structured output request.
     pub structured_output: Option<bcode_model::StructuredOutputRequest>,
+    /// Provider-round shape required to enforce structured output.
+    pub structured_output_execution: bcode_model::CapabilityExecution,
     /// Model parameters.
     pub parameters: ModelParameters,
     /// Host-defined metadata forwarded to the provider.
@@ -294,6 +296,7 @@ impl AgentTurnRequest {
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
             structured_output: None,
+            structured_output_execution: bcode_model::CapabilityExecution::Direct,
             parameters: ModelParameters::default(),
             metadata: BTreeMap::new(),
             timeout: Duration::from_mins(2),
@@ -1741,6 +1744,15 @@ impl AgentRuntime {
         }
         request.tool_call_policy.parallel.get_or_insert(false);
         let negotiated_parallel_policy = request.tool_call_policy.parallel;
+        let structured_output = request.structured_output.clone();
+        let requires_tool_free_finalization = structured_output.is_some()
+            && request.structured_output_execution
+                == bcode_model::CapabilityExecution::ToolFreeProviderRound
+            && !request.tools.is_empty();
+        let mut structured_output_finalization = false;
+        if requires_tool_free_finalization {
+            request.structured_output = None;
+        }
         let mut rounds = ToolRoundState::new(request.max_tool_rounds);
         let turn_cancellation = request.cancellation.clone();
         let started = Instant::now();
@@ -1788,6 +1800,35 @@ impl AgentRuntime {
                 return Ok(stopped_agent_response(response, started, all_events));
             }
             if response.stop_reason != Some(StopReason::ToolCall) {
+                if requires_tool_free_finalization && !structured_output_finalization {
+                    structured_output_finalization = true;
+                    if !response.text.is_empty() {
+                        messages.push(ModelMessage {
+                            role: MessageRole::Assistant,
+                            content: vec![ContentBlock::Text {
+                                text: response.text.clone(),
+                            }],
+                        });
+                    }
+                    messages.push(ModelMessage {
+                        role: MessageRole::User,
+                        content: vec![ContentBlock::Text {
+                            text: "Return the final result now. Produce only the requested structured output from the completed work and tool results."
+                                .to_string(),
+                        }],
+                    });
+                    request.messages.clone_from(&messages);
+                    request.prompt.clear();
+                    request.append_prompt = false;
+                    request.tools.clear();
+                    request.tool_call_policy = bcode_model::ToolCallRequestPolicy {
+                        parallel: Some(false),
+                        choice: bcode_model::ToolChoice::None,
+                    };
+                    request.structured_output.clone_from(&structured_output);
+                    provider_round = provider_round.saturating_add(1);
+                    continue;
+                }
                 return Ok(completed_agent_response(response, started, all_events));
             }
             if calls.is_empty() {

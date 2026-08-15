@@ -3482,6 +3482,11 @@ fn bedrock_structured_output_support(
                 CapabilityMechanism::Native
             },
             fidelity: CapabilityFidelity::Reduced,
+            execution: if messages_surface {
+                bcode_model::CapabilityExecution::ToolFreeProviderRound
+            } else {
+                bcode_model::CapabilityExecution::Direct
+            },
         }
     }
 }
@@ -3506,6 +3511,7 @@ fn bedrock_strict_tool_schema_support(
             source: CapabilitySource::BundledCatalog,
             mechanism: CapabilityMechanism::Native,
             fidelity: CapabilityFidelity::Reduced,
+            execution: bcode_model::CapabilityExecution::Direct,
         }
     }
 }
@@ -7684,7 +7690,8 @@ mod tests {
     #[test]
     fn bedrock_structured_output_capabilities_report_surface_fidelity() {
         use bcode_model::{
-            CapabilityFidelity, CapabilityMechanism, CapabilitySupport, StructuredOutputMode,
+            CapabilityExecution, CapabilityFidelity, CapabilityMechanism, CapabilitySupport,
+            StructuredOutputMode,
         };
 
         let converse = bedrock_feature_support_for_surface(false, false, false);
@@ -7693,6 +7700,7 @@ mod tests {
             CapabilitySupport::Supported {
                 mechanism: CapabilityMechanism::Native,
                 fidelity: CapabilityFidelity::Reduced,
+                execution: CapabilityExecution::Direct,
                 ..
             }
         ));
@@ -7703,6 +7711,7 @@ mod tests {
             CapabilitySupport::Supported {
                 mechanism: CapabilityMechanism::AdapterMediated,
                 fidelity: CapabilityFidelity::Reduced,
+                execution: CapabilityExecution::ToolFreeProviderRound,
                 ..
             }
         ));
@@ -7717,6 +7726,7 @@ mod tests {
             CapabilitySupport::Supported {
                 mechanism: CapabilityMechanism::Native,
                 fidelity: CapabilityFidelity::Exact,
+                execution: CapabilityExecution::Direct,
                 ..
             }
         ));

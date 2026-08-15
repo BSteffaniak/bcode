@@ -19938,6 +19938,7 @@ async fn run_model_turn_inner(
         }
     };
     let mut round = 0_u32;
+    let mut structured_output_finalization = false;
     let mut next_assistant_segment_order = 0_u32;
     let mut next_output_position = 0_u64;
     let mut recovery = ModelTurnRecoveryState::default();
@@ -19991,7 +19992,31 @@ async fn run_model_turn_inner(
         let PreparedModelRequest {
             mut request,
             mut context_projection,
+            structured_output_execution,
         } = prepared;
+        let structured_output_phase = if structured_output_finalization {
+            StructuredOutputPhase::Finalization
+        } else if !request.tools.is_empty() {
+            StructuredOutputPhase::Work
+        } else {
+            StructuredOutputPhase::Direct
+        };
+        let desired_structured_output = request.structured_output.clone();
+        apply_structured_output_phase(
+            &mut request,
+            desired_structured_output.as_ref(),
+            structured_output_execution,
+            structured_output_phase,
+        );
+        if structured_output_finalization {
+            context_projection = projected_request_context(
+                state,
+                session_id,
+                provider_plugin_id.as_deref(),
+                &request,
+            )
+            .await;
+        }
         let should_evaluate_proactive =
             compaction_decision.strategy == AutomaticCompactionStrategy::LocalProactive;
         if should_evaluate_proactive {
@@ -20056,7 +20081,27 @@ async fn run_model_turn_inner(
                     }
                 };
                 request = prepared.request;
-                context_projection = prepared.context_projection;
+                let desired_structured_output = request.structured_output.clone();
+                let phase = if structured_output_finalization {
+                    StructuredOutputPhase::Finalization
+                } else if !request.tools.is_empty() {
+                    StructuredOutputPhase::Work
+                } else {
+                    StructuredOutputPhase::Direct
+                };
+                apply_structured_output_phase(
+                    &mut request,
+                    desired_structured_output.as_ref(),
+                    prepared.structured_output_execution,
+                    phase,
+                );
+                context_projection = projected_request_context(
+                    state,
+                    session_id,
+                    provider_plugin_id.as_deref(),
+                    &request,
+                )
+                .await;
                 append_context_compaction_trace(
                     state,
                     session_id,
@@ -20293,12 +20338,30 @@ async fn run_model_turn_inner(
             Some(bcode_model::StopReason::MaxTokens) => {
                 return max_tokens_continuation_limit_completion(state, session_id).await;
             }
-            Some(_) => {
-                return outcome
-                    .assistant_output
-                    .map_or_else(ModelTurnCompletion::completed, |output| {
-                        ModelTurnCompletion::completed().with_output(output)
-                    });
+            Some(reason) => {
+                if !structured_output_finalization
+                    && structured_output_execution
+                        == Some(bcode_model::CapabilityExecution::ToolFreeProviderRound)
+                    && desired_structured_output.is_some()
+                {
+                    if matches!(
+                        reason,
+                        bcode_model::StopReason::Cancelled | bcode_model::StopReason::Error
+                    ) {
+                        return outcome
+                            .assistant_output
+                            .map_or_else(ModelTurnCompletion::completed, |output| {
+                                ModelTurnCompletion::completed().with_output(output)
+                            });
+                    }
+                    structured_output_finalization = true;
+                } else {
+                    return outcome
+                        .assistant_output
+                        .map_or_else(ModelTurnCompletion::completed, |output| {
+                            ModelTurnCompletion::completed().with_output(output)
+                        });
+                }
             }
             None => {
                 let message = "model provider polling ended without a terminal event".to_string();
@@ -23901,10 +23964,49 @@ fn provider_managed_context_request(
     }
 }
 
+enum StructuredOutputPhase {
+    Direct,
+    Work,
+    Finalization,
+}
+
+const STRUCTURED_OUTPUT_FINALIZATION_INSTRUCTION: &str = "Return the final result now. Produce only the requested structured output from the completed work and tool results.";
+
+fn apply_structured_output_phase(
+    request: &mut ModelTurnRequest,
+    desired: Option<&bcode_model::StructuredOutputRequest>,
+    execution: Option<bcode_model::CapabilityExecution>,
+    phase: StructuredOutputPhase,
+) {
+    if execution != Some(bcode_model::CapabilityExecution::ToolFreeProviderRound) {
+        return;
+    }
+    match phase {
+        StructuredOutputPhase::Direct => {}
+        StructuredOutputPhase::Work => request.structured_output = None,
+        StructuredOutputPhase::Finalization => {
+            request.tools.clear();
+            request.tool_call_policy = bcode_model::ToolCallRequestPolicy {
+                parallel: Some(false),
+                choice: bcode_model::ToolChoice::None,
+            };
+            request.tool_schema_mode = None;
+            request.structured_output = desired.cloned();
+            request.messages.push(ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: STRUCTURED_OUTPUT_FINALIZATION_INSTRUCTION.to_string(),
+                }],
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PreparedModelRequest {
     request: ModelTurnRequest,
     context_projection: bcode_session_models::RequestContextObservation,
+    structured_output_execution: Option<bcode_model::CapabilityExecution>,
 }
 
 #[derive(Clone)]
@@ -24370,6 +24472,7 @@ async fn build_model_turn_request(
     Ok(PreparedModelRequest {
         request,
         context_projection,
+        structured_output_execution: resolved_features.structured_output_execution(),
     })
 }
 
@@ -24836,6 +24939,7 @@ async fn append_negotiated_feature_fidelity_events(
         let bcode_model::NegotiatedFeatureSupport::Guaranteed {
             mechanism,
             fidelity,
+            execution,
             ..
         } = support
         else {
@@ -24868,6 +24972,10 @@ async fn append_negotiated_feature_fidelity_events(
                         .and_then(|value| value.as_str().map(ToOwned::to_owned))
                         .unwrap_or_else(|| "unknown".to_string()),
                     fidelity: serde_json::to_value(fidelity)
+                        .ok()
+                        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    execution: serde_json::to_value(execution)
                         .ok()
                         .and_then(|value| value.as_str().map(ToOwned::to_owned))
                         .unwrap_or_else(|| "unknown".to_string()),

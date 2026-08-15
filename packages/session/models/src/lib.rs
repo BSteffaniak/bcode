@@ -1384,6 +1384,13 @@ pub struct ModelFeatureFidelity {
     pub mechanism: String,
     /// Exact or reduced portable-contract fidelity.
     pub fidelity: String,
+    /// Direct or constrained provider-round execution shape.
+    #[serde(default = "default_model_feature_execution")]
+    pub execution: String,
+}
+
+fn default_model_feature_execution() -> String {
+    "direct".to_string()
 }
 
 /// Generic scheduling priority for an admitted turn.

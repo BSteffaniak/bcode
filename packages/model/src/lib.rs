@@ -440,7 +440,18 @@ pub enum CapabilityFidelity {
     Reduced,
 }
 
-/// One truthful support claim with its provenance, mechanism, and fidelity.
+/// Execution shape required to supply a supported capability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityExecution {
+    /// The capability can be applied directly to the caller's provider round.
+    #[default]
+    Direct,
+    /// The capability requires a provider round with no host tools.
+    ToolFreeProviderRound,
+}
+
+/// One truthful support claim with its provenance, mechanism, fidelity, and execution shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CapabilitySupport {
@@ -456,6 +467,9 @@ pub enum CapabilitySupport {
         /// How completely the implementation satisfies the portable contract.
         #[serde(default)]
         fidelity: CapabilityFidelity,
+        /// Provider-round shape required to supply the capability.
+        #[serde(default)]
+        execution: CapabilityExecution,
     },
     /// The feature is unsupported according to the stated source.
     Unsupported {
@@ -472,6 +486,7 @@ impl CapabilitySupport {
             source,
             mechanism: CapabilityMechanism::Native,
             fidelity: CapabilityFidelity::Exact,
+            execution: CapabilityExecution::Direct,
         }
     }
 
@@ -509,6 +524,7 @@ pub enum NegotiatedFeatureSupport {
         model_source: CapabilitySource,
         mechanism: CapabilityMechanism,
         fidelity: CapabilityFidelity,
+        execution: CapabilityExecution,
     },
     /// One scope explicitly rejects the feature.
     Unsupported {
@@ -760,6 +776,7 @@ fn negotiate_feature_claims(
         source: provider_source,
         mechanism: provider_mechanism,
         fidelity: provider_fidelity,
+        execution: provider_execution,
     } = provider
     else {
         unreachable!("unsupported and unknown provider claims returned above");
@@ -768,6 +785,7 @@ fn negotiate_feature_claims(
         source: model_source,
         mechanism: model_mechanism,
         fidelity: model_fidelity,
+        execution: model_execution,
     } = model
     else {
         unreachable!("unsupported and unknown model claims returned above");
@@ -777,6 +795,7 @@ fn negotiate_feature_claims(
         model_source: *model_source,
         mechanism: std::cmp::max(*provider_mechanism, *model_mechanism),
         fidelity: std::cmp::max(*provider_fidelity, *model_fidelity),
+        execution: std::cmp::max(*provider_execution, *model_execution),
     }
 }
 
@@ -2145,6 +2164,15 @@ impl ResolvedModelFeatureCapabilities {
         )
     }
 
+    /// Return the required structured-output execution shape when guaranteed.
+    #[must_use]
+    pub const fn structured_output_execution(&self) -> Option<CapabilityExecution> {
+        match self.structured_output {
+            Some(NegotiatedFeatureSupport::Guaranteed { execution, .. }) => Some(execution),
+            _ => None,
+        }
+    }
+
     /// Return strict tool-schema policy only when both scopes guarantee it.
     #[must_use]
     pub const fn tool_schema_mode(&self) -> Option<ToolSchemaMode> {
@@ -3310,6 +3338,7 @@ mod tests {
             source: super::CapabilitySource::ProviderApi,
             mechanism: super::CapabilityMechanism::AdapterMediated,
             fidelity: super::CapabilityFidelity::Reduced,
+            execution: super::CapabilityExecution::ToolFreeProviderRound,
         };
 
         assert_eq!(
@@ -3319,6 +3348,7 @@ mod tests {
                 model_source: super::CapabilitySource::ProviderApi,
                 mechanism: super::CapabilityMechanism::AdapterMediated,
                 fidelity: super::CapabilityFidelity::Reduced,
+                execution: super::CapabilityExecution::ToolFreeProviderRound,
             }
         );
     }
@@ -3343,6 +3373,7 @@ mod tests {
             model_source: super::CapabilitySource::ProviderApi,
             mechanism: super::CapabilityMechanism::Native,
             fidelity: super::CapabilityFidelity::Exact,
+            execution: super::CapabilityExecution::Direct,
         };
         let resolved = super::ResolvedModelFeatureCapabilities {
             structured_output: Some(guaranteed.clone()),
