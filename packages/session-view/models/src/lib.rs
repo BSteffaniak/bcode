@@ -10,8 +10,7 @@
 
 use bcode_session_models::{
     ClientId, ModelTurnOutcome, RequestContextOccupancy, RuntimeWorkKind, RuntimeWorkStatus,
-    SessionForkResult, SessionId, SessionSummary, SessionTokenUsage, ToolArtifact,
-    ToolInvocationResult, WorkId,
+    SessionId, SessionSummary, SessionTokenUsage, ToolArtifact, ToolInvocationResult, WorkId,
 };
 pub use bcode_session_models::{
     ToolPresentationIdentity, ToolPresentationRetention, ToolPresentationScopeState,
@@ -1728,10 +1727,6 @@ pub enum SessionViewActionOutcome {
     SessionRenamed { session: Box<SessionSummary> },
     /// Session deletion result.
     SessionDeleted { session: Box<SessionSummary> },
-    /// Session fork result.
-    SessionForked { fork: Box<SessionForkResult> },
-    /// Session clone result.
-    SessionCloned { fork: Box<SessionForkResult> },
     /// Session working-directory change result.
     WorkingDirectoryChanged { session: Box<SessionSummary> },
     /// Runtime-work cancellation request result.
@@ -1843,22 +1838,6 @@ pub enum SessionViewAction {
     DeleteSession {
         /// Target session.
         session_id: SessionId,
-    },
-    /// Fork a session at an optional prompt boundary.
-    ForkSession {
-        /// Source session.
-        session_id: SessionId,
-        /// Prompt sequence to fork from.
-        prompt_sequence: u64,
-        /// New session name override.
-        name: Option<String>,
-    },
-    /// Clone a session.
-    CloneSession {
-        /// Source session.
-        session_id: SessionId,
-        /// New session name override.
-        name: Option<String>,
     },
     /// Change a session working directory.
     ChangeWorkingDirectory {

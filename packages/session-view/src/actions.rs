@@ -92,14 +92,6 @@ pub async fn execute_session_view_action(
         SessionViewAction::DeleteSession { session_id } => {
             execute_delete_session(client, session_id).await
         }
-        SessionViewAction::ForkSession {
-            session_id,
-            prompt_sequence,
-            name,
-        } => execute_fork_session(client, session_id, prompt_sequence, name).await,
-        SessionViewAction::CloneSession { session_id, name } => {
-            execute_clone_session(client, session_id, name).await
-        }
         SessionViewAction::ChangeWorkingDirectory { session_id, path } => {
             execute_change_working_directory(client, session_id, path).await
         }
@@ -214,31 +206,6 @@ async fn execute_delete_session(
 ) -> Result<SessionViewActionOutcome, ClientError> {
     Ok(SessionViewActionOutcome::SessionDeleted {
         session: Box::new(client.delete_session(session_id).await?),
-    })
-}
-
-async fn execute_fork_session(
-    client: &BcodeClient,
-    session_id: SessionId,
-    prompt_sequence: u64,
-    name: Option<String>,
-) -> Result<SessionViewActionOutcome, ClientError> {
-    Ok(SessionViewActionOutcome::SessionForked {
-        fork: Box::new(
-            client
-                .fork_session(session_id, prompt_sequence, name)
-                .await?,
-        ),
-    })
-}
-
-async fn execute_clone_session(
-    client: &BcodeClient,
-    session_id: SessionId,
-    name: Option<String>,
-) -> Result<SessionViewActionOutcome, ClientError> {
-    Ok(SessionViewActionOutcome::SessionCloned {
-        fork: Box::new(client.clone_session(session_id, name).await?),
     })
 }
 
