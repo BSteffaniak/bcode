@@ -657,6 +657,45 @@ mod tests {
         paths
     }
 
+    #[cfg(feature = "static-bundled-session-derivation-plugin")]
+    #[test]
+    fn session_derivation_plugin_is_first_class_and_disableable() {
+        let static_plugins = super::static_bundled_plugins();
+        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &static_plugins,
+        )
+        .expect("enabled host");
+        let slash = host.registered_command_contributions(&bcode_command::CommandSurface::Slash);
+        assert!(
+            slash
+                .iter()
+                .any(|command| command.slash_name() == Some("fork"))
+        );
+        assert!(
+            slash
+                .iter()
+                .any(|command| command.slash_name() == Some("clone"))
+        );
+
+        let selection = bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::All,
+            enabled: std::collections::BTreeSet::new(),
+            disabled: std::collections::BTreeSet::from(["bcode.session-derivation".to_owned()]),
+        };
+        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &selection,
+            &static_plugins,
+        )
+        .expect("disabled host");
+        let slash = host.registered_command_contributions(&bcode_command::CommandSurface::Slash);
+        assert!(
+            slash
+                .iter()
+                .all(|command| !matches!(command.slash_name(), Some("fork" | "clone")))
+        );
+    }
+
     #[cfg(feature = "static-bundled-loop-plugin")]
     #[test]
     fn disabling_loop_removes_all_manifest_contributions() {

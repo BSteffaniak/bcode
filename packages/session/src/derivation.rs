@@ -182,6 +182,9 @@ impl SessionManager {
         };
         self.persist_derivation_operation(request.operation_id)
             .await?;
+        self.metrics
+            .increment_counter("session.derivation.started_total");
+        let derivation_started_at = std::time::Instant::now();
         let result = self
             .derive_session_inner(&request, destination_id, &cancellation, execution.as_ref())
             .await;
@@ -190,9 +193,13 @@ impl SessionManager {
                 session: Box::new(summary),
             },
             Err(SessionError::DerivationCancelled(_)) => {
+                self.metrics
+                    .increment_counter("session.derivation.cancelled_total");
                 SessionDerivationTerminalOutcome::Cancelled
             }
             Err(error) => {
+                self.metrics
+                    .increment_counter("session.derivation.failed_total");
                 self.finish_derivation_operation(
                     request.operation_id,
                     SessionDerivationTerminalOutcome::Failed {
@@ -206,6 +213,10 @@ impl SessionManager {
         };
         self.finish_derivation_operation(request.operation_id, outcome.clone())
             .await?;
+        self.metrics.record_histogram(
+            "session.derivation.duration_ms",
+            crate::elapsed_ms(derivation_started_at),
+        );
         Ok(outcome)
     }
 
@@ -559,6 +570,7 @@ impl SessionManager {
                 )
                 .await?;
             let mut batch = Vec::with_capacity(page.events.len());
+            let mut page_bytes = 0_u64;
             let mut reached_cutoff = false;
             for source_event in page.events {
                 if source_event.sequence > request.cutoff_sequence {
@@ -572,16 +584,14 @@ impl SessionManager {
                     continue;
                 }
                 let kind = rewrite_derived_event_kind(source_event.kind.clone(), &sequence_map);
-                copied_bytes = copied_bytes.saturating_add(
-                    u64::try_from(
-                        serde_json::to_vec(&source_event)
-                            .map_err(|error| {
-                                SessionError::DerivationSerialization(error.to_string())
-                            })?
-                            .len(),
-                    )
-                    .unwrap_or(u64::MAX),
-                );
+                let event_bytes = u64::try_from(
+                    serde_json::to_vec(&source_event)
+                        .map_err(|error| SessionError::DerivationSerialization(error.to_string()))?
+                        .len(),
+                )
+                .unwrap_or(u64::MAX);
+                copied_bytes = copied_bytes.saturating_add(event_bytes);
+                page_bytes = page_bytes.saturating_add(event_bytes);
                 copied_events = copied_events.saturating_add(1);
                 sequence_map.insert(source_event.sequence, destination_sequence);
                 batch.push((
@@ -598,6 +608,16 @@ impl SessionManager {
                 destination_sequence += 1;
             }
             db.append_event_batch(&batch).await?;
+            self.metrics
+                .increment_counter("session.derivation.batch_total");
+            self.metrics
+                .increment_counter("session.derivation.page_total");
+            self.metrics.add_counter(
+                "session.derivation.copied_events_total",
+                u64::try_from(batch.len()).unwrap_or(u64::MAX),
+            );
+            self.metrics
+                .add_counter("session.derivation.copied_bytes_total", page_bytes);
             #[cfg(test)]
             trigger_test_cancellation(
                 DerivationTestCancellationPoint::AfterBatchWrite,
