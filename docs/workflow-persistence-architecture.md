@@ -40,9 +40,10 @@ session/run retention or deletion policy rather than renderer lifetime, daemon r
 visibility. Shared-parent agents create no child session and are serialized by a parent-session lock
 held through turn completion; fixed/fresh children remain activation-scoped.
 
-Runs containing `FixedGenerationFork` agents must pin one exact parent-session generation during
+Runs containing fixed-generation agents must pin one exact parent-session generation during
 start admission. The daemon verifies that generation before creating canonical run state, persists it
-on the run, and each activation clones only parent events through the pinned generation. Later
+on the run, and each activation derives only parent events through the pinned generation using the
+session layer's bounded generic derivation engine. Later
 workflow status or user events cannot enter that child context, while missing, future, stale-at-start,
 or cross-session generation facts fail closed.
 

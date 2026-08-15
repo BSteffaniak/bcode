@@ -331,7 +331,7 @@ pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
     "runtime_work_progress",
     "runtime_work_started",
     "session_created",
-    "session_forked",
+    "session_derived",
     "session_imported",
     "session_renamed",
     "skill_activated",

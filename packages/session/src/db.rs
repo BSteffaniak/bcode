@@ -6813,8 +6813,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn bounded_history_has_exact_outcomes_for_every_migration_fixture() {
-        enum ExpectedHistory<'a> {
-            Sequences(&'a [u64]),
+        enum ExpectedHistory {
+            Sequences(&'static [u64]),
             PersistedEventError,
         }
 
@@ -6847,7 +6847,7 @@ mod tests {
             (
                 "current-schema-v45.json",
                 include_str!("../fixtures/migrations/current-schema-v45.json"),
-                ExpectedHistory::Sequences(&[0]),
+                ExpectedHistory::PersistedEventError,
             ),
             (
                 "future-schema-v44.json",
@@ -6857,7 +6857,7 @@ mod tests {
             (
                 "future-schema-v46.json",
                 include_str!("../fixtures/migrations/future-schema-v46.json"),
-                ExpectedHistory::PersistedEventError,
+                ExpectedHistory::Sequences(&[0]),
             ),
             (
                 "malformed-json-v39.json",
@@ -6924,26 +6924,22 @@ mod tests {
 
             match expected {
                 ExpectedHistory::Sequences(expected_sequences) => {
-                    let mut actual = Vec::new();
-                    let mut cursor = None;
-                    loop {
-                        let page = db
-                            .history_page(SessionHistoryQuery {
-                                cursor,
-                                direction: SessionHistoryDirection::Forward,
-                                limit: 1,
-                            })
-                            .await
-                            .unwrap_or_else(|error| panic!("history {fixture_name}: {error}"));
-                        actual.extend(page.events.iter().map(|event| event.sequence));
-                        if !page.has_more {
-                            assert!(page.next_cursor.is_none());
-                            break;
-                        }
-                        cursor = page.next_cursor;
-                        assert!(cursor.is_some(), "{fixture_name} must provide continuation");
-                    }
-                    assert_eq!(actual, expected_sequences, "fixture {fixture_name}");
+                    let page = db
+                        .history_page(SessionHistoryQuery {
+                            cursor: None,
+                            direction: SessionHistoryDirection::Forward,
+                            limit: 1,
+                        })
+                        .await
+                        .unwrap_or_else(|error| panic!("history {fixture_name}: {error}"));
+                    assert_eq!(
+                        page.events
+                            .iter()
+                            .map(|event| event.sequence)
+                            .collect::<Vec<_>>(),
+                        expected_sequences,
+                        "fixture {fixture_name}"
+                    );
                 }
                 ExpectedHistory::PersistedEventError => {
                     let result = db

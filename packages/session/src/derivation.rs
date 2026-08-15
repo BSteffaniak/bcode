@@ -21,11 +21,67 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(test)]
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 const DERIVATION_EVENT_PAGE_SIZE: usize = 256;
 const STAGING_DIRECTORY: &str = ".derivation-staging";
 const OPERATION_DIRECTORY: &str = ".derivation-operations";
 const OPERATION_RECEIPT_FILE: &str = "operation.json";
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivationTestCancellationPoint {
+    BeforeRead,
+    AfterBatchWrite,
+    BeforeFinalization,
+    BeforePublication,
+}
+
+#[cfg(test)]
+fn test_cancellation_point() -> &'static StdMutex<
+    Option<(
+        DerivationTestCancellationPoint,
+        SessionDerivationOperationId,
+    )>,
+> {
+    static POINT: OnceLock<
+        StdMutex<
+            Option<(
+                DerivationTestCancellationPoint,
+                SessionDerivationOperationId,
+            )>,
+        >,
+    > = OnceLock::new();
+    POINT.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+pub fn set_derivation_test_cancellation_point(
+    point: Option<(
+        DerivationTestCancellationPoint,
+        SessionDerivationOperationId,
+    )>,
+) {
+    *test_cancellation_point()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = point;
+}
+
+#[cfg(test)]
+fn trigger_test_cancellation(
+    point: DerivationTestCancellationPoint,
+    operation_id: SessionDerivationOperationId,
+    cancellation: &AtomicBool,
+) {
+    if *test_cancellation_point()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        == Some((point, operation_id))
+    {
+        cancellation.store(true, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableDerivationOperation {
@@ -202,8 +258,22 @@ impl SessionManager {
             let _cleanup = std::fs::remove_dir_all(&staging_root);
         }
         let summary = result?;
-        ensure_not_cancelled(request.operation_id, cancellation)?;
-        sync_staged_session(&staged_session_paths(&staging_root, destination_id))?;
+        #[cfg(test)]
+        trigger_test_cancellation(
+            DerivationTestCancellationPoint::BeforePublication,
+            request.operation_id,
+            cancellation,
+        );
+        if let Err(error) = ensure_not_cancelled(request.operation_id, cancellation) {
+            let _cleanup = fs::remove_dir_all(&staging_root);
+            return Err(error);
+        }
+        if let Err(error) =
+            sync_staged_session(&staged_session_paths(&staging_root, destination_id))
+        {
+            let _cleanup = fs::remove_dir_all(&staging_root);
+            return Err(error);
+        }
         self.update_derivation_progress(
             request.operation_id,
             SessionDerivationPhase::Publishing,
@@ -471,6 +541,12 @@ impl SessionManager {
         let mut copied_events = 0_u64;
         let mut copied_bytes = 0_u64;
         loop {
+            #[cfg(test)]
+            trigger_test_cancellation(
+                DerivationTestCancellationPoint::BeforeRead,
+                request.operation_id,
+                cancellation,
+            );
             ensure_not_cancelled(request.operation_id, cancellation)?;
             let page = self
                 .session_history_page(
@@ -522,6 +598,13 @@ impl SessionManager {
                 destination_sequence += 1;
             }
             db.append_event_batch(&batch).await?;
+            #[cfg(test)]
+            trigger_test_cancellation(
+                DerivationTestCancellationPoint::AfterBatchWrite,
+                request.operation_id,
+                cancellation,
+            );
+            ensure_not_cancelled(request.operation_id, cancellation)?;
             self.update_derivation_progress(
                 request.operation_id,
                 SessionDerivationPhase::Copying,
@@ -533,6 +616,12 @@ impl SessionManager {
                 break;
             }
         }
+        #[cfg(test)]
+        trigger_test_cancellation(
+            DerivationTestCancellationPoint::BeforeFinalization,
+            request.operation_id,
+            cancellation,
+        );
         ensure_not_cancelled(request.operation_id, cancellation)?;
         self.update_derivation_progress(
             request.operation_id,

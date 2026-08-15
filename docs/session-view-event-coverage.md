@@ -82,7 +82,8 @@ Required migration invariants:
 | `ModelTurnCancelRequested` | Active turn cancellation state. | non-transcript | Cancellation activity and controls. | **Complete**. |
 | `WorkingDirectoryChanged` | Working directory and shared path-safety warning. | transcript | Header path plus warning layout. | **Complete**. |
 | `SessionImported` | None in the session view; provenance remains catalog/session metadata-owned. | none | Catalog provenance when available. | **Intentional no-op**. |
-| `SessionForked` | None in the session view; provenance remains catalog/session metadata-owned. | none | Catalog provenance when available. | **Intentional no-op**. |
+| `SessionDerived` | Generic lineage remains session/application metadata; renderers do not reinterpret copied history. | none | Catalog or plugin-owned presentation when contributed. | **Intentional no-op**. |
+| Historical `session_forked` | Not a current session event. Classification/decoding is migration-owned and no old-to-new lineage conversion occurs. | none | Explicit compatibility or migration diagnostics only. | **Rejected by current runtime**. |
 | `RalphLifecycle` | Portable loop lifecycle history. | transcript | Status-note styling and plugin status refresh. | **Complete**. |
 | `ReasoningChanged` | Reasoning effort and summary selection. | non-transcript | Frontend-selected labels and controls. | **Complete**. |
 | `ToolExchangeRequested` | Typed pending interaction correlated to its invocation. | transcript | Plugin-owned interaction adapter and native controls. | **Complete**. |

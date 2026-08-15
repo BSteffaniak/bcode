@@ -100,6 +100,20 @@ bcode auth logout <provider>
 
 See [Dynamic plugin authentication](dynamic-plugin-authentication.md).
 
+## Plugin-owned session fork and clone
+
+The bundled `bcode.session-derivation` plugin exclusively contributes `/fork`, `/clone`, and their
+palette entries. It owns prompt selection, default names, cutoffs, user-facing status, and
+post-success navigation. The host exposes only versioned generic command context, a typed
+`bcode.session-derivation/v1` application service, generic plugin surfaces, and portable command
+effects.
+
+Fork prompt discovery is generation-pinned and bounded. Renderer-neutral Markdown presentation is
+always returned as a fallback; the native TUI adapter adds direct selection. After selection, the
+plugin separately retrieves the complete canonical user message so truncated preview text never
+becomes authoritative draft state. Disabling the plugin removes these product workflows without
+affecting session storage, normal session use, or workflow-owned fixed-generation derivation.
+
 ## Workflows and presentation
 
 Plugins can contribute typed workflow blocks and immutable templates without owning the generic scheduler or durable workflow store. They can also publish structured presentation payloads with renderer-specific adapters and a generic fallback.

@@ -134,17 +134,10 @@ if [[ "$provider_branch_count" != "3" ]]; then
   violations=1
 fi
 
-clone_files="$(rg -l 'clone_session_at_generation' packages plugins --glob '*.rs' | sort)"
-expected_clone_files="$(cat <<'EOF'
-packages/client/src/lib.rs
-packages/server/src/lib.rs
-packages/session/src/fork.rs
-packages/session/src/lib.rs
-EOF
-)"
-if [[ "$clone_files" != "$expected_clone_files" ]]; then
-  echo "Loop architecture violation: generation-specific cloning spread to unexpected files." >&2
-  diff -u <(printf '%s\n' "$expected_clone_files") <(printf '%s\n' "$clone_files") >&2 || true
+clone_files="$(rg -l 'clone_session_at_generation' packages plugins --glob '*.rs' | sort || true)"
+if [[ -n "$clone_files" ]]; then
+  echo "Loop architecture violation: retired generation-specific clone API remains." >&2
+  printf '%s\n' "$clone_files" >&2
   violations=1
 fi
 
@@ -1554,14 +1547,6 @@ if [[ -e packages/tui/src/helpers.rs \
   echo "Runtime architecture violation: obsolete pre-root TUI helper/flow modules were reintroduced." >&2
   violations=1
 fi
-if rg -n 'struct RootForkPromptPicker[\s\S]{0,500}(prompts: Vec|selected: usize)' \
-  -U packages/tui/src/chat_loop.rs >/tmp/bcode-tui-duplicate-root-picker-state.txt; then
-  echo "Runtime architecture violation: root orchestration duplicated fork-prompt picker rows or selection state." >&2
-  cat /tmp/bcode-tui-duplicate-root-picker-state.txt >&2
-  violations=1
-fi
-rm -f /tmp/bcode-tui-duplicate-root-picker-state.txt
-
 if rg -n 'bmux_tui::input::(TextInputKeyHandler|TextInputKeyOutcome)|handle_default_text_key\(' \
   packages/tui/src --glob '*.rs' >/tmp/bcode-tui-obsolete-text-input-helper.txt; then
   echo "Runtime architecture violation: composer text input bypassed the shared TextInputControl owner." >&2
@@ -1581,23 +1566,8 @@ if ! rg -q 'match picker\.handle_event\(event, keymap\)' packages/tui/src/chat_l
   violations=1
 fi
 
-if ! rg -q 'picker\.picker\.handle_key\(\*stroke\)' packages/tui/src/chat_loop.rs \
-  || ! rg -q 'pub fn handle_key\(' packages/tui/src/session_fork_flow.rs; then
-  echo "Runtime architecture violation: fork-prompt picker state must own keyboard selection policy." >&2
-  violations=1
-fi
-if rg -n 'picker\.selected\s*=|picker\.selected\.saturating' packages/tui/src/chat_loop.rs \
-  >/tmp/bcode-tui-split-fork-picker-state.txt; then
-  echo "Runtime architecture violation: fork-prompt picker selection state escaped its owner." >&2
-  cat /tmp/bcode-tui-split-fork-picker-state.txt >&2
-  violations=1
-fi
-rm -f /tmp/bcode-tui-split-fork-picker-state.txt
-
-if ! rg -q 'match dialog\.handle_event\(event, keymap\)' packages/tui/src/chat_loop.rs \
-  || ! rg -q 'pub fn handle_event\(' packages/tui/src/session_fork_dialog.rs \
-  || ! rg -q 'pub fn handle_event\(' packages/tui/src/wt_create_dialog.rs; then
-  echo "Runtime architecture violation: session-fork and worktree-create dialog state must own terminal event policy." >&2
+if ! rg -q 'pub fn handle_event\(' packages/tui/src/wt_create_dialog.rs; then
+  echo "Runtime architecture violation: worktree-create dialog state must own terminal event policy." >&2
   violations=1
 fi
 

@@ -152,6 +152,31 @@ closed through `Database::close()` before the complete namespace directory is re
 WAL/SHM files are never removed independently. Repeating cleanup after successful removal is an
 idempotent empty inventory.
 
+## Generic session derivation
+
+Current-format session branching is implemented as generic session derivation rather than a
+fork/clone persistence API. A caller captures a bounded source snapshot and submits a versioned
+request containing an exact generation, inclusive cutoff, idempotency identity, optional initial
+composer draft, and producer-owned namespaced lineage.
+
+The session layer reads canonical source events in bounded ascending pages and writes each bounded
+page with one transaction that updates canonical events and every affected projection together.
+The destination is built beneath `.derivation-staging/<operation-id>/`, outside catalog and normal
+session discovery. After canonical/projection validation, the session database, manifest, and
+staging directory are synchronized; the complete session directory is then atomically renamed to
+its one canonical path. Catalog publication and actor adoption occur only after that rename.
+
+Versioned operation receipts under `.derivation-operations/` hold request fingerprints, monotonic
+progress, destination identity, and immutable terminal outcomes. They are operation coordination,
+not canonical transcript authority. Identical retries return the same terminal result; conflicting
+duplicates fail closed. Explicit bounded housekeeping may remove only staging owned by nonterminal
+receipts and never removes canonical destinations or terminal receipts.
+
+Cancellation is checked before reads, after bounded writes, before finalization, and immediately
+before publication. Cancellation and failures remove operation-owned staging and cannot expose a
+partial destination. Historical `session_forked` events are not a current session event and remain
+classified only by the migration domain; there is no old-to-new lineage conversion.
+
 ## Catalog update lifecycle
 
 Canonical event append updates the actor's current summary and publishes committed mutation

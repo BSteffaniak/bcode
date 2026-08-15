@@ -1,6 +1,6 @@
 # Session migration fixtures
 
-Current fixture baseline schema: **45**.
+Current fixture baseline schema: **46**.
 
 When `CURRENT_SESSION_EVENT_SCHEMA_VERSION` changes, update this declared
 baseline and add or update a fixture that records the new schema's compatibility

@@ -285,7 +285,7 @@ A new backend must not:
 
 * Create a parallel Bcode presentation stack for semantics already expressed by `bcode_hyperchad_ui`.
 * Reuse `packages/tui` application state.
-* Fork event projection or daemon-effect behavior.
+* Session derivation persistence or plugin-owned fork/clone workflow behavior.
 * Depend on terminal drawing or event types.
 * Assume plugin TUI surfaces are portable.
 * Full-replay event logs on normal paths.

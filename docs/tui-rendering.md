@@ -89,7 +89,7 @@ canonical execution.
 
 The TUI keeps local canonical-summary filtering distinct from transcript search. Local filtering is
 renderer-owned ephemeral state and may match title, session ID, working directory, import source,
-and fork metadata already present in portable summaries. It does not invoke providers or imply
+and generic derivation metadata already present in portable summaries or plugin contributions. It does not invoke providers or imply
 transcript coverage.
 
 Ctrl-F explicitly starts bounded transcript search from the current picker query. The picker uses

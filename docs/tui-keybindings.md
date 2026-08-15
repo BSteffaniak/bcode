@@ -117,9 +117,13 @@ Typing `/` in the composer exposes slash-command completion. Common commands inc
 /plan
 /build
 /compact
+/fork
+/clone
 /worktree
 /skill
 /thinking
 ```
 
-Available plugin commands depend on the active plugin selection.
+Available plugin commands depend on the active plugin selection. `/fork` and `/clone` are supplied
+by the bundled, disableable session-derivation plugin rather than by the TUI host. `/fork` opens a
+bounded prompt selector; `/clone` derives the current stable session snapshot.

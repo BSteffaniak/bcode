@@ -12,6 +12,7 @@ bcode.model	-	model.status,model.serverStatus,runtime.status,model.select
 bcode.ocr	bcode.ocr.request,bcode.ocr.extract_result,bcode.ocr.status	-
 bcode.question	bcode.question.outcome	bcode.question.inline
 bcode.ralph	-	ralph-home
+bcode.session-derivation	-	session-derivation.fork-select
 bcode.shell	bcode.tool.request.shell.run,bcode.shell.run	-
 bcode.skills	-	skills.list,skills.active
 bcode.vim-edit	bcode.vim-edit.request.preview,bcode.vim-edit.request.apply,bcode.vim-edit.request-draft.preview,bcode.vim-edit.request-draft.apply,bcode.vim-edit.live,bcode.vim-edit.playback	-

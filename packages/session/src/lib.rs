@@ -6510,6 +6510,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn derivation_cancellation_points_never_publish_partial_sessions() {
+        use crate::derivation::{
+            DerivationTestCancellationPoint, set_derivation_test_cancellation_point,
+        };
+
+        for point in [
+            DerivationTestCancellationPoint::BeforeRead,
+            DerivationTestCancellationPoint::AfterBatchWrite,
+            DerivationTestCancellationPoint::BeforeFinalization,
+            DerivationTestCancellationPoint::BeforePublication,
+        ] {
+            let root = unique_temp_dir();
+            let manager = SessionManager::persistent(&root).expect("manager");
+            let source = manager
+                .create_session(Some("source".to_owned()), test_working_directory())
+                .await
+                .expect("source");
+            manager
+                .append_user_message(source.id, ClientId::new(), "prompt".to_owned())
+                .await
+                .expect("prompt");
+            let snapshot = manager
+                .session_derivation_snapshot(source.id)
+                .await
+                .expect("snapshot");
+            let operation_id = bcode_session_models::SessionDerivationOperationId::new();
+            let request = bcode_session_models::SessionDerivationRequest {
+                version: bcode_session_models::SESSION_DERIVATION_CONTRACT_VERSION,
+                operation_id,
+                idempotency_key: format!("cancel-{operation_id}"),
+                source: snapshot.clone(),
+                source_policy: bcode_session_models::SessionDerivationSourcePolicy::ExactGeneration,
+                cutoff_sequence: snapshot.latest_sequence,
+                destination_working_directory: None,
+                destination_name: Some("cancelled".to_owned()),
+                initial_draft: None,
+                lineage: bcode_session_models::SessionDerivationLineage {
+                    producer: "bcode.test".to_owned(),
+                    operation_kind: "bcode.test/cancel".to_owned(),
+                    selected_source_sequence: None,
+                },
+            };
+            set_derivation_test_cancellation_point(Some((point, operation_id)));
+            assert_eq!(
+                manager
+                    .derive_session(request)
+                    .await
+                    .expect("terminal cancellation"),
+                bcode_session_models::SessionDerivationTerminalOutcome::Cancelled
+            );
+            set_derivation_test_cancellation_point(None);
+            let status = manager
+                .session_derivation_status(operation_id)
+                .await
+                .expect("status");
+            assert_eq!(
+                status.outcome,
+                Some(bcode_session_models::SessionDerivationTerminalOutcome::Cancelled)
+            );
+            assert!(
+                !root
+                    .join(".derivation-staging")
+                    .join(operation_id.to_string())
+                    .exists()
+            );
+            assert_eq!(
+                manager.list_sessions(&test_working_directory()).await.len(),
+                1
+            );
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[tokio::test]
     async fn dropping_persistent_manager_releases_loaded_session_lease() {
         let root = unique_temp_dir();
         let session_id = {
@@ -9387,7 +9461,8 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_generation_execution_excludes_later_parent_events() {
-        let manager = SessionManager::default();
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
         let parent = manager
             .create_session(Some("parent".to_string()), test_working_directory())
             .await
