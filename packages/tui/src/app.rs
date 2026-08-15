@@ -3497,7 +3497,7 @@ impl BmuxApp {
         if self.activity_animation_active() {
             requests.push(InvalidationRequest::new(
                 InvalidationKey::new(ACTIVITY_ANIMATION_INVALIDATION_KEY),
-                now + ACTIVITY_ANIMATION_FRAME,
+                next_periodic_deadline(self.activity_started_at, now, ACTIVITY_ANIMATION_FRAME),
             ));
         }
         requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
@@ -4385,6 +4385,13 @@ impl BmuxApp {
 
 pub const fn composer_policy() -> TextInputPolicy {
     TextInputPolicy::chat_composer()
+}
+
+fn next_periodic_deadline(started_at: Instant, now: Instant, interval: Duration) -> Instant {
+    let interval_nanos = interval.as_nanos().max(1);
+    let period = now.saturating_duration_since(started_at).as_nanos() / interval_nanos;
+    let next_offset = interval_nanos.saturating_mul(period.saturating_add(1));
+    started_at + Duration::from_nanos(u64::try_from(next_offset).unwrap_or(u64::MAX))
 }
 
 fn latest_bar_active_frame_duration(burst: u8) -> Duration {

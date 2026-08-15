@@ -13,7 +13,7 @@ use super::artifact_stream::ActiveArtifactFetchCompletion;
 use super::chat_loop::{ChatLoopState, DraftAutosave, TuiRuntimeSettings};
 use super::effects::TuiEffectResult;
 use super::history_flow;
-use super::invalidation::InvalidationKey;
+use super::invalidation::{InvalidationKey, TemporalRegistry};
 use super::markdown_projection_coordinator::MarkdownProjectionCompletion;
 use super::session_flow::ActiveChat;
 
@@ -229,6 +229,7 @@ pub struct BcodeRuntimeModel {
     theme_input_signature: u64,
     theme_reload_at: Instant,
     scheduled_deadlines: BTreeMap<bmux_tui_runtime::TimerId, Instant>,
+    temporal_registry: TemporalRegistry,
 }
 
 enum RootTimer {
@@ -289,6 +290,7 @@ impl BcodeRuntimeModel {
             theme_input_signature,
             theme_reload_at,
             scheduled_deadlines: BTreeMap::new(),
+            temporal_registry: TemporalRegistry::default(),
         }
     }
 
@@ -1341,14 +1343,22 @@ impl BcodeRuntimeModel {
         commands
     }
 
+    fn reconcile_temporal_registry(&mut self) {
+        let now = Instant::now();
+        self.temporal_registry.reconcile(
+            self.chat
+                .app
+                .invalidation_requests(now, std::time::SystemTime::now()),
+        );
+    }
+
     fn schedule_deadlines(&mut self) {
+        self.reconcile_temporal_registry();
+        let invalidation_at = self.temporal_registry.next_at();
         let Some(handle) = &self.runtime_handle else {
             return;
         };
         let now = Instant::now();
-        let now_system = std::time::SystemTime::now();
-        let invalidation_requests = self.chat.app.invalidation_requests(now, now_system);
-        let invalidation_at = invalidation_requests.iter().map(|request| request.at).min();
         let deadlines = [
             (RootTimer::Invalidations, invalidation_at),
             (
@@ -1433,26 +1443,7 @@ impl BcodeRuntimeModel {
         let now = Instant::now();
         let invalidation = match timer.as_str() {
             "bcode.invalidations" => {
-                let now_system = std::time::SystemTime::now();
-                let requests = self.chat.app.invalidation_requests(now, now_system);
-                let due = requests
-                    .iter()
-                    .filter(|request| request.at <= now)
-                    .map(|request| request.key.clone())
-                    .collect::<Vec<_>>();
-                if due.is_empty() {
-                    let overdue_slack = Duration::from_millis(2);
-                    if let Some(request) = requests
-                        .iter()
-                        .min_by_key(|request| request.at)
-                        .filter(|request| request.at <= now + overdue_slack)
-                    {
-                        return self.chat.app.handle_invalidations_with_damage(
-                            std::slice::from_ref(&request.key),
-                            now,
-                        );
-                    }
-                }
+                let due = self.temporal_registry.take_due(now);
                 return self.chat.app.handle_invalidations_with_damage(&due, now);
             }
             "bcode.artifact_retry" => {
@@ -1589,10 +1580,11 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         self.invalidation = super::invalidation::UiInvalidation::None;
         self.last_presented_at = Some(Instant::now());
         self.loop_state.mark_presentation_committed();
-        if self
+        let deferred = self
             .loop_state
-            .apply_deferred_session_stream_updates(&mut self.chat)
-        {
+            .apply_deferred_session_stream_updates(&mut self.chat);
+        self.schedule_deadlines();
+        if deferred {
             self.invalidation = super::invalidation::UiInvalidation::Structural;
             self.presentation_damage = bmux_tui::damage::Damage::Full;
             self.fast_temporal_presentation = false;
