@@ -86,7 +86,7 @@ pub async fn run_standalone_plugin_surface<W: Write>(
     let plugin_id = plugin_id.into();
     model.queue_standalone_plugin_surface(plugin_id.clone(), surface);
     let (runtime, handle) = root_program::runtime(terminal, model);
-    let mut model = root_program::run(runtime, handle).await?;
+    let mut model = Box::pin(root_program::run(runtime, handle)).await?;
     Ok(model
         .take_plugin_surface_result()
         .filter(|(closed_plugin_id, _)| closed_plugin_id == &plugin_id)
@@ -171,39 +171,14 @@ fn initialize_tui(
         opening_session_anchor_sequence: None,
         pending_effects: TuiEffectQueue::default(),
     };
-    let mut declarative_streaming_policy =
-        bcode_session_view_models::StreamingPresentationPolicy::default();
-    let mut effective_streaming_override = None;
-    match config {
-        Ok(config) => {
-            settings.apply_tui_config(&config.tui);
-            chat.app.apply_tui_config(config.tui.clone());
-            declarative_streaming_policy = config.presentation.streaming.policy();
-            match streaming_presentation_override {
-                Ok(streaming_override) => {
-                    effective_streaming_override = streaming_override;
-                    let effective = streaming_override.unwrap_or(declarative_streaming_policy);
-                    let _ = chat.app.apply_streaming_presentation_policy(effective);
-                }
-                Err(error) => {
-                    let _ = chat
-                        .app
-                        .apply_streaming_presentation_policy(declarative_streaming_policy);
-                    chat.app
-                        .set_status(format!("TUI streaming state unavailable: {error}"));
-                }
-            }
-            chat.start_effect(TuiEffect::ReconcileAuthSecurity {
-                config: Box::new(config),
-            });
-            if session_id.is_none() {
-                chat.start_effect(TuiEffect::LoadDraftStatus {
-                    launch_working_directory,
-                });
-            }
-        }
-        Err(_) => chat.start_effect(TuiEffect::LoadConfig),
-    }
+    let (declarative_streaming_policy, effective_streaming_override) = apply_initial_config(
+        config,
+        streaming_presentation_override,
+        session_id,
+        &launch_working_directory,
+        &mut settings,
+        &mut chat,
+    );
     chat.start_effect(TuiEffect::LoadAgentCatalog);
     if let Some(session_id) = session_id {
         let initial_window_request = session_flow::initial_transcript_window_request(
@@ -220,6 +195,54 @@ fn initialize_tui(
         declarative_streaming_policy,
         streaming_presentation_override: effective_streaming_override,
     }
+}
+
+fn apply_initial_config(
+    config: Result<bcode_config::BcodeConfig, bcode_config::ConfigError>,
+    streaming_override: Result<
+        Option<bcode_session_view_models::StreamingPresentationPolicy>,
+        bcode_config::ConfigError,
+    >,
+    session_id: Option<SessionId>,
+    launch_working_directory: &std::path::Path,
+    settings: &mut chat_loop::TuiRuntimeSettings,
+    chat: &mut session_flow::ActiveChat,
+) -> (
+    bcode_session_view_models::StreamingPresentationPolicy,
+    Option<bcode_session_view_models::StreamingPresentationPolicy>,
+) {
+    let Ok(config) = config else {
+        chat.start_effect(TuiEffect::LoadConfig);
+        return (
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+            None,
+        );
+    };
+    settings.apply_tui_config(&config.tui);
+    chat.app.apply_tui_config(config.tui.clone());
+    let declarative = config.presentation.streaming.policy();
+    let effective_override = match streaming_override {
+        Ok(streaming_override) => {
+            let effective = streaming_override.unwrap_or(declarative);
+            let _ = chat.app.apply_streaming_presentation_policy(effective);
+            streaming_override
+        }
+        Err(error) => {
+            let _ = chat.app.apply_streaming_presentation_policy(declarative);
+            chat.app
+                .set_status(format!("TUI streaming state unavailable: {error}"));
+            None
+        }
+    };
+    chat.start_effect(TuiEffect::ReconcileAuthSecurity {
+        config: Box::new(config),
+    });
+    if session_id.is_none() {
+        chat.start_effect(TuiEffect::LoadDraftStatus {
+            launch_working_directory: launch_working_directory.to_path_buf(),
+        });
+    }
+    (declarative, effective_override)
 }
 
 async fn run_root<W: Write>(
@@ -245,6 +268,6 @@ async fn run_root<W: Write>(
         model.queue_plugin_surface("bcode.ralph", surface);
     }
     let (runtime, handle) = root_program::runtime(terminal, model);
-    let _model = root_program::run(runtime, handle).await?;
+    let _model = Box::pin(root_program::run(runtime, handle)).await?;
     Ok(())
 }

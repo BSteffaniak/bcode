@@ -49,6 +49,22 @@ for required in (
     if required not in tui:
         raise SystemExit(f"TUI stream deadline adaptation missing: {required}")
 
+for forbidden in ("bcode.toml", "config_to_toml", "write_tui_toml"):
+    if forbidden in streaming_configurator or forbidden in streaming_configurator_render:
+        raise SystemExit(f"streaming configurator writes declarative configuration: {forbidden}")
+
+for required in (
+    "Streaming configurator",
+    "bcode.streaming_configurator",
+    "interactive `tui.toml` user state",
+):
+    if required not in tui_docs:
+        raise SystemExit(f"TUI configurator documentation missing: {required}")
+
+for required in ("exact same typed source events", "bounded, ephemeral"):
+    if required not in renderer_docs:
+        raise SystemExit(f"renderer configurator documentation missing: {required}")
+
 for required in (
     "LatestSnapshotUpdates",
     "next_streaming_presentation_deadline",

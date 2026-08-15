@@ -64,13 +64,13 @@ pub fn source_viewer_rows_with_style(
 }
 
 fn highlighted_lines(input: SourceViewerInput<'_>) -> Vec<Line> {
-    let lines = input
-        .contents
-        .lines()
-        .take(input.max_lines)
-        .collect::<Vec<_>>();
     #[cfg(feature = "syntax")]
     {
+        let lines = input
+            .contents
+            .lines()
+            .take(input.max_lines)
+            .collect::<Vec<_>>();
         let highlighter = input
             .syntax_palette
             .map_or_else(SyntaxHighlighter::new, SyntaxHighlighter::with_palette);
@@ -87,9 +87,16 @@ fn highlighted_lines(input: SourceViewerInput<'_>) -> Vec<Line> {
                 })
                 .collect();
         }
+        return lines
+            .into_iter()
+            .map(|line| Line::from_spans(vec![Span::raw(line.to_owned())]))
+            .collect();
     }
-    lines
-        .into_iter()
+    #[cfg(not(feature = "syntax"))]
+    input
+        .contents
+        .lines()
+        .take(input.max_lines)
         .map(|line| Line::from_spans(vec![Span::raw(line.to_owned())]))
         .collect()
 }

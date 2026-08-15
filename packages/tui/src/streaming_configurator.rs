@@ -253,15 +253,22 @@ const fn cycle_curve(
     curve: StreamingInterpolationCurve,
     direction: i32,
 ) -> StreamingInterpolationCurve {
-    match (curve, direction < 0) {
-        (StreamingInterpolationCurve::Linear, false) => StreamingInterpolationCurve::EaseIn,
-        (StreamingInterpolationCurve::EaseIn, false) => StreamingInterpolationCurve::EaseOut,
-        (StreamingInterpolationCurve::EaseOut, false) => StreamingInterpolationCurve::EaseInOut,
-        (StreamingInterpolationCurve::EaseInOut, false) => StreamingInterpolationCurve::Linear,
-        (StreamingInterpolationCurve::Linear, true) => StreamingInterpolationCurve::EaseInOut,
-        (StreamingInterpolationCurve::EaseIn, true) => StreamingInterpolationCurve::Linear,
-        (StreamingInterpolationCurve::EaseOut, true) => StreamingInterpolationCurve::EaseIn,
-        (StreamingInterpolationCurve::EaseInOut, true) => StreamingInterpolationCurve::EaseOut,
+    let index = match curve {
+        StreamingInterpolationCurve::Linear => 0,
+        StreamingInterpolationCurve::EaseIn => 1,
+        StreamingInterpolationCurve::EaseOut => 2,
+        StreamingInterpolationCurve::EaseInOut => 3,
+    };
+    let next = if direction < 0 {
+        (index + 3) % 4
+    } else {
+        (index + 1) % 4
+    };
+    match next {
+        0 => StreamingInterpolationCurve::Linear,
+        1 => StreamingInterpolationCurve::EaseIn,
+        2 => StreamingInterpolationCurve::EaseOut,
+        _ => StreamingInterpolationCurve::EaseInOut,
     }
 }
 
@@ -364,7 +371,7 @@ impl StreamingPreviewController {
     }
 
     /// Pause all source and shared-presentation deadlines without discarding state.
-    pub fn pause(&mut self, now: Instant) {
+    pub const fn pause(&mut self, now: Instant) {
         if matches!(self.phase, PlaybackPhase::Running) {
             self.phase = PlaybackPhase::Paused;
             self.paused_at = Some(now);

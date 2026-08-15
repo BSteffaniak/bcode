@@ -517,6 +517,17 @@ mod tests {
     }
 
     #[test]
+    fn bundled_palette_exposes_streaming_configurator_route() {
+        assert!(bundled_host_palette_commands().iter().any(|contribution| {
+            contribution.id == "streaming.configure"
+                && contribution.action
+                    == CommandAction::Host {
+                        route: "streaming.configure".to_owned(),
+                    }
+        }));
+    }
+
+    #[test]
     fn append_text_defaults_legacy_payloads_to_plain_text() {
         let effect = serde_json::from_value::<CommandEffect>(serde_json::json!({
             "type": "append_text",

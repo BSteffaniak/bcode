@@ -4099,7 +4099,7 @@ mod tests {
             if matches!(event, bmux_tui_runtime::RuntimeEvent::Message(_)) {
                 self.received += 1;
             }
-            Ok(if self.received == 2 {
+            Ok(if self.received == 3 {
                 bmux_tui_runtime::Update::exit()
             } else {
                 bmux_tui_runtime::Update::none()
@@ -4124,13 +4124,16 @@ mod tests {
         admit(&handle, BcodeRuntimeMessage::StreamingPresentationDue)
             .await
             .expect("latest message admitted");
+        admit(&handle, BcodeRuntimeMessage::StreamingConfiguratorDue)
+            .await
+            .expect("configurator latest message admitted");
         let output = runtime
             .run()
             .await
             .unwrap_or_else(|_| panic!("runtime succeeds"));
-        assert_eq!(output.program.received, 2);
+        assert_eq!(output.program.received, 3);
         assert_eq!(output.stats.reliable_processed, 1);
-        assert_eq!(output.stats.latest_processed, 1);
+        assert_eq!(output.stats.latest_processed, 2);
         assert_ne!(
             BcodeRuntimeAdmissionError::Full,
             BcodeRuntimeAdmissionError::Closed

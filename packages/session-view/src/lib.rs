@@ -305,7 +305,7 @@ impl PendingTextPresentation {
         self.destination = destination;
     }
 
-    fn adopt_policy(&mut self, policy: StreamingPresentationPolicy) {
+    const fn adopt_policy(&mut self, policy: StreamingPresentationPolicy) {
         self.graphemes_per_second = policy.graphemes_per_second;
         self.max_lag = Duration::from_millis(policy.max_lag_ms);
     }
@@ -4837,6 +4837,70 @@ mod tests {
         assert_eq!(
             transcript_item_text(view.snapshot(), &id),
             Some("whole accepted target")
+        );
+    }
+
+    #[test]
+    fn policy_change_before_cancel_keeps_terminal_state_absorbing() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "accepted before cancellation".to_owned(),
+                },
+            },
+        ));
+        let changed = StreamingPresentationPolicy {
+            curve: StreamingInterpolationCurve::EaseOut,
+            graphemes_per_second: 25,
+            max_lag_ms: 500,
+            ..StreamingPresentationPolicy::default()
+        };
+        assert!(!view.set_streaming_presentation_policy(changed));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 2,
+                revision: 2,
+                operation: bcode_session_models::TextStreamOperation::Terminal {
+                    status: bcode_session_models::TextStreamTerminalStatus::Cancelled,
+                },
+            },
+        ));
+        let visible_at_cancel = transcript_item_text(view.snapshot(), &id)
+            .expect("visible prefix at cancellation")
+            .to_owned();
+        assert!("accepted before cancellation".starts_with(&visible_at_cancel));
+        assert!(matches!(
+            view.snapshot().text_streams[&id].status,
+            TextStreamViewStatus::Terminal(
+                bcode_session_models::TextStreamTerminalStatus::Cancelled
+            )
+        ));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 3,
+                revision: 3,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: "accepted before cancellation".len(),
+                    text: " ignored".to_owned(),
+                },
+            },
+        ));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some(visible_at_cancel.as_str())
         );
     }
 

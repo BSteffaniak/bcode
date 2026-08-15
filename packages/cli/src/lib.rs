@@ -12608,11 +12608,14 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         }
         SessionEventKind::SessionDerived {
             source_session_id,
+            source_generation,
+            source_cutoff_sequence,
             producer,
             operation_kind,
+            selected_source_sequence,
             ..
         } => println!(
-            "#{} session derived from {source_session_id} by {producer} ({operation_kind})",
+            "#{} session derived from {source_session_id} generation {source_generation} through {source_cutoff_sequence} by {producer} ({operation_kind}, selected={selected_source_sequence:?})",
             event.sequence
         ),
         SessionEventKind::ExecutionSessionCreated {

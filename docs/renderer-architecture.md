@@ -42,6 +42,15 @@ skipped animation frames use complete snapshots rather than
 patch chains based on undelivered revisions. TUI and HyperChad code must not split chunks, evaluate
 curves, or own accepted text; those semantics remain in `packages/session-view`.
 
+The TUI streaming configurator follows the same boundary. Its raw and smoothed previews are isolated
+`SessionView` projections receiving the exact same typed source events. Immediate-versus-progressive
+policy selection is frontend orchestration, while interpolation, effective-rate calculation,
+grapheme-safe prefixes, backlog adoption, and terminal convergence remain exclusively shared
+session-view semantics. The configurator renderer consumes projected text and owns only terminal
+layout, focus, key mapping, status, and responsive presentation. Preview projections and their fixed
+source schedule are bounded, ephemeral, absent from canonical session history, and discarded when
+the surface closes.
+
 ## Transcript eligibility catalog
 
 Every `TranscriptViewItemKind` is intentional chronological product history:

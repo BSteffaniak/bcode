@@ -4905,7 +4905,7 @@ struct TuiStreamingState {
 }
 
 impl TuiStreamingState {
-    fn policy(&self) -> bcode_session_view_models::StreamingPresentationPolicy {
+    const fn policy(&self) -> bcode_session_view_models::StreamingPresentationPolicy {
         bcode_session_view_models::StreamingPresentationPolicy {
             enabled: self.enabled,
             curve: self.curve,
@@ -7752,6 +7752,43 @@ enabled = false
                 .expect("streaming state should load"),
             None
         );
+        restore_env("BCODE_TUI_STATE", previous_state);
+    }
+
+    #[test]
+    fn streaming_state_updates_never_touch_declarative_config() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_path = temp.path().join("bcode.toml");
+        let state_path = temp.path().join("tui.toml");
+        std::fs::write(
+            &config_path,
+            "[presentation.streaming]\ngraphemes_per_second = 175\n",
+        )
+        .expect("config should be written");
+        let original = std::fs::read_to_string(&config_path).expect("config should read");
+        let previous_config = std::env::var_os(BCODE_CONFIG_ENV);
+        let previous_state = std::env::var_os("BCODE_TUI_STATE");
+        // SAFETY: tests that mutate process configuration are serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var(BCODE_CONFIG_ENV, &config_path);
+            std::env::set_var("BCODE_TUI_STATE", &state_path);
+        }
+
+        set_tui_streaming_presentation_override(
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+        )
+        .expect("override should write");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config should remain readable"),
+            original
+        );
+        clear_tui_streaming_presentation_override().expect("override should clear");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config should remain readable"),
+            original
+        );
+        restore_env(BCODE_CONFIG_ENV, previous_config);
         restore_env("BCODE_TUI_STATE", previous_state);
     }
 

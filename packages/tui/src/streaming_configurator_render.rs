@@ -71,7 +71,7 @@ fn configurator_modal(theme: TuiTheme) -> ModalFrame {
     .placement(ModalPlacement::Centered)
 }
 
-fn preview_areas(area: Rect) -> (Rect, Rect) {
+const fn preview_areas(area: Rect) -> (Rect, Rect) {
     if area.width >= STACK_BREAKPOINT {
         let left_width = area.width.saturating_sub(1) / 2;
         (
@@ -216,7 +216,68 @@ fn setting_line(focused: bool, label: &str, value: &str, theme: TuiTheme) -> Lin
 
 #[cfg(test)]
 mod tests {
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::frame::Frame;
+
     use super::*;
+
+    fn render_text(area: Rect, state: &StreamingConfiguratorState) -> String {
+        let theme = TuiTheme::for_theme_id("bcode-dark");
+        let mut buffer = Buffer::empty(area);
+        render_streaming_configurator(state, &mut Frame::new(&mut buffer), theme);
+        (0..area.height)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect::<String>()
+    }
+
+    #[test]
+    fn renders_controls_playback_and_responsive_preview_labels() {
+        let now = std::time::Instant::now();
+        let state = StreamingConfiguratorState::new(
+            now,
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+        );
+        let wide = render_text(Rect::new(0, 0, 120, 36), &state);
+        for expected in [
+            "Streaming presentation configurator",
+            "Raw provider chunks",
+            "Smoothed presentation",
+            "Enabled:",
+            "300 graphemes/s",
+            "chunk 0/13",
+            "enter apply",
+        ] {
+            assert!(wide.contains(expected), "missing {expected}: {wide}");
+        }
+        let narrow = render_text(Rect::new(0, 0, 70, 36), &state);
+        assert!(narrow.contains("Raw provider chunks"));
+        assert!(narrow.contains("Smoothed presentation"));
+    }
+
+    #[test]
+    fn renders_minimum_size_fallback_and_reset_state() {
+        let now = std::time::Instant::now();
+        let mut state = StreamingConfiguratorState::new(
+            now,
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+        );
+        let small = render_text(Rect::new(0, 0, 40, 16), &state);
+        assert!(small.contains("terminal is too small"), "{small}");
+        for _ in 0..4 {
+            let _ = state.handle_key(
+                bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Down),
+                now,
+            );
+        }
+        let _ = state.handle_key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Space),
+            now,
+        );
+        let reset = render_text(Rect::new(0, 0, 120, 36), &state);
+        assert!(reset.contains("Reset override: pending"), "{reset}");
+    }
 
     #[test]
     fn preview_layout_switches_from_columns_to_stacks() {

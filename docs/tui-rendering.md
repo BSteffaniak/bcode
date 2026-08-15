@@ -219,6 +219,27 @@ when necessary. Presentation advancement requests transcript-local damage and st
 `[tui.render].max_fps`; cancellation, permissions, execution, canonical stream validation, and
 model-turn terminal flushing do not wait for terminal cadence.
 
+### Streaming configurator
+
+`/streaming` and the `Streaming: Configure` command-palette action open an opaque TUI-owned
+comparison surface. A fixed, bounded source schedule constructs each typed stream event once and
+feeds it to two isolated, disposable `SessionView` projections: an immediate raw projection and a
+projection using the selected normalized policy. The surface never reads or mutates the active
+session projection or canonical history.
+
+The root runtime schedules only the earliest source-arrival, shared-presentation, or completed-hold
+deadline under `bcode.streaming_configurator`. Closing, applying, cancelling, pausing, or replacing
+the surface removes that deadline when no work remains. Normal widths use matched side-by-side
+preview panes; widths below 86 columns stack the panes, and content areas below 54 by 24 render a
+bounded resize explanation.
+
+Apply updates the active TUI policy immediately and asynchronously persists a normalized override in
+interactive `tui.toml` user state. The override takes precedence over declarative
+`[presentation.streaming]` defaults during startup and configuration reload. Reset clears only that
+override and immediately applies the latest declarative fallback. Cancel changes neither active nor
+persisted policy. Theme and streaming updates use sibling-preserving read-modify-write state updates;
+none of these interactions creates or modifies declarative configuration.
+
 ## Draw cadence
 `[tui.render]` controls terminal draw cadence.
 

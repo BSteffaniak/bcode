@@ -1080,6 +1080,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn streaming_builtin_routes_to_configurator() {
+        let outcome = execute_builtin(
+            &BcodeClient::default_endpoint(),
+            None,
+            SlashExecutionContext {
+                working_directory: std::path::Path::new("."),
+                current_agent_id: "build",
+                reasoning_display_mode: bcode_config::TuiThinkingMode::All,
+                reasoning_visible: true,
+            },
+            "/streaming",
+            &["/streaming"],
+            "streaming",
+        )
+        .await
+        .expect("local streaming command");
+        assert_eq!(outcome, SlashCommandOutcome::OpenStreamingConfigurator);
+    }
+
     #[test]
     fn thinking_mode_slash_parser_covers_every_local_mode() {
         for (value, mode) in [

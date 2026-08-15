@@ -324,6 +324,18 @@ impl ChatLoopState {
         let effective = self
             .streaming_presentation_override
             .unwrap_or(self.declarative_streaming_policy);
+        self.thinking_dialog = None;
+        self.theme_picker = None;
+        self.timeline_dialog = None;
+        self.session_fork_dialog = None;
+        self.fork_prompt_picker = None;
+        self.provider_picker = None;
+        self.model_picker = None;
+        self.auth_pool_picker = None;
+        self.skill_picker = None;
+        self.worktree_create_dialog = None;
+        self.ralph_start_dialog = None;
+        self.session_picker = None;
         self.streaming_configurator = Some(
             super::streaming_configurator::StreamingConfiguratorState::new(
                 Instant::now(),
@@ -343,15 +355,19 @@ impl ChatLoopState {
             return false;
         };
         match configurator.handle_key(stroke, Instant::now()) {
-            super::streaming_configurator::StreamingConfiguratorOutcome::Handled => true,
+            super::streaming_configurator::StreamingConfiguratorOutcome::Handled
+            | super::streaming_configurator::StreamingConfiguratorOutcome::Ignored => true,
             super::streaming_configurator::StreamingConfiguratorOutcome::Apply(policy) => {
                 self.streaming_configurator = None;
-                self.request_streaming_presentation_override(chat, policy);
+                Self::request_streaming_presentation_override(chat, policy);
                 true
             }
             super::streaming_configurator::StreamingConfiguratorOutcome::Reset => {
                 self.streaming_configurator = None;
-                self.request_clear_streaming_presentation_override(chat);
+                Self::request_clear_streaming_presentation_override(
+                    chat,
+                    self.declarative_streaming_policy,
+                );
                 true
             }
             super::streaming_configurator::StreamingConfiguratorOutcome::Cancel => {
@@ -360,12 +376,10 @@ impl ChatLoopState {
                     .set_status("streaming presentation changes canceled".to_owned());
                 true
             }
-            super::streaming_configurator::StreamingConfiguratorOutcome::Ignored => false,
         }
     }
 
     pub fn request_streaming_presentation_override(
-        &mut self,
         chat: &mut ActiveChat,
         policy: bcode_session_view_models::StreamingPresentationPolicy,
     ) {
@@ -374,10 +388,13 @@ impl ChatLoopState {
         chat.replace_effect(TuiEffect::PersistStreamingPresentation { policy });
     }
 
-    pub fn request_clear_streaming_presentation_override(&mut self, chat: &mut ActiveChat) {
+    pub fn request_clear_streaming_presentation_override(
+        chat: &mut ActiveChat,
+        declarative_streaming_policy: bcode_session_view_models::StreamingPresentationPolicy,
+    ) {
         let _ = chat
             .app
-            .apply_streaming_presentation_policy(self.declarative_streaming_policy);
+            .apply_streaming_presentation_policy(declarative_streaming_policy);
         chat.replace_effect(TuiEffect::ClearStreamingPresentation);
     }
 
