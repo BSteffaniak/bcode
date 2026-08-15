@@ -2678,6 +2678,9 @@ const fn default_tui_markdown_mermaid() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "mouse")]
 pub struct TuiMouseConfig {
+    /// Whether dragging a transcript selection at a viewport edge autoscrolls.
+    #[serde(default = "default_tui_selection_autoscroll")]
+    pub selection_autoscroll: bool,
     /// Terminal rows to scroll for each terminal mouse-wheel event.
     #[serde(default = "default_tui_mouse_scroll_rows")]
     pub scroll_rows: usize,
@@ -2710,6 +2713,7 @@ impl TuiMouseConfig {
 impl Default for TuiMouseConfig {
     fn default() -> Self {
         Self {
+            selection_autoscroll: default_tui_selection_autoscroll(),
             scroll_rows: default_tui_mouse_scroll_rows(),
             multi_click_ms: default_mouse_multi_click_ms(),
             multi_click_max_distance: 0,
@@ -2717,6 +2721,10 @@ impl Default for TuiMouseConfig {
             triple_click_select: default_triple_click_select(),
         }
     }
+}
+
+const fn default_tui_selection_autoscroll() -> bool {
+    true
 }
 
 const fn default_tui_mouse_scroll_rows() -> usize {
@@ -6189,6 +6197,12 @@ fn write_tui_mouse_toml(output: &mut String, mouse: &TuiMouseConfig) {
         return;
     }
     writeln!(output, "[tui.mouse]").expect("writing to string should not fail");
+    writeln!(
+        output,
+        "selection_autoscroll = {}",
+        mouse.selection_autoscroll
+    )
+    .expect("writing to string should not fail");
     writeln!(output, "scroll_rows = {}", mouse.scroll_rows)
         .expect("writing to string should not fail");
     writeln!(output, "multi_click_ms = {}", mouse.multi_click_ms)
@@ -8402,6 +8416,7 @@ mermaid = false
         let config: BcodeConfig = toml::from_str(
             r#"
 [tui.mouse]
+selection_autoscroll = false
 scroll_rows = 4
 multi_click_ms = 300
 multi_click_max_distance = 1
@@ -8411,6 +8426,7 @@ triple_click_select = "all"
         )
         .expect("config should parse");
 
+        assert!(!config.tui.mouse.selection_autoscroll);
         assert_eq!(config.tui.mouse.scroll_rows, 4);
         assert_eq!(config.tui.mouse.multi_click_ms, 300);
         assert_eq!(config.tui.mouse.multi_click_max_distance, 1);
@@ -8472,6 +8488,7 @@ accent_transition_curve = "ease_in_out"
 
     #[test]
     fn tui_mouse_scroll_rows_defaults_and_clamps_zero() {
+        assert!(TuiMouseConfig::default().selection_autoscroll);
         assert_eq!(TuiMouseConfig::default().scroll_rows, 3);
         assert_eq!(TuiMouseConfig::default().effective_scroll_rows(), 3);
         assert_eq!(

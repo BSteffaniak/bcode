@@ -435,6 +435,57 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
         }
     }
 
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        let canvas = theme.map_or_else(Style::new, |theme| theme.canvas);
+        let text = theme.map_or_else(Style::new, |theme| theme.text);
+        let selection = theme.map_or_else(
+            || Style::new().add_modifier(Modifier::REVERSED),
+            |theme| theme.selection,
+        );
+        frame.fill(area, " ", canvas);
+        frame.write_line(
+            Rect::new(area.x, area.y, area.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                "Select the prompt to edit in the fork",
+                text.add_modifier(Modifier::BOLD),
+            )]),
+        );
+        for (index, candidate) in self
+            .candidates
+            .iter()
+            .take(usize::from(area.height.saturating_sub(2)))
+            .enumerate()
+        {
+            let style = if index == self.selected {
+                selection
+            } else {
+                text
+            };
+            frame.write_line(
+                Rect::new(
+                    area.x,
+                    area.y
+                        .saturating_add(u16::try_from(index + 2).unwrap_or(u16::MAX)),
+                    area.width,
+                    1,
+                ),
+                &Line::from_spans(vec![Span::styled(
+                    format!(
+                        "{}  {}",
+                        candidate.sequence,
+                        candidate.preview.replace('\n', " ")
+                    ),
+                    style,
+                )]),
+            );
+        }
+    }
+
     fn handle_event(
         &mut self,
         event: &Event,

@@ -2094,6 +2094,7 @@ mod daemon_connection_monitor_tests {
 pub struct TuiRuntimeSettings {
     keymap: BmuxKeyMap,
     mouse_scroll_rows: usize,
+    selection_autoscroll: bool,
     frame_interval: Option<Duration>,
     runtime_config: bmux_tui_runtime::RuntimeConfig,
     metrics_enabled: bool,
@@ -2111,6 +2112,7 @@ impl TuiRuntimeSettings {
         Self {
             keymap: BmuxKeyMap::from_config(&tui_config),
             mouse_scroll_rows: tui_config.mouse.effective_scroll_rows(),
+            selection_autoscroll: tui_config.mouse.selection_autoscroll,
             frame_interval: tui_config.render.frame_interval(),
             runtime_config: super::runtime_adapter::config(&tui_config),
             metrics_enabled: false,
@@ -2123,6 +2125,7 @@ impl TuiRuntimeSettings {
     pub fn apply_tui_config(&mut self, tui_config: &TuiConfig) {
         self.keymap = BmuxKeyMap::from_config(tui_config);
         self.mouse_scroll_rows = tui_config.mouse.effective_scroll_rows();
+        self.selection_autoscroll = tui_config.mouse.selection_autoscroll;
         self.frame_interval = tui_config.render.frame_interval();
         self.runtime_config = super::runtime_adapter::config(tui_config);
     }
@@ -2143,6 +2146,10 @@ impl TuiRuntimeSettings {
 
     pub const fn keymap(&self) -> &BmuxKeyMap {
         &self.keymap
+    }
+
+    pub const fn selection_autoscroll(&self) -> bool {
+        self.selection_autoscroll
     }
 
     pub const fn mouse_scroll_rows(&self) -> usize {
@@ -4082,6 +4089,7 @@ pub fn draw_chat_frame<W: Write>(
     damage: bmux_tui::damage::Damage,
     fast_temporal_presentation: bool,
     committed_layout: Option<render::FrameLayout>,
+    transcript_selection: &bmux_tui::selection::SelectionController,
 ) -> Result<(bmux_tui::terminal::DrawStats, Option<render::FrameLayout>), TuiError> {
     let frame_started = Instant::now();
     let prepare_started = frame_started;
@@ -4280,6 +4288,14 @@ pub fn draw_chat_frame<W: Write>(
     let draw_stats = terminal.draw_damage(damage, |frame| {
         if let Some(layout) = layout {
             render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
+            let selection_scene =
+                super::root_program::transcript_selection_scene(&chat.app, layout.body());
+            for scope in selection_scene.scopes() {
+                frame.push_selection_scope(scope.clone());
+            }
+            for fragment in selection_scene.fragments() {
+                frame.push_selection_fragment(fragment.clone());
+            }
         }
         for contribution_id in &rich_presentation.image_removed {
             super::markdown_image::MarkdownImagePresentationStore::remove_from_frame(
@@ -4422,6 +4438,9 @@ pub fn draw_chat_frame<W: Write>(
         }
         if let Some(dialog) = &mut loop_state.worktree_create_dialog {
             super::wt_create_dialog_render::render_dialog(dialog, frame, theme);
+        }
+        if let Some(snapshot) = transcript_selection.snapshot(frame.selection()) {
+            frame.paint_selection(&snapshot, theme.selection);
         }
     })?;
     loop_state.interactive_surface_geometry = loop_state.interactive_surface.as_ref().map(|_| {

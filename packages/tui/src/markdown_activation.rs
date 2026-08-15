@@ -80,6 +80,16 @@ pub fn copy_markdown_destination(
     Ok(true)
 }
 
+/// Copy arbitrary explicit text to the system clipboard.
+///
+/// # Errors
+///
+/// Returns a clipboard initialization or write error.
+pub fn copy_text(text: &str) -> Result<(), arboard::Error> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(text)
+}
+
 /// Return text suitable for explicit copy from a safe destination.
 #[must_use]
 pub fn markdown_destination_text(destination: &MarkdownDestination) -> Option<String> {

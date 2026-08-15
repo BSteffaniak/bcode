@@ -157,6 +157,7 @@ pub fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Opti
             request: KeyRequest::None,
         },
         BmuxAction::ClipboardPasteImage
+        | BmuxAction::TranscriptCopySelection
         | BmuxAction::CommandPaletteOpen
         | BmuxAction::SessionSearchOpen
         | BmuxAction::PermissionApprove

@@ -30,7 +30,7 @@ def features(path: Path, name: str) -> set[str]:
 
 required_bmux = {
     Path("packages/tui/Cargo.toml"): {
-        "action-row", "dialog", "form", "labeled-details", "modal-frame", "picker-frame",
+        "action-row", "checkbox", "dialog", "form", "labeled-details", "modal-frame", "picker-frame",
         "scroll-area", "stepper", "text-input",
     },
     Path("plugins/blims-plugin/Cargo.toml"): {"key-hint-bar", "modal-frame", "pane", "text-view"},

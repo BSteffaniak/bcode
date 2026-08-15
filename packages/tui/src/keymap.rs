@@ -28,6 +28,7 @@ pub enum BmuxAction {
     AppExit,
     AppInterrupt,
     ClipboardPasteImage,
+    TranscriptCopySelection,
     CommandPaletteOpen,
     SessionSearchOpen,
     AgentCycle,
@@ -88,6 +89,7 @@ impl BmuxAction {
             "app.exit" => Self::AppExit,
             "app.interrupt" => Self::AppInterrupt,
             "app.clipboard.pasteImage" => Self::ClipboardPasteImage,
+            "tui.transcript.copySelection" => Self::TranscriptCopySelection,
             "app.command_palette" => Self::CommandPaletteOpen,
             "tui.session.search" => Self::SessionSearchOpen,
             "tui.agent.cycle" => Self::AgentCycle,
@@ -280,6 +282,7 @@ impl BmuxKeyMap {
             | BmuxAction::AppExit
             | BmuxAction::AppInterrupt
             | BmuxAction::ClipboardPasteImage
+            | BmuxAction::TranscriptCopySelection
             | BmuxAction::CommandPaletteOpen
             | BmuxAction::SessionSearchOpen
             | BmuxAction::AgentCycle
@@ -340,6 +343,7 @@ impl BmuxKeyMap {
             | BmuxAction::AppExit
             | BmuxAction::AppInterrupt
             | BmuxAction::ClipboardPasteImage
+            | BmuxAction::TranscriptCopySelection
             | BmuxAction::CommandPaletteOpen
             | BmuxAction::SessionSearchOpen
             | BmuxAction::AgentCycle
@@ -413,6 +417,7 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<BmuxKeyBinding>> {
                     "hit esc twice to cancel",
                 ),
                 bind("ctrl+v", BmuxAction::ClipboardPasteImage),
+                bind("ctrl+shift+c", BmuxAction::TranscriptCopySelection),
                 bind("ctrl+p", BmuxAction::CommandPaletteOpen),
                 bind("ctrl+g", BmuxAction::SessionSearchOpen),
                 bind("tab", BmuxAction::AgentCycle),

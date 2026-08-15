@@ -153,9 +153,12 @@ pub struct TranscriptLayoutCache {
 pub struct VisibleTranscriptLine {
     /// Global transcript row index from the oldest row.
     pub row_index: usize,
-    pub(crate) entry_index: usize,
-    pub(crate) row_in_entry: usize,
-    pub(crate) source: VisibleTranscriptSource,
+    /// Transcript entry index containing this row.
+    pub entry_index: usize,
+    /// Row offset within the transcript entry.
+    pub row_in_entry: usize,
+    /// Logical section that owns this row.
+    pub source: VisibleTranscriptSource,
 }
 
 /// Cached transcript entry source.
@@ -342,7 +345,6 @@ impl TranscriptLayoutCache {
     }
 
     /// Return visible cached row metadata for one global row index.
-    #[cfg(test)]
     #[must_use]
     pub fn line_at_row(&self, row: usize) -> Option<VisibleTranscriptLine> {
         self.entries.line_at_row(row)

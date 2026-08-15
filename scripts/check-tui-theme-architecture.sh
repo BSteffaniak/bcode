@@ -127,7 +127,6 @@ if rg -n 'frame\.fill\([^\n]*Color::Black|bg\(Color::Black\)' \
 fi
 
 if rg -n 'MODAL_BG|Color::Black|ModalTheme::dark\(theme\.accent\)' \
-  packages/tui/src/session_fork_dialog_render.rs \
   packages/tui/src/wt_create_dialog_render.rs \
   packages/tui/src/ralph_start_dialog_render.rs \
   packages/tui/src/thinking_dialog_render.rs \
@@ -137,8 +136,7 @@ if rg -n 'MODAL_BG|Color::Black|ModalTheme::dark\(theme\.accent\)' \
 fi
 
 if rg -n 'Color::Black|Color::Yellow|Color::BrightWhite|Color::BrightBlack|ModalTheme::dark' \
-  packages/tui/src/permission_dialog_render.rs \
-  packages/tui/src/session_fork_flow.rs; then
+  packages/tui/src/permission_dialog_render.rs; then
   fail "permission and fork-prompt surfaces must consume resolved semantic styles"
 fi
 

@@ -405,6 +405,7 @@ pub struct BmuxApp {
     session_view_terminal_adapter: SessionViewTerminalAdapter,
     session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
+    transcript_selection_pinned: bool,
     latest_history_sequence: Option<u64>,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
@@ -615,6 +616,7 @@ impl BmuxApp {
             session_view_terminal_adapter: SessionViewTerminalAdapter::default(),
             session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
+            transcript_selection_pinned: false,
             latest_history_sequence: None,
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
@@ -2179,6 +2181,11 @@ impl BmuxApp {
         }
     }
 
+    /// Pin or unpin resident transcript history for a logical selection.
+    pub const fn set_transcript_selection_pinned(&mut self, pinned: bool) {
+        self.transcript_selection_pinned = pinned;
+    }
+
     /// Return resident transcript-affecting event count.
     #[cfg(test)]
     pub const fn resident_transcript_event_count(&self) -> usize {
@@ -2220,6 +2227,12 @@ impl BmuxApp {
         self.older_history.should_load()
     }
 
+    /// Request loading older transcript history for tests and selection-owned viewport flows.
+    #[cfg(test)]
+    pub(crate) const fn request_older_history_for_test(&mut self, reveal_rows: usize) {
+        self.older_history.request_load(reveal_rows);
+    }
+
     /// Mark newer history as loading or idle.
     pub const fn set_loading_newer_history(&mut self, loading: bool) {
         self.older_history.set_loading_newer(loading);
@@ -2235,6 +2248,12 @@ impl BmuxApp {
     #[must_use]
     pub const fn should_load_newer_history(&self) -> bool {
         self.older_history.should_load_newer()
+    }
+
+    /// Request loading newer transcript history for tests and selection-owned viewport flows.
+    #[cfg(test)]
+    pub(crate) const fn request_newer_history_for_test(&mut self, reveal_rows: usize) {
+        self.older_history.request_load_newer(reveal_rows);
     }
 
     /// Return the current activity state.
@@ -3117,11 +3136,19 @@ impl BmuxApp {
         }
     }
 
+    /// Return whether resident transcript trimming is currently permitted.
+    #[cfg(test)]
+    #[must_use]
+    pub fn can_trim_resident_transcript_window_for_test(&self) -> bool {
+        self.can_trim_resident_transcript_window()
+    }
+
     fn can_trim_resident_transcript_window(&self) -> bool {
         matches!(self.scroll_mode, TranscriptScrollMode::BottomFollow)
             && self.viewport.at_bottom_threshold()
             && self.transcript_scroll_animation.is_none()
             && !self.manual_transcript_scroll_active()
+            && !self.transcript_selection_pinned
             && !self.active_tool_loop()
             && !self.pending_assistant_stream_anchor
             && !self.older_history.loading()

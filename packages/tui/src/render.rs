@@ -661,6 +661,63 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
 
 #[cfg(test)]
 #[test]
+fn transcript_selection_scene_reflows_without_changing_logical_source_ranges() {
+    let session_id = bcode_session_models::SessionId::new();
+    let history = [bcode_session_models::SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: 1,
+        timestamp_ms: 1,
+        session_id,
+        provenance: None,
+        kind: bcode_session_models::SessionEventKind::UserMessage {
+            client_id: bcode_session_models::ClientId::new(),
+            text: "alpha beta".to_owned(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        },
+    }];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let wide_layout = prepare_frame(&mut app, Rect::new(0, 0, 40, 10)).expect("wide layout");
+    let wide = super::root_program::transcript_selection_scene(&app, wide_layout.body());
+    let wide_ranges = wide
+        .fragments()
+        .iter()
+        .map(|fragment| {
+            (
+                fragment.content_id.clone(),
+                fragment.source_range.clone(),
+                fragment.revision,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let narrow_layout = prepare_frame(&mut app, Rect::new(0, 0, 12, 10)).expect("narrow layout");
+    let narrow = super::root_program::transcript_selection_scene(&app, narrow_layout.body());
+    let narrow_ranges = narrow
+        .fragments()
+        .iter()
+        .map(|fragment| {
+            (
+                fragment.content_id.clone(),
+                fragment.source_range.clone(),
+                fragment.revision,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(!wide_ranges.is_empty());
+    assert_eq!(narrow_ranges, wide_ranges);
+    assert!(wide.validate().is_ok());
+    assert!(narrow.validate().is_ok());
+    assert!(
+        narrow
+            .fragments()
+            .iter()
+            .all(|fragment| { fragment.area.intersection(narrow_layout.body()) == fragment.area })
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn details_state_survives_reconstruction_resize_and_cache_reuse_then_drops_on_replacement() {
     let source = "<details><summary>More</summary>Body that wraps across several cells.</details>";
     let item = TranscriptItem::with_format("System", source.to_owned(), TextFormat::Markdown);

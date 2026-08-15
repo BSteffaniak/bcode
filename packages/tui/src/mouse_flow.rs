@@ -110,3 +110,29 @@ fn composer_mouse_changed(chat: &mut ActiveChat, mouse: MouseEvent) -> bool {
         TextInputOutcome::Edited | TextInputOutcome::Redraw
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::{HitMap, HitRegion, HitRole};
+
+    #[test]
+    fn committed_transcript_hit_routes_pointer_events_to_scroll_region() {
+        let area = Rect::new(2, 3, 20, 6);
+        let hits = HitMap::new().with_region(
+            HitRegion::new("transcript", area)
+                .role(HitRole::Scroll)
+                .layer(0),
+        );
+        let down = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(4, 5));
+        let drag = MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(8, 5));
+
+        assert_eq!(mouse_hit_id(&hits, down).as_deref(), Some("transcript"));
+        assert_eq!(mouse_hit_id(&hits, drag).as_deref(), Some("transcript"));
+        assert_eq!(
+            hits.hit_mouse(drag).map(|hit| hit.role()),
+            Some(HitRole::Scroll)
+        );
+    }
+}

@@ -849,8 +849,8 @@ mod tests {
         assert!(session_matches(&session, &session.id.to_string()));
         assert!(session_matches(&session, "workspace/project"));
         assert!(session_matches(&session, "opencode"));
-        assert!(session_matches(&session, "parent title"));
-        assert!(session_matches(&session, &source_session_id.to_string()));
+        assert!(!session_matches(&session, "parent title"));
+        assert!(!session_matches(&session, &source_session_id.to_string()));
         assert!(!session_matches(&session, "transcript-only-term"));
         assert!(!session_matches(&session, "external"));
     }
