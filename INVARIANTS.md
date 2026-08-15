@@ -50,6 +50,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 ## Runtime, tools, and permissions
 
 * **The runtime remains domain-generic.** Turn scheduling, cancellation, streaming, tool dispatch, and loop mechanics must not hardcode behavior owned by a particular tool, plugin, provider, command, or UI.
+* **Active workflow execution is ownership-fenced.** A daemon may dispatch, continue, reconcile, cancel, resume, or terminalize an active workflow only while holding its current durable execution authority; foreign or stale owners defer without mutation, and authority transfers only after prior ownership is verifiably relinquished or ended.
 * **Cancellation is end-to-end.** Cancellation propagates through scheduling, provider work, tool execution, persisted state, and client-visible terminal outcomes.
 * **Authorization precedes side effects.** Tools and commands must not perform side effects before applicable policy and user-permission decisions complete.
 * **Permission decisions use canonical operation facts.** Policy evaluates normalized operation facts rather than presentation text or untrusted tool descriptions.
