@@ -33,7 +33,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 14;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 15;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current durable workflow execution-session link contract version.
@@ -521,6 +521,20 @@ pub struct WorkflowDescendantRunSummary {
     pub run: WorkflowRunSummary,
 }
 
+/// Durable authority required to mutate one active workflow run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowExecutionAuthority {
+    /// Exact daemon artifact selected when the run was admitted.
+    pub target_artifact_id: String,
+    /// Current coordinator daemon instance.
+    pub daemon_instance_id: String,
+    /// Monotonic ownership generation.
+    pub generation: u64,
+    /// Opaque fencing token changed on every ownership transfer.
+    pub fencing_token: String,
+}
+
 /// Durable workflow run creation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewWorkflowRun {
@@ -546,6 +560,10 @@ pub struct NewWorkflowRun {
     pub authored_provenance: Option<AuthoredWorkflowRunProvenance>,
     /// Optional bounded initial input validated against the definition input schema.
     pub input: Option<serde_json::Value>,
+    /// Current durable execution authority. Production active runs must provide this; `None` is
+    /// retained for isolated library use and historical terminal data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_authority: Option<WorkflowExecutionAuthority>,
     /// Creation timestamp supplied by the host clock.
     pub created_at_ms: u64,
     /// Exact normalized non-secret policy/profile identity pinned before any run side effect.
@@ -3749,6 +3767,126 @@ impl WorkflowStore {
         stored.map(verify_stored_definition).transpose()
     }
 
+    /// Read the current durable execution authority for one run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed persisted authority or a database failure.
+    pub fn execution_authority(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<WorkflowExecutionAuthority>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT target_artifact_id, coordinator_daemon_instance_id, \
+                 coordinator_generation, coordinator_fencing_token \
+                 FROM workflow_runs WHERE run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<u64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            None | Some((None, None, None, None)) => Ok(None),
+            Some((
+                Some(target_artifact_id),
+                Some(daemon_instance_id),
+                Some(generation),
+                Some(fencing_token),
+            )) => Ok(Some(WorkflowExecutionAuthority {
+                target_artifact_id,
+                daemon_instance_id,
+                generation,
+                fencing_token,
+            })),
+            Some(_) => Err(WorkflowStoreError::InvalidData(
+                "workflow run has incomplete execution authority".to_string(),
+            )),
+        }
+    }
+
+    /// Verify that the supplied authority is current without mutating workflow state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run is missing, ownerless, stale, or malformed.
+    pub fn verify_execution_authority(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<(), WorkflowStoreError> {
+        let current = self.execution_authority(run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow run has no durable execution authority: {run_id}"
+            ))
+        })?;
+        if current == *authority {
+            Ok(())
+        } else {
+            Err(WorkflowStoreError::InvalidData(format!(
+                "workflow execution authority is stale or foreign: {run_id}"
+            )))
+        }
+    }
+
+    /// Atomically transfer one active run to a replacement coordinator.
+    ///
+    /// The compare-and-swap predicate fences stale owners. Artifact identity cannot change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current authority is stale, the artifact changes, or persistence
+    /// fails.
+    pub fn transfer_execution_authority(
+        &mut self,
+        run_id: &str,
+        expected: &WorkflowExecutionAuthority,
+        replacement: &WorkflowExecutionAuthority,
+        transferred_at_ms: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        if expected.target_artifact_id != replacement.target_artifact_id
+            || replacement.generation != expected.generation.saturating_add(1)
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow execution authority transfer is invalid".to_string(),
+            ));
+        }
+        let changed = self.connection.execute(
+            "UPDATE workflow_runs SET coordinator_daemon_instance_id = ?6, \
+             coordinator_generation = ?7, coordinator_fencing_token = ?8, updated_at_ms = ?9 \
+             WHERE run_id = ?1 AND target_artifact_id = ?2 \
+               AND coordinator_daemon_instance_id = ?3 AND coordinator_generation = ?4 \
+               AND coordinator_fencing_token = ?5 AND status IN ('running', 'paused')",
+            rusqlite::params![
+                run_id,
+                &expected.target_artifact_id,
+                &expected.daemon_instance_id,
+                expected.generation,
+                &expected.fencing_token,
+                &replacement.daemon_instance_id,
+                replacement.generation,
+                &replacement.fencing_token,
+                transferred_at_ms,
+            ],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(WorkflowStoreError::InvalidData(format!(
+                "workflow execution authority transfer lost its ownership race: {run_id}"
+            )))
+        }
+    }
+
     /// Idempotently create one durable workflow run using a caller-stable identity.
     ///
     /// Returns `true` when the run was created and `false` when the exact immutable request was
@@ -6630,6 +6768,42 @@ impl WorkflowStore {
         Ok(admitted)
     }
 
+    /// Redispatch receipt-less read-only attempts for one authority-qualified run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run identity, bound, durable state, owner dispatch, or receipt
+    /// persistence is invalid.
+    pub async fn redispatch_prepared_read_only_for_run<O>(
+        &mut self,
+        owner: &O,
+        run_id: &str,
+        limit: usize,
+        admitted_at_ms: u64,
+    ) -> Result<Vec<String>, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+    {
+        validate_id("run_id", run_id)?;
+        let prepared =
+            prepared_read_only_dispatches_for_run(&self.connection, run_id, bounded_limit(limit)?)?;
+        let mut admitted = Vec::with_capacity(prepared.len());
+        for request in prepared {
+            let receipt = owner.dispatch(&request).await?;
+            self.persist_dispatch_receipt(&DispatchReceipt {
+                run_id: request.activation.run_id.clone(),
+                node_id: request.activation.node_id.clone(),
+                activation_id: request.activation.activation_id.clone(),
+                attempt: request.attempt,
+                dispatch_identity: request.dispatch_identity.clone(),
+                receipt,
+                admitted_at_ms,
+            })?;
+            admitted.push(request.dispatch_identity);
+        }
+        Ok(admitted)
+    }
+
     /// Reconcile receipt-less prepared attempts after restart without external dispatch.
     ///
     /// Mutating attempts are atomically marked repair-required. Read-only attempts remain prepared
@@ -6643,6 +6817,30 @@ impl WorkflowStore {
         limit: usize,
         reconciled_at_ms: u64,
     ) -> Result<ReconciliationSummary, WorkflowStoreError> {
+        self.reconcile_prepared_attempts_scoped(None, limit, reconciled_at_ms)
+    }
+
+    /// Reconcile receipt-less attempts for one authority-qualified run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run identity, bound, query, or transition is invalid.
+    pub fn reconcile_prepared_attempts_for_run(
+        &mut self,
+        run_id: &str,
+        limit: usize,
+        reconciled_at_ms: u64,
+    ) -> Result<ReconciliationSummary, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        self.reconcile_prepared_attempts_scoped(Some(run_id), limit, reconciled_at_ms)
+    }
+
+    fn reconcile_prepared_attempts_scoped(
+        &mut self,
+        run_id: Option<&str>,
+        limit: usize,
+        reconciled_at_ms: u64,
+    ) -> Result<ReconciliationSummary, WorkflowStoreError> {
         if limit == 0 {
             return Err(WorkflowStoreError::InvalidData(
                 "reconciliation limit must be positive".to_string(),
@@ -6653,10 +6851,11 @@ impl WorkflowStore {
         let rows = {
             let mut statement = transaction.prepare(
                 "SELECT run_id, dispatch_identity, side_effect FROM workflow_attempts \
-                 WHERE status = 'prepared' ORDER BY prepared_at_ms, dispatch_identity LIMIT ?1",
+                 WHERE status = 'prepared' AND (?1 IS NULL OR run_id = ?1) \
+                 ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
             )?;
             statement
-                .query_map([limit], |row| {
+                .query_map(rusqlite::params![run_id, limit], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -6695,6 +6894,26 @@ impl WorkflowStore {
         }
         transaction.commit()?;
         Ok(summary)
+    }
+
+    /// Return bounded active run IDs requiring startup ownership qualification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bound or query is invalid.
+    pub fn recovery_candidate_run_ids(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT run_id FROM workflow_runs WHERE status IN ('running', 'paused') \
+             ORDER BY updated_at_ms, run_id LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkflowStoreError::from)
     }
 
     /// Return bounded receipt-backed attempts that need owner reattachment/observation.
@@ -10093,6 +10312,22 @@ fn prepared_read_only_dispatches(
     connection: &Connection,
     limit: i64,
 ) -> Result<Vec<PreparedActivationDispatch>, WorkflowStoreError> {
+    prepared_read_only_dispatches_scoped(connection, None, limit)
+}
+
+fn prepared_read_only_dispatches_for_run(
+    connection: &Connection,
+    run_id: &str,
+    limit: i64,
+) -> Result<Vec<PreparedActivationDispatch>, WorkflowStoreError> {
+    prepared_read_only_dispatches_scoped(connection, Some(run_id), limit)
+}
+
+fn prepared_read_only_dispatches_scoped(
+    connection: &Connection,
+    run_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<PreparedActivationDispatch>, WorkflowStoreError> {
     let mut statement = connection.prepare(
         "SELECT attempt.run_id, attempt.node_id, attempt.activation_id, attempt.attempt, \
          attempt.dispatch_identity, activation.dependency_generation, activation.input_json, \
@@ -10107,10 +10342,11 @@ fn prepared_read_only_dispatches(
          WHERE attempt.status = 'prepared' AND attempt.side_effect = 'read_only' \
            AND attempt.receipt_json IS NULL AND run.status = 'running' \
            AND run.cancellation_requested_at_ms IS NULL \
-         ORDER BY attempt.prepared_at_ms, attempt.dispatch_identity LIMIT ?1",
+           AND (?1 IS NULL OR attempt.run_id = ?1) \
+         ORDER BY attempt.prepared_at_ms, attempt.dispatch_identity LIMIT ?2",
     )?;
     statement
-        .query_map([limit], |row| {
+        .query_map(rusqlite::params![run_id, limit], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -12464,14 +12700,31 @@ fn create_run_in_transaction(
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
+    let (
+        target_artifact_id,
+        coordinator_daemon_instance_id,
+        coordinator_generation,
+        coordinator_fencing_token,
+    ) = run
+        .execution_authority
+        .as_ref()
+        .map_or((None, None, None, None), |authority| {
+            (
+                Some(authority.target_artifact_id.as_str()),
+                Some(authority.daemon_instance_id.as_str()),
+                Some(authority.generation),
+                Some(authority.fencing_token.as_str()),
+            )
+        });
     transaction.execute(
         "INSERT INTO workflow_runs \
              (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
               parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
-              authored_provenance_json, input_json, authorization_profile_json, authorization_ceiling, status, deadline_at_ms, \
-              node_execution_cap, concurrency_cap, cycle_cap, retry_cap, created_at_ms, updated_at_ms) \
+              authored_provenance_json, input_json, authorization_profile_json, authorization_ceiling, \
+              target_artifact_id, coordinator_daemon_instance_id, coordinator_generation, coordinator_fencing_token, \
+              status, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, created_at_ms, updated_at_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                     ?18, ?19, ?20, ?21, ?22, ?22)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?26)",
         rusqlite::params![
             &run.run_id,
             &run.definition_id,
@@ -12488,6 +12741,10 @@ fn create_run_in_transaction(
             &input_json,
             serde_json::to_string(&run.authorization_profile)?,
             workflow_capability_name(run.authorization_ceiling),
+            target_artifact_id,
+            coordinator_daemon_instance_id,
+            coordinator_generation,
+            coordinator_fencing_token,
             RunStatus::Running.as_str(),
             run.limits.deadline_at_ms,
             run.limits.node_execution_cap,
@@ -12744,6 +13001,24 @@ fn validate_run(run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
         return Err(WorkflowStoreError::InvalidData(
             "parent session generation requires parent_session_id".to_string(),
         ));
+    }
+    if let Some(authority) = &run.execution_authority {
+        validate_id("target_artifact_id", &authority.target_artifact_id)?;
+        validate_id(
+            "coordinator_daemon_instance_id",
+            &authority.daemon_instance_id,
+        )?;
+        validate_id("coordinator_fencing_token", &authority.fencing_token)?;
+        if authority.generation == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow coordinator generation must be positive".to_string(),
+            ));
+        }
+        if run.parent_session_id.is_none() {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow execution authority requires a parent session".to_string(),
+            ));
+        }
     }
     if let Some(binding) = &run.binding {
         validate_binding(binding)?;
@@ -13467,6 +13742,10 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
              input_json TEXT,\
              authorization_profile_json TEXT NOT NULL,\
              authorization_ceiling TEXT NOT NULL DEFAULT 'disabled',\
+             target_artifact_id TEXT,\
+             coordinator_daemon_instance_id TEXT,\
+             coordinator_generation INTEGER,\
+             coordinator_fencing_token TEXT,\
              terminal_output_id TEXT,\
              terminal_output_checksum_sha256 TEXT,\
              status TEXT NOT NULL,\
@@ -14582,6 +14861,7 @@ mod tests {
                     binding: None,
                     authored_provenance: None,
                     input: Some(input),
+                    execution_authority: None,
                     created_at_ms: 10,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -14667,6 +14947,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(input),
+                execution_authority: None,
                 created_at_ms: 10,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -14776,6 +15057,7 @@ mod tests {
                     binding: None,
                     authored_provenance: None,
                     input: Some(input),
+                    execution_authority: None,
                     created_at_ms: 10,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -14885,6 +15167,7 @@ mod tests {
                     binding: None,
                     authored_provenance: None,
                     input: Some(input),
+                    execution_authority: None,
                     created_at_ms: 10,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -14940,6 +15223,7 @@ mod tests {
                     binding: None,
                     authored_provenance: None,
                     input: Some(input.clone()),
+                    execution_authority: None,
                     created_at_ms: 10,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -15002,6 +15286,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(input.clone()),
+                execution_authority: None,
                 created_at_ms: 10,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -15051,6 +15336,7 @@ mod tests {
             binding: None,
             authored_provenance: None,
             input: Some(serde_json::json!(1)),
+            execution_authority: None,
             created_at_ms: 10,
             authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                 version: 1,
@@ -15256,6 +15542,7 @@ mod tests {
 
         let conflict = NewWorkflowRun {
             run_id: "run-2".to_string(),
+            execution_authority: None,
             created_at_ms: 15,
             ..run.clone()
         };
@@ -15446,6 +15733,7 @@ mod tests {
         store
             .create_run(&NewWorkflowRun {
                 run_id: "run-2".to_string(),
+                execution_authority: None,
                 created_at_ms: 20,
                 ..new_run()
             })
@@ -15887,6 +16175,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -15981,6 +16270,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -16074,6 +16364,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -16158,6 +16449,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -16255,6 +16547,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -16602,6 +16895,7 @@ mod tests {
         store
             .create_run(&NewWorkflowRun {
                 run_id: "run-2".to_string(),
+                execution_authority: None,
                 created_at_ms: 20,
                 ..new_run()
             })
@@ -17266,6 +17560,55 @@ mod tests {
     }
 
     #[test]
+    fn execution_authority_transfer_is_generation_fenced() {
+        let (_temp, mut store) = initialized_store();
+        let initial = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact-a".to_string(),
+            daemon_instance_id: "daemon-a".to_string(),
+            generation: 1,
+            fencing_token: "token-a".to_string(),
+        };
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET target_artifact_id = ?2, \
+                 coordinator_daemon_instance_id = ?3, coordinator_generation = ?4, \
+                 coordinator_fencing_token = ?5 WHERE run_id = ?1",
+                rusqlite::params![
+                    "run-1",
+                    &initial.target_artifact_id,
+                    &initial.daemon_instance_id,
+                    initial.generation,
+                    &initial.fencing_token,
+                ],
+            )
+            .expect("seed authority");
+        let replacement = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact-a".to_string(),
+            daemon_instance_id: "daemon-b".to_string(),
+            generation: 2,
+            fencing_token: "token-b".to_string(),
+        };
+
+        store
+            .transfer_execution_authority("run-1", &initial, &replacement, 20)
+            .expect("transfer");
+        assert_eq!(
+            store.execution_authority("run-1").expect("authority"),
+            Some(replacement.clone())
+        );
+        assert!(
+            store
+                .transfer_execution_authority("run-1", &initial, &replacement, 21)
+                .is_err()
+        );
+        assert!(store.verify_execution_authority("run-1", &initial).is_err());
+        store
+            .verify_execution_authority("run-1", &replacement)
+            .expect("current authority");
+    }
+
+    #[test]
     fn deferred_receipt_backed_mutation_remains_running() {
         struct Observer;
         impl AttemptStatusObserver for Observer {
@@ -17363,6 +17706,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -17422,6 +17766,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 3,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -17614,6 +17959,7 @@ mod tests {
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 2,
                     authorization_profile: parent.authorization_profile.clone(),
                     authorization_ceiling: parent.authorization_ceiling,
@@ -17677,6 +18023,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -17752,6 +18099,7 @@ mod tests {
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 2,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -17803,6 +18151,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -17862,6 +18211,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 3,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -17925,6 +18275,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -18002,6 +18353,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 3,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -18315,6 +18667,7 @@ mod tests {
         store
             .create_run(&NewWorkflowRun {
                 run_id: "run-2".to_string(),
+                execution_authority: None,
                 created_at_ms: 22,
                 ..first
             })
@@ -18951,6 +19304,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn durable_approval_denial_is_terminal_and_never_activates_downstream() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -19014,6 +19368,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(3)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -19557,6 +19912,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -19795,6 +20151,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -20014,6 +20371,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -20429,6 +20787,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -20539,6 +20898,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -20828,6 +21188,7 @@ mod tests {
                     binding: None,
                     authored_provenance: None,
                     input: Some(value.clone()),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -21523,6 +21884,7 @@ mod tests {
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {

@@ -320,13 +320,18 @@ repair-required state when trust cannot be established.
 ## Reconciliation and repair
 
 Automatic reconciliation is allowed only when durable receipts and owner APIs prove the current
-operation state. Agent-turn receipts persist the exact daemon artifact and daemon-instance identity
-that accepted the turn. A daemon with a different artifact, or a replacement daemon while the
-recorded session owner remains live or unverifiable, defers observation without mutating the
-attempt. This keeps the workflow database canonical across artifact-isolated daemons without letting
-one artifact recover or terminalize another artifact's live work. Prepared mutation without a
-trustworthy receipt or externally provable outcome becomes `repair_required`; it is not retried
-automatically.
+operation state. Every production run persists an immutable target artifact plus a current daemon
+coordinator generation and fencing token. Scheduling, continuation, and startup restoration qualify
+that authority before entering a mutation cycle and recheck it throughout the cycle; stale or foreign
+authority cannot dispatch, observe, cancel, resume, or terminalize the run. Authority transfer is a
+same-artifact compare-and-swap to the next generation and occurs only after canonical session-owner
+evidence proves the prior daemon ended. Agent-turn receipts additionally persist the exact daemon
+artifact and daemon-instance identity that accepted the turn. A daemon with a different artifact, or
+a replacement daemon while the recorded session owner remains live or unverifiable, defers
+observation without mutating the attempt. This keeps the workflow database canonical across
+artifact-isolated daemons without letting one artifact recover or terminalize another artifact's
+live work. Prepared mutation without a trustworthy receipt or externally provable outcome becomes
+`repair_required`; it is not retried automatically.
 
 Full replay, projection rebuild, receipt investigation, forced retry, and ambiguity resolution are
 explicit doctor/reconcile/repair operations. Maintenance acquires exclusive workflow-store

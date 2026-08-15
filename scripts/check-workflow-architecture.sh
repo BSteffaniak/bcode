@@ -92,7 +92,7 @@ if ! rg -q 'pub struct WorkflowStructuredSourceConcisePrompt' packages/workflow/
   violations=1
 fi
 
-if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 14' packages/workflow-store/src/lib.rs \
+if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 15' packages/workflow-store/src/lib.rs \
   || ! rg -q 'UnsupportedStore' packages/workflow-store/src/lib.rs \
   || ! rg -q 'reset_incompatible_store_in_state_dir' packages/workflow-store/src/lib.rs \
   || ! rg -q 'WorkflowStoreResetReceipt' packages/workflow-store/src/lib.rs \
@@ -103,6 +103,13 @@ if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 14' packages/workflow
   || ! rg -q 'restored.authorization_ceiling' packages/workflow-store/src/lib.rs \
   || ! rg -q 'restored active lease' packages/workflow-store/src/lib.rs \
   || ! rg -q 'restored checkpoint' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'WorkflowExecutionAuthority' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'transfer_execution_authority' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'verify_execution_authority' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'workflow_execution_authority' packages/server/src/lib.rs \
+  || ! rg -q 'workflow recovery deferred without mutation' packages/server/src/lib.rs \
+  || ! rg -q 'deferred_receipt_backed_mutation_remains_running' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'foreign_artifact_workflow_receipt_is_deferred_before_observation' packages/server/src/lib.rs \
   || ! rg -q 'DELETE-INCOMPATIBLE-WORKFLOW-STATE' packages/cli/src/lib.rs; then
   echo "Workflow store clean-break violation: fail-closed schema detection or explicit reset plumbing is missing." >&2
   violations=1

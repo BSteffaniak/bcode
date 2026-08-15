@@ -17066,6 +17066,14 @@ async fn start_workflow_run(
     authorization_profile
         .validate()
         .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    let workflow_session_ownership = state
+        .sessions
+        .acquire_session_ownership(
+            parent_session.id,
+            bcode_session::SessionOwnershipKind::RuntimeWork,
+        )
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     let new_run = bcode_workflow_store::NewWorkflowRun {
         run_id: run_id.clone(),
         definition_id: request.definition_id.clone(),
@@ -17076,6 +17084,15 @@ async fn start_workflow_run(
         binding: request.binding,
         authored_provenance,
         input: request.input,
+        execution_authority: Some(bcode_workflow_store::WorkflowExecutionAuthority {
+            target_artifact_id: state.daemon_status.artifact_id.as_ref().map_or_else(
+                || state.daemon_status.build_fingerprint.clone(),
+                ToString::to_string,
+            ),
+            daemon_instance_id: state.daemon_status.instance_id.clone(),
+            generation: 1,
+            fencing_token: uuid::Uuid::new_v4().to_string(),
+        }),
         created_at_ms,
         authorization_profile,
         authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
@@ -17102,6 +17119,7 @@ async fn start_workflow_run(
     )
     .await;
     drive_workflow_run(state, &run_id).await?;
+    drop(workflow_session_ownership);
     Ok(bcode_ipc::WorkflowRunStartResponse {
         run,
         runtime_work_id,
@@ -17135,7 +17153,103 @@ async fn broadcast_workflow_event(
     state.unregister_workflow_event_clients(&disconnected).await;
 }
 
+struct WorkflowAuthorityGuard {
+    authority: bcode_workflow_store::WorkflowExecutionAuthority,
+    _session_ownership: Option<bcode_session::SessionOwnershipGuard>,
+}
+
+async fn workflow_execution_authority(
+    state: &Arc<ServerState>,
+    run_id: &str,
+) -> Result<Option<WorkflowAuthorityGuard>, ServerError> {
+    let current = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execution_authority(run_id)?;
+    let Some(current) = current else {
+        return Ok(None);
+    };
+    let artifact_id = state.daemon_status.artifact_id.as_ref().map_or_else(
+        || state.daemon_status.build_fingerprint.clone(),
+        ToString::to_string,
+    );
+    if current.target_artifact_id != artifact_id {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow run targets another daemon artifact: {run_id}"
+        ))
+        .into());
+    }
+    if current.daemon_instance_id == state.daemon_status.instance_id {
+        return Ok(Some(WorkflowAuthorityGuard {
+            authority: current,
+            _session_ownership: None,
+        }));
+    }
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(run_id)?
+        .ok_or_else(|| WorkflowStoreError::RunNotFound {
+            run_id: run_id.to_string(),
+        })?;
+    let session_id = run
+        .parent_session_id
+        .as_deref()
+        .and_then(|value| SessionId::from_str(value).ok())
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "workflow run has no canonical parent session for ownership transfer".to_string(),
+            )
+        })?;
+    let root = state.sessions.session_store_root().ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "workflow ownership transfer requires a persistent session store".to_string(),
+        )
+    })?;
+    let prior_owner_live = bcode_session::lease::session_owner_observations(&root, session_id)
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+        .into_iter()
+        .any(|observation| {
+            observation.owner.daemon_instance_id.as_deref()
+                == Some(current.daemon_instance_id.as_str())
+                && matches!(
+                    observation.liveness,
+                    bcode_session::lease::SessionOwnerLiveness::Live
+                        | bcode_session::lease::SessionOwnerLiveness::Unverifiable
+                )
+        });
+    if prior_owner_live {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow run remains owned by another live daemon: {run_id}"
+        ))
+        .into());
+    }
+    let replacement = bcode_workflow_store::WorkflowExecutionAuthority {
+        target_artifact_id: current.target_artifact_id.clone(),
+        daemon_instance_id: state.daemon_status.instance_id.clone(),
+        generation: current.generation.saturating_add(1),
+        fencing_token: uuid::Uuid::new_v4().to_string(),
+    };
+    let session_ownership = state
+        .sessions
+        .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .transfer_execution_authority(run_id, &current, &replacement, current_unix_millis())?;
+    Ok(Some(WorkflowAuthorityGuard {
+        authority: replacement,
+        _session_ownership: Some(session_ownership),
+    }))
+}
+
 async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
+    let authority = workflow_execution_authority(state, run_id).await?;
     let started_at = std::time::Instant::now();
     let store_path = state
         .workflow_store
@@ -17144,6 +17258,10 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         .path()
         .to_path_buf();
     loop {
+        if let Some(authority) = authority.as_ref() {
+            bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+                .verify_execution_authority(run_id, &authority.authority)?;
+        }
         let iteration_started_at = std::time::Instant::now();
         let now_ms = current_unix_millis();
         if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
@@ -17953,6 +18071,13 @@ async fn control_associated_workflow_run(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .associated_run(&key)?;
     let changed = if let Some(run) = &run {
+        let _authority = workflow_execution_authority(state, &run.run_id)
+            .await?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "active workflow has no durable execution authority".to_string(),
+                )
+            })?;
         match action {
             bcode_ipc::WorkflowRunControlAction::Pause => state
                 .workflow_store
@@ -18081,6 +18206,13 @@ async fn handle_cancel_workflow_run(
     writer: &SharedWriter,
     run_id: String,
 ) -> Result<(), ServerError> {
+    let _authority = workflow_execution_authority(state, &run_id)
+        .await?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "active workflow has no durable execution authority".to_string(),
+            )
+        })?;
     let (recorded, attempts) = {
         let mut store = state
             .workflow_store
@@ -18110,10 +18242,17 @@ async fn handle_cancel_workflow_run(
 
 async fn handle_pause_workflow_run(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     run_id: String,
 ) -> Result<(), ServerError> {
+    let _authority = workflow_execution_authority(state, &run_id)
+        .await?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "active workflow has no durable execution authority".to_string(),
+            )
+        })?;
     let changed = state
         .workflow_store
         .lock()
@@ -18143,6 +18282,13 @@ async fn handle_resume_workflow_run(
 }
 
 async fn resume_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<bool, ServerError> {
+    let _authority = workflow_execution_authority(state, run_id)
+        .await?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "active workflow has no durable execution authority".to_string(),
+            )
+        })?;
     let changed = state
         .workflow_store
         .lock()
@@ -32200,6 +32346,11 @@ async fn dispatch_workflow_child(
             binding: None,
             authored_provenance,
             input: request.activation.input.clone(),
+            execution_authority: state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .execution_authority(&request.activation.run_id)?,
             created_at_ms: now,
             authorization_profile: parent.authorization_profile,
             authorization_ceiling: parent.authorization_ceiling,
@@ -32685,12 +32836,42 @@ async fn settle_workflow_prompt_observation(
     request: &bcode_workflow_store::PreparedActivationDispatch,
     observation: bcode_workflow_store::AttemptObservation,
 ) {
+    let authority = match workflow_execution_authority(state, &request.activation.run_id).await {
+        Ok(Some(authority)) => authority,
+        Ok(None) => {
+            tracing::warn!(
+                run_id = %request.activation.run_id,
+                "refusing workflow prompt settlement without durable execution authority"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                run_id = %request.activation.run_id,
+                %error,
+                "refusing workflow prompt settlement from a stale or foreign owner"
+            );
+            return;
+        }
+    };
     let store_path = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .path()
         .to_path_buf();
+    if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+        .and_then(|store| {
+            store.verify_execution_authority(&request.activation.run_id, &authority.authority)
+        })
+        .is_err()
+    {
+        tracing::warn!(
+            run_id = %request.activation.run_id,
+            "workflow prompt settlement lost execution authority"
+        );
+        return;
+    }
     match persist_workflow_prompt_completion(&store_path, &request.dispatch_identity, observation)
         .await
     {
@@ -33124,208 +33305,89 @@ async fn dispatch_workflow_prompt_turn(
 
 #[allow(clippy::too_many_lines)]
 async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
-    let prepared = {
-        let mut store = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.reconcile_prepared_attempts(1_000, current_unix_millis()) {
-            Ok(summary) => summary,
+    let run_ids = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recovery_candidate_run_ids(1_000);
+    let run_ids = match run_ids {
+        Ok(run_ids) => run_ids,
+        Err(error) => {
+            tracing::warn!("failed to discover workflow recovery candidates: {error}");
+            return;
+        }
+    };
+    for run_id in run_ids {
+        let authority = match workflow_execution_authority(state, &run_id).await {
+            Ok(Some(authority)) => authority,
+            Ok(None) => {
+                tracing::warn!(run_id, "active workflow has no durable execution authority");
+                continue;
+            }
             Err(error) => {
-                tracing::warn!(
-                    "failed to reconcile prepared workflow attempts at startup: {error}"
-                );
-                return;
+                tracing::debug!(run_id, %error, "workflow recovery deferred without mutation");
+                continue;
             }
-        }
-    };
-    if !prepared.repair_required.is_empty() {
-        tracing::warn!(
-            attempts = ?prepared.repair_required,
-            "workflow mutating attempts require explicit repair after startup"
-        );
-    }
-    let attempts = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .active_attempts(1_000);
-    let attempts = match attempts {
-        Ok(attempts) => attempts,
-        Err(error) => {
-            tracing::warn!("failed to discover active workflow attempts at startup: {error}");
-            return;
-        }
-    };
-    let observer = WorkflowTurnReceiptObserver { state };
-    let store_path = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .path()
-        .to_path_buf();
-    let owner = WorkflowActivationOwner { state };
-    match bcode_workflow_store::WorkflowStore::open_at_path(&store_path) {
-        Ok(mut store) => {
-            if let Err(error) = store
-                .redispatch_prepared_read_only(&owner, 1_000, current_unix_millis())
-                .await
-            {
-                tracing::warn!(
-                    "failed to redispatch prepared read-only workflow attempts: {error}"
-                );
-            }
-        }
-        Err(error) => tracing::warn!("failed to open workflow store for redispatch: {error}"),
-    }
-    match bcode_workflow_store::WorkflowStore::open_at_path(&store_path) {
-        Ok(mut store) => {
-            let reconciliation = store
-                .reconcile_receipt_backed_attempts_async(&observer, 1_000, current_unix_millis())
-                .await;
-            match reconciliation {
-                Ok(summary) => {
-                    let resumable_runs = summary
-                        .succeeded
-                        .iter()
-                        .filter_map(|identity| {
-                            attempts
-                                .iter()
-                                .find(|attempt| &attempt.dispatch_identity == identity)
-                                .map(|attempt| attempt.run_id.clone())
-                        })
-                        .chain(
-                            summary
-                                .retries_scheduled
-                                .iter()
-                                .map(|retry| retry.run_id.clone()),
-                        )
-                        .collect::<BTreeSet<_>>();
-                    let sibling_cancellations = summary.sibling_cancellations;
-                    // Surface unprovable state rather than discarding it. Mutating attempts already
-                    // moved to `repair_required`; read-only attempts stay active, so they are the
-                    // ones an operator would otherwise never hear about.
-                    if !summary.repair_required.is_empty() {
-                        tracing::warn!(
-                            attempts = ?summary.repair_required,
-                            "workflow attempts require explicit repair after startup reconciliation"
-                        );
-                    }
-                    if !summary.unresolved_read_only.is_empty() {
-                        tracing::warn!(
-                            attempts = ?summary.unresolved_read_only,
-                            "read-only workflow attempts could not be resolved at startup and \
-                             remain active; they need explicit inspection"
-                        );
-                    }
-                    drop(store);
-                    if let Err(error) =
-                        propagate_fail_fast_sibling_cancellation(state, sibling_cancellations).await
-                    {
-                        tracing::warn!("failed to restore fail-fast sibling cancellation: {error}");
-                    }
-                    for run_id in resumable_runs {
-                        if let Err(error) = drive_workflow_run(state, &run_id).await {
-                            tracing::warn!(
-                                run_id,
-                                "failed to continue reconciled workflow: {error}"
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!("failed to reconcile workflow attempts at startup: {error}");
-                }
-            }
-        }
-        Err(error) => tracing::warn!("failed to open workflow store at startup: {error}"),
-    }
-    if let Err(error) = continue_pending_workflow_runs(state).await {
-        tracing::warn!("failed to continue pending workflow runs at startup: {error}");
-    }
-    let pending_sibling_cancellations = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pending_sibling_cancellations(1_000);
-    match pending_sibling_cancellations {
-        Ok(attempts) => {
-            if let Err(error) = propagate_fail_fast_sibling_cancellation(state, attempts).await {
-                tracing::warn!("failed to resume fail-fast sibling cancellation: {error}");
-            }
-        }
-        Err(error) => {
-            tracing::warn!("failed to discover fail-fast sibling cancellation: {error}");
-        }
-    }
-    let active_attempts = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .active_attempts(1_000);
-    let active_attempts = match active_attempts {
-        Ok(attempts) => attempts,
-        Err(error) => {
-            tracing::warn!("failed to rediscover active workflow attempts at startup: {error}");
-            return;
-        }
-    };
-    let mut registered_runs = BTreeSet::new();
-    for attempt in active_attempts {
-        let run = state
+        };
+        let store_path = state
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .run_summary(&attempt.run_id);
-        let Ok(Some(run)) = run else {
-            continue;
+            .path()
+            .to_path_buf();
+        let owner = WorkflowActivationOwner { state };
+        let observer = WorkflowTurnReceiptObserver { state };
+        let mut store = match bcode_workflow_store::WorkflowStore::open_at_path(&store_path) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(run_id, %error, "failed to open workflow store for recovery");
+                continue;
+            }
         };
-        let Some(parent_session_id) = run
-            .parent_session_id
-            .as_deref()
-            .and_then(|value| SessionId::from_str(value).ok())
-        else {
+        if let Err(error) = store.verify_execution_authority(&run_id, &authority.authority) {
+            tracing::debug!(run_id, %error, "workflow recovery lost execution authority");
             continue;
-        };
-        let run_work_id = WorkId::new(format!("workflow:{}", attempt.run_id));
-        if registered_runs.insert(attempt.run_id.clone()) {
-            register_workflow_runtime_work(
-                state,
-                parent_session_id,
-                &attempt.run_id,
-                format!("workflow {} v{}", run.definition_id, run.definition_version),
+        }
+        if let Err(error) =
+            store.reconcile_prepared_attempts_for_run(&run_id, 1_000, current_unix_millis())
+        {
+            tracing::warn!(run_id, %error, "failed to reconcile prepared workflow attempts");
+            continue;
+        }
+        if let Err(error) = store
+            .redispatch_prepared_read_only_for_run(&owner, &run_id, 1_000, current_unix_millis())
+            .await
+        {
+            tracing::warn!(run_id, %error, "failed to redispatch prepared workflow attempts");
+            continue;
+        }
+        let reconciliation = store
+            .reconcile_receipt_backed_attempts_for_run_async(
+                &observer,
+                &run_id,
+                1_000,
+                current_unix_millis(),
             )
             .await;
+        drop(store);
+        match reconciliation {
+            Ok(summary) => {
+                if !summary.repair_required.is_empty() {
+                    tracing::warn!(run_id, attempts = ?summary.repair_required,
+                        "workflow attempts require explicit repair after qualified recovery");
+                }
+                if let Err(error) =
+                    propagate_fail_fast_sibling_cancellation(state, summary.sibling_cancellations)
+                        .await
+                {
+                    tracing::warn!(run_id, %error, "failed to restore sibling cancellation");
+                }
+                if let Err(error) = drive_workflow_run(state, &run_id).await {
+                    tracing::warn!(run_id, %error, "failed to continue owned workflow");
+                }
+            }
+            Err(error) => tracing::warn!(run_id, %error, "failed to reconcile owned workflow"),
         }
-        let session_id = attempt
-            .receipt
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| SessionId::from_str(value).ok())
-            .unwrap_or(parent_session_id);
-        let Some(cancellation) = state
-            .session_current_turn(session_id)
-            .await
-            .filter(|turn| {
-                attempt
-                    .receipt
-                    .get("turn_id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|turn_id| turn.turn_id == turn_id)
-            })
-            .map(|turn| turn.cancel_state)
-        else {
-            continue;
-        };
-        register_workflow_node_runtime_work(
-            state,
-            session_id,
-            &run_work_id,
-            &attempt.dispatch_identity,
-            format!("workflow node {}", attempt.node_id),
-            CancellationHandle::WorkflowNode(cancellation),
-        )
-        .await;
     }
 }
 
@@ -33372,18 +33434,6 @@ async fn finish_restored_terminal_workflow_runtime_work(state: &ServerState) {
             tracing::warn!(run_id = %run.run_id, "failed to finish terminal workflow work: {error}");
         }
     }
-}
-
-async fn continue_pending_workflow_runs(state: &Arc<ServerState>) -> Result<(), ServerError> {
-    let run_ids = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resumable_pending_run_ids(1_000)?;
-    for run_id in run_ids {
-        drive_workflow_run(state, &run_id).await?;
-    }
-    Ok(())
 }
 
 async fn register_workflow_runtime_work(
@@ -55395,6 +55445,7 @@ library = "test"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -55585,6 +55636,7 @@ library = "test"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -55768,6 +55820,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -55938,6 +55991,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -56075,6 +56129,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -56243,6 +56298,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!({"condition_met": false})),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -56821,6 +56877,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -56984,6 +57041,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -57180,6 +57238,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!({"condition_met": false})),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -57431,6 +57490,7 @@ library = "test"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"value": true})),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -57576,6 +57636,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -57743,6 +57804,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -58715,6 +58777,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::Value::Null),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -58870,6 +58933,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -59017,6 +59081,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -59210,6 +59275,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -59334,6 +59400,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -59438,6 +59505,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -59533,6 +59601,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(false)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -59701,6 +59770,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -59875,6 +59945,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -60002,6 +60073,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -60104,6 +60176,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 }),
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -60195,6 +60268,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -60298,6 +60372,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     }),
                     authored_provenance: None,
                     input: Some(serde_json::json!(false)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -60632,6 +60707,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -60698,6 +60774,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
+                    execution_authority: None,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -60805,6 +60882,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
+                execution_authority: None,
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -66950,6 +67028,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             binding: None,
             authored_provenance: None,
             input: Some(serde_json::json!(1)),
+            execution_authority: None,
             created_at_ms,
             authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                 version: 1,

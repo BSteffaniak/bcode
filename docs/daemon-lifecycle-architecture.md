@@ -65,6 +65,12 @@ Connection, startup, and application-request deadlines are separate client setti
 
 Artifact-specific daemon routing does not create artifact-specific canonical session history. All artifacts use the canonical session root. Session leases include daemon compatibility and instance metadata and prevent conflicting runtime ownership across artifact versions. Historical daemon records remain conservative control evidence.
 
+The canonical workflow store is likewise shared rather than forked by artifact. Active runs persist
+the immutable artifact they target and a generation-fenced daemon coordinator. A foreign artifact or
+stale daemon may perform bounded discovery for diagnostics but cannot mutate, recover, or control the
+run. A matching artifact may transfer authority only after session-owner evidence proves that the
+prior coordinator ended; unverifiable ownership defers without mutation.
+
 Snapshots, event envelopes, and bounded reconnect checkpoints are state transfer only. They are not described as durable resume unless retention, acknowledgement, replay, and conflict behavior are defined by the relevant transport contract.
 
 ## Transition behavior
