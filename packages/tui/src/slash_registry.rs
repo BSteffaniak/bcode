@@ -68,8 +68,6 @@ const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "cwd" },
     BuiltinSlashCommand { name: "worktree" },
     BuiltinSlashCommand { name: "worktrees" },
-    BuiltinSlashCommand { name: "fork" },
-    BuiltinSlashCommand { name: "clone" },
     BuiltinSlashCommand { name: "ralph" },
     BuiltinSlashCommand { name: "goal" },
     BuiltinSlashCommand { name: "skills" },
@@ -184,14 +182,6 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     SlashCompletion {
         command: "/thinking summary",
         description: "Open reasoning settings focused on summary",
-    },
-    SlashCompletion {
-        command: "/fork",
-        description: "Fork current session",
-    },
-    SlashCompletion {
-        command: "/clone",
-        description: "Clone current session",
     },
     SlashCompletion {
         command: "/worktree",
@@ -408,6 +398,17 @@ mod tests {
         }));
         assert!(is_builtin_command_name("search"));
         assert!(!is_non_conflicting_skill_alias(&SkillId::new("search")));
+    }
+
+    #[test]
+    fn fork_and_clone_are_not_host_builtins() {
+        assert!(!is_builtin_command_name("fork"));
+        assert!(!is_builtin_command_name("clone"));
+        assert!(
+            static_completions()
+                .iter()
+                .all(|completion| !matches!(completion.command(), "/fork" | "/clone"))
+        );
     }
 
     #[test]

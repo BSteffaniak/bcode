@@ -369,6 +369,23 @@ struct ForkSelectSurface {
     selected: usize,
 }
 
+impl ForkSelectSurface {
+    fn selected_outcome(&self) -> Option<serde_json::Value> {
+        let candidate = self.candidates.get(self.selected)?;
+        let outcome = bcode_plugin_sdk::tui::PluginTuiSurfaceOutcome {
+            status: Some("creating fork…".to_owned()),
+            append_text: None,
+            invoke_command: Some(CommandAction::Plugin {
+                plugin_id: PLUGIN_ID.to_owned(),
+                command_id: FORK_COMMAND_ID.to_owned(),
+            }),
+            command_args: BTreeMap::from([("sequence".to_owned(), candidate.sequence.to_string())]),
+            set_session_working_directory: None,
+        };
+        serde_json::to_value(outcome).ok()
+    }
+}
+
 impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
     fn id(&self) -> &'static str {
         "session-derivation.fork-select"
@@ -442,28 +459,81 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
                 bcode_plugin_sdk::tui::PluginTuiAction::Redraw
             }
             KeyCode::Enter => {
-                let Some(candidate) = self.candidates.get(self.selected) else {
+                if self.candidates.get(self.selected).is_none() {
                     return bcode_plugin_sdk::tui::PluginTuiAction::None;
-                };
-                let outcome = bcode_plugin_sdk::tui::PluginTuiSurfaceOutcome {
-                    status: Some("creating fork…".to_owned()),
-                    append_text: None,
-                    invoke_command: Some(CommandAction::Plugin {
-                        plugin_id: PLUGIN_ID.to_owned(),
-                        command_id: FORK_COMMAND_ID.to_owned(),
-                    }),
-                    command_args: BTreeMap::from([(
-                        "sequence".to_owned(),
-                        candidate.sequence.to_string(),
-                    )]),
-                    set_session_working_directory: None,
-                };
+                }
                 bcode_plugin_sdk::tui::PluginTuiAction::Close {
-                    outcome: serde_json::to_value(outcome).ok(),
+                    outcome: self.selected_outcome(),
                 }
             }
             _ => bcode_plugin_sdk::tui::PluginTuiAction::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_plugin_owned_first_class_entries() {
+        let commands = commands();
+        assert_eq!(commands.len(), 2);
+        for (command, slash) in commands.iter().zip(["fork", "clone"]) {
+            assert_eq!(command.slash_name(), Some(slash));
+            assert_eq!(command.session, CommandSessionRequirement::Required);
+            assert!(command.surfaces.contains(&CommandSurface::Palette));
+            assert!(command.surfaces.contains(&CommandSurface::Slash));
+            assert!(matches!(
+                &command.action,
+                CommandAction::Plugin { plugin_id, .. } if plugin_id == PLUGIN_ID
+            ));
+        }
+    }
+
+    #[test]
+    fn fork_surface_selection_returns_plugin_command_continuation() {
+        let mut surface = ForkSelectSurface {
+            candidates: vec![
+                bcode_session_models::SessionDerivationPromptCandidate {
+                    sequence: 4,
+                    timestamp_ms: 1,
+                    preview: "first".to_owned(),
+                    truncated: false,
+                },
+                bcode_session_models::SessionDerivationPromptCandidate {
+                    sequence: 9,
+                    timestamp_ms: 2,
+                    preview: "second".to_owned(),
+                    truncated: false,
+                },
+            ],
+            selected: 0,
+        };
+        surface.selected = 1;
+        let outcome: bcode_plugin_sdk::tui::PluginTuiSurfaceOutcome =
+            serde_json::from_value(surface.selected_outcome().expect("outcome"))
+                .expect("typed outcome");
+        assert_eq!(
+            outcome.command_args.get("sequence").map(String::as_str),
+            Some("9")
+        );
+        assert!(matches!(
+            outcome.invoke_command,
+            Some(CommandAction::Plugin { ref plugin_id, ref command_id })
+                if plugin_id == PLUGIN_ID && command_id == FORK_COMMAND_ID
+        ));
+    }
+
+    #[test]
+    fn renderer_neutral_argument_parser_preserves_sequence_and_name() {
+        assert_eq!(
+            parse_arguments("sequence=42 name=branch"),
+            BTreeMap::from([
+                ("name".to_owned(), "branch".to_owned()),
+                ("sequence".to_owned(), "42".to_owned()),
+            ])
+        );
     }
 }
 

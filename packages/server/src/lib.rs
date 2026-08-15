@@ -5714,7 +5714,7 @@ async fn handle_agent_permission_plugin_request(
             operation,
             payload,
         } => {
-            handle_invoke_plugin_service(
+            Box::pin(handle_invoke_plugin_service(
                 request_id,
                 state,
                 writer,
@@ -5722,7 +5722,7 @@ async fn handle_agent_permission_plugin_request(
                 &interface_id,
                 operation,
                 payload,
-            )
+            ))
             .await
         }
         AgentSkillPluginRequest::CallPluginService {
@@ -33465,27 +33465,29 @@ async fn handle_invoke_plugin_service(
         bcode_plugin::PluginInvocationScope::Global,
         Some(bridge),
     );
-    let response = state
-        .metrics
-        .time_result_async("plugin.service", labels, async {
-            tokio::pin!(invocation);
-            loop {
-                tokio::select! {
-                    result = &mut invocation => break result,
-                    bridge_call = bridge_requests.recv() => {
-                        let Some(bridge_call) = bridge_call else {
-                            continue;
-                        };
-                        let response = resolve_command_plugin_bridge_request(
-                            &state.sessions,
-                            bridge_call.request,
-                        ).await;
-                        let _ = bridge_call.response.send(response);
+    let response = Box::pin(
+        state
+            .metrics
+            .time_result_async("plugin.service", labels, async {
+                tokio::pin!(invocation);
+                loop {
+                    tokio::select! {
+                        result = &mut invocation => break result,
+                        bridge_call = bridge_requests.recv() => {
+                            let Some(bridge_call) = bridge_call else {
+                                continue;
+                            };
+                            let response = resolve_command_plugin_bridge_request(
+                                &state.sessions,
+                                bridge_call.request,
+                            ).await;
+                            let _ = bridge_call.response.send(response);
+                        }
                     }
                 }
-            }
-        })
-        .await;
+            }),
+    )
+    .await;
     send_plugin_service_response(writer, request_id, response).await
 }
 

@@ -443,14 +443,14 @@ mod tests {
     }
 
     #[test]
-    fn includes_session_fork_commands() {
+    fn excludes_host_session_fork_commands() {
         let commands = static_items()
             .into_iter()
             .map(|item| item.command().to_owned())
             .collect::<Vec<_>>();
 
-        assert!(commands.iter().any(|command| command == "/fork"));
-        assert!(commands.iter().any(|command| command == "/clone"));
+        assert!(commands.iter().all(|command| command != "/fork"));
+        assert!(commands.iter().all(|command| command != "/clone"));
     }
 
     #[test]

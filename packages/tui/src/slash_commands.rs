@@ -949,23 +949,6 @@ async fn execute_builtin(
         "worktree" | "worktrees" => {
             worktree_command(client, session_id, context.working_directory, parts).await
         }
-        "fork" => {
-            if session_id.is_none() {
-                return Ok(SlashCommandOutcome::Handled(
-                    "fork requires an active session".to_owned(),
-                ));
-            }
-            Ok(SlashCommandOutcome::OpenForkSessionWizard)
-        }
-        "clone" => {
-            let Some(session_id) = session_id else {
-                return Ok(SlashCommandOutcome::Handled(
-                    "clone requires an active session".to_owned(),
-                ));
-            };
-            let name = parts.get(1).map(|value| (*value).to_owned());
-            Ok(SlashCommandOutcome::CloneSession { session_id, name })
-        }
         "ralph" => Ok(ralph_command(parts)),
         "goal" => Ok(goal_command(parts)),
         "skills" => Ok(SlashCommandOutcome::PickSkill),

@@ -424,18 +424,6 @@ pub fn bundled_host_palette_commands() -> Vec<CommandContribution> {
             "session",
         ),
         CommandContribution::host_palette(
-            "session.fork",
-            "Fork Session",
-            "Create a new session from an earlier prompt",
-            "session",
-        ),
-        CommandContribution::host_palette(
-            "session.clone",
-            "Clone Session",
-            "Copy the full current conversation into a new session",
-            "session",
-        ),
-        CommandContribution::host_palette(
             "theme.select",
             "Theme: Select",
             "List themes and show preview/apply commands",
