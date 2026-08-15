@@ -65,6 +65,11 @@ pub fn static_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExte
         "bcode.ralph",
         bcode_ralph_plugin::tui_registry,
     ));
+    #[cfg(feature = "static-bundled-session-derivation-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.session-derivation",
+        bcode_session_derivation_plugin::session_derivation_tui_registry,
+    ));
     #[cfg(feature = "static-bundled-shell-plugin")]
     extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
         "bcode.shell",
@@ -125,6 +130,10 @@ pub fn tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiR
         "bcode.question" => Some(bcode_question_plugin::question_tui_registry()),
         #[cfg(feature = "static-bundled-ralph-plugin")]
         "bcode.ralph" => Some(bcode_ralph_plugin::tui_registry()),
+        #[cfg(feature = "static-bundled-session-derivation-plugin")]
+        "bcode.session-derivation" => {
+            Some(bcode_session_derivation_plugin::session_derivation_tui_registry())
+        }
         #[cfg(feature = "static-bundled-shell-plugin")]
         "bcode.shell" => Some(bcode_shell_plugin::shell_tui_registry()),
         #[cfg(feature = "static-bundled-skills-plugin")]

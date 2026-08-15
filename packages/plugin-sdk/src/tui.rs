@@ -801,6 +801,12 @@ pub struct PluginTuiSurfaceOutcome {
     /// Optional transcript text. Legacy strings remain plain text.
     #[serde(default)]
     pub append_text: Option<PluginTuiText>,
+    /// Optional plugin command to invoke after this surface closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoke_command: Option<bcode_command::CommandAction>,
+    /// Arguments supplied to `invoke_command`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub command_args: std::collections::BTreeMap<String, String>,
     /// Optional working directory to attach to the active session.
     #[serde(default)]
     pub set_session_working_directory: Option<String>,

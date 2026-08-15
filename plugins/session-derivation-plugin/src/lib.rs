@@ -19,6 +19,12 @@ use bcode_session_models::{
     SessionDerivationRequest, SessionDerivationSourcePolicy, SessionDerivationTerminalOutcome,
 };
 use bcode_tool::{ToolInvocationServiceRequest, ToolInvocationServiceResolution};
+use bmux_keyboard::KeyCode;
+use bmux_tui::event::Event;
+use bmux_tui::frame::Frame;
+use bmux_tui::geometry::Rect;
+use bmux_tui::style::{Modifier, Style};
+use bmux_tui::text::{Line, Span};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -247,7 +253,7 @@ fn prompt_selection_fallback(
         return ServiceResponse::error("no_prompts", "no user prompts are available to fork");
     }
     let mut text = String::from("Select a prompt sequence and run `/fork sequence=<n>`:\n\n");
-    for candidate in page.candidates {
+    for candidate in &page.candidates {
         let preview = candidate.preview.replace('\n', " ");
         let _ = writeln!(text, "* `{}` — {}", candidate.sequence, preview);
     }
@@ -257,10 +263,21 @@ fn prompt_selection_fallback(
         updated_model: None,
         updated_provider: None,
         updated_thinking: None,
-        effects: vec![CommandEffect::AppendText {
-            text,
-            format: bcode_command::CommandTextFormat::Markdown,
-        }],
+        effects: vec![
+            CommandEffect::AppendText {
+                text,
+                format: bcode_command::CommandTextFormat::Markdown,
+            },
+            CommandEffect::OpenPluginSurface {
+                surface_kind: "session-derivation.fork-select".to_owned(),
+                instance_id: format!("fork-select-{session_id}"),
+                options: serde_json::json!({
+                    "session_id": session_id,
+                    "generation": generation,
+                    "candidates": page.candidates,
+                }),
+            },
+        ],
     })
 }
 
@@ -308,6 +325,146 @@ fn parse_arguments(arguments: &str) -> BTreeMap<String, String> {
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
     ServiceResponse::json(value)
         .unwrap_or_else(|error| ServiceResponse::error("encode_failed", error.to_string()))
+}
+
+#[must_use]
+pub fn session_derivation_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_factory(Box::new(ForkSelectSurfaceFactory));
+    registry
+}
+
+struct ForkSelectSurfaceFactory;
+
+impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for ForkSelectSurfaceFactory {
+    fn surface_kind(&self) -> &'static str {
+        "session-derivation.fork-select"
+    }
+
+    fn open(
+        &self,
+        request: bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest,
+    ) -> bcode_plugin_sdk::tui::PluginTuiSurfaceFuture {
+        Box::pin(async move {
+            let candidates = serde_json::from_value::<
+                Vec<bcode_session_models::SessionDerivationPromptCandidate>,
+            >(
+                request
+                    .options
+                    .get("candidates")
+                    .cloned()
+                    .unwrap_or_default(),
+            )?;
+            Ok(Box::new(ForkSelectSurface {
+                candidates,
+                selected: 0,
+            })
+                as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
+        })
+    }
+}
+
+struct ForkSelectSurface {
+    candidates: Vec<bcode_session_models::SessionDerivationPromptCandidate>,
+    selected: usize,
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
+    fn id(&self) -> &'static str {
+        "session-derivation.fork-select"
+    }
+
+    fn title(&self) -> &'static str {
+        "Fork Session"
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        frame.fill(area, " ", Style::new());
+        frame.write_line(
+            Rect::new(area.x, area.y, area.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                "Select the prompt to edit in the fork",
+                Style::new().add_modifier(Modifier::BOLD),
+            )]),
+        );
+        for (index, candidate) in self
+            .candidates
+            .iter()
+            .take(usize::from(area.height.saturating_sub(2)))
+            .enumerate()
+        {
+            let style = if index == self.selected {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            frame.write_line(
+                Rect::new(
+                    area.x,
+                    area.y
+                        .saturating_add(u16::try_from(index + 2).unwrap_or(u16::MAX)),
+                    area.width,
+                    1,
+                ),
+                &Line::from_spans(vec![Span::styled(
+                    format!(
+                        "{}  {}",
+                        candidate.sequence,
+                        candidate.preview.replace('\n', " ")
+                    ),
+                    style,
+                )]),
+            );
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        event: &Event,
+        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        let Event::Key(key) = event else {
+            return bcode_plugin_sdk::tui::PluginTuiAction::None;
+        };
+        match key.key {
+            KeyCode::Escape | KeyCode::Char('q') => {
+                bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
+            }
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+            KeyCode::Down => {
+                self.selected = self
+                    .selected
+                    .saturating_add(1)
+                    .min(self.candidates.len().saturating_sub(1));
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+            KeyCode::Enter => {
+                let Some(candidate) = self.candidates.get(self.selected) else {
+                    return bcode_plugin_sdk::tui::PluginTuiAction::None;
+                };
+                let outcome = bcode_plugin_sdk::tui::PluginTuiSurfaceOutcome {
+                    status: Some("creating fork…".to_owned()),
+                    append_text: None,
+                    invoke_command: Some(CommandAction::Plugin {
+                        plugin_id: PLUGIN_ID.to_owned(),
+                        command_id: FORK_COMMAND_ID.to_owned(),
+                    }),
+                    command_args: BTreeMap::from([(
+                        "sequence".to_owned(),
+                        candidate.sequence.to_string(),
+                    )]),
+                    set_session_working_directory: None,
+                };
+                bcode_plugin_sdk::tui::PluginTuiAction::Close {
+                    outcome: serde_json::to_value(outcome).ok(),
+                }
+            }
+            _ => bcode_plugin_sdk::tui::PluginTuiAction::None,
+        }
+    }
 }
 
 #[cfg(feature = "static-bundled")]

@@ -2478,6 +2478,8 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_tool",
+ "bmux_keyboard",
+ "bmux_tui",
  "serde",
  "serde_json",
 ]
