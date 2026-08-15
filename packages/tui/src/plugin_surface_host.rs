@@ -907,80 +907,6 @@ async fn stream_plugin_session_view_inner(
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod tests {
-    use super::{
-        PluginWorkflowPackageExportStartRequest, SessionId, workflow_package_export_start_request,
-    };
-
-    #[test]
-    fn bmux_invalidation_signal_coalesces_plugin_redraw_requests() {
-        let redraw = bmux_tui_runtime::InvalidationSignal::new();
-        redraw.request();
-        redraw.request();
-
-        assert!(redraw.take());
-        assert!(!redraw.take());
-        assert_eq!(redraw.requests(), 2);
-        assert_eq!(redraw.coalesced(), 1);
-    }
-
-    #[test]
-    fn plugin_surface_host_source_uses_bmux_redraw_latch() {
-        let source = include_str!("plugin_surface_host.rs");
-        assert!(source.contains("InvalidationSignal"));
-    }
-
-    #[test]
-    fn plugin_surface_host_adapts_portable_package_export_start() {
-        let parent_session_id = SessionId::new();
-        let request =
-            workflow_package_export_start_request(PluginWorkflowPackageExportStartRequest {
-                package_export: bcode_workflow::WorkflowPackageExportIdentity {
-                    package_id: "example/package".to_string(),
-                    export: "main".to_string(),
-                    package_lock_digest_sha256: Some("a".repeat(64)),
-                },
-                run_id: Some("run-1".to_string()),
-                parent_session_id,
-                workspace_snapshot: Some("workspace".to_string()),
-                parent_session_generation: Some(1),
-                configuration: None,
-                input: Some(serde_json::json!({"subject": "change"})),
-            });
-        assert_eq!(request.package_export.package_id, "example/package");
-        assert_eq!(request.parent_session_id, parent_session_id);
-        assert_eq!(request.input.expect("input")["subject"], "change");
-    }
-
-    #[test]
-    fn plugin_surface_host_exposes_portable_workflow_authoring_services() {
-        let source = include_str!("plugin_surface_host.rs");
-        for service in [
-            "workflow_authoring_catalog",
-            "generate_structured_output",
-            "accept_generated_workflow_candidate",
-            "instantiate_workflow_template",
-            "workflow_authoring_draft",
-            "workflow_authoring_revision",
-            "apply_workflow_authoring_edits",
-            "validate_workflow_authoring",
-            "preview_workflow_authoring",
-            "publish_workflow_authoring_draft",
-            "start_authored_workflow_revision",
-            "start_workflow_package_export",
-        ] {
-            assert!(
-                source.contains(service),
-                "missing authoring service: {service}"
-            );
-        }
-        assert!(!source.contains(concat!("super::terminal_", "events")));
-        assert!(!source.contains(concat!("Terminal<", "&mut")));
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 async fn stream_plugin_workflow_views(
     client: BcodeClient,
@@ -1125,4 +1051,77 @@ pub fn subscribe_workflow_views(
     let (sender, receiver) = mpsc::channel(64);
     tokio::spawn(stream_plugin_workflow_views(client, sender, redraw));
     receiver
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PluginWorkflowPackageExportStartRequest, SessionId, workflow_package_export_start_request,
+    };
+
+    #[test]
+    fn bmux_invalidation_signal_coalesces_plugin_redraw_requests() {
+        let redraw = bmux_tui_runtime::InvalidationSignal::new();
+        redraw.request();
+        redraw.request();
+
+        assert!(redraw.take());
+        assert!(!redraw.take());
+        assert_eq!(redraw.requests(), 2);
+        assert_eq!(redraw.coalesced(), 1);
+    }
+
+    #[test]
+    fn plugin_surface_host_source_uses_bmux_redraw_latch() {
+        let source = include_str!("plugin_surface_host.rs");
+        assert!(source.contains("InvalidationSignal"));
+    }
+
+    #[test]
+    fn plugin_surface_host_adapts_portable_package_export_start() {
+        let parent_session_id = SessionId::new();
+        let request =
+            workflow_package_export_start_request(PluginWorkflowPackageExportStartRequest {
+                package_export: bcode_workflow::WorkflowPackageExportIdentity {
+                    package_id: "example/package".to_string(),
+                    export: "main".to_string(),
+                    package_lock_digest_sha256: Some("a".repeat(64)),
+                },
+                run_id: Some("run-1".to_string()),
+                parent_session_id,
+                workspace_snapshot: Some("workspace".to_string()),
+                parent_session_generation: Some(1),
+                configuration: None,
+                input: Some(serde_json::json!({"subject": "change"})),
+            });
+        assert_eq!(request.package_export.package_id, "example/package");
+        assert_eq!(request.parent_session_id, parent_session_id);
+        assert_eq!(request.input.expect("input")["subject"], "change");
+    }
+
+    #[test]
+    fn plugin_surface_host_exposes_portable_workflow_authoring_services() {
+        let source = include_str!("plugin_surface_host.rs");
+        for service in [
+            "workflow_authoring_catalog",
+            "generate_structured_output",
+            "accept_generated_workflow_candidate",
+            "instantiate_workflow_template",
+            "workflow_authoring_draft",
+            "workflow_authoring_revision",
+            "apply_workflow_authoring_edits",
+            "validate_workflow_authoring",
+            "preview_workflow_authoring",
+            "publish_workflow_authoring_draft",
+            "start_authored_workflow_revision",
+            "start_workflow_package_export",
+        ] {
+            assert!(
+                source.contains(service),
+                "missing authoring service: {service}"
+            );
+        }
+        assert!(!source.contains(concat!("super::terminal_", "events")));
+        assert!(!source.contains(concat!("Terminal<", "&mut")));
+    }
 }

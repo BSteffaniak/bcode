@@ -6358,7 +6358,15 @@ fn registered_auth_profile_hint(
     {
         return Some(profile);
     }
-    let selected = config.resolved_model_selection().auth_profile?;
+    let selection = config.model.profile.as_deref().map_or_else(
+        || config.resolved_model_selection(),
+        |profile| {
+            config
+                .resolved_model_profile(profile)
+                .unwrap_or_else(|| config.resolved_model_selection())
+        },
+    );
+    let selected = selection.auth_profile?;
     bcode_provider_auth::resolve_auth_provider_profile(
         config,
         &provider.contribution.provider_id,
