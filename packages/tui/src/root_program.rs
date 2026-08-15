@@ -969,6 +969,13 @@ impl BcodeRuntimeModel {
                 }
             }
             Event::Mouse(mouse) => {
+                if self.loop_state.handle_streaming_configurator_mouse(
+                    &mut self.chat,
+                    mouse,
+                    self.committed_area,
+                ) {
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if self.loop_state.handle_theme_picker_mouse(
                     &mut self.chat,
                     mouse,

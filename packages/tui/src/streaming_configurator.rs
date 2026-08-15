@@ -9,6 +9,10 @@ use bcode_session_view_models::{
     StreamingInterpolationCurve, StreamingPresentationPolicy, TranscriptViewItemKind,
 };
 use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_tui::event::{Event, MouseEvent};
+use bmux_tui::geometry::Rect;
+use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
+use bmux_tui_components::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
 
 const TURN_ID: &str = "streaming-configurator-turn";
 const SEGMENT_ID: &str = "streaming-configurator-segment";
@@ -83,6 +87,23 @@ pub enum StreamingConfiguratorOutcome {
     Ignored,
 }
 
+/// Committed geometry for component-owned configurator controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingConfiguratorGeometry {
+    /// Enabled checkbox area.
+    pub enabled: Rect,
+    /// Curve action row area.
+    pub curve: Rect,
+    /// Rate decrement/increment action row area.
+    pub rate: Rect,
+    /// Lag decrement/increment action row area.
+    pub lag: Rect,
+    /// Reset/apply/cancel action row area.
+    pub outcomes: Rect,
+    /// Complete opaque surface area used to capture otherwise-ignored mouse events.
+    pub surface: Rect,
+}
+
 /// Complete local state for the streaming configurator surface.
 pub struct StreamingConfiguratorState {
     controller: StreamingPreviewController,
@@ -90,6 +111,12 @@ pub struct StreamingConfiguratorState {
     declarative_fallback: StreamingPresentationPolicy,
     focus: StreamingConfiguratorFocus,
     reset_pending: bool,
+    enabled_checkbox: CheckboxState,
+    curve_actions: ActionRowState,
+    rate_actions: ActionRowState,
+    lag_actions: ActionRowState,
+    outcome_actions: ActionRowState,
+    committed_geometry: Option<StreamingConfiguratorGeometry>,
 }
 
 impl StreamingConfiguratorState {
@@ -101,13 +128,21 @@ impl StreamingConfiguratorState {
         declarative_fallback: StreamingPresentationPolicy,
     ) -> Self {
         let effective_policy = effective_policy.normalized();
-        Self {
+        let mut state = Self {
             controller: StreamingPreviewController::new(now, effective_policy),
             override_policy: effective_policy,
             declarative_fallback: declarative_fallback.normalized(),
             focus: StreamingConfiguratorFocus::Enabled,
             reset_pending: false,
-        }
+            enabled_checkbox: CheckboxState::new(effective_policy.enabled),
+            curve_actions: ActionRowState::new(),
+            rate_actions: ActionRowState::new(),
+            lag_actions: ActionRowState::new(),
+            outcome_actions: ActionRowState::new(),
+            committed_geometry: None,
+        };
+        state.sync_component_focus();
+        state
     }
 
     /// Return the preview controller.
@@ -138,6 +173,36 @@ impl StreamingConfiguratorState {
         self.reset_pending
     }
 
+    /// Return the enabled checkbox interaction state.
+    #[must_use]
+    pub const fn enabled_checkbox(&self) -> &CheckboxState {
+        &self.enabled_checkbox
+    }
+
+    /// Return curve action interaction state.
+    #[must_use]
+    pub const fn curve_actions(&self) -> &ActionRowState {
+        &self.curve_actions
+    }
+
+    /// Return rate action interaction state.
+    #[must_use]
+    pub const fn rate_actions(&self) -> &ActionRowState {
+        &self.rate_actions
+    }
+
+    /// Return lag action interaction state.
+    #[must_use]
+    pub const fn lag_actions(&self) -> &ActionRowState {
+        &self.lag_actions
+    }
+
+    /// Return outcome action interaction state.
+    #[must_use]
+    pub const fn outcome_actions(&self) -> &ActionRowState {
+        &self.outcome_actions
+    }
+
     /// Return the earliest controller deadline.
     #[must_use]
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
@@ -147,6 +212,158 @@ impl StreamingConfiguratorState {
     /// Advance due preview work.
     pub fn advance(&mut self, now: Instant) -> bool {
         self.controller.advance(now)
+    }
+
+    /// Commit geometry produced by the most recent rendered frame.
+    pub const fn commit_geometry(&mut self, geometry: Option<StreamingConfiguratorGeometry>) {
+        self.committed_geometry = geometry;
+    }
+
+    /// Handle one mouse event using the most recently committed component geometry.
+    pub fn handle_committed_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        now: Instant,
+    ) -> StreamingConfiguratorOutcome {
+        let Some(geometry) = self.committed_geometry else {
+            return StreamingConfiguratorOutcome::Handled;
+        };
+        self.handle_mouse(mouse, geometry, now)
+    }
+
+    /// Handle one mouse event through BMUX interactive components.
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        geometry: StreamingConfiguratorGeometry,
+        now: Instant,
+    ) -> StreamingConfiguratorOutcome {
+        let event = Event::Mouse(mouse);
+        match Checkbox::new("Enabled").handle_event(
+            geometry.enabled,
+            &mut self.enabled_checkbox,
+            &event,
+        ) {
+            CheckboxOutcome::Toggled(enabled) => {
+                self.focus = StreamingConfiguratorFocus::Enabled;
+                self.sync_component_focus();
+                let mut policy = self.override_policy;
+                policy.enabled = enabled;
+                self.apply_override_policy(policy, now);
+                return StreamingConfiguratorOutcome::Handled;
+            }
+            CheckboxOutcome::Redraw => return StreamingConfiguratorOutcome::Handled,
+            CheckboxOutcome::Ignored => {}
+        }
+
+        let curve_actions = curve_action_buttons();
+        match ActionRow::new(&curve_actions).handle_event(
+            geometry.curve,
+            &mut self.curve_actions,
+            &event,
+        ) {
+            ActionRowOutcome::Activated { index, .. } => {
+                self.focus = StreamingConfiguratorFocus::Curve;
+                self.curve_actions.set_focused(Some(index));
+                let curves = [
+                    StreamingInterpolationCurve::Linear,
+                    StreamingInterpolationCurve::EaseIn,
+                    StreamingInterpolationCurve::EaseOut,
+                    StreamingInterpolationCurve::EaseInOut,
+                ];
+                let mut policy = self.override_policy;
+                if let Some(curve) = curves.get(index) {
+                    policy.curve = *curve;
+                    self.apply_override_policy(policy, now);
+                }
+                return StreamingConfiguratorOutcome::Handled;
+            }
+            outcome if outcome.is_handled() => return StreamingConfiguratorOutcome::Handled,
+            _ => {}
+        }
+        if let Some(outcome) = self.handle_numeric_mouse(
+            &event,
+            geometry.rate,
+            StreamingConfiguratorFocus::GraphemesPerSecond,
+            now,
+        ) {
+            return outcome;
+        }
+        if let Some(outcome) = self.handle_numeric_mouse(
+            &event,
+            geometry.lag,
+            StreamingConfiguratorFocus::MaxLag,
+            now,
+        ) {
+            return outcome;
+        }
+
+        let actions = outcome_action_buttons();
+        match ActionRow::new(&actions).handle_event(
+            geometry.outcomes,
+            &mut self.outcome_actions,
+            &event,
+        ) {
+            ActionRowOutcome::Activated { id, .. } if id == "reset" => {
+                self.focus = StreamingConfiguratorFocus::Reset;
+                self.outcome_actions.set_focused(Some(0));
+                self.reset_pending = true;
+                let _ = self.controller.set_policy(self.declarative_fallback);
+                StreamingConfiguratorOutcome::Handled
+            }
+            ActionRowOutcome::Activated { id, .. } if id == "apply" && self.reset_pending => {
+                StreamingConfiguratorOutcome::Reset
+            }
+            ActionRowOutcome::Activated { id, .. } if id == "apply" => {
+                StreamingConfiguratorOutcome::Apply(self.selected_policy())
+            }
+            ActionRowOutcome::Activated { id, .. } if id == "cancel" => {
+                StreamingConfiguratorOutcome::Cancel
+            }
+            outcome if outcome.is_handled() => StreamingConfiguratorOutcome::Handled,
+            _ if geometry.surface.contains(mouse.position) => StreamingConfiguratorOutcome::Handled,
+            _ => StreamingConfiguratorOutcome::Ignored,
+        }
+    }
+
+    fn handle_numeric_mouse(
+        &mut self,
+        event: &Event,
+        area: Rect,
+        focus: StreamingConfiguratorFocus,
+        now: Instant,
+    ) -> Option<StreamingConfiguratorOutcome> {
+        let actions = numeric_action_buttons();
+        let state = match focus {
+            StreamingConfiguratorFocus::GraphemesPerSecond => &mut self.rate_actions,
+            StreamingConfiguratorFocus::MaxLag => &mut self.lag_actions,
+            _ => return None,
+        };
+        let outcome = ActionRow::new(&actions).handle_event(area, state, event);
+        match outcome {
+            ActionRowOutcome::Activated { index, .. } => {
+                self.focus = focus;
+                self.sync_component_focus();
+                self.adjust(if index == 0 { -1 } else { 1 }, false, now);
+                Some(StreamingConfiguratorOutcome::Handled)
+            }
+            outcome if outcome.is_handled() => Some(StreamingConfiguratorOutcome::Handled),
+            _ => None,
+        }
+    }
+
+    fn apply_override_policy(&mut self, policy: StreamingPresentationPolicy, now: Instant) {
+        self.reset_pending = false;
+        let became_smoothing =
+            self.override_policy.is_immediate() && !policy.normalized().is_immediate();
+        self.override_policy = policy.normalized();
+        self.enabled_checkbox
+            .set_checked(self.override_policy.enabled);
+        self.sync_component_focus();
+        let _ = self.controller.set_policy(self.override_policy);
+        if became_smoothing && self.controller.is_completed() {
+            self.controller.restart(now);
+        }
     }
 
     /// Handle one keyboard input event.
@@ -203,6 +420,23 @@ impl StreamingConfiguratorState {
             (current + 1) % len
         };
         self.focus = StreamingConfiguratorFocus::ALL[next];
+        self.sync_component_focus();
+    }
+
+    fn sync_component_focus(&mut self) {
+        self.enabled_checkbox
+            .set_focused(self.focus == StreamingConfiguratorFocus::Enabled);
+        self.curve_actions.set_focused(
+            (self.focus == StreamingConfiguratorFocus::Curve)
+                .then_some(curve_index(self.override_policy.curve)),
+        );
+        self.rate_actions.set_focused(
+            (self.focus == StreamingConfiguratorFocus::GraphemesPerSecond).then_some(1),
+        );
+        self.lag_actions
+            .set_focused((self.focus == StreamingConfiguratorFocus::MaxLag).then_some(1));
+        self.outcome_actions
+            .set_focused((self.focus == StreamingConfiguratorFocus::Reset).then_some(0));
     }
 
     fn adjust(&mut self, direction: i32, coarse: bool, now: Instant) {
@@ -239,13 +473,40 @@ impl StreamingConfiguratorState {
             }
             StreamingConfiguratorFocus::Reset => {}
         }
-        let became_smoothing =
-            self.override_policy.is_immediate() && !policy.normalized().is_immediate();
-        self.override_policy = policy.normalized();
-        let _ = self.controller.set_policy(self.override_policy);
-        if became_smoothing && self.controller.is_completed() {
-            self.controller.restart(now);
-        }
+        self.apply_override_policy(policy, now);
+    }
+}
+
+pub fn curve_action_buttons() -> [ActionButton; 4] {
+    [
+        ActionButton::new("linear", "Linear"),
+        ActionButton::new("ease_in", "Ease in"),
+        ActionButton::new("ease_out", "Ease out"),
+        ActionButton::new("ease_in_out", "Ease in/out"),
+    ]
+}
+
+pub fn numeric_action_buttons() -> [ActionButton; 2] {
+    [
+        ActionButton::new("decrement", "−"),
+        ActionButton::new("increment", "+"),
+    ]
+}
+
+pub fn outcome_action_buttons() -> [ActionButton; 3] {
+    [
+        ActionButton::new("reset", "Reset"),
+        ActionButton::new("apply", "Apply"),
+        ActionButton::new("cancel", "Cancel"),
+    ]
+}
+
+const fn curve_index(curve: StreamingInterpolationCurve) -> usize {
+    match curve {
+        StreamingInterpolationCurve::Linear => 0,
+        StreamingInterpolationCurve::EaseIn => 1,
+        StreamingInterpolationCurve::EaseOut => 2,
+        StreamingInterpolationCurve::EaseInOut => 3,
     }
 }
 
@@ -253,12 +514,7 @@ const fn cycle_curve(
     curve: StreamingInterpolationCurve,
     direction: i32,
 ) -> StreamingInterpolationCurve {
-    let index = match curve {
-        StreamingInterpolationCurve::Linear => 0,
-        StreamingInterpolationCurve::EaseIn => 1,
-        StreamingInterpolationCurve::EaseOut => 2,
-        StreamingInterpolationCurve::EaseInOut => 3,
-    };
+    let index = curve_index(curve);
     let next = if direction < 0 {
         (index + 3) % 4
     } else {
@@ -573,6 +829,64 @@ mod tests {
             state.handle_key(KeyStroke::simple(KeyCode::Escape), now),
             StreamingConfiguratorOutcome::Cancel
         );
+    }
+
+    #[test]
+    fn bmux_components_own_mouse_toggle_adjust_apply_reset_and_capture() {
+        use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+
+        let now = Instant::now();
+        let mut state = StreamingConfiguratorState::new(
+            now,
+            StreamingPresentationPolicy::default(),
+            StreamingPresentationPolicy::immediate(),
+        );
+        let geometry = StreamingConfiguratorGeometry {
+            enabled: Rect::new(2, 2, 20, 1),
+            curve: Rect::new(2, 3, 60, 1),
+            rate: Rect::new(2, 4, 10, 1),
+            lag: Rect::new(2, 5, 10, 1),
+            outcomes: Rect::new(2, 6, 32, 1),
+            surface: Rect::new(0, 0, 80, 24),
+        };
+        let click = |state: &mut StreamingConfiguratorState, point: Point| {
+            assert_eq!(
+                state.handle_mouse(
+                    MouseEvent::new(MouseEventKind::Down(MouseButton::Left), point),
+                    geometry,
+                    now,
+                ),
+                StreamingConfiguratorOutcome::Handled
+            );
+            state.handle_mouse(
+                MouseEvent::new(MouseEventKind::Up(MouseButton::Left), point),
+                geometry,
+                now,
+            )
+        };
+
+        assert_eq!(
+            click(&mut state, Point::new(3, 2)),
+            StreamingConfiguratorOutcome::Handled
+        );
+        assert!(!state.selected_policy().enabled);
+        let before_rate = state.selected_policy().graphemes_per_second;
+        let _ = click(&mut state, Point::new(8, 4));
+        assert!(state.selected_policy().graphemes_per_second > before_rate);
+        assert_eq!(
+            state.handle_mouse(
+                MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(70, 20)),
+                geometry,
+                now,
+            ),
+            StreamingConfiguratorOutcome::Handled
+        );
+
+        let _ = click(&mut state, Point::new(3, 6));
+        assert!(state.reset_pending());
+        let apply = click(&mut state, Point::new(12, 6));
+        assert_eq!(apply, StreamingConfiguratorOutcome::Reset);
     }
 
     #[test]

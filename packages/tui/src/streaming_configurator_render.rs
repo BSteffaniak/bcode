@@ -4,16 +4,65 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::prelude::{Border, Line, Panel, Span, TextBlock, TextWrap, Widget};
 use bmux_tui::style::Modifier;
+use bmux_tui_components::action_row::ActionRow;
+use bmux_tui_components::button::ButtonStyles;
+use bmux_tui_components::checkbox::{Checkbox, CheckboxStyles};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
 
 use super::render::TuiTheme;
 use super::streaming_configurator::{
-    StreamingConfiguratorFocus, StreamingConfiguratorState, StreamingPreviewController,
+    StreamingConfiguratorFocus, StreamingConfiguratorGeometry, StreamingConfiguratorState,
+    StreamingPreviewController, curve_action_buttons, numeric_action_buttons,
+    outcome_action_buttons,
 };
 
 const STACK_BREAKPOINT: u16 = 86;
 const MIN_USEFUL_WIDTH: u16 = 54;
 const MIN_USEFUL_HEIGHT: u16 = 24;
+
+pub fn streaming_configurator_geometry(
+    _state: &StreamingConfiguratorState,
+    frame_area: Rect,
+    theme: TuiTheme,
+) -> Option<StreamingConfiguratorGeometry> {
+    let modal = configurator_modal(theme);
+    let content = modal.content_area(frame_area);
+    if content.width < MIN_USEFUL_WIDTH || content.height < MIN_USEFUL_HEIGHT {
+        return None;
+    }
+    let controls_height = 9;
+    let preview_height = content.height.saturating_sub(controls_height);
+    let area = Rect::new(
+        content.x,
+        content.y.saturating_add(preview_height),
+        content.width,
+        controls_height,
+    );
+    let geometry = StreamingConfiguratorGeometry {
+        enabled: Rect::new(area.x, area.y, 18.min(area.width), 1),
+        curve: Rect::new(
+            area.x.saturating_add(10),
+            area.y + 1,
+            area.width.saturating_sub(10),
+            1,
+        ),
+        rate: Rect::new(
+            area.x.saturating_add(28),
+            area.y + 2,
+            area.width.saturating_sub(28).min(10),
+            1,
+        ),
+        lag: Rect::new(
+            area.x.saturating_add(28),
+            area.y + 3,
+            area.width.saturating_sub(28).min(10),
+            1,
+        ),
+        outcomes: Rect::new(area.x, area.y + 4, area.width.min(30), 1),
+        surface: frame_area,
+    };
+    Some(geometry)
+}
 
 /// Render the opaque streaming configurator surface.
 pub fn render_streaming_configurator(
@@ -113,6 +162,7 @@ fn render_preview(title: &str, text: &str, area: Rect, frame: &mut Frame<'_>, th
         .render(inner, frame);
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_controls(
     state: &StreamingConfiguratorState,
     area: Rect,
@@ -198,6 +248,54 @@ fn render_controls(
         }
         frame.write_line(Rect::new(area.x, area.y + offset, area.width, 1), &row);
     }
+    let Some(geometry) = streaming_configurator_geometry(state, frame.area(), theme) else {
+        return;
+    };
+    let checkbox = Checkbox::new("Enabled").styles(CheckboxStyles {
+        normal: theme.text,
+        focused: theme.focused,
+        hovered: theme.selection,
+        pressed: theme.focused.add_modifier(Modifier::BOLD),
+        disabled: theme.muted,
+    });
+    checkbox.render_with_id(
+        "streaming.enabled",
+        geometry.enabled,
+        state.enabled_checkbox(),
+        frame,
+    );
+    let button_styles = ButtonStyles {
+        normal: theme.text,
+        focused: theme.focused,
+        hovered: theme.selection,
+        pressed: theme.focused.add_modifier(Modifier::BOLD),
+        disabled: theme.muted,
+    };
+    let curve_actions = curve_action_buttons();
+    ActionRow::new(&curve_actions)
+        .styles(button_styles)
+        .render_state_with_id_prefix(
+            geometry.curve,
+            state.curve_actions(),
+            frame,
+            "streaming.curve",
+        );
+    let numeric_actions = numeric_action_buttons();
+    ActionRow::new(&numeric_actions)
+        .styles(button_styles)
+        .render_state_with_id_prefix(geometry.rate, state.rate_actions(), frame, "streaming.rate");
+    ActionRow::new(&numeric_actions)
+        .styles(button_styles)
+        .render_state_with_id_prefix(geometry.lag, state.lag_actions(), frame, "streaming.lag");
+    let outcome_actions = outcome_action_buttons();
+    ActionRow::new(&outcome_actions)
+        .styles(button_styles)
+        .render_state_with_id_prefix(
+            geometry.outcomes,
+            state.outcome_actions(),
+            frame,
+            "streaming.outcomes",
+        );
 }
 
 fn setting_line(focused: bool, label: &str, value: &str, theme: TuiTheme) -> Line {
@@ -231,6 +329,40 @@ mod tests {
     }
 
     #[test]
+    fn renderer_registers_stable_bmux_component_mouse_hits() {
+        let now = std::time::Instant::now();
+        let state = StreamingConfiguratorState::new(
+            now,
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+        );
+        let theme = TuiTheme::for_theme_id("bcode-dark");
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        render_streaming_configurator(&state, &mut frame, theme);
+        let ids = frame
+            .hits()
+            .regions()
+            .iter()
+            .map(|hit| hit.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"streaming.enabled"), "{ids:?}");
+        assert!(
+            ids.iter().any(|id| id.starts_with("streaming.curve")),
+            "{ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id.starts_with("streaming.rate")),
+            "{ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id.starts_with("streaming.outcomes")),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
     fn renders_controls_playback_and_responsive_preview_labels() {
         let now = std::time::Instant::now();
         let state = StreamingConfiguratorState::new(
@@ -243,7 +375,7 @@ mod tests {
             "Streaming presentation configurator",
             "Raw provider chunks",
             "Smoothed presentation",
-            "Enabled:",
+            "[x] Enabled",
             "300 graphemes/s",
             "chunk 0/13",
             "enter apply",
@@ -276,7 +408,7 @@ mod tests {
             now,
         );
         let reset = render_text(Rect::new(0, 0, 120, 36), &state);
-        assert!(reset.contains("Reset override: pending"), "{reset}");
+        assert!(reset.contains("[ Reset ]"), "{reset}");
     }
 
     #[test]
@@ -285,7 +417,7 @@ mod tests {
         let immediate = bcode_session_view_models::StreamingPresentationPolicy::immediate();
         let mut state = StreamingConfiguratorState::new(now, immediate, immediate);
         let focused = render_text(Rect::new(0, 0, 120, 40), &state);
-        assert!(focused.contains("› Enabled:"), "{focused}");
+        assert!(focused.contains("[ ] Enabled"), "{focused}");
 
         let _ = state.handle_key(
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Char('p')),
@@ -316,7 +448,7 @@ mod tests {
             now,
         );
         let reset = render_text(Rect::new(0, 0, 120, 40), &state);
-        assert!(reset.contains("› Reset override: pending"), "{reset}");
+        assert!(reset.contains("[ Reset ]"), "{reset}");
     }
 
     #[test]

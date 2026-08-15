@@ -316,6 +316,41 @@ impl ChatLoopState {
         chat.app.set_status("streaming configurator".to_owned());
     }
 
+    pub fn handle_streaming_configurator_mouse(
+        &mut self,
+        chat: &mut ActiveChat,
+        mouse: bmux_tui::event::MouseEvent,
+        frame_area: Rect,
+    ) -> bool {
+        let Some(configurator) = self.streaming_configurator.as_mut() else {
+            return false;
+        };
+        let _ = frame_area;
+        match configurator.handle_committed_mouse(mouse, Instant::now()) {
+            super::streaming_configurator::StreamingConfiguratorOutcome::Handled
+            | super::streaming_configurator::StreamingConfiguratorOutcome::Ignored => true,
+            super::streaming_configurator::StreamingConfiguratorOutcome::Apply(policy) => {
+                self.streaming_configurator = None;
+                Self::request_streaming_presentation_override(chat, policy);
+                true
+            }
+            super::streaming_configurator::StreamingConfiguratorOutcome::Reset => {
+                self.streaming_configurator = None;
+                Self::request_clear_streaming_presentation_override(
+                    chat,
+                    self.declarative_streaming_policy,
+                );
+                true
+            }
+            super::streaming_configurator::StreamingConfiguratorOutcome::Cancel => {
+                self.streaming_configurator = None;
+                chat.app
+                    .set_status("streaming presentation changes canceled".to_owned());
+                true
+            }
+        }
+    }
+
     pub fn handle_streaming_configurator_key(
         &mut self,
         chat: &mut ActiveChat,
@@ -4237,7 +4272,13 @@ pub fn draw_chat_frame<W: Write>(
         if let Some(palette) = &mut loop_state.palette {
             command_palette_render::render_palette(palette, frame, theme);
         }
-        if let Some(configurator) = &loop_state.streaming_configurator {
+        if let Some(configurator) = &mut loop_state.streaming_configurator {
+            let geometry = super::streaming_configurator_render::streaming_configurator_geometry(
+                configurator,
+                frame.area(),
+                theme,
+            );
+            configurator.commit_geometry(geometry);
             super::streaming_configurator_render::render_streaming_configurator(
                 configurator,
                 frame,

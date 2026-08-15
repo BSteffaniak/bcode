@@ -233,6 +233,12 @@ the surface removes that deadline when no work remains. Normal widths use matche
 preview panes; widths below 86 columns stack the panes, and content areas below 54 by 24 render a
 bounded resize explanation.
 
+The configurator's settings and action controls are composed from BMUX `Checkbox` and `ActionRow`
+components with stable interaction IDs. Rendering commits the component geometry used by subsequent
+mouse routing, so responsive reflow cannot leave stale hit targets. Mouse events are captured by the
+opaque surface and component-owned hover, press, and click policies drive enabled, curve, numeric,
+Reset, Apply, and Cancel interactions.
+
 Apply updates the active TUI policy immediately and asynchronously persists a normalized override in
 interactive `tui.toml` user state. The override takes precedence over declarative
 `[presentation.streaming]` defaults during startup and configuration reload. Reset clears only that
