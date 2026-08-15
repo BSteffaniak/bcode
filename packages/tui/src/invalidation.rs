@@ -194,7 +194,7 @@ mod tests {
         )]);
         assert_eq!(
             registry.take_due(now + Duration::from_millis(20)),
-            [key.clone()]
+            std::slice::from_ref(&key)
         );
 
         registry.reconcile([InvalidationRequest::new(

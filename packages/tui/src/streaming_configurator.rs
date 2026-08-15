@@ -182,12 +182,6 @@ impl StreamingConfiguratorState {
         }
     }
 
-    /// Return the active focus row.
-    #[must_use]
-    pub const fn focus(&self) -> StreamingConfiguratorFocus {
-        self.focus
-    }
-
     /// Return whether Apply will clear the user-state override.
     #[must_use]
     pub const fn reset_pending(&self) -> bool {
@@ -1089,7 +1083,7 @@ mod tests {
             ..original
         };
         let mut state = StreamingConfiguratorState::new(now, original, fallback);
-        assert_eq!(state.focus(), StreamingConfiguratorFocus::Enabled);
+        assert_eq!(state.focus, StreamingConfiguratorFocus::Enabled);
         assert_eq!(
             state.handle_key(KeyStroke::simple(KeyCode::Space), now),
             StreamingConfiguratorOutcome::Handled
@@ -1111,7 +1105,7 @@ mod tests {
         for _ in 0..8 {
             let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
         }
-        assert_eq!(state.focus(), StreamingConfiguratorFocus::Reset);
+        assert_eq!(state.focus, StreamingConfiguratorFocus::Reset);
         let _ = state.handle_key(KeyStroke::simple(KeyCode::Space), now);
         assert!(state.reset_pending());
         assert_eq!(state.selected_policy(), fallback.normalized());
@@ -1212,12 +1206,12 @@ mod tests {
             state.handle_key(KeyStroke::simple(KeyCode::Up), now),
             StreamingConfiguratorOutcome::Handled
         );
-        assert_eq!(state.focus(), StreamingConfiguratorFocus::Reset);
+        assert_eq!(state.focus, StreamingConfiguratorFocus::Reset);
         assert_eq!(
             state.handle_key(KeyStroke::simple(KeyCode::Down), now),
             StreamingConfiguratorOutcome::Handled
         );
-        assert_eq!(state.focus(), StreamingConfiguratorFocus::Enabled);
+        assert_eq!(state.focus, StreamingConfiguratorFocus::Enabled);
         assert_eq!(
             state.handle_key(KeyStroke::simple(KeyCode::Char('p')), now),
             StreamingConfiguratorOutcome::Handled
@@ -1272,7 +1266,7 @@ mod tests {
         for _ in 0..4 {
             let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
         }
-        assert_eq!(state.focus(), StreamingConfiguratorFocus::SourcePreset);
+        assert_eq!(state.focus, StreamingConfiguratorFocus::SourcePreset);
         let _ = state.handle_key(KeyStroke::simple(KeyCode::Right), now);
         assert_eq!(state.source_policy().preset, StreamingSourcePreset::Choppy);
         let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);

@@ -2,8 +2,9 @@
 
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::prelude::{Border, Line, Panel, Span, TextBlock, TextWrap, Widget};
+use bmux_tui::prelude::{Border, Line, Panel, Span, Text, TextBlock, TextWrap, Widget};
 use bmux_tui::style::Modifier;
+use bmux_tui::text::wrap_line_word;
 use bmux_tui_components::action_row::ActionRow;
 use bmux_tui_components::button::ButtonStyles;
 use bmux_tui_components::checkbox::{Checkbox, CheckboxStyles};
@@ -11,8 +12,8 @@ use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
 
 use super::render::TuiTheme;
 use super::streaming_configurator::{
-    StreamingConfiguratorFocus, StreamingConfiguratorGeometry, StreamingConfiguratorState,
-    curve_action_buttons, numeric_action_buttons, outcome_action_buttons, source_preset_buttons,
+    StreamingConfiguratorGeometry, StreamingConfiguratorState, curve_action_buttons,
+    numeric_action_buttons, outcome_action_buttons, source_preset_buttons,
 };
 use super::streaming_source_scenario::LONG_RESPONSE;
 
@@ -39,53 +40,53 @@ pub fn streaming_configurator_geometry(
         controls_height,
     );
     let geometry = StreamingConfiguratorGeometry {
-        enabled: Rect::new(area.x, area.y, 18.min(area.width), 1),
+        enabled: Rect::new(area.x, area.y, 24.min(area.width), 1),
         curve: Rect::new(
-            area.x.saturating_add(10),
+            area.x.saturating_add(22),
             area.y + 1,
-            area.width.saturating_sub(10),
+            area.width.saturating_sub(22),
             1,
         ),
         rate: Rect::new(
-            area.x.saturating_add(28),
+            area.x.saturating_add(42),
             area.y + 2,
-            area.width.saturating_sub(28).min(10),
+            area.width.saturating_sub(42).min(14),
             1,
         ),
         lag: Rect::new(
-            area.x.saturating_add(28),
+            area.x.saturating_add(42),
             area.y + 3,
-            area.width.saturating_sub(28).min(10),
+            area.width.saturating_sub(42).min(14),
             1,
         ),
         source_preset: Rect::new(
-            area.x.saturating_add(10),
+            area.x.saturating_add(34),
             area.y + 4,
-            area.width.saturating_sub(10),
+            area.width.saturating_sub(34),
             1,
         ),
         source_chunk_size: Rect::new(
-            area.x.saturating_add(28),
+            area.x.saturating_add(42),
             area.y + 5,
-            area.width.saturating_sub(28).min(10),
+            area.width.saturating_sub(42).min(14),
             1,
         ),
         source_size_variation: Rect::new(
-            area.x.saturating_add(28),
+            area.x.saturating_add(42),
             area.y + 6,
-            area.width.saturating_sub(28).min(10),
+            area.width.saturating_sub(42).min(14),
             1,
         ),
         source_interval: Rect::new(
-            area.x.saturating_add(28),
+            area.x.saturating_add(42),
             area.y + 7,
-            area.width.saturating_sub(28).min(10),
+            area.width.saturating_sub(42).min(14),
             1,
         ),
         source_interval_variation: Rect::new(
-            area.x.saturating_add(28),
+            area.x.saturating_add(42),
             area.y + 8,
-            area.width.saturating_sub(28).min(10),
+            area.width.saturating_sub(42).min(14),
             1,
         ),
         outcomes: Rect::new(area.x, area.y + 9, area.width.min(48), 1),
@@ -144,10 +145,15 @@ pub fn render_streaming_configurator(
     render_controls(state, controls_area, frame, theme);
 }
 
-fn wrapped_row_count(text: &str, width: u16) -> usize {
+fn preview_text(text: &str) -> Text {
+    Text::from_lines(text.split('\n').map(Line::raw).collect::<Vec<_>>())
+}
+
+fn wrapped_row_count(text: &Text, width: u16) -> usize {
     let width = usize::from(width.max(1));
-    text.lines()
-        .map(|line| line.chars().count().max(1).div_ceil(width))
+    text.lines
+        .iter()
+        .map(|line| wrap_line_word(line, width).len())
         .sum()
 }
 
@@ -205,14 +211,15 @@ fn render_preview(
         .content_style(theme.text);
     let inner = panel.inner_area(area);
     panel.render(area, frame);
+    let preview_text = preview_text(text);
     let base_scroll =
-        wrapped_row_count(text, inner.width).saturating_sub(usize::from(inner.height));
+        wrapped_row_count(&preview_text, inner.width).saturating_sub(usize::from(inner.height));
     let vertical_scroll = if follow_latest {
         base_scroll
     } else {
         base_scroll.saturating_sub(scroll_rows)
     };
-    TextBlock::new(text.to_owned())
+    TextBlock::new(preview_text)
         .style(theme.text)
         .wrap(TextWrap::Word)
         .vertical_scroll(vertical_scroll)
@@ -246,70 +253,40 @@ fn render_controls(
         "running"
     };
     let rows = [
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::Enabled,
-            "Enabled",
-            if policy.enabled { "yes" } else { "no" },
-            theme,
-        ),
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::Curve,
-            "Curve",
-            curve,
-            theme,
-        ),
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::GraphemesPerSecond,
-            "Rate",
-            &rate,
-            theme,
-        ),
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::MaxLag,
+        Line::from(""),
+        label_value_line("Curve", curve, theme),
+        label_value_line("Rate", &rate, theme),
+        label_value_line(
             "Maximum backlog age",
             &format!("{} ms", policy.max_lag_ms),
             theme,
         ),
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::SourcePreset,
+        label_value_line(
             "Provider preset",
             &format!("{:?}", state.source_policy().preset),
             theme,
         ),
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::SourceChunkSize,
+        label_value_line(
             "Target chunk size",
             &format!("{} chars", state.source_policy().target_chunk_chars),
             theme,
         ),
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::SourceSizeVariation,
+        label_value_line(
             "Size variation",
             &format!("{}%", state.source_policy().chunk_size_variation_percent),
             theme,
         ),
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::SourceInterval,
+        label_value_line(
             "Base interval",
             &format!("{} ms", state.source_policy().base_interval_ms),
             theme,
         ),
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::SourceIntervalVariation,
+        label_value_line(
             "Interval variation",
             &format!("{}%", state.source_policy().interval_variation_percent),
             theme,
         ),
-        setting_line(
-            state.focus() == StreamingConfiguratorFocus::Reset,
-            "Reset override",
-            if state.reset_pending() {
-                "pending"
-            } else {
-                "no"
-            },
-            theme,
-        ),
+        Line::from(""),
         Line::from_spans(vec![
             Span::styled("Source: deterministic provider · ", theme.muted),
             Span::styled(
@@ -421,17 +398,10 @@ fn render_controls(
         );
 }
 
-fn setting_line(focused: bool, label: &str, value: &str, theme: TuiTheme) -> Line {
-    let marker = if focused { "›" } else { " " };
-    let marker_style = if focused {
-        theme.focused.add_modifier(Modifier::BOLD)
-    } else {
-        theme.muted
-    };
+fn label_value_line(label: &str, value: &str, theme: TuiTheme) -> Line {
     Line::from_spans(vec![
-        Span::styled(marker, marker_style),
-        Span::styled(format!(" {label}: "), theme.muted),
-        Span::styled(value.to_owned(), theme.focused),
+        Span::styled(format!("{label}: "), theme.muted),
+        Span::styled(value.to_owned(), theme.text),
     ])
 }
 
@@ -449,6 +419,46 @@ mod tests {
         (0..area.height)
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<String>()
+    }
+
+    #[test]
+    fn preview_text_uses_exact_bmux_word_wrap_for_tail_scroll() {
+        let text = "first short line\n\nwide 東京 and cafe\u{301} plus 👩🏽‍💻\na_very_long_word_without_spaces";
+        let preview = preview_text(text);
+        let expected = preview
+            .lines
+            .iter()
+            .map(|line| wrap_line_word(line, 12).len())
+            .sum::<usize>();
+        assert_eq!(wrapped_row_count(&preview, 12), expected);
+        assert_eq!(preview.lines.len(), 4);
+    }
+
+    #[test]
+    fn preview_tail_fills_down_then_keeps_latest_at_bottom() {
+        let theme = TuiTheme::for_theme_id("bcode-dark");
+        let area = Rect::new(0, 0, 24, 6);
+        let render = |text: &str| {
+            let mut buffer = Buffer::empty(area);
+            render_preview(
+                "Preview",
+                text,
+                0,
+                true,
+                area,
+                &mut Frame::new(&mut buffer),
+                theme,
+            );
+            (0..area.height)
+                .filter_map(|row| buffer.row_symbols(row))
+                .collect::<Vec<_>>()
+        };
+        let short = render("one\ntwo");
+        assert!(short[1].contains("one"));
+        assert!(short[2].contains("two"));
+        let long = render("one\ntwo\nthree\nfour\nfive\nsix");
+        assert!(!long.iter().any(|row| row.contains("one")));
+        assert!(long[4].contains("six"), "{long:?}");
     }
 
     #[test]
@@ -483,6 +493,36 @@ mod tests {
             ids.iter().any(|id| id.starts_with("streaming.outcomes")),
             "{ids:?}"
         );
+    }
+
+    #[test]
+    fn control_labels_and_components_do_not_overlap_or_clip() {
+        let now = std::time::Instant::now();
+        let state = StreamingConfiguratorState::new(
+            now,
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+            bcode_session_view_models::StreamingPresentationPolicy::default(),
+        );
+        let text = render_text(Rect::new(0, 0, 120, 44), &state);
+        for forbidden in ["Enabledyes", "Curve: l[", "char[", "ms["] {
+            assert!(
+                !text.contains(forbidden),
+                "overlap/clipping {forbidden}: {text}"
+            );
+        }
+        for expected in [
+            "[x] Enabled",
+            "Curve: linear",
+            "[ Linear ]",
+            "[ − ] [ + ]",
+            "Provider preset: Balanced",
+            "[ Balanced ]",
+            "[ Reset ]",
+            "[ Apply ]",
+            "[ Cancel ]",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
     }
 
     #[test]
