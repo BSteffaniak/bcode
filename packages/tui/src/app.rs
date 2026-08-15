@@ -5632,6 +5632,71 @@ mod tests {
     }
 
     #[test]
+    fn tool_elapsed_deadline_is_not_starved_by_unrelated_reconciliation() {
+        let now = Instant::now();
+        let now_system = std::time::UNIX_EPOCH + Duration::from_secs(3);
+        let mut registry = super::super::invalidation::TemporalRegistry::default();
+        let app = running_tool_app_for_elapsed_test();
+        let initial = app.invalidation_requests(now, now_system);
+        let elapsed = initial
+            .iter()
+            .find(|request| tool_elapsed_invalidation_invocation_id(&request.key) == Some("call-1"))
+            .expect("running tool schedules elapsed invalidation");
+        let deadline = elapsed.at;
+        registry.reconcile(initial);
+
+        for offset in 1..=50 {
+            let advanced = Duration::from_millis(offset);
+            registry.reconcile(app.invalidation_requests(now + advanced, now_system + advanced));
+        }
+
+        assert!(
+            registry
+                .take_due(deadline)
+                .iter()
+                .any(|key| { tool_elapsed_invalidation_invocation_id(key) == Some("call-1") })
+        );
+    }
+
+    fn running_tool_app_for_elapsed_test() -> BmuxApp {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, timestamp_ms, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.absorb_session_event(&event(
+            1,
+            1_000,
+            bcode_session_models::SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            2_000,
+            bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence: 1,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+        app
+    }
+
+    #[test]
     fn tool_elapsed_invalidation_requires_authoritative_running_status() {
         let session_id = bcode_session_models::SessionId::new();
         let event = |sequence, timestamp_ms, kind| bcode_session_models::SessionEvent {

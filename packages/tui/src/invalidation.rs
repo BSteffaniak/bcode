@@ -96,9 +96,10 @@ impl TemporalRegistry {
     }
 
     fn insert(&mut self, request: InvalidationRequest) {
-        if let Some(previous) = self.by_key.insert(request.key.clone(), request.at) {
-            self.by_deadline.remove(&(previous, request.key.clone()));
+        if self.by_key.contains_key(&request.key) {
+            return;
         }
+        self.by_key.insert(request.key.clone(), request.at);
         self.by_deadline.insert((request.at, request.key));
     }
 
@@ -163,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_temporal_registry_replaces_and_removes_sources_incrementally() {
+    fn retained_temporal_registry_preserves_pending_deadline_during_reconciliation() {
         let now = Instant::now();
         let key = InvalidationKey::new("animation");
         let mut registry = TemporalRegistry::default();
@@ -171,11 +172,46 @@ mod tests {
             key.clone(),
             now + Duration::from_millis(20),
         )]);
+        for delay in 21..=100 {
+            registry.reconcile([InvalidationRequest::new(
+                key.clone(),
+                now + Duration::from_millis(delay),
+            )]);
+        }
+        assert_eq!(registry.next_at(), Some(now + Duration::from_millis(20)));
+        assert_eq!(registry.take_due(now + Duration::from_millis(20)), [key]);
+        assert_eq!(registry.next_at(), None);
+    }
+
+    #[test]
+    fn retained_temporal_registry_schedules_next_generation_after_delivery() {
+        let now = Instant::now();
+        let key = InvalidationKey::new("animation");
+        let mut registry = TemporalRegistry::default();
+        registry.reconcile([InvalidationRequest::new(
+            key.clone(),
+            now + Duration::from_millis(20),
+        )]);
+        assert_eq!(
+            registry.take_due(now + Duration::from_millis(20)),
+            [key.clone()]
+        );
+
         registry.reconcile([InvalidationRequest::new(
             key,
             now + Duration::from_millis(40),
         )]);
         assert_eq!(registry.next_at(), Some(now + Duration::from_millis(40)));
+    }
+
+    #[test]
+    fn retained_temporal_registry_removes_inactive_sources() {
+        let now = Instant::now();
+        let mut registry = TemporalRegistry::default();
+        registry.reconcile([InvalidationRequest::new(
+            InvalidationKey::new("animation"),
+            now + Duration::from_millis(20),
+        )]);
 
         registry.reconcile([]);
         assert_eq!(registry.next_at(), None);
