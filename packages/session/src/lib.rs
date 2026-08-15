@@ -6510,6 +6510,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_derivation_uses_bounded_pages_and_batch_scaled_transactions() {
+        let root = unique_temp_dir();
+        let metrics = MetricsRegistry::default();
+        let manager =
+            SessionManager::persistent_with_metrics(&root, metrics.clone()).expect("manager");
+        let source = manager
+            .create_session(Some("large source".to_owned()), test_working_directory())
+            .await
+            .expect("source");
+        for index in 0..600 {
+            manager
+                .append_assistant_message(source.id, format!("event-{index}"))
+                .await
+                .expect("event");
+        }
+        let snapshot = manager
+            .session_derivation_snapshot(source.id)
+            .await
+            .expect("snapshot");
+        let request = bcode_session_models::SessionDerivationRequest {
+            version: bcode_session_models::SESSION_DERIVATION_CONTRACT_VERSION,
+            operation_id: bcode_session_models::SessionDerivationOperationId::new(),
+            idempotency_key: "large-bounded".to_owned(),
+            source: snapshot.clone(),
+            source_policy: bcode_session_models::SessionDerivationSourcePolicy::ExactGeneration,
+            cutoff_sequence: snapshot.latest_sequence,
+            destination_working_directory: None,
+            destination_name: Some("large derived".to_owned()),
+            initial_draft: None,
+            lineage: bcode_session_models::SessionDerivationLineage {
+                producer: "bcode.test".to_owned(),
+                operation_kind: "bcode.test/performance".to_owned(),
+                selected_source_sequence: None,
+            },
+        };
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            manager.derive_session(request).await.expect("derive"),
+            bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { .. }
+        ));
+        let elapsed = started.elapsed();
+        let snapshot = metrics.snapshot();
+        let pages = snapshot
+            .counters
+            .get("session.derivation.page_total")
+            .copied()
+            .unwrap_or_default();
+        let batches = snapshot
+            .counters
+            .get("session.derivation.batch_total")
+            .copied()
+            .unwrap_or_default();
+        let copied = snapshot
+            .counters
+            .get("session.derivation.copied_events_total")
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(copied, 600);
+        assert_eq!(pages, 3);
+        assert_eq!(batches, pages);
+        assert!(batches < copied);
+        assert!(elapsed < std::time::Duration::from_secs(30));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
     async fn derivation_cancellation_points_never_publish_partial_sessions() {
         use crate::derivation::{
             DerivationTestCancellationPoint, set_derivation_test_cancellation_point,

@@ -131,9 +131,11 @@ impl SessionManager {
         request: SessionDerivationRequest,
         execution: Option<ExecutionSessionProvenance>,
     ) -> Result<SessionDerivationTerminalOutcome, SessionError> {
-        request
-            .validate()
-            .map_err(|error| SessionError::InvalidDerivationRequest(error.to_string()))?;
+        request.validate().map_err(|error| {
+            self.metrics
+                .increment_counter("session.derivation.validation_failed_total");
+            SessionError::InvalidDerivationRequest(error.to_string())
+        })?;
         let fingerprint = derivation_request_fingerprint(&request)?;
         let root = self
             .session_store_root()
@@ -147,6 +149,8 @@ impl SessionManager {
                 ));
             }
             if let Some(outcome) = durable.snapshot.outcome {
+                self.metrics
+                    .increment_counter("session.derivation.retry_total");
                 return Ok(outcome);
             }
             cleanup_interrupted_derivation(&root, &durable)?;
@@ -161,6 +165,8 @@ impl SessionManager {
                     ));
                 }
                 if let Some(outcome) = &existing.snapshot.outcome {
+                    self.metrics
+                        .increment_counter("session.derivation.retry_total");
                     return Ok(outcome.clone());
                 }
                 return Err(SessionError::DerivationOperationConflict(
@@ -347,6 +353,8 @@ impl SessionManager {
                 .join(operation.request.operation_id.to_string());
             if staging.exists() {
                 fs::remove_dir_all(staging)?;
+                self.metrics
+                    .increment_counter("session.derivation.cleanup_total");
                 cleaned += 1;
             }
         }
