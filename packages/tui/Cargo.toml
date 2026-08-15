@@ -52,6 +52,7 @@ bcode_tui_components = { workspace = true, features = [
 ] }
 bcode_workflow = { workspace = true }
 bcode_workflow_store = { workspace = true }
+bcode_workflow_view_models = { workspace = true }
 bcode_worktree_models = { workspace = true }
 bmux_image = { workspace = true, features = ["iterm2", "kitty", "sixel"] }
 bmux_keyboard = { workspace = true }

@@ -819,6 +819,10 @@ pub enum PluginTuiSurfaceUpdate {
     WorkflowRun(Box<bcode_workflow_view_models::WorkflowRunView>),
     /// Replace workflow catalog presentation from one authoritative bounded projection.
     WorkflowCatalog(bcode_workflow_view_models::WorkflowCatalogView),
+    /// Report that selected-run detail is being fetched.
+    WorkflowRunLoading { run_id: String },
+    /// Select one exact run whose bounded detail should be loaded by the host.
+    SelectWorkflowRun { run_id: String },
     /// The observer requires bounded snapshot replacement.
     ResyncRequired,
     /// Live observation stopped or entered a degraded state.
@@ -845,6 +849,8 @@ pub enum PluginTuiAction {
     OpenSurface { surface_id: String },
     /// Subscribe this retained surface to bounded workflow snapshots and live invalidation.
     SubscribeWorkflowRuns,
+    /// Load bounded detail for one exact selected workflow run.
+    SelectWorkflowRun { run_id: String },
     /// Invoke a plugin-owned command through the host application without closing this surface.
     InvokePluginCommand {
         plugin_id: String,

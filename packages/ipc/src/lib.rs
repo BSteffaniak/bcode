@@ -722,7 +722,7 @@ pub enum Request {
     },
     /// Return one bounded renderer-neutral workflow run catalog.
     WorkflowCatalogView {
-        limit: usize,
+        request: bcode_workflow_view_models::WorkflowCatalogRequest,
     },
     /// Return one bounded durable workflow run summary.
     WorkflowRunStatus {
@@ -4465,7 +4465,15 @@ mod tests {
                 run_id: "run-1".to_string(),
                 limit: 25,
             },
-            Request::WorkflowCatalogView { limit: 25 },
+            Request::WorkflowCatalogView {
+                request: bcode_workflow_view_models::WorkflowCatalogRequest {
+                    limit: 25,
+                    cursor: None,
+                    filter: bcode_workflow_view_models::WorkflowCatalogFilter::All,
+                    sort: bcode_workflow_view_models::WorkflowCatalogSort::UpdatedAt,
+                    search: None,
+                },
+            },
             Request::WorkflowRunStatus {
                 run_id: "run-1".to_string(),
             },

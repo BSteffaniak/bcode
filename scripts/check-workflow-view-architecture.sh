@@ -30,4 +30,14 @@ rg -q 'name\s*=\s*"bcode_workflow_view_models"' packages/workflow-view/models/Ca
 rg -q 'bcode_workflow_view_models\s*=\s*\{ workspace = true \}' packages/workflow-view/Cargo.toml \
     || fail 'workflow-view does not depend on its portable model contract through the workspace'
 
+rg -q 'pub const WORKFLOW_VIEW_VERSION: u32 = [2-9][0-9]*;' \
+    packages/workflow-view/models/src/lib.rs \
+    || fail 'workflow-view contract version was not advanced for the workspace redesign'
+rg -q 'validate_version' packages/workflow-view/models/src/lib.rs \
+    || fail 'workflow-view contracts do not reject unsupported future versions'
+rg -q 'WorkflowActionTarget' packages/workflow-view/models/src/lib.rs \
+    || fail 'workflow-view actions lack typed stable target identities'
+rg -q 'Presentation fields cannot authorize execution' packages/workflow-view/models/src/lib.rs \
+    || fail 'workflow mutation approval presentation lost its authorization-neutral boundary'
+
 printf 'workflow-view architecture check passed\n'

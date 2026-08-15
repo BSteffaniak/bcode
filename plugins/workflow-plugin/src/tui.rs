@@ -164,8 +164,14 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 options: request.options,
                 selected_approval: 0,
                 text_view: TextViewState::new(),
-                selected_run: 0,
-                selected_node: 0,
+                selected_run_id: None,
+                selected_node_id: None,
+                selected_wait_id: None,
+                selected_approval_id: None,
+                selected_attempt_id: None,
+                selected_output_id: None,
+                selected_child_session_id: None,
+                detail_loading_run_id: None,
                 input_buffer: None,
                 updates: None,
                 catalog: None,
@@ -182,8 +188,14 @@ struct WorkflowStatusSurface {
     options: serde_json::Value,
     selected_approval: usize,
     text_view: TextViewState,
-    selected_run: usize,
-    selected_node: usize,
+    selected_run_id: Option<String>,
+    selected_node_id: Option<String>,
+    selected_wait_id: Option<(String, String)>,
+    selected_approval_id: Option<String>,
+    selected_attempt_id: Option<(String, String, u32)>,
+    selected_output_id: Option<String>,
+    selected_child_session_id: Option<String>,
+    detail_loading_run_id: Option<String>,
     input_buffer: Option<String>,
     updates: Option<PluginTuiSurfaceUpdateReceiver>,
     catalog: Option<bcode_workflow_view_models::WorkflowCatalogView>,
@@ -226,14 +238,67 @@ impl WorkflowSurfaceTheme {
 
 impl WorkflowStatusSurface {
     fn selected_run_view(&self) -> Option<&bcode_workflow_view_models::WorkflowRunView> {
-        let run_id = self
-            .catalog
-            .as_ref()?
-            .runs
-            .get(self.selected_run)?
-            .run_id
-            .as_str();
-        self.runs.get(run_id)
+        self.runs.get(self.selected_run_id.as_deref()?)
+    }
+
+    fn selected_node(&self) -> Option<&bcode_workflow_view_models::WorkflowNodeView> {
+        let node_id = self.selected_node_id.as_deref()?;
+        self.selected_run_view()?
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+    }
+
+    fn select_adjacent_run(&mut self, offset: isize) -> PluginTuiAction {
+        let Some(catalog) = &self.catalog else {
+            return PluginTuiAction::None;
+        };
+        if catalog.runs.is_empty() {
+            self.selected_run_id = None;
+            self.selected_node_id = None;
+            return PluginTuiAction::Redraw;
+        }
+        let current = self
+            .selected_run_id
+            .as_deref()
+            .and_then(|run_id| catalog.runs.iter().position(|run| run.run_id == run_id))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(offset)
+            .min(catalog.runs.len().saturating_sub(1));
+        let run_id = catalog.runs[next].run_id.clone();
+        if self.selected_run_id.as_deref() == Some(run_id.as_str()) {
+            return PluginTuiAction::Redraw;
+        }
+        self.selected_run_id = Some(run_id.clone());
+        self.selected_node_id = None;
+        self.selected_wait_id = None;
+        self.selected_approval_id = None;
+        self.selected_attempt_id = None;
+        self.selected_output_id = None;
+        self.selected_child_session_id = None;
+        self.detail_loading_run_id = Some(run_id.clone());
+        PluginTuiAction::SelectWorkflowRun { run_id }
+    }
+
+    fn select_adjacent_node(&mut self, offset: isize) -> PluginTuiAction {
+        let Some(run) = self.selected_run_view() else {
+            return PluginTuiAction::None;
+        };
+        if run.nodes.is_empty() {
+            self.selected_node_id = None;
+            return PluginTuiAction::Redraw;
+        }
+        let current = self
+            .selected_node_id
+            .as_deref()
+            .and_then(|node_id| run.nodes.iter().position(|node| node.node_id == node_id))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(offset)
+            .min(run.nodes.len().saturating_sub(1));
+        self.selected_node_id = Some(run.nodes[next].node_id.clone());
+        PluginTuiAction::Redraw
     }
 
     #[allow(clippy::too_many_lines)]
@@ -277,35 +342,12 @@ impl WorkflowStatusSurface {
                 _ => return PluginTuiAction::None,
             }
         }
-        let run_count = self
-            .catalog
-            .as_ref()
-            .map_or(0, |catalog| catalog.runs.len());
         match key.key {
             KeyCode::Escape | KeyCode::Char('q') => PluginTuiAction::Close { outcome: None },
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.selected_run = self.selected_run.saturating_sub(1);
-                self.selected_node = 0;
-                PluginTuiAction::Redraw
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if run_count > 0 {
-                    self.selected_run = (self.selected_run + 1).min(run_count - 1);
-                    self.selected_node = 0;
-                }
-                PluginTuiAction::Redraw
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.selected_node = self.selected_node.saturating_sub(1);
-                PluginTuiAction::Redraw
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let node_count = self.selected_run_view().map_or(0, |run| run.nodes.len());
-                if node_count > 0 {
-                    self.selected_node = (self.selected_node + 1).min(node_count - 1);
-                }
-                PluginTuiAction::Redraw
-            }
+            KeyCode::Left | KeyCode::Char('h') => self.select_adjacent_run(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.select_adjacent_run(1),
+            KeyCode::Up | KeyCode::Char('k') => self.select_adjacent_node(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.select_adjacent_node(1),
             KeyCode::Char('p') => self
                 .selected_run_view()
                 .map_or(PluginTuiAction::None, |run| {
@@ -371,7 +413,7 @@ impl WorkflowStatusSurface {
                 let Some(run) = self.selected_run_view() else {
                     return PluginTuiAction::None;
                 };
-                let selected_node = run.nodes.get(self.selected_node);
+                let selected_node = self.selected_node();
                 let Some(attempt) = run.attempts.iter().rev().find(|attempt| {
                     selected_node.is_some_and(|node| node.node_id == attempt.node_id)
                         && attempt.status == "failed"
@@ -431,8 +473,8 @@ impl WorkflowStatusSurface {
                 self.catalog.as_ref(),
                 &self.runs,
                 &self.live_status,
-                self.selected_run,
-                self.selected_node,
+                self.selected_run_id.as_deref(),
+                self.selected_node_id.as_deref(),
                 self.input_buffer.as_deref(),
             )
         } else {
@@ -480,6 +522,7 @@ impl PluginTuiSurface for WorkflowStatusSurface {
         self.live_status = "subscribed".to_string();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn poll(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
         if !self.subscription_requested {
             self.subscription_requested = true;
@@ -493,13 +536,113 @@ impl PluginTuiSurface for WorkflowStatusSurface {
             changed = true;
             match update {
                 PluginTuiSurfaceUpdate::WorkflowCatalog(catalog) => {
+                    if let Err(error) = catalog.validate_version() {
+                        self.live_status = error.to_string();
+                        continue;
+                    }
+                    let prior_selection = self.selected_run_id.clone();
+                    self.selected_run_id = prior_selection
+                        .filter(|run_id| catalog.runs.iter().any(|run| &run.run_id == run_id))
+                        .or_else(|| catalog.runs.first().map(|run| run.run_id.clone()));
                     self.catalog = Some(catalog);
                     self.live_status = "live".to_string();
                 }
                 PluginTuiSurfaceUpdate::WorkflowRun(view) => {
-                    self.runs.insert(view.run.run_id.clone(), *view);
+                    if let Err(error) = view.validate_version() {
+                        self.live_status = error.to_string();
+                        continue;
+                    }
+                    let run_id = view.run.run_id.clone();
+                    if self.selected_run_id.is_none() {
+                        self.selected_run_id = Some(run_id.clone());
+                    }
+                    if self.selected_run_id.as_deref() == Some(run_id.as_str()) {
+                        self.detail_loading_run_id = None;
+                        self.selected_node_id = self
+                            .selected_node_id
+                            .take()
+                            .filter(|node_id| {
+                                view.nodes.iter().any(|node| &node.node_id == node_id)
+                            })
+                            .or_else(|| view.nodes.first().map(|node| node.node_id.clone()));
+                        self.selected_wait_id = self
+                            .selected_wait_id
+                            .take()
+                            .filter(|(node_id, activation_id)| {
+                                view.waits.iter().any(|wait| {
+                                    &wait.node_id == node_id && &wait.activation_id == activation_id
+                                })
+                            })
+                            .or_else(|| {
+                                view.waits
+                                    .first()
+                                    .map(|wait| (wait.node_id.clone(), wait.activation_id.clone()))
+                            });
+                        self.selected_approval_id = self
+                            .selected_approval_id
+                            .take()
+                            .filter(|approval_id| {
+                                view.mutation_approvals
+                                    .iter()
+                                    .any(|approval| &approval.approval_id == approval_id)
+                            })
+                            .or_else(|| {
+                                view.mutation_approvals
+                                    .first()
+                                    .map(|approval| approval.approval_id.clone())
+                            });
+                        self.selected_attempt_id = self
+                            .selected_attempt_id
+                            .take()
+                            .filter(|(node_id, activation_id, attempt)| {
+                                view.attempts.iter().any(|candidate| {
+                                    &candidate.node_id == node_id
+                                        && &candidate.activation_id == activation_id
+                                        && candidate.attempt == *attempt
+                                })
+                            })
+                            .or_else(|| {
+                                view.attempts.first().map(|attempt| {
+                                    (
+                                        attempt.node_id.clone(),
+                                        attempt.activation_id.clone(),
+                                        attempt.attempt,
+                                    )
+                                })
+                            });
+                        self.selected_output_id = self
+                            .selected_output_id
+                            .take()
+                            .filter(|output_id| {
+                                view.outputs
+                                    .iter()
+                                    .any(|output| &output.output_id == output_id)
+                            })
+                            .or_else(|| {
+                                view.outputs.first().map(|output| output.output_id.clone())
+                            });
+                        self.selected_child_session_id = self
+                            .selected_child_session_id
+                            .take()
+                            .filter(|session_id| {
+                                view.child_sessions
+                                    .iter()
+                                    .any(|session| &session.session_id == session_id)
+                            })
+                            .or_else(|| {
+                                view.child_sessions
+                                    .first()
+                                    .map(|session| session.session_id.clone())
+                            });
+                    }
+                    self.runs.clear();
+                    self.runs.insert(run_id, *view);
                     self.live_status = "live".to_string();
                 }
+                PluginTuiSurfaceUpdate::WorkflowRunLoading { run_id } => {
+                    self.detail_loading_run_id = Some(run_id);
+                }
+                PluginTuiSurfaceUpdate::SelectWorkflowRun { .. } => {}
                 PluginTuiSurfaceUpdate::ResyncRequired => {
                     self.live_status = "resync required; reopen /workflow".to_string();
                 }
@@ -559,12 +702,13 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn workflow_view_lines(
     catalog: Option<&bcode_workflow_view_models::WorkflowCatalogView>,
     runs: &std::collections::BTreeMap<String, bcode_workflow_view_models::WorkflowRunView>,
     live_status: &str,
-    selected_run: usize,
-    selected_node: usize,
+    selected_run_id: Option<&str>,
+    selected_node_id: Option<&str>,
     input_buffer: Option<&str>,
 ) -> Vec<String> {
     let mut lines = vec![
@@ -577,30 +721,59 @@ fn workflow_view_lines(
         return lines;
     };
     lines.push(format!("Runs ({})", catalog.runs.len()));
-    for (run_index, item) in catalog.runs.iter().enumerate() {
-        let run_marker = if run_index == selected_run { ">" } else { " " };
+    for item in &catalog.runs {
+        let selected = selected_run_id == Some(item.run_id.as_str());
+        let run_marker = if selected { ">" } else { " " };
+        let progress = &item.progress;
         lines.push(format!(
-            "{run_marker} {} · {} v{} · {:?}",
-            item.run_id, item.definition_id, item.definition_version, item.status
+            "{run_marker} {} · {:?} · {}/{} nodes{}",
+            item.display_title,
+            item.status,
+            progress.completed,
+            progress.total_nodes,
+            if item.attention.needs_attention() {
+                " · needs attention"
+            } else {
+                ""
+            }
         ));
+        lines.push(format!(
+            "    {} · {} v{}",
+            item.run_id, item.definition_id, item.definition_version
+        ));
+        if !selected {
+            continue;
+        }
         if let Some(run) = runs.get(&item.run_id) {
             lines.push(format!("    Nodes ({})", run.nodes.len()));
-            for (node_index, node) in run.nodes.iter().enumerate() {
-                let node_marker = if run_index == selected_run && node_index == selected_node {
+            for node in &run.nodes {
+                let node_marker = if selected_node_id == Some(node.node_id.as_str()) {
                     "▶"
                 } else {
                     " "
                 };
                 lines.push(format!(
                     "    {node_marker} {} · {:?} · {:?}",
-                    node.node_id, node.kind, node.status
+                    node.name, node.kind, node.status
                 ));
             }
             lines.push(format!("    Waits ({})", run.waits.len()));
+            for wait in &run.waits {
+                lines.push(format!("      {:?} · {}", wait.kind, wait.prompt));
+            }
             lines.push(format!(
                 "    Mutation approvals ({})",
                 run.mutation_approvals.len()
             ));
+            for approval in &run.mutation_approvals {
+                lines.push(format!(
+                    "      {} / {} · {} · {}",
+                    approval.plugin_id,
+                    approval.block_id,
+                    approval.operation,
+                    approval.workspace_snapshot
+                ));
+            }
             lines.push(format!("    Attempts ({})", run.attempts.len()));
             lines.push(format!("    Outputs ({})", run.outputs.len()));
             for output in &run.outputs {
@@ -1315,13 +1488,31 @@ mod tests {
                 .contains("Resolve diagnostics and provide valid configuration before start")
         );
     }
+    #[allow(clippy::too_many_lines)]
     fn projected_surface() -> WorkflowStatusSurface {
         let run = bcode_workflow_view_models::WorkflowRunView {
-            version: 1,
+            version: bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,
             run: bcode_workflow_view_models::WorkflowRunListItem {
                 run_id: "run-1".to_string(),
+                display_title: "Review".to_string(),
+                binding_label: None,
                 definition_id: "review".to_string(),
                 definition_version: 1,
+                authored_source: None,
+                definition_disposition:
+                    bcode_workflow_view_models::WorkflowDefinitionDisposition::CompiledOnly,
+                parent_run_id: None,
+                descendant_count: 0,
+                progress: bcode_workflow_view_models::WorkflowRunProgress {
+                    total_nodes: 1,
+                    failed: 1,
+                    ..bcode_workflow_view_models::WorkflowRunProgress::default()
+                },
+                attention: bcode_workflow_view_models::WorkflowAttentionSummary {
+                    pending_approvals: 1,
+                    retryable_failures: 1,
+                    ..bcode_workflow_view_models::WorkflowAttentionSummary::default()
+                },
                 status: bcode_workflow_view_models::WorkflowRunStatus::Running,
                 created_at_ms: 1,
                 updated_at_ms: 2,
@@ -1338,6 +1529,8 @@ mod tests {
                 node_id: "approval".to_string(),
                 activation_id: "approval-activation".to_string(),
                 kind: bcode_workflow_view_models::WorkflowWaitKind::Approval,
+                prompt: "Approve review".to_string(),
+                expected_schema: None,
                 input: None,
                 requested_at_ms: 2,
             }],
@@ -1372,6 +1565,7 @@ mod tests {
                 attempt: 2,
                 session_id: "00000000-0000-0000-0000-000000000001".to_string(),
             }],
+            actions: Vec::new(),
             terminal: None,
             health: bcode_workflow_view_models::WorkflowProjectionHealth::Current,
         };
@@ -1379,13 +1573,24 @@ mod tests {
             options: serde_json::Value::Null,
             selected_approval: 0,
             text_view: TextViewState::new(),
-            selected_run: 0,
-            selected_node: 0,
+            selected_run_id: Some("run-1".to_string()),
+            selected_node_id: Some("reviewer".to_string()),
+            selected_wait_id: Some(("approval".to_string(), "approval-activation".to_string())),
+            selected_approval_id: None,
+            selected_attempt_id: Some(("reviewer".to_string(), "activation-1".to_string(), 2)),
+            selected_output_id: Some("output-1".to_string()),
+            selected_child_session_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            detail_loading_run_id: None,
             input_buffer: None,
             updates: None,
             catalog: Some(bcode_workflow_view_models::WorkflowCatalogView {
-                version: 1,
+                version: bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,
                 runs: vec![run.run.clone()],
+                next_cursor: None,
+                has_more: false,
+                filter: bcode_workflow_view_models::WorkflowCatalogFilter::All,
+                sort: bcode_workflow_view_models::WorkflowCatalogSort::UpdatedAt,
+                search: None,
             }),
             runs: std::collections::BTreeMap::from([("run-1".to_string(), run)]),
             live_status: "live".to_string(),
@@ -1400,8 +1605,8 @@ mod tests {
             surface.catalog.as_ref(),
             &surface.runs,
             &surface.live_status,
-            0,
-            0,
+            Some("run-1"),
+            Some("reviewer"),
             None,
         )
         .join("\n");
@@ -1443,6 +1648,8 @@ mod tests {
             node_id: "input".to_string(),
             activation_id: "input-activation".to_string(),
             kind: bcode_workflow_view_models::WorkflowWaitKind::Input,
+            prompt: "Provide input".to_string(),
+            expected_schema: Some(serde_json::json!({"type": "object"})),
             input: None,
             requested_at_ms: 4,
         }];
@@ -1451,6 +1658,15 @@ mod tests {
                 approval_id: "mutation-1".to_string(),
                 node_id: "mutate".to_string(),
                 activation_id: "mutation-activation".to_string(),
+                plugin_id: "bcode.git".to_string(),
+                block_id: "git.commit".to_string(),
+                block_version: 1,
+                operation: "commit".to_string(),
+                effect: bcode_workflow_view_models::WorkflowOperationEffect::Mutating,
+                input_summary: serde_json::json!({"message": "reviewed"}),
+                resource_claims: Vec::new(),
+                workspace_snapshot: "snapshot-1".to_string(),
+                reconciliation_warning: None,
                 requested_at_ms: 4,
                 expires_at_ms: None,
             }];
@@ -1464,12 +1680,12 @@ mod tests {
 
         let key =
             |character| Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char(character)));
-        assert_eq!(surface.selected_run, 0);
-        assert_eq!(
+        assert_eq!(surface.selected_run_id.as_deref(), Some("run-1"));
+        assert!(matches!(
             surface.handle_control_center_event(&key('l')),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.selected_run, 1);
+            PluginTuiAction::SelectWorkflowRun { ref run_id } if run_id == "run-2"
+        ));
+        assert_eq!(surface.selected_run_id.as_deref(), Some("run-2"));
         assert!(matches!(
             surface.handle_control_center_event(&key('p')),
             PluginTuiAction::InvokePluginCommand { ref command_id, .. }
@@ -1516,7 +1732,11 @@ mod tests {
             surface.handle_control_center_event(&key('l')),
             PluginTuiAction::Redraw
         );
-        assert_eq!(surface.selected_run, 1, "run navigation stays bounded");
+        assert_eq!(
+            surface.selected_run_id.as_deref(),
+            Some("run-2"),
+            "run navigation stays bounded"
+        );
     }
 
     #[test]

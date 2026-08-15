@@ -16,6 +16,7 @@ use bcode_workflow::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -231,6 +232,78 @@ pub struct WorkflowRunSummary {
     pub cancellation_requested_at_ms: Option<u64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+/// Bounded derived counts used by workflow catalog presentation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowRunCatalogSummary {
+    pub total_nodes: u32,
+    pub not_started: u32,
+    pub active: u32,
+    pub blocked: u32,
+    pub completed: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+    pub skipped: u32,
+    pub repair_required: u32,
+    pub pending_inputs: u32,
+    pub pending_approvals: u32,
+    pub pending_mutation_approvals: u32,
+    pub retryable_failures: u32,
+    pub descendant_count: u32,
+}
+
+/// Store-owned catalog filter for bounded run discovery.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkflowRunCatalogFilter {
+    Active,
+    NeedsAttention,
+    Failed,
+    Completed,
+    #[default]
+    All,
+}
+
+/// Store-owned deterministic catalog ordering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkflowRunCatalogSort {
+    #[default]
+    UpdatedAt,
+    CreatedAt,
+    Status,
+}
+
+/// Store-owned keyset cursor for one run catalog query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunCatalogCursor {
+    pub sort: WorkflowRunCatalogSort,
+    pub timestamp_ms: u64,
+    pub status_rank: u8,
+    pub run_id: String,
+}
+
+/// Bounded store query for workflow catalog rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunCatalogQuery {
+    pub limit: usize,
+    pub cursor: Option<WorkflowRunCatalogCursor>,
+    pub filter: WorkflowRunCatalogFilter,
+    pub sort: WorkflowRunCatalogSort,
+    pub search: Option<String>,
+}
+
+/// Stable cursor and presentation data for one bounded workflow catalog row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunCatalogEntry {
+    pub run: WorkflowRunSummary,
+    pub summary: WorkflowRunCatalogSummary,
+}
+
+/// One bounded stable workflow run catalog page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunCatalogPage {
+    pub entries: Vec<WorkflowRunCatalogEntry>,
+    pub has_more: bool,
 }
 
 /// Bounded pending activation ready for host admission.
@@ -8756,6 +8829,210 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Return bounded catalog counts without replaying workflow events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity or inconsistent derived rows.
+    pub fn run_catalog_summary(
+        &self,
+        run_id: &str,
+    ) -> Result<WorkflowRunCatalogSummary, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let definition_json: String = self.connection.query_row(
+            "SELECT definition.definition_json FROM workflow_runs run \
+             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+             AND definition.version = run.definition_version WHERE run.run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+        let mut summary = WorkflowRunCatalogSummary {
+            total_nodes: u32::try_from(definition.nodes.len()).unwrap_or(u32::MAX),
+            not_started: u32::try_from(definition.nodes.len()).unwrap_or(u32::MAX),
+            ..WorkflowRunCatalogSummary::default()
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT node_id, status FROM workflow_activations WHERE run_id = ?1 \
+             ORDER BY node_id, dependency_generation DESC, created_at_ms DESC, activation_id DESC",
+        )?;
+        let rows = statement
+            .query_map([run_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut observed_nodes = BTreeSet::new();
+        for (node_id, status) in rows {
+            if !observed_nodes.insert(node_id) {
+                continue;
+            }
+            summary.not_started = summary.not_started.saturating_sub(1);
+            match status.as_str() {
+                "pending" | "running" => summary.active = summary.active.saturating_add(1),
+                "waiting_input" => {
+                    summary.blocked = summary.blocked.saturating_add(1);
+                    summary.pending_inputs = summary.pending_inputs.saturating_add(1);
+                }
+                "waiting_approval" => {
+                    summary.blocked = summary.blocked.saturating_add(1);
+                    summary.pending_approvals = summary.pending_approvals.saturating_add(1);
+                }
+                "waiting_mutation_approval" => {
+                    summary.blocked = summary.blocked.saturating_add(1);
+                }
+                "completed" => summary.completed = summary.completed.saturating_add(1),
+                "failed" => summary.failed = summary.failed.saturating_add(1),
+                "cancelled" => summary.cancelled = summary.cancelled.saturating_add(1),
+                "skipped" => summary.skipped = summary.skipped.saturating_add(1),
+                "repair_required" => {
+                    summary.repair_required = summary.repair_required.saturating_add(1);
+                }
+                _ => {
+                    return Err(WorkflowStoreError::InvalidData(format!(
+                        "invalid workflow activation status: {status}"
+                    )));
+                }
+            }
+        }
+        summary.pending_mutation_approvals = self.connection.query_row(
+            "SELECT COUNT(*) FROM workflow_mutation_approvals WHERE run_id = ?1 AND status = 'pending'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        summary.retryable_failures = self.connection.query_row(
+            "SELECT COUNT(*) FROM workflow_attempts attempt \
+             JOIN workflow_activations activation ON activation.run_id = attempt.run_id \
+             AND activation.node_id = attempt.node_id AND activation.activation_id = attempt.activation_id \
+             WHERE attempt.run_id = ?1 AND attempt.status = 'failed' AND activation.status = 'failed' \
+             AND attempt.attempt = (SELECT MAX(latest.attempt) FROM workflow_attempts latest \
+             WHERE latest.run_id = attempt.run_id AND latest.node_id = attempt.node_id \
+             AND latest.activation_id = attempt.activation_id)",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        summary.descendant_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM workflow_run_links WHERE root_run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(summary)
+    }
+
+    /// Return one bounded deterministic workflow catalog page.
+    ///
+    /// Filtering is performed over bounded rows and approved display metadata. The query never
+    /// replays canonical workflow events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds, cursors, searches, or inconsistent derived state.
+    #[allow(clippy::too_many_lines)]
+    pub fn workflow_run_catalog_page(
+        &self,
+        request: &WorkflowRunCatalogQuery,
+    ) -> Result<WorkflowRunCatalogPage, WorkflowStoreError> {
+        let query_limit = authoring_page_query_limit(request.limit)?;
+        if request
+            .search
+            .as_ref()
+            .is_some_and(|search| search.is_empty() || search.len() > MAX_DISPLAY_LABEL_BYTES)
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow catalog search must contain 1..=512 bytes".to_string(),
+            ));
+        }
+        if let Some(cursor) = &request.cursor {
+            validate_id("workflow catalog cursor run_id", &cursor.run_id)?;
+            if cursor.sort != request.sort {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow catalog cursor sort does not match request".to_string(),
+                ));
+            }
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
+             parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
+             single_active, authored_provenance_json, terminal_output_id, \
+             terminal_output_checksum_sha256, authorization_profile_json, authorization_ceiling, status, cancellation_requested_at_ms, \
+             created_at_ms, updated_at_ms FROM workflow_runs ORDER BY updated_at_ms DESC, run_id ASC LIMIT 1000",
+        )?;
+        let mut runs = statement
+            .query_map([], run_summary_from_row)?
+            .map(|row| {
+                row.map_err(WorkflowStoreError::from)
+                    .and_then(parse_run_summary)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let search = request.search.as_ref().map(|value| value.to_lowercase());
+        runs.retain(|run| {
+            let summary = self.run_catalog_summary(&run.run_id).ok();
+            let filter_matches = match request.filter {
+                WorkflowRunCatalogFilter::Active => {
+                    matches!(run.status, RunStatus::Running | RunStatus::Paused)
+                }
+                WorkflowRunCatalogFilter::NeedsAttention => {
+                    summary.as_ref().is_some_and(|summary| {
+                        summary.pending_inputs > 0
+                            || summary.pending_approvals > 0
+                            || summary.pending_mutation_approvals > 0
+                            || summary.retryable_failures > 0
+                            || summary.repair_required > 0
+                    }) || run.status == RunStatus::RepairRequired
+                }
+                WorkflowRunCatalogFilter::Failed => {
+                    matches!(run.status, RunStatus::Failed | RunStatus::RepairRequired)
+                }
+                WorkflowRunCatalogFilter::Completed => run.status == RunStatus::Completed,
+                WorkflowRunCatalogFilter::All => true,
+            };
+            let search_matches = search.as_ref().is_none_or(|search| {
+                run.run_id.to_lowercase().contains(search)
+                    || run.definition_id.to_lowercase().contains(search)
+                    || run
+                        .binding
+                        .as_ref()
+                        .and_then(|binding| binding.display_label.as_ref())
+                        .is_some_and(|label| label.to_lowercase().contains(search))
+                    || run
+                        .authored_provenance
+                        .as_ref()
+                        .is_some_and(|source| source.workflow_id.to_lowercase().contains(search))
+            });
+            filter_matches && search_matches
+        });
+        runs.sort_by(|left, right| match request.sort {
+            WorkflowRunCatalogSort::UpdatedAt => right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| left.run_id.cmp(&right.run_id)),
+            WorkflowRunCatalogSort::CreatedAt => right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| left.run_id.cmp(&right.run_id)),
+            WorkflowRunCatalogSort::Status => run_status_rank(left.status)
+                .cmp(&run_status_rank(right.status))
+                .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+                .then_with(|| left.run_id.cmp(&right.run_id)),
+        });
+        if let Some(cursor) = &request.cursor {
+            runs.retain(|run| run_follows_catalog_cursor(run, cursor));
+        }
+        let requested = usize::try_from(query_limit).unwrap_or(1_001);
+        runs.truncate(requested);
+        let has_more = runs.len() > request.limit;
+        runs.truncate(request.limit);
+        let entries = runs
+            .into_iter()
+            .map(|run| {
+                Ok(WorkflowRunCatalogEntry {
+                    summary: self.run_catalog_summary(&run.run_id)?,
+                    run,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkflowStoreError>>()?;
+        Ok(WorkflowRunCatalogPage { entries, has_more })
+    }
+
     /// Return the newest run associated with one exact generic binding key.
     ///
     /// This uses a bounded indexed lookup and never replays workflow events.
@@ -11119,6 +11396,39 @@ fn enforce_attempt_limits(
         ));
     }
     Ok(())
+}
+
+const fn run_status_rank(status: RunStatus) -> u8 {
+    match status {
+        RunStatus::Running => 0,
+        RunStatus::Paused => 1,
+        RunStatus::RepairRequired => 2,
+        RunStatus::Failed => 3,
+        RunStatus::Completed => 4,
+        RunStatus::Cancelled => 5,
+    }
+}
+
+#[allow(clippy::suspicious_operation_groupings)]
+fn run_follows_catalog_cursor(run: &WorkflowRunSummary, cursor: &WorkflowRunCatalogCursor) -> bool {
+    match cursor.sort {
+        WorkflowRunCatalogSort::UpdatedAt => {
+            run.updated_at_ms < cursor.timestamp_ms
+                || (run.updated_at_ms == cursor.timestamp_ms && run.run_id > cursor.run_id)
+        }
+        WorkflowRunCatalogSort::CreatedAt => {
+            run.created_at_ms < cursor.timestamp_ms
+                || (run.created_at_ms == cursor.timestamp_ms && run.run_id > cursor.run_id)
+        }
+        WorkflowRunCatalogSort::Status => {
+            let rank = run_status_rank(run.status);
+            rank > cursor.status_rank
+                || (rank == cursor.status_rank
+                    && (run.updated_at_ms < cursor.timestamp_ms
+                        || (run.updated_at_ms == cursor.timestamp_ms
+                            && run.run_id > cursor.run_id)))
+        }
+    }
 }
 
 fn authoring_page_query_limit(limit: usize) -> Result<i64, WorkflowStoreError> {

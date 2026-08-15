@@ -463,6 +463,7 @@ impl InteractiveSurfaceState {
             PluginTuiAction::None => InteractiveSurfaceEventOutcome::Ignored,
             PluginTuiAction::Redraw
             | PluginTuiAction::SubscribeWorkflowRuns
+            | PluginTuiAction::SelectWorkflowRun { .. }
             | PluginTuiAction::InvokePluginCommand { .. }
             | PluginTuiAction::OpenSession { .. }
             | PluginTuiAction::OpenSurface { .. } => InteractiveSurfaceEventOutcome::Consumed,

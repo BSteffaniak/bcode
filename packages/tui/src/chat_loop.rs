@@ -207,6 +207,7 @@ pub struct ChatLoopState {
     streaming_configurator: Option<super::streaming_configurator::StreamingConfiguratorState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     plugin_surface: Option<RootPluginSurface>,
+    workflow_view_requests: Option<tokio::sync::mpsc::Sender<String>>,
     provider_picker: Option<super::provider_picker::ProviderPickerApp>,
     model_picker: Option<RootModelPicker>,
     auth_pool_picker: Option<super::auth_pool_picker::AuthPoolPickerApp>,
@@ -257,6 +258,7 @@ impl ChatLoopState {
             streaming_configurator: None,
             timeline_dialog: None,
             plugin_surface: None,
+            workflow_view_requests: None,
             provider_picker: None,
             model_picker: None,
             auth_pool_picker: None,
@@ -977,9 +979,17 @@ impl ChatLoopState {
     pub fn attach_root_plugin_surface_updates(
         &mut self,
         updates: bcode_plugin_sdk::tui::PluginTuiSurfaceUpdateReceiver,
+        workflow_view_requests: tokio::sync::mpsc::Sender<String>,
     ) {
+        self.workflow_view_requests = Some(workflow_view_requests);
         if let Some(surface) = self.plugin_surface.as_mut() {
             surface.surface.attach_updates(updates);
+        }
+    }
+
+    pub fn request_root_workflow_run(&self, run_id: String) {
+        if let Some(requests) = &self.workflow_view_requests {
+            let _ = requests.try_send(run_id);
         }
     }
 
@@ -988,11 +998,13 @@ impl ChatLoopState {
         outcome: Option<serde_json::Value>,
     ) -> Option<(String, Option<serde_json::Value>)> {
         let surface = self.plugin_surface.take()?;
+        self.workflow_view_requests = None;
         Some((surface.plugin_id, outcome))
     }
 
     pub fn close_root_plugin_surface(&mut self) {
         self.plugin_surface = None;
+        self.workflow_view_requests = None;
     }
 
     pub const fn has_model_picker(&self) -> bool {

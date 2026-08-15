@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Current workflow projection schema version.
-pub const WORKFLOW_VIEW_VERSION: u32 = 1;
+pub const WORKFLOW_VIEW_VERSION: u32 = 2;
 
 /// Current workflow live-event contract version.
 pub const WORKFLOW_LIVE_EVENT_VERSION: u32 = 1;
@@ -93,7 +93,73 @@ impl WorkflowLiveSequence {
     }
 }
 
-/// Bounded catalog snapshot of durable workflow runs.
+/// Error returned when a workflow projection uses an unsupported contract version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedWorkflowViewVersion {
+    pub version: u32,
+}
+
+impl std::fmt::Display for UnsupportedWorkflowViewVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported workflow view version {}; expected {WORKFLOW_VIEW_VERSION}",
+            self.version
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedWorkflowViewVersion {}
+
+/// Portable catalog filter applied by the workflow application boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCatalogFilter {
+    Active,
+    NeedsAttention,
+    Failed,
+    Completed,
+    #[default]
+    All,
+}
+
+/// Portable deterministic catalog ordering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCatalogSort {
+    #[default]
+    UpdatedAt,
+    CreatedAt,
+    Status,
+}
+
+/// Stable keyset cursor for a bounded workflow catalog page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCatalogCursor {
+    pub sort: WorkflowCatalogSort,
+    pub timestamp_ms: u64,
+    pub status_rank: u8,
+    pub run_id: String,
+}
+
+/// Renderer-neutral bounded workflow catalog request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCatalogRequest {
+    pub limit: usize,
+    #[serde(default)]
+    pub cursor: Option<WorkflowCatalogCursor>,
+    #[serde(default)]
+    pub filter: WorkflowCatalogFilter,
+    #[serde(default)]
+    pub sort: WorkflowCatalogSort,
+    /// Bounded case-insensitive search over approved run display fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+}
+
+/// Bounded catalog page of durable workflow runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowCatalogView {
@@ -101,6 +167,92 @@ pub struct WorkflowCatalogView {
     pub version: u32,
     /// Runs ordered by the application catalog query.
     pub runs: Vec<WorkflowRunListItem>,
+    /// Cursor for the next deterministic page.
+    pub next_cursor: Option<WorkflowCatalogCursor>,
+    /// True when another bounded page follows this page.
+    pub has_more: bool,
+    pub filter: WorkflowCatalogFilter,
+    pub sort: WorkflowCatalogSort,
+    pub search: Option<String>,
+}
+
+impl WorkflowCatalogView {
+    /// Reject projections that do not use the exact supported contract version.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsupported version without guessing future semantics.
+    pub const fn validate_version(&self) -> Result<(), UnsupportedWorkflowViewVersion> {
+        if self.version == WORKFLOW_VIEW_VERSION {
+            Ok(())
+        } else {
+            Err(UnsupportedWorkflowViewVersion {
+                version: self.version,
+            })
+        }
+    }
+}
+
+/// Authored source identity for a workflow run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoredSourceView {
+    /// Stable authored workflow identity.
+    pub workflow_id: String,
+    /// Exact immutable published revision used by this run.
+    pub revision: u64,
+}
+
+/// Renderer-neutral definition navigation disposition for a workflow run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowDefinitionDisposition {
+    /// This run uses an exact published authored revision.
+    Published {
+        workflow_id: String,
+        revision: u64,
+        editable_draft_id: Option<String>,
+    },
+    /// This run uses a compiled definition with no authored editing boundary.
+    CompiledOnly,
+}
+
+/// Portable bounded run-progress counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunProgress {
+    pub total_nodes: u32,
+    pub not_started: u32,
+    pub active: u32,
+    pub blocked: u32,
+    pub completed: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+    pub skipped: u32,
+    pub repair_required: u32,
+}
+
+/// Portable bounded summary of workflow states requiring attention.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAttentionSummary {
+    pub pending_inputs: u32,
+    pub pending_approvals: u32,
+    pub pending_mutation_approvals: u32,
+    pub retryable_failures: u32,
+    pub repair_required: bool,
+}
+
+impl WorkflowAttentionSummary {
+    /// Return whether the run currently needs operator attention.
+    #[must_use]
+    pub const fn needs_attention(&self) -> bool {
+        self.pending_inputs > 0
+            || self.pending_approvals > 0
+            || self.pending_mutation_approvals > 0
+            || self.retryable_failures > 0
+            || self.repair_required
+    }
 }
 
 /// Portable workflow run catalog item.
@@ -108,8 +260,18 @@ pub struct WorkflowCatalogView {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowRunListItem {
     pub run_id: String,
+    /// Primary user-facing identity.
+    pub display_title: String,
+    /// Optional product binding label.
+    pub binding_label: Option<String>,
     pub definition_id: String,
     pub definition_version: u32,
+    pub authored_source: Option<WorkflowAuthoredSourceView>,
+    pub definition_disposition: WorkflowDefinitionDisposition,
+    pub parent_run_id: Option<String>,
+    pub descendant_count: u32,
+    pub progress: WorkflowRunProgress,
+    pub attention: WorkflowAttentionSummary,
     pub status: WorkflowRunStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -127,6 +289,69 @@ pub enum WorkflowRunStatus {
     RepairRequired,
 }
 
+/// Renderer-neutral action kind exposed only as a presentation affordance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowActionKind {
+    Pause,
+    Resume,
+    Cancel,
+    ProvideInput,
+    Approve,
+    Deny,
+    ApproveMutation,
+    DenyMutation,
+    RetryNode,
+    OpenSession,
+    ViewDefinition,
+    EditDraft,
+    ForkDefinition,
+}
+
+/// Exact stable identity for one presentation action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowActionTarget {
+    Run {
+        run_id: String,
+    },
+    Activation {
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+    },
+    MutationApproval {
+        approval_id: String,
+    },
+    Attempt {
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        attempt: u32,
+    },
+    Session {
+        session_id: String,
+    },
+    PublishedDefinition {
+        workflow_id: String,
+        revision: u64,
+    },
+    Draft {
+        workflow_id: String,
+        draft_id: String,
+    },
+}
+
+/// Presentation-only action availability. The application boundary revalidates every request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowActionAffordance {
+    pub kind: WorkflowActionKind,
+    pub target: WorkflowActionTarget,
+    pub enabled: bool,
+    pub unavailable_reason: Option<String>,
+}
+
 /// Bounded semantic projection of one workflow run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,8 +366,26 @@ pub struct WorkflowRunView {
     pub outputs: Vec<WorkflowOutputView>,
     pub descendant_runs: Vec<WorkflowDescendantRunView>,
     pub child_sessions: Vec<WorkflowChildSessionView>,
+    pub actions: Vec<WorkflowActionAffordance>,
     pub terminal: Option<WorkflowTerminalView>,
     pub health: WorkflowProjectionHealth,
+}
+
+impl WorkflowRunView {
+    /// Reject projections that do not use the exact supported contract version.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsupported version without guessing future semantics.
+    pub const fn validate_version(&self) -> Result<(), UnsupportedWorkflowViewVersion> {
+        if self.version == WORKFLOW_VIEW_VERSION {
+            Ok(())
+        } else {
+            Err(UnsupportedWorkflowViewVersion {
+                version: self.version,
+            })
+        }
+    }
 }
 
 /// Semantic node kind, independent of any renderer.
@@ -215,8 +458,28 @@ pub struct WorkflowWaitView {
     pub node_id: String,
     pub activation_id: String,
     pub kind: WorkflowWaitKind,
+    /// Bounded user-facing prompt derived from the exact node definition.
+    pub prompt: String,
+    /// Expected value schema for input waits.
+    pub expected_schema: Option<serde_json::Value>,
+    /// Current bounded activation input summary.
     pub input: Option<serde_json::Value>,
     pub requested_at_ms: u64,
+}
+
+/// Side-effect class of a pending mutation operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowOperationEffect {
+    Mutating,
+}
+
+/// Portable resource claim shown for informed approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowResourceClaimView {
+    pub resource: String,
+    pub access: String,
 }
 
 /// Pending plugin mutation approval. Presentation fields cannot authorize execution.
@@ -226,6 +489,15 @@ pub struct WorkflowMutationApprovalView {
     pub approval_id: String,
     pub node_id: String,
     pub activation_id: String,
+    pub plugin_id: String,
+    pub block_id: String,
+    pub block_version: u32,
+    pub operation: String,
+    pub effect: WorkflowOperationEffect,
+    pub input_summary: serde_json::Value,
+    pub resource_claims: Vec<WorkflowResourceClaimView>,
+    pub workspace_snapshot: String,
+    pub reconciliation_warning: Option<String>,
     pub requested_at_ms: u64,
     pub expires_at_ms: Option<u64>,
 }
@@ -310,6 +582,25 @@ pub enum WorkflowProjectionHealth {
 #[cfg(test)]
 mod live_event_tests {
     use super::*;
+
+    #[test]
+    fn projection_versions_fail_closed() {
+        let catalog = WorkflowCatalogView {
+            version: WORKFLOW_VIEW_VERSION + 1,
+            runs: Vec::new(),
+            next_cursor: None,
+            has_more: false,
+            filter: WorkflowCatalogFilter::All,
+            sort: WorkflowCatalogSort::UpdatedAt,
+            search: None,
+        };
+        assert_eq!(
+            catalog.validate_version(),
+            Err(UnsupportedWorkflowViewVersion {
+                version: WORKFLOW_VIEW_VERSION + 1,
+            })
+        );
+    }
 
     fn event(version: u32, event_sequence: u64) -> WorkflowLiveEvent {
         WorkflowLiveEvent {

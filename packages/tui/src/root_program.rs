@@ -557,13 +557,17 @@ impl BcodeRuntimeModel {
                         .set_status(format!("surface toggle requested: {surface_id}"));
                 }
                 bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns => {
-                    let updates = super::plugin_surface_host::subscribe_workflow_views(
+                    let (updates, requests) = super::plugin_surface_host::subscribe_workflow_views(
                         self.loop_state.foreground_client(),
                         self.loop_state
                             .root_plugin_surface_invalidation()
                             .expect("plugin surface invalidation"),
                     );
-                    self.loop_state.attach_root_plugin_surface_updates(updates);
+                    self.loop_state
+                        .attach_root_plugin_surface_updates(updates, requests);
+                }
+                bcode_plugin_sdk::tui::PluginTuiAction::SelectWorkflowRun { run_id } => {
+                    self.loop_state.request_root_workflow_run(run_id);
                 }
                 bcode_plugin_sdk::tui::PluginTuiAction::InvokePluginCommand {
                     plugin_id,
@@ -2376,13 +2380,19 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         super::invalidation::UiInvalidation::Structural
                     }
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns) => {
-                        let updates = super::plugin_surface_host::subscribe_workflow_views(
-                            self.loop_state.foreground_client(),
-                            self.loop_state
-                                .root_plugin_surface_invalidation()
-                                .expect("plugin surface invalidation"),
-                        );
-                        self.loop_state.attach_root_plugin_surface_updates(updates);
+                        let (updates, requests) =
+                            super::plugin_surface_host::subscribe_workflow_views(
+                                self.loop_state.foreground_client(),
+                                self.loop_state
+                                    .root_plugin_surface_invalidation()
+                                    .expect("plugin surface invalidation"),
+                            );
+                        self.loop_state
+                            .attach_root_plugin_surface_updates(updates, requests);
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::SelectWorkflowRun { run_id }) => {
+                        self.loop_state.request_root_workflow_run(run_id);
                         super::invalidation::UiInvalidation::Structural
                     }
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::InvokePluginCommand {

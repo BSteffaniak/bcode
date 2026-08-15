@@ -911,8 +911,11 @@ async fn stream_plugin_session_view_inner(
 async fn stream_plugin_workflow_views(
     client: BcodeClient,
     sender: mpsc::Sender<PluginTuiSurfaceUpdate>,
+    mut requests: mpsc::Receiver<String>,
     redraw: InvalidationSignal,
 ) {
+    const CATALOG_PAGE_SIZE: usize = 100;
+    const RUN_DETAIL_LIMIT: usize = 1_000;
     let mut watcher = match client.watch_workflow_runs().await {
         Ok(watcher) => watcher,
         Err(error) => {
@@ -925,7 +928,14 @@ async fn stream_plugin_workflow_views(
             return;
         }
     };
-    let catalog = match client.workflow_catalog_view(1_000).await {
+    let catalog_request = bcode_workflow_view_models::WorkflowCatalogRequest {
+        limit: CATALOG_PAGE_SIZE,
+        cursor: None,
+        filter: bcode_workflow_view_models::WorkflowCatalogFilter::All,
+        sort: bcode_workflow_view_models::WorkflowCatalogSort::UpdatedAt,
+        search: None,
+    };
+    let catalog = match client.workflow_catalog_view(catalog_request.clone()).await {
         Ok(catalog) => catalog,
         Err(error) => {
             let _ = sender
@@ -937,11 +947,7 @@ async fn stream_plugin_workflow_views(
             return;
         }
     };
-    let run_ids = catalog
-        .runs
-        .iter()
-        .map(|run| run.run_id.clone())
-        .collect::<Vec<_>>();
+    let mut selected_run_id = catalog.runs.first().map(|run| run.run_id.clone());
     if sender
         .send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog))
         .await
@@ -949,8 +955,8 @@ async fn stream_plugin_workflow_views(
     {
         return;
     }
-    for run_id in run_ids {
-        match client.workflow_run_view(run_id, 1_000).await {
+    if let Some(run_id) = selected_run_id.clone() {
+        match client.workflow_run_view(run_id, RUN_DETAIL_LIMIT).await {
             Ok(view) => {
                 if sender
                     .send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view)))
@@ -974,71 +980,91 @@ async fn stream_plugin_workflow_views(
     redraw.request();
 
     loop {
-        match watcher.next_event().await {
-            Ok(bcode_client::WorkflowRunWatchEvent::Changed(event)) => {
-                let catalog = match client.workflow_catalog_view(1_000).await {
-                    Ok(catalog) => catalog,
-                    Err(error) => {
-                        let _ = sender
-                            .send(PluginTuiSurfaceUpdate::Disconnected {
-                                message: error.to_string(),
-                            })
-                            .await;
-                        redraw.request();
-                        return;
-                    }
+        tokio::select! {
+            requested = requests.recv() => {
+                let Some(run_id) = requested else {
+                    return;
                 };
+                if selected_run_id.as_deref() == Some(run_id.as_str()) {
+                    continue;
+                }
+                selected_run_id = Some(run_id.clone());
                 if sender
-                    .send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog))
+                    .send(PluginTuiSurfaceUpdate::WorkflowRunLoading {
+                        run_id: run_id.clone(),
+                    })
                     .await
                     .is_err()
                 {
                     return;
                 }
-                match client.workflow_run_view(event.run_id, 1_000).await {
+                match client.workflow_run_view(run_id, RUN_DETAIL_LIMIT).await {
                     Ok(view) => {
-                        if sender
-                            .send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view)))
-                            .await
-                            .is_err()
-                        {
+                        if sender.send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view))).await.is_err() {
                             return;
                         }
                         redraw.request();
                     }
                     Err(error) => {
-                        let _ = sender
-                            .send(PluginTuiSurfaceUpdate::Disconnected {
-                                message: error.to_string(),
-                            })
-                            .await;
+                        let _ = sender.send(PluginTuiSurfaceUpdate::Disconnected {
+                            message: error.to_string(),
+                        }).await;
                         redraw.request();
-                        return;
                     }
                 }
             }
-            Ok(bcode_client::WorkflowRunWatchEvent::ResyncRequired) => {
-                let _ = sender.send(PluginTuiSurfaceUpdate::ResyncRequired).await;
-                redraw.request();
-                return;
-            }
-            Ok(bcode_client::WorkflowRunWatchEvent::UnsupportedVersion { version }) => {
-                let _ = sender
-                    .send(PluginTuiSurfaceUpdate::Disconnected {
+            event = watcher.next_event() => match event {
+                Ok(bcode_client::WorkflowRunWatchEvent::Changed(event)) => {
+                    let catalog = match client.workflow_catalog_view(catalog_request.clone()).await {
+                        Ok(catalog) => catalog,
+                        Err(error) => {
+                            let _ = sender.send(PluginTuiSurfaceUpdate::Disconnected {
+                                message: error.to_string(),
+                            }).await;
+                            redraw.request();
+                            return;
+                        }
+                    };
+                    if sender.send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog)).await.is_err() {
+                        return;
+                    }
+                    if selected_run_id.as_deref() == Some(event.run_id.as_str()) {
+                        match client.workflow_run_view(event.run_id, RUN_DETAIL_LIMIT).await {
+                            Ok(view) => {
+                                if sender.send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = sender.send(PluginTuiSurfaceUpdate::Disconnected {
+                                    message: error.to_string(),
+                                }).await;
+                                redraw.request();
+                                return;
+                            }
+                        }
+                    }
+                    redraw.request();
+                }
+                Ok(bcode_client::WorkflowRunWatchEvent::ResyncRequired) => {
+                    let _ = sender.send(PluginTuiSurfaceUpdate::ResyncRequired).await;
+                    redraw.request();
+                    return;
+                }
+                Ok(bcode_client::WorkflowRunWatchEvent::UnsupportedVersion { version }) => {
+                    let _ = sender.send(PluginTuiSurfaceUpdate::Disconnected {
                         message: format!("unsupported workflow live-event version {version}"),
-                    })
-                    .await;
-                redraw.request();
-                return;
-            }
-            Err(error) => {
-                let _ = sender
-                    .send(PluginTuiSurfaceUpdate::Disconnected {
+                    }).await;
+                    redraw.request();
+                    return;
+                }
+                Err(error) => {
+                    let _ = sender.send(PluginTuiSurfaceUpdate::Disconnected {
                         message: error.to_string(),
-                    })
-                    .await;
-                redraw.request();
-                return;
+                    }).await;
+                    redraw.request();
+                    return;
+                }
             }
         }
     }
@@ -1047,10 +1073,13 @@ async fn stream_plugin_workflow_views(
 pub fn subscribe_workflow_views(
     client: BcodeClient,
     redraw: InvalidationSignal,
-) -> PluginTuiSurfaceUpdateReceiver {
+) -> (PluginTuiSurfaceUpdateReceiver, mpsc::Sender<String>) {
     let (sender, receiver) = mpsc::channel(64);
-    tokio::spawn(stream_plugin_workflow_views(client, sender, redraw));
-    receiver
+    let (request_sender, requests) = mpsc::channel(8);
+    tokio::spawn(stream_plugin_workflow_views(
+        client, sender, requests, redraw,
+    ));
+    (receiver, request_sender)
 }
 
 #[cfg(test)]

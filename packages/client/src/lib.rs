@@ -3718,10 +3718,10 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the bounded request.
     pub async fn workflow_catalog_view(
         &self,
-        limit: usize,
+        request: bcode_workflow_view_models::WorkflowCatalogRequest,
     ) -> Result<bcode_workflow_view_models::WorkflowCatalogView, ClientError> {
         match self
-            .send_request(Request::WorkflowCatalogView { limit })
+            .send_request(Request::WorkflowCatalogView { request })
             .await?
         {
             ResponsePayload::WorkflowCatalogView { view } => Ok(view),

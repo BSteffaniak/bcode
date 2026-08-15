@@ -485,7 +485,7 @@ pub enum RuntimeAndModelRequest {
     },
     /// Return one bounded renderer-neutral workflow run catalog.
     WorkflowCatalogView {
-        limit: usize,
+        request: bcode_workflow_view_models::WorkflowCatalogRequest,
     },
     /// Return one bounded durable workflow run summary.
     WorkflowRunStatus {
@@ -1091,9 +1091,9 @@ impl RoutedRequest {
                     limit,
                 }))
             }
-            Request::WorkflowCatalogView { limit } => {
+            Request::WorkflowCatalogView { request } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowCatalogView {
-                    limit,
+                    request,
                 }))
             }
             Request::WorkflowRunStatus { run_id } => {
