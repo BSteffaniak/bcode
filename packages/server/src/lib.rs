@@ -10613,6 +10613,17 @@ fn session_db_error_response(error: &bcode_session::db::SessionDbError) -> Error
                 actual,
                 current,
             },
+        ) if actual < current => ErrorResponse::new(
+            "session_migration_required",
+            format!(
+                "session history uses event schema {actual}, but this Bcode build writes schema {current}; reopen the session to migrate it forward automatically, or migrate in bulk with `bcode session migrate-start`"
+            ),
+        ),
+        bcode_session::db::SessionDbError::PersistedEvent(
+            bcode_session::persisted::PersistedSessionEventError::UnsupportedSchemaVersion {
+                actual,
+                current,
+            },
         ) => ErrorResponse::new(
             "session_format_incompatible",
             format!(
@@ -38137,6 +38148,19 @@ mod tests {
         ));
         assert_eq!(future.code, "session_format_incompatible");
 
+        let outdated =
+            session_db_error_response(&bcode_session::db::SessionDbError::PersistedEvent(
+                bcode_session::persisted::PersistedSessionEventError::UnsupportedSchemaVersion {
+                    actual: CURRENT_SESSION_EVENT_SCHEMA_VERSION.saturating_sub(1),
+                    current: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                },
+            ));
+        assert_eq!(
+            outdated.code, "session_migration_required",
+            "history older than this build must never be reported as needing a newer build"
+        );
+        assert!(!outdated.message.contains("upgrade Bcode"));
+
         let ambiguous = ErrorResponse::new(
             "session_incompatible_active_client",
             "session is active for another compatibility namespace",
@@ -50593,6 +50617,14 @@ library = "test"
         session_root: &Path,
         workspace: &Path,
     ) -> (SessionId, SessionId) {
+        create_current_writer_with_event_schema_ipc_sessions(session_root, workspace, 40).await
+    }
+
+    async fn create_current_writer_with_event_schema_ipc_sessions(
+        session_root: &Path,
+        workspace: &Path,
+        historical_schema: u16,
+    ) -> (SessionId, SessionId) {
         let sessions = SessionManager::persistent(session_root).expect("persistent sessions");
         let current_session_id = create_current_session(&sessions, workspace).await;
         let session = sessions
@@ -50608,7 +50640,10 @@ library = "test"
                 .expect("session database");
         db.database()
             .update("events")
-            .value("schema_version", DatabaseValue::Int64(40))
+            .value(
+                "schema_version",
+                DatabaseValue::Int64(i64::from(historical_schema)),
+            )
             .execute(db.database())
             .await
             .expect("event schema should become historical");
@@ -50619,7 +50654,7 @@ library = "test"
                     "\"schema_version\":{}",
                     bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION
                 ),
-                "\"schema_version\":40",
+                &format!("\"schema_version\":{historical_schema}"),
             );
             db.database()
                 .update("events")
@@ -50682,6 +50717,73 @@ library = "test"
             .attach_session_recent(session_id, 16)
             .await
             .expect("schema-40 attach should migrate transparently");
+        let migrated =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &session_root)
+                .await
+                .expect("migrated database");
+        assert_eq!(
+            migrated
+                .first_non_current_event_schema()
+                .await
+                .expect("event schema query"),
+            None
+        );
+        server.abort();
+    }
+
+    /// A session written by the immediately preceding build must migrate transparently.
+    ///
+    /// Schema bumps that do not extend the released historical inventory orphan every session the
+    /// previous build wrote, so the newest historical schema is exercised end to end here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn previous_build_event_schema_session_migrates_on_real_open_ipc() {
+        let previous_schema = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1;
+        assert!(
+            bcode_session_migration::is_released_historical_event_schema(previous_schema),
+            "schema {previous_schema} written by the previous build must remain migratable"
+        );
+        let workspace = tempfile::tempdir().expect("IPC workspace");
+        let session_root = workspace.path().join("sessions");
+        let (session_id, _current_session_id) =
+            create_current_writer_with_event_schema_ipc_sessions(
+                &session_root,
+                workspace.path(),
+                previous_schema,
+            )
+            .await;
+
+        let sessions = SessionManager::persistent(&session_root).expect("restored sessions");
+        let state = Arc::new(test_server_state(sessions));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut connection = client
+            .connect("previous-schema-migration-test")
+            .await
+            .expect("connect");
+
+        let terminal = prepare_session_until_terminal(&mut connection, session_id).await;
+        assert_eq!(
+            terminal.outcome,
+            Some(bcode_session_models::SessionOpenTerminalOutcome::Ready),
+            "the previous build's sessions must open without manual migration"
+        );
+        connection
+            .attach_session_recent(session_id, 16)
+            .await
+            .expect("previous-schema attach should migrate transparently");
         let migrated =
             bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &session_root)
                 .await

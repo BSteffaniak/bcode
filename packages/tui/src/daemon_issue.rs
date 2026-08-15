@@ -23,6 +23,8 @@ pub enum TuiDaemonIssue {
     SessionDegradedReadOnly { message: String },
     /// The session event format is newer than this build understands.
     SessionFormatIncompatible { message: String },
+    /// The session history predates this build and must be migrated forward.
+    SessionMigrationRequired { message: String },
     /// The session storage writer generation is unsupported by this build.
     SessionWriterIncompatible { message: String },
     /// The requested session is unavailable.
@@ -96,6 +98,12 @@ impl TuiDaemonIssue {
                 status: format!("{label}: session requires a newer Bcode build"),
                 detail: Some(format!(
                     "This session contains a persisted event schema or event kind that this Bcode build cannot interpret. Upgrade Bcode, restart the daemon, and reopen the session. Do not run repair or delete canonical events for a format incompatibility.\n\nDaemon error: {message}"
+                )),
+            },
+            Self::SessionMigrationRequired { message } => TuiDaemonIssueMessage {
+                status: format!("{label}: session history needs migration"),
+                detail: Some(format!(
+                    "This session was written by an older Bcode build. Bcode migrates it forward automatically once exclusive ownership is available; reopen the session to start migration, or migrate in bulk with `bcode session migrate-start`. Do not upgrade or run repair for this state.\n\nDaemon error: {message}"
                 )),
             },
             Self::SessionWriterIncompatible { message } => TuiDaemonIssueMessage {
@@ -193,6 +201,9 @@ fn classify_server_error(code: &str, message: &str) -> TuiDaemonIssue {
             message: message.to_owned(),
         },
         "session_format_incompatible" => TuiDaemonIssue::SessionFormatIncompatible {
+            message: message.to_owned(),
+        },
+        "session_migration_required" => TuiDaemonIssue::SessionMigrationRequired {
             message: message.to_owned(),
         },
         "session_writer_incompatible" => TuiDaemonIssue::SessionWriterIncompatible {
@@ -396,6 +407,30 @@ mod tests {
         assert!(detail.contains("Upgrade Bcode"));
         assert!(detail.contains("restart the daemon"));
         assert!(detail.contains("Do not run repair"));
+    }
+
+    #[test]
+    fn older_session_history_recommends_migration_not_upgrade() {
+        let error = bcode_client::ClientError::Server {
+            code: "session_migration_required".to_owned(),
+            message: "session history uses event schema 44".to_owned(),
+        };
+        let issue = classify_client_error(&error);
+        assert_eq!(
+            issue,
+            TuiDaemonIssue::SessionMigrationRequired {
+                message: "session history uses event schema 44".to_owned(),
+            }
+        );
+        let message = issue.message("attach failed");
+        assert!(message.status.contains("needs migration"));
+        let detail = message.detail.expect("detail");
+        assert!(detail.contains("older Bcode build"));
+        assert!(detail.contains("automatically"));
+        assert!(
+            !detail.contains("Upgrade Bcode"),
+            "an outdated session must never be reported as requiring a newer build"
+        );
     }
 
     #[test]

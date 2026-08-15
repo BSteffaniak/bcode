@@ -328,7 +328,9 @@ fn decode_for_migration(
         });
     }
     let source_kind = envelope.source_kind_name()?;
-    if source_kind == "execution_session_created" && envelope.schema_version() <= 42 {
+    if source_kind == "execution_session_created"
+        && envelope.schema_version() <= crate::LATEST_HISTORICAL_EVENT_SCHEMA
+    {
         return historical_event_families::decode_execution_session_created(&envelope);
     }
     if source_kind == "tool_call_finished" && envelope.schema_version() <= 39 {
@@ -755,6 +757,7 @@ mod tests {
             ("legacy_turn_started", 32),
             ("plugin_automation_turn_finished", 29),
             ("plugin_automation_turn_started", 29),
+            ("session_forked", 45),
             ("tool_invocation_presentation", 21),
         ] {
             let payload = format!(
@@ -948,6 +951,21 @@ mod tests {
 
             assert_eq!(normalized.event.schema_version, crate::CURRENT_EVENT_SCHEMA);
             assert_eq!(normalized.event.sequence, source.sequence);
+            let retired = crate::RELEASED_EVENT_VARIANTS
+                .iter()
+                .find(|variant| variant.kind == source_kind)
+                .expect("inventoried fixture kind")
+                .treatment
+                == crate::ReleasedEventTreatment::RetiredKnown;
+            assert_eq!(normalized.retired_known, retired, "{source_kind}");
+            if retired {
+                assert!(matches!(
+                    normalized.event.kind,
+                    SessionEventKind::InertHistory { ref event_type, .. }
+                        if event_type == source_kind
+                ));
+                continue;
+            }
             assert_eq!(
                 serde_json::to_value(&normalized.event.kind)
                     .expect("normalized kind")
@@ -955,18 +973,40 @@ mod tests {
                     .and_then(|kind| kind.keys().next()),
                 Some(source_kind)
             );
-            assert!(!normalized.retired_known);
         }
     }
 
     #[test]
     fn historical_codec_only_applies_family_rules_to_released_schema_ranges() {
+        let unreleased = crate::NEVER_RELEASED_EVENT_SCHEMAS[2];
+        let payload = format!(
+            r#"{{"schema_version":{unreleased},"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
+        );
+        assert!(matches!(
+            decode_for_migration(&payload, reject_current),
+            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version })
+                if schema_version == unreleased
+        ));
+
+        let future = crate::CURRENT_EVENT_SCHEMA + 1;
+        let payload = format!(
+            r#"{{"schema_version":{future},"sequence":1,"session_id":"{SESSION_ID}","kind":{{"user_message":{{"client_id":"00000000-0000-0000-0000-0000000000ff","text":"hello"}}}}}}"#
+        );
+        assert!(matches!(
+            decode_for_migration(&payload, reject_current),
+            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version })
+                if schema_version == future
+        ));
+
         let payload = format!(
             r#"{{"schema_version":44,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
         );
         assert!(matches!(
             decode_for_migration(&payload, reject_current),
-            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 44 })
+            Err(HistoricalSessionEventError::UnsupportedEventKind {
+                schema_version: 44,
+                ..
+            })
         ));
 
         let payload = format!(

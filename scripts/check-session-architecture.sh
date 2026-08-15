@@ -226,6 +226,55 @@ if ! sed -n '/fn reject_unsupported_future_shape/,/fn is_unknown_variant_error/p
   violations=1
 fi
 
+# Every schema below the current one must remain an auto-migratable historical input. A schema bump
+# that does not extend the released historical inventory silently orphans sessions written by the
+# previous build, so the two constants are pinned to each other here as well as in unit tests.
+migration_live_schema="$(sed -n 's/.*LATEST_HISTORICAL_EVENT_SCHEMA: u16 = \([0-9][0-9]*\).*/\1/p' \
+  packages/session-migration/src/inventory.rs)"
+if [[ -z "$migration_live_schema" || -z "$current_event_schema" ]] \
+  || (( migration_live_schema + 1 != current_event_schema )); then
+  echo "Session migration-inventory violation: LATEST_HISTORICAL_EVENT_SCHEMA ($migration_live_schema) must be exactly one below CURRENT_SESSION_EVENT_SCHEMA_VERSION ($current_event_schema) so the previous build's sessions still auto-migrate." >&2
+  violations=1
+fi
+if ! python3 - "$current_event_schema" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+current = int(sys.argv[1])
+source = Path("packages/session-migration/src/inventory.rs").read_text()
+
+
+def constant(name):
+    body = source.split(f"{name}: &[u16] = &[")[1].split("];")[0]
+    return {int(value) for value in re.findall(r"\d+", body)}
+
+
+released = constant("RELEASED_HISTORICAL_EVENT_SCHEMAS")
+never = constant("NEVER_RELEASED_EVENT_SCHEMAS")
+orphaned = sorted(set(range(1, current)) - released - never)
+if orphaned:
+    print(
+        "event schemas below the current schema are neither historical inputs nor documented as "
+        f"never released: {orphaned}"
+    )
+    raise SystemExit(1)
+if current in released:
+    print(f"the current schema {current} must not be listed as a historical input")
+    raise SystemExit(1)
+PY
+then
+  echo "Session migration-inventory violation: every released schema below the current schema must remain auto-migratable." >&2
+  violations=1
+fi
+if ! rg -q 'every_schema_below_current_is_historical_input_or_explicitly_never_released' \
+  packages/session-migration/src/inventory.rs \
+  || ! rg -q 'older_session_history_recommends_migration_not_upgrade' packages/tui/src/daemon_issue.rs \
+  || ! rg -q 'session_migration_required' packages/tui/src/daemon_issue.rs; then
+  echo "Session migration-inventory violation: schema-drift and outdated-session messaging regression coverage must remain present." >&2
+  violations=1
+fi
+
 if rg -n 'OpaqueEvent|opaque_event' packages/session/src packages/session/models/src --glob '*.rs' \
   >/tmp/bcode-current-opaque-event.txt \
   || ! rg -q 'InertHistory' packages/session/models/src/lib.rs \
@@ -309,7 +358,7 @@ if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 6' packages/session/mode
   || ! rg -q 'RELEASED_EVENT_VARIANTS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_schema_ranges_match_all_ref_inventory_boundaries' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_variant_treatments_are_sorted_unique_and_total' packages/session-migration/src/inventory.rs \
-  || ! rg -q 'RELEASED_EVENT_VARIANTS.len\(\), 65' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_EVENT_VARIANTS.len\(\), 67' packages/session-migration/src/inventory.rs \
   || ! rg -q 'CURRENT_PERSISTED_SESSION_EVENT_KINDS' packages/session/models/src/lib.rs \
   || ! rg -q 'persisted_session_event_kind_name as event_kind_name' packages/session/src/db_event_store.rs \
   || ! rg -q 'migration inventory must include every current persisted event kind' packages/session-migration/src/inventory.rs \

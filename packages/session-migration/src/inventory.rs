@@ -1453,11 +1453,18 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
         .any(|descriptor| descriptor.kind == kind && descriptor.supports_schema(schema))
 }
 
+/// Highest event schema emitted by a released writer before [`CURRENT_EVENT_SCHEMA`].
+///
+/// Event kinds that the current build still persists remain historically decodable through this
+/// schema; the current schema itself is classified by [`classify_event_kind_schema`].
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 45;
+
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
+    let live = LATEST_HISTORICAL_EVENT_SCHEMA;
     match kind {
-        "assistant_reasoning_activity" | "inert_history" => (40, 42),
-        "assistant_response_segment" => (41, 42),
-        "agent_changed" => (3, 42),
+        "assistant_reasoning_activity" | "inert_history" => (40, live),
+        "assistant_response_segment" => (41, live),
+        "agent_changed" => (3, live),
         "assistant_reasoning_delta"
         | "assistant_reasoning_message"
         | "skill_activated"
@@ -1465,43 +1472,45 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         | "skill_deactivated"
         | "skill_invocation_failed"
         | "skill_invoked"
-        | "skill_suggested" => (9, 42),
-        "context_compacted" => (6, 42),
+        | "skill_suggested" => (9, live),
+        "context_compacted" => (6, live),
         "context_usage_observed" => (26, 31),
-        "provider_context_compacted" => (26, 42),
-        "execution_session_created" => (39, 42),
+        "provider_context_compacted" => (26, live),
+        "execution_session_created" => (39, live),
         "opaque_event" => (39, 39),
         "interactive_tool_request_created" | "interactive_tool_request_resolved" => (25, 35),
         "legacy_event" | "legacy_turn_finished" | "legacy_turn_started" => (32, 39),
         "positioned_assistant_reasoning_activity"
         | "positioned_assistant_response_segment"
-        | "positioned_tool_call_requested" => (42, 42),
-        "request_context_observed" => (32, 42),
+        | "positioned_tool_call_requested" => (42, live),
+        "request_context_observed" => (32, live),
         "legacy_tool_invocation_presentation" => (25, 39),
-        "reasoning_changed" => (25, 42),
-        "model_turn_cancel_requested" => (17, 42),
-        "model_turn_finished" | "model_turn_started" => (4, 42),
-        "model_usage" => (5, 42),
-        "permission_requested" | "permission_resolved" => (2, 42),
+        "reasoning_changed" => (25, live),
+        "model_feature_fidelity_negotiated" => (45, live),
+        "model_turn_cancel_requested" => (17, live),
+        "model_turn_finished" | "model_turn_started" => (4, live),
+        "model_usage" => (5, live),
+        "permission_requested" | "permission_resolved" => (2, live),
         "plugin_automation_turn_finished" | "plugin_automation_turn_started" => (29, 32),
-        "plugin_status_note" => (29, 42),
-        "ralph_lifecycle" => (23, 42),
+        "plugin_status_note" => (29, live),
+        "ralph_lifecycle" => (23, live),
         "runtime_work_cancel_requested" | "runtime_work_finished" | "runtime_work_started" => {
-            (11, 42)
+            (11, live)
         }
-        "runtime_work_progress" => (18, 42),
-        "session_forked" => (22, 42),
-        "session_imported" => (16, 42),
-        "session_renamed" | "trace_event" => (7, 42),
+        "runtime_work_progress" => (18, live),
+        "session_derived" => (CURRENT_EVENT_SCHEMA, CURRENT_EVENT_SCHEMA),
+        "session_forked" => (22, live),
+        "session_imported" => (16, live),
+        "session_renamed" | "trace_event" => (7, live),
         "tool_contribution"
         | "tool_exchange_requested"
         | "tool_exchange_resolved"
-        | "tool_invocation_lifecycle" => (35, 42),
-        "tool_contribution_placed" => (38, 42),
+        | "tool_invocation_lifecycle" => (35, live),
+        "tool_contribution_placed" => (38, live),
         "tool_invocation_presentation" => (21, 25),
-        "tool_invocation_result_recorded" => (37, 42),
+        "tool_invocation_result_recorded" => (37, live),
         "tool_invocation_stream" => (12, 39),
-        "working_directory_changed" => (15, 42),
+        "working_directory_changed" => (15, live),
         "assistant_delta"
         | "assistant_message"
         | "client_attached"
@@ -1510,7 +1519,7 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         | "session_created"
         | "system_message"
         | "tool_call_requested"
-        | "user_message" => (1, 42),
+        | "user_message" => (1, live),
         "tool_call_finished" => (1, 39),
         _ => unreachable!("released event inventory must declare a schema range"),
     }
@@ -1602,6 +1611,10 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
+        kind: "model_feature_fidelity_negotiated",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
         kind: "model_turn_cancel_requested",
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
@@ -1690,8 +1703,12 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
-        kind: "session_forked",
+        kind: "session_derived",
         treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "session_forked",
+        treatment: ReleasedEventTreatment::RetiredKnown,
     },
     ReleasedEventVariantDescriptor {
         kind: "session_imported",
@@ -2229,11 +2246,18 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5];
 /// Released historical event schemas currently evidenced by Git history.
 ///
 /// Schemas 33, 34, and 36 were never released. Schema 40 was emitted by an epoch-5
-/// development build and is retained as supported historical input.
+/// development build and is retained as supported historical input. Schemas 43, 44, and 45 were
+/// emitted by epoch-6 builds and migrate forward without a writer-epoch change.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42,
+    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45,
 ];
+
+/// Event schemas between the first released schema and the current schema that no writer emitted.
+///
+/// Every other schema below [`CURRENT_EVENT_SCHEMA`] must remain a supported historical input so a
+/// schema bump cannot orphan sessions written by the previous build.
+pub const NEVER_RELEASED_EVENT_SCHEMAS: &[u16] = &[33, 34, 36];
 
 /// Current event schema emitted by this build.
 pub const CURRENT_EVENT_SCHEMA: u16 = bcode_session_migration_target::CURRENT_EVENT_SCHEMA;
@@ -2414,7 +2438,7 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].kind < pair[1].kind)
         );
-        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 65);
+        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 67);
         assert_eq!(
             bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS
                 .iter()
@@ -2461,6 +2485,7 @@ mod tests {
                 "opaque_event",
                 "plugin_automation_turn_finished",
                 "plugin_automation_turn_started",
+                "session_forked",
                 "tool_invocation_presentation",
                 "tool_invocation_stream",
             ],
@@ -2767,12 +2792,37 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
         );
-        for unreleased in [33, 34, 36] {
+        for unreleased in NEVER_RELEASED_EVENT_SCHEMAS.iter().copied() {
             assert!(!is_released_historical_event_schema(unreleased));
         }
         for released in RELEASED_HISTORICAL_EVENT_SCHEMAS {
             assert!(is_released_historical_event_schema(*released));
         }
+    }
+
+    #[test]
+    fn every_schema_below_current_is_historical_input_or_explicitly_never_released() {
+        let orphaned = (1..CURRENT_EVENT_SCHEMA)
+            .filter(|schema| !is_released_historical_event_schema(*schema))
+            .filter(|schema| !NEVER_RELEASED_EVENT_SCHEMAS.contains(schema))
+            .collect::<Vec<_>>();
+        assert!(
+            orphaned.is_empty(),
+            "schemas {orphaned:?} are below the current schema {CURRENT_EVENT_SCHEMA} but are \
+             neither supported historical inputs nor documented as never released; sessions \
+             written at those schemas cannot migrate forward"
+        );
+        assert!(
+            !is_released_historical_event_schema(CURRENT_EVENT_SCHEMA),
+            "the current schema is classified as current, never as historical input"
+        );
+        assert_eq!(
+            LATEST_HISTORICAL_EVENT_SCHEMA,
+            CURRENT_EVENT_SCHEMA - 1,
+            "live event kinds must remain decodable through the schema emitted by the previous \
+             build; bumping CURRENT_SESSION_EVENT_SCHEMA_VERSION requires extending the released \
+             historical inventory in the same change"
+        );
     }
 
     #[test]
