@@ -26762,6 +26762,7 @@ fn tool_invocation_metric_labels(
 
 struct ServerPluginBridgeCall {
     request: ServiceBridgeRequest,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
     response: std::sync::mpsc::SyncSender<Result<ServiceBridgeResponse, String>>,
 }
 
@@ -26783,7 +26784,11 @@ fn request_server_plugin_bridge(
 ) -> Result<ServiceBridgeResponse, String> {
     let (response, response_receiver) = std::sync::mpsc::sync_channel(1);
     sender
-        .send(ServerPluginBridgeCall { request, response })
+        .send(ServerPluginBridgeCall {
+            request,
+            cancellation: cancellation.clone(),
+            response,
+        })
         .map_err(|_| "server invocation bridge closed".to_string())?;
     loop {
         if cancellation.is_cancelled() {
@@ -33245,6 +33250,7 @@ async fn handle_list_plugin_contributions(
 async fn resolve_command_plugin_bridge_request(
     sessions: &SessionManager,
     request: ServiceBridgeRequest,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<ServiceBridgeResponse, String> {
     let ServiceBridgeRequest::InvokeService(request) = request else {
         return Err(
@@ -33256,14 +33262,20 @@ async fn resolve_command_plugin_bridge_request(
             bcode_tool::ToolInvocationServiceResolution::Unsupported,
         ));
     }
+    if cancellation.is_cancelled() {
+        return Ok(ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Cancelled,
+        ));
+    }
     Ok(ServiceBridgeResponse::Service(
-        dispatch_session_derivation_bridge(sessions, request.payload).await,
+        dispatch_session_derivation_bridge(sessions, request.payload, cancellation).await,
     ))
 }
 
 async fn dispatch_session_derivation_bridge(
     sessions: &SessionManager,
     payload: serde_json::Value,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
 ) -> bcode_tool::ToolInvocationServiceResolution {
     let request = match serde_json::from_value::<bcode_plugin_sdk::SessionDerivationServiceRequest>(
         payload,
@@ -33303,9 +33315,13 @@ async fn dispatch_session_derivation_bridge(
                 .await
                 .map(|text| bcode_plugin_sdk::SessionDerivationServiceResponse::Prompt { text }),
             bcode_plugin_sdk::SessionDerivationServiceRequest::Derive { request } => {
-                sessions.derive_session(*request).await.map(|outcome| {
-                    bcode_plugin_sdk::SessionDerivationServiceResponse::Derived { outcome }
-                })
+                derive_with_invocation_cancellation(sessions, *request, cancellation)
+                    .await
+                    .map(
+                        |outcome| bcode_plugin_sdk::SessionDerivationServiceResponse::Derived {
+                            outcome,
+                        },
+                    )
             }
             bcode_plugin_sdk::SessionDerivationServiceRequest::Status { operation_id } => sessions
                 .session_derivation_status(operation_id)
@@ -33333,6 +33349,26 @@ async fn dispatch_session_derivation_bridge(
             code: "session_derivation_failed".to_owned(),
             message: error.to_string(),
         },
+    }
+}
+
+async fn derive_with_invocation_cancellation(
+    sessions: &SessionManager,
+    request: bcode_session_models::SessionDerivationRequest,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<bcode_session_models::SessionDerivationTerminalOutcome, SessionError> {
+    let operation_id = request.operation_id;
+    let derive = sessions.derive_session(request);
+    tokio::pin!(derive);
+    loop {
+        tokio::select! {
+            result = &mut derive => return result,
+            () = tokio::time::sleep(Duration::from_millis(10)) => {
+                if cancellation.is_cancelled() {
+                    let _accepted = sessions.cancel_session_derivation(operation_id).await;
+                }
+            }
+        }
     }
 }
 
@@ -33372,6 +33408,7 @@ async fn handle_invoke_plugin_service(
                             let response = resolve_command_plugin_bridge_request(
                                 &state.sessions,
                                 bridge_call.request,
+                                &bridge_call.cancellation,
                             ).await;
                             let _ = bridge_call.response.send(response);
                         }
