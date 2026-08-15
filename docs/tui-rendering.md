@@ -233,6 +233,18 @@ the surface removes that deadline when no work remains. Normal widths use matche
 preview panes; widths below 86 columns stack the panes, and content areas below 54 by 24 render a
 bounded resize explanation.
 
+The provider simulation is also configurable while playback is running. Named Balanced, Choppy,
+Bursty, and Sparse presets set bounded target chunk size, chunk-size variation, base interval, and
+interval variation values; direct numeric edits switch the scenario to Custom. A fixed long Markdown
+response and deterministic factor sequences keep runs reproducible while producing varying chunks
+and gaps throughout. Source-policy changes re-plan only the undispatched suffix and replace the next
+source deadline without retracting accepted text. Source simulation settings remain ephemeral and
+are excluded from Apply and Reset persistence.
+
+The previews bottom-follow long output by default. Shared Page Up/Page Down navigation suspends and
+restores synchronized following, while End returns directly to latest output. Restart resets viewport
+following and begins the same long response from byte zero using the current source policy.
+
 The configurator's settings and action controls are composed from BMUX `Checkbox` and `ActionRow`
 components with stable interaction IDs. Rendering commits the component geometry used by subsequent
 mouse routing, so responsive reflow cannot leave stale hit targets. Mouse events are captured by the

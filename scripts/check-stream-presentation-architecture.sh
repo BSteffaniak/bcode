@@ -65,8 +65,19 @@ for required in ("exact same typed source events", "bounded, ephemeral"):
     if required not in renderer_docs:
         raise SystemExit(f"renderer configurator documentation missing: {required}")
 
+for required in ("StreamingSourceScenario", "LONG_RESPONSE", "StreamingSourcePreset"):
+    if required not in streaming_configurator and required not in Path("packages/tui/src/streaming_source_scenario.rs").read_text():
+        raise SystemExit(f"streaming source simulation contract missing: {required}")
+
+for required in ("source simulation settings remain ephemeral", "undispatched suffix"):
+    if required not in tui_docs.lower():
+        raise SystemExit(f"streaming source simulation documentation missing: {required}")
+
+for forbidden in ("set_tui_streaming_presentation_override", "write_tui_state"):
+    if forbidden in Path("packages/tui/src/streaming_source_scenario.rs").read_text():
+        raise SystemExit(f"source simulation leaked into persistence: {forbidden}")
+
 for required in (
-    "LatestSnapshotUpdates",
     "next_streaming_presentation_deadline",
     "advance_streaming_presentation",
     "with_streaming_presentation_policy",

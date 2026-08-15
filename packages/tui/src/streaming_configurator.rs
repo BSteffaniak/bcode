@@ -14,31 +14,13 @@ use bmux_tui::geometry::Rect;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
 use bmux_tui_components::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
 
+use super::streaming_source_scenario::{
+    StreamingSourcePolicy, StreamingSourcePreset, StreamingSourceScenario,
+};
+
 const TURN_ID: &str = "streaming-configurator-turn";
 const SEGMENT_ID: &str = "streaming-configurator-segment";
 const COMPLETED_HOLD: Duration = Duration::from_millis(1_500);
-
-const SAMPLE_CHUNKS: &[(u64, &str)] = &[
-    (350, "# Bursty streaming\n\n"),
-    (375, "A"),
-    (390, " provider"),
-    (405, " can deliver"),
-    (700, " several words together,"),
-    (715, " then"),
-    (730, " pause."),
-    (
-        780,
-        "\n\n**Smoothing** keeps the accepted text monotonic while ",
-    ),
-    (900, "Unicode stays intact: "),
-    (930, "cafe\u{301}, "),
-    (960, "👩🏽‍💻, "),
-    (1_000, "and 東京."),
-    (
-        1_750,
-        "\n\nThe final burst arrives after one conspicuous provider gap.",
-    ),
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaybackPhase {
@@ -58,16 +40,31 @@ pub enum StreamingConfiguratorFocus {
     GraphemesPerSecond,
     /// Maximum accepted-text backlog age.
     MaxLag,
+    /// Provider simulation preset.
+    SourcePreset,
+    /// Target provider chunk size.
+    SourceChunkSize,
+    /// Provider chunk-size variation.
+    SourceSizeVariation,
+    /// Base provider chunk interval.
+    SourceInterval,
+    /// Provider interval variation.
+    SourceIntervalVariation,
     /// Apply declarative fallback by clearing the override.
     Reset,
 }
 
 impl StreamingConfiguratorFocus {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 10] = [
         Self::Enabled,
         Self::Curve,
         Self::GraphemesPerSecond,
         Self::MaxLag,
+        Self::SourcePreset,
+        Self::SourceChunkSize,
+        Self::SourceSizeVariation,
+        Self::SourceInterval,
+        Self::SourceIntervalVariation,
         Self::Reset,
     ];
 }
@@ -98,6 +95,16 @@ pub struct StreamingConfiguratorGeometry {
     pub rate: Rect,
     /// Lag decrement/increment action row area.
     pub lag: Rect,
+    /// Preset action row area.
+    pub source_preset: Rect,
+    /// Source chunk-size action row area.
+    pub source_chunk_size: Rect,
+    /// Source size-variation action row area.
+    pub source_size_variation: Rect,
+    /// Source interval action row area.
+    pub source_interval: Rect,
+    /// Source interval-variation action row area.
+    pub source_interval_variation: Rect,
     /// Reset/apply/cancel action row area.
     pub outcomes: Rect,
     /// Complete opaque surface area used to capture otherwise-ignored mouse events.
@@ -115,8 +122,15 @@ pub struct StreamingConfiguratorState {
     curve_actions: ActionRowState,
     rate_actions: ActionRowState,
     lag_actions: ActionRowState,
+    source_preset_actions: ActionRowState,
+    source_chunk_size_actions: ActionRowState,
+    source_size_variation_actions: ActionRowState,
+    source_interval_actions: ActionRowState,
+    source_interval_variation_actions: ActionRowState,
     outcome_actions: ActionRowState,
     committed_geometry: Option<StreamingConfiguratorGeometry>,
+    preview_scroll_rows: usize,
+    follow_latest: bool,
 }
 
 impl StreamingConfiguratorState {
@@ -138,8 +152,15 @@ impl StreamingConfiguratorState {
             curve_actions: ActionRowState::new(),
             rate_actions: ActionRowState::new(),
             lag_actions: ActionRowState::new(),
+            source_preset_actions: ActionRowState::new(),
+            source_chunk_size_actions: ActionRowState::new(),
+            source_size_variation_actions: ActionRowState::new(),
+            source_interval_actions: ActionRowState::new(),
+            source_interval_variation_actions: ActionRowState::new(),
             outcome_actions: ActionRowState::new(),
             committed_geometry: None,
+            preview_scroll_rows: 0,
+            follow_latest: true,
         };
         state.sync_component_focus();
         state
@@ -197,10 +218,58 @@ impl StreamingConfiguratorState {
         &self.lag_actions
     }
 
+    /// Return current source-simulation policy.
+    #[must_use]
+    pub const fn source_policy(&self) -> StreamingSourcePolicy {
+        self.controller.source_policy()
+    }
+
+    /// Return preset action interaction state.
+    #[must_use]
+    pub const fn source_preset_actions(&self) -> &ActionRowState {
+        &self.source_preset_actions
+    }
+
+    /// Return chunk-size action interaction state.
+    #[must_use]
+    pub const fn source_chunk_size_actions(&self) -> &ActionRowState {
+        &self.source_chunk_size_actions
+    }
+
+    /// Return size-variation action interaction state.
+    #[must_use]
+    pub const fn source_size_variation_actions(&self) -> &ActionRowState {
+        &self.source_size_variation_actions
+    }
+
+    /// Return interval action interaction state.
+    #[must_use]
+    pub const fn source_interval_actions(&self) -> &ActionRowState {
+        &self.source_interval_actions
+    }
+
+    /// Return interval-variation action interaction state.
+    #[must_use]
+    pub const fn source_interval_variation_actions(&self) -> &ActionRowState {
+        &self.source_interval_variation_actions
+    }
+
     /// Return outcome action interaction state.
     #[must_use]
     pub const fn outcome_actions(&self) -> &ActionRowState {
         &self.outcome_actions
+    }
+
+    /// Return shared preview scroll rows.
+    #[must_use]
+    pub const fn preview_scroll_rows(&self) -> usize {
+        self.preview_scroll_rows
+    }
+
+    /// Return whether previews follow latest output.
+    #[must_use]
+    pub const fn follows_latest(&self) -> bool {
+        self.follow_latest
     }
 
     /// Return the earliest controller deadline.
@@ -211,7 +280,13 @@ impl StreamingConfiguratorState {
 
     /// Advance due preview work.
     pub fn advance(&mut self, now: Instant) -> bool {
-        self.controller.advance(now)
+        let was_completed = self.controller.is_completed();
+        let changed = self.controller.advance(now);
+        if was_completed && !self.controller.is_completed() {
+            self.preview_scroll_rows = 0;
+            self.follow_latest = true;
+        }
+        changed
     }
 
     /// Commit geometry produced by the most recent rendered frame.
@@ -298,6 +373,10 @@ impl StreamingConfiguratorState {
             return outcome;
         }
 
+        if let Some(outcome) = self.handle_source_mouse(&event, geometry, now) {
+            return outcome;
+        }
+
         let actions = outcome_action_buttons(self.reset_pending);
         match ActionRow::new(&actions).handle_event(
             geometry.outcomes,
@@ -326,6 +405,54 @@ impl StreamingConfiguratorState {
         }
     }
 
+    fn handle_source_mouse(
+        &mut self,
+        event: &Event,
+        geometry: StreamingConfiguratorGeometry,
+        now: Instant,
+    ) -> Option<StreamingConfiguratorOutcome> {
+        let presets = source_preset_buttons();
+        match ActionRow::new(&presets).handle_event(
+            geometry.source_preset,
+            &mut self.source_preset_actions,
+            event,
+        ) {
+            ActionRowOutcome::Activated { index, .. } => {
+                if let Some(preset) = StreamingSourcePreset::NAMED.get(index) {
+                    self.focus = StreamingConfiguratorFocus::SourcePreset;
+                    self.controller.set_source_policy(preset.policy(), now);
+                    self.sync_component_focus();
+                }
+                return Some(StreamingConfiguratorOutcome::Handled);
+            }
+            outcome if outcome.is_handled() => return Some(StreamingConfiguratorOutcome::Handled),
+            _ => {}
+        }
+        for (area, focus) in [
+            (
+                geometry.source_chunk_size,
+                StreamingConfiguratorFocus::SourceChunkSize,
+            ),
+            (
+                geometry.source_size_variation,
+                StreamingConfiguratorFocus::SourceSizeVariation,
+            ),
+            (
+                geometry.source_interval,
+                StreamingConfiguratorFocus::SourceInterval,
+            ),
+            (
+                geometry.source_interval_variation,
+                StreamingConfiguratorFocus::SourceIntervalVariation,
+            ),
+        ] {
+            if let Some(outcome) = self.handle_numeric_mouse(event, area, focus, now) {
+                return Some(outcome);
+            }
+        }
+        None
+    }
+
     fn handle_numeric_mouse(
         &mut self,
         event: &Event,
@@ -337,6 +464,14 @@ impl StreamingConfiguratorState {
         let state = match focus {
             StreamingConfiguratorFocus::GraphemesPerSecond => &mut self.rate_actions,
             StreamingConfiguratorFocus::MaxLag => &mut self.lag_actions,
+            StreamingConfiguratorFocus::SourceChunkSize => &mut self.source_chunk_size_actions,
+            StreamingConfiguratorFocus::SourceSizeVariation => {
+                &mut self.source_size_variation_actions
+            }
+            StreamingConfiguratorFocus::SourceInterval => &mut self.source_interval_actions,
+            StreamingConfiguratorFocus::SourceIntervalVariation => {
+                &mut self.source_interval_variation_actions
+            }
             _ => return None,
         };
         let outcome = ActionRow::new(&actions).handle_event(area, state, event);
@@ -344,7 +479,17 @@ impl StreamingConfiguratorState {
             ActionRowOutcome::Activated { index, .. } => {
                 self.focus = focus;
                 self.sync_component_focus();
-                self.adjust(if index == 0 { -1 } else { 1 }, false, now);
+                if matches!(
+                    focus,
+                    StreamingConfiguratorFocus::SourceChunkSize
+                        | StreamingConfiguratorFocus::SourceSizeVariation
+                        | StreamingConfiguratorFocus::SourceInterval
+                        | StreamingConfiguratorFocus::SourceIntervalVariation
+                ) {
+                    self.adjust_source(if index == 0 { -1 } else { 1 }, false, now);
+                } else {
+                    self.adjust(if index == 0 { -1 } else { 1 }, false, now);
+                }
                 Some(StreamingConfiguratorOutcome::Handled)
             }
             outcome if outcome.is_handled() => Some(StreamingConfiguratorOutcome::Handled),
@@ -378,19 +523,21 @@ impl StreamingConfiguratorState {
                 StreamingConfiguratorOutcome::Handled
             }
             KeyCode::Left => {
-                self.adjust(-1, stroke.modifiers.shift, now);
+                self.adjust_focused(-1, stroke.modifiers.shift, now);
                 StreamingConfiguratorOutcome::Handled
             }
             KeyCode::Right => {
-                self.adjust(1, stroke.modifiers.shift, now);
+                self.adjust_focused(1, stroke.modifiers.shift, now);
                 StreamingConfiguratorOutcome::Handled
             }
             KeyCode::Space => {
-                self.adjust(1, false, now);
+                self.adjust_focused(1, false, now);
                 StreamingConfiguratorOutcome::Handled
             }
             KeyCode::Char('r') => {
                 self.controller.restart(now);
+                self.preview_scroll_rows = 0;
+                self.follow_latest = true;
                 StreamingConfiguratorOutcome::Handled
             }
             KeyCode::Char('p') => {
@@ -399,6 +546,21 @@ impl StreamingConfiguratorState {
                 } else {
                     self.controller.pause(now);
                 }
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::PageUp => {
+                self.preview_scroll_rows = self.preview_scroll_rows.saturating_add(8);
+                self.follow_latest = false;
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::PageDown => {
+                self.preview_scroll_rows = self.preview_scroll_rows.saturating_sub(8);
+                self.follow_latest = self.preview_scroll_rows == 0;
+                StreamingConfiguratorOutcome::Handled
+            }
+            KeyCode::End => {
+                self.preview_scroll_rows = 0;
+                self.follow_latest = true;
                 StreamingConfiguratorOutcome::Handled
             }
             KeyCode::Enter if self.reset_pending => StreamingConfiguratorOutcome::Reset,
@@ -435,8 +597,98 @@ impl StreamingConfiguratorState {
         );
         self.lag_actions
             .set_focused((self.focus == StreamingConfiguratorFocus::MaxLag).then_some(1));
+        self.source_preset_actions.set_focused(
+            (self.focus == StreamingConfiguratorFocus::SourcePreset).then_some(
+                StreamingSourcePreset::NAMED
+                    .iter()
+                    .position(|preset| *preset == self.controller.source_policy().preset)
+                    .unwrap_or_default(),
+            ),
+        );
+        self.source_chunk_size_actions
+            .set_focused((self.focus == StreamingConfiguratorFocus::SourceChunkSize).then_some(1));
+        self.source_size_variation_actions.set_focused(
+            (self.focus == StreamingConfiguratorFocus::SourceSizeVariation).then_some(1),
+        );
+        self.source_interval_actions
+            .set_focused((self.focus == StreamingConfiguratorFocus::SourceInterval).then_some(1));
+        self.source_interval_variation_actions.set_focused(
+            (self.focus == StreamingConfiguratorFocus::SourceIntervalVariation).then_some(1),
+        );
         self.outcome_actions
             .set_focused((self.focus == StreamingConfiguratorFocus::Reset).then_some(0));
+    }
+
+    fn adjust_focused(&mut self, direction: i32, coarse: bool, now: Instant) {
+        if matches!(
+            self.focus,
+            StreamingConfiguratorFocus::SourcePreset
+                | StreamingConfiguratorFocus::SourceChunkSize
+                | StreamingConfiguratorFocus::SourceSizeVariation
+                | StreamingConfiguratorFocus::SourceInterval
+                | StreamingConfiguratorFocus::SourceIntervalVariation
+        ) {
+            self.adjust_source(direction, coarse, now);
+        } else {
+            self.adjust(direction, coarse, now);
+        }
+    }
+
+    fn adjust_source(&mut self, direction: i32, coarse: bool, now: Instant) {
+        let mut policy = self.controller.source_policy();
+        match self.focus {
+            StreamingConfiguratorFocus::SourcePreset => {
+                let current = StreamingSourcePreset::NAMED
+                    .iter()
+                    .position(|preset| *preset == policy.preset)
+                    .unwrap_or_default();
+                let next = if direction < 0 {
+                    current
+                        .checked_sub(1)
+                        .unwrap_or(StreamingSourcePreset::NAMED.len() - 1)
+                } else {
+                    (current + 1) % StreamingSourcePreset::NAMED.len()
+                };
+                policy = StreamingSourcePreset::NAMED[next].policy();
+            }
+            StreamingConfiguratorFocus::SourceChunkSize => {
+                let step = if coarse { 16 } else { 2 };
+                policy.target_chunk_chars = adjust_u16(
+                    policy.target_chunk_chars,
+                    direction,
+                    step,
+                    StreamingSourcePolicy::MIN_CHUNK_CHARS,
+                    StreamingSourcePolicy::MAX_CHUNK_CHARS,
+                );
+                policy = policy.custom();
+            }
+            StreamingConfiguratorFocus::SourceSizeVariation => {
+                let step = if coarse { 20 } else { 5 };
+                policy.chunk_size_variation_percent =
+                    adjust_u8(policy.chunk_size_variation_percent, direction, step, 0, 100);
+                policy = policy.custom();
+            }
+            StreamingConfiguratorFocus::SourceInterval => {
+                let step = if coarse { 100 } else { 10 };
+                policy.base_interval_ms = adjust_u16(
+                    policy.base_interval_ms,
+                    direction,
+                    step,
+                    StreamingSourcePolicy::MIN_INTERVAL_MS,
+                    StreamingSourcePolicy::MAX_INTERVAL_MS,
+                );
+                policy = policy.custom();
+            }
+            StreamingConfiguratorFocus::SourceIntervalVariation => {
+                let step = if coarse { 20 } else { 5 };
+                policy.interval_variation_percent =
+                    adjust_u8(policy.interval_variation_percent, direction, step, 0, 100);
+                policy = policy.custom();
+            }
+            _ => return,
+        }
+        self.controller.set_source_policy(policy, now);
+        self.sync_component_focus();
     }
 
     fn adjust(&mut self, direction: i32, coarse: bool, now: Instant) {
@@ -471,7 +723,12 @@ impl StreamingConfiguratorState {
                     StreamingPresentationPolicy::MAX_LAG_MS,
                 );
             }
-            StreamingConfiguratorFocus::Reset => {}
+            StreamingConfiguratorFocus::SourcePreset
+            | StreamingConfiguratorFocus::SourceChunkSize
+            | StreamingConfiguratorFocus::SourceSizeVariation
+            | StreamingConfiguratorFocus::SourceInterval
+            | StreamingConfiguratorFocus::SourceIntervalVariation
+            | StreamingConfiguratorFocus::Reset => {}
         }
         self.apply_override_policy(policy, now);
     }
@@ -535,6 +792,32 @@ const fn cycle_curve(
     }
 }
 
+fn adjust_u16(value: u16, direction: i32, step: u16, minimum: u16, maximum: u16) -> u16 {
+    if direction < 0 {
+        value.saturating_sub(step).max(minimum)
+    } else {
+        value.saturating_add(step).min(maximum)
+    }
+}
+
+fn adjust_u8(value: u8, direction: i32, step: u8, minimum: u8, maximum: u8) -> u8 {
+    if direction < 0 {
+        value.saturating_sub(step).max(minimum)
+    } else {
+        value.saturating_add(step).min(maximum)
+    }
+}
+
+/// Return provider source preset buttons.
+pub fn source_preset_buttons() -> [ActionButton; 4] {
+    [
+        ActionButton::new("balanced", "Balanced"),
+        ActionButton::new("choppy", "Choppy"),
+        ActionButton::new("bursty", "Bursty"),
+        ActionButton::new("sparse", "Sparse"),
+    ]
+}
+
 fn adjust_u32(value: u32, direction: i32, step: u32, maximum: u32) -> u32 {
     if direction < 0 {
         value.saturating_sub(step)
@@ -557,11 +840,9 @@ pub struct StreamingPreviewController {
     raw: SessionView,
     smoothed: SessionView,
     selected_policy: StreamingPresentationPolicy,
-    started_at: Instant,
+    source: StreamingSourceScenario,
     paused_at: Option<Instant>,
     phase: PlaybackPhase,
-    next_chunk: usize,
-    accepted_bytes: usize,
     revision: u64,
     completion_at: Option<Instant>,
 }
@@ -580,11 +861,9 @@ impl StreamingPreviewController {
             raw,
             smoothed,
             selected_policy,
-            started_at: now,
+            source: StreamingSourceScenario::new(now, StreamingSourcePolicy::default()),
             paused_at: None,
             phase: PlaybackPhase::Running,
-            next_chunk: 0,
-            accepted_bytes: 0,
             revision: 0,
             completion_at: None,
         }
@@ -605,13 +884,24 @@ impl StreamingPreviewController {
     /// Return the number of source chunks already accepted.
     #[must_use]
     pub const fn delivered_chunks(&self) -> usize {
-        self.next_chunk
+        self.source.delivered_chunks()
     }
 
-    /// Return the fixed number of source chunks.
+    /// Return accepted source byte count.
     #[must_use]
-    pub const fn total_chunks() -> usize {
-        SAMPLE_CHUNKS.len()
+    pub const fn accepted_bytes(&self) -> usize {
+        self.source.accepted_bytes()
+    }
+
+    /// Return source policy.
+    #[must_use]
+    pub const fn source_policy(&self) -> StreamingSourcePolicy {
+        self.source.policy()
+    }
+
+    /// Apply a source policy to only the undispatched suffix.
+    pub fn set_source_policy(&mut self, policy: StreamingSourcePolicy, now: Instant) {
+        self.source.set_policy(policy, now);
     }
 
     /// Return whether playback is paused.
@@ -648,7 +938,7 @@ impl StreamingPreviewController {
         }
         if let Some(paused_at) = self.paused_at.take() {
             let paused_for = now.saturating_duration_since(paused_at);
-            self.started_at += paused_for;
+            self.source.shift_deadline(paused_for);
             if let Some(completion_at) = self.completion_at.as_mut() {
                 *completion_at += paused_for;
             }
@@ -658,7 +948,9 @@ impl StreamingPreviewController {
 
     /// Restart the deterministic scenario from its initial state.
     pub fn restart(&mut self, now: Instant) {
+        let source_policy = self.source.policy();
         *self = Self::new(now, self.selected_policy);
+        self.source.set_policy(source_policy, now);
     }
 
     /// Return the earliest semantic source, presentation, or loop deadline.
@@ -670,10 +962,7 @@ impl StreamingPreviewController {
         if self.is_completed() {
             return self.completion_at.map(|at| at + COMPLETED_HOLD);
         }
-        let source = SAMPLE_CHUNKS
-            .get(self.next_chunk)
-            .map(|(offset_ms, _)| self.started_at + Duration::from_millis(*offset_ms))
-            .or_else(|| Some(self.started_at + Duration::from_millis(1_751)));
+        let source = self.source.next_deadline();
         [
             source,
             self.smoothed.next_streaming_presentation_deadline(now),
@@ -700,10 +989,7 @@ impl StreamingPreviewController {
         }
 
         let mut changed = self.smoothed.advance_streaming_presentation(now);
-        while let Some(&(offset_ms, chunk)) = SAMPLE_CHUNKS.get(self.next_chunk) {
-            if now < self.started_at + Duration::from_millis(offset_ms) {
-                break;
-            }
+        while let Some(chunk) = self.source.take_due(now) {
             self.revision = self.revision.saturating_add(1);
             let event = SessionLiveEvent {
                 session_id: self.session_id,
@@ -717,7 +1003,10 @@ impl StreamingPreviewController {
                         first_revision: self.revision,
                         revision: self.revision,
                         operation: TextStreamOperation::Append {
-                            expected_offset: self.accepted_bytes,
+                            expected_offset: self
+                                .source
+                                .accepted_bytes()
+                                .saturating_sub(chunk.len()),
                             text: chunk.to_owned(),
                         },
                     },
@@ -725,12 +1014,10 @@ impl StreamingPreviewController {
             };
             self.raw.apply_live_event(&event);
             self.smoothed.apply_live_event(&event);
-            self.accepted_bytes = self.accepted_bytes.saturating_add(chunk.len());
-            self.next_chunk = self.next_chunk.saturating_add(1);
             changed = true;
         }
 
-        if self.next_chunk == SAMPLE_CHUNKS.len() {
+        if self.source.is_complete() {
             self.finish(now);
             changed = true;
         }
@@ -821,7 +1108,7 @@ mod tests {
             StreamingInterpolationCurve::Linear
         );
 
-        for _ in 0..3 {
+        for _ in 0..8 {
             let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
         }
         assert_eq!(state.focus(), StreamingConfiguratorFocus::Reset);
@@ -854,7 +1141,12 @@ mod tests {
             curve: Rect::new(2, 3, 60, 1),
             rate: Rect::new(2, 4, 10, 1),
             lag: Rect::new(2, 5, 10, 1),
-            outcomes: Rect::new(2, 6, 32, 1),
+            source_preset: Rect::new(2, 6, 60, 1),
+            source_chunk_size: Rect::new(2, 7, 10, 1),
+            source_size_variation: Rect::new(2, 8, 10, 1),
+            source_interval: Rect::new(2, 9, 10, 1),
+            source_interval_variation: Rect::new(2, 10, 10, 1),
+            outcomes: Rect::new(2, 11, 48, 1),
             surface: Rect::new(0, 0, 80, 24),
         };
         let click = |state: &mut StreamingConfiguratorState, point: Point| {
@@ -890,7 +1182,7 @@ mod tests {
             StreamingConfiguratorOutcome::Handled
         );
 
-        let _ = click(&mut state, Point::new(3, 6));
+        let _ = click(&mut state, Point::new(3, 11));
         assert!(state.reset_pending());
         let apply_actions = outcome_action_buttons(true);
         let apply_areas = ActionRow::new(&apply_actions).action_areas(geometry.outcomes);
@@ -970,6 +1262,37 @@ mod tests {
     }
 
     #[test]
+    fn source_controls_change_future_delivery_and_viewport_following() {
+        let now = Instant::now();
+        let mut state = StreamingConfiguratorState::new(
+            now,
+            StreamingPresentationPolicy::default(),
+            StreamingPresentationPolicy::default(),
+        );
+        for _ in 0..4 {
+            let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        }
+        assert_eq!(state.focus(), StreamingConfiguratorFocus::SourcePreset);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Right), now);
+        assert_eq!(state.source_policy().preset, StreamingSourcePreset::Choppy);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Right), now);
+        assert_eq!(state.source_policy().preset, StreamingSourcePreset::Custom);
+        assert_eq!(state.source_policy().target_chunk_chars, 10);
+
+        assert!(state.follows_latest());
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::PageUp), now);
+        assert!(!state.follows_latest());
+        assert_eq!(state.preview_scroll_rows(), 8);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::PageDown), now);
+        assert!(state.follows_latest());
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::PageUp), now);
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::End), now);
+        assert!(state.follows_latest());
+        assert_eq!(state.preview_scroll_rows(), 0);
+    }
+
+    #[test]
     fn numeric_controls_use_fine_and_coarse_bounded_steps() {
         let now = Instant::now();
         let mut state = StreamingConfiguratorState::new(
@@ -1007,23 +1330,24 @@ mod tests {
             StreamingPreviewController::new(started, StreamingPresentationPolicy::default());
         let mut previous_raw = String::new();
         let mut previous_smoothed = String::new();
-        for millis in 0..=1_800 {
-            let _ = controller.advance(started + Duration::from_millis(millis));
+        let mut now = started;
+        while let Some(deadline) = controller.next_deadline(now) {
+            now = deadline;
+            let _ = controller.advance(now);
             assert!(controller.raw_text().starts_with(&previous_raw));
             assert!(controller.smoothed_text().starts_with(&previous_smoothed));
             previous_raw = controller.raw_text().to_owned();
             previous_smoothed = controller.smoothed_text().to_owned();
+            if controller.is_completed() {
+                break;
+            }
         }
         assert!(controller.is_completed());
+        assert!(controller.delivered_chunks() > 20);
         assert_eq!(
-            controller.delivered_chunks(),
-            StreamingPreviewController::total_chunks()
+            controller.raw_text(),
+            super::super::streaming_source_scenario::LONG_RESPONSE
         );
-        let expected = SAMPLE_CHUNKS
-            .iter()
-            .map(|(_, chunk)| *chunk)
-            .collect::<String>();
-        assert_eq!(controller.raw_text(), expected);
         assert_eq!(controller.smoothed_text(), controller.raw_text());
     }
 
@@ -1032,7 +1356,7 @@ mod tests {
         let started = Instant::now();
         let mut controller =
             StreamingPreviewController::new(started, StreamingPresentationPolicy::default());
-        let first_due = started + Duration::from_millis(SAMPLE_CHUNKS[0].0);
+        let first_due = controller.next_deadline(started).expect("first deadline");
         assert!(controller.advance(first_due));
         let raw = controller.raw_text().to_owned();
         controller.pause(first_due);
@@ -1045,6 +1369,32 @@ mod tests {
         controller.restart(first_due + Duration::from_secs(6));
         assert!(controller.raw_text().is_empty());
         assert_eq!(controller.delivered_chunks(), 0);
+    }
+
+    #[test]
+    fn live_source_policy_change_preserves_prefix_and_restart_retains_policy() {
+        let started = Instant::now();
+        let mut controller =
+            StreamingPreviewController::new(started, StreamingPresentationPolicy::default());
+        let first_due = controller.next_deadline(started).expect("first deadline");
+        assert!(controller.advance(first_due));
+        let raw_prefix = controller.raw_text().to_owned();
+        let accepted = controller.accepted_bytes();
+        let sparse = StreamingSourcePreset::Sparse.policy();
+        controller.set_source_policy(sparse, first_due);
+        assert_eq!(controller.raw_text(), raw_prefix);
+        assert_eq!(controller.accepted_bytes(), accepted);
+        let next_due = controller
+            .next_deadline(first_due)
+            .expect("replacement deadline");
+        assert!(next_due > first_due);
+        assert!(controller.advance(next_due));
+        assert!(controller.raw_text().starts_with(&raw_prefix));
+
+        controller.restart(next_due);
+        assert_eq!(controller.source_policy(), sparse);
+        assert!(controller.raw_text().is_empty());
+        assert_eq!(controller.accepted_bytes(), 0);
     }
 
     #[test]

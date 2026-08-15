@@ -12,13 +12,13 @@ use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
 use super::render::TuiTheme;
 use super::streaming_configurator::{
     StreamingConfiguratorFocus, StreamingConfiguratorGeometry, StreamingConfiguratorState,
-    StreamingPreviewController, curve_action_buttons, numeric_action_buttons,
-    outcome_action_buttons,
+    curve_action_buttons, numeric_action_buttons, outcome_action_buttons, source_preset_buttons,
 };
+use super::streaming_source_scenario::LONG_RESPONSE;
 
 const STACK_BREAKPOINT: u16 = 86;
 const MIN_USEFUL_WIDTH: u16 = 54;
-const MIN_USEFUL_HEIGHT: u16 = 24;
+const MIN_USEFUL_HEIGHT: u16 = 29;
 
 pub fn streaming_configurator_geometry(
     _state: &StreamingConfiguratorState,
@@ -30,7 +30,7 @@ pub fn streaming_configurator_geometry(
     if content.width < MIN_USEFUL_WIDTH || content.height < MIN_USEFUL_HEIGHT {
         return None;
     }
-    let controls_height = 9;
+    let controls_height = 14;
     let preview_height = content.height.saturating_sub(controls_height);
     let area = Rect::new(
         content.x,
@@ -58,7 +58,37 @@ pub fn streaming_configurator_geometry(
             area.width.saturating_sub(28).min(10),
             1,
         ),
-        outcomes: Rect::new(area.x, area.y + 4, area.width.min(48), 1),
+        source_preset: Rect::new(
+            area.x.saturating_add(10),
+            area.y + 4,
+            area.width.saturating_sub(10),
+            1,
+        ),
+        source_chunk_size: Rect::new(
+            area.x.saturating_add(28),
+            area.y + 5,
+            area.width.saturating_sub(28).min(10),
+            1,
+        ),
+        source_size_variation: Rect::new(
+            area.x.saturating_add(28),
+            area.y + 6,
+            area.width.saturating_sub(28).min(10),
+            1,
+        ),
+        source_interval: Rect::new(
+            area.x.saturating_add(28),
+            area.y + 7,
+            area.width.saturating_sub(28).min(10),
+            1,
+        ),
+        source_interval_variation: Rect::new(
+            area.x.saturating_add(28),
+            area.y + 8,
+            area.width.saturating_sub(28).min(10),
+            1,
+        ),
+        outcomes: Rect::new(area.x, area.y + 9, area.width.min(48), 1),
         surface: frame_area,
     };
     Some(geometry)
@@ -75,7 +105,7 @@ pub fn render_streaming_configurator(
     let content = modal.content_area(frame.area());
     if content.width < MIN_USEFUL_WIDTH || content.height < MIN_USEFUL_HEIGHT {
         TextBlock::new(
-            "The terminal is too small for the streaming comparison. Resize to at least 54 × 24.",
+            "The terminal is too small for the streaming comparison. Resize to at least 54 × 29.",
         )
         .style(theme.selection)
         .wrap(TextWrap::Word)
@@ -83,7 +113,7 @@ pub fn render_streaming_configurator(
         return;
     }
 
-    let controls_height = 9;
+    let controls_height = 14;
     let preview_height = content.height.saturating_sub(controls_height);
     let preview_area = Rect::new(content.x, content.y, content.width, preview_height);
     let controls_area = Rect::new(
@@ -96,6 +126,8 @@ pub fn render_streaming_configurator(
     render_preview(
         "Raw provider chunks",
         state.controller().raw_text(),
+        state.preview_scroll_rows(),
+        state.follows_latest(),
         raw_area,
         frame,
         theme,
@@ -103,6 +135,8 @@ pub fn render_streaming_configurator(
     render_preview(
         "Smoothed presentation",
         state.controller().smoothed_text(),
+        state.preview_scroll_rows(),
+        state.follows_latest(),
         smoothed_area,
         frame,
         theme,
@@ -110,9 +144,16 @@ pub fn render_streaming_configurator(
     render_controls(state, controls_area, frame, theme);
 }
 
+fn wrapped_row_count(text: &str, width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    text.lines()
+        .map(|line| line.chars().count().max(1).div_ceil(width))
+        .sum()
+}
+
 fn configurator_modal(theme: TuiTheme) -> ModalFrame {
     ModalFrame::new(
-        ModalSizing::new(Size::new(54, 24), Size::new(140, 46), Insets::all(1)),
+        ModalSizing::new(Size::new(54, 29), Size::new(140, 52), Insets::all(1)),
         theme.modal_theme(),
     )
     .title(" Streaming presentation configurator ")
@@ -146,7 +187,15 @@ const fn preview_areas(area: Rect) -> (Rect, Rect) {
     }
 }
 
-fn render_preview(title: &str, text: &str, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
+fn render_preview(
+    title: &str,
+    text: &str,
+    scroll_rows: usize,
+    follow_latest: bool,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: TuiTheme,
+) {
     let panel = Panel::new()
         .border(Border::rounded())
         .title(title)
@@ -156,9 +205,17 @@ fn render_preview(title: &str, text: &str, area: Rect, frame: &mut Frame<'_>, th
         .content_style(theme.text);
     let inner = panel.inner_area(area);
     panel.render(area, frame);
+    let base_scroll =
+        wrapped_row_count(text, inner.width).saturating_sub(usize::from(inner.height));
+    let vertical_scroll = if follow_latest {
+        base_scroll
+    } else {
+        base_scroll.saturating_sub(scroll_rows)
+    };
     TextBlock::new(text.to_owned())
         .style(theme.text)
         .wrap(TextWrap::Word)
+        .vertical_scroll(vertical_scroll)
         .render(inner, frame);
 }
 
@@ -214,6 +271,36 @@ fn render_controls(
             theme,
         ),
         setting_line(
+            state.focus() == StreamingConfiguratorFocus::SourcePreset,
+            "Provider preset",
+            &format!("{:?}", state.source_policy().preset),
+            theme,
+        ),
+        setting_line(
+            state.focus() == StreamingConfiguratorFocus::SourceChunkSize,
+            "Target chunk size",
+            &format!("{} chars", state.source_policy().target_chunk_chars),
+            theme,
+        ),
+        setting_line(
+            state.focus() == StreamingConfiguratorFocus::SourceSizeVariation,
+            "Size variation",
+            &format!("{}%", state.source_policy().chunk_size_variation_percent),
+            theme,
+        ),
+        setting_line(
+            state.focus() == StreamingConfiguratorFocus::SourceInterval,
+            "Base interval",
+            &format!("{} ms", state.source_policy().base_interval_ms),
+            theme,
+        ),
+        setting_line(
+            state.focus() == StreamingConfiguratorFocus::SourceIntervalVariation,
+            "Interval variation",
+            &format!("{}%", state.source_policy().interval_variation_percent),
+            theme,
+        ),
+        setting_line(
             state.focus() == StreamingConfiguratorFocus::Reset,
             "Reset override",
             if state.reset_pending() {
@@ -224,18 +311,19 @@ fn render_controls(
             theme,
         ),
         Line::from_spans(vec![
-            Span::styled("Source: bursty provider · ", theme.muted),
+            Span::styled("Source: deterministic provider · ", theme.muted),
             Span::styled(
                 format!(
-                    "chunk {}/{} · {playback}",
+                    "{} / {} bytes · chunk {} · {playback}",
+                    state.controller().accepted_bytes(),
+                    LONG_RESPONSE.len(),
                     state.controller().delivered_chunks(),
-                    StreamingPreviewController::total_chunks()
                 ),
                 theme.text,
             ),
         ]),
         Line::from_spans(vec![Span::styled(
-            "↑↓ select  ←→ adjust  shift+←→ coarse  space toggle  r restart  p pause  enter apply  esc cancel",
+            "↑↓ select  ←→ adjust  shift+←→ coarse  space toggle  pgup/pgdn scroll  end follow  r restart  p pause  enter apply  esc cancel",
             theme.muted,
         )]),
     ];
@@ -287,6 +375,41 @@ fn render_controls(
     ActionRow::new(&numeric_actions)
         .styles(button_styles)
         .render_state_with_id_prefix(geometry.lag, state.lag_actions(), frame, "streaming.lag");
+    let preset_actions = source_preset_buttons();
+    ActionRow::new(&preset_actions)
+        .styles(button_styles)
+        .render_state_with_id_prefix(
+            geometry.source_preset,
+            state.source_preset_actions(),
+            frame,
+            "streaming.source.preset",
+        );
+    for (area, action_state, id) in [
+        (
+            geometry.source_chunk_size,
+            state.source_chunk_size_actions(),
+            "streaming.source.chunk-size",
+        ),
+        (
+            geometry.source_size_variation,
+            state.source_size_variation_actions(),
+            "streaming.source.size-variation",
+        ),
+        (
+            geometry.source_interval,
+            state.source_interval_actions(),
+            "streaming.source.interval",
+        ),
+        (
+            geometry.source_interval_variation,
+            state.source_interval_variation_actions(),
+            "streaming.source.interval-variation",
+        ),
+    ] {
+        ActionRow::new(&numeric_actions)
+            .styles(button_styles)
+            .render_state_with_id_prefix(area, action_state, frame, id);
+    }
     let outcome_actions = outcome_action_buttons(state.reset_pending());
     ActionRow::new(&outcome_actions)
         .styles(button_styles)
@@ -377,7 +500,7 @@ mod tests {
             "Smoothed presentation",
             "[x] Enabled",
             "300 graphemes/s",
-            "chunk 0/13",
+            "chunk 0",
             "enter apply",
         ] {
             assert!(wide.contains(expected), "missing {expected}: {wide}");
@@ -397,7 +520,7 @@ mod tests {
         );
         let small = render_text(Rect::new(0, 0, 40, 16), &state);
         assert!(small.contains("terminal is too small"), "{small}");
-        for _ in 0..4 {
+        for _ in 0..9 {
             let _ = state.handle_key(
                 bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Down),
                 now,
@@ -429,15 +552,25 @@ mod tests {
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Char('p')),
             now,
         );
-        assert!(state.advance(now + std::time::Duration::from_millis(1_800)));
-        let completed = render_text(Rect::new(0, 0, 120, 44), &state);
+        let mut cursor = now;
+        while !state.controller().is_completed() {
+            let Some(deadline) = state.next_deadline(cursor) else {
+                break;
+            };
+            cursor = deadline;
+            let _ = state.advance(cursor);
+        }
+        let completed = render_text(Rect::new(0, 0, 120, 50), &state);
         assert!(completed.contains("completed"), "{completed}");
-        assert_eq!(completed.matches("# Bursty streaming").count(), 2);
-        assert_eq!(completed.matches("cafe\u{301}").count(), 2);
-        assert_eq!(completed.matches("👩🏽‍💻").count(), 2);
-        assert_eq!(completed.matches("東京").count(), 2);
+        assert_eq!(
+            state.controller().raw_text(),
+            state.controller().smoothed_text()
+        );
+        assert!(state.controller().raw_text().contains("cafe\u{301}"));
+        assert!(state.controller().raw_text().contains("👩🏽‍💻"));
+        assert!(state.controller().raw_text().contains("東京"));
 
-        for _ in 0..4 {
+        for _ in 0..9 {
             let _ = state.handle_key(
                 bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Down),
                 now,
