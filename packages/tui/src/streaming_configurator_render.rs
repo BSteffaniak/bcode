@@ -58,7 +58,7 @@ pub fn streaming_configurator_geometry(
             area.width.saturating_sub(28).min(10),
             1,
         ),
-        outcomes: Rect::new(area.x, area.y + 4, area.width.min(30), 1),
+        outcomes: Rect::new(area.x, area.y + 4, area.width.min(48), 1),
         surface: frame_area,
     };
     Some(geometry)
@@ -287,7 +287,7 @@ fn render_controls(
     ActionRow::new(&numeric_actions)
         .styles(button_styles)
         .render_state_with_id_prefix(geometry.lag, state.lag_actions(), frame, "streaming.lag");
-    let outcome_actions = outcome_action_buttons();
+    let outcome_actions = outcome_action_buttons(state.reset_pending());
     ActionRow::new(&outcome_actions)
         .styles(button_styles)
         .render_state_with_id_prefix(
@@ -408,7 +408,7 @@ mod tests {
             now,
         );
         let reset = render_text(Rect::new(0, 0, 120, 36), &state);
-        assert!(reset.contains("[ Reset ]"), "{reset}");
+        assert!(reset.contains("[ Reset pending ]"), "{reset}");
     }
 
     #[test]
@@ -448,7 +448,7 @@ mod tests {
             now,
         );
         let reset = render_text(Rect::new(0, 0, 120, 40), &state);
-        assert!(reset.contains("[ Reset ]"), "{reset}");
+        assert!(reset.contains("[ Reset pending ]"), "{reset}");
     }
 
     #[test]

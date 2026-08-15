@@ -298,7 +298,7 @@ impl StreamingConfiguratorState {
             return outcome;
         }
 
-        let actions = outcome_action_buttons();
+        let actions = outcome_action_buttons(self.reset_pending);
         match ActionRow::new(&actions).handle_event(
             geometry.outcomes,
             &mut self.outcome_actions,
@@ -493,9 +493,16 @@ pub fn numeric_action_buttons() -> [ActionButton; 2] {
     ]
 }
 
-pub fn outcome_action_buttons() -> [ActionButton; 3] {
+pub fn outcome_action_buttons(reset_pending: bool) -> [ActionButton; 3] {
     [
-        ActionButton::new("reset", "Reset"),
+        ActionButton::new(
+            "reset",
+            if reset_pending {
+                "Reset pending"
+            } else {
+                "Reset"
+            },
+        ),
         ActionButton::new("apply", "Apply"),
         ActionButton::new("cancel", "Cancel"),
     ]
@@ -885,7 +892,10 @@ mod tests {
 
         let _ = click(&mut state, Point::new(3, 6));
         assert!(state.reset_pending());
-        let apply = click(&mut state, Point::new(12, 6));
+        let apply_actions = outcome_action_buttons(true);
+        let apply_areas = ActionRow::new(&apply_actions).action_areas(geometry.outcomes);
+        let apply_point = Point::new(apply_areas[1].x, apply_areas[1].y);
+        let apply = click(&mut state, apply_point);
         assert_eq!(apply, StreamingConfiguratorOutcome::Reset);
     }
 
