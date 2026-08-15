@@ -945,18 +945,6 @@ pub enum Request {
         #[serde(default)]
         working_directory: Option<PathBuf>,
     },
-    ForkSession {
-        source_session_id: SessionId,
-        prompt_sequence: u64,
-        name: Option<String>,
-    },
-    CloneSession {
-        source_session_id: SessionId,
-        name: Option<String>,
-        /// Require the cloned history snapshot to end at this generation.
-        #[serde(default)]
-        expected_generation: Option<u64>,
-    },
     /// Capture one bounded source snapshot for generic session derivation.
     SessionDerivationSnapshot {
         session_id: SessionId,
@@ -2742,10 +2730,6 @@ pub enum ResponsePayload {
     ExternalSessionImported {
         session: SessionSummary,
         warnings: Vec<SessionImportWarning>,
-    },
-    SessionForked {
-        session: SessionSummary,
-        draft: Option<String>,
     },
     SessionDerivationSnapshot {
         snapshot: SessionDerivationSourceSnapshot,

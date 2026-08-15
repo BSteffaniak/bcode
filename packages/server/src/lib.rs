@@ -3966,12 +3966,6 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::AttachSessionProjectionWindow { session_id, .. } => Some(*session_id),
         Request::StartWorkflowRun(request) => Some(request.parent_session_id),
         Request::StartWorkflowPackageExport(request) => Some(request.parent_session_id),
-        Request::ForkSession {
-            source_session_id, ..
-        }
-        | Request::CloneSession {
-            source_session_id, ..
-        } => Some(*source_session_id),
         _ => None,
     }
 }
@@ -4049,8 +4043,6 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RalphRunStatus(_) => "ralph_run_status",
         Request::RecordRalphLifecycle(_) => "record_ralph_lifecycle",
         Request::ImportExternalSession { .. } => "import_external_session",
-        Request::ForkSession { .. } => "fork_session",
-        Request::CloneSession { .. } => "clone_session",
         Request::SessionDerivationSnapshot { .. } => "session_derivation_snapshot",
         Request::SessionDerivationPrompts { .. } => "session_derivation_prompts",
         Request::DeriveSession { .. } => "derive_session",
@@ -4467,36 +4459,6 @@ async fn handle_request_inner(
         }
         SessionLifecycleRequest::InvocationInput { session_id, input } => {
             handle_invocation_input(request_id, state, writer, session_id, input).await
-        }
-        SessionLifecycleRequest::ForkSession {
-            source_session_id,
-            prompt_sequence,
-            name,
-        } => {
-            handle_fork_session(
-                request_id,
-                state,
-                writer,
-                source_session_id,
-                prompt_sequence,
-                name,
-            )
-            .await
-        }
-        SessionLifecycleRequest::CloneSession {
-            source_session_id,
-            name,
-            expected_generation,
-        } => {
-            handle_clone_session(
-                request_id,
-                state,
-                writer,
-                source_session_id,
-                name,
-                expected_generation,
-            )
-            .await
         }
         SessionLifecycleRequest::SessionDerivationSnapshot { session_id } => {
             handle_session_derivation_snapshot(request_id, state, writer, session_id).await
@@ -9544,87 +9506,6 @@ async fn handle_delete_session(
                     "session_delete_failed",
                     error.to_string(),
                 )),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_clone_session(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    source_session_id: SessionId,
-    name: Option<String>,
-    expected_generation: Option<u64>,
-) -> Result<(), ServerError> {
-    match state
-        .sessions
-        .clone_session_at_generation(source_session_id, name, expected_generation)
-        .await
-    {
-        Ok(result) => {
-            state
-                .session_catalog
-                .upsert_native_session(result.session.clone())
-                .await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionForked {
-                    session: result.session,
-                    draft: result.draft,
-                }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_clone_failed",
-                    error.to_string(),
-                )),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_fork_session(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    source_session_id: SessionId,
-    prompt_sequence: u64,
-    name: Option<String>,
-) -> Result<(), ServerError> {
-    match state
-        .sessions
-        .fork_session_from_prompt(source_session_id, prompt_sequence, name)
-        .await
-    {
-        Ok(result) => {
-            state
-                .session_catalog
-                .upsert_native_session(result.session.clone())
-                .await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionForked {
-                    session: result.session,
-                    draft: result.draft,
-                }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new("session_fork_failed", error.to_string())),
             )
             .await
         }

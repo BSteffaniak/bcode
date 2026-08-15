@@ -124,17 +124,6 @@ pub enum SessionLifecycleRequest {
         session_id: SessionId,
         input: bcode_tool::ToolInvocationInput,
     },
-    ForkSession {
-        source_session_id: SessionId,
-        prompt_sequence: u64,
-        name: Option<String>,
-    },
-    CloneSession {
-        source_session_id: SessionId,
-        name: Option<String>,
-        /// Require the cloned history snapshot to end at this generation.
-        expected_generation: Option<u64>,
-    },
     SessionDerivationSnapshot {
         session_id: SessionId,
     },
@@ -1442,24 +1431,6 @@ impl RoutedRequest {
                 source_id,
                 external_session_id,
                 working_directory,
-            }),
-            Request::ForkSession {
-                source_session_id,
-                prompt_sequence,
-                name,
-            } => Self::SessionLifecycle(SessionLifecycleRequest::ForkSession {
-                source_session_id,
-                prompt_sequence,
-                name,
-            }),
-            Request::CloneSession {
-                source_session_id,
-                name,
-                expected_generation,
-            } => Self::SessionLifecycle(SessionLifecycleRequest::CloneSession {
-                source_session_id,
-                name,
-                expected_generation,
             }),
             Request::SessionDerivationSnapshot { session_id } => {
                 Self::SessionLifecycle(SessionLifecycleRequest::SessionDerivationSnapshot {

@@ -25,10 +25,10 @@ use bcode_ipc::{
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionDerivationPromptPage,
     SessionDerivationPromptQuery, SessionDerivationRequest, SessionDerivationSourceSnapshot,
-    SessionDerivationTerminalOutcome, SessionEvent, SessionEventKind, SessionForkResult,
-    SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
-    SessionId, SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery,
-    SessionSummary, WorkId,
+    SessionDerivationTerminalOutcome, SessionEvent, SessionEventKind, SessionHistoryAroundQuery,
+    SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow, SessionId,
+    SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery, SessionSummary,
+    WorkId,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::{BTreeMap, VecDeque};
@@ -1313,87 +1313,6 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionCreated { session } => Ok(session),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Fork a session from a selected user prompt.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn fork_session(
-        &self,
-        source_session_id: SessionId,
-        prompt_sequence: u64,
-        name: Option<String>,
-    ) -> Result<SessionForkResult, ClientError> {
-        match self
-            .send_request(Request::ForkSession {
-                source_session_id,
-                prompt_sequence,
-                name,
-            })
-            .await?
-        {
-            ResponsePayload::SessionForked { session, draft } => {
-                Ok(SessionForkResult { session, draft })
-            }
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Clone a session's full history.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn clone_session(
-        &self,
-        source_session_id: SessionId,
-        name: Option<String>,
-    ) -> Result<SessionForkResult, ClientError> {
-        match self
-            .send_request(Request::CloneSession {
-                source_session_id,
-                name,
-                expected_generation: None,
-            })
-            .await?
-        {
-            ResponsePayload::SessionForked { session, draft } => {
-                Ok(SessionForkResult { session, draft })
-            }
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Clone a session's history only when its current generation matches `expected_generation`.
-    ///
-    /// The generation comparison and history snapshot are performed by the session actor as one
-    /// serialized read, so accepted clones cannot contain a different source generation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon cannot be reached, rejects the request, or the source
-    /// generation changed before the snapshot was captured.
-    pub async fn clone_session_at_generation(
-        &self,
-        source_session_id: SessionId,
-        expected_generation: u64,
-        name: Option<String>,
-    ) -> Result<SessionForkResult, ClientError> {
-        match self
-            .send_request(Request::CloneSession {
-                source_session_id,
-                name,
-                expected_generation: Some(expected_generation),
-            })
-            .await?
-        {
-            ResponsePayload::SessionForked { session, draft } => {
-                Ok(SessionForkResult { session, draft })
-            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
