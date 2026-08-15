@@ -908,6 +908,7 @@ async fn stream_plugin_session_view_inner(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
         PluginWorkflowPackageExportStartRequest, SessionId, workflow_package_export_start_request,
@@ -980,6 +981,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn stream_plugin_workflow_views(
     client: BcodeClient,
     sender: mpsc::Sender<PluginTuiSurfaceUpdate>,

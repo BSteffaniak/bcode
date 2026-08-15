@@ -576,6 +576,76 @@ mod tests {
     }
 
     #[test]
+    fn every_key_path_and_numeric_boundary_is_owned_and_bounded() {
+        let now = Instant::now();
+        let mut state = StreamingConfiguratorState::new(
+            now,
+            StreamingPresentationPolicy {
+                graphemes_per_second: 0,
+                max_lag_ms: 0,
+                ..StreamingPresentationPolicy::default()
+            },
+            StreamingPresentationPolicy::default(),
+        );
+        assert_eq!(
+            state.handle_key(KeyStroke::simple(KeyCode::Left), now),
+            StreamingConfiguratorOutcome::Handled
+        );
+        assert!(!state.selected_policy().enabled);
+        assert_eq!(
+            state.handle_key(KeyStroke::simple(KeyCode::Up), now),
+            StreamingConfiguratorOutcome::Handled
+        );
+        assert_eq!(state.focus(), StreamingConfiguratorFocus::Reset);
+        assert_eq!(
+            state.handle_key(KeyStroke::simple(KeyCode::Down), now),
+            StreamingConfiguratorOutcome::Handled
+        );
+        assert_eq!(state.focus(), StreamingConfiguratorFocus::Enabled);
+        assert_eq!(
+            state.handle_key(KeyStroke::simple(KeyCode::Char('p')), now),
+            StreamingConfiguratorOutcome::Handled
+        );
+        assert!(state.controller().is_paused());
+        assert!(state.next_deadline(now).is_none());
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Char('p')), now);
+        assert!(!state.controller().is_paused());
+        let _ = state.handle_key(KeyStroke::simple(KeyCode::Char('r')), now);
+        assert_eq!(state.controller().delivered_chunks(), 0);
+        assert_eq!(
+            state.handle_key(KeyStroke::simple(KeyCode::Enter), now),
+            StreamingConfiguratorOutcome::Apply(state.selected_policy())
+        );
+        assert_eq!(
+            state.handle_key(KeyStroke::simple(KeyCode::Char('x')), now),
+            StreamingConfiguratorOutcome::Ignored
+        );
+
+        let mut maximum = StreamingConfiguratorState::new(
+            now,
+            StreamingPresentationPolicy {
+                graphemes_per_second: StreamingPresentationPolicy::MAX_GRAPHEMES_PER_SECOND,
+                max_lag_ms: StreamingPresentationPolicy::MAX_LAG_MS,
+                ..StreamingPresentationPolicy::default()
+            },
+            StreamingPresentationPolicy::default(),
+        );
+        let _ = maximum.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        let _ = maximum.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        let _ = maximum.handle_key(KeyStroke::simple(KeyCode::Right), now);
+        assert_eq!(
+            maximum.selected_policy().graphemes_per_second,
+            StreamingPresentationPolicy::MAX_GRAPHEMES_PER_SECOND
+        );
+        let _ = maximum.handle_key(KeyStroke::simple(KeyCode::Down), now);
+        let _ = maximum.handle_key(KeyStroke::simple(KeyCode::Right), now);
+        assert_eq!(
+            maximum.selected_policy().max_lag_ms,
+            StreamingPresentationPolicy::MAX_LAG_MS
+        );
+    }
+
+    #[test]
     fn numeric_controls_use_fine_and_coarse_bounded_steps() {
         let now = Instant::now();
         let mut state = StreamingConfiguratorState::new(

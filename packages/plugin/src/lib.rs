@@ -5498,6 +5498,8 @@ library = "libcommands.dylib"
                 category: Some("example".to_string()),
                 surfaces: BTreeSet::from([bcode_command::CommandSurface::Palette]),
                 slash: None,
+                arguments: Vec::new(),
+                session: bcode_command::CommandSessionRequirement::Optional,
                 execution: bcode_command::CommandExecution::Normal,
                 owner: bcode_command::CommandOwner::Plugin {
                     plugin_id: "bcode.commands".to_string(),

@@ -11860,7 +11860,6 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::InertHistory { .. } => "inert_history",
-        SessionEventKind::SessionDerived { .. } => "session_derived",
     }
 }
 
@@ -12644,7 +12643,7 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::InertHistory { event_type, .. } => {
             println!("#{} legacy event: {event_type}", event.sequence);
         }
-        SessionEventKind::TraceEvent { .. } | SessionEventKind::SessionDerived { .. } => {}
+        SessionEventKind::TraceEvent { .. } => {}
     }
 }
 

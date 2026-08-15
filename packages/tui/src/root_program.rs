@@ -4108,6 +4108,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_configurator_apply_cancel_and_reset_own_input_and_effects() {
+        let mut apply = root_test_model();
+        apply
+            .loop_state
+            .open_streaming_configurator(&mut apply.chat);
+        assert!(apply.loop_state.handle_streaming_configurator_key(
+            &mut apply.chat,
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Char('x')),
+        ));
+        assert!(apply.loop_state.handle_streaming_configurator_key(
+            &mut apply.chat,
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Enter),
+        ));
+        assert!(apply.chat.pending_effects.contains_effect(
+            &super::super::effects::TuiEffect::PersistStreamingPresentation {
+                policy: bcode_session_view_models::StreamingPresentationPolicy::default(),
+            },
+        ));
+        assert!(
+            apply
+                .loop_state
+                .streaming_configurator_deadline(std::time::Instant::now())
+                .is_none()
+        );
+
+        let mut cancel = root_test_model();
+        cancel
+            .loop_state
+            .open_streaming_configurator(&mut cancel.chat);
+        assert!(cancel.loop_state.handle_streaming_configurator_key(
+            &mut cancel.chat,
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Escape),
+        ));
+        assert_eq!(cancel.chat.queued_effect_count(), 0);
+
+        let mut reset = root_test_model();
+        reset
+            .loop_state
+            .open_streaming_configurator(&mut reset.chat);
+        for _ in 0..4 {
+            assert!(reset.loop_state.handle_streaming_configurator_key(
+                &mut reset.chat,
+                bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Down),
+            ));
+        }
+        assert!(reset.loop_state.handle_streaming_configurator_key(
+            &mut reset.chat,
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Space),
+        ));
+        assert!(reset.loop_state.handle_streaming_configurator_key(
+            &mut reset.chat,
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Enter),
+        ));
+        assert!(
+            reset
+                .chat
+                .pending_effects
+                .contains_effect(&super::super::effects::TuiEffect::ClearStreamingPresentation,)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_configurator_deadline_stops_on_pause_and_close() {
+        let mut model = root_test_model();
+        model
+            .loop_state
+            .open_streaming_configurator(&mut model.chat);
+        let now = std::time::Instant::now();
+        assert!(
+            model
+                .loop_state
+                .streaming_configurator_deadline(now)
+                .is_some()
+        );
+        assert!(model.loop_state.handle_streaming_configurator_key(
+            &mut model.chat,
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Char('p')),
+        ));
+        assert!(
+            model
+                .loop_state
+                .streaming_configurator_deadline(now)
+                .is_none()
+        );
+        assert!(model.loop_state.handle_streaming_configurator_key(
+            &mut model.chat,
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Escape),
+        ));
+        assert!(
+            model
+                .loop_state
+                .streaming_configurator_deadline(now)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn domain_owned_admission_separates_reliable_and_latest_messages() {
         let config = bmux_tui_runtime::RuntimeConfig {
             frame_interval: None,

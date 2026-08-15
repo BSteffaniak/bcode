@@ -87,10 +87,10 @@ fn highlighted_lines(input: SourceViewerInput<'_>) -> Vec<Line> {
                 })
                 .collect();
         }
-        return lines
+        lines
             .into_iter()
             .map(|line| Line::from_spans(vec![Span::raw(line.to_owned())]))
-            .collect();
+            .collect()
     }
     #[cfg(not(feature = "syntax"))]
     input

@@ -65238,6 +65238,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
     }
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn workflow_live_transport_publishes_commits_bounds_catch_up_and_cleans_disconnects() {
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let mut store =

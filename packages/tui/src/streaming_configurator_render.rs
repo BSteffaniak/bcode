@@ -280,6 +280,46 @@ mod tests {
     }
 
     #[test]
+    fn renders_focus_pause_completion_reset_and_identical_unicode_markdown() {
+        let now = std::time::Instant::now();
+        let immediate = bcode_session_view_models::StreamingPresentationPolicy::immediate();
+        let mut state = StreamingConfiguratorState::new(now, immediate, immediate);
+        let focused = render_text(Rect::new(0, 0, 120, 40), &state);
+        assert!(focused.contains("› Enabled:"), "{focused}");
+
+        let _ = state.handle_key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Char('p')),
+            now,
+        );
+        let paused = render_text(Rect::new(0, 0, 120, 40), &state);
+        assert!(paused.contains("paused"), "{paused}");
+        let _ = state.handle_key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Char('p')),
+            now,
+        );
+        assert!(state.advance(now + std::time::Duration::from_millis(1_800)));
+        let completed = render_text(Rect::new(0, 0, 120, 44), &state);
+        assert!(completed.contains("completed"), "{completed}");
+        assert_eq!(completed.matches("# Bursty streaming").count(), 2);
+        assert_eq!(completed.matches("cafe\u{301}").count(), 2);
+        assert_eq!(completed.matches("👩🏽‍💻").count(), 2);
+        assert_eq!(completed.matches("東京").count(), 2);
+
+        for _ in 0..4 {
+            let _ = state.handle_key(
+                bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Down),
+                now,
+            );
+        }
+        let _ = state.handle_key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Space),
+            now,
+        );
+        let reset = render_text(Rect::new(0, 0, 120, 40), &state);
+        assert!(reset.contains("› Reset override: pending"), "{reset}");
+    }
+
+    #[test]
     fn preview_layout_switches_from_columns_to_stacks() {
         let wide = Rect::new(0, 0, 100, 20);
         let (raw, smooth) = preview_areas(wide);
