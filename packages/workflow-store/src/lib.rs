@@ -831,6 +831,9 @@ pub enum AttemptObservation {
     Admitted,
     /// External work is active.
     Running,
+    /// Observation is intentionally deferred because another live or artifact-specific owner is
+    /// authoritative. Deferral never mutates durable attempt state.
+    Deferred { reason: String },
     /// External work completed with schema-validated output.
     Succeeded { output: ValidatedOutput },
     /// External work failed terminally and must not be retried automatically.
@@ -881,6 +884,8 @@ pub trait AsyncAttemptStatusObserver: Sync {
 pub struct ReceiptReconciliationSummary {
     pub admitted: Vec<String>,
     pub running: Vec<String>,
+    /// Attempts intentionally left unchanged because another owner remains authoritative.
+    pub deferred: Vec<String>,
     pub succeeded: Vec<String>,
     pub failed: Vec<String>,
     /// Durable retries scheduled from exact owner observations and node policy.
@@ -6115,6 +6120,7 @@ impl WorkflowStore {
             }
             AttemptObservation::Admitted
             | AttemptObservation::Running
+            | AttemptObservation::Deferred { .. }
             | AttemptObservation::Succeeded { .. } => return Ok(None),
         };
         self.schedule_automatic_retry_for_failed_attempt(
@@ -10605,7 +10611,9 @@ fn apply_attempt_observation(
     ) {
         let compatible = matches!(
             observation,
-            AttemptObservation::Admitted | AttemptObservation::Running
+            AttemptObservation::Admitted
+                | AttemptObservation::Running
+                | AttemptObservation::Deferred { .. }
         ) || matches!(
             (current_status.as_str(), &observation),
             ("succeeded", AttemptObservation::Succeeded { .. })
@@ -10655,6 +10663,9 @@ fn apply_attempt_observation(
         AttemptObservation::Running => {
             transition_attempt(transaction, request, "running", None)?;
             summary.running.push(request.dispatch_identity.clone());
+        }
+        AttemptObservation::Deferred { reason: _ } => {
+            summary.deferred.push(request.dispatch_identity.clone());
         }
         AttemptObservation::Succeeded { output } => {
             validate_observed_output(request, &output)?;
@@ -17251,6 +17262,43 @@ mod tests {
                 .expect("run")
                 .status,
             RunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn deferred_receipt_backed_mutation_remains_running() {
+        struct Observer;
+        impl AttemptStatusObserver for Observer {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Deferred {
+                    reason: "another live daemon owns the attempt".to_string(),
+                })
+            }
+        }
+
+        let (temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let summary = store
+            .reconcile_receipt_backed_attempts(&Observer, 10, 20)
+            .expect("reconcile");
+        assert_eq!(summary.deferred, [identity]);
+        assert!(summary.repair_required.is_empty());
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+        assert_eq!(
+            store.attempt_history("run-1", None, 10).expect("attempts")[0].status,
+            "admitted"
         );
     }
 

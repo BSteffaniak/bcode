@@ -320,8 +320,13 @@ repair-required state when trust cannot be established.
 ## Reconciliation and repair
 
 Automatic reconciliation is allowed only when durable receipts and owner APIs prove the current
-operation state. Prepared mutation without a trustworthy receipt or externally provable outcome
-becomes `repair_required`; it is not retried automatically.
+operation state. Agent-turn receipts persist the exact daemon artifact and daemon-instance identity
+that accepted the turn. A daemon with a different artifact, or a replacement daemon while the
+recorded session owner remains live or unverifiable, defers observation without mutating the
+attempt. This keeps the workflow database canonical across artifact-isolated daemons without letting
+one artifact recover or terminalize another artifact's live work. Prepared mutation without a
+trustworthy receipt or externally provable outcome becomes `repair_required`; it is not retried
+automatically.
 
 Full replay, projection rebuild, receipt investigation, forced retry, and ambiguity resolution are
 explicit doctor/reconcile/repair operations. Maintenance acquires exclusive workflow-store

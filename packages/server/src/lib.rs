@@ -31113,6 +31113,12 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
         >,
     > {
         Box::pin(async move {
+            if workflow_receipt_belongs_to_foreign_daemon(self.state, request) {
+                return Ok(bcode_workflow_store::AttemptObservation::Deferred {
+                    reason: "workflow attempt belongs to another daemon artifact or instance"
+                        .to_string(),
+                });
+            }
             if request
                 .receipt
                 .get("owner")
@@ -31175,6 +31181,63 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
             structural_observation_or_unknown(observation, request)
         })
     }
+}
+
+fn workflow_receipt_belongs_to_foreign_daemon(
+    state: &ServerState,
+    request: &bcode_workflow_store::AttemptReconciliationRequest,
+) -> bool {
+    if request
+        .receipt
+        .get("owner")
+        .and_then(serde_json::Value::as_str)
+        != Some("bcode.server.agent-turn/v1")
+    {
+        return false;
+    }
+    let receipt_artifact = request
+        .receipt
+        .get("owner_artifact_id")
+        .and_then(serde_json::Value::as_str);
+    let current_artifact = state
+        .daemon_status
+        .artifact_id
+        .as_ref()
+        .map(ToString::to_string);
+    if receipt_artifact.is_some_and(|artifact| Some(artifact) != current_artifact.as_deref()) {
+        return true;
+    }
+    let Some(receipt_instance) = request
+        .receipt
+        .get("owner_daemon_instance_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    if receipt_instance == state.daemon_status.instance_id {
+        return false;
+    }
+    let Some(session_id) = request
+        .receipt
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| SessionId::from_str(value).ok())
+    else {
+        return true;
+    };
+    let Some(root) = state.sessions.session_store_root() else {
+        return true;
+    };
+    bcode_session::lease::session_owner_observations(&root, session_id).map_or(true, |owners| {
+        owners.into_iter().any(|observation| {
+            observation.owner.daemon_instance_id.as_deref() == Some(receipt_instance)
+                && matches!(
+                    observation.liveness,
+                    bcode_session::lease::SessionOwnerLiveness::Live
+                        | bcode_session::lease::SessionOwnerLiveness::Unverifiable
+                )
+        })
+    })
 }
 
 /// Convert a structurally undecodable observation into [`AttemptObservation::Unknown`].
@@ -31308,36 +31371,12 @@ async fn observe_workflow_turn(
             } if event_turn_id == turn_id => Some((*outcome, message.clone(), event.timestamp_ms)),
             _ => None,
         });
-    let in_memory_history = Some(
-        state
-            .sessions
-            .session_history(session_id)
-            .await
-            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
-    );
-    let terminal = terminal.or_else(|| {
-        in_memory_history.as_ref().and_then(|events| {
-            events.iter().rev().find_map(|event| match &event.kind {
-                SessionEventKind::ModelTurnFinished {
-                    turn_id: event_turn_id,
-                    outcome,
-                    message,
-                } if event_turn_id == turn_id => {
-                    Some((*outcome, message.clone(), event.timestamp_ms))
-                }
-                _ => None,
-            })
-        })
-    });
     let Some((outcome, message, terminal_at_ms)) = terminal else {
         return Ok(bcode_workflow_store::AttemptObservation::Running);
     };
     match outcome {
         ModelTurnOutcome::Completed => {
-            let output = in_memory_history
-                .as_deref()
-                .and_then(|history| workflow_turn_output(history, turn_id))
-                .or_else(|| workflow_turn_output(&page.events, turn_id));
+            let output = workflow_turn_output(&page.events, turn_id);
             let output = output.ok_or_else(|| {
                 WorkflowStoreError::InvalidData(
                     "completed workflow prompt turn has no assistant output".to_string(),
@@ -33073,6 +33112,8 @@ async fn dispatch_workflow_prompt_turn(
     }
     Ok(serde_json::json!({
         "owner": "bcode.server.agent-turn/v1",
+        "owner_artifact_id": state.daemon_status.artifact_id.as_ref().map(ToString::to_string),
+        "owner_daemon_instance_id": state.daemon_status.instance_id,
         "session_id": target_session_id,
         "work_id": receipt.work_id,
         "turn_id": receipt.turn_id,
@@ -33781,7 +33822,8 @@ fn runtime_work_outcome_from_attempt_observation(
             Some("workflow attempt outcome is unknown and requires repair".to_string()),
         ),
         bcode_workflow_store::AttemptObservation::Admitted
-        | bcode_workflow_store::AttemptObservation::Running => (
+        | bcode_workflow_store::AttemptObservation::Running
+        | bcode_workflow_store::AttemptObservation::Deferred { .. } => (
             RuntimeWorkStatus::Failed,
             Some("workflow model turn ended without a terminal attempt outcome".to_string()),
         ),
@@ -58552,6 +58594,30 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("repeat successor dispatched");
+    }
+
+    #[test]
+    fn foreign_artifact_workflow_receipt_is_deferred_before_observation() {
+        let mut state = test_server_state(SessionManager::default());
+        state.daemon_status.artifact_id =
+            Some(bcode_ipc::ArtifactId::parse("current-artifact").expect("current artifact"));
+        state.daemon_status.instance_id = "current-instance".to_string();
+        let request = bcode_workflow_store::AttemptReconciliationRequest {
+            run_id: "run-1".to_string(),
+            node_id: "node-1".to_string(),
+            activation_id: "activation-1".to_string(),
+            attempt: 1,
+            dispatch_identity: "dispatch-1".to_string(),
+            side_effect: bcode_workflow_store::DispatchSideEffect::Mutating,
+            receipt: serde_json::json!({
+                "owner": "bcode.server.agent-turn/v1",
+                "owner_artifact_id": "foreign-artifact",
+                "owner_daemon_instance_id": "foreign-instance",
+                "session_id": SessionId::new(),
+            }),
+        };
+
+        assert!(workflow_receipt_belongs_to_foreign_daemon(&state, &request));
     }
 
     #[test]
