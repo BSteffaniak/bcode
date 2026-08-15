@@ -336,8 +336,6 @@ fn plugin_slash_items(
 
 fn static_items() -> Vec<SlashItem> {
     slash_registry::static_completions()
-        .iter()
-        .copied()
         .map(|completion| item(completion.command(), completion.description()))
         .collect()
 }

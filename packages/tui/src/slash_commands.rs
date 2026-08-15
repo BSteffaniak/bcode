@@ -756,7 +756,7 @@ pub async fn execute_resolved(
     let parts = message.split_whitespace().collect::<Vec<_>>();
     let outcome = match resolution {
         slash_registry::SlashResolution::Builtin(command) => {
-            execute_builtin(client, session_id, context, message, &parts, command.name()).await
+            execute_builtin(client, session_id, context, message, &parts, command.id()).await
         }
         slash_registry::SlashResolution::SkillAlias {
             skill_id,
@@ -836,26 +836,28 @@ async fn execute_builtin(
     context: SlashExecutionContext<'_>,
     message: &str,
     parts: &[&str],
-    command: &str,
+    command: slash_registry::BuiltinCommandId,
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    use slash_registry::BuiltinCommandId;
+
     match command {
-        "version" => Ok(SlashCommandOutcome::SystemMarkdown(
+        BuiltinCommandId::Version => Ok(SlashCommandOutcome::SystemMarkdown(
             format_build_info_markdown(&super::build_info()),
         )),
-        "sessions" => Ok(SlashCommandOutcome::PickSession),
-        "search" => Ok(SlashCommandOutcome::SearchSessions),
-        "resync" => resync_command(client, parts).await,
-        "rescan-imports" => client.refresh_session_catalog(None).await.map(|list| {
+        BuiltinCommandId::Sessions => Ok(SlashCommandOutcome::PickSession),
+        BuiltinCommandId::Search => Ok(SlashCommandOutcome::SearchSessions),
+        BuiltinCommandId::Resync => resync_command(client, parts).await,
+        BuiltinCommandId::RescanImports => client.refresh_session_catalog(None).await.map(|list| {
             SlashCommandOutcome::Handled(format!(
                 "session catalog refresh requested (revision {})",
                 list.catalog_revision
             ))
         }),
-        "new" => Ok(SlashCommandOutcome::NewDraftSession),
-        "plan" | "build" | "agent" => {
+        BuiltinCommandId::New => Ok(SlashCommandOutcome::NewDraftSession),
+        BuiltinCommandId::Agent => {
             handle_agent_command(client, session_id, context.current_agent_id, parts).await
         }
-        "compact" => {
+        BuiltinCommandId::Compact => {
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::Handled(
                     "compact requires an active session".to_owned(),
@@ -863,11 +865,11 @@ async fn execute_builtin(
             };
             Ok(SlashCommandOutcome::CompactContext { session_id })
         }
-        "theme" => Ok(theme_command(parts)),
-        "streaming" => Ok(SlashCommandOutcome::OpenStreamingConfigurator),
-        "model" | "models" if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
-        "auth-pool" | "subscriptions" if parts.len() == 1 => Ok(SlashCommandOutcome::PickAuthPool),
-        "model" | "set-model" if parts.len() > 1 => {
+        BuiltinCommandId::Theme => Ok(theme_command(parts)),
+        BuiltinCommandId::Streaming => Ok(SlashCommandOutcome::OpenStreamingConfigurator),
+        BuiltinCommandId::Model if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
+        BuiltinCommandId::AuthPool if parts.len() == 1 => Ok(SlashCommandOutcome::PickAuthPool),
+        BuiltinCommandId::Model if parts.len() > 1 => {
             let model_id = parts[1].to_owned();
             if let Some(session_id) = session_id {
                 Ok(SlashCommandOutcome::SetSessionModel {
@@ -882,7 +884,7 @@ async fn execute_builtin(
                 })
             }
         }
-        "provider" | "set-provider" if parts.len() > 1 => {
+        BuiltinCommandId::Provider if parts.len() > 1 => {
             let provider = parts[1].to_owned();
             let status = if let Some(session_id) = session_id {
                 client.session_model_status(session_id).await?
@@ -903,7 +905,7 @@ async fn execute_builtin(
                 })
             }
         }
-        "provider" => {
+        BuiltinCommandId::Provider => {
             let status = if let Some(session_id) = session_id {
                 client.session_model_status(session_id).await?
             } else {
@@ -914,7 +916,7 @@ async fn execute_builtin(
                 status.provider_plugin_id.as_deref().unwrap_or("auto")
             )))
         }
-        "context-strategy" | "context" => {
+        BuiltinCommandId::Context => {
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::Handled(
                     "context-strategy requires an active session".to_owned(),
@@ -931,7 +933,7 @@ async fn execute_builtin(
                 status.compaction_mode.as_deref().unwrap_or("unknown")
             )))
         }
-        "cwd" => {
+        BuiltinCommandId::Cwd => {
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::Handled(
                     "cwd requires an active session".to_owned(),
@@ -939,13 +941,13 @@ async fn execute_builtin(
             };
             Ok(cwd_command(session_id, context.working_directory, parts))
         }
-        "worktree" | "worktrees" => {
+        BuiltinCommandId::Worktree => {
             worktree_command(client, session_id, context.working_directory, parts).await
         }
-        "ralph" => Ok(ralph_command(parts)),
-        "goal" => Ok(goal_command(parts)),
-        "skills" => Ok(SlashCommandOutcome::PickSkill),
-        "skill" => {
+        BuiltinCommandId::Ralph => Ok(ralph_command(parts)),
+        BuiltinCommandId::Goal => Ok(goal_command(parts)),
+        BuiltinCommandId::Skills => Ok(SlashCommandOutcome::PickSkill),
+        BuiltinCommandId::Skill => {
             if parts.get(1) == Some(&"describe") {
                 if let Some(skill_id) = parts.get(2) {
                     return describe_skill(client, skill_id).await;
@@ -965,7 +967,7 @@ async fn execute_builtin(
             }
             skill_command(client, parts).await
         }
-        "thinking" => {
+        BuiltinCommandId::Thinking => {
             let Some(session_id) = session_id else {
                 return Ok(draft_thinking_command(parts));
             };
@@ -978,8 +980,8 @@ async fn execute_builtin(
             )
             .await
         }
-        "timeline" => Ok(SlashCommandOutcome::OpenTimeline),
-        "stop" => {
+        BuiltinCommandId::Timeline => Ok(SlashCommandOutcome::OpenTimeline),
+        BuiltinCommandId::Stop => {
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::Handled(
                     "stop requires an active session".to_owned(),
@@ -987,7 +989,7 @@ async fn execute_builtin(
             };
             Ok(stop_command(session_id))
         }
-        "cancel-runtime" => {
+        BuiltinCommandId::CancelRuntime => {
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::Handled(
                     "runtime cancellation requires an active session".to_owned(),
@@ -995,7 +997,7 @@ async fn execute_builtin(
             };
             Ok(cancel_runtime_command(session_id, parts))
         }
-        "runtime" | "status" => {
+        BuiltinCommandId::Runtime => {
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::Handled(
                     "runtime: no active session".to_owned(),
@@ -1069,7 +1071,7 @@ mod tests {
             },
             "/streaming",
             &["/streaming"],
-            "streaming",
+            slash_registry::BuiltinCommandId::Streaming,
         )
         .await
         .expect("local streaming command");

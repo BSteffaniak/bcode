@@ -4,17 +4,47 @@ use bcode_client::BcodeClient;
 use bcode_command::CommandContribution;
 use bcode_skill_models::SkillId;
 
-/// Static metadata for a builtin slash command name.
+/// Stable identity for a host-owned slash command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinCommandId {
+    Version,
+    Sessions,
+    Search,
+    Resync,
+    RescanImports,
+    New,
+    Agent,
+    Compact,
+    Theme,
+    Streaming,
+    Model,
+    AuthPool,
+    Provider,
+    Context,
+    Cwd,
+    Worktree,
+    Ralph,
+    Goal,
+    Skills,
+    Skill,
+    Thinking,
+    Timeline,
+    Stop,
+    CancelRuntime,
+    Runtime,
+}
+
+/// Resolved host-owned slash command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinSlashCommand {
-    name: &'static str,
+    id: BuiltinCommandId,
 }
 
 impl BuiltinSlashCommand {
-    /// Return the command name without a leading slash.
+    /// Return the stable command identity.
     #[must_use]
-    pub const fn name(self) -> &'static str {
-        self.name
+    pub const fn id(self) -> BuiltinCommandId {
+        self.id
     }
 }
 
@@ -39,245 +69,216 @@ impl SlashCompletion {
     }
 }
 
-const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
-    BuiltinSlashCommand { name: "version" },
-    BuiltinSlashCommand { name: "sessions" },
-    BuiltinSlashCommand { name: "search" },
-    BuiltinSlashCommand { name: "resync" },
-    BuiltinSlashCommand {
-        name: "rescan-imports",
-    },
-    BuiltinSlashCommand { name: "new" },
-    BuiltinSlashCommand { name: "plan" },
-    BuiltinSlashCommand { name: "build" },
-    BuiltinSlashCommand { name: "agent" },
-    BuiltinSlashCommand { name: "compact" },
-    BuiltinSlashCommand { name: "model" },
-    BuiltinSlashCommand { name: "theme" },
-    BuiltinSlashCommand { name: "streaming" },
-    BuiltinSlashCommand { name: "models" },
-    BuiltinSlashCommand { name: "set-model" },
-    BuiltinSlashCommand { name: "provider" },
-    BuiltinSlashCommand {
-        name: "set-provider",
-    },
-    BuiltinSlashCommand {
-        name: "context-strategy",
-    },
-    BuiltinSlashCommand { name: "context" },
-    BuiltinSlashCommand { name: "cwd" },
-    BuiltinSlashCommand { name: "worktree" },
-    BuiltinSlashCommand { name: "worktrees" },
-    BuiltinSlashCommand { name: "ralph" },
-    BuiltinSlashCommand { name: "goal" },
-    BuiltinSlashCommand { name: "skills" },
-    BuiltinSlashCommand { name: "skill" },
-    BuiltinSlashCommand { name: "thinking" },
-    BuiltinSlashCommand { name: "timeline" },
-    BuiltinSlashCommand { name: "stop" },
-    BuiltinSlashCommand {
-        name: "cancel-runtime",
-    },
-    BuiltinSlashCommand { name: "runtime" },
-    BuiltinSlashCommand { name: "status" },
-];
+#[derive(Debug, Clone, Copy)]
+struct BuiltinCommandSpec {
+    id: BuiltinCommandId,
+    names: &'static [&'static str],
+    completions: &'static [SlashCompletion],
+}
 
-const STATIC_COMPLETIONS: &[SlashCompletion] = &[
-    SlashCompletion {
-        command: "/version",
-        description: "Show detailed build information",
+macro_rules! completion {
+    ($command:literal, $description:literal) => {
+        SlashCompletion {
+            command: $command,
+            description: $description,
+        }
+    };
+}
+
+const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Version,
+        names: &["version"],
+        completions: &[completion!("/version", "Show detailed build information")],
     },
-    SlashCompletion {
-        command: "/plan",
-        description: "Switch to plan agent",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Sessions,
+        names: &["sessions"],
+        completions: &[completion!("/sessions", "Open session picker")],
     },
-    SlashCompletion {
-        command: "/build",
-        description: "Switch to build agent",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Search,
+        names: &["search"],
+        completions: &[completion!("/search", "Search session transcripts")],
     },
-    SlashCompletion {
-        command: "/sessions",
-        description: "Open session picker",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Resync,
+        names: &["resync"],
+        completions: &[completion!("/resync", "Resynchronize the active session")],
     },
-    SlashCompletion {
-        command: "/search",
-        description: "Search session transcripts",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::RescanImports,
+        names: &["rescan-imports"],
+        completions: &[completion!(
+            "/rescan-imports",
+            "Rescan and open importable sessions"
+        )],
     },
-    SlashCompletion {
-        command: "/new",
-        description: "Create and switch to a new session",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::New,
+        names: &["new"],
+        completions: &[completion!("/new", "Create and switch to a new session")],
     },
-    SlashCompletion {
-        command: "/compact",
-        description: "Compact current session context",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Agent,
+        names: &["plan", "build", "agent"],
+        completions: &[
+            completion!("/plan", "Switch to plan agent"),
+            completion!("/build", "Switch to build agent"),
+            completion!("/agent ", "Set session agent by id"),
+        ],
     },
-    SlashCompletion {
-        command: "/theme",
-        description: "Open interactive theme picker",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Compact,
+        names: &["compact"],
+        completions: &[completion!("/compact", "Compact current session context")],
     },
-    SlashCompletion {
-        command: "/streaming",
-        description: "Compare and tune streaming presentation",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Theme,
+        names: &["theme"],
+        completions: &[
+            completion!("/theme", "Open interactive theme picker"),
+            completion!("/theme preview ", "Preview bundled theme"),
+            completion!("/theme apply ", "Persist bundled theme"),
+            completion!("/theme cancel", "Cancel theme preview"),
+        ],
     },
-    SlashCompletion {
-        command: "/theme preview ",
-        description: "Preview bundled theme",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Streaming,
+        names: &["streaming"],
+        completions: &[completion!(
+            "/streaming",
+            "Compare and tune streaming presentation"
+        )],
     },
-    SlashCompletion {
-        command: "/theme apply ",
-        description: "Persist bundled theme",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Model,
+        names: &["model", "models", "set-model"],
+        completions: &[
+            completion!("/model", "Open model picker"),
+            completion!("/models", "Open model picker"),
+            completion!("/set-model ", "Set model by id"),
+        ],
     },
-    SlashCompletion {
-        command: "/theme cancel",
-        description: "Cancel theme preview",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::AuthPool,
+        names: &["auth-pool", "subscriptions"],
+        completions: &[
+            completion!("/auth-pool", "Choose preferred provider subscription"),
+            completion!("/subscriptions", "Choose preferred provider subscription"),
+        ],
     },
-    SlashCompletion {
-        command: "/model",
-        description: "Open model picker",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Provider,
+        names: &["provider", "set-provider"],
+        completions: &[
+            completion!("/provider", "Show current provider"),
+            completion!("/set-provider ", "Set provider by id"),
+        ],
     },
-    SlashCompletion {
-        command: "/models",
-        description: "Open model picker",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Context,
+        names: &["context-strategy", "context"],
+        completions: &[
+            completion!("/context", "Show session context strategy"),
+            completion!("/context-strategy", "Show session context strategy"),
+        ],
     },
-    SlashCompletion {
-        command: "/auth-pool",
-        description: "Choose preferred provider subscription",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Cwd,
+        names: &["cwd"],
+        completions: &[completion!("/cwd ", "Set session working directory")],
     },
-    SlashCompletion {
-        command: "/subscriptions",
-        description: "Choose preferred provider subscription",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Worktree,
+        names: &["worktree", "worktrees"],
+        completions: &[
+            completion!("/worktree", "Create worktree"),
+            completion!("/worktrees", "Create worktree"),
+            completion!("/worktree list", "List Git worktrees"),
+            completion!("/worktree create", "Open worktree create dialog"),
+            completion!("/worktree attach ", "Set session working directory"),
+        ],
     },
-    SlashCompletion {
-        command: "/set-model ",
-        description: "Set model by id",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Ralph,
+        names: &["ralph"],
+        completions: &[
+            completion!("/ralph", "Open Ralph UI"),
+            completion!("/ralph ui", "Open Ralph UI"),
+            completion!("/ralph start", "Start/setup Ralph loop"),
+            completion!("/ralph run", "Prepare Ralph run"),
+            completion!("/ralph approve", "Approve prepared Ralph run"),
+            completion!("/ralph status", "Show Ralph status"),
+            completion!("/ralph runs", "List Ralph runs"),
+            completion!("/ralph iterations", "List Ralph iterations"),
+            completion!("/ralph stop", "Stop active Ralph run"),
+            completion!("/ralph resume", "Resume interrupted Ralph run"),
+            completion!("/ralph audit", "Build Ralph audit prompt"),
+            completion!("/ralph replan", "Build Ralph replan prompt"),
+            completion!("/ralph open", "Open Ralph progress doc"),
+        ],
     },
-    SlashCompletion {
-        command: "/provider",
-        description: "Show current provider",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Goal,
+        names: &["goal"],
+        completions: &[completion!("/goal", "Start/continue Ralph goal workflow")],
     },
-    SlashCompletion {
-        command: "/set-provider ",
-        description: "Set provider by id",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Skills,
+        names: &["skills"],
+        completions: &[completion!("/skills", "Open skill picker")],
     },
-    SlashCompletion {
-        command: "/thinking",
-        description: "Open reasoning output settings",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Skill,
+        names: &["skill"],
+        completions: &[
+            completion!("/skill ", "Invoke skill by id"),
+            completion!("/skill describe ", "Describe skill by id"),
+        ],
     },
-    SlashCompletion {
-        command: "/timeline",
-        description: "Browse user messages",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Thinking,
+        names: &["thinking"],
+        completions: &[
+            completion!("/thinking", "Open reasoning output settings"),
+            completion!("/thinking status", "Show reasoning output status"),
+            completion!(
+                "/thinking capabilities",
+                "Show model reasoning capabilities"
+            ),
+            completion!(
+                "/thinking effort",
+                "Open reasoning settings focused on effort"
+            ),
+            completion!(
+                "/thinking summary",
+                "Open reasoning settings focused on summary"
+            ),
+        ],
     },
-    SlashCompletion {
-        command: "/thinking status",
-        description: "Show reasoning output status",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Timeline,
+        names: &["timeline"],
+        completions: &[completion!("/timeline", "Browse user messages")],
     },
-    SlashCompletion {
-        command: "/thinking capabilities",
-        description: "Show model reasoning capabilities",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Stop,
+        names: &["stop"],
+        completions: &[completion!("/stop", "Stop the active turn")],
     },
-    SlashCompletion {
-        command: "/thinking effort",
-        description: "Open reasoning settings focused on effort",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::CancelRuntime,
+        names: &["cancel-runtime"],
+        completions: &[completion!("/cancel-runtime ", "Cancel runtime work by id")],
     },
-    SlashCompletion {
-        command: "/thinking summary",
-        description: "Open reasoning settings focused on summary",
-    },
-    SlashCompletion {
-        command: "/worktree",
-        description: "Create worktree",
-    },
-    SlashCompletion {
-        command: "/worktrees",
-        description: "Create worktree",
-    },
-    SlashCompletion {
-        command: "/worktree list",
-        description: "List Git worktrees",
-    },
-    SlashCompletion {
-        command: "/worktree create",
-        description: "Open worktree create dialog",
-    },
-    SlashCompletion {
-        command: "/worktree attach ",
-        description: "Set session working directory",
-    },
-    SlashCompletion {
-        command: "/ralph",
-        description: "Open Ralph UI",
-    },
-    SlashCompletion {
-        command: "/ralph ui",
-        description: "Open Ralph UI",
-    },
-    SlashCompletion {
-        command: "/ralph start",
-        description: "Start/setup Ralph loop",
-    },
-    SlashCompletion {
-        command: "/ralph run",
-        description: "Prepare Ralph run",
-    },
-    SlashCompletion {
-        command: "/ralph approve",
-        description: "Approve prepared Ralph run",
-    },
-    SlashCompletion {
-        command: "/ralph status",
-        description: "Show Ralph status",
-    },
-    SlashCompletion {
-        command: "/ralph runs",
-        description: "List Ralph runs",
-    },
-    SlashCompletion {
-        command: "/ralph iterations",
-        description: "List Ralph iterations",
-    },
-    SlashCompletion {
-        command: "/ralph stop",
-        description: "Stop active Ralph run",
-    },
-    SlashCompletion {
-        command: "/ralph resume",
-        description: "Resume interrupted Ralph run",
-    },
-    SlashCompletion {
-        command: "/ralph audit",
-        description: "Build Ralph audit prompt",
-    },
-    SlashCompletion {
-        command: "/ralph replan",
-        description: "Build Ralph replan prompt",
-    },
-    SlashCompletion {
-        command: "/ralph open",
-        description: "Open Ralph progress doc",
-    },
-    SlashCompletion {
-        command: "/goal",
-        description: "Start/continue Ralph goal workflow",
-    },
-    SlashCompletion {
-        command: "/rescan-imports",
-        description: "Rescan and open importable sessions",
-    },
-    SlashCompletion {
-        command: "/skills",
-        description: "Open skill picker",
-    },
-    SlashCompletion {
-        command: "/agent ",
-        description: "Set session agent by id",
-    },
-    SlashCompletion {
-        command: "/skill ",
-        description: "Invoke skill by id",
-    },
-    SlashCompletion {
-        command: "/skill describe ",
-        description: "Describe skill by id",
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Runtime,
+        names: &["runtime", "status"],
+        completions: &[
+            completion!("/runtime", "Show runtime status"),
+            completion!("/status", "Show runtime status"),
+        ],
     },
 ];
 
@@ -299,25 +300,20 @@ pub enum SlashResolution {
 
 impl SlashResolution {}
 
-/// Return static builtin slash command metadata.
-#[must_use]
-pub const fn builtin_commands() -> &'static [BuiltinSlashCommand] {
+/// Return slash completion metadata derived from the builtin command catalog.
+pub fn static_completions() -> impl Iterator<Item = SlashCompletion> {
     BUILTIN_COMMANDS
-}
-
-/// Return static slash completion metadata.
-#[must_use]
-pub const fn static_completions() -> &'static [SlashCompletion] {
-    STATIC_COMPLETIONS
+        .iter()
+        .flat_map(|command| command.completions.iter().copied())
 }
 
 /// Return the builtin command matching a command name without a leading slash.
 #[must_use]
 pub fn builtin_command(command: &str) -> Option<BuiltinSlashCommand> {
-    builtin_commands()
+    BUILTIN_COMMANDS
         .iter()
-        .copied()
-        .find(|candidate| candidate.name() == command)
+        .find(|candidate| candidate.names.contains(&command))
+        .map(|candidate| BuiltinSlashCommand { id: candidate.id })
 }
 
 /// Return true when the command name is a builtin slash command.
@@ -392,7 +388,7 @@ mod tests {
 
     #[test]
     fn search_is_discoverable_and_reserved_as_a_builtin() {
-        assert!(static_completions().iter().any(|completion| {
+        assert!(static_completions().any(|completion| {
             completion.command() == "/search"
                 && completion.description().contains("session transcripts")
         }));
@@ -406,14 +402,55 @@ mod tests {
         assert!(!is_builtin_command_name("clone"));
         assert!(
             static_completions()
-                .iter()
                 .all(|completion| !matches!(completion.command(), "/fork" | "/clone"))
         );
     }
 
     #[test]
+    fn every_builtin_name_is_discoverable_and_unique() {
+        let mut names = std::collections::BTreeSet::new();
+        for spec in BUILTIN_COMMANDS {
+            assert!(
+                !spec.completions.is_empty(),
+                "builtin {:?} has no slash completion",
+                spec.id
+            );
+            for name in spec.names {
+                assert!(names.insert(*name), "duplicate builtin slash name: {name}");
+                assert!(
+                    spec.completions.iter().any(|completion| {
+                        completion
+                            .command()
+                            .trim_start_matches('/')
+                            .split_whitespace()
+                            .next()
+                            == Some(*name)
+                    }),
+                    "builtin slash name is not discoverable: {name}"
+                );
+                assert_eq!(
+                    builtin_command(name).map(BuiltinSlashCommand::id),
+                    Some(spec.id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cwd_is_discoverable_with_a_path_argument() {
+        assert!(static_completions().any(|completion| {
+            completion.command() == "/cwd "
+                && completion.description().contains("working directory")
+        }));
+        assert_eq!(
+            builtin_command("cwd").map(BuiltinSlashCommand::id),
+            Some(BuiltinCommandId::Cwd)
+        );
+    }
+
+    #[test]
     fn version_is_discoverable() {
-        assert!(static_completions().iter().any(|completion| {
+        assert!(static_completions().any(|completion| {
             completion.command() == "/version"
                 && completion.description().contains("build information")
         }));
