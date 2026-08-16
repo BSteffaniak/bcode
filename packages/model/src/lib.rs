@@ -440,6 +440,10 @@ pub enum CapabilityFidelity {
     Reduced,
 }
 
+/// Provider-neutral instruction used to transition completed tool work into authoritative structured
+/// output. Hosts add this only for a dedicated structured-output finalization round.
+pub const STRUCTURED_OUTPUT_FINALIZATION_INSTRUCTION: &str = "Return the final result now. Produce only the requested structured output from the completed work and tool results.";
+
 /// Execution shape required to supply a supported capability.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

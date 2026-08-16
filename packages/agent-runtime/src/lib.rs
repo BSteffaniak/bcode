@@ -1790,13 +1790,15 @@ impl AgentRuntime {
                 })
                 .collect::<Vec<_>>();
 
-            if request.stop_condition.as_ref().is_some_and(|condition| {
-                condition.should_stop(AgentLoopStopContext {
-                    provider_round,
-                    response: &response,
-                    tool_calls: &calls,
+            if (!requires_tool_free_finalization || structured_output_finalization)
+                && request.stop_condition.as_ref().is_some_and(|condition| {
+                    condition.should_stop(AgentLoopStopContext {
+                        provider_round,
+                        response: &response,
+                        tool_calls: &calls,
+                    })
                 })
-            }) {
+            {
                 return Ok(stopped_agent_response(response, started, all_events));
             }
             if response.stop_reason != Some(StopReason::ToolCall) {
@@ -1813,7 +1815,7 @@ impl AgentRuntime {
                     messages.push(ModelMessage {
                         role: MessageRole::User,
                         content: vec![ContentBlock::Text {
-                            text: "Return the final result now. Produce only the requested structured output from the completed work and tool results."
+                            text: bcode_model::STRUCTURED_OUTPUT_FINALIZATION_INSTRUCTION
                                 .to_string(),
                         }],
                     });
@@ -4889,6 +4891,74 @@ mod tests {
                 |content| matches!(content, ContentBlock::Text { text } if text == "work complete"),
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn structured_finalization_precedes_application_stop_conditions() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [
+                vec![
+                    ProviderTurnEvent::TextDelta {
+                        text: "intermediate".to_string(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ],
+                vec![
+                    ProviderTurnEvent::TextDelta {
+                        text: r#"{"done":true}"#.to_string(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ],
+            ],
+            Arc::clone(&requests),
+        );
+        let mut request = AgentTurnRequest::new("model", "finish");
+        request.tools = vec![tool_definition("first")];
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "result".to_string(),
+            schema: serde_json::json!({ "type": "object" }),
+            strict: true,
+        });
+        request.structured_output_execution =
+            bcode_model::CapabilityExecution::ToolFreeProviderRound;
+        request.stop_condition = Some(AgentLoopStopPredicate::new(
+            |_context: AgentLoopStopContext<'_>| true,
+        ));
+
+        let response = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &UnifiedToolCatalog::new().with_inline_tool(tool_definition("first")),
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(0),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink::default()),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
+            )
+            .await
+            .expect("finalization should run before the stop condition");
+
+        assert_eq!(response.text, r#"{"done":true}"#);
+        assert_eq!(
+            response.termination_reason,
+            AgentLoopTerminationReason::StopCondition
+        );
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].tools.is_empty());
+        assert!(requests[1].structured_output.is_some());
     }
 
     #[derive(Debug, Default)]

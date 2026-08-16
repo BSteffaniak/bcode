@@ -23970,8 +23970,6 @@ enum StructuredOutputPhase {
     Finalization,
 }
 
-const STRUCTURED_OUTPUT_FINALIZATION_INSTRUCTION: &str = "Return the final result now. Produce only the requested structured output from the completed work and tool results.";
-
 fn apply_structured_output_phase(
     request: &mut ModelTurnRequest,
     desired: Option<&bcode_model::StructuredOutputRequest>,
@@ -23995,7 +23993,7 @@ fn apply_structured_output_phase(
             request.messages.push(ModelMessage {
                 role: MessageRole::User,
                 content: vec![ContentBlock::Text {
-                    text: STRUCTURED_OUTPUT_FINALIZATION_INSTRUCTION.to_string(),
+                    text: bcode_model::STRUCTURED_OUTPUT_FINALIZATION_INSTRUCTION.to_string(),
                 }],
             });
         }
