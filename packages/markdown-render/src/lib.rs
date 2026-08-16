@@ -906,15 +906,23 @@ pub const fn markdown_contribution_selection_fallback(
 
 #[must_use]
 pub fn markdown_code_block_selections(source: &str) -> Vec<MarkdownCodeBlockSelection> {
-    let parser_ranges = parse_markdown_document(source)
+    let document = parse_markdown_document(source);
+    markdown_code_block_selections_from_document(source, &document)
+}
+
+fn markdown_code_block_selections_from_document(
+    source: &str,
+    document: &MarkdownDocument,
+) -> Vec<MarkdownCodeBlockSelection> {
+    let parser_ranges = document
         .events
-        .into_iter()
+        .iter()
         .filter_map(|event| {
             matches!(
                 event.kind,
                 MarkdownSemanticEventKind::Start(MarkdownSemanticTag::CodeBlock(_))
             )
-            .then_some(event.source_range)
+            .then_some(event.source_range.clone())
         })
         .collect::<Vec<_>>();
     let lines = source_lines_with_offsets(source);
@@ -1421,7 +1429,8 @@ impl MarkdownStreamingRenderState {
             markdown,
             &lines,
         );
-        let code_block_selections = markdown_code_block_selections(markdown);
+        let code_block_selections =
+            markdown_code_block_selections_from_document(markdown, &document);
         let layout_signature = markdown_layout_signature(
             markdown,
             options,
@@ -1625,7 +1634,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     );
     #[cfg(test)]
     let signature_started = std::time::Instant::now();
-    let code_block_selections = markdown_code_block_selections(markdown);
+    let code_block_selections = markdown_code_block_selections_from_document(markdown, &document);
     let layout_signature = markdown_layout_signature(
         markdown,
         options,
