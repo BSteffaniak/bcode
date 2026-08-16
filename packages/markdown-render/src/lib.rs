@@ -771,11 +771,134 @@ pub fn parse_markdown_document(markdown: &str) -> MarkdownDocument {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarkdownSelectionProvenance {
+    /// Original UTF-8 source ranges in canonical source order.
+    pub source_ranges: Vec<Range<usize>>,
+    /// Post-layout document-relative cells when this unit has truthful visible geometry.
+    pub rects: Vec<MarkdownCellRect>,
+    /// Optional semantic identity for whole-unit expansion.
+    pub semantic_expansion: Option<String>,
+    /// Parser semantic kind represented by the ranges.
+    pub kind: MarkdownSelectionKind,
+}
+
+/// Parser-neutral semantic kind for one selectable Markdown source unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkdownSelectionKind {
+    /// Opening semantic delimiter or container boundary.
+    Start,
+    /// Closing semantic delimiter or container boundary.
+    End,
+    /// Visible text.
+    Text,
+    /// Inline or block code content.
+    Code,
+    /// Soft source break.
+    SoftBreak,
+    /// Explicit hard break.
+    HardBreak,
+    /// Other truthful parser event with source bytes.
+    Other,
+}
+
+fn semantic_expansion_id(event: &MarkdownSemanticEvent) -> Option<String> {
+    match &event.kind {
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::CodeBlock(_)) => Some(format!(
+            "code-block:{}:{}",
+            event.source_range.start, event.source_range.end
+        )),
+        _ => None,
+    }
+}
+
+fn markdown_selection_provenance(document: &MarkdownDocument) -> Vec<MarkdownSelectionProvenance> {
+    document
+        .events
+        .iter()
+        .filter(|event| event.source_range.start <= event.source_range.end)
+        .map(|event| MarkdownSelectionProvenance {
+            source_ranges: vec![event.source_range.clone()],
+            rects: Vec::new(),
+            semantic_expansion: semantic_expansion_id(event),
+            kind: match &event.kind {
+                MarkdownSemanticEventKind::Start(_) => MarkdownSelectionKind::Start,
+                MarkdownSemanticEventKind::End(_) => MarkdownSelectionKind::End,
+                MarkdownSemanticEventKind::Text(_) => MarkdownSelectionKind::Text,
+                MarkdownSemanticEventKind::Code(_) => MarkdownSelectionKind::Code,
+                MarkdownSemanticEventKind::SoftBreak => MarkdownSelectionKind::SoftBreak,
+                MarkdownSemanticEventKind::HardBreak => MarkdownSelectionKind::HardBreak,
+                _ => MarkdownSelectionKind::Other,
+            },
+        })
+        .collect()
+}
+
+fn assign_selection_geometry(
+    provenance: Vec<MarkdownSelectionProvenance>,
+    document: &MarkdownDocument,
+    source: &str,
+    lines: &[Line],
+) -> Vec<MarkdownSelectionProvenance> {
+    let display = DisplayedMarkdown::new(lines);
+    let mut search_from = 0;
+    let mut projected = Vec::new();
+    for (unit, event) in provenance.into_iter().zip(&document.events) {
+        let (MarkdownSemanticEventKind::Text(visible) | MarkdownSemanticEventKind::Code(visible)) =
+            &event.kind
+        else {
+            projected.push(unit);
+            continue;
+        };
+        let Some(canonical) = source.get(event.source_range.clone()) else {
+            projected.push(unit);
+            continue;
+        };
+        if canonical != visible {
+            projected.push(unit);
+            continue;
+        }
+        let mut source_offset = event.source_range.start;
+        for grapheme in visible.graphemes(true) {
+            let source_range = source_offset..source_offset.saturating_add(grapheme.len());
+            source_offset = source_range.end;
+            if matches!(grapheme, "\n" | "\r\n") {
+                projected.push(MarkdownSelectionProvenance {
+                    source_ranges: vec![source_range],
+                    rects: Vec::new(),
+                    semantic_expansion: unit.semantic_expansion.clone(),
+                    kind: unit.kind,
+                });
+                continue;
+            }
+            let Some((display_range, rects)) = display.find_geometry(grapheme, search_from) else {
+                projected.push(MarkdownSelectionProvenance {
+                    source_ranges: vec![source_range],
+                    rects: Vec::new(),
+                    semantic_expansion: unit.semantic_expansion.clone(),
+                    kind: unit.kind,
+                });
+                continue;
+            };
+            search_from = display_range.end;
+            projected.push(MarkdownSelectionProvenance {
+                source_ranges: vec![source_range],
+                rects,
+                semantic_expansion: unit.semantic_expansion.clone(),
+                kind: unit.kind,
+            });
+        }
+    }
+    projected
+}
+
 /// Rendered Markdown lines plus semantic contributions for richer consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownRenderResult {
     /// Terminal text projection.
     pub lines: Vec<Line>,
+    /// Renderer-owned source provenance available to selection consumers.
+    pub selection_provenance: Vec<MarkdownSelectionProvenance>,
     /// Source-order semantic contributions independent of TUI event-loop types.
     pub contributions: Vec<MarkdownContribution>,
     /// Post-layout document-relative cell rectangles for rich contributions.
@@ -979,6 +1102,7 @@ impl MarkdownStreamingRenderState {
         append_markdown_blocks(&mut lines, &suffix_result.lines);
         let result = MarkdownRenderResult {
             lines,
+            selection_provenance: markdown_selection_provenance(&parse_markdown_document(markdown)),
             contributions: Vec::new(),
             geometry: Vec::new(),
             anchors: Vec::new(),
@@ -1063,6 +1187,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     #[cfg(test)]
     let semantic_started = std::time::Instant::now();
     let document = parse_markdown_document(markdown);
+    let mut selection_provenance = markdown_selection_provenance(&document);
     let details = collect_details_projections(markdown);
     let contributions = markdown_contributions(
         &document,
@@ -1083,7 +1208,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     let destination_unchanged = matches!(destination_projection, Cow::Borrowed(_));
     let projected_source = destination_projection.as_ref();
     let projected_document = if destination_unchanged {
-        document
+        document.clone()
     } else {
         parse_markdown_document(projected_source)
     };
@@ -1133,6 +1258,10 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     };
     let (lines, mut geometry, heading_rows) =
         render_markdown_projection(&projected_markdown, options);
+    if projected_markdown.as_ref() == markdown {
+        selection_provenance =
+            assign_selection_geometry(selection_provenance, &document, markdown, &lines);
+    }
     #[cfg(test)]
     record_markdown_stage(
         |diagnostics, elapsed| {
@@ -1173,6 +1302,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     );
     MarkdownRenderResult {
         lines,
+        selection_provenance,
         contributions,
         geometry,
         anchors,
@@ -4343,6 +4473,70 @@ mod tests {
     }
 
     #[test]
+    fn selection_provenance_tracks_wrapped_text_after_visual_prefixes() {
+        let rendered = render_markdown(
+            "> 1. a long **emphasized value** that wraps across terminal rows",
+            &MarkdownRenderOptions::new(18),
+        );
+        let emphasized = rendered
+            .selection_provenance
+            .iter()
+            .filter(|unit| unit.kind == super::MarkdownSelectionKind::Text)
+            .filter(|unit| {
+                unit.source_ranges.iter().any(|range| {
+                    "> 1. a long **emphasized value** that wraps across terminal rows"
+                        [range.clone()]
+                    .chars()
+                    .all(|character| "emphasized value".contains(character))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!emphasized.is_empty());
+        assert!(
+            emphasized
+                .iter()
+                .flat_map(|unit| &unit.rects)
+                .next()
+                .is_some()
+        );
+        assert!(
+            emphasized
+                .iter()
+                .flat_map(|unit| &unit.rects)
+                .all(|rect| rect.x >= 2)
+        );
+    }
+
+    #[test]
+    fn selection_provenance_tracks_code_through_syntax_highlighting() {
+        let markdown = "```rust\nfn main() {\n\tprintln!(\"hi\");\n}\n```";
+        let rendered = render_markdown(markdown, &MarkdownRenderOptions::new(80));
+        let code = rendered
+            .selection_provenance
+            .iter()
+            .filter(|unit| {
+                matches!(
+                    unit.kind,
+                    super::MarkdownSelectionKind::Text | super::MarkdownSelectionKind::Code
+                ) && unit
+                    .source_ranges
+                    .iter()
+                    .any(|range| range.start >= 8 && range.end <= markdown.len().saturating_sub(3))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(code.iter().flat_map(|unit| &unit.rects).next().is_some());
+        assert_eq!(
+            code.iter()
+                .flat_map(|unit| &unit.source_ranges)
+                .map(|range| &markdown[range.clone()])
+                .collect::<String>(),
+            "fn main() {\n\tprintln!(\"hi\");\n}\n"
+        );
+    }
+
+    #[test]
     fn renders_code_block_with_generic_syntax_highlighting() {
         let rows =
             render_markdown_lines("```rust\nfn main() {}\n```", MarkdownRenderOptions::new(80));
@@ -4387,6 +4581,73 @@ mod tests {
                     && span.style.fg.is_some()),
                 "expected highlighted {language} spans"
             );
+        }
+    }
+
+    #[test]
+    fn selection_provenance_preserves_parser_source_ranges_and_semantic_kinds() {
+        let markdown = "# *hello* [world](https://example.com)\n\n`code`  \nnext";
+        let result = render_markdown(markdown, &MarkdownRenderOptions::new(40));
+
+        assert!(!result.selection_provenance.is_empty());
+        assert!(result.selection_provenance.iter().all(|entry| {
+            entry
+                .rects
+                .iter()
+                .all(|rect| rect.width > 0 && rect.height > 0)
+                && entry.source_ranges.iter().all(|range| {
+                    range.start <= range.end
+                        && markdown.is_char_boundary(range.start)
+                        && markdown.is_char_boundary(range.end)
+                })
+        }));
+        for kind in [
+            super::MarkdownSelectionKind::Start,
+            super::MarkdownSelectionKind::End,
+            super::MarkdownSelectionKind::Text,
+            super::MarkdownSelectionKind::Code,
+            super::MarkdownSelectionKind::HardBreak,
+        ] {
+            assert!(
+                result
+                    .selection_provenance
+                    .iter()
+                    .any(|entry| entry.kind == kind),
+                "missing {kind:?}"
+            );
+        }
+        assert!(result.selection_provenance.iter().any(|entry| {
+            entry.source_ranges.iter().any(|range| {
+                markdown
+                    .get(range.clone())
+                    .is_some_and(|source| source.contains("https://example.com"))
+            })
+        }));
+    }
+
+    #[test]
+    fn block_code_provenance_never_invents_source_bytes() {
+        for markdown in [
+            "```rust\nfn main() {}\n```",
+            "    indented\tcode\n",
+            "```\npartial",
+        ] {
+            let result = render_markdown(markdown, &MarkdownRenderOptions::new(20));
+            assert!(result.selection_provenance.iter().all(|entry| {
+                entry.source_ranges.iter().all(|range| {
+                    range.end <= markdown.len()
+                        && markdown.is_char_boundary(range.start)
+                        && markdown.is_char_boundary(range.end)
+                })
+            }));
+            if markdown.starts_with("```") {
+                assert!(result.selection_provenance.iter().any(|entry| {
+                    entry
+                        .semantic_expansion
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("code-block:"))
+                }));
+            }
         }
     }
 

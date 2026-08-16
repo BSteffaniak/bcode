@@ -47,7 +47,7 @@ pub fn semantic_state_theme() -> super::theme::PresentedTheme {
 const MARKDOWN_BODY_INDENT: u16 = 2;
 
 #[derive(Debug, Clone, Copy)]
-struct TranscriptItemLayout {
+pub struct TranscriptItemLayout {
     outer_width: u16,
     content_width: u16,
     content_x: u16,
@@ -56,7 +56,11 @@ struct TranscriptItemLayout {
 }
 
 impl TranscriptItemLayout {
-    fn resolve(theme: &super::theme::PresentedTheme, item: &TranscriptItem, width: u16) -> Self {
+    pub(super) fn resolve(
+        theme: &super::theme::PresentedTheme,
+        item: &TranscriptItem,
+        width: u16,
+    ) -> Self {
         let container = transcript_item_container(theme, item).filter(|presentation| {
             !matches!(
                 presentation.recipe.layout,
@@ -95,8 +99,12 @@ impl TranscriptItemLayout {
             .max(1)
     }
 
-    const fn markdown_x(self) -> u16 {
+    pub(super) const fn markdown_x(self) -> u16 {
         self.content_x.saturating_add(MARKDOWN_BODY_INDENT)
+    }
+
+    pub(super) const fn bottom_rows(self) -> usize {
+        self.bottom_rows
     }
 }
 

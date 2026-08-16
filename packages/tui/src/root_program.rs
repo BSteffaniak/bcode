@@ -1202,7 +1202,12 @@ impl BcodeRuntimeModel {
                 .set_status("no transcript selection".to_owned());
             return;
         };
-        match super::markdown_activation::copy_text(text) {
+        let result = super::markdown_activation::copy_text(text);
+        self.report_transcript_copy_result(result);
+    }
+
+    fn report_transcript_copy_result<E: std::fmt::Display>(&mut self, result: Result<(), E>) {
+        match result {
             Ok(()) => self
                 .chat
                 .app
@@ -1793,6 +1798,7 @@ pub(super) fn transcript_selection_scene(
     scene
 }
 
+#[allow(clippy::too_many_lines)]
 fn register_transcript_selection_scene(
     scene: &mut bmux_tui::selection::SelectionScene,
     app: &super::app::BmuxApp,
@@ -1862,6 +1868,71 @@ fn register_transcript_selection_scene(
             );
         }
         let text = row.plain_text();
+        if item.text_format() == bcode_session_view_models::TextFormat::Markdown {
+            let entry_start = app
+                .transcript_layout()
+                .entry_start_row(visible.source, visible.entry_index)
+                .unwrap_or(visible.row_index);
+            let layout = super::render::TranscriptItemLayout::resolve(
+                &app.presented_theme(),
+                item,
+                body.width,
+            );
+            let content_offset = {
+                let entry_rows = app
+                    .transcript_layout()
+                    .entry_row_count(visible.source, visible.entry_index)
+                    .unwrap_or_default();
+                let markdown_rows =
+                    super::render::transcript_markdown_projection_for_layout(app, item, body.width)
+                        .as_ref()
+                        .map_or(0, |projection| projection.lines.len());
+                entry_rows
+                    .saturating_sub(markdown_rows)
+                    .saturating_sub(1)
+                    .saturating_sub(layout.bottom_rows())
+            };
+            let document_row = visible
+                .row_in_entry
+                .checked_sub(content_offset)
+                .and_then(|row| u16::try_from(row).ok());
+            if let Some(document_row) = document_row {
+                let projection =
+                    super::render::transcript_markdown_projection_for_layout(app, item, body.width);
+                if let Some(projection) = projection {
+                    let origin = bmux_tui::geometry::Point::new(
+                        body.x.saturating_add(layout.markdown_x()),
+                        body.y.saturating_add(
+                            u16::try_from(
+                                entry_start
+                                    .saturating_add(content_offset)
+                                    .saturating_sub(top_row),
+                            )
+                            .unwrap_or(u16::MAX),
+                        ),
+                    );
+                    for fragment in super::markdown_selection::markdown_selection_fragments(
+                        &scope_id,
+                        &format!("bcode.transcript.item.{}.markdown", item.id().get()),
+                        &projection,
+                        origin,
+                        u64::try_from(visible.entry_index)
+                            .unwrap_or(u64::MAX)
+                            .saturating_mul(1_000_000),
+                        item.revision(),
+                    )
+                    .into_iter()
+                    .filter(|fragment| {
+                        fragment.area.y == y
+                            && document_row == fragment.area.y.saturating_sub(origin.y)
+                    }) {
+                        scene.push_fragment(fragment);
+                    }
+                    y = y.saturating_add(1);
+                    continue;
+                }
+            }
+        }
         let ranges = source_ranges.entry(visible.entry_index).or_insert_with(|| {
             transcript_plain_row_source_ranges(
                 item.text.as_str(),
@@ -1904,7 +1975,12 @@ fn export_plain_transcript_selection<'a>(
         let content = slice.content_id.as_str();
         let item_id = content
             .strip_prefix("bcode.transcript.item.")?
-            .strip_suffix(".plain")?
+            .strip_suffix(".plain")
+            .or_else(|| {
+                content
+                    .strip_prefix("bcode.transcript.item.")?
+                    .strip_suffix(".markdown")
+            })?
             .parse::<u64>()
             .ok()?;
         selected
@@ -2653,6 +2729,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_present_and_mouse_input_path_creates_transcript_selection() {
+        use bmux_tui_runtime::Presenter;
+
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "normal input path".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        }];
+        let mut model = root_test_model_with_history(session_id, &history);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("startup frame presents");
+        let fragment = model
+            .committed_selection
+            .fragments()
+            .first()
+            .cloned()
+            .expect("startup transcript fragment");
+
+        assert_eq!(
+            model.handle_basic_terminal_event(bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                    bmux_tui::geometry::Point::new(fragment.area.x, fragment.area.y),
+                ),
+            )),
+            super::super::invalidation::UiInvalidation::None
+        );
+        assert!(matches!(
+            model.handle_basic_terminal_event(bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                    bmux_tui::geometry::Point::new(
+                        fragment.area.x.saturating_add(fragment.area.width),
+                        fragment.area.y,
+                    ),
+                ),
+            )),
+            super::super::invalidation::UiInvalidation::Paint
+                | super::super::invalidation::UiInvalidation::Structural
+        ));
+        assert_eq!(
+            model.handle_basic_terminal_event(bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                    bmux_tui::geometry::Point::new(
+                        fragment.area.x.saturating_add(fragment.area.width),
+                        fragment.area.y,
+                    ),
+                ),
+            )),
+            super::super::invalidation::UiInvalidation::Paint
+        );
+        assert!(model.selected_plain_text.is_some());
+        assert!(
+            model
+                .transcript_selection
+                .snapshot(&model.committed_selection)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn scrolling_reprojects_selection_highlights_for_still_visible_content() {
+        use bmux_tui_runtime::Presenter;
+
+        let session_id = bcode_session_models::SessionId::new();
+        let history = (1..=20)
+            .map(|sequence| bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: sequence,
+                session_id,
+                provenance: None,
+                kind: bcode_session_models::SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: format!("message {sequence}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut model = root_test_model_with_history(session_id, &history);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
+        let mut initial_bytes = Vec::new();
+        let mut initial_terminal = bmux_tui::terminal::Terminal::new(&mut initial_bytes, area);
+        super::BcodeRuntimePresenter::new(&mut initial_terminal)
+            .present(&mut model)
+            .expect("initial frame presents");
+        let fragment = model
+            .committed_selection
+            .fragments()
+            .iter()
+            .find(|fragment| {
+                fragment.area.y
+                    == model
+                        .committed_layout
+                        .expect("committed layout")
+                        .body()
+                        .bottom()
+                        .saturating_sub(2)
+            })
+            .cloned()
+            .expect("penultimate visible fragment");
+        let _ = model.transcript_selection.handle_mouse(
+            &model.committed_selection,
+            bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(fragment.area.x, fragment.area.y),
+            ),
+        );
+        let _ = model.transcript_selection.handle_mouse(
+            &model.committed_selection,
+            bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(
+                    fragment.area.x.saturating_add(fragment.area.width),
+                    fragment.area.y,
+                ),
+            ),
+        );
+        let before = model
+            .transcript_selection
+            .snapshot(&model.committed_selection)
+            .expect("selection before scroll");
+        let before_highlights = before.visible_highlights.clone();
+
+        assert!(model.chat.app.scroll_transcript_up(1));
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        let mut scrolled_bytes = Vec::new();
+        let mut scrolled_terminal = bmux_tui::terminal::Terminal::new(&mut scrolled_bytes, area);
+        super::BcodeRuntimePresenter::new(&mut scrolled_terminal)
+            .present(&mut model)
+            .expect("scrolled frame presents");
+        let after = model
+            .transcript_selection
+            .snapshot(&model.committed_selection)
+            .expect("selection survives scroll");
+
+        assert_eq!(after.slices, before.slices);
+        assert_ne!(after.visible_highlights, before_highlights);
+        assert!(after.visible_highlights.iter().all(|highlight| {
+            model
+                .committed_layout
+                .expect("committed layout")
+                .body()
+                .intersection(*highlight)
+                == *highlight
+        }));
+    }
+
+    #[tokio::test]
     async fn presenter_paints_selection_highlight_over_real_transcript_content() {
         use bmux_tui_runtime::Presenter;
 
@@ -2817,6 +3055,18 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn clipboard_failure_reports_user_visible_status() {
+        let mut model = root_test_model();
+
+        model.report_transcript_copy_result(Err("clipboard unavailable"));
+
+        assert_eq!(
+            model.chat.app.status(),
+            "copy failed: clipboard unavailable"
+        );
+    }
+
     #[test]
     fn default_ctrl_shift_c_copies_transcript_selection() {
         let keymap =
@@ -2879,6 +3129,71 @@ mod tests {
         let loop_state =
             super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
         super::BcodeRuntimeModel::new(chat, settings, loop_state)
+    }
+
+    #[tokio::test]
+    async fn markdown_click_is_released_to_activation_while_drag_is_consumed() {
+        let mut model = root_test_model();
+        let layout = super::super::render::prepare_frame(
+            &mut model.chat.app,
+            bmux_tui::geometry::Rect::new(0, 0, 20, 8),
+        )
+        .expect("layout");
+        let body = layout.body();
+        model.committed_layout = Some(layout);
+        model
+            .committed_selection
+            .push_scope(bmux_tui::selection::SelectionScope::new(
+                "bcode.transcript",
+                body,
+            ));
+        for fragment in bmux_tui::selection::plain_text_fragments(
+            "bcode.transcript",
+            "link.label",
+            bmux_tui::geometry::Rect::new(body.x, body.y, 8, 1),
+            0,
+            "linktext",
+            0,
+            1,
+        ) {
+            model.committed_selection.push_fragment(fragment);
+        }
+
+        assert_eq!(
+            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(body.x, body.y),
+            )),
+            Some(super::super::invalidation::UiInvalidation::None)
+        );
+        assert_eq!(
+            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(body.x, body.y),
+            )),
+            None
+        );
+
+        let _ = model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::geometry::Point::new(body.x, body.y),
+        ));
+        assert!(
+            model
+                .handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                    bmux_tui::geometry::Point::new(body.x.saturating_add(4), body.y),
+                ))
+                .is_some()
+        );
+        assert!(
+            model
+                .handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                    bmux_tui::geometry::Point::new(body.x.saturating_add(4), body.y),
+                ))
+                .is_some()
+        );
     }
 
     #[tokio::test]
