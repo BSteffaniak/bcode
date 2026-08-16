@@ -14,10 +14,12 @@ pub(crate) mod context_compaction;
 mod image_input;
 mod invariant_guidance;
 mod model_ignores;
+mod model_request_target;
 mod request_routing;
 mod runtime_work;
 mod session_bulk_migration;
 
+use model_request_target::{ModelRequestTargetInput, resolve_model_request_target};
 use request_routing::{
     AgentSkillPluginRequest, CoreRuntimeRequest, PermissionInteractionRequest, RoutedRequest,
     RuntimeAndModelRequest, SessionLifecycleRequest, SessionSearchAttachRequest,
@@ -2852,10 +2854,24 @@ async fn invariant_selector_runtime(
         return None;
     }
     let active = config.resolved_model_selection();
+    let mut model = resolve_invariant_selector_model(&config, &active)?;
+    let target = resolve_model_request_target(
+        state,
+        ModelRequestTargetInput {
+            provider_plugin_id: model.provider_plugin_id.as_deref(),
+            selected_model_id: Some(&model.model_id),
+            provider_context: &model.provider_context,
+        },
+    )
+    .await
+    .ok()?;
+    model.provider_plugin_id = target.provider_plugin_id;
+    model.model_id = target.model_id;
+    model.provider_context = target.provider_context;
     Some(InvariantSelectorRuntime {
         plugins: state.plugins.clone(),
         config: config.invariants.clone(),
-        model: resolve_invariant_selector_model(&config, &active)?,
+        model,
         guidance: Arc::clone(&state.invariant_guidance),
         full_fallback: Arc::clone(&state.invariant_full_fallback),
         generations: Arc::clone(&state.invariant_guidance_generation),
@@ -13169,28 +13185,6 @@ async fn resolved_provider_models(
         bcode_model_catalog::ModelListView::Complete,
     )
     .await
-}
-
-async fn effective_model_id(
-    state: &ServerState,
-    selection: &SessionModelSelection,
-) -> Result<String, String> {
-    let models = resolved_provider_models(
-        state,
-        selection.provider_plugin_id.clone(),
-        bcode_model::ModelListRequest {
-            provider_context: selection.provider_context.clone(),
-            selected_model_id: selection.model_id.clone(),
-        },
-    )
-    .await?;
-    models
-        .models
-        .iter()
-        .find(|model| model.is_default)
-        .or_else(|| models.models.first())
-        .map(|model| model.model_id.clone())
-        .ok_or_else(|| "model provider has no usable models".to_string())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -24536,9 +24530,21 @@ async fn build_model_turn_request(
     }
     let system_prompt = static_context.system_prompt.clone();
     let tools = static_context.tools.clone();
-    let model_id = effective_model_id(state, selection)
-        .await
-        .unwrap_or_else(|_| model_id_for_provider_request(selected_model_id));
+    let target = resolve_model_request_target(
+        state,
+        ModelRequestTargetInput {
+            provider_plugin_id,
+            selected_model_id,
+            provider_context: &selection.provider_context,
+        },
+    )
+    .await
+    .map_err(|error| {
+        bcode_session::SessionError::EventSerialization(format!(
+            "failed to resolve model request target: {error}"
+        ))
+    })?;
+    let model_id = target.model_id;
     let reasoning_capabilities = resolve_model_reasoning_info(
         state,
         provider_plugin_id,
@@ -24564,15 +24570,7 @@ async fn build_model_turn_request(
         parameters_timer.elapsed_ms(),
         metric_labels.clone(),
     );
-    let mut provider_context = selection.provider_context.clone();
-    select_host_auth_pool_candidate(state, provider_plugin_id, &mut provider_context).await;
-    provider_context.api_surface = resolve_model_api_surface(
-        state,
-        provider_plugin_id,
-        &model_id,
-        &selection.provider_context,
-    )
-    .await;
+    let provider_context = target.provider_context;
     let projection_timer = state.metrics.timer();
     let context_format = compaction_policy
         .capabilities
@@ -25324,39 +25322,6 @@ async fn resolve_parallel_tool_call_capabilities(
         model: supported,
         runtime,
     }
-}
-
-async fn resolve_model_api_surface(
-    state: &ServerState,
-    provider_plugin_id: Option<&str>,
-    model_id: &str,
-    provider_context: &bcode_model::ProviderRequestContext,
-) -> Option<bcode_model::ModelApiSurface> {
-    let models = resolved_provider_models(
-        state,
-        provider_plugin_id.map(ToOwned::to_owned),
-        bcode_model::ModelListRequest {
-            provider_context: provider_context.clone(),
-            selected_model_id: Some(model_id.to_owned()),
-        },
-    )
-    .await
-    .ok()?;
-    if let Some(api_surface) = models
-        .models
-        .iter()
-        .find(|model| model.model_id == model_id)
-        .and_then(|model| model.api_surface)
-    {
-        return Some(api_surface);
-    }
-    // The live list may not yet contain the selected model while background discovery runs.
-    // Routing must still use the catalog-known transport rather than the provider default.
-    let catalog_provider_id = catalog_provider_id_for_policy(&models.catalog.policy)?;
-    state
-        .model_catalog
-        .model_api_surface(&catalog_provider_id, model_id)
-        .await
 }
 
 /// Return the catalog provider identity a provider's catalog policy maps its models to.
@@ -45271,16 +45236,82 @@ library = "test"
         ));
     }
 
+    #[tokio::test]
+    async fn internal_model_requests_share_the_resolved_request_target() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+        let provider_context = bcode_model::ProviderRequestContext {
+            api_surface: Some(bcode_model::ModelApiSurface::Responses),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        let target = resolve_model_request_target(
+            &state,
+            ModelRequestTargetInput {
+                provider_plugin_id: Some("bcode.fake-provider"),
+                selected_model_id: Some("fake-echo"),
+                provider_context: &provider_context,
+            },
+        )
+        .await
+        .expect("request target");
+
+        let request = build_compaction_request(
+            SessionId::new(),
+            target.model_id.clone(),
+            target.provider_context.clone(),
+            "old transcript",
+            "turn".into(),
+        );
+
+        assert_eq!(
+            target.provider_plugin_id.as_deref(),
+            Some("bcode.fake-provider")
+        );
+        assert_eq!(request.model_id, target.model_id);
+        assert_eq!(request.provider_context, target.provider_context);
+        assert_eq!(
+            request.provider_context.api_surface,
+            Some(bcode_model::ModelApiSurface::Responses)
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_surface_overrides_stale_context_and_unknown_models_keep_context() {
+        let state = test_server_state(SessionManager::default());
+        let policy = bcode_model::ModelCatalogPolicy::ExpandAll {
+            provider_id: "bedrock".to_string(),
+        };
+
+        let known = model_request_target::resolve_request_api_surface(
+            &state,
+            &policy,
+            "openai.gpt-5.6-sol",
+            None,
+            Some(bcode_model::ModelApiSurface::Messages),
+        )
+        .await;
+        let unknown = model_request_target::resolve_request_api_surface(
+            &state,
+            &policy,
+            "openai.unknown-future-model",
+            None,
+            Some(bcode_model::ModelApiSurface::Messages),
+        )
+        .await;
+
+        assert_eq!(known, Some(bcode_model::ModelApiSurface::Responses));
+        assert_eq!(unknown, Some(bcode_model::ModelApiSurface::Messages));
+    }
+
     #[test]
     fn compaction_request_omits_optional_params_for_strict_providers() {
         let session_id = SessionId::new();
-        let selection = SessionModelSelection {
-            model_id: Some("model".to_string()),
-            ..SessionModelSelection::default()
-        };
-        let prompt_text = "old transcript";
-
-        let request = build_compaction_request(session_id, &selection, prompt_text, "turn".into());
+        let request = build_compaction_request(
+            session_id,
+            "model".to_string(),
+            bcode_model::ProviderRequestContext::default(),
+            "old transcript",
+            "turn".into(),
+        );
 
         assert_eq!(request.parameters.temperature, None);
         assert_eq!(request.parameters.max_output_tokens, None);

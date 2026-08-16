@@ -61,6 +61,19 @@ capability is advertised. Verification and provider-auth usage/reset operations 
 extensions. The complete machine-readable classification is
 `bcode_model::MODEL_PROVIDER_OPERATIONS`.
 
+## Model request target resolution
+
+Before any production `start_turn` invocation, the application host resolves one normalized request
+target containing the effective model ID and provider API surface. Both values come from the same
+resolved provider-model view, with the application model catalog supplying the surface while live
+discovery is incomplete. If neither source knows a surface, an existing profile-resolved surface is
+retained; model-name prefixes are never interpreted as transport policy.
+
+Normal turns, compaction summaries, invariant selection, and future internal model calls use this
+same target boundary. Request-purpose owners still construct their own prompts, tools, parameters,
+and context-management behavior. Provider adapters consume the normalized surface and own its wire
+transport mapping; request metadata such as `bcode_request_kind` must not affect routing.
+
 ## Discovery and capability truthfulness
 
 `ProviderCapabilities` returns a stable, non-empty provider ID and display name. `ModelList`

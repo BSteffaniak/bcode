@@ -8115,6 +8115,10 @@ mod tests {
         let default_transport = BedrockTransport::Runtime;
 
         let mut responses_request = test_model_turn_request();
+        responses_request.model_id = "openai.gpt-5.6-sol".to_string();
+        responses_request
+            .metadata
+            .insert("bcode_request_kind".to_string(), "compaction".to_string());
         responses_request.provider_context.api_surface =
             Some(bcode_model::ModelApiSurface::Responses);
         assert!(

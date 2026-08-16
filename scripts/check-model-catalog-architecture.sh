@@ -20,8 +20,19 @@ if grep -R --include='*.rs' -n 'ensure_selected_model_info' plugins/*-provider-p
 fi
 
 if grep -R --include='*.rs' -nE 'gpt-5\.5|gpt-5\.6-sol' plugins/*-provider-plugin/src \
-  | grep -vE ':[0-9]+:.*(test|build_responses_request|Some\()'; then
+  | grep -vE ':[0-9]+:.*(test|build_responses_request|Some\(|model_id = )'; then
   echo "provider plugins must not contain catalog-owned model defaults" >&2
+  exit 1
+fi
+
+if grep -R --include='*.rs' -nE 'fn (effective_model_id|resolve_model_api_surface)' packages/server/src; then
+  echo "server model identity and API surface must resolve together through model_request_target" >&2
+  exit 1
+fi
+
+if ! grep -F 'resolve_model_request_target(' packages/server/src/context_compaction.rs >/dev/null ||
+   ! grep -F 'resolve_model_request_target(' packages/server/src/lib.rs >/dev/null; then
+  echo "production model request paths must use centralized request-target resolution" >&2
   exit 1
 fi
 

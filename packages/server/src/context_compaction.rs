@@ -1011,10 +1011,23 @@ pub async fn collect_compaction_summary_once(
         "{session_id}-compact-{}",
         transcript.compacted_through_sequence
     );
-    let mut request = build_compaction_request(session_id, selection, prompt_text, turn_id.clone());
-    request.model_id = effective_model_id(state, selection)
-        .await
-        .map_err(CompactionError::Provider)?;
+    let target = resolve_model_request_target(
+        state,
+        ModelRequestTargetInput {
+            provider_plugin_id: selection.provider_plugin_id.as_deref(),
+            selected_model_id: selection.model_id.as_deref(),
+            provider_context: &selection.provider_context,
+        },
+    )
+    .await
+    .map_err(|error| CompactionError::Provider(error.to_string()))?;
+    let request = build_compaction_request(
+        session_id,
+        target.model_id,
+        target.provider_context,
+        prompt_text,
+        turn_id.clone(),
+    );
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
@@ -1110,15 +1123,16 @@ pub async fn collect_compaction_summary_once(
 
 pub fn build_compaction_request(
     session_id: SessionId,
-    selection: &SessionModelSelection,
+    model_id: String,
+    provider_context: bcode_model::ProviderRequestContext,
     prompt_text: &str,
     turn_id: String,
 ) -> ModelTurnRequest {
     ModelTurnRequest {
         session_id,
         turn_id,
-        model_id: model_id_for_provider_request(selection.model_id.as_deref()),
-        provider_context: selection.provider_context.clone(),
+        model_id,
+        provider_context,
         system_prompt: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         messages: vec![ModelMessage {
             role: MessageRole::User,
