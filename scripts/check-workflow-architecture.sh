@@ -110,6 +110,9 @@ if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 15' packages/workflow
   || ! rg -q 'workflow recovery deferred without mutation' packages/server/src/lib.rs \
   || ! rg -q 'deferred_receipt_backed_mutation_remains_running' packages/workflow-store/src/lib.rs \
   || ! rg -q 'foreign_artifact_workflow_receipt_is_deferred_before_observation' packages/server/src/lib.rs \
+  || ! rg -q 'workflow_store_unavailable' packages/server/src/lib.rs \
+  || ! rg -q 'workflow capability is unavailable; daemon startup will continue' packages/server/src/lib.rs \
+  || ! rg -q 'workflow restoration skipped while the workflow domain is unavailable' packages/server/src/lib.rs \
   || ! rg -q 'DELETE-INCOMPATIBLE-WORKFLOW-STATE' packages/cli/src/lib.rs; then
   echo "Workflow store clean-break violation: fail-closed schema detection or explicit reset plumbing is missing." >&2
   violations=1

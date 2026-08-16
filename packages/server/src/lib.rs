@@ -383,6 +383,7 @@ pub struct ServerState {
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
     workflow_store: StdMutex<bcode_workflow_store::WorkflowStore>,
+    workflow_store_unavailable: Option<String>,
     workflow_application_authorization: WorkflowApplicationAuthorizationPolicy,
     workflow_computations: StdMutex<BTreeMap<String, Arc<WorkflowComputationCancellation>>>,
     runtime_work: RuntimeWorkManager,
@@ -1399,7 +1400,32 @@ struct ServerStateInit {
     ralph_store: bcode_ralph::RalphStateStore,
 }
 
+fn workflow_store_or_degraded(
+    store: Result<bcode_workflow_store::WorkflowStore, WorkflowStoreError>,
+    degraded_root: &Path,
+) -> (bcode_workflow_store::WorkflowStore, Option<String>) {
+    match store {
+        Ok(store) => (store, None),
+        Err(error) => {
+            tracing::error!(%error, "workflow capability is unavailable; daemon startup will continue");
+            let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(degraded_root)
+                .expect("isolated degraded workflow store must open");
+            (store, Some(error.to_string()))
+        }
+    }
+}
+
 impl ServerState {
+    fn require_workflow_store(&self) -> Result<(), ServerError> {
+        self.workflow_store_unavailable
+            .as_ref()
+            .map_or(Ok(()), |reason| {
+                Err(ServerError::WorkflowCapabilityUnavailable(format!(
+                    "workflow storage requires explicit maintenance: {reason}"
+                )))
+            })
+    }
+
     /// Authorize one normalized side-effecting authored-workflow application operation.
     ///
     /// This boundary is independent of tool-call/session permission coordination. Callers must
@@ -1536,6 +1562,7 @@ impl ServerState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn new(
         sessions: SessionManager,
         plugins: bcode_plugin::PluginRuntimeHost,
@@ -1543,6 +1570,17 @@ impl ServerState {
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         let session_migrations = bcode_session_migration::SessionMigrationService::default();
+        let (workflow_store, workflow_store_unavailable) = init.workflow_store.map_or_else(
+            || {
+                workflow_store_or_degraded(
+                    bcode_workflow_store::WorkflowStore::open_default(),
+                    &bcode_config::default_state_dir()
+                        .join("degraded-domains")
+                        .join(format!("workflow-{}", std::process::id())),
+                )
+            },
+            |store| (store, None),
+        );
         Self {
             sessions,
             session_migrations,
@@ -1582,10 +1620,8 @@ impl ServerState {
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
             turn_admission_locks: Mutex::default(),
-            workflow_store: StdMutex::new(init.workflow_store.unwrap_or_else(|| {
-                bcode_workflow_store::WorkflowStore::open_default()
-                    .expect("default workflow store must open")
-            })),
+            workflow_store: StdMutex::new(workflow_store),
+            workflow_store_unavailable,
             workflow_application_authorization: init.workflow_application_authorization.unwrap_or(
                 WorkflowApplicationAuthorizationPolicy {
                     evaluator: Arc::new(authorize_local_workflow_application_operation),
@@ -4847,6 +4883,7 @@ async fn handle_workflow_mutation_request(
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
+    state.require_workflow_store()?;
     match request {
         WorkflowMutationRequest::CreateAuthoredWorkflow(request) => {
             handle_create_authored_workflow(request_id, client_id, state, writer, request).await
@@ -4942,6 +4979,7 @@ async fn handle_workflow_authoring_request(
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
+    state.require_workflow_store()?;
     match request {
         WorkflowAuthoringRequest::ListAuthoredWorkflows { cursor, limit } => {
             let workflows = state
@@ -5125,6 +5163,7 @@ async fn handle_workflow_validation_request(
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
+    state.require_workflow_store()?;
     match request {
         WorkflowDefinitionRequest::WorkflowAuthoringCatalog => {
             handle_workflow_authoring_catalog(request_id, state, writer).await
@@ -5381,6 +5420,7 @@ async fn handle_workflow_run_request(
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
+    state.require_workflow_store()?;
     match request {
         RuntimeAndModelRequest::InspectWorkflowRun { run_id, limit } => {
             handle_inspect_workflow_run(request_id, state, writer, run_id, limit).await
@@ -33305,6 +33345,10 @@ async fn dispatch_workflow_prompt_turn(
 
 #[allow(clippy::too_many_lines)]
 async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
+    if let Err(error) = state.require_workflow_store() {
+        tracing::warn!(%error, "workflow restoration skipped while the workflow domain is unavailable");
+        return;
+    }
     let run_ids = state
         .workflow_store
         .lock()
@@ -58656,6 +58700,27 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("repeat successor dispatched");
+    }
+
+    #[test]
+    fn incompatible_workflow_store_degrades_without_mutating_canonical_state() {
+        let root = tempfile::tempdir().expect("workflow root");
+        let workflows = root.path().join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows directory");
+        let canonical = workflows.join("workflow.db");
+        let legacy = b"not-a-current-workflow-store";
+        std::fs::write(&canonical, legacy).expect("legacy database");
+        let before = std::fs::read(&canonical).expect("canonical bytes");
+        let degraded = root.path().join("degraded");
+
+        let (store, unavailable) = workflow_store_or_degraded(
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()),
+            &degraded,
+        );
+
+        assert!(unavailable.is_some());
+        assert!(store.path().starts_with(&degraded));
+        assert_eq!(std::fs::read(&canonical).expect("unchanged bytes"), before);
     }
 
     #[test]
