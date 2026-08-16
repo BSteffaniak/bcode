@@ -781,6 +781,23 @@ pub struct MarkdownSelectionProvenance {
     pub semantic_expansion: Option<String>,
     /// Parser semantic kind represented by the ranges.
     pub kind: MarkdownSelectionKind,
+    /// Active parser containers from outermost to innermost.
+    pub containers: Vec<MarkdownSelectionContainer>,
+}
+
+/// Parser container associated with one selection provenance unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkdownSelectionContainer {
+    Heading,
+    BlockQuote,
+    List,
+    ListItem,
+    Emphasis,
+    Strong,
+    Link,
+    CodeBlock,
+    Table,
+    RawHtml,
 }
 
 /// Exact canonical source ranges for one rendered code block.
@@ -837,6 +854,34 @@ pub enum MarkdownSelectionFallback {
     WholeSemanticUnit,
     /// No canonical mapping is claimed; consumers may use explicit rendered-text fallback.
     RenderedText,
+}
+
+/// Conservative fallback for Markdown structures whose terminal layout is transformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkdownStructureSelectionFallback {
+    /// Parser events preserve exact ordered source slices.
+    ExactSourceSlices,
+    /// The transformed structure must never claim one false contiguous source range.
+    DiscontiguousSourceSlices,
+    /// Raw source remains authoritative and is selected exactly.
+    RawSource,
+}
+
+/// Return safe selection behavior for one parser-level Markdown structure.
+#[must_use]
+pub const fn markdown_structure_selection_fallback(
+    tag: &MarkdownSemanticTag,
+) -> MarkdownStructureSelectionFallback {
+    match tag {
+        MarkdownSemanticTag::Table(_)
+        | MarkdownSemanticTag::TableHead
+        | MarkdownSemanticTag::TableRow
+        | MarkdownSemanticTag::TableCell => {
+            MarkdownStructureSelectionFallback::DiscontiguousSourceSlices
+        }
+        MarkdownSemanticTag::HtmlBlock => MarkdownStructureSelectionFallback::RawSource,
+        _ => MarkdownStructureSelectionFallback::ExactSourceSlices,
+    }
 }
 
 /// Return the safe selection fallback for one semantic contribution.
@@ -1024,25 +1069,78 @@ fn semantic_expansion_id(event: &MarkdownSemanticEvent) -> Option<String> {
 }
 
 fn markdown_selection_provenance(document: &MarkdownDocument) -> Vec<MarkdownSelectionProvenance> {
+    let mut containers = Vec::new();
     document
         .events
         .iter()
         .filter(|event| event.source_range.start <= event.source_range.end)
-        .map(|event| MarkdownSelectionProvenance {
-            source_ranges: vec![event.source_range.clone()],
-            rects: Vec::new(),
-            semantic_expansion: semantic_expansion_id(event),
-            kind: match &event.kind {
-                MarkdownSemanticEventKind::Start(_) => MarkdownSelectionKind::Start,
-                MarkdownSemanticEventKind::End(_) => MarkdownSelectionKind::End,
-                MarkdownSemanticEventKind::Text(_) => MarkdownSelectionKind::Text,
-                MarkdownSemanticEventKind::Code(_) => MarkdownSelectionKind::Code,
-                MarkdownSemanticEventKind::SoftBreak => MarkdownSelectionKind::SoftBreak,
-                MarkdownSemanticEventKind::HardBreak => MarkdownSelectionKind::HardBreak,
-                _ => MarkdownSelectionKind::Other,
-            },
+        .map(|event| {
+            if let MarkdownSemanticEventKind::End(end) = event.kind {
+                pop_selection_container(&mut containers, end);
+            }
+            let unit = MarkdownSelectionProvenance {
+                source_ranges: vec![event.source_range.clone()],
+                rects: Vec::new(),
+                semantic_expansion: semantic_expansion_id(event),
+                kind: match &event.kind {
+                    MarkdownSemanticEventKind::Start(_) => MarkdownSelectionKind::Start,
+                    MarkdownSemanticEventKind::End(_) => MarkdownSelectionKind::End,
+                    MarkdownSemanticEventKind::Text(_) => MarkdownSelectionKind::Text,
+                    MarkdownSemanticEventKind::Code(_) => MarkdownSelectionKind::Code,
+                    MarkdownSemanticEventKind::SoftBreak => MarkdownSelectionKind::SoftBreak,
+                    MarkdownSemanticEventKind::HardBreak => MarkdownSelectionKind::HardBreak,
+                    _ => MarkdownSelectionKind::Other,
+                },
+                containers: containers.clone(),
+            };
+            if let MarkdownSemanticEventKind::Start(tag) = &event.kind
+                && let Some(container) = selection_container(tag)
+            {
+                containers.push(container);
+            }
+            unit
         })
         .collect()
+}
+
+const fn selection_container(tag: &MarkdownSemanticTag) -> Option<MarkdownSelectionContainer> {
+    match tag {
+        MarkdownSemanticTag::Heading(_) => Some(MarkdownSelectionContainer::Heading),
+        MarkdownSemanticTag::BlockQuote(_) => Some(MarkdownSelectionContainer::BlockQuote),
+        MarkdownSemanticTag::List(_) => Some(MarkdownSelectionContainer::List),
+        MarkdownSemanticTag::Item => Some(MarkdownSelectionContainer::ListItem),
+        MarkdownSemanticTag::Emphasis => Some(MarkdownSelectionContainer::Emphasis),
+        MarkdownSemanticTag::Strong => Some(MarkdownSelectionContainer::Strong),
+        MarkdownSemanticTag::Link(_) => Some(MarkdownSelectionContainer::Link),
+        MarkdownSemanticTag::CodeBlock(_) => Some(MarkdownSelectionContainer::CodeBlock),
+        MarkdownSemanticTag::Table(_) => Some(MarkdownSelectionContainer::Table),
+        MarkdownSemanticTag::HtmlBlock => Some(MarkdownSelectionContainer::RawHtml),
+        _ => None,
+    }
+}
+
+fn pop_selection_container(
+    containers: &mut Vec<MarkdownSelectionContainer>,
+    end: MarkdownSemanticTagEnd,
+) {
+    let expected = match end {
+        MarkdownSemanticTagEnd::Heading => Some(MarkdownSelectionContainer::Heading),
+        MarkdownSemanticTagEnd::BlockQuote => Some(MarkdownSelectionContainer::BlockQuote),
+        MarkdownSemanticTagEnd::List => Some(MarkdownSelectionContainer::List),
+        MarkdownSemanticTagEnd::Item => Some(MarkdownSelectionContainer::ListItem),
+        MarkdownSemanticTagEnd::Emphasis => Some(MarkdownSelectionContainer::Emphasis),
+        MarkdownSemanticTagEnd::Strong => Some(MarkdownSelectionContainer::Strong),
+        MarkdownSemanticTagEnd::Link => Some(MarkdownSelectionContainer::Link),
+        MarkdownSemanticTagEnd::CodeBlock => Some(MarkdownSelectionContainer::CodeBlock),
+        MarkdownSemanticTagEnd::Table => Some(MarkdownSelectionContainer::Table),
+        MarkdownSemanticTagEnd::HtmlBlock => Some(MarkdownSelectionContainer::RawHtml),
+        _ => None,
+    };
+    if let Some(expected) = expected
+        && containers.last() == Some(&expected)
+    {
+        containers.pop();
+    }
 }
 
 fn assign_selection_geometry(
@@ -1079,6 +1177,7 @@ fn assign_selection_geometry(
                     rects: Vec::new(),
                     semantic_expansion: unit.semantic_expansion.clone(),
                     kind: unit.kind,
+                    containers: unit.containers.clone(),
                 });
                 continue;
             }
@@ -1088,6 +1187,7 @@ fn assign_selection_geometry(
                     rects: Vec::new(),
                     semantic_expansion: unit.semantic_expansion.clone(),
                     kind: unit.kind,
+                    containers: unit.containers.clone(),
                 });
                 continue;
             };
@@ -1097,6 +1197,7 @@ fn assign_selection_geometry(
                 rects,
                 semantic_expansion: unit.semantic_expansion.clone(),
                 kind: unit.kind,
+                containers: unit.containers.clone(),
             });
         }
     }
@@ -4716,6 +4817,83 @@ mod tests {
     }
 
     #[test]
+    fn selection_provenance_records_nested_semantic_containers() {
+        let source = "> 1. **strong *inner*** [label](url) `inline_code`\n\n# heading";
+        let rendered = render_markdown(source, &MarkdownRenderOptions::new(80));
+        let unit_for = |needle: &str| {
+            let start = source.find(needle).expect("needle");
+            let end = start + needle.len();
+            rendered
+                .selection_provenance
+                .iter()
+                .find(|unit| {
+                    matches!(
+                        unit.kind,
+                        super::MarkdownSelectionKind::Text | super::MarkdownSelectionKind::Code
+                    ) && unit
+                        .source_ranges
+                        .iter()
+                        .any(|range| range.start < end && start < range.end)
+                })
+                .expect("semantic unit")
+        };
+        let inner = unit_for("inner");
+        for container in [
+            super::MarkdownSelectionContainer::BlockQuote,
+            super::MarkdownSelectionContainer::List,
+            super::MarkdownSelectionContainer::ListItem,
+            super::MarkdownSelectionContainer::Strong,
+            super::MarkdownSelectionContainer::Emphasis,
+        ] {
+            assert!(
+                inner.containers.contains(&container),
+                "missing {container:?}"
+            );
+        }
+        assert!(
+            unit_for("heading")
+                .containers
+                .contains(&super::MarkdownSelectionContainer::Heading)
+        );
+        assert!(
+            unit_for("label")
+                .containers
+                .contains(&super::MarkdownSelectionContainer::Link)
+        );
+        assert_eq!(
+            unit_for("inline_code").kind,
+            super::MarkdownSelectionKind::Code
+        );
+    }
+
+    #[test]
+    fn markdown_inline_source_ranges_obey_delimiter_and_link_contracts() {
+        let source = "# > **strong *inner*** [label](https://example.com) `code`  \nnext";
+        let rendered = render_markdown(source, &MarkdownRenderOptions::new(24));
+        let slices = rendered
+            .selection_provenance
+            .iter()
+            .flat_map(|unit| &unit.source_ranges)
+            .filter_map(|range| source.get(range.clone()))
+            .collect::<Vec<_>>();
+
+        assert!(slices.iter().any(|slice| slice.contains("strong")));
+        assert!(slices.iter().any(|slice| slice.contains("inner")));
+        assert!(slices.iter().any(|slice| slice.contains("label")));
+        assert!(slices.iter().any(|slice| slice.contains("code")));
+        assert!(
+            slices
+                .iter()
+                .any(|slice| slice.contains("https://example.com"))
+        );
+        let label_range = source.find("label").expect("label")
+            ..source.find("label").expect("label") + "label".len();
+        let destination_range = source.find("https://").expect("destination")
+            ..source.find(')').expect("destination end");
+        assert!(label_range.end < destination_range.start);
+    }
+
+    #[test]
     fn selection_provenance_tracks_wrapped_text_after_visual_prefixes() {
         let rendered = render_markdown(
             "> 1. a long **emphasized value** that wraps across terminal rows",
@@ -4840,6 +5018,41 @@ mod tests {
     }
 
     #[test]
+    fn transformed_table_and_raw_html_selection_policies_are_truthful() {
+        assert_eq!(
+            super::markdown_structure_selection_fallback(&super::MarkdownSemanticTag::Table(
+                vec![]
+            )),
+            super::MarkdownStructureSelectionFallback::DiscontiguousSourceSlices
+        );
+        assert_eq!(
+            super::markdown_structure_selection_fallback(&super::MarkdownSemanticTag::HtmlBlock),
+            super::MarkdownStructureSelectionFallback::RawSource
+        );
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n\n<div>raw</div>";
+        let document = super::parse_markdown_document(source);
+        let table_ranges = document
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event.kind, super::MarkdownSemanticEventKind::Text(_))
+                    && event.source_range.end <= source.find("<div>").expect("html")
+            })
+            .map(|event| event.source_range.clone())
+            .collect::<Vec<_>>();
+        assert!(table_ranges.len() >= 4);
+        assert!(
+            table_ranges
+                .windows(2)
+                .any(|ranges| ranges[0].end < ranges[1].start)
+        );
+        assert!(document.events.iter().any(|event| {
+            matches!(event.kind, super::MarkdownSemanticEventKind::Html(_))
+                && &source[event.source_range.clone()] == "<div>raw</div>"
+        }));
+    }
+
+    #[test]
     fn rich_selection_fallbacks_are_explicit_and_conservative() {
         let rendered = render_markdown(
             "[label](https://example.com)\n\n![alt](image.png)\n\n```mermaid\ngraph TD; A-->B\n```\n\n<details><summary>More</summary>Body</details>\n\n$x$",
@@ -4916,6 +5129,65 @@ mod tests {
             "```\r\n"
         );
         assert_eq!(&markdown[block.whole_range.clone()], markdown);
+    }
+
+    #[test]
+    fn locked_markdown_code_export_rules_preserve_only_canonical_bytes() {
+        let cases = [
+            (
+                "```rust\r\nlet\tvalue = 1;\r\n```\r\n",
+                "let\tvalue = 1;\r\n",
+                "```rust\r\nlet\tvalue = 1;\r\n```\r\n",
+            ),
+            (
+                "    first\n\tsecond\n\nnext",
+                "    first\n\tsecond\n",
+                "    first\n\tsecond\n\n",
+            ),
+            ("~~~\npartial", "partial", "~~~\npartial"),
+        ];
+        for (source, expected_body, expected_whole) in cases {
+            let blocks = super::markdown_code_block_selections(source);
+            let block = blocks.first().expect("code block");
+            let body = block
+                .body_ranges
+                .iter()
+                .map(|range| &source[range.clone()])
+                .collect::<String>();
+            assert_eq!(body, expected_body);
+            assert_eq!(&source[block.whole_range.clone()], expected_whole);
+        }
+    }
+
+    #[test]
+    fn wrapped_code_geometry_does_not_change_canonical_line_breaks() {
+        let source =
+            "```text\na very long source line that wraps visually without a canonical newline\n```";
+        let rendered = render_markdown(source, &MarkdownRenderOptions::new(16));
+        let block = rendered.code_block_selections.first().expect("code block");
+        assert_eq!(
+            block
+                .body_ranges
+                .iter()
+                .map(|range| &source[range.clone()])
+                .collect::<String>(),
+            "a very long source line that wraps visually without a canonical newline\n"
+        );
+        let body_rows = rendered
+            .selection_provenance
+            .iter()
+            .filter(|unit| {
+                unit.source_ranges.iter().all(|range| {
+                    block
+                        .body_ranges
+                        .iter()
+                        .any(|body| body.start <= range.start && range.end <= body.end)
+                })
+            })
+            .flat_map(|unit| &unit.rects)
+            .map(|rect| rect.y)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(body_rows.len() > 1);
     }
 
     #[test]

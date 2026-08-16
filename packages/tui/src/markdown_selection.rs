@@ -261,8 +261,26 @@ mod tests {
             Some(std::iter::once(9..23).collect())
         );
         assert_eq!(
+            expand_markdown_selection_range(source, "code.0.header", 0..source.len()),
+            Some(std::iter::once(0..9).collect())
+        );
+        assert_eq!(
+            expand_markdown_selection_range(source, "code.0.footer", 0..source.len()),
+            Some(std::iter::once(23..source.len()).collect())
+        );
+        assert_eq!(
             expand_markdown_selection_range(source, "code.0.whole", 0..source.len()),
             Some(std::iter::once(0..source.len()).collect())
+        );
+
+        let indented = "    first\n\tsecond\n\nnext";
+        assert_eq!(
+            expand_markdown_selection_range(indented, "code.0.body", 0..indented.len(),),
+            Some(vec![0..10, 10..18])
+        );
+        assert_eq!(
+            expand_markdown_selection_range(indented, "code.0.whole", 0..indented.len(),),
+            Some(std::iter::once(0..19).collect())
         );
 
         let incomplete = "```\n\tbody";
@@ -270,6 +288,23 @@ mod tests {
             expand_markdown_selection_range(incomplete, "code.0.body", 0..incomplete.len(),)
                 .and_then(|ranges| ranges.first().cloned()),
             Some(4..9)
+        );
+    }
+
+    #[test]
+    fn markdown_code_partial_ranges_never_expand_beyond_selection() {
+        let source = "```rust\nabcdef\n```\n";
+        assert_eq!(
+            expand_markdown_selection_range(source, "code.0.body", 12..14),
+            Some(std::iter::once(12..14).collect())
+        );
+        assert_eq!(
+            expand_markdown_selection_range(source, "code.0.header", 3..7),
+            Some(std::iter::once(3..7).collect())
+        );
+        assert_eq!(
+            expand_markdown_selection_range(source, "code.0.footer", 17..19),
+            Some(std::iter::once(17..19).collect())
         );
     }
 
