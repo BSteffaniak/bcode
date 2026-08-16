@@ -1279,6 +1279,9 @@ pub enum SystemPromptMode {
 #[allow(clippy::struct_excessive_bools)]
 #[config_doc(section = "sections")]
 pub struct SystemPromptSectionsConfig {
+    /// Include the current local date, time, and UTC offset in request-only context.
+    #[serde(default = "default_true")]
+    pub current_datetime: bool,
     /// Include repository invariants independently of ordinary repository context.
     #[serde(default = "default_true")]
     pub repository_invariants: bool,
@@ -1299,6 +1302,7 @@ pub struct SystemPromptSectionsConfig {
 impl Default for SystemPromptSectionsConfig {
     fn default() -> Self {
         Self {
+            current_datetime: true,
             repository_invariants: true,
             repository_context: true,
             dynamic_repository_context: true,
@@ -5994,6 +5998,9 @@ fn write_system_prompt_toml(output: &mut String, system_prompt: &SystemPromptCon
     output.push('\n');
     if system_prompt.sections != SystemPromptSectionsConfig::default() {
         output.push_str("[system_prompt.sections]\n");
+        if !system_prompt.sections.current_datetime {
+            output.push_str("current_datetime = false\n");
+        }
         if !system_prompt.sections.repository_invariants {
             output.push_str("repository_invariants = false\n");
         }
@@ -8809,6 +8816,7 @@ disabled = ["vim_edit.apply"]
         config.system_prompt.repository_instructions_max_chars = std::num::NonZeroUsize::new(6_000);
         config.system_prompt.repository_invariants_max_chars = std::num::NonZeroUsize::new(8_000);
         config.system_prompt.git_status_max_chars = std::num::NonZeroUsize::new(12_000).unwrap();
+        config.system_prompt.sections.current_datetime = false;
         config.system_prompt.sections.repository_invariants = false;
         config.skills.max_skill_file_bytes = std::num::NonZeroU64::new(512_000).unwrap();
         config.skills.preview_max_chars = std::num::NonZeroUsize::new(4_000).unwrap();
@@ -8842,6 +8850,7 @@ disabled = ["vim_edit.apply"]
             rendered.contains("repository_invariants = false"),
             "{rendered}"
         );
+        assert!(rendered.contains("current_datetime = false"), "{rendered}");
 
         let parsed: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
         assert_eq!(
@@ -8860,6 +8869,16 @@ disabled = ["vim_edit.apply"]
             9_000
         );
         assert!(!parsed.system_prompt.sections.repository_invariants);
+        assert!(!parsed.system_prompt.sections.current_datetime);
+    }
+
+    #[test]
+    fn current_datetime_prompt_section_defaults_to_enabled_when_omitted() {
+        let default = BcodeConfig::default();
+        assert!(default.system_prompt.sections.current_datetime);
+
+        let parsed: BcodeConfig = toml::from_str("[system_prompt.sections]\n").expect("config");
+        assert!(parsed.system_prompt.sections.current_datetime);
     }
 
     #[test]

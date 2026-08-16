@@ -2428,6 +2428,7 @@ dependencies = [
  "bcode_workflow_view_models",
  "bcode_worktree",
  "bcode_worktree_models",
+ "chrono",
  "futures 0.3.34",
  "hyperchad",
  "jsonschema",

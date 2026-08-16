@@ -25569,6 +25569,25 @@ fn build_coding_system_prompt_parts(
     agent_prompt_suffix: Option<&str>,
     skill_catalog: Option<&str>,
 ) -> (String, String) {
+    let current_datetime = format_current_datetime(&chrono::Local::now());
+    build_coding_system_prompt_parts_at(
+        cwd,
+        config,
+        include_full_invariants,
+        agent_prompt_suffix,
+        skill_catalog,
+        &current_datetime,
+    )
+}
+
+fn build_coding_system_prompt_parts_at(
+    cwd: &Path,
+    config: &bcode_config::SystemPromptConfig,
+    include_full_invariants: bool,
+    agent_prompt_suffix: Option<&str>,
+    skill_catalog: Option<&str>,
+    current_datetime: &str,
+) -> (String, String) {
     let (stable_context, dynamic_context) = build_repository_context_parts(
         cwd,
         config
@@ -25607,18 +25626,34 @@ fn build_coding_system_prompt_parts(
         stable.push_str(suffix.trim());
     }
 
-    let mut dynamic = if config.sections.dynamic_repository_context {
-        dynamic_context
-    } else {
-        String::new()
-    };
+    let mut dynamic_sections = Vec::new();
+    if config.sections.current_datetime {
+        dynamic_sections.push(current_datetime.to_string());
+    }
+    if config.sections.dynamic_repository_context {
+        dynamic_sections.push(dynamic_context);
+    }
     if let Some(skill_catalog) = skill_catalog
         && !skill_catalog.trim().is_empty()
     {
-        dynamic.push_str(skill_catalog);
+        dynamic_sections.push(skill_catalog.to_string());
     }
 
-    (stable, dynamic)
+    (stable, dynamic_sections.join("\n\n"))
+}
+
+fn format_current_datetime(now: &chrono::DateTime<chrono::Local>) -> String {
+    format_datetime_context(
+        &now.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        &now.format("%Z").to_string(),
+        &now.format("%:z").to_string(),
+    )
+}
+
+fn format_datetime_context(timestamp: &str, timezone: &str, utc_offset: &str) -> String {
+    format!(
+        "Current date and time:\n* Local timestamp: {timestamp}\n* Time zone: {timezone} (UTC{utc_offset})"
+    )
 }
 
 fn read_repository_invariants(cwd: &Path, max_chars: Option<usize>) -> Option<String> {
@@ -47634,8 +47669,50 @@ library = "test"
         assert!(stable.contains("Shared rendering remains renderer-neutral"));
         assert!(stable.contains("Stable repository context:"));
         assert!(stable.contains("agent suffix"));
+        assert!(dynamic.contains("Current date and time:"));
         assert!(dynamic.contains("Dynamic repository context:"));
+        assert!(!stable.contains("Current date and time:"));
         assert!(!stable.contains("Git status:"));
+    }
+
+    #[test]
+    fn coding_system_prompt_datetime_is_request_only_and_independently_configurable() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let fixed_datetime = format_datetime_context("2026-08-16T14:02:19-04:00", "EDT", "-04:00");
+        let mut config = bcode_config::SystemPromptConfig::default();
+        config.sections.dynamic_repository_context = false;
+
+        let (stable, dynamic) =
+            build_coding_system_prompt_parts_at(&cwd, &config, false, None, None, &fixed_datetime);
+
+        assert!(!stable.contains("Current date and time:"));
+        assert!(dynamic.contains("2026-08-16T14:02:19-04:00"));
+        assert!(dynamic.contains("EDT (UTC-04:00)"));
+        assert!(!dynamic.contains("Dynamic repository context:"));
+
+        config.sections.current_datetime = false;
+        config.sections.dynamic_repository_context = true;
+        let (_, dynamic) =
+            build_coding_system_prompt_parts_at(&cwd, &config, false, None, None, &fixed_datetime);
+        assert!(!dynamic.contains("Current date and time:"));
+        assert!(dynamic.contains("Dynamic repository context:"));
+    }
+
+    #[test]
+    fn replacement_system_prompt_includes_enabled_datetime() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = bcode_config::SystemPromptConfig {
+            mode: bcode_config::SystemPromptMode::Replace,
+            text: Some("custom base".to_owned()),
+            ..bcode_config::SystemPromptConfig::default()
+        };
+        let fixed_datetime = format_datetime_context("2026-01-02T03:04:05+00:00", "UTC", "+00:00");
+
+        let (stable, dynamic) =
+            build_coding_system_prompt_parts_at(&cwd, &config, false, None, None, &fixed_datetime);
+
+        assert!(stable.starts_with("custom base"));
+        assert!(dynamic.contains("2026-01-02T03:04:05+00:00"));
     }
 
     #[test]
@@ -47685,6 +47762,7 @@ library = "test"
             text: Some("custom base".to_owned()),
             ..bcode_config::SystemPromptConfig::default()
         };
+        config.sections.current_datetime = false;
         config.sections.repository_context = false;
         config.sections.dynamic_repository_context = false;
         config.sections.agent_suffix = false;

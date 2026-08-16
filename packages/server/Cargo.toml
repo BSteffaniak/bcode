@@ -45,6 +45,7 @@ bcode_workflow_view = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
 bcode_worktree = { workspace = true }
 bcode_worktree_models = { workspace = true }
+chrono = { workspace = true }
 futures = { workspace = true }
 jsonschema = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }

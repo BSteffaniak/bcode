@@ -295,6 +295,8 @@ mod tests {
     fn config_reference_documents_derived_stable_sections() {
         let doc = generate_config_reference();
 
+        assert!(doc.contains("current_datetime"));
+        assert!(doc.contains("current local date, time, and UTC offset"));
         assert!(doc.contains("enabled"));
         assert!(doc.contains("config.<plugin-id>.<setting>"));
         assert!(doc.contains("prompt.catalog"));
