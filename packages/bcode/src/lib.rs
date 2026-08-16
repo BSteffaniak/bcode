@@ -2139,7 +2139,7 @@ impl ModelResponseCacheKey {
                 .for_each(|credential| credential.value.clear());
         }
         let identity = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "provider_plugin_id": request.provider_plugin_id,
             "model_id": request.model_id,
             "provider_context": provider_context,
@@ -2150,6 +2150,7 @@ impl ModelResponseCacheKey {
             "tools": request.tools,
             "tool_call_policy": request.tool_call_policy,
             "structured_output": request.structured_output,
+            "structured_output_execution": request.structured_output_execution,
             "parameters": request.parameters,
             "metadata": request.metadata,
             "max_tool_rounds": request.max_tool_rounds,
@@ -2163,7 +2164,7 @@ impl ModelResponseCacheKey {
         })?;
         let digest = Sha256::digest(encoded);
         Ok(Self {
-            schema_version: 1,
+            schema_version: 2,
             digest_hex: format!("{digest:x}"),
         })
     }
@@ -4015,6 +4016,25 @@ impl ProviderRegistry {
             .negotiate(&model.feature_support, feature)
     }
 
+    /// Return the execution shape required for structured output by the selected provider/model.
+    #[must_use]
+    pub fn structured_output_execution(
+        &self,
+        selector: &ModelSelector,
+        strict: bool,
+    ) -> bcode_model::CapabilityExecution {
+        let mode = if strict {
+            StructuredOutputMode::StrictJsonSchema
+        } else {
+            StructuredOutputMode::JsonSchema
+        };
+        match self.feature_support(selector, RequestedModelFeature::StructuredOutput(mode)) {
+            NegotiatedFeatureSupport::Guaranteed { execution, .. } => execution,
+            NegotiatedFeatureSupport::Unsupported { .. }
+            | NegotiatedFeatureSupport::Unknown { .. } => bcode_model::CapabilityExecution::Direct,
+        }
+    }
+
     /// Return selected provider/model capability support for parallel tool calls.
     #[must_use]
     pub fn parallel_tool_capabilities(
@@ -4426,9 +4446,13 @@ impl Bcode {
         };
         if let Some(report) = self.provider_registry.default_selection_report() {
             let selector = report.selector.clone();
+            let structured_output_execution = self
+                .provider_registry
+                .structured_output_execution(&selector, true);
             builder
                 .provider_context(self.provider_context.clone())
                 .selection_report(report)
+                .structured_output_execution(structured_output_execution)
                 .parallel_tool_capabilities(
                     self.provider_registry.parallel_tool_capabilities(&selector),
                 )
@@ -6491,6 +6515,7 @@ pub struct Agent {
     registration_source: Option<ProviderRegistrationSource>,
     model_metadata_source: Option<ModelMetadataSource>,
     model_pricing: Option<ModelPricingInfo>,
+    structured_output_execution: bcode_model::CapabilityExecution,
     provider_context: ProviderRequestContext,
     system_prompt: Option<String>,
     parameters: ModelParameters,
@@ -6541,6 +6566,10 @@ impl fmt::Debug for Agent {
             .field("registration_source", &self.registration_source)
             .field("model_metadata_source", &self.model_metadata_source)
             .field("model_pricing", &self.model_pricing)
+            .field(
+                "structured_output_execution",
+                &self.structured_output_execution,
+            )
             .field("provider_context", &self.provider_context)
             .field("system_prompt", &self.system_prompt)
             .field("parameters", &self.parameters)
@@ -7612,6 +7641,7 @@ impl Agent {
     ) -> AgentTurnRequest {
         let mut request = self.turn_request_with_cancellation(prompt, cancellation);
         request.structured_output = structured_output;
+        request.structured_output_execution = self.structured_output_execution;
         request.messages = messages;
         request
     }
@@ -7635,7 +7665,7 @@ impl Agent {
                 .negotiate(self.execution_options.parallel, self.tool_choice.clone()),
             structured_output: None,
             structured_output_execution: bcode_model::CapabilityExecution::Direct,
-
+            parameters: self.parameters.clone(),
             metadata: self.metadata.clone(),
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,
@@ -7767,6 +7797,7 @@ pub struct AgentBuilder {
     registration_source: Option<ProviderRegistrationSource>,
     model_metadata_source: Option<ModelMetadataSource>,
     model_pricing: Option<ModelPricingInfo>,
+    structured_output_execution: bcode_model::CapabilityExecution,
     provider_context: ProviderRequestContext,
     system_prompt: Option<String>,
     parameters: ModelParameters,
@@ -7820,6 +7851,10 @@ impl fmt::Debug for AgentBuilder {
             .field("registration_source", &self.registration_source)
             .field("model_metadata_source", &self.model_metadata_source)
             .field("model_pricing", &self.model_pricing)
+            .field(
+                "structured_output_execution",
+                &self.structured_output_execution,
+            )
             .field("provider_context", &self.provider_context)
             .field("system_prompt", &self.system_prompt)
             .field("parameters", &self.parameters)
@@ -7895,6 +7930,7 @@ impl Default for AgentBuilder {
             registration_source: None,
             model_metadata_source: None,
             model_pricing: None,
+            structured_output_execution: bcode_model::CapabilityExecution::Direct,
             provider_context: ProviderRequestContext::default(),
             system_prompt: None,
             parameters: ModelParameters::default(),
@@ -7990,6 +8026,7 @@ impl AgentBuilder {
         self.selection_provenance.model = Some(ModelSelectionSource::PerRequest);
         self.model_metadata_source = None;
         self.model_pricing = None;
+        self.structured_output_execution = bcode_model::CapabilityExecution::Direct;
         self.parallel_tool_capabilities.model = Some(false);
         self
     }
@@ -8013,6 +8050,7 @@ impl AgentBuilder {
         self.selection_provenance.model = Some(ModelSelectionSource::PerRequest);
         self.model_metadata_source = None;
         self.model_pricing = None;
+        self.structured_output_execution = bcode_model::CapabilityExecution::Direct;
         if self.provider_plugin_id.is_some() {
             self.selection_provenance.provider = Some(ModelSelectionSource::PerRequest);
         }
@@ -8030,6 +8068,7 @@ impl AgentBuilder {
         self.registration_source = None;
         self.model_metadata_source = None;
         self.model_pricing = None;
+        self.structured_output_execution = bcode_model::CapabilityExecution::Direct;
         self.parallel_tool_capabilities.provider = None;
         self.parallel_tool_capabilities.model = None;
         self
@@ -8051,6 +8090,16 @@ impl AgentBuilder {
         self.registration_source = report.registration_source;
         self.model_metadata_source = report.model_metadata_source;
         self.model_pricing = report.model_pricing;
+        self
+    }
+
+    /// Configure the selected provider/model's structured-output execution shape.
+    #[must_use]
+    pub const fn structured_output_execution(
+        mut self,
+        execution: bcode_model::CapabilityExecution,
+    ) -> Self {
+        self.structured_output_execution = execution;
         self
     }
 
@@ -8703,6 +8752,7 @@ impl AgentBuilder {
             registration_source: self.registration_source,
             model_metadata_source: self.model_metadata_source,
             model_pricing: self.model_pricing,
+            structured_output_execution: self.structured_output_execution,
             provider_context: self.provider_context,
             system_prompt: self.system_prompt,
             parameters: self.parameters,

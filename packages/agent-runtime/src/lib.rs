@@ -4801,6 +4801,96 @@ mod tests {
         drop(requests);
     }
 
+    #[tokio::test]
+    async fn canonical_loop_finalizes_structured_output_after_tool_work() {
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "first".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [
+                vec![
+                    ProviderTurnEvent::ToolCallFinished { call },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::ToolCall,
+                    },
+                ],
+                vec![
+                    ProviderTurnEvent::TextDelta {
+                        text: "work complete".to_string(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ],
+                vec![
+                    ProviderTurnEvent::TextDelta {
+                        text: r#"{"done":true}"#.to_string(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ],
+            ],
+            Arc::clone(&requests),
+        );
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("first"));
+        let mut request = AgentTurnRequest::new("model", "run tool");
+        request.tools = vec![tool_definition("first")];
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "result".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": { "done": { "type": "boolean" } },
+                "required": ["done"]
+            }),
+            strict: true,
+        });
+        request.structured_output_execution =
+            bcode_model::CapabilityExecution::ToolFreeProviderRound;
+
+        let response = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(1),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink::default()),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
+            )
+            .await
+            .expect("structured finalization should complete");
+
+        assert_eq!(response.text, r#"{"done":true}"#);
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].structured_output.is_none());
+        assert_eq!(requests[0].tools.len(), 1);
+        assert!(requests[1].structured_output.is_none());
+        assert_eq!(requests[1].tools.len(), 1);
+        assert!(requests[2].structured_output.is_some());
+        assert!(requests[2].tools.is_empty());
+        assert_eq!(
+            requests[2].tool_call_policy.choice,
+            bcode_model::ToolChoice::None
+        );
+        assert!(requests[2].messages.iter().any(|message| {
+            message.content.iter().any(
+                |content| matches!(content, ContentBlock::Text { text } if text == "work complete"),
+            )
+        }));
+    }
+
     #[derive(Debug, Default)]
     struct RetryOncePlanner {
         plans: AtomicUsize,

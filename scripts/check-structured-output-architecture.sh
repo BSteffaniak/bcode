@@ -30,4 +30,20 @@ if rg -n 'strict: bool' packages/model/src/lib.rs | rg -B5 -A2 'ToolDefinition';
   exit 1
 fi
 
+if ! rg -q 'CapabilityExecution::ToolFreeProviderRound' packages/agent-runtime/src/lib.rs packages/server/src/lib.rs; then
+  echo "generic runtimes must preserve the normalized tool-free structured-output execution requirement" >&2
+  exit 1
+fi
+
+if ! rg -q 'structured_output_emulation_requires_tool_free_round' packages/model-provider-runtime/src/lib.rs; then
+  echo "provider-local synthetic structured output must continue rejecting mixed host tools" >&2
+  exit 1
+fi
+
+if rg -n '(bedrock|anthropic|opus|loop).*(structured_output_finalization|ToolFreeProviderRound)|(structured_output_finalization|ToolFreeProviderRound).*(bedrock|anthropic|opus|loop)' packages/agent-runtime/src packages/server/src \
+  | grep -vE ':[0-9]+:.*test'; then
+  echo "generic structured-output finalization must not branch on provider, model, or workflow identity" >&2
+  exit 1
+fi
+
 echo "structured output architecture checks passed"
