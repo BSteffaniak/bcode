@@ -2052,9 +2052,12 @@ fn format_transcript_selection_item(
                 .map_or_else(String::new, |duration| format!(", {duration}ms"))
         )),
         TranscriptItemKind::ToolRequestDraft { .. } => {
-            Some("Tool request draft [pending]".to_owned())
+            Some("Tool request draft [pending; rendered-text fallback]".to_owned())
         }
-        TranscriptItemKind::ToolContribution { .. } => Some("Tool contribution".to_owned()),
+        TranscriptItemKind::ToolContribution { contribution, .. } => Some(format!(
+            "Tool contribution: {} v{} by {} [rendered-text fallback]",
+            contribution.schema, contribution.schema_version, contribution.producer_id
+        )),
         _ => None,
     };
     metadata.map_or_else(
@@ -3578,6 +3581,68 @@ mod tests {
             super::export_plain_transcript_selection(items.iter(), &snapshot).as_deref(),
             Some("first\n\nsecond")
         );
+    }
+
+    #[test]
+    fn pending_tool_draft_export_is_explicit_and_uses_bounded_fallback() {
+        let draft = bcode_session_view_models::ToolRequestDraftView {
+            output_location: None,
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "shell".to_owned(),
+            producer_plugin_id: Some("shell-plugin".to_owned()),
+            schema: "shell.request".to_owned(),
+            schema_version: 1,
+            placement: bcode_session_models::ToolContributionPlacement::Request,
+            generation: 1,
+            revision: 1,
+            argument_bytes: 100,
+            preview_start_offset: 0,
+            preview: "secret preview".to_owned(),
+            truncated: true,
+        };
+        let item = super::super::transcript::TranscriptItem::with_kind(
+            "Tool",
+            "shell request · 100 bytes · truncated".to_owned(),
+            true,
+            super::super::transcript::TranscriptItemKind::ToolRequestDraft {
+                draft: Box::new(draft),
+            },
+        );
+        let item_id = item.id().get();
+        let content_id = format!("bcode.transcript.item.{item_id}.plain");
+        let snapshot = bmux_tui::selection::SelectionSnapshot {
+            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+            anchor: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
+                offset: 0,
+                order: 0,
+                affinity: bmux_tui::selection::SelectionAffinity::Before,
+                revision: 0,
+            },
+            focus: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
+                offset: item.text.len(),
+                order: 0,
+                affinity: bmux_tui::selection::SelectionAffinity::After,
+                revision: 0,
+            },
+            reversed: false,
+            slices: vec![bmux_tui::selection::SelectionSlice {
+                content_id: bmux_tui::selection::SelectionContentId::new(content_id),
+                source_range: 0..item.text.len(),
+                revision: 0,
+            }],
+            visible_highlights: Vec::new(),
+        };
+        let exported = super::export_plain_transcript_selection(std::iter::once(&item), &snapshot)
+            .expect("draft export");
+
+        assert!(exported.starts_with("Tool request draft [pending; rendered-text fallback]\n"));
+        assert!(exported.contains("100 bytes · truncated"));
+        assert!(!exported.contains("secret preview"));
     }
 
     #[test]
