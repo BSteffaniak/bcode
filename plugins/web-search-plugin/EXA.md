@@ -60,6 +60,14 @@ A basic request uses bounded highlights, which are efficient for agent workflows
 }
 ```
 
+Generic request hints are adapted by the selected provider. Blank optional strings are treated as
+absent. For Exa, explicit `provider_options` publication dates take precedence over generic
+`freshness`, and unsupported generic safe-search hints are omitted because Exa has no equivalent
+wire field. Exa-only `provider_options` are retained when `auto` selects Exa, ignored when `auto`
+selects another provider, and rejected only when the caller explicitly selects a non-Exa provider.
+This keeps ordinary model-generated requests first-attempt usable without claiming unsupported Exa
+capabilities.
+
 Generic domain and freshness fields are translated to Exa's native filters:
 
 ```json

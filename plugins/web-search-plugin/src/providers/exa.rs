@@ -266,13 +266,12 @@ fn build_request_at(input: SearchInput<'_>, now: SystemTime) -> Result<Value, We
     } = input;
     let mut options =
         provider_options.map_or_else(|| Ok(ExaSearchOptions::default()), serde_json::from_value)?;
+    normalize_options(&mut options);
     validate_options(&options)?;
 
-    if safe_search.is_some_and(|value| !value.trim().is_empty()) {
-        return Err(WebError::InvalidRequest(
-            "safe_search is not supported by Exa".to_string(),
-        ));
-    }
+    // Safe-search is a generic cross-provider hint. Exa has no corresponding request field, so
+    // preserve capability fidelity by omitting it rather than rejecting an otherwise valid search.
+    let _ = safe_search;
     if let Some(site) = site.map(str::trim).filter(|site| !site.is_empty()) {
         validate_domain(site)?;
         if !options.include_domains.is_empty()
@@ -286,12 +285,9 @@ fn build_request_at(input: SearchInput<'_>, now: SystemTime) -> Result<Value, We
             options.include_domains.push(site.to_string());
         }
     }
-    if let Some(freshness) = freshness.map(str::trim).filter(|value| !value.is_empty()) {
-        if options.start_published_date.is_some() {
-            return Err(WebError::InvalidRequest(
-                "freshness conflicts with provider_options.start_published_date".to_string(),
-            ));
-        }
+    if let Some(freshness) = freshness.map(str::trim).filter(|value| !value.is_empty())
+        && options.start_published_date.is_none()
+    {
         options.start_published_date = Some(freshness_start(freshness, now)?);
     }
     let user_location = region
@@ -341,6 +337,31 @@ fn build_request_at(input: SearchInput<'_>, now: SystemTime) -> Result<Value, We
         contents,
     };
     serde_json::to_value(request).map_err(WebError::Decode)
+}
+
+fn normalize_options(options: &mut ExaSearchOptions) {
+    for value in [
+        &mut options.start_published_date,
+        &mut options.end_published_date,
+        &mut options.start_crawl_date,
+        &mut options.end_crawl_date,
+    ] {
+        if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+            *value = None;
+        }
+    }
+    options
+        .include_domains
+        .retain(|value| !value.trim().is_empty());
+    options
+        .exclude_domains
+        .retain(|value| !value.trim().is_empty());
+    options
+        .include_text
+        .retain(|value| !value.trim().is_empty());
+    options
+        .exclude_text
+        .retain(|value| !value.trim().is_empty());
 }
 
 fn validate_options(options: &ExaSearchOptions) -> Result<(), WebError> {
@@ -619,6 +640,64 @@ mod tests {
     }
 
     #[test]
+    fn session_regression_shape_is_normalized_on_first_attempt() {
+        let request = build_request_at(
+            SearchInput {
+                query: "latest Rust programming language news March 2026",
+                max_results: 3,
+                site: Some(""),
+                freshness: Some("month"),
+                region: Some("US"),
+                safe_search: Some("moderate"),
+                provider_options: Some(serde_json::json!({
+                    "category": "news",
+                    "content": "highlights",
+                    "end_crawl_date": "",
+                    "end_published_date": "",
+                    "exclude_domains": [],
+                    "exclude_text": [],
+                    "include_domains": [],
+                    "include_text": [],
+                    "max_age_hours": -1,
+                    "max_characters": 3000,
+                    "search_type": "auto",
+                    "start_crawl_date": "",
+                    "start_published_date": ""
+                })),
+            },
+            fixed_now(),
+        )
+        .expect("model-generated optional defaults normalize");
+        assert_eq!(request["startPublishedDate"], "2024-12-02T00:00:00Z");
+        assert!(request.get("endPublishedDate").is_none());
+        assert!(request.get("startCrawlDate").is_none());
+        assert!(request.get("endCrawlDate").is_none());
+        assert!(request.get("safeSearch").is_none());
+    }
+
+    #[test]
+    fn explicit_dates_take_precedence_over_generic_freshness() {
+        let request = build_request_at(
+            SearchInput {
+                query: "q",
+                max_results: 1,
+                site: None,
+                freshness: Some("month"),
+                region: None,
+                safe_search: None,
+                provider_options: Some(serde_json::json!({
+                    "start_published_date": "2024-12-15",
+                    "end_published_date": "2025-01-01"
+                })),
+            },
+            fixed_now(),
+        )
+        .expect("explicit date range wins");
+        assert_eq!(request["startPublishedDate"], "2024-12-15");
+        assert_eq!(request["endPublishedDate"], "2025-01-01");
+    }
+
+    #[test]
     fn minimal_request_uses_bounded_highlights() {
         let request = build_request_at(
             SearchInput {
@@ -779,21 +858,19 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            build_request_at(
-                SearchInput {
-                    query: "q",
-                    max_results: 1,
-                    site: None,
-                    freshness: None,
-                    region: None,
-                    safe_search: Some("strict"),
-                    provider_options: None
-                },
-                fixed_now()
-            )
-            .is_err()
-        );
+        build_request_at(
+            SearchInput {
+                query: "q",
+                max_results: 1,
+                site: None,
+                freshness: None,
+                region: None,
+                safe_search: Some("strict"),
+                provider_options: None,
+            },
+            fixed_now(),
+        )
+        .expect("unsupported generic safe-search hint is omitted");
     }
 
     #[test]

@@ -760,8 +760,39 @@ enum WebError {
     Cancelled,
 }
 
+fn normalize_search_request(request: &mut SearchRequest) {
+    for value in [
+        &mut request.provider,
+        &mut request.site,
+        &mut request.freshness,
+        &mut request.region,
+        &mut request.safe_search,
+    ] {
+        if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+            *value = None;
+        }
+    }
+}
+
+fn adapt_provider_options(request: &mut SearchRequest, provider: &str) -> Result<(), WebError> {
+    if request.provider_options.is_none() || provider == "exa" {
+        return Ok(());
+    }
+    if request
+        .provider
+        .as_deref()
+        .is_some_and(|value| value != "auto")
+    {
+        return Err(WebError::InvalidRequest(
+            "provider_options are currently supported only when provider is exa".to_string(),
+        ));
+    }
+    request.provider_options = None;
+    Ok(())
+}
+
 async fn search_async(
-    request: SearchRequest,
+    mut request: SearchRequest,
     config: WebSearchConfig,
     credentials: ProviderCredentials,
     progress: Option<ProgressReporter>,
@@ -770,12 +801,9 @@ async fn search_async(
     preparation_descriptor: serde_json::Value,
 ) -> Result<SearchResponse, WebError> {
     validate_non_empty("query", &request.query)?;
+    normalize_search_request(&mut request);
     let provider = search_provider(request.provider.as_deref(), &config, &credentials)?;
-    if request.provider_options.is_some() && provider != "exa" {
-        return Err(WebError::InvalidRequest(
-            "provider_options are currently supported only when provider is exa".to_string(),
-        ));
-    }
+    adapt_provider_options(&mut request, &provider)?;
     if let Some(progress) = &progress {
         progress.emit(format!("search: provider selected: {provider}"));
     }
@@ -1810,15 +1838,16 @@ fn search_tool_definition() -> ToolDefinition {
             "required": ["query"],
             "properties": {
                 "query": { "type": "string" },
-                "provider": { "type": "string", "description": "Optional provider override: auto, model_native, brave, tavily, exa, perplexity, gemini, serper, serpapi, or duckduckgo_html" },
+                "provider": { "type": "string", "description": "Optional provider override. auto is a selection mode that chooses the first available configured provider: brave, tavily, exa, perplexity, gemini, serper, serpapi, model_native, then duckduckgo_html" },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 20 },
                 "site": { "type": "string", "description": "Optional domain restriction; provider adapters translate this to native filtering when supported" },
                 "freshness": { "type": "string", "description": "Provider freshness filter; Exa accepts day, week, month, or year" },
                 "region": { "type": "string", "description": "Provider-specific country/region code; Exa accepts a two-letter country code" },
-                "safe_search": { "type": "string", "description": "Provider-specific safe-search setting" },
+                "safe_search": { "type": "string", "description": "Provider-specific safe-search hint. Providers without an equivalent capability ignore it" },
                 "timeout_ms": { "type": "integer", "minimum": 1 },
                 "provider_options": {
                     "type": "object",
+                    "description": "Exa-only options. Ignored when auto selects another provider; rejected with an explicit non-Exa provider",
                     "description": "Exa-only options: search_type, category, include_domains, exclude_domains, publication/crawl date ranges, include_text, exclude_text, content, max_characters, and max_age_hours. Unknown fields are rejected by the Exa adapter.",
                     "properties": {
                         "search_type": { "type": "string", "enum": ["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"] },
@@ -3137,6 +3166,48 @@ mod tests {
     fn validate_url_rejects_non_http_urls() {
         assert!(validate_url("file:///etc/passwd").is_err());
         assert!(validate_url("https://example.com").is_ok());
+    }
+
+    #[test]
+    fn auto_selection_drops_exa_options_for_another_provider() {
+        let mut request = SearchRequest {
+            query: "q".to_owned(),
+            provider: Some("auto".to_owned()),
+            max_results: None,
+            site: None,
+            freshness: None,
+            region: None,
+            safe_search: None,
+            timeout_ms: None,
+            provider_options: Some(serde_json::json!({"category": "news"})),
+        };
+        adapt_provider_options(&mut request, "brave").expect("auto adapts to selected provider");
+        assert_eq!(request.provider_options, None);
+
+        request.provider = Some("brave".to_owned());
+        request.provider_options = Some(serde_json::json!({"category": "news"}));
+        assert!(adapt_provider_options(&mut request, "brave").is_err());
+    }
+
+    #[test]
+    fn blank_generic_fields_are_absent_after_normalization() {
+        let mut request = SearchRequest {
+            query: "q".to_owned(),
+            provider: Some(String::new()),
+            max_results: None,
+            site: Some("  ".to_owned()),
+            freshness: Some(String::new()),
+            region: Some(String::new()),
+            safe_search: Some(String::new()),
+            timeout_ms: None,
+            provider_options: None,
+        };
+        normalize_search_request(&mut request);
+        assert_eq!(request.provider, None);
+        assert_eq!(request.site, None);
+        assert_eq!(request.freshness, None);
+        assert_eq!(request.region, None);
+        assert_eq!(request.safe_search, None);
     }
 
     #[test]
