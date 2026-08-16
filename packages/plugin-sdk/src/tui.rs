@@ -815,14 +815,20 @@ pub struct PluginTuiSurfaceOutcome {
 /// Renderer-neutral update delivered to a plugin-owned surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginTuiSurfaceUpdate {
+    /// Report that the catalog is being fetched. Stale content may remain visible.
+    WorkflowCatalogLoading { stale: bool },
     /// Replace workflow presentation from one authoritative bounded projection.
     WorkflowRun(Box<bcode_workflow_view_models::WorkflowRunView>),
     /// Replace workflow catalog presentation from one authoritative bounded projection.
     WorkflowCatalog(bcode_workflow_view_models::WorkflowCatalogView),
     /// Append one exact continuation page to the current catalog query.
     WorkflowCatalogPage(bcode_workflow_view_models::WorkflowCatalogView),
+    /// Report a bounded catalog request failure without implying observer disconnection.
+    WorkflowCatalogError { message: String },
     /// Report that selected-run detail is being fetched.
     WorkflowRunLoading { run_id: String },
+    /// Report a selected-run detail failure without implying observer disconnection.
+    WorkflowRunError { run_id: String, message: String },
     /// Select one exact run whose bounded detail should be loaded by the host.
     SelectWorkflowRun { run_id: String },
     /// The observer requires bounded snapshot replacement.

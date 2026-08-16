@@ -178,8 +178,13 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 selected_output_id: None,
                 selected_child_session_id: None,
                 detail_loading_run_id: None,
+                catalog_loading: true,
+                catalog_stale: false,
+                catalog_error: None,
+                detail_errors: std::collections::BTreeMap::new(),
                 active_detail_tab: 0,
                 input_buffer: None,
+                catalog_search_buffer: None,
                 updates: None,
                 catalog: None,
                 runs: std::collections::BTreeMap::new(),
@@ -203,8 +208,13 @@ struct WorkflowStatusSurface {
     selected_output_id: Option<String>,
     selected_child_session_id: Option<String>,
     detail_loading_run_id: Option<String>,
+    catalog_loading: bool,
+    catalog_stale: bool,
+    catalog_error: Option<String>,
+    detail_errors: std::collections::BTreeMap<String, String>,
     active_detail_tab: usize,
     input_buffer: Option<String>,
+    catalog_search_buffer: Option<String>,
     updates: Option<PluginTuiSurfaceUpdateReceiver>,
     catalog: Option<bcode_workflow_view_models::WorkflowCatalogView>,
     runs: std::collections::BTreeMap<String, bcode_workflow_view_models::WorkflowRunView>,
@@ -315,13 +325,33 @@ impl WorkflowStatusSurface {
 
     #[allow(clippy::too_many_lines)]
     fn render_workspace(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
-        let Some(catalog) = self.catalog.as_ref() else {
-            return;
-        };
         if area.height < 4 || area.width < 24 {
             return;
         }
-        let header = Rect::new(area.x, area.y, area.width, 2.min(area.height));
+        let Some(catalog) = self.catalog.as_ref() else {
+            let message = self
+                .catalog_error
+                .as_ref()
+                .map_or("Loading workflow catalog…", |error| error.as_str());
+            frame.write_line(
+                Rect::new(area.x, area.y, area.width, 1),
+                &Line::from_spans(vec![Span::styled(
+                    message,
+                    if self.catalog_error.is_some() {
+                        theme.error
+                    } else {
+                        theme.muted
+                    },
+                )]),
+            );
+            return;
+        };
+        let header_height = u16::from(
+            self.catalog_loading || self.catalog_error.is_some() || self.live_status != "live",
+        )
+        .saturating_add(2)
+        .min(area.height);
+        let header = Rect::new(area.x, area.y, area.width, header_height);
         let footer_height = 1.min(area.height.saturating_sub(header.height));
         let body = Rect::new(
             area.x,
@@ -366,13 +396,24 @@ impl WorkflowStatusSurface {
         } else {
             self.render_narrow_page(body, frame, theme, catalog);
         }
+        if let Some(search) = &self.catalog_search_buffer {
+            frame.write_line(
+                footer,
+                &Line::from_spans(vec![
+                    Span::styled("Search › ", theme.focused),
+                    Span::styled(search, theme.text),
+                    Span::styled("  Enter apply · Esc cancel", theme.muted),
+                ]),
+            );
+            return;
+        }
         let hints = [
             KeyHint::new("←/→", "run"),
             KeyHint::new("↑/↓", "node"),
             KeyHint::new("Tab", "section"),
+            KeyHint::new("/", "search"),
             KeyHint::new("f/s/g", "filter/sort/group"),
             KeyHint::new("m", "more"),
-            KeyHint::new("?", "help"),
         ];
         KeyHintBar::new(&hints)
             .styles(KeyHintBarStyles {
@@ -440,15 +481,37 @@ impl WorkflowStatusSurface {
                 Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
                 &Line::from_spans(vec![Span::styled(
                     format!(
-                        " Filter: {:?}  Sort: {:?}  Group: {:?}  Showing {}{}",
+                        " Filter: {:?}  Sort: {:?}  Group: {:?}  Search: {}  Showing {}{}",
                         catalog.filter,
                         catalog.sort,
                         catalog.group,
+                        catalog.search.as_deref().unwrap_or("all"),
                         catalog.runs.len(),
                         if catalog.has_more { "+" } else { "" }
                     ),
                     theme.muted,
                 )]),
+            );
+        }
+        if area.height > 2 {
+            let (message, style) = self.catalog_error.as_ref().map_or_else(
+                || {
+                    if self.catalog_loading && self.catalog_stale {
+                        (
+                            "Refreshing catalog · showing stale results".to_string(),
+                            theme.warning,
+                        )
+                    } else if self.catalog_loading {
+                        ("Loading workflow catalog…".to_string(), theme.info)
+                    } else {
+                        (self.live_status.clone(), theme.warning)
+                    }
+                },
+                |error| (format!("Catalog refresh failed · {error}"), theme.error),
+            );
+            frame.write_line(
+                Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+                &Line::from_spans(vec![Span::styled(message, style)]),
             );
         }
     }
@@ -461,6 +524,20 @@ impl WorkflowStatusSurface {
         catalog: &bcode_workflow_view_models::WorkflowCatalogView,
     ) {
         if area.is_empty() {
+            return;
+        }
+        if catalog.runs.is_empty() {
+            let message = if catalog.search.is_some()
+                || catalog.filter != bcode_workflow_view_models::WorkflowCatalogFilter::All
+            {
+                "No workflow runs match the current query"
+            } else {
+                "No workflow runs yet"
+            };
+            frame.write_line(
+                Rect::new(area.x, area.y, area.width, 1),
+                &Line::from_spans(vec![Span::styled(message, theme.muted)]),
+            );
             return;
         }
         let columns = [
@@ -532,27 +609,42 @@ impl WorkflowStatusSurface {
         let state = PaneState::new(area);
         pane.render(&state, frame);
         let inner = pane.inner_area(&state);
-        let lines = self.selected_run_view().map_or_else(
-            || vec![Line::from("Loading selected run…")],
-            |run| {
-                run.nodes
-                    .iter()
-                    .map(|node| {
-                        let marker =
-                            if self.selected_node_id.as_deref() == Some(node.node_id.as_str()) {
+        let lines = if let Some(run_id) = self.selected_run_id.as_deref()
+            && let Some(error) = self.detail_errors.get(run_id)
+        {
+            vec![Line::from_spans(vec![Span::styled(
+                format!("Run detail unavailable · {error}"),
+                theme.error,
+            )])]
+        } else if self.detail_loading_run_id.as_deref() == self.selected_run_id.as_deref() {
+            vec![Line::from_spans(vec![Span::styled(
+                "Loading selected run…",
+                theme.muted,
+            )])]
+        } else {
+            self.selected_run_view().map_or_else(
+                || vec![Line::from("Select a workflow run")],
+                |run| {
+                    run.nodes
+                        .iter()
+                        .map(|node| {
+                            let marker = if self.selected_node_id.as_deref()
+                                == Some(node.node_id.as_str())
+                            {
                                 "▶"
                             } else {
                                 " "
                             };
-                        let style = workflow_node_style(&node.status, theme);
-                        Line::from_spans(vec![Span::styled(
-                            format!("{marker} {}  {:?}", node.name, node.status),
-                            style,
-                        )])
-                    })
-                    .collect()
-            },
-        );
+                            let style = workflow_node_style(&node.status, theme);
+                            Line::from_spans(vec![Span::styled(
+                                format!("{marker} {}  {:?}", node.name, node.status),
+                                style,
+                            )])
+                        })
+                        .collect()
+                },
+            )
+        };
         TextView::new(&lines)
             .policy(TextViewPolicy::bare())
             .styles(TextViewStyles {
@@ -698,6 +790,7 @@ impl WorkflowStatusSurface {
         self.selected_attempt_id = None;
         self.selected_output_id = None;
         self.selected_child_session_id = None;
+        self.detail_errors.remove(&run_id);
         self.detail_loading_run_id = Some(run_id.clone());
         PluginTuiAction::SelectWorkflowRun { run_id }
     }
@@ -761,6 +854,36 @@ impl WorkflowStatusSurface {
         let Event::Key(key) = event else {
             return PluginTuiAction::None;
         };
+        if let Some(buffer) = self.catalog_search_buffer.as_mut() {
+            match key.key {
+                KeyCode::Escape => {
+                    self.catalog_search_buffer = None;
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char(character) => {
+                    buffer.push(character);
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Enter => {
+                    let search = std::mem::take(buffer);
+                    self.catalog_search_buffer = None;
+                    let Some(catalog) = self.catalog.as_ref() else {
+                        return PluginTuiAction::None;
+                    };
+                    return PluginTuiAction::UpdateWorkflowCatalogQuery {
+                        filter: catalog.filter,
+                        sort: catalog.sort,
+                        group: catalog.group,
+                        search: (!search.trim().is_empty()).then_some(search),
+                    };
+                }
+                _ => return PluginTuiAction::None,
+            }
+        }
         if let Some(buffer) = self.input_buffer.as_mut() {
             match key.key {
                 KeyCode::Escape => {
@@ -803,6 +926,15 @@ impl WorkflowStatusSurface {
             KeyCode::Right | KeyCode::Char('l') => self.select_adjacent_run(1),
             KeyCode::Up | KeyCode::Char('k') => self.select_adjacent_node(-1),
             KeyCode::Down | KeyCode::Char('j') => self.select_adjacent_node(1),
+            KeyCode::Char('/') => {
+                self.catalog_search_buffer = Some(
+                    self.catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.search.clone())
+                        .unwrap_or_default(),
+                );
+                PluginTuiAction::Redraw
+            }
             KeyCode::Char('f') => {
                 let Some(catalog) = self.catalog.as_ref() else {
                     return PluginTuiAction::None;
@@ -959,7 +1091,7 @@ impl WorkflowStatusSurface {
         let pane_state = PaneState::new(area);
         pane.render(&pane_state, frame);
         let content = pane.inner_area(&pane_state);
-        if self.catalog.is_some() {
+        if self.subscription_requested || self.catalog.is_some() {
             self.render_workspace(content, frame, theme);
             return;
         }
@@ -1019,15 +1151,34 @@ impl PluginTuiSurface for WorkflowStatusSurface {
         while let Ok(update) = updates.try_recv() {
             changed = true;
             match update {
+                PluginTuiSurfaceUpdate::WorkflowCatalogLoading { stale } => {
+                    self.catalog_loading = true;
+                    self.catalog_stale = stale;
+                    self.catalog_error = None;
+                }
                 PluginTuiSurfaceUpdate::WorkflowCatalog(catalog) => {
                     if let Err(error) = catalog.validate_version() {
                         self.live_status = error.to_string();
                         continue;
                     }
-                    let prior_selection = self.selected_run_id.clone();
-                    self.selected_run_id = prior_selection
-                        .filter(|run_id| catalog.runs.iter().any(|run| &run.run_id == run_id))
+                    let previous_run_id = self.selected_run_id.clone();
+                    self.selected_run_id = previous_run_id
+                        .as_ref()
+                        .filter(|run_id| catalog.runs.iter().any(|run| &run.run_id == *run_id))
+                        .cloned()
                         .or_else(|| catalog.runs.first().map(|run| run.run_id.clone()));
+                    if self.selected_run_id != previous_run_id {
+                        self.selected_node_id = None;
+                        self.selected_wait_id = None;
+                        self.selected_approval_id = None;
+                        self.selected_attempt_id = None;
+                        self.selected_output_id = None;
+                        self.selected_child_session_id = None;
+                        self.detail_loading_run_id = self.selected_run_id.clone();
+                    }
+                    self.catalog_loading = false;
+                    self.catalog_stale = false;
+                    self.catalog_error = None;
                     self.catalog = Some(catalog);
                     self.live_status = "live".to_string();
                 }
@@ -1056,7 +1207,15 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                         catalog.next_cursor = page.next_cursor;
                         catalog.has_more = page.has_more;
                     }
+                    self.catalog_loading = false;
+                    self.catalog_stale = false;
+                    self.catalog_error = None;
                     self.live_status = "live".to_string();
+                }
+                PluginTuiSurfaceUpdate::WorkflowCatalogError { message } => {
+                    self.catalog_loading = false;
+                    self.catalog_stale = self.catalog.is_some();
+                    self.catalog_error = Some(message);
                 }
                 PluginTuiSurfaceUpdate::WorkflowRun(view) => {
                     if let Err(error) = view.validate_version() {
@@ -1069,6 +1228,7 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                     }
                     if self.selected_run_id.as_deref() == Some(run_id.as_str()) {
                         self.detail_loading_run_id = None;
+                        self.detail_errors.remove(&run_id);
                         self.selected_node_id = self
                             .selected_node_id
                             .take()
@@ -1151,7 +1311,14 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                     self.live_status = "live".to_string();
                 }
                 PluginTuiSurfaceUpdate::WorkflowRunLoading { run_id } => {
+                    self.detail_errors.remove(&run_id);
                     self.detail_loading_run_id = Some(run_id);
+                }
+                PluginTuiSurfaceUpdate::WorkflowRunError { run_id, message } => {
+                    if self.detail_loading_run_id.as_deref() == Some(run_id.as_str()) {
+                        self.detail_loading_run_id = None;
+                    }
+                    self.detail_errors.insert(run_id, message);
                 }
                 PluginTuiSurfaceUpdate::SelectWorkflowRun { .. } => {}
                 PluginTuiSurfaceUpdate::ResyncRequired => {
@@ -1170,7 +1337,7 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
-        if self.catalog.is_some() {
+        if self.subscription_requested || self.catalog.is_some() {
             return self.handle_control_center_event(event);
         }
         let approval_count =
@@ -2218,8 +2385,13 @@ mod tests {
             selected_output_id: Some("output-1".to_string()),
             selected_child_session_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
             detail_loading_run_id: None,
+            catalog_loading: false,
+            catalog_stale: false,
+            catalog_error: None,
+            detail_errors: std::collections::BTreeMap::new(),
             active_detail_tab: 0,
             input_buffer: None,
+            catalog_search_buffer: None,
             updates: None,
             catalog: Some(bcode_workflow_view_models::WorkflowCatalogView {
                 version: bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,
@@ -2381,6 +2553,108 @@ mod tests {
             Some("run-2"),
             "run navigation stays bounded"
         );
+    }
+
+    #[test]
+    fn catalog_search_preserves_query_controls_and_supports_clearing() {
+        let mut surface = projected_surface();
+        let key =
+            |character| Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char(character)));
+        assert_eq!(
+            surface.handle_control_center_event(&key('/')),
+            PluginTuiAction::Redraw
+        );
+        for character in ['r', 'e', 'v', 'i', 'e', 'w'] {
+            assert_eq!(
+                surface.handle_control_center_event(&key(character)),
+                PluginTuiAction::Redraw
+            );
+        }
+        assert!(matches!(
+            surface.handle_control_center_event(&Event::Key(
+                bmux_keyboard::KeyStroke::simple(KeyCode::Enter)
+            )),
+            PluginTuiAction::UpdateWorkflowCatalogQuery {
+                filter: bcode_workflow_view_models::WorkflowCatalogFilter::All,
+                sort: bcode_workflow_view_models::WorkflowCatalogSort::UpdatedAt,
+                group: bcode_workflow_view_models::WorkflowCatalogGroup::None,
+                search: Some(ref search),
+            } if search == "review"
+        ));
+
+        surface.catalog.as_mut().expect("catalog").search = Some("review".to_string());
+        assert_eq!(
+            surface.handle_control_center_event(&key('/')),
+            PluginTuiAction::Redraw
+        );
+        for _ in 0..6 {
+            assert_eq!(
+                surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                    KeyCode::Backspace
+                ))),
+                PluginTuiAction::Redraw
+            );
+        }
+        assert!(matches!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Enter
+            ))),
+            PluginTuiAction::UpdateWorkflowCatalogQuery { search: None, .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_snapshot_reconciles_stable_selection_without_retargeting_detail() {
+        let mut surface = projected_surface();
+        surface.selected_run_id = Some("removed-run".to_string());
+        surface.selected_node_id = Some("removed-node".to_string());
+        surface.selected_wait_id = Some(("removed-node".to_string(), "activation".to_string()));
+        let catalog = surface.catalog.clone().expect("catalog");
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        surface.attach_updates(receiver);
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog))
+            .expect("catalog update");
+
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert_eq!(surface.selected_run_id.as_deref(), Some("run-1"));
+        assert!(surface.selected_node_id.is_none());
+        assert!(surface.selected_wait_id.is_none());
+        assert_eq!(surface.detail_loading_run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn loading_and_request_errors_are_scoped_without_discarding_stale_data() {
+        let mut surface = projected_surface();
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        surface.attach_updates(receiver);
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowCatalogLoading { stale: true })
+            .expect("loading update");
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowCatalogError {
+                message: "catalog unavailable".to_string(),
+            })
+            .expect("catalog error");
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowRunError {
+                run_id: "run-1".to_string(),
+                message: "detail unavailable".to_string(),
+            })
+            .expect("detail error");
+
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert!(surface.catalog.is_some(), "stale catalog remains visible");
+        assert_eq!(
+            surface.catalog_error.as_deref(),
+            Some("catalog unavailable")
+        );
+        assert!(surface.catalog_stale);
+        assert_eq!(
+            surface.detail_errors.get("run-1").map(String::as_str),
+            Some("detail unavailable")
+        );
+        assert_ne!(surface.live_status, "live updates unavailable");
     }
 
     #[test]
