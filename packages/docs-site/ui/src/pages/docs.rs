@@ -296,6 +296,14 @@ mod tests {
         let doc = generate_config_reference();
 
         assert!(doc.contains("current_datetime"));
+        assert!(doc.contains("execution_environment"));
+        assert!(doc.contains("hosting_environment"));
+        assert!(doc.contains("locale"));
+        assert!(doc.contains("git_revision"));
+        assert!(doc.contains("runtime_mode"));
+        assert!(doc.contains("toolchain_context"));
+        assert!(doc.contains("worktree_context"));
+        assert!(doc.contains("config_profile"));
         assert!(doc.contains("current local date, time, and UTC offset"));
         assert!(doc.contains("enabled"));
         assert!(doc.contains("config.<plugin-id>.<setting>"));

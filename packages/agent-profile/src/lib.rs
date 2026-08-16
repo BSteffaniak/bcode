@@ -90,6 +90,9 @@ pub struct AgentContextResponse {
     /// Optional system-prompt suffix contributed by the active agent.
     #[serde(default)]
     pub system_prompt_suffix: Option<String>,
+    /// Optional generic operating-mode label, such as `read_only` or `implementation`.
+    #[serde(default)]
+    pub operating_mode: Option<String>,
     /// Optional exact list of tool names exposed to the model.
     #[serde(default)]
     pub enabled_tools: Option<Vec<String>>,

@@ -187,6 +187,14 @@ git_status_max_chars = 4000 # bounded by default; configurable
 
 [system_prompt.sections]
 current_datetime = true
+execution_environment = true
+hosting_environment = true
+locale = true
+git_revision = true
+runtime_mode = true
+toolchain_context = false # opt in; invokes bounded version commands
+worktree_context = true
+config_profile = true
 repository_invariants = true
 repository_context = true
 dynamic_repository_context = true
@@ -200,6 +208,8 @@ Behavior:
 * `mode = "replace"` uses `text` as the base prompt.
 * Enabled sections are appended to either base mode.
 * `system_prompt.sections.current_datetime = true` adds the daemon's current local timestamp, timezone abbreviation, and UTC offset to request-only model context. Set it to `false` to disable the section independently of repository context.
+* `execution_environment`, `hosting_environment`, `locale`, `git_revision`, `runtime_mode`, `worktree_context`, and `config_profile` add bounded, request-only context and are independently enabled by default. Execution context excludes usernames, hostnames, addresses, and environment-variable values other than locale, coarse environment-presence signals, and the shell executable name.
+* `toolchain_context` is disabled by default. Enabling it runs a fixed set of version commands with per-command time and output limits; failures and unavailable commands are omitted.
 * `system_prompt.sections.repository_invariants` controls complete-catalog placement in full mode; the `[invariants] enabled` setting is the authoritative master switch across both modes. Replacement mode does not disable enabled invariant guidance.
 * Repository instructions and invariants are untruncated by default. Set `system_prompt.repository_instructions_max_chars` or `system_prompt.repository_invariants_max_chars` to apply independent character limits; configured invariant truncation is explicitly marked in model context.
 * Git status is generated repository context and remains bounded by default through configurable `system_prompt.git_status_max_chars`. There is no hidden aggregate cap on dynamic repository context.

@@ -142,7 +142,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -153,6 +153,7 @@ use thiserror::Error;
 use tokio::io::{WriteHalf, split};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+use wait_timeout::ChildExt as _;
 
 const CLIENT_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const CATALOG_EVENT_BROADCAST_BATCH_SIZE: usize = 16;
@@ -23970,7 +23971,16 @@ async fn prepare_static_model_turn_context(
         .lock()
         .await
         .remove(&session_id);
-    let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
+    let dynamic_system_context = build_dynamic_system_context(
+        &working_directory,
+        &config.system_prompt.sections,
+        &agent_id,
+        agent_context
+            .as_ref()
+            .and_then(|context| context.operating_mode.as_deref()),
+        config.composition.active_profile.as_deref(),
+    );
+    let (system_prompt, repository_system_context) = build_coding_system_prompt_parts(
         &working_directory,
         &config.system_prompt,
         matches!(
@@ -23983,13 +23993,13 @@ async fn prepare_static_model_turn_context(
         Some(&skill_catalog),
     );
     let mut system_messages = Vec::new();
-    if !dynamic_system_context.is_empty() {
-        system_messages.push(ModelMessage {
-            role: MessageRole::System,
-            content: vec![ContentBlock::Text {
-                text: dynamic_system_context,
-            }],
-        });
+    for context in [dynamic_system_context, repository_system_context] {
+        if !context.is_empty() {
+            system_messages.push(ModelMessage {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Text { text: context }],
+            });
+        }
     }
     if matches!(
         invariant_mode,
@@ -25569,25 +25579,6 @@ fn build_coding_system_prompt_parts(
     agent_prompt_suffix: Option<&str>,
     skill_catalog: Option<&str>,
 ) -> (String, String) {
-    let current_datetime = format_current_datetime(&chrono::Local::now());
-    build_coding_system_prompt_parts_at(
-        cwd,
-        config,
-        include_full_invariants,
-        agent_prompt_suffix,
-        skill_catalog,
-        &current_datetime,
-    )
-}
-
-fn build_coding_system_prompt_parts_at(
-    cwd: &Path,
-    config: &bcode_config::SystemPromptConfig,
-    include_full_invariants: bool,
-    agent_prompt_suffix: Option<&str>,
-    skill_catalog: Option<&str>,
-    current_datetime: &str,
-) -> (String, String) {
     let (stable_context, dynamic_context) = build_repository_context_parts(
         cwd,
         config
@@ -25627,9 +25618,6 @@ fn build_coding_system_prompt_parts_at(
     }
 
     let mut dynamic_sections = Vec::new();
-    if config.sections.current_datetime {
-        dynamic_sections.push(current_datetime.to_string());
-    }
     if config.sections.dynamic_repository_context {
         dynamic_sections.push(dynamic_context);
     }
@@ -25654,6 +25642,260 @@ fn format_datetime_context(timestamp: &str, timezone: &str, utc_offset: &str) ->
     format!(
         "Current date and time:\n* Local timestamp: {timestamp}\n* Time zone: {timezone} (UTC{utc_offset})"
     )
+}
+
+const DYNAMIC_COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
+const DYNAMIC_COMMAND_BUDGET: Duration = Duration::from_millis(1_500);
+const DYNAMIC_COMMAND_MAX_CHARS: usize = 160;
+const DYNAMIC_VALUE_MAX_CHARS: usize = 80;
+
+fn build_dynamic_system_context(
+    cwd: &Path,
+    sections: &bcode_config::SystemPromptSectionsConfig,
+    agent_id: &str,
+    operating_mode: Option<&str>,
+    config_profile: Option<&str>,
+) -> String {
+    let deadline = Instant::now() + DYNAMIC_COMMAND_BUDGET;
+    let mut context = Vec::new();
+    if sections.current_datetime {
+        context.push(format_current_datetime(&chrono::Local::now()));
+    }
+    if sections.execution_environment {
+        context.push(format_execution_environment());
+    }
+    if sections.hosting_environment {
+        context.push(format_hosting_environment());
+    }
+    if sections.locale {
+        context.push(format_locale_context());
+    }
+    if sections.git_revision
+        && let Some(git) = format_git_revision_context(cwd, deadline)
+    {
+        context.push(git);
+    }
+    if sections.runtime_mode {
+        context.push(format_runtime_mode_context(agent_id, operating_mode));
+    }
+    if sections.toolchain_context
+        && let Some(toolchains) = format_toolchain_context(cwd, deadline)
+    {
+        context.push(toolchains);
+    }
+    if sections.worktree_context
+        && let Some(worktree) = format_worktree_context(cwd, deadline)
+    {
+        context.push(worktree);
+    }
+    if sections.config_profile
+        && let Some(profile) = config_profile.filter(|profile| !profile.trim().is_empty())
+    {
+        context.push(format!(
+            "Configuration context:\n* Active profile: {profile}"
+        ));
+    }
+    context.join("\n\n")
+}
+
+fn bounded_dynamic_value(value: &str) -> String {
+    truncate_text(value.trim(), DYNAMIC_VALUE_MAX_CHARS)
+}
+
+fn format_execution_environment() -> String {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .and_then(|path| Path::new(&path).file_name()?.to_str().map(str::to_owned))
+        .map_or_else(
+            || "unknown".to_string(),
+            |value| bounded_dynamic_value(&value),
+        );
+    format!(
+        "Execution environment:\n* Operating system: {}\n* Architecture: {}\n* Default shell: {shell}\n* Environment: local",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+fn format_hosting_environment() -> String {
+    let remote = if std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+    {
+        "ssh"
+    } else {
+        "local"
+    };
+    let container = if Path::new("/.dockerenv").exists() {
+        "docker"
+    } else if std::env::var_os("container").is_some() {
+        "container"
+    } else {
+        "none detected"
+    };
+    let subsystem = if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        "wsl"
+    } else {
+        "native"
+    };
+    format!(
+        "Hosting environment:\n* Connection: {remote}\n* Container: {container}\n* Platform layer: {subsystem}"
+    )
+}
+
+fn format_locale_context() -> String {
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map_or_else(
+            || "unknown".to_string(),
+            |value| bounded_dynamic_value(&value),
+        );
+    let language = std::env::var("LANGUAGE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(|| locale.clone(), |value| bounded_dynamic_value(&value));
+    format!("Locale context:\n* Locale: {locale}\n* Preferred language: {language}")
+}
+
+fn format_runtime_mode_context(agent_id: &str, operating_mode: Option<&str>) -> String {
+    let operating_mode = operating_mode.unwrap_or("profile_defined");
+    format!("Runtime context:\n* Agent profile: {agent_id}\n* Operating mode: {operating_mode}")
+}
+
+fn format_git_revision_context(cwd: &Path, deadline: Instant) -> Option<String> {
+    let root = PathBuf::from(run_bounded_command(
+        cwd,
+        "git",
+        &["rev-parse", "--show-toplevel"],
+        deadline,
+    )?);
+    let head = run_bounded_command(&root, "git", &["rev-parse", "--short=12", "HEAD"], deadline)?;
+    let mut lines = vec![
+        "Git revision context:".to_string(),
+        format!("* HEAD: {head}"),
+    ];
+    let upstream_ref = format!("@{{{}}}", "upstream");
+    if let Some(upstream) = run_bounded_command(
+        &root,
+        "git",
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            &upstream_ref,
+        ],
+        deadline,
+    ) {
+        lines.push(format!("* Upstream: {upstream}"));
+        let revision_range = ["HEAD...", upstream_ref.as_str()].concat();
+        if let Some(counts) = run_bounded_command(
+            &root,
+            "git",
+            &["rev-list", "--left-right", "--count", &revision_range],
+            deadline,
+        ) {
+            let mut counts = counts.split_whitespace();
+            if let (Some(ahead), Some(behind)) = (counts.next(), counts.next()) {
+                lines.push(format!("* Upstream status: {ahead} ahead, {behind} behind"));
+            }
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+fn format_worktree_context(cwd: &Path, deadline: Instant) -> Option<String> {
+    let root = PathBuf::from(run_bounded_command(
+        cwd,
+        "git",
+        &["rev-parse", "--show-toplevel"],
+        deadline,
+    )?);
+    let git_dir = PathBuf::from(run_bounded_command(
+        &root,
+        "git",
+        &["rev-parse", "--absolute-git-dir"],
+        deadline,
+    )?);
+    let common_dir = PathBuf::from(run_bounded_command(
+        &root,
+        "git",
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        deadline,
+    )?);
+    let linked = git_dir != common_dir;
+    Some(format!(
+        "Git worktree context:\n* Checkout kind: {}\n* Worktree root: {}",
+        if linked {
+            "linked worktree"
+        } else {
+            "primary checkout"
+        },
+        display(&root, cwd)
+    ))
+}
+
+fn format_toolchain_context(cwd: &Path, deadline: Instant) -> Option<String> {
+    let commands = [
+        ("Rust", "rustc", &["--version"] as &[&str]),
+        ("Cargo", "cargo", &["--version"] as &[&str]),
+        ("Node.js", "node", &["--version"] as &[&str]),
+        ("Python", "python3", &["--version"] as &[&str]),
+    ];
+    let versions = commands
+        .into_iter()
+        .filter_map(|(label, program, args)| {
+            run_bounded_command(cwd, program, args, deadline)
+                .map(|version| format!("* {label}: {version}"))
+        })
+        .collect::<Vec<_>>();
+    (!versions.is_empty()).then(|| format!("Detected toolchains:\n{}", versions.join("\n")))
+}
+
+fn run_bounded_command(
+    cwd: &Path,
+    program: &str,
+    args: &[&str],
+    deadline: Instant,
+) -> Option<String> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    let timeout = remaining.min(DYNAMIC_COMMAND_TIMEOUT);
+    if timeout.is_zero() {
+        return None;
+    }
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let Some(status) = child.wait_timeout(timeout).ok()? else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut output = String::new();
+    child
+        .stdout
+        .take()?
+        .take(1_024)
+        .read_to_string(&mut output)
+        .ok()?;
+    if output.trim().is_empty()
+        && let Some(stderr) = child.stderr.take()
+    {
+        stderr.take(1_024).read_to_string(&mut output).ok()?;
+    }
+    let output = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!output.is_empty()).then(|| truncate_text(&output, DYNAMIC_COMMAND_MAX_CHARS))
 }
 
 fn read_repository_invariants(cwd: &Path, max_chars: Option<usize>) -> Option<String> {
@@ -47669,50 +47911,71 @@ library = "test"
         assert!(stable.contains("Shared rendering remains renderer-neutral"));
         assert!(stable.contains("Stable repository context:"));
         assert!(stable.contains("agent suffix"));
-        assert!(dynamic.contains("Current date and time:"));
         assert!(dynamic.contains("Dynamic repository context:"));
         assert!(!stable.contains("Current date and time:"));
         assert!(!stable.contains("Git status:"));
     }
 
     #[test]
-    fn coding_system_prompt_datetime_is_request_only_and_independently_configurable() {
+    fn dynamic_system_context_is_request_only_and_independently_configurable() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let fixed_datetime = format_datetime_context("2026-08-16T14:02:19-04:00", "EDT", "-04:00");
-        let mut config = bcode_config::SystemPromptConfig::default();
-        config.sections.dynamic_repository_context = false;
+        let mut sections = bcode_config::SystemPromptSectionsConfig {
+            current_datetime: false,
+            git_revision: false,
+            ..bcode_config::SystemPromptSectionsConfig::default()
+        };
 
-        let (stable, dynamic) =
-            build_coding_system_prompt_parts_at(&cwd, &config, false, None, None, &fixed_datetime);
+        let dynamic =
+            build_dynamic_system_context(&cwd, &sections, "plan", Some("read_only"), Some("dev"));
 
-        assert!(!stable.contains("Current date and time:"));
-        assert!(dynamic.contains("2026-08-16T14:02:19-04:00"));
-        assert!(dynamic.contains("EDT (UTC-04:00)"));
-        assert!(!dynamic.contains("Dynamic repository context:"));
-
-        config.sections.current_datetime = false;
-        config.sections.dynamic_repository_context = true;
-        let (_, dynamic) =
-            build_coding_system_prompt_parts_at(&cwd, &config, false, None, None, &fixed_datetime);
+        assert!(dynamic.contains("Execution environment:"));
+        assert!(dynamic.contains("Hosting environment:"));
+        assert!(dynamic.contains("Locale context:"));
+        assert!(dynamic.contains("Agent profile: plan"));
+        assert!(dynamic.contains("Operating mode: read_only"));
+        assert!(dynamic.contains("Active profile: dev"));
         assert!(!dynamic.contains("Current date and time:"));
-        assert!(dynamic.contains("Dynamic repository context:"));
+        assert!(!dynamic.contains("Detected toolchains:"));
+
+        sections.execution_environment = false;
+        sections.hosting_environment = false;
+        sections.locale = false;
+        sections.runtime_mode = false;
+        sections.worktree_context = false;
+        sections.config_profile = false;
+        assert!(build_dynamic_system_context(&cwd, &sections, "build", None, None).is_empty());
     }
 
     #[test]
-    fn replacement_system_prompt_includes_enabled_datetime() {
+    fn dynamic_context_formatters_are_bounded_and_non_identifying() {
+        let environment = format_execution_environment();
+        let locale = format_locale_context();
+        let runtime = format_runtime_mode_context("build", Some("implementation"));
+
+        assert!(environment.contains(std::env::consts::OS));
+        assert!(environment.contains(std::env::consts::ARCH));
+        assert!(!environment.contains("Hostname"));
+        assert!(!environment.contains("Username"));
+        assert!(locale.contains("Locale:"));
+        assert!(runtime.contains("Agent profile: build"));
+        assert!(runtime.contains("Operating mode: implementation"));
+    }
+
+    #[test]
+    fn replacement_system_prompt_keeps_dynamic_context_separate() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = bcode_config::SystemPromptConfig {
             mode: bcode_config::SystemPromptMode::Replace,
             text: Some("custom base".to_owned()),
             ..bcode_config::SystemPromptConfig::default()
         };
-        let fixed_datetime = format_datetime_context("2026-01-02T03:04:05+00:00", "UTC", "+00:00");
 
-        let (stable, dynamic) =
-            build_coding_system_prompt_parts_at(&cwd, &config, false, None, None, &fixed_datetime);
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, false, None, None);
+        let datetime = format_datetime_context("2026-01-02T03:04:05+00:00", "UTC", "+00:00");
 
         assert!(stable.starts_with("custom base"));
-        assert!(dynamic.contains("2026-01-02T03:04:05+00:00"));
+        assert!(!stable.contains("Current date and time:"));
+        assert!(datetime.contains("2026-01-02T03:04:05+00:00"));
     }
 
     #[test]

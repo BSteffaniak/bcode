@@ -188,8 +188,17 @@ fn agent_context(request: &ServiceRequest) -> ServiceResponse {
         BUILD_AGENT => "[BUILD AGENT ACTIVE]\n\nImplementation is allowed subject to Bcode permissions, active agent policy, and project instructions. Use tools normally, keep changes focused, and report validation. When the user asks what text an image or screenshot says, use `ocr.extract` instead of `filesystem.read`.".to_string(),
         other => format!("[AGENT ACTIVE: {other}]\n\nFollow this agent's configured tool and permission policy."),
     });
+    let operating_mode = Some(
+        match request.agent_id.as_str() {
+            PLAN_AGENT => "read_only",
+            BUILD_AGENT => "implementation",
+            _ => "profile_defined",
+        }
+        .to_string(),
+    );
     json_response(&AgentContextResponse {
         system_prompt_suffix,
+        operating_mode,
         enabled_tools,
     })
 }

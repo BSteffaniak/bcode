@@ -1282,6 +1282,30 @@ pub struct SystemPromptSectionsConfig {
     /// Include the current local date, time, and UTC offset in request-only context.
     #[serde(default = "default_true")]
     pub current_datetime: bool,
+    /// Include non-identifying operating-system, architecture, and shell context.
+    #[serde(default = "default_true")]
+    pub execution_environment: bool,
+    /// Include non-secret local/container/remote execution classification.
+    #[serde(default = "default_true")]
+    pub hosting_environment: bool,
+    /// Include locale and preferred-language context.
+    #[serde(default = "default_true")]
+    pub locale: bool,
+    /// Include bounded Git revision and upstream context.
+    #[serde(default = "default_true")]
+    pub git_revision: bool,
+    /// Include the active agent profile and generic operating mode.
+    #[serde(default = "default_true")]
+    pub runtime_mode: bool,
+    /// Include bounded toolchain versions discovered by invoking known version commands.
+    #[serde(default)]
+    pub toolchain_context: bool,
+    /// Include whether the current checkout is a linked Git worktree.
+    #[serde(default = "default_true")]
+    pub worktree_context: bool,
+    /// Include the active declarative configuration profile name when one is selected.
+    #[serde(default = "default_true")]
+    pub config_profile: bool,
     /// Include repository invariants independently of ordinary repository context.
     #[serde(default = "default_true")]
     pub repository_invariants: bool,
@@ -1303,6 +1327,14 @@ impl Default for SystemPromptSectionsConfig {
     fn default() -> Self {
         Self {
             current_datetime: true,
+            execution_environment: true,
+            hosting_environment: true,
+            locale: true,
+            git_revision: true,
+            runtime_mode: true,
+            toolchain_context: false,
+            worktree_context: true,
+            config_profile: true,
             repository_invariants: true,
             repository_context: true,
             dynamic_repository_context: true,
@@ -6001,6 +6033,30 @@ fn write_system_prompt_toml(output: &mut String, system_prompt: &SystemPromptCon
         if !system_prompt.sections.current_datetime {
             output.push_str("current_datetime = false\n");
         }
+        if !system_prompt.sections.execution_environment {
+            output.push_str("execution_environment = false\n");
+        }
+        if !system_prompt.sections.hosting_environment {
+            output.push_str("hosting_environment = false\n");
+        }
+        if !system_prompt.sections.locale {
+            output.push_str("locale = false\n");
+        }
+        if !system_prompt.sections.git_revision {
+            output.push_str("git_revision = false\n");
+        }
+        if !system_prompt.sections.runtime_mode {
+            output.push_str("runtime_mode = false\n");
+        }
+        if system_prompt.sections.toolchain_context {
+            output.push_str("toolchain_context = true\n");
+        }
+        if !system_prompt.sections.worktree_context {
+            output.push_str("worktree_context = false\n");
+        }
+        if !system_prompt.sections.config_profile {
+            output.push_str("config_profile = false\n");
+        }
         if !system_prompt.sections.repository_invariants {
             output.push_str("repository_invariants = false\n");
         }
@@ -8817,6 +8873,14 @@ disabled = ["vim_edit.apply"]
         config.system_prompt.repository_invariants_max_chars = std::num::NonZeroUsize::new(8_000);
         config.system_prompt.git_status_max_chars = std::num::NonZeroUsize::new(12_000).unwrap();
         config.system_prompt.sections.current_datetime = false;
+        config.system_prompt.sections.execution_environment = false;
+        config.system_prompt.sections.hosting_environment = false;
+        config.system_prompt.sections.locale = false;
+        config.system_prompt.sections.git_revision = false;
+        config.system_prompt.sections.runtime_mode = false;
+        config.system_prompt.sections.toolchain_context = true;
+        config.system_prompt.sections.worktree_context = false;
+        config.system_prompt.sections.config_profile = false;
         config.system_prompt.sections.repository_invariants = false;
         config.skills.max_skill_file_bytes = std::num::NonZeroU64::new(512_000).unwrap();
         config.skills.preview_max_chars = std::num::NonZeroUsize::new(4_000).unwrap();
@@ -8851,6 +8915,20 @@ disabled = ["vim_edit.apply"]
             "{rendered}"
         );
         assert!(rendered.contains("current_datetime = false"), "{rendered}");
+        assert!(
+            rendered.contains("execution_environment = false"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("hosting_environment = false"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("locale = false"), "{rendered}");
+        assert!(rendered.contains("git_revision = false"), "{rendered}");
+        assert!(rendered.contains("runtime_mode = false"), "{rendered}");
+        assert!(rendered.contains("toolchain_context = true"), "{rendered}");
+        assert!(rendered.contains("worktree_context = false"), "{rendered}");
+        assert!(rendered.contains("config_profile = false"), "{rendered}");
 
         let parsed: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
         assert_eq!(
@@ -8870,15 +8948,39 @@ disabled = ["vim_edit.apply"]
         );
         assert!(!parsed.system_prompt.sections.repository_invariants);
         assert!(!parsed.system_prompt.sections.current_datetime);
+        assert!(!parsed.system_prompt.sections.execution_environment);
+        assert!(!parsed.system_prompt.sections.hosting_environment);
+        assert!(!parsed.system_prompt.sections.locale);
+        assert!(!parsed.system_prompt.sections.git_revision);
+        assert!(!parsed.system_prompt.sections.runtime_mode);
+        assert!(parsed.system_prompt.sections.toolchain_context);
+        assert!(!parsed.system_prompt.sections.worktree_context);
+        assert!(!parsed.system_prompt.sections.config_profile);
     }
 
     #[test]
     fn current_datetime_prompt_section_defaults_to_enabled_when_omitted() {
         let default = BcodeConfig::default();
         assert!(default.system_prompt.sections.current_datetime);
+        assert!(default.system_prompt.sections.execution_environment);
+        assert!(default.system_prompt.sections.hosting_environment);
+        assert!(default.system_prompt.sections.locale);
+        assert!(default.system_prompt.sections.git_revision);
+        assert!(default.system_prompt.sections.runtime_mode);
+        assert!(!default.system_prompt.sections.toolchain_context);
+        assert!(default.system_prompt.sections.worktree_context);
+        assert!(default.system_prompt.sections.config_profile);
 
         let parsed: BcodeConfig = toml::from_str("[system_prompt.sections]\n").expect("config");
         assert!(parsed.system_prompt.sections.current_datetime);
+        assert!(parsed.system_prompt.sections.execution_environment);
+        assert!(parsed.system_prompt.sections.hosting_environment);
+        assert!(parsed.system_prompt.sections.locale);
+        assert!(parsed.system_prompt.sections.git_revision);
+        assert!(parsed.system_prompt.sections.runtime_mode);
+        assert!(!parsed.system_prompt.sections.toolchain_context);
+        assert!(parsed.system_prompt.sections.worktree_context);
+        assert!(parsed.system_prompt.sections.config_profile);
     }
 
     #[test]
