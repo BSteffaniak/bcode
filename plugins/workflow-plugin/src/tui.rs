@@ -178,6 +178,7 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 selected_run_id: None,
                 selected_node_id: None,
                 selected_wait_id: None,
+                selected_input_wait_id: None,
                 selected_approval_id: None,
                 selected_attempt_id: None,
                 selected_output_id: None,
@@ -439,6 +440,7 @@ struct WorkflowStatusSurface {
     selected_run_id: Option<String>,
     selected_node_id: Option<String>,
     selected_wait_id: Option<(String, String)>,
+    selected_input_wait_id: Option<(String, String)>,
     selected_approval_id: Option<String>,
     selected_attempt_id: Option<(String, String, u32)>,
     selected_output_id: Option<String>,
@@ -636,6 +638,19 @@ impl WorkflowStatusSurface {
             .and_then(|(node_id, activation_id)| {
                 run.waits.iter().find(|wait| {
                     wait.kind == kind
+                        && &wait.node_id == node_id
+                        && &wait.activation_id == activation_id
+                })
+            })
+    }
+
+    fn selected_input_wait(&self) -> Option<&bcode_workflow_view_models::WorkflowWaitView> {
+        let run = self.selected_run_view()?;
+        self.selected_input_wait_id
+            .as_ref()
+            .and_then(|(node_id, activation_id)| {
+                run.waits.iter().find(|wait| {
+                    wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Input
                         && &wait.node_id == node_id
                         && &wait.activation_id == activation_id
                 })
@@ -893,9 +908,9 @@ impl WorkflowStatusSurface {
             );
             return;
         }
-        let hints = [
+        let mut hints = vec![
             KeyHint::new("←/→", "run"),
-            KeyHint::new("↑/↓", "node"),
+            KeyHint::new("↑/↓", "node/item"),
             KeyHint::new("Tab", "focus/page"),
             KeyHint::new("1-4", "page"),
             KeyHint::new("[/]", "section"),
@@ -904,6 +919,33 @@ impl WorkflowStatusSurface {
             KeyHint::new("m", "more"),
             KeyHint::new("D/T/N", "definitions/templates/new"),
         ];
+        if self.workspace_focus == WorkflowWorkspaceFocus::Inspector
+            && (1..=5).contains(&self.active_detail_tab)
+        {
+            hints.insert(2, KeyHint::new("↑/↓", "select exact item"));
+        }
+        if self
+            .selected_definition_action(
+                bcode_workflow_view_models::WorkflowActionKind::ViewDefinition,
+            )
+            .is_some()
+        {
+            hints.push(KeyHint::new("V", "view definition"));
+        }
+        if self
+            .selected_definition_action(bcode_workflow_view_models::WorkflowActionKind::EditDraft)
+            .is_some()
+        {
+            hints.push(KeyHint::new("E", "edit draft"));
+        }
+        if self
+            .selected_definition_action(
+                bcode_workflow_view_models::WorkflowActionKind::ForkDefinition,
+            )
+            .is_some()
+        {
+            hints.push(KeyHint::new("F", "fork definition"));
+        }
         KeyHintBar::new(&hints)
             .styles(KeyHintBarStyles {
                 key: theme.focused,
@@ -1203,7 +1245,19 @@ impl WorkflowStatusSurface {
                 },
             )])]
         } else {
-            inspector_lines(self.selected_run_view(), self.active_detail_tab, theme)
+            inspector_lines(
+                self.selected_run_view(),
+                self.active_detail_tab,
+                InspectorSelection {
+                    input_wait: self.selected_input_wait_id.as_ref(),
+                    output: self.selected_output_id.as_deref(),
+                    attempt: self.selected_attempt_id.as_ref(),
+                    ordinary_approval: self.selected_wait_id.as_ref(),
+                    mutation_approval: self.selected_approval_id.as_deref(),
+                    child_session: self.selected_child_session_id.as_deref(),
+                },
+                theme,
+            )
         };
         TextView::new(&lines)
             .policy(TextViewPolicy::bare())
@@ -1242,7 +1296,14 @@ impl WorkflowStatusSurface {
                 ActionButton::new(format!("{:?}", action.kind), label)
             })
             .collect::<Vec<_>>();
-        let row_area = Rect::new(area.x, area.y, area.width, 1.min(area.height));
+        let row_area = Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            u16::try_from(actions.len())
+                .unwrap_or(u16::MAX)
+                .min(area.height),
+        );
         ActionRow::new(&actions)
             .styles(ActionRowStyles {
                 normal: theme.text,
@@ -1343,6 +1404,7 @@ impl WorkflowStatusSurface {
         self.selected_run_id = Some(run_id.clone());
         self.selected_node_id = None;
         self.selected_wait_id = None;
+        self.selected_input_wait_id = None;
         self.selected_approval_id = None;
         self.selected_attempt_id = None;
         self.selected_output_id = None;
@@ -1463,6 +1525,97 @@ impl WorkflowStatusSurface {
             .saturating_add_signed(offset)
             .min(run.nodes.len().saturating_sub(1));
         self.selected_node_id = Some(run.nodes[next].node_id.clone());
+        PluginTuiAction::Redraw
+    }
+
+    fn select_adjacent_detail_item(&mut self, offset: isize) -> PluginTuiAction {
+        let Some(run) = self.selected_run_view() else {
+            return PluginTuiAction::None;
+        };
+        match self.active_detail_tab {
+            1 => {
+                let candidates = run
+                    .waits
+                    .iter()
+                    .filter(|wait| wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Input)
+                    .map(|wait| (wait.node_id.clone(), wait.activation_id.clone()))
+                    .collect::<Vec<_>>();
+                self.selected_input_wait_id =
+                    adjacent_identity(&candidates, self.selected_input_wait_id.as_ref(), offset);
+            }
+            2 => {
+                let candidates = run
+                    .outputs
+                    .iter()
+                    .map(|output| output.output_id.clone())
+                    .collect::<Vec<_>>();
+                self.selected_output_id =
+                    adjacent_identity(&candidates, self.selected_output_id.as_ref(), offset);
+            }
+            3 => {
+                let candidates = run
+                    .attempts
+                    .iter()
+                    .map(|attempt| {
+                        (
+                            attempt.node_id.clone(),
+                            attempt.activation_id.clone(),
+                            attempt.attempt,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                self.selected_attempt_id =
+                    adjacent_identity(&candidates, self.selected_attempt_id.as_ref(), offset);
+            }
+            4 => {
+                let ordinary = run
+                    .waits
+                    .iter()
+                    .filter(|wait| {
+                        wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Approval
+                    })
+                    .map(|wait| (wait.node_id.clone(), wait.activation_id.clone()))
+                    .collect::<Vec<_>>();
+                let mutations = run
+                    .mutation_approvals
+                    .iter()
+                    .map(|approval| approval.approval_id.clone())
+                    .collect::<Vec<_>>();
+                let ordinary_index = self.selected_wait_id.as_ref().and_then(|selected| {
+                    ordinary.iter().position(|candidate| candidate == selected)
+                });
+                let mutation_index = self.selected_approval_id.as_ref().and_then(|selected| {
+                    mutations.iter().position(|candidate| candidate == selected)
+                });
+                let total = ordinary.len().saturating_add(mutations.len());
+                if total == 0 {
+                    self.selected_wait_id = None;
+                    self.selected_approval_id = None;
+                } else {
+                    let current = ordinary_index
+                        .or_else(|| mutation_index.map(|index| ordinary.len() + index))
+                        .unwrap_or(0);
+                    let next = adjacent_index(current, total, offset);
+                    if next < ordinary.len() {
+                        self.selected_wait_id = Some(ordinary[next].clone());
+                        self.selected_approval_id = None;
+                    } else {
+                        self.selected_wait_id = None;
+                        self.selected_approval_id = Some(mutations[next - ordinary.len()].clone());
+                    }
+                }
+            }
+            5 => {
+                let candidates = run
+                    .child_sessions
+                    .iter()
+                    .map(|session| session.session_id.clone())
+                    .collect::<Vec<_>>();
+                self.selected_child_session_id =
+                    adjacent_identity(&candidates, self.selected_child_session_id.as_ref(), offset);
+            }
+            _ => return PluginTuiAction::None,
+        }
         PluginTuiAction::Redraw
     }
 
@@ -1627,8 +1780,20 @@ impl WorkflowStatusSurface {
             KeyCode::Escape | KeyCode::Char('q') => PluginTuiAction::Close { outcome: None },
             KeyCode::Left | KeyCode::Char('h') => self.select_adjacent_run(-1),
             KeyCode::Right | KeyCode::Char('l') => self.select_adjacent_run(1),
-            KeyCode::Up | KeyCode::Char('k') => self.select_adjacent_node(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.select_adjacent_node(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.workspace_focus == WorkflowWorkspaceFocus::Inspector {
+                    self.select_adjacent_detail_item(-1)
+                } else {
+                    self.select_adjacent_node(-1)
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.workspace_focus == WorkflowWorkspaceFocus::Inspector {
+                    self.select_adjacent_detail_item(1)
+                } else {
+                    self.select_adjacent_node(1)
+                }
+            }
             KeyCode::Char('/') => {
                 self.catalog_search_buffer = Some(
                     self.catalog
@@ -1844,10 +2009,7 @@ impl WorkflowStatusSurface {
                 let Some(run) = self.selected_run_view() else {
                     return PluginTuiAction::None;
                 };
-                let Some(wait) = self
-                    .selected_wait(bcode_workflow_view_models::WorkflowWaitKind::Input)
-                    .cloned()
-                else {
+                let Some(wait) = self.selected_input_wait().cloned() else {
                     return PluginTuiAction::None;
                 };
                 self.input_form = Some(WorkflowInputForm::new(run.run.run_id.clone(), &wait));
@@ -2205,6 +2367,7 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                     if self.selected_run_id != previous_run_id {
                         self.selected_node_id = None;
                         self.selected_wait_id = None;
+                        self.selected_input_wait_id = None;
                         self.selected_approval_id = None;
                         self.selected_attempt_id = None;
                         self.selected_output_id = None;
@@ -2295,12 +2458,38 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                             .take()
                             .filter(|(node_id, activation_id)| {
                                 view.waits.iter().any(|wait| {
-                                    &wait.node_id == node_id && &wait.activation_id == activation_id
+                                    wait.kind
+                                        == bcode_workflow_view_models::WorkflowWaitKind::Approval
+                                        && &wait.node_id == node_id
+                                        && &wait.activation_id == activation_id
                                 })
                             })
                             .or_else(|| {
                                 view.waits
-                                    .first()
+                                    .iter()
+                                    .find(|wait| {
+                                        wait.kind
+                                            == bcode_workflow_view_models::WorkflowWaitKind::Approval
+                                    })
+                                    .map(|wait| (wait.node_id.clone(), wait.activation_id.clone()))
+                            });
+                        self.selected_input_wait_id = self
+                            .selected_input_wait_id
+                            .take()
+                            .filter(|(node_id, activation_id)| {
+                                view.waits.iter().any(|wait| {
+                                    wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Input
+                                        && &wait.node_id == node_id
+                                        && &wait.activation_id == activation_id
+                                })
+                            })
+                            .or_else(|| {
+                                view.waits
+                                    .iter()
+                                    .find(|wait| {
+                                        wait.kind
+                                            == bcode_workflow_view_models::WorkflowWaitKind::Input
+                                    })
                                     .map(|wait| (wait.node_id.clone(), wait.activation_id.clone()))
                             });
                         self.selected_approval_id = self
@@ -2732,9 +2921,44 @@ const fn workflow_node_style(
     }
 }
 
+fn adjacent_index(current: usize, len: usize, offset: isize) -> usize {
+    current
+        .saturating_add_signed(offset)
+        .min(len.saturating_sub(1))
+}
+
+fn adjacent_identity<T: Clone + PartialEq>(
+    candidates: &[T],
+    selected: Option<&T>,
+    offset: isize,
+) -> Option<T> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let current = selected
+        .and_then(|selected| {
+            candidates
+                .iter()
+                .position(|candidate| candidate == selected)
+        })
+        .unwrap_or(0);
+    Some(candidates[adjacent_index(current, candidates.len(), offset)].clone())
+}
+
+#[derive(Clone, Copy, Default)]
+struct InspectorSelection<'a> {
+    input_wait: Option<&'a (String, String)>,
+    output: Option<&'a str>,
+    attempt: Option<&'a (String, String, u32)>,
+    ordinary_approval: Option<&'a (String, String)>,
+    mutation_approval: Option<&'a str>,
+    child_session: Option<&'a str>,
+}
+
 fn inspector_lines(
     run: Option<&bcode_workflow_view_models::WorkflowRunView>,
     tab: usize,
+    selection: InspectorSelection<'_>,
     theme: WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     let Some(run) = run else {
@@ -2742,11 +2966,16 @@ fn inspector_lines(
     };
     match tab {
         0 => inspector_overview_lines(run),
-        1 => inspector_input_lines(run),
-        2 => inspector_output_lines(run, theme),
-        3 => inspector_attempt_lines(run),
-        4 => inspector_approval_lines(run),
-        5 => inspector_session_lines(run),
+        1 => inspector_input_lines(run, selection.input_wait, theme),
+        2 => inspector_output_lines(run, selection.output, theme),
+        3 => inspector_attempt_lines(run, selection.attempt, theme),
+        4 => inspector_approval_lines(
+            run,
+            selection.ordinary_approval,
+            selection.mutation_approval,
+            theme,
+        ),
+        5 => inspector_session_lines(run, selection.child_session, theme),
         _ => inspector_definition_lines(run),
     }
 }
@@ -2785,18 +3014,37 @@ fn inspector_overview_lines(run: &bcode_workflow_view_models::WorkflowRunView) -
     lines
 }
 
-fn inspector_input_lines(run: &bcode_workflow_view_models::WorkflowRunView) -> Vec<Line> {
-    if run.waits.is_empty() {
-        return vec![Line::from("No pending workflow inputs or approvals")];
-    }
-    run.waits
+fn inspector_input_lines(
+    run: &bcode_workflow_view_models::WorkflowRunView,
+    selected: Option<&(String, String)>,
+    theme: WorkflowSurfaceTheme,
+) -> Vec<Line> {
+    let inputs = run
+        .waits
         .iter()
+        .filter(|wait| wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Input)
+        .collect::<Vec<_>>();
+    if inputs.is_empty() {
+        return vec![Line::from("No pending workflow inputs")];
+    }
+    inputs
+        .into_iter()
         .flat_map(|wait| {
+            let is_selected = selected.is_some_and(|(node_id, activation_id)| {
+                node_id == &wait.node_id && activation_id == &wait.activation_id
+            });
             vec![
-                Line::from(format!(
-                    "{:?} · {} · {}",
-                    wait.kind, wait.node_id, wait.activation_id
-                )),
+                Line::from_spans(vec![
+                    Span::styled(if is_selected { "▶ " } else { "  " }, theme.selected),
+                    Span::styled(
+                        format!("Input · {} · {}", wait.node_id, wait.activation_id),
+                        if is_selected {
+                            theme.selected
+                        } else {
+                            theme.text
+                        },
+                    ),
+                ]),
                 Line::from(format!("Prompt: {}", wait.prompt)),
                 Line::from(format!(
                     "Expected schema: {}",
@@ -2817,6 +3065,7 @@ fn inspector_input_lines(run: &bcode_workflow_view_models::WorkflowRunView) -> V
 
 fn inspector_output_lines(
     run: &bcode_workflow_view_models::WorkflowRunView,
+    selected: Option<&str>,
     theme: WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     if run.outputs.is_empty() {
@@ -2828,17 +3077,45 @@ fn inspector_output_lines(
             let value = match &output.value {
                 bcode_workflow_view_models::WorkflowOutputValue::Resolved { value } => value,
                 bcode_workflow_view_models::WorkflowOutputValue::Unresolved => {
-                    return vec![Line::from(format!(
-                        "{} · {} v{} · unresolved",
-                        output.node_id, output.schema_id, output.schema_version
-                    ))];
+                    let is_selected = selected == Some(output.output_id.as_str());
+                    return vec![Line::from_spans(vec![
+                        Span::styled(if is_selected { "▶ " } else { "  " }, theme.selected),
+                        Span::styled(
+                            format!(
+                                "{} · {} v{} · unresolved",
+                                output.node_id, output.schema_id, output.schema_version
+                            ),
+                            if is_selected {
+                                theme.selected
+                            } else {
+                                theme.text
+                            },
+                        ),
+                    ])];
                 }
             };
             let mut lines = vec![
-                Line::from(format!(
-                    "{} · {} v{}",
-                    output.node_id, output.schema_id, output.schema_version
-                )),
+                Line::from_spans(vec![
+                    Span::styled(
+                        if selected == Some(output.output_id.as_str()) {
+                            "▶ "
+                        } else {
+                            "  "
+                        },
+                        theme.selected,
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} · {} v{}",
+                            output.node_id, output.schema_id, output.schema_version
+                        ),
+                        if selected == Some(output.output_id.as_str()) {
+                            theme.selected
+                        } else {
+                            theme.text
+                        },
+                    ),
+                ]),
                 Line::from(format!("Output id: {}", output.output_id)),
             ];
             if let Some(verdict) = value.get("verdict") {
@@ -2873,18 +3150,37 @@ fn inspector_output_lines(
         .collect()
 }
 
-fn inspector_attempt_lines(run: &bcode_workflow_view_models::WorkflowRunView) -> Vec<Line> {
+fn inspector_attempt_lines(
+    run: &bcode_workflow_view_models::WorkflowRunView,
+    selected: Option<&(String, String, u32)>,
+    theme: WorkflowSurfaceTheme,
+) -> Vec<Line> {
     if run.attempts.is_empty() {
         return vec![Line::from("No dispatch attempts")];
     }
     run.attempts
         .iter()
         .flat_map(|attempt| {
+            let is_selected = selected.is_some_and(|(node_id, activation_id, number)| {
+                node_id == &attempt.node_id
+                    && activation_id == &attempt.activation_id
+                    && *number == attempt.attempt
+            });
             vec![
-                Line::from(format!(
-                    "#{} {} · {}",
-                    attempt.attempt, attempt.node_id, attempt.status
-                )),
+                Line::from_spans(vec![
+                    Span::styled(if is_selected { "▶ " } else { "  " }, theme.selected),
+                    Span::styled(
+                        format!(
+                            "#{} {} · {}",
+                            attempt.attempt, attempt.node_id, attempt.status
+                        ),
+                        if is_selected {
+                            theme.selected
+                        } else {
+                            theme.text
+                        },
+                    ),
+                ]),
                 Line::from(format!("Dispatch: {}", attempt.dispatch_identity)),
                 Line::from(format!(
                     "Prepared: {} · terminal: {} · receipt: {}",
@@ -2899,24 +3195,56 @@ fn inspector_attempt_lines(run: &bcode_workflow_view_models::WorkflowRunView) ->
         .collect()
 }
 
-fn inspector_approval_lines(run: &bcode_workflow_view_models::WorkflowRunView) -> Vec<Line> {
+fn inspector_approval_lines(
+    run: &bcode_workflow_view_models::WorkflowRunView,
+    selected_wait: Option<&(String, String)>,
+    selected_mutation: Option<&str>,
+    theme: WorkflowSurfaceTheme,
+) -> Vec<Line> {
     let mut lines = run
         .waits
         .iter()
         .filter(|wait| wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Approval)
         .map(|wait| {
-            Line::from(format!(
-                "Approval · {} · {} · {}",
-                wait.node_id, wait.activation_id, wait.prompt
-            ))
+            let is_selected = selected_wait.is_some_and(|(node_id, activation_id)| {
+                node_id == &wait.node_id && activation_id == &wait.activation_id
+            });
+            Line::from_spans(vec![
+                Span::styled(if is_selected { "▶ " } else { "  " }, theme.selected),
+                Span::styled(
+                    format!(
+                        "Approval · {} · {} · {}",
+                        wait.node_id, wait.activation_id, wait.prompt
+                    ),
+                    if is_selected {
+                        theme.selected
+                    } else {
+                        theme.text
+                    },
+                ),
+            ])
         })
         .collect::<Vec<_>>();
     for approval in &run.mutation_approvals {
+        let is_selected = selected_mutation == Some(approval.approval_id.as_str());
         lines.extend([
-            Line::from(format!(
-                "Mutation · {} · {} / {} v{}",
-                approval.approval_id, approval.plugin_id, approval.block_id, approval.block_version
-            )),
+            Line::from_spans(vec![
+                Span::styled(if is_selected { "▶ " } else { "  " }, theme.selected),
+                Span::styled(
+                    format!(
+                        "Mutation · {} · {} / {} v{}",
+                        approval.approval_id,
+                        approval.plugin_id,
+                        approval.block_id,
+                        approval.block_version
+                    ),
+                    if is_selected {
+                        theme.selected
+                    } else {
+                        theme.text
+                    },
+                ),
+            ]),
             Line::from(format!(
                 "Operation: {} · effect: {:?}",
                 approval.operation, approval.effect
@@ -2943,17 +3271,32 @@ fn inspector_approval_lines(run: &bcode_workflow_view_models::WorkflowRunView) -
     lines
 }
 
-fn inspector_session_lines(run: &bcode_workflow_view_models::WorkflowRunView) -> Vec<Line> {
+fn inspector_session_lines(
+    run: &bcode_workflow_view_models::WorkflowRunView,
+    selected: Option<&str>,
+    theme: WorkflowSurfaceTheme,
+) -> Vec<Line> {
     if run.child_sessions.is_empty() {
         return vec![Line::from("No child sessions")];
     }
     run.child_sessions
         .iter()
         .map(|session| {
-            Line::from(format!(
-                "{} · node {} · attempt {} · activation {}",
-                session.session_id, session.node_id, session.attempt, session.activation_id
-            ))
+            let is_selected = selected == Some(session.session_id.as_str());
+            Line::from_spans(vec![
+                Span::styled(if is_selected { "▶ " } else { "  " }, theme.selected),
+                Span::styled(
+                    format!(
+                        "{} · node {} · attempt {} · activation {}",
+                        session.session_id, session.node_id, session.attempt, session.activation_id
+                    ),
+                    if is_selected {
+                        theme.selected
+                    } else {
+                        theme.text
+                    },
+                ),
+            ])
         })
         .collect()
 }
@@ -3993,6 +4336,7 @@ mod tests {
             selected_run_id: Some("run-1".to_string()),
             selected_node_id: Some("reviewer".to_string()),
             selected_wait_id: Some(("approval".to_string(), "approval-activation".to_string())),
+            selected_input_wait_id: None,
             selected_approval_id: None,
             selected_attempt_id: Some(("reviewer".to_string(), "activation-1".to_string(), 2)),
             selected_output_id: Some("output-1".to_string()),
@@ -4083,6 +4427,132 @@ mod tests {
                 .is_some_and(|error| error.contains("stale or unavailable"))
         );
         assert!(surface.pending_action_target.is_none());
+    }
+
+    #[test]
+    fn inspector_navigation_selects_exact_action_targets() {
+        let mut surface = projected_surface();
+        let run = surface.runs.get_mut("run-1").expect("run");
+        let mut second_approval = run
+            .waits
+            .iter()
+            .find(|wait| wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Approval)
+            .expect("approval")
+            .clone();
+        second_approval.node_id = "approval-two".to_string();
+        second_approval.activation_id = "approval-activation-two".to_string();
+        second_approval.prompt = "Approve second operation".to_string();
+        run.waits.push(second_approval);
+        run.actions
+            .push(bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::Approve,
+                target: bcode_workflow_view_models::WorkflowActionTarget::Activation {
+                    run_id: "run-1".to_string(),
+                    node_id: "approval-two".to_string(),
+                    activation_id: "approval-activation-two".to_string(),
+                },
+                enabled: true,
+                unavailable_reason: None,
+            });
+        surface.workspace_focus = WorkflowWorkspaceFocus::Inspector;
+        surface.active_detail_tab = 4;
+
+        assert_eq!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Down
+            ))),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(
+            surface.selected_wait_id.as_ref(),
+            Some(&(
+                "approval-two".to_string(),
+                "approval-activation-two".to_string()
+            ))
+        );
+        assert!(matches!(
+            surface.handle_control_center_event(&Event::Key(
+                bmux_keyboard::KeyStroke::simple(KeyCode::Char('a'))
+            )),
+            PluginTuiAction::InvokePluginCommand {
+                ref command_id,
+                arguments: Some(ref arguments),
+                ..
+            } if command_id == "workflow.approve"
+                && arguments.contains("node_id=approval-two")
+                && arguments.contains("activation_id=approval-activation-two")
+        ));
+    }
+
+    #[test]
+    fn inspector_navigation_selects_outputs_attempts_and_sessions_by_identity() {
+        let mut surface = projected_surface();
+        let run = surface.runs.get_mut("run-1").expect("run");
+        let mut second_output = run.outputs[0].clone();
+        second_output.output_id = "output-2".to_string();
+        run.outputs.push(second_output);
+        let mut second_attempt = run.attempts[0].clone();
+        second_attempt.attempt = 3;
+        run.attempts.push(second_attempt);
+        let mut second_session = run.child_sessions[0].clone();
+        second_session.session_id = "00000000-0000-0000-0000-000000000002".to_string();
+        run.child_sessions.push(second_session);
+        surface.workspace_focus = WorkflowWorkspaceFocus::Inspector;
+
+        surface.active_detail_tab = 2;
+        assert_eq!(
+            surface.select_adjacent_detail_item(1),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.selected_output_id.as_deref(), Some("output-2"));
+
+        surface.active_detail_tab = 3;
+        assert_eq!(
+            surface.select_adjacent_detail_item(1),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(
+            surface.selected_attempt_id.as_ref().map(|item| item.2),
+            Some(3)
+        );
+
+        surface.active_detail_tab = 5;
+        assert_eq!(
+            surface.select_adjacent_detail_item(1),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(
+            surface.selected_child_session_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000002")
+        );
+    }
+
+    #[test]
+    fn definition_navigation_is_visible_in_the_workspace_footer() {
+        let mut surface = projected_surface();
+        surface.runs.get_mut("run-1").expect("run").actions.extend([
+            bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::ViewDefinition,
+                target: bcode_workflow_view_models::WorkflowActionTarget::PublishedDefinition {
+                    workflow_id: "review-workflow".to_string(),
+                    revision: 3,
+                },
+                enabled: true,
+                unavailable_reason: None,
+            },
+            bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::ForkDefinition,
+                target: bcode_workflow_view_models::WorkflowActionTarget::PublishedDefinition {
+                    workflow_id: "review-workflow".to_string(),
+                    revision: 3,
+                },
+                enabled: true,
+                unavailable_reason: None,
+            },
+        ]);
+        let rendered = render_workspace_text(&surface, 200, 32);
+        assert!(rendered.contains("V view definition"));
+        assert!(rendered.contains("F fork definition"));
     }
 
     #[test]
@@ -4194,7 +4664,7 @@ mod tests {
                 unavailable_reason: None,
             });
         surface.runs.insert("run-1".to_string(), run);
-        surface.selected_wait_id = Some(("input".to_string(), "input-1".to_string()));
+        surface.selected_input_wait_id = Some(("input".to_string(), "input-1".to_string()));
         assert_eq!(
             surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
                 KeyCode::Char('i')
@@ -4520,7 +4990,8 @@ mod tests {
             .push(second_item);
         surface.runs.insert("run-2".to_string(), second);
         surface.selected_approval_id = Some("mutation-1".to_string());
-        surface.selected_wait_id = Some(("input".to_string(), "input-activation".to_string()));
+        surface.selected_input_wait_id =
+            Some(("input".to_string(), "input-activation".to_string()));
 
         let key =
             |character| Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char(character)));
@@ -4531,7 +5002,8 @@ mod tests {
         ));
         assert_eq!(surface.selected_run_id.as_deref(), Some("run-2"));
         surface.selected_approval_id = Some("mutation-1".to_string());
-        surface.selected_wait_id = Some(("input".to_string(), "input-activation".to_string()));
+        surface.selected_input_wait_id =
+            Some(("input".to_string(), "input-activation".to_string()));
         assert!(matches!(
             surface.handle_control_center_event(&key('p')),
             PluginTuiAction::InvokePluginCommand { ref command_id, .. }
@@ -4698,6 +5170,8 @@ mod tests {
         surface.selected_run_id = Some("removed-run".to_string());
         surface.selected_node_id = Some("removed-node".to_string());
         surface.selected_wait_id = Some(("removed-node".to_string(), "activation".to_string()));
+        surface.selected_input_wait_id =
+            Some(("removed-input".to_string(), "activation".to_string()));
         let catalog = surface.catalog.clone().expect("catalog");
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         surface.attach_updates(receiver);
@@ -4709,6 +5183,7 @@ mod tests {
         assert_eq!(surface.selected_run_id.as_deref(), Some("run-1"));
         assert!(surface.selected_node_id.is_none());
         assert!(surface.selected_wait_id.is_none());
+        assert!(surface.selected_input_wait_id.is_none());
         assert_eq!(surface.detail_loading_run_id.as_deref(), Some("run-1"));
     }
 
@@ -4825,6 +5300,16 @@ mod tests {
             requested_at_ms: 4,
             expires_at_ms: Some(10),
         }];
+        run.waits
+            .push(bcode_workflow_view_models::WorkflowWaitView {
+                node_id: "input".to_string(),
+                activation_id: "input-activation".to_string(),
+                kind: bcode_workflow_view_models::WorkflowWaitKind::Input,
+                prompt: "Provide reviewer scope".to_string(),
+                expected_schema: Some(serde_json::json!({"type": "string"})),
+                input: None,
+                requested_at_ms: 3,
+            });
         run.run.definition_disposition =
             bcode_workflow_view_models::WorkflowDefinitionDisposition::Published {
                 workflow_id: "review-workflow".to_string(),
@@ -4833,15 +5318,20 @@ mod tests {
             };
 
         let rendered = |tab| {
-            inspector_lines(Some(run), tab, WorkflowSurfaceTheme::resolve(None))
-                .into_iter()
-                .flat_map(|line| {
-                    line.spans
-                        .into_iter()
-                        .map(|span| span.content)
-                        .collect::<Vec<_>>()
-                })
-                .collect::<String>()
+            inspector_lines(
+                Some(run),
+                tab,
+                InspectorSelection::default(),
+                WorkflowSurfaceTheme::resolve(None),
+            )
+            .into_iter()
+            .flat_map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<String>()
         };
         assert!(rendered(0).contains("descendants"));
         assert!(rendered(1).contains("Expected schema"));

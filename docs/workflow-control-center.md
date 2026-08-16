@@ -1,35 +1,59 @@
-# Workflow Control Center
+# Workflow Operations Workspace
 
-Open the plugin-owned control center with `/workflow`.
+Open the plugin-owned workflow operations workspace with `/workflow`.
 
-The surface subscribes to durable workflow updates and shows:
+The surface subscribes to durable workflow notifications and performs bounded semantic refetches. It presents:
 
-* all bounded durable runs and live status;
-* selected run nodes, waits, approvals, attempts, typed outputs, and terminal state;
-* explicit degraded, disconnected, and resync-required state.
+* a paginated run catalog with search, filter, sort, and grouping controls;
+* a responsive execution graph and tabbed inspector for the selected run;
+* exact selected inputs, approvals, attempts, outputs, child sessions, and definition provenance;
+* contextual enabled and disabled actions with their exact visible targets;
+* explicit loading, stale, degraded, disconnected, resynchronizing, and repair-required states.
 
-## Keys
+Wide terminals use Runs, Graph, and Inspector panes. Medium terminals combine the run catalog with tabbed detail. Narrow terminals expose explicit Runs, Graph, Inspector, and Actions pages.
 
-* `h` / `l` or Left / Right: select a run
-* `j` / `k` or Down / Up: select a node
-* `p`: pause or resume the selected run
-* `c`: cancel the selected run
-* `r`: retry the selected failed node attempt
-* `a` / `d`: approve or deny the first pending mutation or ordinary approval
-* `i`: enter JSON for the selected run's pending input wait; Enter submits, Escape cancels
-* `o`: open the selected run's background child session
-* `q` or Escape: close the surface
+## Navigation
 
-Actions use canonical plugin/application command paths and do not close the control center.
+* Left / Right or `h` / `l`: select the previous or next run.
+* Up / Down or `k` / `j`: select a graph node; when the Inspector has focus, select an exact input, output, attempt, approval, or child session.
+* `Tab`: move workspace focus; on narrow terminals it also advances the active page.
+* `1` through `4`: open the narrow Runs, Graph, Inspector, or Actions page.
+* `[` / `]`: select the previous or next Inspector section.
+* `n`: expand or collapse nested workflows and child sessions.
+* `/`: edit bounded catalog search.
+* `f` / `s` / `g`: cycle catalog filter, sort, or grouping.
+* `m`: load the next bounded catalog page when available.
+
+Selection uses stable workflow identities. Live catalog reorder does not silently retarget the selected run, node, wait, approval, attempt, output, or child session.
+
+## Exact workflow actions
+
+The Actions pane shows available shortcuts and disabled explanations from the portable workflow projection. The application revalidates every operation against canonical state before mutation.
+
+* `p`: pause or resume the exact selected run.
+* `c`: confirm cancellation of the exact selected run.
+* `i`: open the structured input form for the exact selected input wait.
+* `a` / `d`: approve or deny the exact selected ordinary or mutation approval.
+* `r`: retry the exact selected failed attempt.
+* `o`: open the exact selected child session.
+* `V`: view the selected run's exact immutable definition revision.
+* `E`: edit its existing draft when available.
+* `F`: fork an immutable published revision into the authoring surface.
+* `D` / `T` / `N`: open Definitions, Templates, or New Workflow in the plugin-owned authoring surface.
+* `q` or Escape: close the workspace when no dialog is active.
+
+Destructive and reconciliation-sensitive actions use explicit confirmation. A submitted action remains pending until an authoritative projection refresh confirms the resulting state. Stale or ambiguous targets fail closed.
+
+## Typed input
+
+The input dialog displays the exact run, node, and activation, plus its bounded prompt and expected schema. Supported simple object schemas use field controls. Complex schemas retain a JSON editor fallback. Local validation is advisory; canonical server validation remains authoritative, and rejected input stays available for correction.
 
 ## Scriptable typed outputs
 
-Use the independently supported CLI path to read canonical checksum-verified node outputs:
+The independently supported CLI can read canonical checksum-verified node outputs:
 
 ```sh
 bcode workflow run-output --run-id <RUN_ID> --limit 100
 ```
 
-The response includes node and activation identity, schema ID/version, checksum, artifact
-reference when present, and the validated JSON value. Reviewer verdicts and findings therefore do
-not require reading child-session event history.
+The response includes node and activation identity, schema ID/version, checksum, artifact reference when present, and the validated JSON value. Reviewer verdicts and findings therefore do not require reading child-session event history.
