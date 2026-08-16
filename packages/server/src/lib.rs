@@ -42306,6 +42306,49 @@ library = "test"
         }
     }
 
+    #[test]
+    fn structured_output_phases_preserve_work_and_isolate_finalization() {
+        let structured_output = bcode_model::StructuredOutputRequest {
+            name: "result".to_string(),
+            schema: serde_json::json!({ "type": "object" }),
+            strict: true,
+        };
+        let mut work =
+            test_model_turn_request(vec![test_model_message(MessageRole::User, "perform work")]);
+        work.tools.push(bcode_model::ToolDefinition {
+            name: "real_tool".to_string(),
+            description: "real host tool".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        });
+        work.structured_output = Some(structured_output.clone());
+
+        apply_structured_output_phase(
+            &mut work,
+            Some(&structured_output),
+            Some(bcode_model::CapabilityExecution::ToolFreeProviderRound),
+            StructuredOutputPhase::Work,
+        );
+        assert!(work.structured_output.is_none());
+        assert_eq!(work.tools.len(), 1);
+
+        let original_messages = work.messages.clone();
+        apply_structured_output_phase(
+            &mut work,
+            Some(&structured_output),
+            Some(bcode_model::CapabilityExecution::ToolFreeProviderRound),
+            StructuredOutputPhase::Finalization,
+        );
+        assert_eq!(work.structured_output, Some(structured_output));
+        assert!(work.tools.is_empty());
+        assert_eq!(work.tool_call_policy.choice, bcode_model::ToolChoice::None);
+        assert_eq!(work.messages[..original_messages.len()], original_messages);
+        assert!(matches!(
+            work.messages.last().and_then(|message| message.content.first()),
+            Some(ContentBlock::Text { text })
+                if text == bcode_model::STRUCTURED_OUTPUT_FINALIZATION_INSTRUCTION
+        ));
+    }
+
     fn prompt_cache_point_count_in_messages(messages: &[ModelMessage]) -> usize {
         messages
             .iter()
