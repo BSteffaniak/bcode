@@ -592,6 +592,12 @@ pub enum RuntimeAndModelRequest {
         after_sequence: u64,
         limit: usize,
     },
+    SubscribeWorkflowRuns,
+}
+
+/// Requests owned by core session runtime, model selection, and auth configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreRuntimeRequest {
     ListRuntimeWork {
         session_id: SessionId,
     },
@@ -602,7 +608,6 @@ pub enum RuntimeAndModelRequest {
     SubscribeRuntimeWork {
         session_id: SessionId,
     },
-    SubscribeWorkflowRuns,
     CompactSession {
         session_id: SessionId,
     },
@@ -616,7 +621,6 @@ pub enum RuntimeAndModelRequest {
         effort: Option<String>,
         summary: Option<String>,
     },
-    /// Append one durable, presentation-only note at the current session sequence.
     AppendPresentationNote {
         session_id: SessionId,
         source_id: String,
@@ -631,9 +635,7 @@ pub enum RuntimeAndModelRequest {
     SessionModelList {
         provider_plugin_id: Option<String>,
     },
-    /// List portable auth-pool status.
     AuthPoolList,
-    /// Persist or clear an interactive preferred auth-pool profile.
     SetAuthPoolPreference {
         pool: String,
         profile: Option<String>,
@@ -720,6 +722,7 @@ pub enum RoutedRequest {
     WorkflowAuthoring(WorkflowAuthoringRequest),
     WorkflowDefinition(Box<WorkflowDefinitionRequest>),
     RuntimeAndModel(Box<RuntimeAndModelRequest>),
+    CoreRuntime(Box<CoreRuntimeRequest>),
     PermissionInteraction(PermissionInteractionRequest),
     AgentSkillPlugin(AgentSkillPluginRequest),
 }
@@ -1231,15 +1234,13 @@ impl RoutedRequest {
                 }))
             }
             Request::CompactSession { session_id } => {
-                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::CompactSession {
-                    session_id,
-                }))
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::CompactSession { session_id }))
             }
             Request::SetSessionModel {
                 session_id,
                 provider_plugin_id,
                 model_id,
-            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SetSessionModel {
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetSessionModel {
                 session_id,
                 provider_plugin_id,
                 model_id,
@@ -1248,21 +1249,21 @@ impl RoutedRequest {
                 session_id,
                 effort,
                 summary,
-            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SetSessionReasoning {
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetSessionReasoning {
                 session_id,
                 effort,
                 summary,
             })),
             Request::SessionModelStatus { session_id } => {
-                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SessionModelStatus {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::SessionModelStatus {
                     session_id,
                 }))
             }
             Request::DefaultModelStatus => {
-                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::DefaultModelStatus))
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::DefaultModelStatus))
             }
             Request::SessionModelList { provider_plugin_id } => {
-                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SessionModelList {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::SessionModelList {
                     provider_plugin_id,
                 }))
             }
@@ -1464,18 +1465,16 @@ impl RoutedRequest {
                 sources,
             }),
             Request::ListRuntimeWork { session_id } => {
-                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ListRuntimeWork {
-                    session_id,
-                }))
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::ListRuntimeWork { session_id }))
             }
             Request::RuntimeWorkHistory { session_id, limit } => {
-                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::RuntimeWorkHistory {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::RuntimeWorkHistory {
                     session_id,
                     limit,
                 }))
             }
             Request::SubscribeRuntimeWork { session_id } => {
-                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SubscribeRuntimeWork {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::SubscribeRuntimeWork {
                     session_id,
                 }))
             }
@@ -1541,11 +1540,9 @@ impl RoutedRequest {
             Request::IngestClientMetrics { batch } => {
                 Self::SessionLifecycle(SessionLifecycleRequest::IngestClientMetrics { batch })
             }
-            Request::AuthPoolList => {
-                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::AuthPoolList))
-            }
+            Request::AuthPoolList => Self::CoreRuntime(Box::new(CoreRuntimeRequest::AuthPoolList)),
             Request::SetAuthPoolPreference { pool, profile } => {
-                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SetAuthPoolPreference {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetAuthPoolPreference {
                     pool,
                     profile,
                 }))
@@ -1665,7 +1662,7 @@ impl RoutedRequest {
                 note_id,
                 text,
                 format,
-            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::AppendPresentationNote {
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::AppendPresentationNote {
                 session_id,
                 source_id,
                 note_id,

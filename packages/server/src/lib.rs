@@ -19,9 +19,10 @@ mod runtime_work;
 mod session_bulk_migration;
 
 use request_routing::{
-    AgentSkillPluginRequest, PermissionInteractionRequest, RoutedRequest, RuntimeAndModelRequest,
-    SessionLifecycleRequest, SessionSearchAttachRequest, SessionTurnRequest,
-    WorkflowAuthoringRequest, WorkflowDefinitionRequest, WorkflowMutationRequest,
+    AgentSkillPluginRequest, CoreRuntimeRequest, PermissionInteractionRequest, RoutedRequest,
+    RuntimeAndModelRequest, SessionLifecycleRequest, SessionSearchAttachRequest,
+    SessionTurnRequest, WorkflowAuthoringRequest, WorkflowDefinitionRequest,
+    WorkflowMutationRequest,
 };
 mod session_migration_adapter;
 mod session_migration_execution;
@@ -4265,6 +4266,12 @@ async fn dispatch_routed_request(
             ))
             .await
         }
+        RoutedRequest::CoreRuntime(request) => {
+            Box::pin(handle_core_runtime_request(
+                *request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
         RoutedRequest::PermissionInteraction(request) => {
             Box::pin(handle_permission_interaction_request(
                 request, request_id, client_id, state, writer,
@@ -5563,22 +5570,34 @@ async fn handle_workflow_run_request(
             handle_workflow_live_event_catch_up(request_id, state, writer, after_sequence, limit)
                 .await
         }
-        RuntimeAndModelRequest::ListRuntimeWork { session_id } => {
-            handle_list_runtime_work(request_id, state, writer, session_id).await
-        }
-        RuntimeAndModelRequest::RuntimeWorkHistory { session_id, limit } => {
-            handle_runtime_work_history(request_id, state, writer, session_id, limit).await
-        }
-        RuntimeAndModelRequest::SubscribeRuntimeWork { session_id } => {
-            handle_subscribe_runtime_work(request_id, client_id, state, writer, session_id).await
-        }
         RuntimeAndModelRequest::SubscribeWorkflowRuns => {
             handle_subscribe_workflow_runs(request_id, client_id, state, writer).await
         }
-        RuntimeAndModelRequest::CompactSession { session_id } => {
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_core_runtime_request(
+    request: CoreRuntimeRequest,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
+        CoreRuntimeRequest::ListRuntimeWork { session_id } => {
+            handle_list_runtime_work(request_id, state, writer, session_id).await
+        }
+        CoreRuntimeRequest::RuntimeWorkHistory { session_id, limit } => {
+            handle_runtime_work_history(request_id, state, writer, session_id, limit).await
+        }
+        CoreRuntimeRequest::SubscribeRuntimeWork { session_id } => {
+            handle_subscribe_runtime_work(request_id, client_id, state, writer, session_id).await
+        }
+        CoreRuntimeRequest::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
         }
-        RuntimeAndModelRequest::SetSessionModel {
+        CoreRuntimeRequest::SetSessionModel {
             session_id,
             provider_plugin_id,
             model_id,
@@ -5593,7 +5612,7 @@ async fn handle_workflow_run_request(
             )
             .await
         }
-        RuntimeAndModelRequest::SetSessionReasoning {
+        CoreRuntimeRequest::SetSessionReasoning {
             session_id,
             effort,
             summary,
@@ -5601,7 +5620,7 @@ async fn handle_workflow_run_request(
             handle_set_session_reasoning(request_id, state, writer, session_id, effort, summary)
                 .await
         }
-        RuntimeAndModelRequest::AppendPresentationNote {
+        CoreRuntimeRequest::AppendPresentationNote {
             session_id,
             source_id,
             note_id,
@@ -5622,17 +5641,17 @@ async fn handle_workflow_run_request(
             )
             .await
         }
-        RuntimeAndModelRequest::SessionModelStatus { session_id } => {
+        CoreRuntimeRequest::SessionModelStatus { session_id } => {
             handle_session_model_status(request_id, client_id, state, writer, session_id).await
         }
-        RuntimeAndModelRequest::DefaultModelStatus => {
+        CoreRuntimeRequest::DefaultModelStatus => {
             handle_default_model_status(request_id, client_id, state, writer).await
         }
-        RuntimeAndModelRequest::SessionModelList { provider_plugin_id } => {
+        CoreRuntimeRequest::SessionModelList { provider_plugin_id } => {
             handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
                 .await
         }
-        RuntimeAndModelRequest::AuthPoolList => {
+        CoreRuntimeRequest::AuthPoolList => {
             let config = bcode_config::load_config()?;
             send_response(
                 writer,
@@ -5643,7 +5662,7 @@ async fn handle_workflow_run_request(
             )
             .await
         }
-        RuntimeAndModelRequest::SetAuthPoolPreference { pool, profile } => {
+        CoreRuntimeRequest::SetAuthPoolPreference { pool, profile } => {
             match bcode_provider_auth::set_auth_pool_preference(&pool, profile.as_deref()) {
                 Ok(_) => {
                     send_response(

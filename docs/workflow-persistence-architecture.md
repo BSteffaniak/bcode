@@ -347,9 +347,12 @@ rejected without writes; normal startup never migrates or reinterprets it.
 Normal workflow startup opens the canonical store fail-closed. An incompatible, corrupt, or
 maintenance-required workflow store disables only the workflow domain: daemon readiness and
 unrelated session/model/tool capabilities continue, workflow requests return a stable unavailable
-error, and the canonical workflow bytes remain untouched until explicit maintenance. The unavailable
-domain uses only an isolated process-local scratch store to satisfy internal construction; it is not
-canonical and no workflow request or restoration path may reach it.
+error, and the canonical workflow bytes remain untouched until explicit maintenance. Core runtime,
+model, auth, and session requests use separate typed routing and never pass through workflow
+availability gates. Passive plugin session-status hydration treats an unavailable optional workflow
+domain as no contribution rather than a session or skill failure. The unavailable domain uses only
+an isolated process-local scratch store to satisfy internal construction; it is not canonical and no
+workflow request or restoration path may reach it.
 
 Destructive reset is a separate maintenance operation. It acquires the workflow ownership lock
 exclusively (proving no workflow store handles are active), obtains an immediate exclusive SQLite

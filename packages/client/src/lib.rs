@@ -207,6 +207,16 @@ pub enum ClientError {
 }
 
 impl ClientError {
+    /// Return true when an optional domain is unavailable while unrelated daemon capabilities
+    /// remain usable.
+    #[must_use]
+    pub fn is_optional_domain_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Server { code, .. } if code == "workflow_capability_unavailable"
+        )
+    }
+
     /// Return true when the error means the local daemon transport is unavailable.
     #[must_use]
     pub fn is_daemon_unavailable(&self) -> bool {

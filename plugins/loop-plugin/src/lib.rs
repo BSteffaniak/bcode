@@ -305,29 +305,35 @@ fn control_loop(
 }
 
 fn session_status_response(session_id: SessionId) -> bcode_plugin_sdk::SessionStatusResponse {
-    let contribution = associated_workflow_run(session_id)
-        .ok()
-        .flatten()
-        .filter(|run| {
-            matches!(
-                run.status,
-                bcode_workflow_store::RunStatus::Running
-                    | bcode_workflow_store::RunStatus::Paused
-                    | bcode_workflow_store::RunStatus::RepairRequired
-            )
-        })
-        .map(|run| bcode_plugin_sdk::SessionStatusContribution {
-            contribution_id: "active-loop".to_owned(),
-            text: format_workflow_status(&run),
-            priority: 20,
-            metadata: std::collections::BTreeMap::from([
-                ("run_id".to_owned(), serde_json::json!(run.run_id)),
-                (
-                    "status".to_owned(),
-                    serde_json::json!(format!("{:?}", run.status)),
-                ),
-            ]),
-        });
+    let contribution = match associated_workflow_run(session_id) {
+        Ok(run) => run,
+        Err(LoopIpcError::Client(ClientError::Server { code, .. }))
+            if code == "workflow_capability_unavailable" =>
+        {
+            None
+        }
+        Err(_) => None,
+    }
+    .filter(|run| {
+        matches!(
+            run.status,
+            bcode_workflow_store::RunStatus::Running
+                | bcode_workflow_store::RunStatus::Paused
+                | bcode_workflow_store::RunStatus::RepairRequired
+        )
+    })
+    .map(|run| bcode_plugin_sdk::SessionStatusContribution {
+        contribution_id: "active-loop".to_owned(),
+        text: format_workflow_status(&run),
+        priority: 20,
+        metadata: std::collections::BTreeMap::from([
+            ("run_id".to_owned(), serde_json::json!(run.run_id)),
+            (
+                "status".to_owned(),
+                serde_json::json!(format!("{:?}", run.status)),
+            ),
+        ]),
+    });
     bcode_plugin_sdk::SessionStatusResponse { contribution }
 }
 

@@ -113,6 +113,10 @@ if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 15' packages/workflow
   || ! rg -q 'workflow_store_unavailable' packages/server/src/lib.rs \
   || ! rg -q 'workflow capability is unavailable; daemon startup will continue' packages/server/src/lib.rs \
   || ! rg -q 'workflow restoration skipped while the workflow domain is unavailable' packages/server/src/lib.rs \
+  || ! rg -q 'CoreRuntimeRequest' packages/server/src/request_routing.rs \
+  || ! rg -q 'RoutedRequest::CoreRuntime' packages/server/src/lib.rs \
+  || ! rg -q 'is_optional_domain_unavailable' packages/tui/src/effects.rs \
+  || ! rg -q 'workflow_status_failed' plugins/workflow-plugin/src/lib.rs \
   || ! rg -q 'DELETE-INCOMPATIBLE-WORKFLOW-STATE' packages/cli/src/lib.rs; then
   echo "Workflow store clean-break violation: fail-closed schema detection or explicit reset plumbing is missing." >&2
   violations=1

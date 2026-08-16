@@ -983,10 +983,18 @@ fn session_status(request: &ServiceRequest) -> ServiceResponse {
 async fn active_session_status(
     session_id: bcode_session_models::SessionId,
 ) -> Result<Option<bcode_plugin_sdk::SessionStatusContribution>, String> {
-    let runs = bcode_client::BcodeClient::default_endpoint()
+    let runs = match bcode_client::BcodeClient::default_endpoint()
         .list_workflow_runs(QUERY_LIMIT)
         .await
-        .map_err(|error| error.to_string())?;
+    {
+        Ok(runs) => runs,
+        Err(bcode_client::ClientError::Server { code, .. })
+            if code == "workflow_capability_unavailable" =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let session_id = session_id.to_string();
     let active = runs
         .into_iter()

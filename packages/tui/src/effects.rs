@@ -2443,6 +2443,7 @@ async fn load_plugin_session_status(
                     first_error.get_or_insert(error.message);
                 }
             }
+            Err(error) if error.is_optional_domain_unavailable() => {}
             Err(error) => {
                 first_error.get_or_insert_with(|| error.to_string());
             }
@@ -2577,6 +2578,11 @@ mod progress_routing_tests {
             DaemonObservation::from_client_result::<()>(&Err(server_error)),
             DaemonObservation::Failed(_)
         ));
+        let optional_domain = ClientError::Server {
+            code: "workflow_capability_unavailable".to_owned(),
+            message: "maintenance required".to_owned(),
+        };
+        assert!(optional_domain.is_optional_domain_unavailable());
         assert_eq!(
             DaemonObservation::from_tui_result::<()>(&Err(TuiError::SessionUnavailable {
                 session_id: SessionId::new(),
