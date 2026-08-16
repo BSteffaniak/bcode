@@ -58688,6 +58688,50 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ..
             }
         ));
+        assert!(matches!(
+            workflow_attempt_observation_from_completion(
+                &state,
+                &request,
+                ModelTurnCompletion::with_message(ModelTurnOutcome::Error, "tool failed"),
+            )
+            .expect("tool failure observation"),
+            bcode_workflow_store::AttemptObservation::Failed { message }
+                if message == "tool failed"
+        ));
+        assert!(matches!(
+            workflow_attempt_observation_from_completion(
+                &state,
+                &request,
+                ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    "structured finalization failed",
+                ),
+            )
+            .expect("finalization failure observation"),
+            bcode_workflow_store::AttemptObservation::Failed { message }
+                if message == "structured finalization failed"
+        ));
+        let succeeded = workflow_attempt_observation_from_completion(
+            &state,
+            &request,
+            ModelTurnCompletion {
+                outcome: ModelTurnOutcome::Completed,
+                message: None,
+                output: Some(
+                    serde_json::json!({
+                        "version": 1,
+                        "title": "Complete",
+                        "description": "done"
+                    })
+                    .to_string(),
+                ),
+            },
+        )
+        .expect("successful observation");
+        assert!(matches!(
+            succeeded,
+            bcode_workflow_store::AttemptObservation::Succeeded { .. }
+        ));
         let malformed = workflow_attempt_observation_from_completion(
             &state,
             &request,
@@ -64694,6 +64738,51 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .count(),
             1,
             "history: {history:#?}"
+        );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelFeatureFidelityNegotiated { feature, .. }
+                if feature.family == "structured_output"
+                    && feature.execution == "tool_free_provider_round"
+        )));
+        let assistant_segments = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::AssistantResponseSegment {
+                    segment_order,
+                    text,
+                    ..
+                }
+                | SessionEventKind::PositionedAssistantResponseSegment {
+                    segment_order,
+                    text,
+                    ..
+                } => Some((*segment_order, text.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            assistant_segments.len() >= 2
+                && assistant_segments
+                    .iter()
+                    .any(|(_, text)| Some(*text) != completion.output.as_deref()),
+            "work output should remain canonical context: {history:#?}"
+        );
+        assert_eq!(
+            assistant_segments
+                .iter()
+                .max_by_key(|(segment_order, _)| *segment_order)
+                .map(|(_, text)| *text),
+            completion.output.as_deref(),
+            "only the latest finalization segment is authoritative"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ModelTurnFinished { .. }))
+                .count(),
+            1,
+            "the workflow turn must have one terminal outcome: {history:#?}"
         );
     }
 
