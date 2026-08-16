@@ -1803,6 +1803,14 @@ impl WorkflowStatusSurface {
                 );
                 PluginTuiAction::Redraw
             }
+            KeyCode::Char('f') if key.modifiers.shift => self
+                .definition_action(bcode_workflow_view_models::WorkflowActionKind::ForkDefinition),
+            KeyCode::Char('d') if key.modifiers.shift => Self::authoring_command("workflow.list"),
+            KeyCode::Char('n') if key.modifiers.shift => PluginTuiAction::OpenSurface {
+                plugin_id: "bcode.workflow".to_string(),
+                surface_id: WORKFLOW_AUTHOR_SURFACE_KIND.to_string(),
+                options: serde_json::json!({"entry": "new_workflow"}),
+            },
             KeyCode::Char('f') => {
                 let Some(catalog) = self.catalog.as_ref() else {
                     return PluginTuiAction::None;
@@ -1936,7 +1944,7 @@ impl WorkflowStatusSurface {
                     plugin_command("workflow.cancel", format!("run_id={run_id}")),
                 )
             }
-            KeyCode::Char('a' | 'd') => {
+            KeyCode::Char('a' | 'd') if !key.modifiers.shift => {
                 let approve = key.key == KeyCode::Char('a');
                 let Some(run) = self.selected_run_view() else {
                     return PluginTuiAction::None;
@@ -2063,20 +2071,14 @@ impl WorkflowStatusSurface {
                     },
                 )
             }
-            KeyCode::Char('V') => self
+            KeyCode::Char('v') if key.modifiers.shift => self
                 .definition_action(bcode_workflow_view_models::WorkflowActionKind::ViewDefinition),
-            KeyCode::Char('E') => {
+            KeyCode::Char('e') if key.modifiers.shift => {
                 self.definition_action(bcode_workflow_view_models::WorkflowActionKind::EditDraft)
             }
-            KeyCode::Char('F') => self
-                .definition_action(bcode_workflow_view_models::WorkflowActionKind::ForkDefinition),
-            KeyCode::Char('D') => Self::authoring_command("workflow.list"),
-            KeyCode::Char('T') => Self::authoring_command("workflow.templates"),
-            KeyCode::Char('N') => PluginTuiAction::OpenSurface {
-                plugin_id: "bcode.workflow".to_string(),
-                surface_id: WORKFLOW_AUTHOR_SURFACE_KIND.to_string(),
-                options: serde_json::json!({"entry": "new_workflow"}),
-            },
+            KeyCode::Char('t') if key.modifiers.shift => {
+                Self::authoring_command("workflow.templates")
+            }
             _ => PluginTuiAction::None,
         }
     }
@@ -4556,6 +4558,35 @@ mod tests {
     }
 
     #[test]
+    fn shifted_definition_shortcuts_route_normalized_keyboard_events() {
+        let mut surface = projected_surface();
+        surface.runs.get_mut("run-1").expect("run").actions.push(
+            bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::ViewDefinition,
+                target: bcode_workflow_view_models::WorkflowActionTarget::PublishedDefinition {
+                    workflow_id: "review-workflow".to_string(),
+                    revision: 3,
+                },
+                enabled: true,
+                unavailable_reason: None,
+            },
+        );
+        let event = Event::Key(bmux_keyboard::KeyStroke::with_modifiers(
+            KeyCode::Char('v'),
+            bmux_keyboard::Modifiers {
+                shift: true,
+                ..bmux_keyboard::Modifiers::NONE
+            },
+        ));
+        assert!(matches!(
+            surface.handle_control_center_event(&event),
+            PluginTuiAction::OpenSurface { ref options, .. }
+                if options["workflow_id"] == "review-workflow"
+                    && options["view_revision"] == 3
+        ));
+    }
+
+    #[test]
     fn projected_control_center_renders_typed_results_and_routes_actions() {
         let mut surface = projected_surface();
         let rendered = workflow_view_lines(
@@ -4800,20 +4831,27 @@ mod tests {
     #[test]
     fn top_level_authoring_entries_route_to_plugin_owned_capabilities() {
         let mut surface = projected_surface();
-        let key =
-            |character| Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char(character)));
+        let shifted_key = |character| {
+            Event::Key(bmux_keyboard::KeyStroke::with_modifiers(
+                KeyCode::Char(character),
+                bmux_keyboard::Modifiers {
+                    shift: true,
+                    ..bmux_keyboard::Modifiers::NONE
+                },
+            ))
+        };
         assert!(matches!(
-            surface.handle_control_center_event(&key('D')),
+            surface.handle_control_center_event(&shifted_key('d')),
             PluginTuiAction::InvokePluginCommand { ref command_id, .. }
                 if command_id == "workflow.list"
         ));
         assert!(matches!(
-            surface.handle_control_center_event(&key('T')),
+            surface.handle_control_center_event(&shifted_key('t')),
             PluginTuiAction::InvokePluginCommand { ref command_id, .. }
                 if command_id == "workflow.templates"
         ));
         assert!(matches!(
-            surface.handle_control_center_event(&key('N')),
+            surface.handle_control_center_event(&shifted_key('n')),
             PluginTuiAction::OpenSurface {
                 ref plugin_id,
                 ref surface_id,

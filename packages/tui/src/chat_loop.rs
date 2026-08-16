@@ -132,6 +132,7 @@ struct RootPluginSurface {
     plugin_id: String,
     surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
     invalidation: bmux_tui_runtime::InvalidationSignal,
+    active_tasks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pending_session_navigation: Option<bcode_session_models::SessionId>,
     workflow_view_requests: Option<tokio::sync::mpsc::Sender<WorkflowViewRequest>>,
 }
@@ -898,11 +899,13 @@ impl ChatLoopState {
             self.parent_plugin_surface = Some(active);
         }
         let invalidation = bmux_tui_runtime::InvalidationSignal::new();
+        let active_tasks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         invalidation.request();
         self.plugin_surface = Some(RootPluginSurface {
             plugin_id: plugin_id.into(),
             surface,
             invalidation,
+            active_tasks,
             pending_session_navigation: None,
             workflow_view_requests: None,
         });
@@ -966,8 +969,11 @@ impl ChatLoopState {
         client: &BcodeClient,
     ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
         let surface = self.plugin_surface.as_mut()?;
-        let host =
-            super::plugin_surface_host::root_host(surface.invalidation.clone(), client.clone());
+        let host = super::plugin_surface_host::root_host(
+            surface.invalidation.clone(),
+            client.clone(),
+            std::sync::Arc::clone(&surface.active_tasks),
+        );
         Some(surface.surface.handle_event(event, &host))
     }
 
@@ -982,8 +988,11 @@ impl ChatLoopState {
         client: &BcodeClient,
     ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
         let surface = self.plugin_surface.as_mut()?;
-        let host =
-            super::plugin_surface_host::root_host(surface.invalidation.clone(), client.clone());
+        let host = super::plugin_surface_host::root_host(
+            surface.invalidation.clone(),
+            client.clone(),
+            std::sync::Arc::clone(&surface.active_tasks),
+        );
         let invalidated = surface.invalidation.take();
         let action = surface.surface.poll(&host);
         if invalidated && matches!(action, bcode_plugin_sdk::tui::PluginTuiAction::None) {

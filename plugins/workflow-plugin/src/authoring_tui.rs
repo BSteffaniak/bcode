@@ -29,7 +29,7 @@ use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
 const PALETTE_HEADER_ROWS: u16 = 2;
-const CANVAS_HEADER_ROWS: u16 = 2;
+const CANVAS_HEADER_ROWS: u16 = 3;
 const GRAPH_PRESENTATION_NAMESPACE: &str = "bcode.graph";
 const GRAPH_PRESENTATION_VERSION: u32 = 1;
 const DEFAULT_DRAFT_ID: &str = "draft-1";
@@ -127,6 +127,7 @@ enum AuthoringOperation {
     AcceptingGenerated,
     Start,
     Starting,
+    InitialLoad,
 }
 
 #[derive(Debug)]
@@ -1192,6 +1193,7 @@ impl WorkflowAuthorSurface {
             &format!("{} nodes · {edges} edges", nodes.len()),
             theme.muted,
         );
+        write_row(frame, area, 2, &self.status, theme.muted);
         let node_visible = visible.saturating_sub(edges.min(4));
         for (row, (id, node)) in nodes
             .iter()
@@ -1489,31 +1491,41 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('E') && self.focus == EditorPane::Canvas =>
+                if key.key == KeyCode::Char('e')
+                    && key.modifiers.shift
+                    && self.focus == EditorPane::Canvas =>
             {
                 self.request_mutation(PendingMutation::RemoveEdge);
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('H') && self.focus == EditorPane::Canvas =>
+                if key.key == KeyCode::Char('h')
+                    && key.modifiers.shift
+                    && self.focus == EditorPane::Canvas =>
             {
                 self.request_mutation(PendingMutation::MoveLeft);
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('L') && self.focus == EditorPane::Canvas =>
+                if key.key == KeyCode::Char('l')
+                    && key.modifiers.shift
+                    && self.focus == EditorPane::Canvas =>
             {
                 self.request_mutation(PendingMutation::MoveRight);
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('K') && self.focus == EditorPane::Canvas =>
+                if key.key == KeyCode::Char('k')
+                    && key.modifiers.shift
+                    && self.focus == EditorPane::Canvas =>
             {
                 self.request_mutation(PendingMutation::MoveUp);
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('J') && self.focus == EditorPane::Canvas =>
+                if key.key == KeyCode::Char('j')
+                    && key.modifiers.shift
+                    && self.focus == EditorPane::Canvas =>
             {
                 self.request_mutation(PendingMutation::MoveDown);
                 true
@@ -1537,7 +1549,9 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('F') && self.focus == EditorPane::Inspector =>
+                if key.key == KeyCode::Char('f')
+                    && key.modifiers.shift
+                    && self.focus == EditorPane::Inspector =>
             {
                 self.begin_selected_schema_edit();
                 true
@@ -1549,19 +1563,25 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('M') && self.focus == EditorPane::Inspector =>
+                if key.key == KeyCode::Char('m')
+                    && key.modifiers.shift
+                    && self.focus == EditorPane::Inspector =>
             {
                 self.begin_inspector_edit(InspectorEditTarget::AgentModel);
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('B') && self.focus == EditorPane::Inspector =>
+                if key.key == KeyCode::Char('b')
+                    && key.modifiers.shift
+                    && self.focus == EditorPane::Inspector =>
             {
                 self.begin_inspector_edit(InspectorEditTarget::RepeatBound);
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('P') && self.focus == EditorPane::Inspector =>
+                if key.key == KeyCode::Char('p')
+                    && key.modifiers.shift
+                    && self.focus == EditorPane::Inspector =>
             {
                 self.begin_inspector_edit(InspectorEditTarget::PredicatePath);
                 true
@@ -1590,15 +1610,15 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 self.request_mutation(PendingMutation::CyclePredicate);
                 true
             }
-            Event::Key(key) if key.key == KeyCode::Char('R') => {
+            Event::Key(key) if key.key == KeyCode::Char('r') && key.modifiers.shift => {
                 self.resolve_conflict();
                 true
             }
-            Event::Key(key) if key.key == KeyCode::Char('G') => {
+            Event::Key(key) if key.key == KeyCode::Char('g') && key.modifiers.shift => {
                 self.begin_prompt_generation();
                 true
             }
-            Event::Key(key) if key.key == KeyCode::Char('A') => {
+            Event::Key(key) if key.key == KeyCode::Char('a') && key.modifiers.shift => {
                 self.accept_generated_candidate();
                 true
             }
@@ -1640,6 +1660,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 (self.workflow_id.clone(), self.view_revision)
         {
             self.operations.insert(AuthoringOperation::RevisionLoad);
+            self.operations.insert(AuthoringOperation::InitialLoad);
             let future = host.workflow_authoring_revision(workflow_id, revision);
             let sender = self.authoring_sender.clone();
             host.spawn(Box::pin(async move {
@@ -1660,6 +1681,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
             )
         {
             self.operations.insert(AuthoringOperation::Forking);
+            self.operations.insert(AuthoringOperation::InitialLoad);
             self.status = format!("Forking immutable revision {revision} into draft {draft_id}…");
             let future = host.fork_workflow_authoring_revision(
                 workflow_id,
@@ -1682,6 +1704,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 (self.workflow_id.clone(), self.draft_id.clone())
         {
             self.operations.insert(AuthoringOperation::DraftLoad);
+            self.operations.insert(AuthoringOperation::InitialLoad);
             let future = host.workflow_authoring_draft(workflow_id, draft_id);
             let sender = self.authoring_sender.clone();
             host.spawn(Box::pin(async move {
@@ -1698,6 +1721,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 (self.workflow_id.clone(), self.base_revision)
         {
             self.operations.insert(AuthoringOperation::BaseLoad);
+            self.operations.insert(AuthoringOperation::InitialLoad);
             let future = host.workflow_authoring_revision(workflow_id, revision);
             let sender = self.authoring_sender.clone();
             host.spawn(Box::pin(async move {
@@ -2129,7 +2153,11 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
             }
         }
         if changed {
+            self.operations.remove(&AuthoringOperation::InitialLoad);
             PluginTuiAction::Redraw
+        } else if self.operations.contains(&AuthoringOperation::InitialLoad) {
+            host.request_redraw();
+            PluginTuiAction::None
         } else {
             PluginTuiAction::None
         }

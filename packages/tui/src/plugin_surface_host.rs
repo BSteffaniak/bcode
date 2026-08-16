@@ -43,23 +43,6 @@ struct BcodePluginTuiHost {
     client: BcodeClient,
 }
 
-impl BcodePluginTuiHost {
-    /// Create a plugin TUI host from the current Tokio runtime.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called outside a Tokio runtime.
-    #[must_use]
-    fn current(redraw: InvalidationSignal, client: BcodeClient) -> Self {
-        Self {
-            handle: tokio::runtime::Handle::current(),
-            redraw,
-            active_tasks: Arc::new(AtomicUsize::new(0)),
-            client,
-        }
-    }
-}
-
 fn workflow_start_request(
     request: PluginWorkflowStartRequest,
 ) -> Result<bcode_ipc::WorkflowStartRequest, PluginTuiHostError> {
@@ -575,8 +558,17 @@ impl PluginTuiHost for BcodePluginTuiHost {
     }
 }
 
-pub fn root_host(redraw: InvalidationSignal, client: BcodeClient) -> impl PluginTuiHost {
-    BcodePluginTuiHost::current(redraw, client)
+pub fn root_host(
+    redraw: InvalidationSignal,
+    client: BcodeClient,
+    active_tasks: Arc<AtomicUsize>,
+) -> impl PluginTuiHost {
+    BcodePluginTuiHost {
+        handle: tokio::runtime::Handle::current(),
+        redraw,
+        active_tasks,
+        client,
+    }
 }
 
 fn plugin_workflow_authoring_draft(

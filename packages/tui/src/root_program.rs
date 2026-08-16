@@ -2368,7 +2368,13 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 BcodeRuntimeMessage::PluginSurfaceInvalidated,
             ) => {
                 let client = self.loop_state.foreground_client();
-                match self.loop_state.poll_root_plugin_surface(&client) {
+                let action = self.loop_state.poll_root_plugin_surface(&client);
+                if self.loop_state.has_root_plugin_surface()
+                    && let Some(invalidation) = self.loop_state.root_plugin_surface_invalidation()
+                {
+                    invalidation.request();
+                }
+                match action {
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome }) => {
                         if let Some((plugin_id, outcome)) = self
                             .loop_state
