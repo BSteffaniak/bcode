@@ -64624,6 +64624,107 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn structured_finalization_recovers_after_max_tokens() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("structured max tokens".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "structured max tokens".to_string(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        execution: bcode_session_models::TurnExecutionOptions {
+                            tools: bcode_session_models::TurnToolPolicy::Enabled,
+                            tool_allowlist: Some(vec!["filesystem.read".to_string()]),
+                            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                            model_id: Some("fake-echo".to_string()),
+                            structured_output: Some(
+                                bcode_session_models::TurnStructuredOutputRequest {
+                                    name: "Result".to_string(),
+                                    schema: serde_json::json!({
+                                        "type": "object",
+                                        "required": ["done"],
+                                        "properties": {"done": {"type": "boolean"}}
+                                    }),
+                                    strict: true,
+                                },
+                            ),
+                            ..bcode_session_models::TurnExecutionOptions::default()
+                        },
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
+                },
+            )
+            .await
+            .expect("trigger");
+        let state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([
+                ("fake_tool_rounds".to_string(), "1".to_string()),
+                (
+                    "fake_structured_output_execution".to_string(),
+                    "tool_free_provider_round".to_string(),
+                ),
+                (
+                    "fake_max_tokens_structured_once".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "fake_structured_output_json".to_string(),
+                    serde_json::json!({"done": true}).to_string(),
+                ),
+            ]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                selected_model_id: Some("fake-echo".to_string()),
+                provider_context,
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        assert_eq!(completion.output.as_deref(), Some(r#"{"done":true}"#));
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(
+                    &trace.payload,
+                    SessionTracePayload::ProviderEvent { event_type, .. }
+                        if event_type == "max_tokens_continuation"
+                )
+        )));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ModelTurnFinished { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn workflow_prompt_turn_executes_tool_then_finalizes_structured_output() {
         let sessions = SessionManager::default();
         let session_id = sessions

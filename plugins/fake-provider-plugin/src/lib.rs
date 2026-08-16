@@ -372,6 +372,7 @@ impl FakeProviderPlugin {
         json_response(&capabilities(execution))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn start_turn(&self, request: &ServiceRequest, positioned_output: bool) -> ServiceResponse {
         let request = match request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
@@ -435,11 +436,17 @@ impl FakeProviderPlugin {
         if emit_overflow {
             state.overflow_emitted = true;
         }
-        let emit_max_tokens = request
+        let emit_max_tokens = (request
             .provider_context
             .settings
             .get("fake_max_tokens_once")
             .is_some_and(|value| value == "true")
+            || (request.structured_output.is_some()
+                && request
+                    .provider_context
+                    .settings
+                    .get("fake_max_tokens_structured_once")
+                    .is_some_and(|value| value == "true")))
             && !is_compaction_request
             && !state.max_tokens_emitted;
         if emit_max_tokens {
@@ -763,6 +770,14 @@ fn fake_response_text(
     let Some(structured) = request.structured_output.as_ref() else {
         return Ok(format!("fake: {user_text}"));
     };
+    if request
+        .provider_context
+        .settings
+        .get("fake_malformed_structured_output")
+        .is_some_and(|value| value == "true")
+    {
+        return Ok("{malformed".to_string());
+    }
     if let Some(value) = configured_fake_structured_output(request, structured, user_text)? {
         return Ok(value);
     }
@@ -2615,6 +2630,31 @@ mod tests {
                 } if *actual == status
             )));
         }
+    }
+
+    #[test]
+    fn fake_provider_can_emit_malformed_structured_output_for_host_validation() {
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "turn_id": "turn",
+            "model_id": "fake-echo",
+            "messages": []
+        }))
+        .expect("test request");
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "Result".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        request.provider_context.settings.insert(
+            "fake_malformed_structured_output".to_string(),
+            "true".to_string(),
+        );
+
+        assert_eq!(
+            fake_response_text(&request, None, "input").expect("configured malformed output"),
+            "{malformed"
+        );
     }
 
     #[test]
