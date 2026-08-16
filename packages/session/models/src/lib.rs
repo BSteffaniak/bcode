@@ -3762,6 +3762,20 @@ mod tests {
     }
 
     #[test]
+    fn historical_model_feature_fidelity_defaults_execution_to_direct() {
+        let fidelity: ModelFeatureFidelity = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "family": "structured_output",
+            "feature": "strict_json_schema",
+            "mechanism": "adapter_mediated",
+            "fidelity": "reduced"
+        }))
+        .expect("historical fidelity record should decode");
+
+        assert_eq!(fidelity.execution, "direct");
+    }
+
+    #[test]
     fn turn_execution_overrides_round_trip_and_validate() {
         let metadata = TurnAdmissionMetadata {
             execution: TurnExecutionOptions {

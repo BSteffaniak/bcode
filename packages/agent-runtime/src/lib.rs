@@ -4818,6 +4818,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_free_structured_output_without_tools_executes_directly() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [vec![
+                ProviderTurnEvent::TextDelta {
+                    text: r#"{"done":true}"#.to_string(),
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ]],
+            Arc::clone(&requests),
+        );
+        let mut request = AgentTurnRequest::new("model", "finish directly");
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "result".to_string(),
+            schema: serde_json::json!({ "type": "object" }),
+            strict: true,
+        });
+        request.structured_output_execution =
+            bcode_model::CapabilityExecution::ToolFreeProviderRound;
+
+        let response = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &UnifiedToolCatalog::new(),
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(0),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink::default()),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
+            )
+            .await
+            .expect("tool-free structured request should execute directly");
+
+        assert_eq!(response.text, r#"{"done":true}"#);
+        assert!(!response.events.iter().any(|event| matches!(
+            event,
+            AgentRuntimeEvent::StructuredOutputFinalizationStarted
+        )));
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.is_empty());
+        assert!(requests[0].structured_output.is_some());
+        drop(requests);
+    }
+
+    #[tokio::test]
     async fn canonical_loop_finalizes_structured_output_after_tool_work() {
         let call = ToolCall {
             id: "call-1".to_string(),

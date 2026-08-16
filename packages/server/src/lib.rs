@@ -64787,6 +64787,134 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workflow_evaluation_executes_read_only_tool_then_finalizes_structured_output() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("workflow evaluation finalization".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let execution = bcode_session_models::TurnExecutionOptions {
+            tools: bcode_session_models::TurnToolPolicy::ReadOnly,
+            tool_allowlist: Some(vec!["filesystem.read".to_string()]),
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            model_id: Some("fake-echo".to_string()),
+            structured_output: Some(bcode_session_models::TurnStructuredOutputRequest {
+                name: "LoopWorkflowEvaluation".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["condition_met", "evidence", "implementation_prompt", "iteration", "max_iterations", "stop_condition", "summary"],
+                    "properties": {
+                        "condition_met": {"type": "boolean"},
+                        "evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                        "implementation_prompt": {"type": "string"},
+                        "iteration": {"type": "integer"},
+                        "max_iterations": {"type": "integer"},
+                        "stop_condition": {"type": "string"},
+                        "summary": {"type": "string", "minLength": 1}
+                    }
+                }),
+                strict: true,
+            }),
+            ..bcode_session_models::TurnExecutionOptions::default()
+        };
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "workflow loop evaluation".to_string(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        origin: Some(bcode_session_models::TurnOrigin {
+                            producer: "bcode.workflow".to_string(),
+                            correlation_id: Some("loop-run:loop.evaluation:1".to_string()),
+                            display_label: Some("loop.evaluation".to_string()),
+                        }),
+                        execution,
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
+                },
+            )
+            .await
+            .expect("trigger");
+        let state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([
+                ("fake_tool_rounds".to_string(), "1".to_string()),
+                (
+                    "fake_structured_output_execution".to_string(),
+                    "tool_free_provider_round".to_string(),
+                ),
+                (
+                    "fake_structured_output_json".to_string(),
+                    serde_json::json!({
+                        "condition_met": true,
+                        "evidence": ["filesystem state satisfies the stop condition"],
+                        "implementation_prompt": "continue",
+                        "iteration": 1,
+                        "max_iterations": 20,
+                        "stop_condition": "done",
+                        "summary": "complete"
+                    })
+                    .to_string(),
+                ),
+            ]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                selected_model_id: Some("fake-echo".to_string()),
+                provider_context,
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        let output: serde_json::Value = serde_json::from_str(
+            completion
+                .output
+                .as_deref()
+                .expect("structured evaluation output"),
+        )
+        .expect("valid evaluation JSON");
+        assert_eq!(output["condition_met"], true);
+        assert_eq!(output["evidence"].as_array().map(Vec::len), Some(1));
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ToolInvocationResultRecorded { .. }
+                ))
+                .count(),
+            1,
+            "history: {history:#?}"
+        );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelFeatureFidelityNegotiated { feature, .. }
+                if feature.family == "structured_output"
+                    && feature.execution == "tool_free_provider_round"
+        )));
+    }
+
+    #[tokio::test]
     async fn repeated_tool_rounds_do_not_recompact_an_unchanged_boundary() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
