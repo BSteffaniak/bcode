@@ -391,6 +391,81 @@ fn project_terminal(
 mod tests {
     use super::*;
 
+    fn catalog_item(
+        run_id: &str,
+        status: WorkflowRunStatus,
+        created: u64,
+        updated: u64,
+    ) -> WorkflowRunListItem {
+        WorkflowRunListItem {
+            run_id: run_id.to_string(),
+            display_title: format!("Run {run_id}"),
+            binding_label: None,
+            definition_id: "definition-1".to_string(),
+            definition_version: 1,
+            authored_source: None,
+            definition_disposition:
+                bcode_workflow_view_models::WorkflowDefinitionDisposition::CompiledOnly,
+            parent_run_id: None,
+            descendant_count: 0,
+            progress: bcode_workflow_view_models::WorkflowRunProgress::default(),
+            attention: bcode_workflow_view_models::WorkflowAttentionSummary::default(),
+            status,
+            created_at_ms: created,
+            updated_at_ms: updated,
+        }
+    }
+
+    #[test]
+    fn catalog_cursors_are_deterministic_for_every_sort_and_query_identity() {
+        let runs = vec![
+            catalog_item("run-a", WorkflowRunStatus::Running, 10, 30),
+            catalog_item("run-b", WorkflowRunStatus::Failed, 20, 40),
+        ];
+        for (sort, expected_timestamp, expected_rank) in [
+            (
+                bcode_workflow_view_models::WorkflowCatalogSort::UpdatedAt,
+                40,
+                3,
+            ),
+            (
+                bcode_workflow_view_models::WorkflowCatalogSort::CreatedAt,
+                20,
+                3,
+            ),
+            (
+                bcode_workflow_view_models::WorkflowCatalogSort::Status,
+                40,
+                3,
+            ),
+        ] {
+            let request = bcode_workflow_view_models::WorkflowCatalogRequest {
+                limit: 2,
+                cursor: None,
+                filter: bcode_workflow_view_models::WorkflowCatalogFilter::NeedsAttention,
+                sort,
+                group: bcode_workflow_view_models::WorkflowCatalogGroup::Definition,
+                search: Some("review".to_string()),
+            };
+            let first = project_catalog(runs.clone(), &request, true);
+            let second = project_catalog(runs.clone(), &request, true);
+            assert_eq!(first, second);
+            assert_eq!(first.filter, request.filter);
+            assert_eq!(first.sort, sort);
+            assert_eq!(first.group, request.group);
+            assert_eq!(first.search, request.search);
+            assert_eq!(
+                first.next_cursor,
+                Some(bcode_workflow_view_models::WorkflowCatalogCursor {
+                    sort,
+                    timestamp_ms: expected_timestamp,
+                    status_rank: expected_rank,
+                    run_id: "run-b".to_string(),
+                })
+            );
+        }
+    }
+
     #[test]
     fn node_status_projection_is_exhaustive_for_current_states() {
         let cases = [

@@ -17465,6 +17465,13 @@ async fn handle_inspect_workflow_run(
     .await
 }
 
+const WORKFLOW_RUN_VIEW_COLLECTION_LIMIT_MAX: usize = 1_000;
+
+#[must_use]
+fn workflow_run_view_collection_limit(requested: usize) -> usize {
+    requested.min(WORKFLOW_RUN_VIEW_COLLECTION_LIMIT_MAX)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_workflow_run_view(
     request_id: u64,
@@ -17473,6 +17480,7 @@ async fn handle_workflow_run_view(
     run_id: String,
     limit: usize,
 ) -> Result<(), ServerError> {
+    let limit = workflow_run_view_collection_limit(limit);
     let view = {
         let store = state
             .workflow_store
@@ -35127,6 +35135,16 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workflow_run_view_collection_limit_bounds_outputs_and_attempts() {
+        assert_eq!(super::workflow_run_view_collection_limit(0), 0);
+        assert_eq!(super::workflow_run_view_collection_limit(250), 250);
+        assert_eq!(
+            super::workflow_run_view_collection_limit(usize::MAX),
+            super::WORKFLOW_RUN_VIEW_COLLECTION_LIMIT_MAX
+        );
+    }
+
     #[tokio::test]
     async fn working_directory_validation_rejects_files_and_missing_paths() {
         let root = tempfile::tempdir().expect("temporary directory");
