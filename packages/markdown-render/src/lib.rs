@@ -828,15 +828,61 @@ pub enum MarkdownSelectionKind {
     Other,
 }
 
+/// Conservative copy behavior for renderer transformations without one-to-one source geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkdownSelectionFallback {
+    /// Visible units retain exact source ranges.
+    ExactSource,
+    /// Selection must expand to the complete semantic unit.
+    WholeSemanticUnit,
+    /// No canonical mapping is claimed; consumers may use explicit rendered-text fallback.
+    RenderedText,
+}
+
+/// Return the safe selection fallback for one semantic contribution.
+#[must_use]
+pub const fn markdown_contribution_selection_fallback(
+    kind: &MarkdownContributionKind,
+) -> MarkdownSelectionFallback {
+    match kind {
+        MarkdownContributionKind::Link { .. }
+        | MarkdownContributionKind::FootnoteReference { .. }
+        | MarkdownContributionKind::FootnoteDefinition { .. }
+        | MarkdownContributionKind::InlineMath { .. }
+        | MarkdownContributionKind::DisplayMath { .. } => MarkdownSelectionFallback::ExactSource,
+        MarkdownContributionKind::Details { .. } | MarkdownContributionKind::Mermaid { .. } => {
+            MarkdownSelectionFallback::WholeSemanticUnit
+        }
+        MarkdownContributionKind::Image { .. } | MarkdownContributionKind::GitHubIssue { .. } => {
+            MarkdownSelectionFallback::RenderedText
+        }
+    }
+}
+
 #[must_use]
 pub fn markdown_code_block_selections(source: &str) -> Vec<MarkdownCodeBlockSelection> {
+    let parser_ranges = parse_markdown_document(source)
+        .events
+        .into_iter()
+        .filter_map(|event| {
+            matches!(
+                event.kind,
+                MarkdownSemanticEventKind::Start(MarkdownSemanticTag::CodeBlock(_))
+            )
+            .then_some(event.source_range)
+        })
+        .collect::<Vec<_>>();
     let lines = source_lines_with_offsets(source);
     let mut blocks = Vec::new();
     let mut index = 0;
     while index < lines.len() {
         let (line_start, line_end, content_end) = lines[index];
         let line = &source[line_start..content_end];
-        if let Some((marker, marker_len)) = opening_fence(line) {
+        if let Some((marker, marker_len)) = opening_fence(line)
+            && parser_ranges
+                .iter()
+                .any(|range| line_start < range.end && range.start < line_end)
+        {
             let id = format!("code-block:{line_start}");
             let body_start = line_end;
             let mut footer = None;
@@ -873,7 +919,11 @@ pub fn markdown_code_block_selections(source: &str) -> Vec<MarkdownCodeBlockSele
             };
             continue;
         }
-        if is_indented_code_line(line) {
+        if is_indented_code_line(line)
+            && parser_ranges
+                .iter()
+                .any(|range| line_start < range.end && range.start < line_end)
+        {
             let start_index = index;
             let mut cursor = index.saturating_add(1);
             while cursor < lines.len() {
@@ -1270,14 +1320,23 @@ impl MarkdownStreamingRenderState {
             markdown,
             &lines,
         );
+        let code_block_selections = markdown_code_block_selections(markdown);
+        let layout_signature = markdown_layout_signature(
+            markdown,
+            options,
+            &[],
+            &[],
+            &selection_provenance,
+            &code_block_selections,
+        );
         let result = MarkdownRenderResult {
             lines,
             selection_provenance,
-            code_block_selections: markdown_code_block_selections(markdown),
+            code_block_selections,
             contributions: Vec::new(),
             geometry: Vec::new(),
             anchors: Vec::new(),
-            layout_signature: markdown_layout_signature(markdown, options, &[], &[]),
+            layout_signature,
         };
         self.source.clear();
         self.source.push_str(markdown);
@@ -1465,7 +1524,15 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     );
     #[cfg(test)]
     let signature_started = std::time::Instant::now();
-    let layout_signature = markdown_layout_signature(markdown, options, &contributions, &geometry);
+    let code_block_selections = markdown_code_block_selections(markdown);
+    let layout_signature = markdown_layout_signature(
+        markdown,
+        options,
+        &contributions,
+        &geometry,
+        &selection_provenance,
+        &code_block_selections,
+    );
     #[cfg(test)]
     record_markdown_stage(
         |diagnostics, elapsed| diagnostics.signature = elapsed,
@@ -1474,7 +1541,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     MarkdownRenderResult {
         lines,
         selection_provenance,
-        code_block_selections: markdown_code_block_selections(markdown),
+        code_block_selections,
         contributions,
         geometry,
         anchors,
@@ -1844,13 +1911,17 @@ fn markdown_layout_signature(
     options: &MarkdownRenderOptions,
     contributions: &[MarkdownContribution],
     geometry: &[MarkdownContributionGeometry],
+    selection_provenance: &[MarkdownSelectionProvenance],
+    code_block_selections: &[MarkdownCodeBlockSelection],
 ) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     markdown.hash(&mut hasher);
     options.hash(&mut hasher);
     contributions.hash(&mut hasher);
     geometry.hash(&mut hasher);
-    format!("markdown-layout-v4:{:016x}", hasher.finish())
+    selection_provenance.hash(&mut hasher);
+    code_block_selections.hash(&mut hasher);
+    format!("markdown-layout-v5:{:016x}", hasher.finish())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -4754,6 +4825,71 @@ mod tests {
                 "expected highlighted {language} spans"
             );
         }
+    }
+
+    #[test]
+    fn layout_signature_includes_selection_provenance_contract() {
+        let plain = render_markdown("text", &MarkdownRenderOptions::new(40));
+        let fenced = render_markdown("```\ntext\n```", &MarkdownRenderOptions::new(40));
+
+        assert!(plain.layout_signature.starts_with("markdown-layout-v5:"));
+        assert!(fenced.layout_signature.starts_with("markdown-layout-v5:"));
+        assert_ne!(plain.layout_signature, fenced.layout_signature);
+        assert_ne!(plain.selection_provenance, fenced.selection_provenance);
+        assert_ne!(plain.code_block_selections, fenced.code_block_selections);
+    }
+
+    #[test]
+    fn rich_selection_fallbacks_are_explicit_and_conservative() {
+        let rendered = render_markdown(
+            "[label](https://example.com)\n\n![alt](image.png)\n\n```mermaid\ngraph TD; A-->B\n```\n\n<details><summary>More</summary>Body</details>\n\n$x$",
+            &MarkdownRenderOptions::new(80),
+        );
+        assert!(rendered.contributions.iter().any(|contribution| {
+            matches!(
+                contribution.kind,
+                super::MarkdownContributionKind::Link { .. }
+            ) && super::markdown_contribution_selection_fallback(&contribution.kind)
+                == super::MarkdownSelectionFallback::ExactSource
+        }));
+        assert!(rendered.contributions.iter().any(|contribution| {
+            matches!(
+                contribution.kind,
+                super::MarkdownContributionKind::Image { .. }
+            ) && super::markdown_contribution_selection_fallback(&contribution.kind)
+                == super::MarkdownSelectionFallback::RenderedText
+        }));
+        assert!(rendered.contributions.iter().any(|contribution| {
+            matches!(
+                contribution.kind,
+                super::MarkdownContributionKind::Mermaid { .. }
+                    | super::MarkdownContributionKind::Details { .. }
+            ) && super::markdown_contribution_selection_fallback(&contribution.kind)
+                == super::MarkdownSelectionFallback::WholeSemanticUnit
+        }));
+        assert!(rendered.contributions.iter().any(|contribution| {
+            matches!(
+                contribution.kind,
+                super::MarkdownContributionKind::InlineMath { .. }
+            ) && super::markdown_contribution_selection_fallback(&contribution.kind)
+                == super::MarkdownSelectionFallback::ExactSource
+        }));
+    }
+
+    #[test]
+    fn code_block_selection_uses_parser_truth_for_nested_indentation() {
+        let list = "- item\n\n      indented code\n      next\n";
+        let rendered = render_markdown(list, &MarkdownRenderOptions::new(80));
+        assert_eq!(rendered.code_block_selections.len(), 1);
+        let block = &rendered.code_block_selections[0];
+        assert_eq!(
+            &list[block.whole_range.clone()],
+            "      indented code\n      next\n"
+        );
+
+        let ordinary_indent = "paragraph\n    continuation\n";
+        let rendered = render_markdown(ordinary_indent, &MarkdownRenderOptions::new(80));
+        assert!(rendered.code_block_selections.is_empty());
     }
 
     #[test]
