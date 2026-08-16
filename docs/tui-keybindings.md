@@ -21,6 +21,22 @@ Common defaults:
 | `Home` / `End` | Jump to transcript start/end |
 | `Up` / `Down` | Navigate composer history |
 | `Ctrl+I` | Restore the active transcript interaction into view |
+| `Ctrl+Shift+C` | Copy the current transcript selection |
+
+Transcript selection uses logical content rather than framebuffer text. Dragging from inside one
+response constrains the gesture to that response; dragging from transcript-owned surrounding space
+may span multiple items in transcript order. Selection follows scrolling, history loading, and
+responsive reflow. Markdown responses copy canonical source where the rendered projection is
+unambiguous, while unsupported transformed visuals use an explicit rendered-text fallback rather
+than inventing source ranges. Copy success, absence of a selection, and clipboard failures are
+reported in the normal status area.
+
+The copy binding is configurable:
+
+```toml
+[tui.keybindings.chat]
+"ctrl+shift+c" = "tui.transcript.copySelection"
+```
 
 The composer is Unicode-aware. Arrow keys move by grapheme; `Alt+Left` / `Alt+Right` and `Ctrl+Left` / `Ctrl+Right` move by word. `Ctrl+A` / `Ctrl+E` move to the start or end, while standard character, word, and line deletion bindings are available. Active plugin text inputs consume these same configured edit, selection, newline, and submit actions.
 
