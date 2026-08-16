@@ -241,6 +241,12 @@ impl TranscriptItem {
         self.event_sequence
     }
 
+    /// Return the source event timestamp associated with this item, when known.
+    #[must_use]
+    pub const fn timestamp_ms(&self) -> Option<u64> {
+        self.timestamp_ms
+    }
+
     /// Return stable item identity.
     #[must_use]
     pub const fn id(&self) -> TranscriptItemId {

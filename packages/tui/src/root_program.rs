@@ -2006,10 +2006,66 @@ fn export_plain_transcript_selection<'a>(
             }
         }
         if !text.is_empty() {
-            output.push(text);
+            output.push(format_transcript_selection_item(item, &text));
         }
     }
     (!output.is_empty()).then(|| output.join("\n\n"))
+}
+
+fn format_transcript_selection_item(
+    item: &super::transcript::TranscriptItem,
+    text: &str,
+) -> String {
+    use super::transcript::TranscriptItemKind;
+
+    let metadata = match item.kind() {
+        TranscriptItemKind::ToolRequest {
+            tool_name,
+            status,
+            active,
+            ..
+        } => Some(format!(
+            "Tool request: {tool_name} [{}]",
+            status.map_or(
+                if *active { "active" } else { "requested" },
+                |status| match status {
+                    bcode_session_view_models::ToolInvocationViewStatus::Requested => "requested",
+                    bcode_session_view_models::ToolInvocationViewStatus::Waiting => "waiting",
+                    bcode_session_view_models::ToolInvocationViewStatus::Running => "running",
+                    bcode_session_view_models::ToolInvocationViewStatus::Finished => "finished",
+                    bcode_session_view_models::ToolInvocationViewStatus::Failed => "failed",
+                    bcode_session_view_models::ToolInvocationViewStatus::Cancelled => "cancelled",
+                }
+            )
+        )),
+        TranscriptItemKind::ToolResult {
+            tool_name,
+            is_error,
+            timing,
+            ..
+        } => Some(format!(
+            "Tool result: {} [{}{}]",
+            tool_name.as_deref().unwrap_or("unknown"),
+            if *is_error { "failed" } else { "finished" },
+            timing
+                .duration_ms
+                .map_or_else(String::new, |duration| format!(", {duration}ms"))
+        )),
+        TranscriptItemKind::ToolRequestDraft { .. } => {
+            Some("Tool request draft [pending]".to_owned())
+        }
+        TranscriptItemKind::ToolContribution { .. } => Some("Tool contribution".to_owned()),
+        _ => None,
+    };
+    metadata.map_or_else(
+        || text.to_owned(),
+        |metadata| {
+            item.timestamp_ms().map_or_else(
+                || format!("{metadata}\n{text}"),
+                |timestamp| format!("{metadata} @ {timestamp}ms\n{text}"),
+            )
+        },
+    )
 }
 
 fn transcript_plain_row_source_ranges(
@@ -3522,6 +3578,75 @@ mod tests {
             super::export_plain_transcript_selection(items.iter(), &snapshot).as_deref(),
             Some("first\n\nsecond")
         );
+    }
+
+    #[test]
+    fn selected_tool_items_export_canonical_context_and_status() {
+        let request = super::super::transcript::tool_request_item(
+            "call-1",
+            Some("filesystem"),
+            "read_file",
+            r#"{"path":"src/lib.rs"}"#,
+            None,
+        )
+        .with_event_metadata(1, 123);
+        let result = super::super::transcript::tool_result_item(
+            "call-1",
+            Some("read_file"),
+            Some(r#"{"path":"src/lib.rs"}"#),
+            "contents",
+            false,
+        )
+        .with_event_metadata(2, 456);
+        let request_id = request.id().get();
+        let result_id = result.id().get();
+        let snapshot = bmux_tui::selection::SelectionSnapshot {
+            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+            anchor: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: bmux_tui::selection::SelectionContentId::new(format!(
+                    "bcode.transcript.item.{request_id}.plain"
+                )),
+                offset: 0,
+                order: 0,
+                affinity: bmux_tui::selection::SelectionAffinity::Before,
+                revision: 0,
+            },
+            focus: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: bmux_tui::selection::SelectionContentId::new(format!(
+                    "bcode.transcript.item.{result_id}.plain"
+                )),
+                offset: result.text.len(),
+                order: 1,
+                affinity: bmux_tui::selection::SelectionAffinity::After,
+                revision: 0,
+            },
+            reversed: false,
+            slices: vec![
+                bmux_tui::selection::SelectionSlice {
+                    content_id: bmux_tui::selection::SelectionContentId::new(format!(
+                        "bcode.transcript.item.{result_id}.plain"
+                    )),
+                    source_range: 0..result.text.len(),
+                    revision: 0,
+                },
+                bmux_tui::selection::SelectionSlice {
+                    content_id: bmux_tui::selection::SelectionContentId::new(format!(
+                        "bcode.transcript.item.{request_id}.plain"
+                    )),
+                    source_range: 0..request.text.len(),
+                    revision: 0,
+                },
+            ],
+            visible_highlights: Vec::new(),
+        };
+        let exported = super::export_plain_transcript_selection([&request, &result], &snapshot)
+            .expect("tool export");
+
+        assert!(exported.starts_with("Tool request: read_file [requested] @ 123ms"));
+        assert!(exported.contains("src/lib.rs"));
+        assert!(exported.contains("Tool result: read_file [finished] @ 456ms\ncontents"));
     }
 
     #[test]
