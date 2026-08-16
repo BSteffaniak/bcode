@@ -4185,8 +4185,8 @@ pub fn add_openai_chatgpt_subscription_auth(
             profile.to_string(),
             AuthProfileConfig {
                 backend: "sshenv".to_string(),
-                provider_id: None,
-                owner_plugin_id: None,
+                provider_id: Some("openai".to_owned()),
+                owner_plugin_id: Some("bcode.openai-compatible".to_owned()),
                 scheme: Some("chatgpt".to_string()),
                 map: openai_compatible_auth_map("openai", &AuthMode::ChatGpt),
                 settings,

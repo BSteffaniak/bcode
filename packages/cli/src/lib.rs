@@ -6344,17 +6344,36 @@ fn resolved_auth_method<'a>(
     selected_auth_method(provider, Some(scheme))
 }
 
-fn registered_auth_profile_hint(
+fn owned_ambient_auth_profile_hint(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    profile: Option<String>,
+) -> Option<String> {
+    let profile = profile.filter(|profile| !profile.trim().is_empty())?;
+    bcode_provider_auth::resolve_auth_provider_profile(
+        config,
+        &provider.contribution.provider_id,
+        &provider.plugin_id,
+        Some(&profile),
+        runtime,
+    )
+    .is_ok()
+    .then_some(profile)
+}
+
+fn registered_auth_profile_hint_from(
     config: &bcode_config::BcodeConfig,
     runtime: &bcode_config::RuntimeAuthSubscriptions,
     provider: &bcode_plugin::RegisteredAuthProvider,
     explicit_profile: Option<&str>,
+    ambient_auth_profile: Option<String>,
 ) -> Option<String> {
     if let Some(profile) = explicit_profile {
         return Some(profile.to_owned());
     }
-    if let Ok(profile) = std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
-        && !profile.trim().is_empty()
+    if let Some(profile) =
+        owned_ambient_auth_profile_hint(config, runtime, provider, ambient_auth_profile)
     {
         return Some(profile);
     }
@@ -6366,16 +6385,39 @@ fn registered_auth_profile_hint(
                 .unwrap_or_else(|| config.resolved_model_selection())
         },
     );
-    let selected = selection.auth_profile?;
+    owned_ambient_auth_profile_hint(config, runtime, provider, selection.auth_profile)
+}
+
+fn registered_auth_profile_hint(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    explicit_profile: Option<&str>,
+) -> Option<String> {
+    registered_auth_profile_hint_from(
+        config,
+        runtime,
+        provider,
+        explicit_profile,
+        std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV).ok(),
+    )
+}
+
+fn resolve_registered_auth_profile_from(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    explicit_profile: Option<&str>,
+) -> Result<bcode_provider_auth::ResolvedAuthProfile, CliError> {
+    let profile_hint = registered_auth_profile_hint(config, runtime, provider, explicit_profile);
     bcode_provider_auth::resolve_auth_provider_profile(
         config,
         &provider.contribution.provider_id,
         &provider.plugin_id,
-        Some(&selected),
+        profile_hint.as_deref(),
         runtime,
     )
-    .is_ok()
-    .then_some(selected)
+    .map_err(|error| CliError::LoginProfile(error.to_string()))
 }
 
 fn resolve_registered_auth_profile(
@@ -6384,33 +6426,25 @@ fn resolve_registered_auth_profile(
 ) -> Result<bcode_provider_auth::ResolvedAuthProfile, CliError> {
     let config = bcode_config::load_config()?;
     let runtime = bcode_config::load_runtime_auth_subscriptions();
-    let profile_hint = registered_auth_profile_hint(&config, &runtime, provider, explicit_profile);
-    bcode_provider_auth::resolve_auth_provider_profile(
-        &config,
-        &provider.contribution.provider_id,
-        &provider.plugin_id,
-        profile_hint.as_deref(),
-        &runtime,
-    )
-    .map_err(|error| CliError::LoginProfile(error.to_string()))
+    resolve_registered_auth_profile_from(&config, &runtime, provider, explicit_profile)
 }
 
-fn resolve_or_prepare_auth_profile(
+fn resolve_or_prepare_auth_profile_from(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
     provider: &bcode_plugin::RegisteredAuthProvider,
     method: &bcode_provider_auth_models::AuthMethodContribution,
     explicit_profile: Option<&str>,
     explicit_vault: Option<PathBuf>,
     recipient_key: Option<&str>,
 ) -> Result<(bcode_provider_auth::ResolvedAuthProfile, bool), CliError> {
-    let config = bcode_config::load_config()?;
-    let runtime = bcode_config::load_runtime_auth_subscriptions();
-    let profile_hint = registered_auth_profile_hint(&config, &runtime, provider, explicit_profile);
+    let profile_hint = registered_auth_profile_hint(config, runtime, provider, explicit_profile);
     match bcode_provider_auth::resolve_auth_provider_profile(
-        &config,
+        config,
         &provider.contribution.provider_id,
         &provider.plugin_id,
         profile_hint.as_deref(),
-        &runtime,
+        runtime,
     ) {
         Ok(mut resolved) => {
             if let Some(vault) = explicit_vault {
@@ -6491,6 +6525,26 @@ fn resolve_or_prepare_auth_profile(
         }
         Err(error) => Err(CliError::LoginProfile(error.to_string())),
     }
+}
+
+fn resolve_or_prepare_auth_profile(
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    method: &bcode_provider_auth_models::AuthMethodContribution,
+    explicit_profile: Option<&str>,
+    explicit_vault: Option<PathBuf>,
+    recipient_key: Option<&str>,
+) -> Result<(bcode_provider_auth::ResolvedAuthProfile, bool), CliError> {
+    let config = bcode_config::load_config()?;
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    resolve_or_prepare_auth_profile_from(
+        &config,
+        &runtime,
+        provider,
+        method,
+        explicit_profile,
+        explicit_vault,
+        recipient_key,
+    )
 }
 
 fn runtime_pool_profile(
@@ -13057,13 +13111,21 @@ mod auth_cli_tests {
     fn registered_provider(
         methods: Vec<bcode_provider_auth_models::AuthMethodContribution>,
     ) -> bcode_plugin::RegisteredAuthProvider {
+        registered_provider_owned_by("test", "bcode.test", methods)
+    }
+
+    fn registered_provider_owned_by(
+        provider_id: &str,
+        plugin_id: &str,
+        methods: Vec<bcode_provider_auth_models::AuthMethodContribution>,
+    ) -> bcode_plugin::RegisteredAuthProvider {
         bcode_plugin::RegisteredAuthProvider {
-            plugin_id: "bcode.test".to_owned(),
+            plugin_id: plugin_id.to_owned(),
             contribution: bcode_provider_auth_models::AuthProviderContribution {
                 schema_version:
                     bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
-                provider_id: "test".to_owned(),
-                display_name: "Test".to_owned(),
+                provider_id: provider_id.to_owned(),
+                display_name: provider_id.to_owned(),
                 methods,
             },
         }
@@ -13324,6 +13386,174 @@ mod auth_cli_tests {
                 .get("access_token")
                 .and_then(|mapping| mapping.key.as_deref()),
             Some("TOKEN")
+        );
+    }
+
+    #[test]
+    fn ambient_unowned_wrapper_profile_does_not_hijack_registered_provider() {
+        let provider =
+            registered_provider_owned_by("exa", "bcode.web-search", vec![interactive("api_key")]);
+        let config: bcode_config::BcodeConfig = toml::from_str(
+            r#"
+[auth.profiles.openai]
+backend = "sshenv"
+
+[auth.profiles.openai.settings]
+mode = "chatgpt"
+profile = "openai"
+provider = "openai"
+
+[model]
+profile = "default"
+
+[model.profiles.default]
+provider_plugin_id = "bcode.wrapper"
+auth_profile = "openai"
+"#,
+        )
+        .expect("OpenAI wrapper config parses");
+        let runtime = bcode_config::RuntimeAuthSubscriptions::default();
+
+        assert_eq!(
+            registered_auth_profile_hint_from(
+                &config,
+                &runtime,
+                &provider,
+                None,
+                Some("openai".to_owned()),
+            ),
+            None
+        );
+        assert_eq!(
+            registered_auth_profile_hint_from(&config, &runtime, &provider, None, None),
+            None
+        );
+        let error = resolve_registered_auth_profile_from(&config, &runtime, &provider, None)
+            .expect_err("missing Exa enrollment");
+        assert!(error.to_string().contains("provider 'exa'"));
+        assert!(
+            !error
+                .to_string()
+                .contains("profile 'openai' has no authentication scheme")
+        );
+
+        let (resolved, persist_runtime) = resolve_or_prepare_auth_profile_from(
+            &config,
+            &runtime,
+            &provider,
+            &interactive("api_key"),
+            None,
+            Some(PathBuf::from("/tmp/exa-vault")),
+            None,
+        )
+        .expect("prepare Exa profile independently of wrapper");
+        assert_eq!(resolved.profile_name, "exa");
+        assert_eq!(resolved.profile.provider_id.as_deref(), Some("exa"));
+        assert_eq!(
+            resolved.profile.owner_plugin_id.as_deref(),
+            Some("bcode.web-search")
+        );
+        assert!(persist_runtime);
+    }
+
+    #[test]
+    fn ambient_typed_other_provider_is_ignored_but_explicit_profile_fails_closed() {
+        let provider =
+            registered_provider_owned_by("exa", "bcode.web-search", vec![interactive("api_key")]);
+        let config = bcode_config::BcodeConfig {
+            model: bcode_config::ModelConfig {
+                profile: Some("wrapper".to_owned()),
+                profiles: BTreeMap::from([(
+                    "wrapper".to_owned(),
+                    bcode_config::ModelProfileConfig {
+                        provider_plugin_id: "bcode.wrapper".to_owned(),
+                        auth_profile: Some("openai".to_owned()),
+                        ..bcode_config::ModelProfileConfig::default()
+                    },
+                )]),
+                ..bcode_config::ModelConfig::default()
+            },
+            auth: bcode_config::AuthConfig {
+                profiles: BTreeMap::from([(
+                    "openai".to_owned(),
+                    bcode_config::AuthProfileConfig {
+                        backend: "sshenv".to_owned(),
+                        provider_id: Some("openai".to_owned()),
+                        owner_plugin_id: Some("bcode.wrapper".to_owned()),
+                        scheme: Some("chatgpt".to_owned()),
+                        ..bcode_config::AuthProfileConfig::default()
+                    },
+                )]),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let runtime = bcode_config::RuntimeAuthSubscriptions::default();
+
+        assert_eq!(
+            registered_auth_profile_hint_from(
+                &config,
+                &runtime,
+                &provider,
+                None,
+                Some("openai".to_owned()),
+            ),
+            None
+        );
+        let error =
+            resolve_registered_auth_profile_from(&config, &runtime, &provider, Some("openai"))
+                .expect_err("explicit mismatched profile must fail closed");
+        assert!(error.to_string().contains("belongs to provider 'openai'"));
+    }
+
+    #[test]
+    fn runtime_provider_binding_resolves_under_unrelated_wrapper() {
+        let provider =
+            registered_provider_owned_by("exa", "bcode.web-search", vec![interactive("api_key")]);
+        let config: bcode_config::BcodeConfig = toml::from_str(
+            r#"
+[auth.profiles.openai]
+backend = "sshenv"
+
+[model]
+profile = "default"
+
+[model.profiles.default]
+provider_plugin_id = "bcode.wrapper"
+auth_profile = "openai"
+"#,
+        )
+        .expect("wrapper config parses");
+        let runtime = bcode_config::RuntimeAuthSubscriptions {
+            bindings: BTreeMap::from([(
+                "exa".to_owned(),
+                bcode_config::RuntimeAuthBinding {
+                    profile: "exa".to_owned(),
+                    owner_plugin_id: "bcode.web-search".to_owned(),
+                },
+            )]),
+            profiles: BTreeMap::from([(
+                "exa".to_owned(),
+                bcode_config::RuntimeAuthProfile {
+                    provider_id: "exa".to_owned(),
+                    owner_plugin_id: "bcode.web-search".to_owned(),
+                    backend: "sshenv".to_owned(),
+                    scheme: "api_key".to_owned(),
+                    storage_profile: "exa".to_owned(),
+                    vault: PathBuf::from("/tmp/exa-vault"),
+                    map: BTreeMap::new(),
+                    device_seal: None,
+                },
+            )]),
+            ..bcode_config::RuntimeAuthSubscriptions::default()
+        };
+
+        let resolved = resolve_registered_auth_profile_from(&config, &runtime, &provider, None)
+            .expect("runtime Exa binding resolves");
+        assert_eq!(resolved.profile_name, "exa");
+        assert_eq!(
+            resolved.source,
+            bcode_provider_auth::AuthProfileSource::Runtime
         );
     }
 

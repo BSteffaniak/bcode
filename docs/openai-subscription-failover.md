@@ -75,6 +75,8 @@ The CLI writes ordinary declarative config. You can also author it directly:
 ```toml
 [auth.profiles.openai]
 backend = "sshenv"
+provider_id = "openai"
+owner_plugin_id = "bcode.openai-compatible"
 scheme = "chatgpt"
 
 [auth.profiles.openai.settings]
@@ -85,6 +87,8 @@ mode = "chatgpt"
 
 [auth.profiles.openai-2]
 backend = "sshenv"
+provider_id = "openai"
+owner_plugin_id = "bcode.openai-compatible"
 scheme = "chatgpt"
 
 [auth.profiles.openai-2.settings]

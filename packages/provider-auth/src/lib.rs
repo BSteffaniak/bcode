@@ -283,6 +283,10 @@ pub enum AuthProfileResolutionError {
         provider_id: String,
         profile: String,
     },
+    #[error(
+        "auth profile '{profile}' cannot prove registered provider ownership: missing {missing}"
+    )]
+    OwnershipUnverifiable { profile: String, missing: String },
     #[error("auth profile '{profile}' belongs to provider '{actual}', not '{expected}'")]
     ProviderMismatch {
         profile: String,
@@ -305,7 +309,7 @@ pub enum AuthProfileResolutionError {
 ///
 /// # Errors
 ///
-/// Returns an error for missing profiles or provider/plugin ownership mismatch.
+/// Returns an error for missing profiles, unverifiable ownership, or provider/plugin mismatch.
 pub fn resolve_auth_provider_profile(
     config: &bcode_config::BcodeConfig,
     provider_id: &str,
@@ -351,6 +355,16 @@ pub fn resolve_auth_provider_profile(
             profile: profile_name.to_string(),
         }
     })?;
+    if let Some(binding) = runtime_binding
+        && binding.profile == profile_name
+        && binding.owner_plugin_id != owner_plugin_id
+    {
+        return Err(AuthProfileResolutionError::OwnerMismatch {
+            profile: profile_name.to_string(),
+            expected: owner_plugin_id.to_string(),
+            actual: binding.owner_plugin_id.clone(),
+        });
+    }
     if runtime_profile.provider_id != provider_id {
         return Err(AuthProfileResolutionError::ProviderMismatch {
             profile: profile_name.to_string(),
@@ -402,22 +416,30 @@ fn validate_auth_profile_ownership(
     provider_id: &str,
     owner_plugin_id: &str,
 ) -> Result<(), AuthProfileResolutionError> {
-    if let Some(actual) = &profile.provider_id
-        && actual != provider_id
-    {
+    let Some(actual_provider_id) = &profile.provider_id else {
+        return Err(AuthProfileResolutionError::OwnershipUnverifiable {
+            profile: profile_name.to_string(),
+            missing: "provider_id".to_owned(),
+        });
+    };
+    if actual_provider_id != provider_id {
         return Err(AuthProfileResolutionError::ProviderMismatch {
             profile: profile_name.to_string(),
             expected: provider_id.to_string(),
-            actual: actual.clone(),
+            actual: actual_provider_id.clone(),
         });
     }
-    if let Some(actual) = &profile.owner_plugin_id
-        && actual != owner_plugin_id
-    {
+    let Some(actual_owner_plugin_id) = &profile.owner_plugin_id else {
+        return Err(AuthProfileResolutionError::OwnershipUnverifiable {
+            profile: profile_name.to_string(),
+            missing: "owner_plugin_id".to_owned(),
+        });
+    };
+    if actual_owner_plugin_id != owner_plugin_id {
         return Err(AuthProfileResolutionError::OwnerMismatch {
             profile: profile_name.to_string(),
             expected: owner_plugin_id.to_string(),
-            actual: actual.clone(),
+            actual: actual_owner_plugin_id.clone(),
         });
     }
     Ok(())
@@ -754,6 +776,82 @@ fn apply_default_priming_required_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unowned_declarative_profile_fails_closed() {
+        for (provider_id, owner_plugin_id, missing) in [
+            (None, Some("bcode.web-search".to_owned()), "provider_id"),
+            (Some("exa".to_owned()), None, "owner_plugin_id"),
+        ] {
+            let config = bcode_config::BcodeConfig {
+                auth: bcode_config::AuthConfig {
+                    profiles: BTreeMap::from([(
+                        "exa".to_owned(),
+                        bcode_config::AuthProfileConfig {
+                            backend: "sshenv".to_owned(),
+                            provider_id,
+                            owner_plugin_id,
+                            scheme: Some("api_key".to_owned()),
+                            ..bcode_config::AuthProfileConfig::default()
+                        },
+                    )]),
+                    ..bcode_config::AuthConfig::default()
+                },
+                ..bcode_config::BcodeConfig::default()
+            };
+            assert!(matches!(
+                resolve_auth_provider_profile(
+                    &config,
+                    "exa",
+                    "bcode.web-search",
+                    Some("exa"),
+                    &bcode_config::RuntimeAuthSubscriptions::default(),
+                ),
+                Err(AuthProfileResolutionError::OwnershipUnverifiable {
+                    missing: actual,
+                    ..
+                }) if actual == missing
+            ));
+        }
+    }
+
+    #[test]
+    fn runtime_binding_owner_mismatch_fails_closed() {
+        let runtime = bcode_config::RuntimeAuthSubscriptions {
+            bindings: BTreeMap::from([(
+                "exa".to_owned(),
+                bcode_config::RuntimeAuthBinding {
+                    profile: "exa".to_owned(),
+                    owner_plugin_id: "bcode.other".to_owned(),
+                },
+            )]),
+            profiles: BTreeMap::from([(
+                "exa".to_owned(),
+                bcode_config::RuntimeAuthProfile {
+                    provider_id: "exa".to_owned(),
+                    owner_plugin_id: "bcode.web-search".to_owned(),
+                    backend: "sshenv".to_owned(),
+                    scheme: "api_key".to_owned(),
+                    storage_profile: "exa".to_owned(),
+                    vault: PathBuf::from("/tmp/exa-vault"),
+                    map: BTreeMap::new(),
+                    device_seal: None,
+                },
+            )]),
+            ..bcode_config::RuntimeAuthSubscriptions::default()
+        };
+        assert!(matches!(
+            resolve_auth_provider_profile(
+                &bcode_config::BcodeConfig::default(),
+                "exa",
+                "bcode.web-search",
+                None,
+                &runtime,
+            ),
+            Err(AuthProfileResolutionError::OwnerMismatch { actual, .. })
+                if actual == "bcode.other"
+        ));
+    }
 
     #[test]
     fn declarative_binding_precedes_runtime_and_enforces_ownership() {

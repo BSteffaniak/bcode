@@ -69,15 +69,18 @@ Provider-native callback payloads, token responses, and HTTP errors remain insid
 
 Resolution is deterministic:
 
-1. an explicit CLI profile
-2. an explicit active auth-profile environment selection
-3. an owned auth profile selected by the active model/wrapper profile
+1. an explicit CLI profile, with exact typed provider/plugin ownership
+2. an explicit active auth-profile environment selection, only when exact ownership matches
+3. an owned auth profile selected by the active model/wrapper profile, only when exact ownership matches
 4. a declarative provider binding
 5. a same-named declarative profile
 6. a runtime provider binding and runtime profile
 7. the provider ID as the profile name for new enrollment
 
-Declarative profiles and bindings take precedence over runtime metadata. Explicit or active profiles with mismatched provider/plugin ownership fail closed; a model-selected profile owned by an unrelated provider is ignored for the current provider.
+Declarative profiles and bindings take precedence over runtime metadata. Explicit profiles selected
+for a provider lifecycle command fail closed when provider/plugin ownership is missing or mismatched.
+Ambient environment/model selections are hints only: unrelated, legacy-unowned, or mismatched
+profiles are ignored so an explicit provider command cannot be hijacked by the active model wrapper.
 
 Runtime metadata contains provider ID, owner plugin ID, backend, scheme, storage profile, vault path, credential-to-storage mapping, and device-seal selection. It never contains credential values. Pool enrollment registers a profile without replacing the provider's primary binding.
 
