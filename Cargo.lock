@@ -1513,6 +1513,7 @@ dependencies = [
  "bcode_settings",
  "bcode_tui",
  "bcode_workflow",
+ "bcode_workflow_store",
  "bcode_worktree_models",
  "bmux_keyboard",
  "bmux_tui",

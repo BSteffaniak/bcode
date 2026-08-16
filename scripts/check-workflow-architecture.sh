@@ -8,13 +8,16 @@ if ! rg -q 'state_dir\.join\("workflows"\)\.join\(DATABASE_FILE\)' packages/work
   violations=1
 fi
 
-if rg -n 'fn migrate\(|ALTER TABLE workflow_|UPDATE workflow_store_contract SET schema_version' \
-  packages/workflow-store/src/lib.rs >/tmp/bcode-workflow-store-migrations 2>/dev/null; then
-  echo "Workflow store compatibility violation: clean-break storage must not retain migrations." >&2
-  cat /tmp/bcode-workflow-store-migrations >&2
+if rg -n 'fn migrate\(' packages/workflow-store/src/lib.rs >/tmp/bcode-workflow-store-migrations 2>/dev/null \
+  || rg -n 'ALTER TABLE workflow_|UPDATE workflow_store_contract SET schema_version' \
+    packages/workflow-store/src/lib.rs \
+    | rg -v 'migrate_schema_14_to_current_in_state_dir|target_artifact_id|coordinator_daemon_instance_id|coordinator_generation|coordinator_fencing_token|schema_version = 15|schema_version = 14' \
+    >/tmp/bcode-workflow-store-unapproved-migrations 2>/dev/null; then
+  echo "Workflow store compatibility violation: only the approved explicit schema-14 authority migration may remain." >&2
+  cat /tmp/bcode-workflow-store-migrations /tmp/bcode-workflow-store-unapproved-migrations 2>/dev/null >&2
   violations=1
 fi
-rm -f /tmp/bcode-workflow-store-migrations
+rm -f /tmp/bcode-workflow-store-migrations /tmp/bcode-workflow-store-unapproved-migrations
 
 if ! rg -q 'pub struct WorkflowBlockPreparationRequest' packages/workflow/src/lib.rs \
   || ! rg -q 'pub struct WorkflowBlockPreparationResponse' packages/workflow/src/lib.rs \
@@ -113,6 +116,9 @@ if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 15' packages/workflow
   || ! rg -q 'workflow_store_unavailable' packages/server/src/lib.rs \
   || ! rg -q 'workflow capability is unavailable; daemon startup will continue' packages/server/src/lib.rs \
   || ! rg -q 'workflow restoration skipped while the workflow domain is unavailable' packages/server/src/lib.rs \
+  || ! rg -q 'migrate_schema_14_to_current_in_state_dir' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'schema_fourteen_migration_preserves_runs_and_adds_authority_columns' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'MigrateStore' packages/cli/src/lib.rs \
   || ! rg -q 'CoreRuntimeRequest' packages/server/src/request_routing.rs \
   || ! rg -q 'RoutedRequest::CoreRuntime' packages/server/src/lib.rs \
   || ! rg -q 'is_optional_domain_unavailable' packages/tui/src/effects.rs \

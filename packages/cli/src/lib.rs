@@ -62,6 +62,8 @@ pub enum CliError {
     Config(#[from] bcode_config::ConfigError),
     #[error("server error: {0}")]
     Server(#[from] bcode_server::ServerError),
+    #[error("workflow store error: {0}")]
+    WorkflowStore(#[from] bcode_workflow_store::WorkflowStoreError),
     #[error("session database error: {0}")]
     SessionDb(#[from] bcode_session::db::SessionDbError),
     #[error("session lease error: {0}")]
@@ -454,6 +456,14 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         }
         WorkflowCommand::CancelComputation { operation_id } => {
             print_json(&client.cancel_workflow_computation(operation_id).await?)?;
+        }
+        WorkflowCommand::MigrateStore => {
+            print_json(
+                &bcode_workflow_store::WorkflowStore::migrate_schema_14_to_current_in_state_dir(
+                    &bcode_config::default_state_dir(),
+                    current_unix_time_ms()?,
+                )?,
+            )?;
         }
         WorkflowCommand::ResetStore { confirm } => {
             if confirm != "DELETE-INCOMPATIBLE-WORKFLOW-STATE" {
@@ -2637,6 +2647,8 @@ enum WorkflowCommand {
         #[command(subcommand)]
         command: WorkflowPackageCommand,
     },
+    /// Explicitly migrate the immediately preceding workflow store schema without data loss.
+    MigrateStore,
     /// Explicitly back up and delete only incompatible workflow-owned state.
     ResetStore {
         /// Required destructive-operation acknowledgement.

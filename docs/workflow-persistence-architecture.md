@@ -347,7 +347,9 @@ rejected without writes; normal startup never migrates or reinterprets it.
 Normal workflow startup opens the canonical store fail-closed. An incompatible, corrupt, or
 maintenance-required workflow store disables only the workflow domain: daemon readiness and
 unrelated session/model/tool capabilities continue, workflow requests return a stable unavailable
-error, and the canonical workflow bytes remain untouched until explicit maintenance. Core runtime,
+error, and the canonical workflow bytes remain untouched until explicit maintenance. The immediately
+preceding schema has an explicit offline, backup-verified, non-destructive migration command;
+unsupported older or damaged stores still require reviewed reset or future migration support. Core runtime,
 model, auth, and session requests use separate typed routing and never pass through workflow
 availability gates. Passive plugin session-status hydration treats an unavailable optional workflow
 domain as no contribution rather than a session or skill failure. The unavailable domain uses only

@@ -119,13 +119,17 @@ if rg -n 'bcode\.(git|review|progress-doc)/|GitWorkflow|ReviewWorkflow|ProgressD
 fi
 rm -f /tmp/bcode-product-workflow-blocks.txt
 
-if rg -n 'fn migrate\(|ALTER TABLE workflow_|UPDATE workflow_store_contract SET schema_version' \
-  packages/workflow-store/src/lib.rs >/tmp/bcode-workflow-store-compatibility.txt 2>/dev/null; then
-  echo "Composable workflow compatibility violation: obsolete store migration paths remain." >&2
-  cat /tmp/bcode-workflow-store-compatibility.txt >&2
+if rg -n 'fn migrate\(' packages/workflow-store/src/lib.rs \
+  >/tmp/bcode-workflow-store-compatibility.txt 2>/dev/null \
+  || rg -n 'ALTER TABLE workflow_|UPDATE workflow_store_contract SET schema_version' \
+    packages/workflow-store/src/lib.rs \
+    | rg -v 'target_artifact_id|coordinator_daemon_instance_id|coordinator_generation|coordinator_fencing_token|schema_version = 15|schema_version = 14' \
+    >/tmp/bcode-workflow-store-unapproved-compatibility.txt 2>/dev/null; then
+  echo "Composable workflow compatibility violation: unapproved store migration paths remain." >&2
+  cat /tmp/bcode-workflow-store-compatibility.txt /tmp/bcode-workflow-store-unapproved-compatibility.txt 2>/dev/null >&2
   violations=1
 fi
-rm -f /tmp/bcode-workflow-store-compatibility.txt
+rm -f /tmp/bcode-workflow-store-compatibility.txt /tmp/bcode-workflow-store-unapproved-compatibility.txt
 
 if ! rg -q 'pub const WORKFLOW_SOURCE_DOCUMENT_VERSION: u32 = 3;' packages/workflow/src/lib.rs; then
   echo "Composable workflow source violation: clean source-v3 boundary drifted." >&2

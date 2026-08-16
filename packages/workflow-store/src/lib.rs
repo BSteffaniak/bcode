@@ -29,6 +29,8 @@ const DATABASE_FILE: &str = "workflow.db";
 const LOCK_FILE: &str = "workflow.lock";
 const ARTIFACT_DIRECTORY: &str = "artifacts";
 const RESET_RECEIPT_FILE: &str = "workflow-reset-receipt.json";
+const MIGRATION_RECEIPT_FILE: &str = "workflow-migration-receipt.json";
+const MIGRATION_BACKUP_DIRECTORY: &str = "migration-backups";
 const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
@@ -36,6 +38,8 @@ pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLO
 pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 15;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
+/// Current explicit workflow-store migration receipt contract.
+pub const WORKFLOW_STORE_MIGRATION_RECEIPT_VERSION: u32 = 1;
 /// Current durable workflow execution-session link contract version.
 pub const WORKFLOW_EXECUTION_SESSION_LINK_VERSION: u32 = 1;
 /// Current durable authored-run provenance contract version.
@@ -1256,6 +1260,18 @@ pub enum WorkflowStoreError {
     InvalidData(String),
 }
 
+/// Bounded durable evidence from one explicit non-destructive workflow-store migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStoreMigrationReceipt {
+    pub version: u32,
+    pub previous_schema_version: u32,
+    pub new_schema_version: u32,
+    pub backup_path: PathBuf,
+    pub backup_sha256: String,
+    pub migrated_at_ms: u64,
+}
+
 /// Bounded durable evidence from one explicit destructive workflow-store reset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1523,6 +1539,102 @@ impl WorkflowStore {
             connection,
             _ownership: ownership,
         })
+    }
+
+    /// Explicitly migrate the immediately preceding workflow schema without discarding canonical
+    /// workflow state.
+    ///
+    /// This offline operation acquires exclusive workflow-store ownership, creates and verifies a
+    /// `SQLite` backup, adds the version-15 execution-authority columns, advances the contract, and
+    /// records a bounded receipt. Existing rows remain byte-for-byte represented except for the
+    /// new nullable authority fields and schema contract version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when ownership is unavailable, the source schema is not 14, backup or
+    /// integrity verification fails, or migration cannot commit atomically.
+    pub fn migrate_schema_14_to_current_in_state_dir(
+        state_dir: &Path,
+        migrated_at_ms: u64,
+    ) -> Result<WorkflowStoreMigrationReceipt, WorkflowStoreError> {
+        let path = workflow_database_path(state_dir);
+        let root = path.parent().ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow database has no parent directory".to_string())
+        })?;
+        std::fs::create_dir_all(root)?;
+        let ownership = open_ownership_file(root)?;
+        match ownership.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow store migration requires exclusive ownership; stop active workflow writers"
+                        .to_string(),
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        if !path.is_file() {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow store migration requires an existing database".to_string(),
+            ));
+        }
+        let source = Connection::open(&path)?;
+        source.busy_timeout(std::time::Duration::ZERO)?;
+        let previous_schema_version = detected_store_schema(&source).ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "workflow store migration cannot read the source schema".to_string(),
+            )
+        })?;
+        if previous_schema_version != 14 {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow store migration supports only schema 14, found {previous_schema_version}"
+            )));
+        }
+        source.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        let backup_directory = root.join(MIGRATION_BACKUP_DIRECTORY);
+        std::fs::create_dir_all(&backup_directory)?;
+        let backup_path = backup_directory.join(format!("workflow-{migrated_at_ms}.db"));
+        if backup_path.exists() {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow migration backup already exists for this timestamp".to_string(),
+            ));
+        }
+        source.backup(rusqlite::DatabaseName::Main, &backup_path, None)?;
+        drop(source);
+        let backup_sha256 = verify_reset_backup(&backup_path)?;
+
+        let mut connection = Connection::open(&path)?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "ALTER TABLE workflow_runs ADD COLUMN target_artifact_id TEXT;\
+             ALTER TABLE workflow_runs ADD COLUMN coordinator_daemon_instance_id TEXT;\
+             ALTER TABLE workflow_runs ADD COLUMN coordinator_generation INTEGER;\
+             ALTER TABLE workflow_runs ADD COLUMN coordinator_fencing_token TEXT;\
+             UPDATE workflow_store_contract SET schema_version = 15 WHERE contract_id = 1 AND schema_version = 14;",
+        )?;
+        transaction.commit()?;
+        verify_store_schema(&connection)?;
+        let integrity =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
+        if integrity != "ok" {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow migration integrity verification failed: {integrity}"
+            )));
+        }
+        drop(connection);
+        let receipt = WorkflowStoreMigrationReceipt {
+            version: WORKFLOW_STORE_MIGRATION_RECEIPT_VERSION,
+            previous_schema_version,
+            new_schema_version: WORKFLOW_STORE_SCHEMA_VERSION,
+            backup_path,
+            backup_sha256,
+            migrated_at_ms,
+        };
+        write_migration_receipt(root, &receipt)?;
+        Ok(receipt)
     }
 
     /// Explicitly replace incompatible workflow state after retaining a verified backup.
@@ -12197,6 +12309,27 @@ fn sha256_file(path: &Path) -> Result<String, WorkflowStoreError> {
         }))
 }
 
+fn write_migration_receipt(
+    root: &Path,
+    receipt: &WorkflowStoreMigrationReceipt,
+) -> Result<(), WorkflowStoreError> {
+    let path = root.join(MIGRATION_RECEIPT_FILE);
+    let temporary = root.join(format!(
+        "{MIGRATION_RECEIPT_FILE}.tmp-{}",
+        receipt.migrated_at_ms
+    ));
+    let bytes = serde_json::to_vec_pretty(receipt)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn write_reset_receipt(
     root: &Path,
     receipt: &WorkflowStoreResetReceipt,
@@ -17556,6 +17689,43 @@ mod tests {
                 .expect("run")
                 .status,
             RunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn schema_fourteen_migration_preserves_runs_and_adds_authority_columns() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let definition = definition("example");
+        store
+            .persist_definition("example", 1, &definition)
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        let path = store.path().to_path_buf();
+        drop(store);
+        let connection = Connection::open(&path).expect("schema 15");
+        connection
+            .execute_batch(
+                "ALTER TABLE workflow_runs DROP COLUMN target_artifact_id;\
+                 ALTER TABLE workflow_runs DROP COLUMN coordinator_daemon_instance_id;\
+                 ALTER TABLE workflow_runs DROP COLUMN coordinator_generation;\
+                 ALTER TABLE workflow_runs DROP COLUMN coordinator_fencing_token;\
+                 UPDATE workflow_store_contract SET schema_version = 14 WHERE contract_id = 1;",
+            )
+            .expect("schema 14 fixture");
+        drop(connection);
+
+        let receipt = WorkflowStore::migrate_schema_14_to_current_in_state_dir(temp.path(), 30)
+            .expect("migration");
+
+        assert_eq!(receipt.previous_schema_version, 14);
+        assert_eq!(receipt.new_schema_version, WORKFLOW_STORE_SCHEMA_VERSION);
+        assert!(receipt.backup_path.is_file());
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("current store");
+        assert!(reopened.run_summary("run-1").expect("run").is_some());
+        assert_eq!(
+            reopened.execution_authority("run-1").expect("authority"),
+            None
         );
     }
 
