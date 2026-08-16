@@ -783,6 +783,32 @@ pub struct MarkdownSelectionProvenance {
     pub kind: MarkdownSelectionKind,
 }
 
+/// Exact canonical source ranges for one rendered code block.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarkdownCodeBlockSelection {
+    /// Stable identity shared by code-body provenance entries.
+    pub id: String,
+    /// Entire original block, including indentation or fences.
+    pub whole_range: Range<usize>,
+    /// Original opening fence and info line, absent for indented blocks.
+    pub header_range: Option<Range<usize>>,
+    /// Ordered canonical code-body slices. Indented slices retain source indentation.
+    pub body_ranges: Vec<Range<usize>>,
+    /// Original closing fence, absent for indented or incomplete fenced blocks.
+    pub footer_range: Option<Range<usize>>,
+    /// Source representation used by the block.
+    pub kind: MarkdownCodeBlockSelectionKind,
+}
+
+/// Canonical Markdown code-block representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkdownCodeBlockSelectionKind {
+    /// Backtick- or tilde-fenced block.
+    Fenced,
+    /// Four-space or tab-indented block.
+    Indented,
+}
+
 /// Parser-neutral semantic kind for one selectable Markdown source unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarkdownSelectionKind {
@@ -800,6 +826,141 @@ pub enum MarkdownSelectionKind {
     HardBreak,
     /// Other truthful parser event with source bytes.
     Other,
+}
+
+#[must_use]
+pub fn markdown_code_block_selections(source: &str) -> Vec<MarkdownCodeBlockSelection> {
+    let lines = source_lines_with_offsets(source);
+    let mut blocks = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let (line_start, line_end, content_end) = lines[index];
+        let line = &source[line_start..content_end];
+        if let Some((marker, marker_len)) = opening_fence(line) {
+            let id = format!("code-block:{line_start}");
+            let body_start = line_end;
+            let mut footer = None;
+            let mut cursor = index.saturating_add(1);
+            while cursor < lines.len() {
+                let (candidate_start, candidate_end, candidate_content_end) = lines[cursor];
+                if closing_fence(
+                    &source[candidate_start..candidate_content_end],
+                    marker,
+                    marker_len,
+                ) {
+                    footer = Some(candidate_start..candidate_end);
+                    break;
+                }
+                cursor = cursor.saturating_add(1);
+            }
+            let body_end = footer.as_ref().map_or(source.len(), |range| range.start);
+            let whole_end = footer.as_ref().map_or(source.len(), |range| range.end);
+            blocks.push(MarkdownCodeBlockSelection {
+                id,
+                whole_range: line_start..whole_end,
+                header_range: Some(line_start..line_end),
+                body_ranges: (body_start < body_end)
+                    .then_some(body_start..body_end)
+                    .into_iter()
+                    .collect(),
+                footer_range: footer,
+                kind: MarkdownCodeBlockSelectionKind::Fenced,
+            });
+            index = if cursor < lines.len() {
+                cursor.saturating_add(1)
+            } else {
+                lines.len()
+            };
+            continue;
+        }
+        if is_indented_code_line(line) {
+            let start_index = index;
+            let mut cursor = index.saturating_add(1);
+            while cursor < lines.len() {
+                let (candidate_start, _, candidate_content_end) = lines[cursor];
+                let candidate = &source[candidate_start..candidate_content_end];
+                if !(candidate.is_empty() || is_indented_code_line(candidate)) {
+                    break;
+                }
+                cursor = cursor.saturating_add(1);
+            }
+            let whole_start = lines[start_index].0;
+            let whole_end = lines[cursor.saturating_sub(1)].1;
+            blocks.push(MarkdownCodeBlockSelection {
+                id: format!("code-block:{whole_start}"),
+                whole_range: whole_start..whole_end,
+                header_range: None,
+                body_ranges: lines[start_index..cursor]
+                    .iter()
+                    .filter_map(|(start, end, content_end)| {
+                        (*start < *content_end).then_some(*start..*end)
+                    })
+                    .collect(),
+                footer_range: None,
+                kind: MarkdownCodeBlockSelectionKind::Indented,
+            });
+            index = cursor;
+            continue;
+        }
+        index = index.saturating_add(1);
+    }
+    blocks
+}
+
+fn source_lines_with_offsets(source: &str) -> Vec<(usize, usize, usize)> {
+    let mut offset = 0_usize;
+    let mut lines = source
+        .split_inclusive('\n')
+        .map(|line| {
+            let start = offset;
+            offset = offset.saturating_add(line.len());
+            let content_end = offset
+                .saturating_sub(usize::from(line.ends_with('\n')))
+                .saturating_sub(usize::from(line.ends_with("\r\n")));
+            (start, offset, content_end)
+        })
+        .collect::<Vec<_>>();
+    if source.is_empty() || source.ends_with('\n') {
+        lines.push((offset, offset, offset));
+    }
+    lines
+}
+
+fn opening_fence(line: &str) -> Option<(u8, usize)> {
+    let bytes = line.as_bytes();
+    let indent = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let marker = *bytes.get(indent)?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let count = bytes[indent..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    (count >= 3).then_some((marker, count))
+}
+
+fn closing_fence(line: &str, marker: u8, minimum_len: usize) -> bool {
+    let bytes = line.as_bytes();
+    let indent = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let count = bytes[indent..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    count >= minimum_len
+        && bytes[indent.saturating_add(count)..]
+            .iter()
+            .all(u8::is_ascii_whitespace)
+}
+
+fn is_indented_code_line(line: &str) -> bool {
+    line.starts_with("    ") || line.starts_with('\t')
 }
 
 fn semantic_expansion_id(event: &MarkdownSemanticEvent) -> Option<String> {
@@ -899,6 +1060,8 @@ pub struct MarkdownRenderResult {
     pub lines: Vec<Line>,
     /// Renderer-owned source provenance available to selection consumers.
     pub selection_provenance: Vec<MarkdownSelectionProvenance>,
+    /// Exact canonical fenced and indented code-block ranges.
+    pub code_block_selections: Vec<MarkdownCodeBlockSelection>,
     /// Source-order semantic contributions independent of TUI event-loop types.
     pub contributions: Vec<MarkdownContribution>,
     /// Post-layout document-relative cell rectangles for rich contributions.
@@ -1100,9 +1263,17 @@ impl MarkdownStreamingRenderState {
         }
         let mut lines = self.stable_lines.clone();
         append_markdown_blocks(&mut lines, &suffix_result.lines);
+        let document = parse_markdown_document(markdown);
+        let selection_provenance = assign_selection_geometry(
+            markdown_selection_provenance(&document),
+            &document,
+            markdown,
+            &lines,
+        );
         let result = MarkdownRenderResult {
             lines,
-            selection_provenance: markdown_selection_provenance(&parse_markdown_document(markdown)),
+            selection_provenance,
+            code_block_selections: markdown_code_block_selections(markdown),
             contributions: Vec::new(),
             geometry: Vec::new(),
             anchors: Vec::new(),
@@ -1303,6 +1474,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     MarkdownRenderResult {
         lines,
         selection_provenance,
+        code_block_selections: markdown_code_block_selections(markdown),
         contributions,
         geometry,
         anchors,
@@ -4582,6 +4754,66 @@ mod tests {
                 "expected highlighted {language} spans"
             );
         }
+    }
+
+    #[test]
+    fn code_block_selection_distinguishes_exact_fence_body_and_footer() {
+        let markdown = "```rust\r\nfn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n```\r\n";
+        let rendered = render_markdown(markdown, &MarkdownRenderOptions::new(80));
+        let block = rendered.code_block_selections.first().expect("code block");
+
+        assert_eq!(block.kind, super::MarkdownCodeBlockSelectionKind::Fenced);
+        assert_eq!(
+            &markdown[block.header_range.clone().expect("header")],
+            "```rust\r\n"
+        );
+        assert_eq!(
+            block
+                .body_ranges
+                .iter()
+                .map(|range| &markdown[range.clone()])
+                .collect::<String>(),
+            "fn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n"
+        );
+        assert_eq!(
+            &markdown[block.footer_range.clone().expect("footer")],
+            "```\r\n"
+        );
+        assert_eq!(&markdown[block.whole_range.clone()], markdown);
+    }
+
+    #[test]
+    fn code_block_selection_preserves_indentation_and_incomplete_fences() {
+        let indented = "    first\n\tsecond\n\nnext";
+        let rendered = render_markdown(indented, &MarkdownRenderOptions::new(80));
+        let block = rendered
+            .code_block_selections
+            .first()
+            .expect("indented block");
+        assert_eq!(block.kind, super::MarkdownCodeBlockSelectionKind::Indented);
+        assert!(block.header_range.is_none());
+        assert!(block.footer_range.is_none());
+        assert_eq!(
+            &indented[block.whole_range.clone()],
+            "    first\n\tsecond\n\n"
+        );
+
+        let incomplete = "~~~rust\nlet value = 1;";
+        let rendered = render_markdown(incomplete, &MarkdownRenderOptions::new(80));
+        let block = rendered
+            .code_block_selections
+            .first()
+            .expect("incomplete block");
+        assert!(block.footer_range.is_none());
+        assert_eq!(&incomplete[block.whole_range.clone()], incomplete);
+        assert_eq!(
+            block
+                .body_ranges
+                .iter()
+                .map(|range| &incomplete[range.clone()])
+                .collect::<String>(),
+            "let value = 1;"
+        );
     }
 
     #[test]

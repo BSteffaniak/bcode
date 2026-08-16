@@ -1970,32 +1970,40 @@ fn export_plain_transcript_selection<'a>(
     items: impl IntoIterator<Item = &'a super::transcript::TranscriptItem>,
     snapshot: &bmux_tui::selection::SelectionSnapshot,
 ) -> Option<String> {
-    let mut selected = std::collections::BTreeMap::<u64, Vec<std::ops::Range<usize>>>::new();
+    let mut selected =
+        std::collections::BTreeMap::<u64, Vec<(String, std::ops::Range<usize>)>>::new();
     for slice in &snapshot.slices {
         let content = slice.content_id.as_str();
-        let item_id = content
-            .strip_prefix("bcode.transcript.item.")?
-            .strip_suffix(".plain")
-            .or_else(|| {
-                content
-                    .strip_prefix("bcode.transcript.item.")?
-                    .strip_suffix(".markdown")
-            })?
-            .parse::<u64>()
-            .ok()?;
+        let remainder = content.strip_prefix("bcode.transcript.item.")?;
+        let (item_id, kind) = remainder.split_once('.')?;
+        let item_id = item_id.parse::<u64>().ok()?;
+        if kind != "plain" && kind != "markdown" && !kind.starts_with("markdown.code.") {
+            return None;
+        }
         selected
             .entry(item_id)
             .or_default()
-            .push(slice.source_range.clone());
+            .push((kind.to_owned(), slice.source_range.clone()));
     }
     let mut output = Vec::new();
     for item in items {
-        let Some(ranges) = selected.remove(&item.id().get()) else {
+        let Some(selections) = selected.remove(&item.id().get()) else {
             continue;
         };
         let mut text = String::new();
-        for range in ranges {
-            text.push_str(item.text().get(range)?);
+        for (kind, range) in selections {
+            if let Some(suffix) = kind.strip_prefix("markdown.") {
+                let ranges = super::markdown_selection::expand_markdown_selection_range(
+                    item.text(),
+                    suffix,
+                    range,
+                )?;
+                for range in ranges {
+                    text.push_str(item.text().get(range)?);
+                }
+            } else {
+                text.push_str(item.text().get(range)?);
+            }
         }
         if !text.is_empty() {
             output.push(text);
@@ -3513,6 +3521,97 @@ mod tests {
         assert_eq!(
             super::export_plain_transcript_selection(items.iter(), &snapshot).as_deref(),
             Some("first\n\nsecond")
+        );
+    }
+
+    #[test]
+    fn markdown_code_body_selection_exports_exact_canonical_bytes() {
+        let source = "```rust\r\nfn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n```\r\n";
+        let item = super::super::transcript::TranscriptItem::with_format(
+            "Assistant",
+            source.to_owned(),
+            bcode_session_view_models::TextFormat::Markdown,
+        );
+        let item_id = item.id().get();
+        let snapshot = bmux_tui::selection::SelectionSnapshot {
+            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+            anchor: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: bmux_tui::selection::SelectionContentId::new(format!(
+                    "bcode.transcript.item.{item_id}.markdown.code.0.body"
+                )),
+                offset: 0,
+                order: 0,
+                affinity: bmux_tui::selection::SelectionAffinity::Before,
+                revision: 0,
+            },
+            focus: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: bmux_tui::selection::SelectionContentId::new(format!(
+                    "bcode.transcript.item.{item_id}.markdown.code.0.body"
+                )),
+                offset: source.len(),
+                order: 1,
+                affinity: bmux_tui::selection::SelectionAffinity::After,
+                revision: 0,
+            },
+            reversed: false,
+            slices: vec![bmux_tui::selection::SelectionSlice {
+                content_id: bmux_tui::selection::SelectionContentId::new(format!(
+                    "bcode.transcript.item.{item_id}.markdown.code.0.body"
+                )),
+                source_range: 0..source.len(),
+                revision: 0,
+            }],
+            visible_highlights: Vec::new(),
+        };
+
+        assert_eq!(
+            super::export_plain_transcript_selection(std::iter::once(&item), &snapshot).as_deref(),
+            Some("fn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n")
+        );
+    }
+
+    #[test]
+    fn markdown_code_whole_selection_exports_original_fences_and_language() {
+        let source = "```rust\nfn main() {}\n```\n";
+        let item = super::super::transcript::TranscriptItem::with_format(
+            "Assistant",
+            source.to_owned(),
+            bcode_session_view_models::TextFormat::Markdown,
+        );
+        let item_id = item.id().get();
+        let content_id = format!("bcode.transcript.item.{item_id}.markdown.code.0.whole");
+        let snapshot = bmux_tui::selection::SelectionSnapshot {
+            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+            anchor: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
+                offset: 0,
+                order: 0,
+                affinity: bmux_tui::selection::SelectionAffinity::Before,
+                revision: 0,
+            },
+            focus: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
+                offset: source.len(),
+                order: 1,
+                affinity: bmux_tui::selection::SelectionAffinity::After,
+                revision: 0,
+            },
+            reversed: false,
+            slices: vec![bmux_tui::selection::SelectionSlice {
+                content_id: bmux_tui::selection::SelectionContentId::new(content_id),
+                source_range: 0..source.len(),
+                revision: 0,
+            }],
+            visible_highlights: Vec::new(),
+        };
+
+        assert_eq!(
+            super::export_plain_transcript_selection(std::iter::once(&item), &snapshot).as_deref(),
+            Some(source)
         );
     }
 
