@@ -4471,6 +4471,7 @@ mod tests {
                     cursor: None,
                     filter: bcode_workflow_view_models::WorkflowCatalogFilter::All,
                     sort: bcode_workflow_view_models::WorkflowCatalogSort::UpdatedAt,
+                    group: bcode_workflow_view_models::WorkflowCatalogGroup::None,
                     search: None,
                 },
             },

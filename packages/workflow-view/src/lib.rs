@@ -84,6 +84,7 @@ pub fn project_catalog(
         has_more,
         filter: request.filter,
         sort: request.sort,
+        group: request.group,
         search: request.search.clone(),
     }
 }

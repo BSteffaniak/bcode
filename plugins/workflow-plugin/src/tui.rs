@@ -11,6 +11,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
+use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowStyles};
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
 use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
 use bmux_tui_components::tab_bar::{TabBar, TabBarState, TabBarStyles, TabItem};
@@ -267,6 +268,43 @@ impl WorkflowStatusSurface {
         self.runs.get(self.selected_run_id.as_deref()?)
     }
 
+    fn selected_wait(
+        &self,
+        kind: bcode_workflow_view_models::WorkflowWaitKind,
+    ) -> Option<&bcode_workflow_view_models::WorkflowWaitView> {
+        let run = self.selected_run_view()?;
+        self.selected_wait_id
+            .as_ref()
+            .and_then(|(node_id, activation_id)| {
+                run.waits.iter().find(|wait| {
+                    wait.kind == kind
+                        && &wait.node_id == node_id
+                        && &wait.activation_id == activation_id
+                })
+            })
+    }
+
+    fn selected_mutation_approval(
+        &self,
+    ) -> Option<&bcode_workflow_view_models::WorkflowMutationApprovalView> {
+        let approval_id = self.selected_approval_id.as_deref()?;
+        self.selected_run_view()?
+            .mutation_approvals
+            .iter()
+            .find(|approval| approval.approval_id == approval_id)
+    }
+
+    fn selected_attempt(&self) -> Option<&bcode_workflow_view_models::WorkflowAttemptView> {
+        let (node_id, activation_id, attempt) = self.selected_attempt_id.as_ref()?;
+        self.selected_run_view()?.attempts.iter().find(|candidate| {
+            &candidate.node_id == node_id
+                && &candidate.activation_id == activation_id
+                && candidate.attempt == *attempt
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn selected_node(&self) -> Option<&bcode_workflow_view_models::WorkflowNodeView> {
         let node_id = self.selected_node_id.as_deref()?;
         self.selected_run_view()?
@@ -332,6 +370,7 @@ impl WorkflowStatusSurface {
             KeyHint::new("←/→", "run"),
             KeyHint::new("↑/↓", "node"),
             KeyHint::new("Tab", "section"),
+            KeyHint::new("f/s/g", "filter/sort/group"),
             KeyHint::new("m", "more"),
             KeyHint::new("?", "help"),
         ];
@@ -401,9 +440,10 @@ impl WorkflowStatusSurface {
                 Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
                 &Line::from_spans(vec![Span::styled(
                     format!(
-                        " Filter: {:?}  Sort: {:?}  Showing {}{}",
+                        " Filter: {:?}  Sort: {:?}  Group: {:?}  Showing {}{}",
                         catalog.filter,
                         catalog.sort,
+                        catalog.group,
                         catalog.runs.len(),
                         if catalog.has_more { "+" } else { "" }
                     ),
@@ -427,17 +467,36 @@ impl WorkflowStatusSurface {
             TableColumn::new("Run").flex(3).align(TableAlign::Left),
             TableColumn::new("Status").flex(2).align(TableAlign::Left),
         ];
+        let mut current_group = String::new();
         let rows = catalog
             .runs
             .iter()
             .map(|run| {
+                let group = match catalog.group {
+                    bcode_workflow_view_models::WorkflowCatalogGroup::None => String::new(),
+                    bcode_workflow_view_models::WorkflowCatalogGroup::AuthoredWorkflow => {
+                        run.authored_source.as_ref().map_or_else(
+                            || "Compiled definitions".to_string(),
+                            |source| source.workflow_id.clone(),
+                        )
+                    }
+                    bcode_workflow_view_models::WorkflowCatalogGroup::Definition => {
+                        format!("{} v{}", run.definition_id, run.definition_version)
+                    }
+                };
+                let group_prefix = if group.is_empty() || group == current_group {
+                    String::new()
+                } else {
+                    current_group.clone_from(&group);
+                    format!("[{group}] ")
+                };
                 let attention = if run.attention.needs_attention() {
                     " !"
                 } else {
                     ""
                 };
                 TableRow::rich(vec![
-                    Line::from(run.display_title.clone()),
+                    Line::from(format!("{group_prefix}{}", run.display_title)),
                     Line::from(format!("{:?}{attention}", run.status)),
                 ])
             })
@@ -511,6 +570,13 @@ impl WorkflowStatusSurface {
         theme: WorkflowSurfaceTheme,
         tabbed: bool,
     ) {
+        if area.is_empty() {
+            return;
+        }
+        if self.active_detail_tab == 3 {
+            self.render_action_panel(area, frame, theme);
+            return;
+        }
         let tabs = [
             TabItem::new("overview", "Overview"),
             TabItem::new("outputs", "Outputs"),
@@ -550,6 +616,44 @@ impl WorkflowStatusSurface {
                 background: theme.canvas,
             })
             .render(content, &self.text_view, frame);
+    }
+
+    fn render_action_panel(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
+        let Some(run) = self.selected_run_view() else {
+            frame.write_line(area, &Line::from("Loading selected run…"));
+            return;
+        };
+        let actions = run
+            .actions
+            .iter()
+            .map(|action| {
+                ActionButton::new(format!("{:?}", action.kind), format!("{:?}", action.kind))
+            })
+            .collect::<Vec<_>>();
+        let row_area = Rect::new(area.x, area.y, area.width, 1.min(area.height));
+        ActionRow::new(&actions)
+            .styles(ActionRowStyles {
+                normal: theme.text,
+                focused: theme.focused,
+                hovered: theme.focused,
+                pressed: theme.selected,
+                disabled: theme.muted,
+            })
+            .render_with_fallback_style(row_area, frame, theme.canvas);
+        for (index, action) in run.actions.iter().enumerate() {
+            if let Some(reason) = &action.unavailable_reason {
+                let row = u16::try_from(index).unwrap_or(u16::MAX).saturating_add(2);
+                if row < area.height {
+                    frame.write_line(
+                        Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+                        &Line::from_spans(vec![Span::styled(
+                            format!("{:?}: {reason}", action.kind),
+                            theme.muted,
+                        )]),
+                    );
+                }
+            }
+        }
     }
 
     fn render_narrow_page(
@@ -598,6 +702,40 @@ impl WorkflowStatusSurface {
         PluginTuiAction::SelectWorkflowRun { run_id }
     }
 
+    fn definition_navigation_action(&self) -> PluginTuiAction {
+        let Some(run) = self.selected_run_view() else {
+            return PluginTuiAction::None;
+        };
+        match &run.run.definition_disposition {
+            bcode_workflow_view_models::WorkflowDefinitionDisposition::Published {
+                workflow_id,
+                revision,
+                editable_draft_id,
+            } => PluginTuiAction::OpenSurface {
+                plugin_id: "bcode.workflow".to_string(),
+                surface_id: WORKFLOW_AUTHOR_SURFACE_KIND.to_string(),
+                options: editable_draft_id.as_ref().map_or_else(
+                    || {
+                        serde_json::json!({
+                            "workflow_id": workflow_id,
+                            "base_revision": revision,
+                            "fork_required": true,
+                        })
+                    },
+                    |draft_id| {
+                        serde_json::json!({
+                            "workflow_id": workflow_id,
+                            "draft_id": draft_id,
+                        })
+                    },
+                ),
+            },
+            bcode_workflow_view_models::WorkflowDefinitionDisposition::CompiledOnly => {
+                PluginTuiAction::None
+            }
+        }
+    }
+
     fn select_adjacent_node(&mut self, offset: isize) -> PluginTuiAction {
         let Some(run) = self.selected_run_view() else {
             return PluginTuiAction::None;
@@ -643,9 +781,9 @@ impl WorkflowStatusSurface {
                     let Some(run) = self.selected_run_view() else {
                         return PluginTuiAction::None;
                     };
-                    let Some(wait) = run.waits.iter().find(|wait| {
-                        wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Input
-                    }) else {
+                    let Some(wait) =
+                        self.selected_wait(bcode_workflow_view_models::WorkflowWaitKind::Input)
+                    else {
                         return PluginTuiAction::None;
                     };
                     return plugin_command(
@@ -665,6 +803,39 @@ impl WorkflowStatusSurface {
             KeyCode::Right | KeyCode::Char('l') => self.select_adjacent_run(1),
             KeyCode::Up | KeyCode::Char('k') => self.select_adjacent_node(-1),
             KeyCode::Down | KeyCode::Char('j') => self.select_adjacent_node(1),
+            KeyCode::Char('f') => {
+                let Some(catalog) = self.catalog.as_ref() else {
+                    return PluginTuiAction::None;
+                };
+                PluginTuiAction::UpdateWorkflowCatalogQuery {
+                    filter: next_catalog_filter(catalog.filter),
+                    sort: catalog.sort,
+                    group: catalog.group,
+                    search: catalog.search.clone(),
+                }
+            }
+            KeyCode::Char('s') => {
+                let Some(catalog) = self.catalog.as_ref() else {
+                    return PluginTuiAction::None;
+                };
+                PluginTuiAction::UpdateWorkflowCatalogQuery {
+                    filter: catalog.filter,
+                    sort: next_catalog_sort(catalog.sort),
+                    group: catalog.group,
+                    search: catalog.search.clone(),
+                }
+            }
+            KeyCode::Char('g') => {
+                let Some(catalog) = self.catalog.as_ref() else {
+                    return PluginTuiAction::None;
+                };
+                PluginTuiAction::UpdateWorkflowCatalogQuery {
+                    filter: catalog.filter,
+                    sort: catalog.sort,
+                    group: next_catalog_group(catalog.group),
+                    search: catalog.search.clone(),
+                }
+            }
             KeyCode::Char('m') => self
                 .catalog
                 .as_ref()
@@ -698,7 +869,7 @@ impl WorkflowStatusSurface {
                 let Some(run) = self.selected_run_view() else {
                     return PluginTuiAction::None;
                 };
-                if let Some(approval) = run.mutation_approvals.first() {
+                if let Some(approval) = self.selected_mutation_approval() {
                     return plugin_command(
                         if approve {
                             "workflow.approve-mutation"
@@ -708,9 +879,9 @@ impl WorkflowStatusSurface {
                         format!("approval_id={}", approval.approval_id),
                     );
                 }
-                let Some(wait) = run.waits.iter().find(|wait| {
-                    wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Approval
-                }) else {
+                let Some(wait) =
+                    self.selected_wait(bcode_workflow_view_models::WorkflowWaitKind::Approval)
+                else {
                     return PluginTuiAction::None;
                 };
                 plugin_command(
@@ -726,11 +897,10 @@ impl WorkflowStatusSurface {
                 )
             }
             KeyCode::Char('i') => {
-                if self.selected_run_view().is_some_and(|run| {
-                    run.waits.iter().any(|wait| {
-                        wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Input
-                    })
-                }) {
+                if self
+                    .selected_wait(bcode_workflow_view_models::WorkflowWaitKind::Input)
+                    .is_some()
+                {
                     self.input_buffer = Some(String::new());
                     PluginTuiAction::Redraw
                 } else {
@@ -741,11 +911,10 @@ impl WorkflowStatusSurface {
                 let Some(run) = self.selected_run_view() else {
                     return PluginTuiAction::None;
                 };
-                let selected_node = self.selected_node();
-                let Some(attempt) = run.attempts.iter().rev().find(|attempt| {
-                    selected_node.is_some_and(|node| node.node_id == attempt.node_id)
-                        && attempt.status == "failed"
-                }) else {
+                let Some(attempt) = self
+                    .selected_attempt()
+                    .filter(|attempt| attempt.status == "failed")
+                else {
                     return PluginTuiAction::None;
                 };
                 plugin_command(
@@ -757,19 +926,13 @@ impl WorkflowStatusSurface {
                 )
             }
             KeyCode::Char('o') => self
-                .selected_run_view()
-                .map_or(PluginTuiAction::None, |run| {
-                    run.child_sessions
-                        .first()
-                        .map_or(PluginTuiAction::None, |session| {
-                            session
-                                .session_id
-                                .parse()
-                                .map_or(PluginTuiAction::None, |session_id| {
-                                    PluginTuiAction::OpenSession { session_id }
-                                })
-                        })
+                .selected_child_session_id
+                .as_deref()
+                .and_then(|session_id| session_id.parse().ok())
+                .map_or(PluginTuiAction::None, |session_id| {
+                    PluginTuiAction::OpenSession { session_id }
                 }),
+            KeyCode::Char('e') => self.definition_navigation_action(),
             _ => PluginTuiAction::None,
         }
     }
@@ -877,6 +1040,7 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                         && catalog.filter == page.filter
                         && catalog.sort == page.sort
                         && catalog.search == page.search
+                        && catalog.group == page.group
                     {
                         let known = catalog
                             .runs
@@ -1046,6 +1210,41 @@ impl PluginTuiSurface for WorkflowStatusSurface {
             }
             _ => PluginTuiAction::None,
         }
+    }
+}
+
+const fn next_catalog_filter(
+    filter: bcode_workflow_view_models::WorkflowCatalogFilter,
+) -> bcode_workflow_view_models::WorkflowCatalogFilter {
+    use bcode_workflow_view_models::WorkflowCatalogFilter as Filter;
+    match filter {
+        Filter::All => Filter::Active,
+        Filter::Active => Filter::NeedsAttention,
+        Filter::NeedsAttention => Filter::Failed,
+        Filter::Failed => Filter::Completed,
+        Filter::Completed => Filter::All,
+    }
+}
+
+const fn next_catalog_sort(
+    sort: bcode_workflow_view_models::WorkflowCatalogSort,
+) -> bcode_workflow_view_models::WorkflowCatalogSort {
+    use bcode_workflow_view_models::WorkflowCatalogSort as Sort;
+    match sort {
+        Sort::UpdatedAt => Sort::CreatedAt,
+        Sort::CreatedAt => Sort::Status,
+        Sort::Status => Sort::UpdatedAt,
+    }
+}
+
+const fn next_catalog_group(
+    group: bcode_workflow_view_models::WorkflowCatalogGroup,
+) -> bcode_workflow_view_models::WorkflowCatalogGroup {
+    use bcode_workflow_view_models::WorkflowCatalogGroup as Group;
+    match group {
+        Group::None => Group::AuthoredWorkflow,
+        Group::AuthoredWorkflow => Group::Definition,
+        Group::Definition => Group::None,
     }
 }
 
@@ -2029,6 +2228,7 @@ mod tests {
                 has_more: false,
                 filter: bcode_workflow_view_models::WorkflowCatalogFilter::All,
                 sort: bcode_workflow_view_models::WorkflowCatalogSort::UpdatedAt,
+                group: bcode_workflow_view_models::WorkflowCatalogGroup::None,
                 search: None,
             }),
             runs: std::collections::BTreeMap::from([("run-1".to_string(), run)]),
@@ -2075,6 +2275,7 @@ mod tests {
         ));
     }
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn projected_control_center_handles_navigation_pause_mutation_and_input() {
         let mut surface = projected_surface();
         let second = surface.runs.get("run-1").expect("first run").clone();
@@ -2116,6 +2317,8 @@ mod tests {
             .runs
             .push(second_item);
         surface.runs.insert("run-2".to_string(), second);
+        surface.selected_approval_id = Some("mutation-1".to_string());
+        surface.selected_wait_id = Some(("input".to_string(), "input-activation".to_string()));
 
         let key =
             |character| Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char(character)));
@@ -2125,6 +2328,8 @@ mod tests {
             PluginTuiAction::SelectWorkflowRun { ref run_id } if run_id == "run-2"
         ));
         assert_eq!(surface.selected_run_id.as_deref(), Some("run-2"));
+        surface.selected_approval_id = Some("mutation-1".to_string());
+        surface.selected_wait_id = Some(("input".to_string(), "input-activation".to_string()));
         assert!(matches!(
             surface.handle_control_center_event(&key('p')),
             PluginTuiAction::InvokePluginCommand { ref command_id, .. }

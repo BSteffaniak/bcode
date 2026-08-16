@@ -464,6 +464,7 @@ impl InteractiveSurfaceState {
             PluginTuiAction::Redraw
             | PluginTuiAction::SubscribeWorkflowRuns
             | PluginTuiAction::SelectWorkflowRun { .. }
+            | PluginTuiAction::UpdateWorkflowCatalogQuery { .. }
             | PluginTuiAction::LoadMoreWorkflowRuns { .. }
             | PluginTuiAction::InvokePluginCommand { .. }
             | PluginTuiAction::OpenSession { .. }

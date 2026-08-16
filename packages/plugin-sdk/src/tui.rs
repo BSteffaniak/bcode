@@ -847,12 +847,23 @@ pub enum PluginTuiAction {
     Close { outcome: Option<serde_json::Value> },
     /// Open an ordinary Bcode session and resume this surface when the native viewer returns.
     OpenSession { session_id: SessionId },
-    /// Open another registered surface.
-    OpenSurface { surface_id: String },
+    /// Open another registered surface with renderer-neutral options.
+    OpenSurface {
+        plugin_id: String,
+        surface_id: String,
+        options: serde_json::Value,
+    },
     /// Subscribe this retained surface to bounded workflow snapshots and live invalidation.
     SubscribeWorkflowRuns,
     /// Load bounded detail for one exact selected workflow run.
     SelectWorkflowRun { run_id: String },
+    /// Replace the active workflow catalog query and fetch its first bounded page.
+    UpdateWorkflowCatalogQuery {
+        filter: bcode_workflow_view_models::WorkflowCatalogFilter,
+        sort: bcode_workflow_view_models::WorkflowCatalogSort,
+        group: bcode_workflow_view_models::WorkflowCatalogGroup,
+        search: Option<String>,
+    },
     /// Request another bounded workflow catalog page.
     LoadMoreWorkflowRuns {
         cursor: bcode_workflow_view_models::WorkflowCatalogCursor,

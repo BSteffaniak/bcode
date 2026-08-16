@@ -133,6 +133,16 @@ pub enum WorkflowCatalogSort {
     Status,
 }
 
+/// Portable catalog grouping preference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCatalogGroup {
+    #[default]
+    None,
+    AuthoredWorkflow,
+    Definition,
+}
+
 /// Stable keyset cursor for a bounded workflow catalog page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -154,6 +164,8 @@ pub struct WorkflowCatalogRequest {
     pub filter: WorkflowCatalogFilter,
     #[serde(default)]
     pub sort: WorkflowCatalogSort,
+    #[serde(default)]
+    pub group: WorkflowCatalogGroup,
     /// Bounded case-insensitive search over approved run display fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<String>,
@@ -173,6 +185,7 @@ pub struct WorkflowCatalogView {
     pub has_more: bool,
     pub filter: WorkflowCatalogFilter,
     pub sort: WorkflowCatalogSort,
+    pub group: WorkflowCatalogGroup,
     pub search: Option<String>,
 }
 
@@ -592,6 +605,7 @@ mod live_event_tests {
             has_more: false,
             filter: WorkflowCatalogFilter::All,
             sort: WorkflowCatalogSort::UpdatedAt,
+            group: WorkflowCatalogGroup::None,
             search: None,
         };
         assert_eq!(

@@ -551,10 +551,23 @@ impl BcodeRuntimeModel {
                         super::history_flow::initial_transcript_window_request(self.committed_area),
                     );
                 }
-                bcode_plugin_sdk::tui::PluginTuiAction::OpenSurface { surface_id } => {
+                bcode_plugin_sdk::tui::PluginTuiAction::OpenSurface {
+                    plugin_id,
+                    surface_id,
+                    options,
+                } => {
                     self.chat
-                        .app
-                        .set_status(format!("surface toggle requested: {surface_id}"));
+                        .replace_effect(super::effects::TuiEffect::OpenPluginSurface {
+                            plugin_id,
+                            surface_kind: surface_id.clone(),
+                            instance_id: format!("workflow-related-{surface_id}"),
+                            options,
+                            working_directory: self
+                                .settings
+                                .launch_working_directory()
+                                .to_path_buf(),
+                            session_id: self.chat.session_id,
+                        });
                 }
                 bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns => {
                     let (updates, requests) = super::plugin_surface_host::subscribe_workflow_views(
@@ -568,6 +581,15 @@ impl BcodeRuntimeModel {
                 }
                 bcode_plugin_sdk::tui::PluginTuiAction::SelectWorkflowRun { run_id } => {
                     self.loop_state.request_root_workflow_run(run_id);
+                }
+                bcode_plugin_sdk::tui::PluginTuiAction::UpdateWorkflowCatalogQuery {
+                    filter,
+                    sort,
+                    group,
+                    search,
+                } => {
+                    self.loop_state
+                        .request_root_workflow_query(filter, sort, group, search);
                 }
                 bcode_plugin_sdk::tui::PluginTuiAction::LoadMoreWorkflowRuns { cursor } => {
                     self.loop_state.request_more_root_workflow_runs(cursor);
@@ -2376,10 +2398,23 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         self.handle_session_changed();
                         super::invalidation::UiInvalidation::Structural
                     }
-                    Some(bcode_plugin_sdk::tui::PluginTuiAction::OpenSurface { surface_id }) => {
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::OpenSurface {
+                        plugin_id,
+                        surface_id,
+                        options,
+                    }) => {
                         self.chat
-                            .app
-                            .set_status(format!("surface toggle requested: {surface_id}"));
+                            .replace_effect(super::effects::TuiEffect::OpenPluginSurface {
+                                plugin_id,
+                                surface_kind: surface_id.clone(),
+                                instance_id: format!("workflow-related-{surface_id}"),
+                                options,
+                                working_directory: self
+                                    .settings
+                                    .launch_working_directory()
+                                    .to_path_buf(),
+                                session_id: self.chat.session_id,
+                            });
                         super::invalidation::UiInvalidation::Structural
                     }
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns) => {
@@ -2396,6 +2431,16 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     }
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::SelectWorkflowRun { run_id }) => {
                         self.loop_state.request_root_workflow_run(run_id);
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::UpdateWorkflowCatalogQuery {
+                        filter,
+                        sort,
+                        group,
+                        search,
+                    }) => {
+                        self.loop_state
+                            .request_root_workflow_query(filter, sort, group, search);
                         super::invalidation::UiInvalidation::Structural
                     }
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::LoadMoreWorkflowRuns {

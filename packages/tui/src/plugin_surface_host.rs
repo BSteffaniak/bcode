@@ -928,11 +928,12 @@ async fn stream_plugin_workflow_views(
             return;
         }
     };
-    let catalog_request = bcode_workflow_view_models::WorkflowCatalogRequest {
+    let mut catalog_request = bcode_workflow_view_models::WorkflowCatalogRequest {
         limit: CATALOG_PAGE_SIZE,
         cursor: None,
         filter: bcode_workflow_view_models::WorkflowCatalogFilter::All,
         sort: bcode_workflow_view_models::WorkflowCatalogSort::UpdatedAt,
+        group: bcode_workflow_view_models::WorkflowCatalogGroup::None,
         search: None,
     };
     let catalog = match client.workflow_catalog_view(catalog_request.clone()).await {
@@ -1004,6 +1005,44 @@ async fn stream_plugin_workflow_views(
                             Ok(view) => {
                                 if sender.send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view))).await.is_err() {
                                     return;
+                                }
+                                redraw.request();
+                            }
+                            Err(error) => {
+                                let _ = sender.send(PluginTuiSurfaceUpdate::Disconnected {
+                                    message: error.to_string(),
+                                }).await;
+                                redraw.request();
+                            }
+                        }
+                    }
+                    super::chat_loop::WorkflowViewRequest::UpdateQuery {
+                        filter,
+                        sort,
+                        group,
+                        search,
+                    } => {
+                        catalog_request = bcode_workflow_view_models::WorkflowCatalogRequest {
+                            limit: CATALOG_PAGE_SIZE,
+                            cursor: None,
+                            filter,
+                            sort,
+                            group,
+                            search,
+                        };
+                        match client.workflow_catalog_view(catalog_request.clone()).await {
+                            Ok(catalog) => {
+                                selected_run_id = catalog.runs.first().map(|run| run.run_id.clone());
+                                if sender.send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog)).await.is_err() {
+                                    return;
+                                }
+                                if let Some(run_id) = selected_run_id.clone() {
+                                    let _ = sender.send(PluginTuiSurfaceUpdate::WorkflowRunLoading {
+                                        run_id: run_id.clone(),
+                                    }).await;
+                                    if let Ok(view) = client.workflow_run_view(run_id, RUN_DETAIL_LIMIT).await {
+                                        let _ = sender.send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view))).await;
+                                    }
                                 }
                                 redraw.request();
                             }

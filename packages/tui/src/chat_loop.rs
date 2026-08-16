@@ -150,6 +150,12 @@ pub enum AuthPoolPickerRootOutcome {
 #[derive(Debug)]
 pub enum WorkflowViewRequest {
     SelectRun(String),
+    UpdateQuery {
+        filter: bcode_workflow_view_models::WorkflowCatalogFilter,
+        sort: bcode_workflow_view_models::WorkflowCatalogSort,
+        group: bcode_workflow_view_models::WorkflowCatalogGroup,
+        search: Option<String>,
+    },
     LoadMore(bcode_workflow_view_models::WorkflowCatalogCursor),
 }
 
@@ -996,6 +1002,23 @@ impl ChatLoopState {
     pub fn request_root_workflow_run(&self, run_id: String) {
         if let Some(requests) = &self.workflow_view_requests {
             let _ = requests.try_send(WorkflowViewRequest::SelectRun(run_id));
+        }
+    }
+
+    pub fn request_root_workflow_query(
+        &self,
+        filter: bcode_workflow_view_models::WorkflowCatalogFilter,
+        sort: bcode_workflow_view_models::WorkflowCatalogSort,
+        group: bcode_workflow_view_models::WorkflowCatalogGroup,
+        search: Option<String>,
+    ) {
+        if let Some(requests) = &self.workflow_view_requests {
+            let _ = requests.try_send(WorkflowViewRequest::UpdateQuery {
+                filter,
+                sort,
+                group,
+                search,
+            });
         }
     }
 
