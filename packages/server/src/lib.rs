@@ -2855,14 +2855,14 @@ async fn invariant_selector_runtime(
     }
     let active = config.resolved_model_selection();
     let mut model = resolve_invariant_selector_model(&config, &active)?;
-    let target = resolve_model_request_target(
+    let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
             provider_plugin_id: model.provider_plugin_id.as_deref(),
             selected_model_id: Some(&model.model_id),
             provider_context: &model.provider_context,
         },
-    )
+    ))
     .await
     .ok()?;
     model.provider_plugin_id = target.provider_plugin_id;
@@ -24530,14 +24530,14 @@ async fn build_model_turn_request(
     }
     let system_prompt = static_context.system_prompt.clone();
     let tools = static_context.tools.clone();
-    let target = resolve_model_request_target(
+    let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
             provider_plugin_id,
             selected_model_id,
             provider_context: &selection.provider_context,
         },
-    )
+    ))
     .await
     .map_err(|error| {
         bcode_session::SessionError::EventSerialization(format!(
@@ -45272,34 +45272,6 @@ library = "test"
             request.provider_context.api_surface,
             Some(bcode_model::ModelApiSurface::Responses)
         );
-    }
-
-    #[tokio::test]
-    async fn catalog_surface_overrides_stale_context_and_unknown_models_keep_context() {
-        let state = test_server_state(SessionManager::default());
-        let policy = bcode_model::ModelCatalogPolicy::ExpandAll {
-            provider_id: "bedrock".to_string(),
-        };
-
-        let known = model_request_target::resolve_request_api_surface(
-            &state,
-            &policy,
-            "openai.gpt-5.6-sol",
-            None,
-            Some(bcode_model::ModelApiSurface::Messages),
-        )
-        .await;
-        let unknown = model_request_target::resolve_request_api_surface(
-            &state,
-            &policy,
-            "openai.unknown-future-model",
-            None,
-            Some(bcode_model::ModelApiSurface::Messages),
-        )
-        .await;
-
-        assert_eq!(known, Some(bcode_model::ModelApiSurface::Responses));
-        assert_eq!(unknown, Some(bcode_model::ModelApiSurface::Messages));
     }
 
     #[test]

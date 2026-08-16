@@ -998,6 +998,7 @@ pub async fn collect_compaction_summary(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn collect_compaction_summary_once(
     state: &ServerState,
     session_id: SessionId,
@@ -1011,14 +1012,14 @@ pub async fn collect_compaction_summary_once(
         "{session_id}-compact-{}",
         transcript.compacted_through_sequence
     );
-    let target = resolve_model_request_target(
+    let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
             provider_plugin_id: selection.provider_plugin_id.as_deref(),
             selected_model_id: selection.model_id.as_deref(),
             provider_context: &selection.provider_context,
         },
-    )
+    ))
     .await
     .map_err(|error| CompactionError::Provider(error.to_string()))?;
     let request = build_compaction_request(
