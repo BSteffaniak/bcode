@@ -384,24 +384,28 @@ impl ForkSelectSurface {
         };
         serde_json::to_value(outcome).ok()
     }
-}
-
-impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
-    fn id(&self) -> &'static str {
-        "session-derivation.fork-select"
-    }
-
-    fn title(&self) -> &'static str {
-        "Fork Session"
-    }
-
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        frame.fill(area, " ", Style::new());
+    fn render_with_presentation(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        let canvas = theme.map_or_else(Style::new, |theme| theme.canvas);
+        let text = theme.map_or_else(Style::new, |theme| theme.text);
+        let focused = theme.map_or_else(
+            || Style::new().add_modifier(Modifier::BOLD),
+            |theme| theme.focused.add_modifier(Modifier::BOLD),
+        );
+        let selected = theme.map_or_else(
+            || Style::new().add_modifier(Modifier::REVERSED),
+            |theme| theme.selection,
+        );
+        frame.fill(area, " ", canvas);
         frame.write_line(
             Rect::new(area.x, area.y, area.width, 1),
             &Line::from_spans(vec![Span::styled(
                 "Select the prompt to edit in the fork",
-                Style::new().add_modifier(Modifier::BOLD),
+                focused,
             )]),
         );
         for (index, candidate) in self
@@ -411,9 +415,9 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
             .enumerate()
         {
             let style = if index == self.selected {
-                Style::new().add_modifier(Modifier::REVERSED)
+                selected
             } else {
-                Style::new()
+                text
             };
             frame.write_line(
                 Rect::new(
@@ -433,6 +437,29 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
                 )]),
             );
         }
+    }
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
+    fn id(&self) -> &'static str {
+        "session-derivation.fork-select"
+    }
+
+    fn title(&self) -> &'static str {
+        "Fork Session"
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        self.render_with_presentation(area, frame, None);
+    }
+
+    fn render_with_theme(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        self.render_with_presentation(area, frame, theme);
     }
 
     fn render_with_theme(

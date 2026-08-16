@@ -930,6 +930,13 @@ async fn stream_plugin_session_view_inner(
     }
 }
 
+fn workflow_event_refreshes_selected_detail(
+    selected_run_id: Option<&str>,
+    changed_run_id: &str,
+) -> bool {
+    selected_run_id == Some(changed_run_id)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn stream_plugin_workflow_views(
     client: BcodeClient,
@@ -1136,7 +1143,10 @@ async fn stream_plugin_workflow_views(
                     if sender.send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog)).await.is_err() {
                         return;
                     }
-                    if selected_run_id.as_deref() == Some(event.run_id.as_str()) {
+                    if workflow_event_refreshes_selected_detail(
+                        selected_run_id.as_deref(),
+                        &event.run_id,
+                    ) {
                         match client.workflow_run_view(event.run_id, RUN_DETAIL_LIMIT).await {
                             Ok(view) => {
                                 if sender.send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view))).await.is_err() {
@@ -1196,7 +1206,8 @@ pub fn subscribe_workflow_views(
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginWorkflowPackageExportStartRequest, SessionId, workflow_package_export_start_request,
+        PluginWorkflowPackageExportStartRequest, SessionId,
+        workflow_event_refreshes_selected_detail, workflow_package_export_start_request,
     };
 
     #[test]
@@ -1237,6 +1248,24 @@ mod tests {
         assert_eq!(request.package_export.package_id, "example/package");
         assert_eq!(request.parent_session_id, parent_session_id);
         assert_eq!(request.input.expect("input")["subject"], "change");
+    }
+
+    #[test]
+    fn repeated_workflow_events_refresh_only_exact_selected_detail() {
+        for _ in 0..10_000 {
+            assert!(workflow_event_refreshes_selected_detail(
+                Some("selected-run"),
+                "selected-run"
+            ));
+            assert!(!workflow_event_refreshes_selected_detail(
+                Some("selected-run"),
+                "historical-run"
+            ));
+            assert!(!workflow_event_refreshes_selected_detail(
+                None,
+                "historical-run"
+            ));
+        }
     }
 
     #[test]

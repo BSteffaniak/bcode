@@ -3825,6 +3825,31 @@ mod tests {
     }
 
     #[test]
+    fn stale_visible_action_fails_closed_before_dispatch() {
+        let mut surface = projected_surface();
+        surface
+            .runs
+            .get_mut("run-1")
+            .expect("run")
+            .actions
+            .retain(|action| action.kind != bcode_workflow_view_models::WorkflowActionKind::Pause);
+
+        assert_eq!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Char('p')
+            ))),
+            PluginTuiAction::Redraw
+        );
+        assert!(
+            surface
+                .inline_error
+                .as_deref()
+                .is_some_and(|error| error.contains("stale or unavailable"))
+        );
+        assert!(surface.pending_action_target.is_none());
+    }
+
+    #[test]
     fn projected_control_center_renders_typed_results_and_routes_actions() {
         let mut surface = projected_surface();
         let rendered = workflow_view_lines(
@@ -3932,6 +3957,58 @@ mod tests {
                 && arguments.contains("activation_id=input-1")
         ));
         assert!(surface.input_form.is_some());
+    }
+
+    #[test]
+    fn mutation_approval_confirmation_renders_exact_operation_facts() {
+        let mut surface = projected_surface();
+        let run = surface.runs.get_mut("run-1").expect("run");
+        run.mutation_approvals = vec![bcode_workflow_view_models::WorkflowMutationApprovalView {
+            approval_id: "approval-exact".to_string(),
+            node_id: "mutate".to_string(),
+            activation_id: "activation-exact".to_string(),
+            plugin_id: "bcode.git".to_string(),
+            block_id: "git.commit".to_string(),
+            block_version: 3,
+            operation: "commit".to_string(),
+            effect: bcode_workflow_view_models::WorkflowOperationEffect::Mutating,
+            input_summary: serde_json::json!({"message":"reviewed"}),
+            resource_claims: vec![bcode_workflow_view_models::WorkflowResourceClaimView {
+                resource: "repository".to_string(),
+                access: "write".to_string(),
+            }],
+            workspace_snapshot: "snapshot-exact".to_string(),
+            reconciliation_warning: Some("verify HEAD".to_string()),
+            requested_at_ms: 4,
+            expires_at_ms: Some(10),
+        }];
+        run.actions
+            .push(bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::DenyMutation,
+                target: bcode_workflow_view_models::WorkflowActionTarget::MutationApproval {
+                    approval_id: "approval-exact".to_string(),
+                },
+                enabled: true,
+                unavailable_reason: None,
+            });
+        surface.selected_approval_id = Some("approval-exact".to_string());
+
+        assert_eq!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Char('d')
+            ))),
+            PluginTuiAction::Redraw
+        );
+        let confirmation = surface.pending_confirmation.as_ref().expect("confirmation");
+        assert!(confirmation.detail.contains("bcode.git / git.commit"));
+        assert!(confirmation.detail.contains("operation commit"));
+        assert!(confirmation.detail.contains("snapshot snapshot-exact"));
+        assert!(matches!(
+            confirmation.target,
+            bcode_workflow_view_models::WorkflowActionTarget::MutationApproval {
+                ref approval_id
+            } if approval_id == "approval-exact"
+        ));
     }
 
     #[test]
@@ -4501,6 +4578,47 @@ mod tests {
     }
 
     #[test]
+    fn long_identity_and_reviewer_findings_render_within_bounded_terminal_area() {
+        let mut surface = projected_surface();
+        let long_name = "workflow-".repeat(40);
+        surface.catalog.as_mut().expect("catalog").runs[0].display_title = long_name.clone();
+        let run = surface.runs.get_mut("run-1").expect("run");
+        run.run.display_title = long_name;
+        run.outputs[0].value = bcode_workflow_view_models::WorkflowOutputValue::Resolved {
+            value: serde_json::json!({
+                "verdict": "fail",
+                "findings": ["bounded reviewer finding ".repeat(80)]
+            }),
+        };
+        surface.active_detail_tab = 2;
+
+        for (width, height) in [(132, 28), (88, 24)] {
+            let buffer = render_workspace_buffer(&surface, width, height);
+            assert_eq!(
+                buffer.cells().len(),
+                usize::from(width) * usize::from(height)
+            );
+            let rendered = buffer
+                .cells()
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>();
+            assert!(rendered.contains("Verdict"));
+            assert!(rendered.contains("Findings"));
+        }
+        surface.narrow_page = WorkflowNarrowPage::Inspector;
+        let buffer = render_workspace_buffer(&surface, 62, 20);
+        assert_eq!(buffer.cells().len(), 62 * 20);
+        let rendered = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert!(rendered.contains("Verdict"));
+        assert!(rendered.contains("Findings"));
+    }
+
+    #[test]
     fn every_run_and_node_status_has_a_semantic_style_and_glyph() {
         let theme = WorkflowSurfaceTheme::resolve(None);
         for (status, expected) in [
@@ -4746,6 +4864,32 @@ mod tests {
     }
 
     #[test]
+    fn large_catalog_render_and_navigation_remain_page_bounded() {
+        let mut surface = projected_surface();
+        let first = surface.catalog.as_ref().expect("catalog").runs[0].clone();
+        surface.catalog.as_mut().expect("catalog").runs = (0..100)
+            .map(|index| {
+                let mut run = first.clone();
+                run.run_id = format!("run-{index:03}");
+                run.display_title = format!("Review workflow {index:03}");
+                run
+            })
+            .collect();
+        surface.selected_run_id = Some("run-000".to_string());
+
+        let rendered = render_workspace_text(&surface, 132, 28);
+        assert!(rendered.contains("Showing 100"));
+        for _ in 0..150 {
+            let _ = surface.handle_control_center_event(&Event::Key(
+                bmux_keyboard::KeyStroke::simple(KeyCode::Right),
+            ));
+        }
+        assert_eq!(surface.selected_run_id.as_deref(), Some("run-099"));
+        assert_eq!(surface.catalog.as_ref().expect("catalog").runs.len(), 100);
+        assert_eq!(surface.runs.len(), 1, "catalog rows do not retain details");
+    }
+
+    #[test]
     fn bounded_catalog_pages_and_navigation_do_not_load_unselected_details() {
         let source = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -4754,7 +4898,7 @@ mod tests {
         assert!(source.contains("const CATALOG_PAGE_SIZE: usize = 100"));
         assert!(source.contains("const RUN_DETAIL_LIMIT: usize = 1_000"));
         assert!(source.contains("WorkflowViewRequest::LoadMore(cursor)"));
-        assert!(source.contains("if selected_run_id.as_deref() == Some(event.run_id.as_str())"));
+        assert!(source.contains("workflow_event_refreshes_selected_detail("));
 
         let mut surface = projected_surface();
         let first = surface.catalog.as_ref().expect("catalog").runs[0].clone();
