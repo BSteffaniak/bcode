@@ -518,6 +518,18 @@ impl WorkflowSurfaceTheme {
     }
 }
 
+const fn workflow_run_status_is_terminal(
+    status: bcode_workflow_view_models::WorkflowRunStatus,
+) -> bool {
+    matches!(
+        status,
+        bcode_workflow_view_models::WorkflowRunStatus::Completed
+            | bcode_workflow_view_models::WorkflowRunStatus::Failed
+            | bcode_workflow_view_models::WorkflowRunStatus::Cancelled
+            | bcode_workflow_view_models::WorkflowRunStatus::RepairRequired
+    )
+}
+
 impl WorkflowStatusSurface {
     fn action_is_current(
         &self,
@@ -2101,6 +2113,14 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                         continue;
                     }
                     let run_id = view.run.run_id.clone();
+                    if self.runs.get(&run_id).is_some_and(|current| {
+                        workflow_run_status_is_terminal(current.run.status)
+                            && !workflow_run_status_is_terminal(view.run.status)
+                    }) {
+                        self.live_status =
+                            "ignored stale workflow update after terminal state".to_string();
+                        continue;
+                    }
                     if self.selected_run_id.is_none() {
                         self.selected_run_id = Some(run_id.clone());
                     }
@@ -4256,6 +4276,35 @@ mod tests {
     }
 
     #[test]
+    fn catalog_live_insertion_appears_without_loading_new_run_detail() {
+        let mut surface = projected_surface();
+        let mut inserted = surface.catalog.as_ref().expect("catalog").runs[0].clone();
+        inserted.run_id = "run-new".to_string();
+        inserted.display_title = "New live run".to_string();
+        let mut catalog = surface.catalog.clone().expect("catalog");
+        catalog.runs.insert(0, inserted);
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        surface.attach_updates(receiver);
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog))
+            .expect("catalog update");
+
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert_eq!(surface.selected_run_id.as_deref(), Some("run-1"));
+        assert!(
+            surface
+                .catalog
+                .as_ref()
+                .expect("catalog")
+                .runs
+                .iter()
+                .any(|run| run.run_id == "run-new")
+        );
+        assert!(!surface.runs.contains_key("run-new"));
+        assert!(surface.detail_loading_run_id.is_none());
+    }
+
+    #[test]
     fn catalog_snapshot_reorder_preserves_exact_run_and_node_selection() {
         let mut surface = projected_surface();
         let mut second = surface.catalog.as_ref().expect("catalog").runs[0].clone();
@@ -4318,6 +4367,38 @@ mod tests {
         assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
         assert_eq!(surface.selected_run_id.as_deref(), Some("run-1"));
         assert_eq!(surface.selected_node_id.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn stale_live_detail_cannot_regress_authoritative_terminal_state() {
+        let mut surface = projected_surface();
+        let run = surface.runs.get_mut("run-1").expect("run");
+        run.run.status = bcode_workflow_view_models::WorkflowRunStatus::Completed;
+        run.terminal = Some(
+            bcode_workflow_view_models::WorkflowTerminalView::Completed {
+                output_id: "output-1".to_string(),
+            },
+        );
+        let mut stale = run.clone();
+        stale.run.status = bcode_workflow_view_models::WorkflowRunStatus::Running;
+        stale.terminal = None;
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        surface.attach_updates(receiver);
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(stale)))
+            .expect("stale live update");
+
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        let retained = surface.runs.get("run-1").expect("retained run");
+        assert_eq!(
+            retained.run.status,
+            bcode_workflow_view_models::WorkflowRunStatus::Completed
+        );
+        assert!(matches!(
+            retained.terminal,
+            Some(bcode_workflow_view_models::WorkflowTerminalView::Completed { .. })
+        ));
+        assert!(surface.live_status.contains("ignored stale"));
     }
 
     #[test]
@@ -4520,6 +4601,97 @@ mod tests {
     }
 
     #[test]
+    fn graph_matrix_covers_branches_joins_repeat_retry_fanout_parallel_and_nested_runs() {
+        let mut surface = projected_surface();
+        let template = surface.runs.get("run-1").expect("run").nodes[0].clone();
+        let run = surface.runs.get_mut("run-1").expect("run");
+        for (id, name, kind) in [
+            (
+                "fanout",
+                "Fan out",
+                bcode_workflow_view_models::WorkflowNodeKind::FanOut,
+            ),
+            (
+                "parallel",
+                "Parallel",
+                bcode_workflow_view_models::WorkflowNodeKind::Parallel,
+            ),
+            (
+                "join",
+                "Join",
+                bcode_workflow_view_models::WorkflowNodeKind::Task,
+            ),
+            (
+                "repeat",
+                "Repeat",
+                bcode_workflow_view_models::WorkflowNodeKind::Repeat,
+            ),
+            (
+                "retry",
+                "Retry",
+                bcode_workflow_view_models::WorkflowNodeKind::Retry,
+            ),
+        ] {
+            let mut node = template.clone();
+            node.node_id = id.to_string();
+            node.name = name.to_string();
+            node.kind = kind;
+            run.nodes.push(node);
+        }
+        run.edges = vec![
+            ("reviewer", "fanout", "direct"),
+            ("fanout", "parallel", "conditional"),
+            ("fanout", "join", "direct"),
+            ("parallel", "join", "direct"),
+            ("join", "repeat", "direct"),
+            ("repeat", "retry", "back"),
+            ("retry", "repeat", "retry"),
+        ]
+        .into_iter()
+        .map(
+            |(from, to, kind)| bcode_workflow_view_models::WorkflowEdgeView {
+                from: from.to_string(),
+                to: to.to_string(),
+                kind: kind.to_string(),
+            },
+        )
+        .collect();
+        let child = surface.catalog.as_ref().expect("catalog").runs[0].clone();
+        run.descendant_runs = vec![bcode_workflow_view_models::WorkflowDescendantRunView {
+            run: child,
+            parent_run_id: "run-1".to_string(),
+            parent_node_id: "repeat".to_string(),
+            depth: 1,
+        }];
+        let rendered = workflow_graph_lines(
+            run,
+            Some("join"),
+            100,
+            40,
+            true,
+            WorkflowSurfaceTheme::resolve(None),
+        )
+        .into_iter()
+        .flat_map(|line| line.spans.into_iter().map(|span| span.content))
+        .collect::<String>();
+        for expected in [
+            "fan-out",
+            "parallel",
+            "Join",
+            "repeat",
+            "retry",
+            "conditional",
+            "back",
+            "Nested",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing graph semantic {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn graph_layout_falls_back_for_narrow_or_cyclic_geometry_and_keeps_selection_visible() {
         let mut surface = projected_surface();
         let run = surface.runs.get_mut("run-1").expect("run");
@@ -4553,6 +4725,36 @@ mod tests {
         assert!(lines.len() <= 5);
         assert!(rendered.contains("Node 11"));
         assert!(rendered.contains('▶'));
+    }
+
+    #[test]
+    fn lifecycle_and_failure_states_render_purposeful_workspace_messages() {
+        let mut surface = projected_surface();
+        let catalog = surface.catalog.as_mut().expect("catalog");
+        catalog.runs.clear();
+        assert!(render_workspace_text(&surface, 88, 24).contains("No workflow runs yet"));
+
+        let mut surface = projected_surface();
+        surface.catalog_loading = true;
+        surface.catalog_stale = true;
+        assert!(render_workspace_text(&surface, 88, 24).contains("showing stale results"));
+        surface.catalog_loading = false;
+        surface.catalog_stale = false;
+        surface.live_status = "live updates unavailable: offline".to_string();
+        assert!(render_workspace_text(&surface, 88, 24).contains("offline"));
+        surface.live_status = "resync required; reopen /workflow".to_string();
+        assert!(render_workspace_text(&surface, 88, 24).contains("resync required"));
+        surface.live_status = "live".to_string();
+        surface.runs.get_mut("run-1").expect("run").health =
+            bcode_workflow_view_models::WorkflowProjectionHealth::Degraded {
+                reason: "bounded detail unavailable".to_string(),
+            };
+        assert!(render_workspace_text(&surface, 88, 24).contains("projection is degraded"));
+        surface.runs.get_mut("run-1").expect("run").health =
+            bcode_workflow_view_models::WorkflowProjectionHealth::RepairRequired {
+                reason: "explicit repair required".to_string(),
+            };
+        assert!(render_workspace_text(&surface, 88, 24).contains("requires repair"));
     }
 
     #[test]
