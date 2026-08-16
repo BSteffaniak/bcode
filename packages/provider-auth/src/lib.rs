@@ -273,6 +273,15 @@ pub enum AuthProfileSource {
     Runtime,
 }
 
+/// Result of looking up an authentication profile for a registered provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthProviderProfileLookup {
+    /// A declarative or runtime profile is configured and ownership-checked.
+    Configured(ResolvedAuthProfile),
+    /// No profile or binding exists yet; enrollment may create this provider-owned profile.
+    Unconfigured { profile_name: String },
+}
+
 /// Generic provider-to-profile resolution failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthProfileResolutionError {
@@ -299,6 +308,46 @@ pub enum AuthProfileResolutionError {
         expected: String,
         actual: String,
     },
+}
+
+/// Look up an auth profile while distinguishing fresh, unenrolled state from invalid state.
+///
+/// A missing explicit profile or a binding that references a missing profile remains an error.
+/// `Unconfigured` is returned only when no declarative/runtime profile or binding selected the
+/// provider's default profile name.
+///
+/// # Errors
+///
+/// Returns an error for invalid IDs, dangling selections, unverifiable ownership, or ownership
+/// mismatch.
+pub fn lookup_auth_provider_profile(
+    config: &bcode_config::BcodeConfig,
+    provider_id: &str,
+    owner_plugin_id: &str,
+    explicit_profile: Option<&str>,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+) -> Result<AuthProviderProfileLookup, AuthProfileResolutionError> {
+    match resolve_auth_provider_profile(
+        config,
+        provider_id,
+        owner_plugin_id,
+        explicit_profile,
+        runtime,
+    ) {
+        Ok(resolved) => Ok(AuthProviderProfileLookup::Configured(resolved)),
+        Err(AuthProfileResolutionError::MissingProfile { profile, .. })
+            if explicit_profile.is_none()
+                && !config.auth.bindings.contains_key(provider_id)
+                && !runtime.bindings.contains_key(provider_id)
+                && !config.auth.profiles.contains_key(&profile)
+                && !runtime.profiles.contains_key(&profile) =>
+        {
+            Ok(AuthProviderProfileLookup::Unconfigured {
+                profile_name: profile,
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Resolve an auth profile for one registered provider with declarative precedence.
@@ -776,6 +825,58 @@ fn apply_default_priming_required_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_provider_lookup_is_unconfigured_without_hiding_dangling_selections() {
+        assert_eq!(
+            lookup_auth_provider_profile(
+                &bcode_config::BcodeConfig::default(),
+                "exa",
+                "bcode.web-search",
+                None,
+                &bcode_config::RuntimeAuthSubscriptions::default(),
+            )
+            .expect("fresh provider lookup"),
+            AuthProviderProfileLookup::Unconfigured {
+                profile_name: "exa".to_owned(),
+            }
+        );
+
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                bindings: BTreeMap::from([(
+                    "exa".to_owned(),
+                    bcode_config::AuthBindingConfig {
+                        profile: Some("missing".to_owned()),
+                    },
+                )]),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        assert!(matches!(
+            lookup_auth_provider_profile(
+                &config,
+                "exa",
+                "bcode.web-search",
+                None,
+                &bcode_config::RuntimeAuthSubscriptions::default(),
+            ),
+            Err(AuthProfileResolutionError::MissingProfile { profile, .. })
+                if profile == "missing"
+        ));
+        assert!(matches!(
+            lookup_auth_provider_profile(
+                &bcode_config::BcodeConfig::default(),
+                "exa",
+                "bcode.web-search",
+                Some("missing"),
+                &bcode_config::RuntimeAuthSubscriptions::default(),
+            ),
+            Err(AuthProfileResolutionError::MissingProfile { profile, .. })
+                if profile == "missing"
+        ));
+    }
 
     #[test]
     fn unowned_declarative_profile_fails_closed() {

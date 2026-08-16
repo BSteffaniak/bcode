@@ -2564,9 +2564,18 @@ fn resolve_invocation_secrets(
     config: &bcode_config::BcodeConfig,
     value: &serde_json::Value,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    resolve_invocation_secrets_with_runtime(plugin_id, config, value, &runtime)
+}
+
+fn resolve_invocation_secrets_with_runtime(
+    plugin_id: &str,
+    config: &bcode_config::BcodeConfig,
+    value: &serde_json::Value,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut secrets = std::collections::BTreeMap::new();
     collect_explicit_secret_refs(plugin_id, value, &mut Vec::new(), &mut secrets)?;
-    let runtime = bcode_config::load_runtime_auth_subscriptions();
     for (provider_id, binding) in &config.auth.bindings {
         if let Some(profile_name) = binding.profile.as_deref().or(Some(provider_id.as_str()))
             && let Some(profile) = config.auth.profiles.get(profile_name)
@@ -36684,6 +36693,80 @@ mod tests {
                 .get("bcode.web-search/exa/api_key")
                 .map(String::as_str),
             Some("second")
+        );
+    }
+
+    #[test]
+    fn runtime_invocation_secret_resolution_is_owner_scoped_and_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vault = temp.path().join("vault");
+        let runtime_profile = bcode_config::RuntimeAuthProfile {
+            provider_id: "exa".to_owned(),
+            owner_plugin_id: "bcode.web-search".to_owned(),
+            backend: "env".to_owned(),
+            scheme: "api_key".to_owned(),
+            storage_profile: "exa".to_owned(),
+            vault,
+            map: std::collections::BTreeMap::from([(
+                "api_key".to_owned(),
+                bcode_config::AuthCredentialMapping {
+                    env: Some("BCODE_TEST_RUNTIME_EXA_KEY".to_owned()),
+                    key: None,
+                },
+            )]),
+            device_seal: None,
+        };
+        let runtime = bcode_config::RuntimeAuthSubscriptions {
+            bindings: std::collections::BTreeMap::from([(
+                "exa".to_owned(),
+                bcode_config::RuntimeAuthBinding {
+                    profile: "exa".to_owned(),
+                    owner_plugin_id: "bcode.web-search".to_owned(),
+                },
+            )]),
+            profiles: std::collections::BTreeMap::from([("exa".to_owned(), runtime_profile)]),
+            ..bcode_config::RuntimeAuthSubscriptions::default()
+        };
+        unsafe {
+            std::env::set_var("BCODE_TEST_RUNTIME_EXA_KEY", "runtime-secret");
+        }
+        let owned = resolve_invocation_secrets_with_runtime(
+            "bcode.web-search",
+            &bcode_config::BcodeConfig::default(),
+            &serde_json::Value::Null,
+            &runtime,
+        )
+        .expect("owner resolves runtime credential");
+        let unrelated = resolve_invocation_secrets_with_runtime(
+            "bcode.unrelated",
+            &bcode_config::BcodeConfig::default(),
+            &serde_json::Value::Null,
+            &runtime,
+        )
+        .expect("unrelated plugin sees no credential");
+        unsafe {
+            std::env::remove_var("BCODE_TEST_RUNTIME_EXA_KEY");
+        }
+        assert_eq!(
+            owned
+                .get("bcode.web-search/exa/api_key")
+                .map(String::as_str),
+            Some("runtime-secret")
+        );
+        assert!(unrelated.is_empty());
+
+        let dangling = bcode_config::RuntimeAuthSubscriptions {
+            bindings: runtime.bindings,
+            ..bcode_config::RuntimeAuthSubscriptions::default()
+        };
+        assert!(
+            resolve_invocation_secrets_with_runtime(
+                "bcode.web-search",
+                &bcode_config::BcodeConfig::default(),
+                &serde_json::Value::Null,
+                &dangling,
+            )
+            .is_err()
         );
     }
 

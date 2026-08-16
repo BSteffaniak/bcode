@@ -57,8 +57,9 @@ if ! grep -F 'pub map: BTreeMap<String, AuthCredentialMapping>' <<<"$runtime_met
 fi
 
 if ! grep -F 'fn owned_ambient_auth_profile_hint' packages/cli/src/lib.rs >/dev/null ||
+   ! grep -F 'AuthProviderProfileLookup::Unconfigured' packages/cli/src/lib.rs >/dev/null ||
    ! grep -F 'OwnershipUnverifiable' packages/provider-auth/src/lib.rs >/dev/null; then
-  echo "Auth architecture violation: registered provider lifecycle lost source-aware hints or strict typed ownership." >&2
+  echo "Auth architecture violation: registered provider lifecycle lost source-aware hints, fresh enrollment status, or strict typed ownership." >&2
   violations=1
 fi
 

@@ -1139,6 +1139,32 @@ mod tests {
 
     #[cfg(feature = "static-bundled-web-search-plugin")]
     #[test]
+    fn web_search_is_a_disableable_distribution_default() {
+        let static_plugins = super::static_bundled_plugins();
+        let default_ids = bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)
+            .expect("static plugin manifests parse");
+        assert!(default_ids.iter().any(|id| id == "bcode.web-search"));
+
+        let default_selection = bcode_config::plugin_selection_with_default_plugin_ids(
+            &bcode_config::BcodeConfig::default(),
+            &default_ids,
+        );
+        assert!(default_selection.is_enabled("bcode.web-search"));
+
+        let disabled_config = bcode_config::BcodeConfig {
+            plugins: bcode_config::PluginConfig {
+                disabled: std::collections::BTreeSet::from(["bcode.web-search".to_owned()]),
+                ..bcode_config::PluginConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let disabled_selection =
+            bcode_config::plugin_selection_with_default_plugin_ids(&disabled_config, &default_ids);
+        assert!(!disabled_selection.is_enabled("bcode.web-search"));
+    }
+
+    #[cfg(feature = "static-bundled-web-search-plugin")]
+    #[test]
     fn disabled_web_search_bundle_does_not_register_exa_auth_provider() {
         let static_plugins = super::static_bundled_plugins();
         let selection = bcode_plugin::PluginSelection {

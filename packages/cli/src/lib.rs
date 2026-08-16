@@ -6403,6 +6403,23 @@ fn registered_auth_profile_hint(
     )
 }
 
+fn lookup_registered_auth_profile_from(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    explicit_profile: Option<&str>,
+) -> Result<bcode_provider_auth::AuthProviderProfileLookup, CliError> {
+    let profile_hint = registered_auth_profile_hint(config, runtime, provider, explicit_profile);
+    bcode_provider_auth::lookup_auth_provider_profile(
+        config,
+        &provider.contribution.provider_id,
+        &provider.plugin_id,
+        profile_hint.as_deref(),
+        runtime,
+    )
+    .map_err(|error| CliError::LoginProfile(error.to_string()))
+}
+
 fn resolve_registered_auth_profile_from(
     config: &bcode_config::BcodeConfig,
     runtime: &bcode_config::RuntimeAuthSubscriptions,
@@ -6798,14 +6815,59 @@ async fn auth_provider_logout(
     Ok(())
 }
 
+fn unconfigured_auth_provider_status_lines(
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    profile_name: &str,
+) -> Vec<String> {
+    vec![
+        format!("Provider: {}", provider.contribution.display_name),
+        format!("Plugin: {}", provider.plugin_id),
+        format!("Profile: {profile_name}"),
+        "Configured: false".to_owned(),
+        "Available: false".to_owned(),
+        format!(
+            "Diagnostic [auth_profile_missing]: Authentication has not been configured for provider '{}'.",
+            provider.contribution.provider_id
+        ),
+        format!(
+            "  remediation: Run `bcode auth login {}`.",
+            provider.contribution.provider_id
+        ),
+    ]
+}
+
+fn print_unconfigured_auth_provider_status(
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    profile_name: &str,
+) {
+    for line in unconfigured_auth_provider_status_lines(provider, profile_name) {
+        println!("{line}");
+    }
+}
+
 fn auth_provider_status(provider_id: &str, explicit_profile: Option<&str>) -> Result<(), CliError> {
     let mut host = load_cli_plugin_host()?;
     let provider = registered_auth_provider(&host, provider_id)?;
-    let resolved = resolve_registered_auth_profile(&provider, explicit_profile)?;
+    let config = bcode_config::load_config()?;
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    let resolved = match lookup_registered_auth_profile_from(
+        &config,
+        &runtime,
+        &provider,
+        explicit_profile,
+    )? {
+        bcode_provider_auth::AuthProviderProfileLookup::Configured(resolved) => resolved,
+        bcode_provider_auth::AuthProviderProfileLookup::Unconfigured { profile_name } => {
+            print_unconfigured_auth_provider_status(&provider, &profile_name);
+            host.deactivate_all()?;
+            return Ok(());
+        }
+    };
     let method = resolved_auth_method(&provider, &resolved)?;
     println!("Provider: {}", provider.contribution.display_name);
     println!("Plugin: {}", provider.plugin_id);
     println!("Profile: {}", resolved.profile_name);
+    println!("Configured: true");
     let status = bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
         &resolved,
         provider_id,
@@ -13387,6 +13449,102 @@ mod auth_cli_tests {
                 .and_then(|mapping| mapping.key.as_deref()),
             Some("TOKEN")
         );
+    }
+
+    fn secret_field(method_id: &str) -> bcode_provider_auth_models::AuthMethodContribution {
+        bcode_provider_auth_models::AuthMethodContribution::SecretFields {
+            method_id: method_id.to_owned(),
+            display_name: method_id.to_owned(),
+            fields: vec![bcode_provider_auth_models::AuthSecretField {
+                credential_id: "api_key".to_owned(),
+                storage_key: "TEST_PROVIDER_API_KEY".to_owned(),
+                prompt: "API key".to_owned(),
+                optional: false,
+                validation: bcode_provider_auth_models::AuthSecretValidation::default(),
+            }],
+            supports_verification: false,
+            supports_revocation: false,
+        }
+    }
+
+    #[test]
+    fn fresh_provider_status_lookup_is_non_mutating_and_login_blueprint_is_owned() {
+        let provider =
+            registered_provider_owned_by("exa", "bcode.web-search", vec![secret_field("api_key")]);
+        let config = bcode_config::BcodeConfig::default();
+        let runtime = bcode_config::RuntimeAuthSubscriptions::default();
+
+        assert_eq!(
+            lookup_registered_auth_profile_from(&config, &runtime, &provider, None)
+                .expect("fresh status lookup"),
+            bcode_provider_auth::AuthProviderProfileLookup::Unconfigured {
+                profile_name: "exa".to_owned(),
+            }
+        );
+        assert!(runtime.bindings.is_empty());
+        assert!(runtime.profiles.is_empty());
+        let status = unconfigured_auth_provider_status_lines(&provider, "exa").join("\n");
+        assert!(status.contains("Configured: false"));
+        assert!(status.contains("Available: false"));
+        assert!(status.contains("Diagnostic [auth_profile_missing]"));
+        assert!(status.contains("bcode auth login exa"));
+
+        let (resolved, persist_runtime) = resolve_or_prepare_auth_profile_from(
+            &config,
+            &runtime,
+            &provider,
+            &secret_field("api_key"),
+            None,
+            Some(PathBuf::from("/tmp/exa-vault")),
+            None,
+        )
+        .expect("fresh login blueprint");
+        assert!(persist_runtime);
+        assert_eq!(resolved.profile_name, "exa");
+        assert_eq!(resolved.profile.provider_id.as_deref(), Some("exa"));
+        assert_eq!(
+            resolved.profile.owner_plugin_id.as_deref(),
+            Some("bcode.web-search")
+        );
+        assert_eq!(resolved.profile.scheme.as_deref(), Some("api_key"));
+        assert_eq!(
+            resolved
+                .profile
+                .map
+                .get("api_key")
+                .and_then(|mapping| mapping.key.as_deref()),
+            Some("TEST_PROVIDER_API_KEY")
+        );
+    }
+
+    #[test]
+    fn fresh_status_lookup_does_not_hide_explicit_or_dangling_missing_profile() {
+        let provider =
+            registered_provider_owned_by("exa", "bcode.web-search", vec![secret_field("api_key")]);
+        let runtime = bcode_config::RuntimeAuthSubscriptions::default();
+        assert!(
+            lookup_registered_auth_profile_from(
+                &bcode_config::BcodeConfig::default(),
+                &runtime,
+                &provider,
+                Some("missing"),
+            )
+            .is_err()
+        );
+
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                bindings: BTreeMap::from([(
+                    "exa".to_owned(),
+                    bcode_config::AuthBindingConfig {
+                        profile: Some("missing".to_owned()),
+                    },
+                )]),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        assert!(lookup_registered_auth_profile_from(&config, &runtime, &provider, None,).is_err());
     }
 
     #[test]

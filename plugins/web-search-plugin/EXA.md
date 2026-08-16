@@ -5,17 +5,19 @@ runtime packages do not interpret Exa requests or responses.
 
 ## Configure authentication
 
-The preferred integrated flow uses Bcode's generic plugin-auth CLI:
+The preferred integrated flow uses Bcode's generic plugin-auth CLI. The plugin is statically bundled
+and enabled by Bcode's default distribution policy, so no auth TOML is required for ordinary use:
 
 ```sh
-bcode auth providers          # includes exa when bcode.web-search is enabled
-bcode auth login exa          # securely prompts for and stores the key
+bcode auth status exa       # reports Configured: false before first enrollment
+bcode auth login exa        # securely prompts for and stores the key
 bcode auth status exa
 ```
 
-This requires neither an exported key nor an `sshenv run` wrapper. The web-search plugin
-registers Exa dynamically, while Bcode owns enrollment, secure storage, ownership checks,
-and invocation-scoped secret delivery.
+After login, automatic provider selection prefers Exa because its integrated credential is
+available. This requires neither an exported key, an `sshenv run` wrapper, a daemon restart, nor a
+manual profile declaration. The web-search plugin registers Exa dynamically, while Bcode owns
+enrollment, secure storage, ownership checks, and invocation-scoped secret delivery.
 
 To force Exa instead of automatic provider selection, configure:
 

@@ -65,6 +65,23 @@ Interactive effects are renderer-neutral:
 
 Provider-native callback payloads, token responses, and HTTP errors remain inside the plugin.
 
+A fresh bundled provider may be registered but not enrolled. That is a normal, non-mutating status:
+
+```text
+Provider: Exa
+Plugin: bcode.web-search
+Profile: exa
+Configured: false
+Available: false
+Diagnostic [auth_profile_missing]: Authentication has not been configured for provider 'exa'.
+  remediation: Run `bcode auth login exa`.
+```
+
+Status distinguishes this from invalid state. Explicit missing profiles, dangling bindings,
+unverifiable ownership, and ownership mismatch still fail closed. Status never creates runtime
+metadata or a vault. Login uses the registered method as the enrollment blueprint and persists only
+owned, non-secret runtime profile and binding metadata.
+
 ## Profile resolution and precedence
 
 Resolution is deterministic:
