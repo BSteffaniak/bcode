@@ -3358,6 +3358,94 @@ mod tests {
     }
 
     #[test]
+    fn structured_output_negotiation_covers_supported_and_untrusted_execution_shapes() {
+        use super::{
+            CapabilityExecution, CapabilityFidelity, CapabilityMechanism, CapabilityScope,
+            CapabilitySource, CapabilitySupport, NegotiatedFeatureSupport,
+        };
+
+        let supported = |source, mechanism, fidelity, execution| CapabilitySupport::Supported {
+            source,
+            mechanism,
+            fidelity,
+            execution,
+        };
+        let exact_native = supported(
+            CapabilitySource::ProviderApi,
+            CapabilityMechanism::Native,
+            CapabilityFidelity::Exact,
+            CapabilityExecution::Direct,
+        );
+        let reduced_native = supported(
+            CapabilitySource::BundledCatalog,
+            CapabilityMechanism::Native,
+            CapabilityFidelity::Reduced,
+            CapabilityExecution::Direct,
+        );
+        let adapter_tool_free = supported(
+            CapabilitySource::ProviderApi,
+            CapabilityMechanism::AdapterMediated,
+            CapabilityFidelity::Reduced,
+            CapabilityExecution::ToolFreeProviderRound,
+        );
+
+        assert_eq!(
+            super::negotiate_feature_claims(&exact_native, &exact_native),
+            NegotiatedFeatureSupport::Guaranteed {
+                provider_source: CapabilitySource::ProviderApi,
+                model_source: CapabilitySource::ProviderApi,
+                mechanism: CapabilityMechanism::Native,
+                fidelity: CapabilityFidelity::Exact,
+                execution: CapabilityExecution::Direct,
+            }
+        );
+        assert!(matches!(
+            super::negotiate_feature_claims(&reduced_native, &exact_native),
+            NegotiatedFeatureSupport::Guaranteed {
+                mechanism: CapabilityMechanism::Native,
+                fidelity: CapabilityFidelity::Reduced,
+                execution: CapabilityExecution::Direct,
+                ..
+            }
+        ));
+        assert!(matches!(
+            super::negotiate_feature_claims(&exact_native, &adapter_tool_free),
+            NegotiatedFeatureSupport::Guaranteed {
+                mechanism: CapabilityMechanism::AdapterMediated,
+                fidelity: CapabilityFidelity::Reduced,
+                execution: CapabilityExecution::ToolFreeProviderRound,
+                ..
+            }
+        ));
+        assert_eq!(
+            super::negotiate_feature_claims(&CapabilitySupport::Unknown, &exact_native),
+            NegotiatedFeatureSupport::Unknown {
+                scope: CapabilityScope::Provider,
+            }
+        );
+        assert!(matches!(
+            super::negotiate_feature_claims(
+                &exact_native,
+                &CapabilitySupport::Unsupported {
+                    source: CapabilitySource::ProviderApi,
+                    reason: "model rejects schema".to_string(),
+                },
+            ),
+            NegotiatedFeatureSupport::Unsupported {
+                scope: CapabilityScope::Model,
+                ..
+            }
+        ));
+        assert!(matches!(
+            super::negotiate_feature_claims(&adapter_tool_free, &exact_native),
+            NegotiatedFeatureSupport::Guaranteed {
+                execution: CapabilityExecution::ToolFreeProviderRound,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn resolved_feature_capabilities_require_guarantees_for_provider_policy() {
         let unknown = super::ResolvedModelFeatureCapabilities {
             structured_output: Some(super::NegotiatedFeatureSupport::Unknown {

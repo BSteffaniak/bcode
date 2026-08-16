@@ -1,10 +1,16 @@
 #![cfg(feature = "config")]
 
-use bcode::{Bcode, BcodeError, ModelSelector, ProviderRegistry};
+use bcode::{
+    Bcode, BcodeError, ModelProviderInvoker, ModelSelector, ProviderRegistry, RuntimeError,
+    RuntimeFuture,
+};
 use bcode_config::{BcodeConfig, ConfigEnvironmentSnapshot};
 use bcode_model::{
-    CapabilitySource, CapabilitySupport, ModelCapability, ModelCatalogHints, ModelFeatureSupport,
-    ModelInfo, ModelList, ProviderCapabilities, ProviderCapability, ToolChoiceMode,
+    AckResponse, CancelTurnRequest, CapabilityExecution, CapabilityFidelity, CapabilityMechanism,
+    CapabilitySource, CapabilitySupport, FinishTurnRequest, ModelCapability, ModelCatalogHints,
+    ModelFeatureSupport, ModelInfo, ModelList, ModelTurnRequest, PollTurnEventsRequest,
+    PollTurnEventsResponse, ProviderCapabilities, ProviderCapability, StartTurnResponse,
+    StructuredOutputMode, ToolChoiceMode,
 };
 use std::collections::BTreeSet;
 
@@ -155,6 +161,7 @@ fn provider_registry_negotiates_parallel_only_when_provider_and_model_support_it
         context_window: None,
         max_output_tokens: None,
         max_image_input_base64_bytes: None,
+        api_surface: None,
         capabilities: BTreeSet::from([
             ModelCapability::ToolCalls,
             ModelCapability::ParallelToolCalls,
@@ -176,7 +183,9 @@ fn provider_registry_negotiates_parallel_only_when_provider_and_model_support_it
             },
         );
     let negotiated = registry.parallel_tool_capabilities(&selector);
-    assert!(negotiated.provider && negotiated.model && negotiated.runtime);
+    assert_eq!(negotiated.provider, Some(true));
+    assert_eq!(negotiated.model, Some(true));
+    assert!(negotiated.runtime);
 
     let legacy_capabilities = ProviderCapabilities {
         feature_support: ModelFeatureSupport::default(),
@@ -196,7 +205,8 @@ fn provider_registry_negotiates_parallel_only_when_provider_and_model_support_it
             },
         );
     let legacy_parallel = legacy.parallel_tool_capabilities(&selector);
-    assert!(!legacy_parallel.provider && !legacy_parallel.model);
+    assert_eq!(legacy_parallel.provider, None);
+    assert_eq!(legacy_parallel.model, None);
 
     let without_provider = ProviderRegistry::new().provider_models(
         "example.provider",
@@ -205,14 +215,18 @@ fn provider_registry_negotiates_parallel_only_when_provider_and_model_support_it
             catalog: ModelCatalogHints::default(),
         },
     );
-    assert!(
-        !without_provider
+    assert_eq!(
+        without_provider
             .parallel_tool_capabilities(&selector)
-            .provider
+            .provider,
+        None
     );
 
     let without_model = ProviderRegistry::new().provider_capabilities(capabilities);
-    assert!(!without_model.parallel_tool_capabilities(&selector).model);
+    assert_eq!(
+        without_model.parallel_tool_capabilities(&selector).model,
+        None
+    );
 }
 
 #[test]
@@ -230,6 +244,7 @@ fn selection_report_combines_registration_and_model_discovery_provenance() {
                     context_window: None,
                     max_output_tokens: None,
                     max_image_input_base64_bytes: None,
+                    api_surface: None,
                     capabilities: BTreeSet::new(),
                     feature_support: ModelFeatureSupport::default(),
                     reasoning: None,
@@ -262,6 +277,158 @@ fn selection_report_combines_registration_and_model_discovery_provenance() {
         serde_json::from_value::<bcode::ModelSelectionReport>(encoded)
             .expect("report should deserialize"),
         report
+    );
+}
+
+#[derive(Debug, Default)]
+struct UnexpectedProvider;
+
+impl ModelProviderInvoker for UnexpectedProvider {
+    fn start_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a ModelTurnRequest,
+    ) -> RuntimeFuture<'a, StartTurnResponse> {
+        Box::pin(async {
+            Err(RuntimeError::HostExtension(
+                "provider reached after successful capability admission".to_string(),
+            ))
+        })
+    }
+
+    fn poll_turn_events<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a PollTurnEventsRequest,
+    ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+        unreachable!()
+    }
+
+    fn cancel_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a CancelTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        unreachable!()
+    }
+
+    fn finish_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a FinishTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn registry_agents_fail_closed_for_untrusted_structured_output_capabilities() {
+    let selector = ModelSelector::with_provider("example.provider", "example-model");
+    let capability = |support: CapabilitySupport| {
+        let mut features = ModelFeatureSupport::default();
+        features
+            .structured_output
+            .insert(StructuredOutputMode::StrictJsonSchema, support);
+        features
+    };
+    let provider_capabilities = |feature_support| ProviderCapabilities {
+        provider_id: "example.provider".to_string(),
+        display_name: "Example".to_string(),
+        capabilities: BTreeSet::new(),
+        feature_support,
+        auth_schemes: BTreeSet::new(),
+        retry_rules: Vec::new(),
+        metadata: Default::default(),
+    };
+    let model = |feature_support| ModelInfo {
+        model_id: "example-model".to_string(),
+        display_name: "Example model".to_string(),
+        is_default: true,
+        context_window: None,
+        max_output_tokens: None,
+        max_image_input_base64_bytes: None,
+        api_surface: None,
+        capabilities: BTreeSet::new(),
+        feature_support,
+        reasoning: None,
+        cache: Default::default(),
+        metadata_source: None,
+        pricing: None,
+        visibility: Default::default(),
+    };
+    let unsupported = CapabilitySupport::Unsupported {
+        source: CapabilitySource::ProviderApi,
+        reason: "not supported".to_string(),
+    };
+    let unknown_registry = ProviderRegistry::new()
+        .provider_capabilities(provider_capabilities(ModelFeatureSupport::default()))
+        .provider_models(
+            "example.provider",
+            ModelList {
+                models: vec![model(ModelFeatureSupport::default())],
+                catalog: ModelCatalogHints::default(),
+            },
+        )
+        .default_model(selector.clone());
+    let unsupported_registry = ProviderRegistry::new()
+        .provider_capabilities(provider_capabilities(capability(unsupported.clone())))
+        .provider_models(
+            "example.provider",
+            ModelList {
+                models: vec![model(capability(unsupported))],
+                catalog: ModelCatalogHints::default(),
+            },
+        )
+        .default_model(selector.clone());
+    let tool_free = CapabilitySupport::Supported {
+        source: CapabilitySource::ProviderApi,
+        mechanism: CapabilityMechanism::AdapterMediated,
+        fidelity: CapabilityFidelity::Reduced,
+        execution: CapabilityExecution::ToolFreeProviderRound,
+    };
+    let guaranteed_registry = ProviderRegistry::new()
+        .provider_capabilities(provider_capabilities(capability(tool_free.clone())))
+        .provider_models(
+            "example.provider",
+            ModelList {
+                models: vec![model(capability(tool_free))],
+                catalog: ModelCatalogHints::default(),
+            },
+        )
+        .default_model(selector);
+
+    for registry in [unknown_registry, unsupported_registry] {
+        let agent = Bcode::builder()
+            .provider_registry(registry)
+            .build()
+            .agent()
+            .build();
+        let error = agent
+            .generate_object_with_provider::<serde_json::Value, _>(
+                &mut UnexpectedProvider,
+                "produce output",
+            )
+            .await
+            .expect_err("unknown and unsupported claims must fail before provider work");
+        assert!(matches!(error, BcodeError::StructuredOutput(_)));
+    }
+
+    let agent = Bcode::builder()
+        .provider_registry(guaranteed_registry)
+        .build()
+        .agent()
+        .build();
+    let request = agent
+        .generate_object_with_provider::<serde_json::Value, _>(
+            &mut UnexpectedProvider,
+            "produce output",
+        )
+        .await
+        .expect_err("guaranteed request should reach the intentionally unavailable provider");
+    assert!(matches!(request, BcodeError::Runtime(_)));
+    assert_eq!(
+        agent.selection_report().selector,
+        ModelSelector::with_provider("example.provider", "example-model")
     );
 }
 

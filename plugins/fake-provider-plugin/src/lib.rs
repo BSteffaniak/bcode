@@ -304,7 +304,18 @@ impl FakeProviderPlugin {
             .settings
             .get("fake_reasoning_subset")
             .is_some_and(|value| value == "true");
-        json_response(&models(has_context_window, subset_reasoning))
+        let structured_output_execution = request
+            .provider_context
+            .settings
+            .get("fake_structured_output_execution")
+            .is_some_and(|value| value == "tool_free_provider_round")
+            .then_some(bcode_model::CapabilityExecution::ToolFreeProviderRound)
+            .unwrap_or_default();
+        json_response(&models(
+            has_context_window,
+            subset_reasoning,
+            structured_output_execution,
+        ))
     }
 
     fn compact_context(request: &ServiceRequest) -> ServiceResponse {
@@ -345,10 +356,18 @@ impl FakeProviderPlugin {
     }
 
     fn capabilities_response(request: &ServiceRequest) -> ServiceResponse {
-        if let Err(error) = request.payload_json::<bcode_model::ProviderCapabilitiesRequest>() {
-            return invalid_request(&error);
-        }
-        json_response(&capabilities())
+        let request = match request.payload_json::<bcode_model::ProviderCapabilitiesRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        let execution = request
+            .provider_context
+            .settings
+            .get("fake_structured_output_execution")
+            .is_some_and(|value| value == "tool_free_provider_round")
+            .then_some(bcode_model::CapabilityExecution::ToolFreeProviderRound)
+            .unwrap_or_default();
+        json_response(&capabilities(execution))
     }
 
     fn start_turn(&self, request: &ServiceRequest, positioned_output: bool) -> ServiceResponse {
@@ -1706,6 +1725,12 @@ fn fake_delay() -> Option<Duration> {
 }
 
 fn fake_feature_support() -> bcode_model::ModelFeatureSupport {
+    fake_feature_support_for_execution(bcode_model::CapabilityExecution::Direct)
+}
+
+fn fake_feature_support_for_execution(
+    structured_output_execution: bcode_model::CapabilityExecution,
+) -> bcode_model::ModelFeatureSupport {
     use bcode_model::{
         CapabilitySource, CapabilitySupport, MediaInputFeature, ModelFeatureSupport,
         ModelParameterKey, PromptCacheFeature, StructuredOutputMode, ToolChoiceMode,
@@ -1746,8 +1771,24 @@ fn fake_feature_support() -> bcode_model::ModelFeatureSupport {
         })
         .collect(),
         structured_output: [
-            (StructuredOutputMode::JsonSchema, supported()),
-            (StructuredOutputMode::StrictJsonSchema, supported()),
+            (
+                StructuredOutputMode::JsonSchema,
+                CapabilitySupport::Supported {
+                    source: CapabilitySource::TestContract,
+                    mechanism: bcode_model::CapabilityMechanism::Native,
+                    fidelity: bcode_model::CapabilityFidelity::Exact,
+                    execution: structured_output_execution,
+                },
+            ),
+            (
+                StructuredOutputMode::StrictJsonSchema,
+                CapabilitySupport::Supported {
+                    source: CapabilitySource::TestContract,
+                    mechanism: bcode_model::CapabilityMechanism::Native,
+                    fidelity: bcode_model::CapabilityFidelity::Exact,
+                    execution: structured_output_execution,
+                },
+            ),
         ]
         .into_iter()
         .collect(),
@@ -1801,7 +1842,9 @@ fn fake_feature_support() -> bcode_model::ModelFeatureSupport {
     }
 }
 
-fn capabilities() -> ProviderCapabilities {
+fn capabilities(
+    structured_output_execution: bcode_model::CapabilityExecution,
+) -> ProviderCapabilities {
     ProviderCapabilities {
         provider_id: "bcode.fake-provider".to_string(),
         display_name: "Bcode Fake Provider".to_string(),
@@ -1814,14 +1857,18 @@ fn capabilities() -> ProviderCapabilities {
         ]
         .into_iter()
         .collect(),
-        feature_support: fake_feature_support(),
+        feature_support: fake_feature_support_for_execution(structured_output_execution),
         auth_schemes: BTreeSet::new(),
         retry_rules: Vec::new(),
         metadata: BTreeMap::new(),
     }
 }
 
-fn models(has_context_window: bool, subset_reasoning: bool) -> ModelList {
+fn models(
+    has_context_window: bool,
+    subset_reasoning: bool,
+    structured_output_execution: bcode_model::CapabilityExecution,
+) -> ModelList {
     let effort_values = if subset_reasoning {
         vec!["low".to_owned(), "high".to_owned()]
     } else {
@@ -1847,7 +1894,7 @@ fn models(has_context_window: bool, subset_reasoning: bool) -> ModelList {
             ]
             .into_iter()
             .collect(),
-            feature_support: fake_feature_support(),
+            feature_support: fake_feature_support_for_execution(structured_output_execution),
             reasoning: Some(bcode_model::ModelReasoningInfo {
                 effort_values,
                 default_effort: Some("medium".to_owned()),
@@ -2569,7 +2616,9 @@ mod tests {
 
     #[test]
     fn fake_subset_model_advertises_only_low_and_high_reasoning() {
-        let model = models(true, true).models.remove(0);
+        let model = models(true, true, bcode_model::CapabilityExecution::Direct)
+            .models
+            .remove(0);
         let reasoning = model.reasoning.expect("reasoning metadata");
 
         assert_eq!(reasoning.effort_values, ["low", "high"]);
@@ -2577,8 +2626,10 @@ mod tests {
 
     #[test]
     fn fake_capability_contract_matches_request_validation() {
-        let provider = capabilities();
-        let model = models(true, false).models.remove(0);
+        let provider = capabilities(bcode_model::CapabilityExecution::Direct);
+        let model = models(true, false, bcode_model::CapabilityExecution::Direct)
+            .models
+            .remove(0);
         assert!(provider.feature_support.has_complete_inventory());
         assert!(model.feature_support.has_complete_inventory());
         assert!(

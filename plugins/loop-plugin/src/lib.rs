@@ -1785,6 +1785,43 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn loop_implementation_allows_empty_evidence_but_evaluation_requires_it() {
+        let envelope = serde_json::json!({
+            "implementation_prompt": "continue implementation",
+            "stop_condition": "all work complete",
+            "max_iterations": 20,
+            "iteration": 3,
+            "condition_met": false,
+            "evidence": [],
+            "summary": "implementation remains in progress"
+        });
+        let implementation: LoopWorkflowIteration = serde_json::from_value(envelope.clone())
+            .expect("implementation envelope may carry no evaluation evidence");
+        assert_eq!(implementation.iteration, 3);
+        assert!(!implementation.condition_met);
+        assert!(implementation.evidence.is_empty());
+
+        let input = LoopWorkflowInput {
+            implementation_prompt: "continue implementation".to_string(),
+            stop_condition: "all work complete".to_string(),
+            max_iterations: 20,
+        };
+        let spec = loop_workflow_spec(&input).expect("loop workflow");
+        let definition = spec.definition();
+        let implementation_schema = &definition.nodes["loop.implementation"].configuration["structured_output"]
+            ["schema"]["schema"];
+        let evaluation_schema = &definition.nodes["loop.evaluation"].configuration["structured_output"]
+            ["schema"]["schema"];
+        let implementation_validator =
+            jsonschema::validator_for(implementation_schema).expect("implementation schema");
+        let evaluation_validator =
+            jsonschema::validator_for(evaluation_schema).expect("evaluation schema");
+
+        assert!(implementation_validator.is_valid(&envelope));
+        assert!(!evaluation_validator.is_valid(&envelope));
+    }
+
     async fn poll_surface_until_action(
         surface: &mut LoopSurface,
         host: &dyn PluginTuiHost,

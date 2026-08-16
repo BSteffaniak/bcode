@@ -407,8 +407,9 @@ pub enum AgentRuntimeEvent {
     },
     /// Assistant text delta from a legacy v1 provider.
     TextDelta(String),
-    /// Legacy untyped reasoning text delta.
-    ///
+    /// A dedicated tool-free round is starting to produce the authoritative structured result.
+    StructuredOutputFinalizationStarted,
+    /// Legacy untyped reasoning text delta.    ///
     /// This compatibility event loses representation kind, part identity, order, and lifecycle.
     /// New providers and consumers should use [`Self::ReasoningActivity`].
     ReasoningDelta(String),
@@ -1701,6 +1702,8 @@ impl AgentRuntime {
             Ok(_) => Err(RuntimeError::Cancelled),
             Err(error) => {
                 let _ = self.cancel_turn_scope(&scope);
+                let _ = scope.control().mark_cancelled();
+                let _ = self.turns.release_terminal_turn(&scope);
                 Err(error)
             }
         }
@@ -1804,6 +1807,11 @@ impl AgentRuntime {
             if response.stop_reason != Some(StopReason::ToolCall) {
                 if requires_tool_free_finalization && !structured_output_finalization {
                     structured_output_finalization = true;
+                    let transition = AgentRuntimeEvent::StructuredOutputFinalizationStarted;
+                    if !scope.emit(ScopedTurnEvent::Runtime(transition.clone())) {
+                        return Err(RuntimeError::Cancelled);
+                    }
+                    all_events.push(transition);
                     if !response.text.is_empty() {
                         messages.push(ModelMessage {
                             role: MessageRole::Assistant,
@@ -1832,6 +1840,12 @@ impl AgentRuntime {
                     continue;
                 }
                 return Ok(completed_agent_response(response, started, all_events));
+            }
+            if structured_output_finalization {
+                return Err(RuntimeError::HostExtension(
+                    "structured-output finalization requested a host tool despite tool-free execution"
+                        .to_string(),
+                ));
             }
             if calls.is_empty() {
                 return Err(RuntimeError::EmptyProviderToolRound);
@@ -4882,6 +4896,10 @@ mod tests {
         assert_eq!(requests[1].tools.len(), 1);
         assert!(requests[2].structured_output.is_some());
         assert!(requests[2].tools.is_empty());
+        assert!(response.events.iter().any(|event| matches!(
+            event,
+            AgentRuntimeEvent::StructuredOutputFinalizationStarted
+        )));
         assert_eq!(
             requests[2].tool_call_policy.choice,
             bcode_model::ToolChoice::None
@@ -4959,6 +4977,131 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[1].tools.is_empty());
         assert!(requests[1].structured_output.is_some());
+    }
+
+    #[tokio::test]
+    async fn structured_finalization_does_not_consume_tool_round_budget() {
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "first".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [
+                vec![
+                    ProviderTurnEvent::ToolCallFinished { call },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::ToolCall,
+                    },
+                ],
+                vec![ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                }],
+                vec![
+                    ProviderTurnEvent::TextDelta {
+                        text: r#"{"done":true}"#.to_string(),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ],
+            ],
+            Arc::clone(&requests),
+        );
+        let mut request = AgentTurnRequest::new("model", "run tool");
+        request.tools = vec![tool_definition("first")];
+        request.max_tool_rounds = 1;
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "result".to_string(),
+            schema: serde_json::json!({ "type": "object" }),
+            strict: true,
+        });
+        request.structured_output_execution =
+            bcode_model::CapabilityExecution::ToolFreeProviderRound;
+
+        let response = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &UnifiedToolCatalog::new().with_inline_tool(tool_definition("first")),
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(1),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink::default()),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
+            )
+            .await
+            .expect("finalization should not consume the one permitted tool round");
+
+        assert_eq!(response.text, r#"{"done":true}"#);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_finalization_rejects_host_tool_calls() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [
+                vec![ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                }],
+                vec![
+                    ProviderTurnEvent::ToolCallFinished {
+                        call: ToolCall {
+                            id: "call-1".to_string(),
+                            name: "first".to_string(),
+                            arguments: serde_json::Value::Null,
+                        },
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::ToolCall,
+                    },
+                ],
+            ],
+            requests,
+        );
+        let mut request = AgentTurnRequest::new("model", "finish");
+        request.tools = vec![tool_definition("first")];
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "result".to_string(),
+            schema: serde_json::json!({ "type": "object" }),
+            strict: true,
+        });
+        request.structured_output_execution =
+            bcode_model::CapabilityExecution::ToolFreeProviderRound;
+
+        let error = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &UnifiedToolCatalog::new().with_inline_tool(tool_definition("first")),
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(0),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink::default()),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
+            )
+            .await
+            .expect_err("a finalization round must never dispatch a host tool");
+
+        assert!(
+            matches!(error, RuntimeError::HostExtension(message) if message.contains("finalization requested a host tool"))
+        );
     }
 
     #[derive(Debug, Default)]
@@ -5055,6 +5198,172 @@ mod tests {
             Some("true")
         );
         drop(requests);
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingEventSink(StdMutex<Vec<ScopedTurnEvent>>);
+
+    impl TurnEventSink for RecordingEventSink {
+        fn emit(&self, event: ScopedTurnEvent) -> bool {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+            true
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RetryFinalizationPlanner {
+        finalization_attempts: AtomicUsize,
+    }
+
+    impl ProviderRoundPlanner for RetryFinalizationPlanner {
+        fn plan_round<'a>(
+            &'a self,
+            context: ProviderRoundPlanContext<'a>,
+        ) -> RuntimeFuture<'a, ProviderRoundPlan> {
+            let is_finalization = context.proposed_request.structured_output.is_some()
+                && context.proposed_request.tools.is_empty();
+            if is_finalization {
+                self.finalization_attempts.fetch_add(1, Ordering::SeqCst);
+            }
+            Box::pin(async move {
+                if is_finalization && context.previous_failure.is_some() {
+                    assert_eq!(context.round, 1);
+                    assert_eq!(context.attempt, 1);
+                    Ok(ProviderRoundPlan::RetryAfter {
+                        request: context.proposed_request.clone(),
+                        delay: Duration::from_millis(1),
+                    })
+                } else if context.previous_failure.is_some() {
+                    Ok(ProviderRoundPlan::Fail { error: None })
+                } else {
+                    Ok(ProviderRoundPlan::Proceed {
+                        request: context.proposed_request.clone(),
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_finalization_retry_preserves_phase_request_and_aggregates_usage() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [
+                vec![
+                    ProviderTurnEvent::Usage {
+                        usage: TokenUsage {
+                            input_tokens: Some(10),
+                            output_tokens: Some(2),
+                            total_tokens: Some(12),
+                            ..TokenUsage::default()
+                        },
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ],
+                vec![ProviderTurnEvent::Error {
+                    error: ProviderError {
+                        code: "retry-finalization".to_string(),
+                        category: bcode_model::ProviderErrorCategory::Network,
+                        message: "temporary finalization failure".to_string(),
+                        retryable: true,
+                        provider_message: None,
+                        failure: None,
+                        request_id: None,
+                        diagnostic_context: Box::default(),
+                        sources: Box::default(),
+                        retry: None,
+                    },
+                }],
+                vec![
+                    ProviderTurnEvent::TextDelta {
+                        text: r#"{"done":true}"#.to_string(),
+                    },
+                    ProviderTurnEvent::Usage {
+                        usage: TokenUsage {
+                            input_tokens: Some(12),
+                            output_tokens: Some(4),
+                            total_tokens: Some(16),
+                            ..TokenUsage::default()
+                        },
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                ],
+            ],
+            Arc::clone(&requests),
+        );
+        let mut request = AgentTurnRequest::new("model", "finish");
+        request.tools = vec![tool_definition("available")];
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "result".to_string(),
+            schema: serde_json::json!({ "type": "object" }),
+            strict: true,
+        });
+        request.structured_output_execution =
+            bcode_model::CapabilityExecution::ToolFreeProviderRound;
+        let planner = RetryFinalizationPlanner::default();
+        let events = Arc::new(RecordingEventSink::default());
+
+        let response = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                request,
+                &UnifiedToolCatalog::new().with_inline_tool(tool_definition("available")),
+                &AllowBatchAuthorization::default(),
+                &ContractTestInvoker::new(0),
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                events.clone(),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &planner,
+            )
+            .await
+            .expect("finalization retry should recover");
+
+        assert_eq!(response.text, r#"{"done":true}"#);
+        assert_eq!(
+            response.usage.as_ref().and_then(|usage| usage.total_tokens),
+            Some(28)
+        );
+        assert_eq!(planner.finalization_attempts.load(Ordering::SeqCst), 2);
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 3);
+        for request in &requests[1..] {
+            assert!(request.tools.is_empty());
+            assert!(request.structured_output.is_some());
+            assert_eq!(
+                request.tool_call_policy.choice,
+                bcode_model::ToolChoice::None
+            );
+        }
+        assert_eq!(requests[1].messages, requests[2].messages);
+        drop(requests);
+        let events = events
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ScopedTurnEvent::Runtime(
+                        AgentRuntimeEvent::StructuredOutputFinalizationStarted
+                    )
+                ))
+                .count(),
+            1
+        );
     }
 
     #[derive(Debug, Default)]
@@ -7408,6 +7717,180 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("{message}"));
+    }
+
+    struct FinalizationBlockingProvider {
+        lifecycle: Arc<ProviderLifecycle>,
+        round: usize,
+    }
+
+    impl ModelProviderInvoker for FinalizationBlockingProvider {
+        fn start_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a ModelTurnRequest,
+        ) -> RuntimeFuture<'a, StartTurnResponse> {
+            self.round = self.round.saturating_add(1);
+            self.lifecycle.started.store(true, Ordering::Release);
+            let provider_turn_id = format!("finalization-round-{}", self.round);
+            Box::pin(async move { Ok(StartTurnResponse { provider_turn_id }) })
+        }
+
+        fn poll_turn_events<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a PollTurnEventsRequest,
+        ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+            self.lifecycle.polling.store(true, Ordering::Release);
+            if self.round == 1 {
+                return Box::pin(async {
+                    Ok(PollTurnEventsResponse {
+                        events: vec![
+                            ProviderTurnEvent::TextDelta {
+                                text: "work complete".to_string(),
+                            },
+                            ProviderTurnEvent::TurnFinished {
+                                stop_reason: StopReason::EndTurn,
+                            },
+                        ],
+                    })
+                });
+            }
+            Box::pin(std::future::pending())
+        }
+
+        fn cancel_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a CancelTurnRequest,
+        ) -> RuntimeFuture<'a, AckResponse> {
+            self.lifecycle.cancelled.store(true, Ordering::Release);
+            Box::pin(async { Ok(AckResponse::default()) })
+        }
+
+        fn finish_turn<'a>(
+            &'a mut self,
+            _provider_plugin_id: Option<&'a str>,
+            _request: &'a FinishTurnRequest,
+        ) -> RuntimeFuture<'a, AckResponse> {
+            self.lifecycle.finished.store(true, Ordering::Release);
+            Box::pin(async { Ok(AckResponse::default()) })
+        }
+    }
+
+    fn tool_free_finalization_request(cancellation: CancellationToken) -> AgentTurnRequest {
+        let mut request = AgentTurnRequest::new("test-model", "finish structured output");
+        request.tools.push(tool_definition("available"));
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "result".to_string(),
+            schema: serde_json::json!({ "type": "object" }),
+            strict: true,
+        });
+        request.structured_output_execution =
+            bcode_model::CapabilityExecution::ToolFreeProviderRound;
+        request.cancellation = cancellation;
+        request
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_structured_finalization_is_terminal_and_cleans_up() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let cancellation = CancellationToken::new();
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_provider_tool_loop(
+            FinalizationBlockingProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                round: 0,
+            },
+            tool_free_finalization_request(cancellation.clone()),
+            Arc::new(UnifiedToolCatalog::new().with_inline_tool(tool_definition("available"))),
+            Arc::new(AllowBatchAuthorization::default()),
+            Arc::new(FakeToolInvoker),
+            RuntimePermissionContext::default(),
+            Vec::new(),
+            ToolExecutionOptions::default(),
+            Arc::new(AcceptingEventSink),
+            InvocationCapabilities::default(),
+            Arc::new(NoopToolRoundObserver),
+            Arc::new(NoopProviderRoundPlanner),
+        );
+
+        let mut saw_transition = false;
+        while let Some(item) = stream.next().await {
+            if matches!(
+                item,
+                AgentLoopStreamItem::Event(ScopedTurnEvent::Runtime(
+                    AgentRuntimeEvent::StructuredOutputFinalizationStarted
+                ))
+            ) {
+                saw_transition = true;
+                cancellation.cancel();
+            }
+            if matches!(item, AgentLoopStreamItem::Error(RuntimeError::Cancelled)) {
+                break;
+            }
+        }
+
+        assert!(saw_transition);
+        wait_for_flag(
+            &lifecycle.cancelled,
+            "finalization should cancel provider work",
+        )
+        .await;
+        wait_for_flag(
+            &lifecycle.finished,
+            "finalization should finish provider cleanup",
+        )
+        .await;
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn structured_finalization_timeout_is_terminal_and_cleans_up() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let runtime = AgentRuntime::new();
+        let mut request = tool_free_finalization_request(CancellationToken::new());
+        request.timeout = Duration::from_millis(25);
+        let mut stream = runtime.run_streaming_provider_tool_loop(
+            FinalizationBlockingProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                round: 0,
+            },
+            request,
+            Arc::new(UnifiedToolCatalog::new().with_inline_tool(tool_definition("available"))),
+            Arc::new(AllowBatchAuthorization::default()),
+            Arc::new(FakeToolInvoker),
+            RuntimePermissionContext::default(),
+            Vec::new(),
+            ToolExecutionOptions::default(),
+            Arc::new(AcceptingEventSink),
+            InvocationCapabilities::default(),
+            Arc::new(NoopToolRoundObserver),
+            Arc::new(NoopProviderRoundPlanner),
+        );
+
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            if matches!(item, AgentLoopStreamItem::Error(_)) {
+                terminal = Some(item);
+            }
+        }
+
+        assert!(matches!(
+            terminal,
+            Some(AgentLoopStreamItem::Error(RuntimeError::Timeout { .. }))
+        ));
+        wait_for_flag(
+            &lifecycle.cancelled,
+            "timed-out finalization should cancel provider",
+        )
+        .await;
+        wait_for_flag(
+            &lifecycle.finished,
+            "timed-out finalization should finish provider",
+        )
+        .await;
+        assert_eq!(runtime.active_turn_generation(), None);
     }
 
     struct BlockingPollProvider;

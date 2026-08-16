@@ -19937,7 +19937,7 @@ async fn run_model_turn_inner(
             return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
         }
     };
-    let mut round = 0_u32;
+    let mut rounds = ModelTurnRoundState::new(turn_config.model.effective_max_tool_rounds());
     let mut structured_output_finalization = false;
     let mut next_assistant_segment_order = 0_u32;
     let mut next_output_position = 0_u64;
@@ -19971,7 +19971,7 @@ async fn run_model_turn_inner(
             session_id,
             trigger_event,
             &execution,
-            round,
+            rounds.provider_round(),
             provider_plugin_id.as_deref(),
             selection.model_id.as_deref(),
             recovery.retry_instruction,
@@ -20062,7 +20062,7 @@ async fn run_model_turn_inner(
                     session_id,
                     trigger_event,
                     &execution,
-                    round,
+                    rounds.provider_round(),
                     provider_plugin_id.as_deref(),
                     selection.model_id.as_deref(),
                     recovery.retry_instruction,
@@ -20177,7 +20177,7 @@ async fn run_model_turn_inner(
             session_id,
             &request,
             provider_plugin_id.as_deref(),
-            round,
+            rounds.provider_round(),
         )
         .await;
         let outcome = match Box::pin(run_model_turn_round(
@@ -20239,6 +20239,12 @@ async fn run_model_turn_inner(
         }
         match outcome.stop_reason {
             Some(bcode_model::StopReason::ToolCall) => {
+                if structured_output_finalization {
+                    return ModelTurnCompletion::with_message(
+                        ModelTurnOutcome::Error,
+                        "structured-output finalization requested a host tool despite tool-free execution",
+                    );
+                }
                 if outcome.pending_tool_calls.is_empty() {
                     let message = if outcome.incomplete_tool_calls.is_empty() {
                         "model stopped for tool calls without emitting a complete tool call"
@@ -20251,6 +20257,16 @@ async fn run_model_turn_inner(
                     };
                     append_system_event(state, session_id, message.clone()).await;
                     return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
+                }
+                if let Err(max) = rounds.begin_tool_round() {
+                    let message = format!(
+                        "model tool-call round limit reached ({max}); remove [model].max_tool_rounds or set max_tool_rounds = 0 for unlimited rounds"
+                    );
+                    append_system_event(state, session_id, message.clone()).await;
+                    return ModelTurnCompletion::with_message(
+                        ModelTurnOutcome::ToolRoundLimitReached,
+                        message,
+                    );
                 }
                 if !execute_model_tool_batch(
                     state,
@@ -20355,6 +20371,17 @@ async fn run_model_turn_inner(
                             });
                     }
                     structured_output_finalization = true;
+                    append_provider_event_trace(
+                        state,
+                        session_id,
+                        &request.turn_id,
+                        "structured_output_finalization_started",
+                        Some(format!(
+                            "execution=tool_free_provider_round; completed_tool_rounds={}",
+                            rounds.completed_tool_rounds()
+                        )),
+                    )
+                    .await;
                 } else {
                     return outcome
                         .assistant_output
@@ -20369,19 +20396,46 @@ async fn run_model_turn_inner(
                 return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
             }
         }
-        round = round.saturating_add(1);
-        if let Some(max) = turn_config.model.effective_max_tool_rounds()
-            && round > max
-        {
-            let message = format!(
-                "model tool-call round limit reached ({max}); remove [model].max_tool_rounds or set max_tool_rounds = 0 for unlimited rounds"
-            );
-            append_system_event(state, session_id, message.clone()).await;
-            return ModelTurnCompletion::with_message(
-                ModelTurnOutcome::ToolRoundLimitReached,
-                message,
-            );
+        rounds.complete_provider_round();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelTurnRoundState {
+    provider_round: u32,
+    completed_tool_rounds: u32,
+    max_tool_rounds: Option<u32>,
+}
+
+impl ModelTurnRoundState {
+    const fn new(max_tool_rounds: Option<u32>) -> Self {
+        Self {
+            provider_round: 0,
+            completed_tool_rounds: 0,
+            max_tool_rounds,
         }
+    }
+
+    const fn provider_round(self) -> u32 {
+        self.provider_round
+    }
+
+    const fn completed_tool_rounds(self) -> u32 {
+        self.completed_tool_rounds
+    }
+
+    const fn begin_tool_round(&mut self) -> Result<(), u32> {
+        if let Some(max) = self.max_tool_rounds
+            && self.completed_tool_rounds >= max
+        {
+            return Err(max);
+        }
+        self.completed_tool_rounds = self.completed_tool_rounds.saturating_add(1);
+        Ok(())
+    }
+
+    const fn complete_provider_round(&mut self) {
+        self.provider_round = self.provider_round.saturating_add(1);
     }
 }
 
@@ -23964,10 +24018,21 @@ fn provider_managed_context_request(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StructuredOutputPhase {
     Direct,
     Work,
     Finalization,
+}
+
+impl StructuredOutputPhase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Work => "work",
+            Self::Finalization => "finalization",
+        }
+    }
 }
 
 fn apply_structured_output_phase(
@@ -23979,6 +24044,14 @@ fn apply_structured_output_phase(
     if execution != Some(bcode_model::CapabilityExecution::ToolFreeProviderRound) {
         return;
     }
+    request.metadata.insert(
+        "bcode_structured_output_phase".to_string(),
+        phase.name().to_string(),
+    );
+    request.metadata.insert(
+        "bcode_structured_output_execution".to_string(),
+        "tool_free_provider_round".to_string(),
+    );
     match phase {
         StructuredOutputPhase::Direct => {}
         StructuredOutputPhase::Work => request.structured_output = None,
@@ -42330,6 +42403,10 @@ library = "test"
         );
         assert!(work.structured_output.is_none());
         assert_eq!(work.tools.len(), 1);
+        assert_eq!(
+            work.metadata.get("bcode_structured_output_phase"),
+            Some(&"work".to_string())
+        );
 
         let original_messages = work.messages.clone();
         apply_structured_output_phase(
@@ -42341,12 +42418,31 @@ library = "test"
         assert_eq!(work.structured_output, Some(structured_output));
         assert!(work.tools.is_empty());
         assert_eq!(work.tool_call_policy.choice, bcode_model::ToolChoice::None);
+        assert_eq!(
+            work.metadata.get("bcode_structured_output_phase"),
+            Some(&"finalization".to_string())
+        );
         assert_eq!(work.messages[..original_messages.len()], original_messages);
         assert!(matches!(
             work.messages.last().and_then(|message| message.content.first()),
             Some(ContentBlock::Text { text })
                 if text == bcode_model::STRUCTURED_OUTPUT_FINALIZATION_INSTRUCTION
         ));
+    }
+
+    #[test]
+    fn structured_output_finalization_does_not_consume_tool_round_budget() {
+        let mut rounds = ModelTurnRoundState::new(Some(1));
+
+        rounds
+            .begin_tool_round()
+            .expect("first tool round should be allowed");
+        rounds.complete_provider_round();
+        rounds.complete_provider_round();
+
+        assert_eq!(rounds.provider_round(), 2);
+        assert_eq!(rounds.completed_tool_rounds(), 1);
+        assert_eq!(rounds.begin_tool_round(), Err(1));
     }
 
     fn prompt_cache_point_count_in_messages(messages: &[ModelMessage]) -> usize {
@@ -49908,6 +50004,34 @@ library = "test"
             ToolInvocationServiceResolution::Failed { code, .. }
                 if code == "invocation_id_mismatch"
         ));
+    }
+
+    fn test_server_state_with_fake_provider_and_filesystem(
+        sessions: SessionManager,
+    ) -> ServerState {
+        let provider = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+            bcode_fake_provider_plugin::static_plugin(),
+        );
+        let filesystem = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+            bcode_filesystem_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from([
+                    "bcode.fake-provider".to_string(),
+                    "bcode.filesystem".to_string(),
+                ]),
+                disabled: BTreeSet::new(),
+            },
+            &[provider, filesystem],
+        )
+        .expect("load fake provider and filesystem plugin");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state
     }
 
     fn test_server_state_with_filesystem_plugin(sessions: SessionManager) -> ServerState {
@@ -64451,6 +64575,124 @@ event_symbol = "bcode_plugin_handle_event_v1"
             labels
                 .values()
                 .all(|value| !value.contains("portable summary"))
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_prompt_turn_executes_tool_then_finalizes_structured_output() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("workflow structured finalization".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let execution = bcode_session_models::TurnExecutionOptions {
+            tools: bcode_session_models::TurnToolPolicy::ReadOnly,
+            tool_allowlist: Some(vec!["filesystem.read".to_string()]),
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            model_id: Some("fake-echo".to_string()),
+            structured_output: Some(bcode_session_models::TurnStructuredOutputRequest {
+                name: "LoopWorkflowIteration".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["condition_met", "evidence", "implementation_prompt", "iteration", "max_iterations", "stop_condition", "summary"],
+                    "properties": {
+                        "condition_met": {"type": "boolean"},
+                        "evidence": {"type": "array", "items": {"type": "string"}},
+                        "implementation_prompt": {"type": "string"},
+                        "iteration": {"type": "integer"},
+                        "max_iterations": {"type": "integer"},
+                        "stop_condition": {"type": "string"},
+                        "summary": {"type": "string"}
+                    }
+                }),
+                strict: true,
+            }),
+            ..bcode_session_models::TurnExecutionOptions::default()
+        };
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "workflow loop implementation".to_string(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        origin: Some(bcode_session_models::TurnOrigin {
+                            producer: "bcode.workflow".to_string(),
+                            correlation_id: Some("loop-run:loop.implementation:1".to_string()),
+                            display_label: Some("loop.implementation".to_string()),
+                        }),
+                        execution,
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
+                },
+            )
+            .await
+            .expect("trigger");
+        let state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([
+                ("fake_tool_rounds".to_string(), "1".to_string()),
+                (
+                    "fake_structured_output_execution".to_string(),
+                    "tool_free_provider_round".to_string(),
+                ),
+                (
+                    "fake_structured_output_json".to_string(),
+                    serde_json::json!({
+                        "condition_met": false,
+                        "evidence": [],
+                        "implementation_prompt": "continue",
+                        "iteration": 1,
+                        "max_iterations": 20,
+                        "stop_condition": "done",
+                        "summary": "implemented"
+                    })
+                    .to_string(),
+                ),
+            ]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                selected_model_id: Some("fake-echo".to_string()),
+                provider_context,
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        assert_eq!(
+            completion.output.as_deref(),
+            Some(
+                r#"{"condition_met":false,"evidence":[],"implementation_prompt":"continue","iteration":1,"max_iterations":20,"stop_condition":"done","summary":"implemented"}"#
+            )
+        );
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ToolInvocationResultRecorded { .. }
+                ))
+                .count(),
+            1,
+            "history: {history:#?}"
         );
     }
 

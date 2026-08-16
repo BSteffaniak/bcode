@@ -78,12 +78,13 @@ pub use bcode_client::{
     BcodeClient, ClientConnection, ClientError, DaemonAvailability, SessionList,
 };
 pub use bcode_model::{
-    CapabilityScope, CapabilitySource, CapabilitySupport, ContentBlock as ModelContentBlock,
-    MediaInputFeature, MessageRole, ModelCostEstimate, ModelFeatureSupport, ModelInfo, ModelList,
-    ModelMessage, ModelMetadataSource, ModelParameterKey, ModelParameters, ModelPricingInfo,
-    ModelPricingSource, ModelPricingUnit, ModelTokenPrice, ModelTurnRequest,
-    NegotiatedFeatureSupport, PromptCacheFeature, ProviderCapabilities, ProviderError,
-    ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext, ProviderRequestExtension,
+    CapabilityExecution, CapabilityFidelity, CapabilityMechanism, CapabilityScope,
+    CapabilitySource, CapabilitySupport, ContentBlock as ModelContentBlock, MediaInputFeature,
+    MessageRole, ModelCostEstimate, ModelFeatureSupport, ModelInfo, ModelList, ModelMessage,
+    ModelMetadataSource, ModelParameterKey, ModelParameters, ModelPricingInfo, ModelPricingSource,
+    ModelPricingUnit, ModelTokenPrice, ModelTurnRequest, NegotiatedFeatureSupport,
+    PromptCacheFeature, ProviderCapabilities, ProviderError, ProviderErrorCategory,
+    ProviderErrorSource, ProviderRequestContext, ProviderRequestExtension,
     ProviderRequestProjection, ProviderRetryHint, ProviderTurnEvent, RequestedModelFeature,
     StopReason, StructuredOutputMode, TokenUsage, ToolCall, ToolChoice, ToolChoiceMode, ToolResult,
     ToolResultContent,
@@ -1007,12 +1008,14 @@ impl StreamTextBuilder {
         P: ModelProviderInvoker + 'static,
     {
         let agent = self.agent.build();
-        let request = agent.turn_request_with_structured_output_messages_and_cancellation(
-            self.prompt,
-            None,
-            self.messages,
-            self.cancellation,
-        );
+        let request = agent
+            .turn_request_with_structured_output_messages_and_cancellation(
+                self.prompt,
+                None,
+                self.messages,
+                self.cancellation,
+            )
+            .expect("text requests do not require structured-output capability admission");
         TextStream::start(&agent, provider, request)
     }
 }
@@ -1380,6 +1383,7 @@ pin_project! {
         buffer: String,
         last_partial: Option<serde_json::Value>,
         last_validated_partial: Option<serde_json::Value>,
+        accepting_structured_deltas: bool,
         pending: VecDeque<ObjectStreamItem<T>>,
     }
 }
@@ -1394,6 +1398,7 @@ where
             &mut self.buffer,
             &mut self.last_partial,
             &mut self.last_validated_partial,
+            &mut self.accepting_structured_deltas,
             &mut self.pending,
             item,
         );
@@ -1442,6 +1447,7 @@ where
                 this.buffer,
                 this.last_partial,
                 this.last_validated_partial,
+                this.accepting_structured_deltas,
                 this.pending,
                 item,
             );
@@ -1457,6 +1463,7 @@ fn accept_object_stream_item<T>(
     buffer: &mut String,
     last_partial: &mut Option<serde_json::Value>,
     last_validated_partial: &mut Option<serde_json::Value>,
+    accepting_structured_deltas: &mut bool,
     pending: &mut VecDeque<ObjectStreamItem<T>>,
     item: TextStreamItem,
 ) where
@@ -1464,6 +1471,9 @@ fn accept_object_stream_item<T>(
 {
     match item {
         TextStreamItem::Event(AgentEvent::TextDelta(delta)) => {
+            if !*accepting_structured_deltas {
+                return;
+            }
             buffer.push_str(&delta);
             pending.push_back(ObjectStreamItem::RawDelta(delta));
             if let Some(value) = json_value_from_text(buffer) {
@@ -1478,6 +1488,15 @@ fn accept_object_stream_item<T>(
                     *last_validated_partial = Some(value);
                 }
             }
+        }
+        TextStreamItem::Event(AgentEvent::StructuredOutputFinalizationStarted) => {
+            buffer.clear();
+            *last_partial = None;
+            *last_validated_partial = None;
+            *accepting_structured_deltas = true;
+            pending.push_back(ObjectStreamItem::Event(
+                AgentEvent::StructuredOutputFinalizationStarted,
+            ));
         }
         TextStreamItem::Event(event) => {
             pending.push_back(ObjectStreamItem::Event(event));
@@ -1660,6 +1679,7 @@ impl<T> StreamObjectBuilder<T> {
                 buffer: String::new(),
                 last_partial: None,
                 last_validated_partial: None,
+                accepting_structured_deltas: true,
                 pending: VecDeque::from([ObjectStreamItem::Error(
                     BcodeError::StructuredStreamingRepairsUnsupported { max_repairs },
                 )]),
@@ -1671,12 +1691,28 @@ impl<T> StreamObjectBuilder<T> {
             strict,
         };
         let agent = self.agent.build();
-        let request = agent.turn_request_with_structured_output_messages_and_cancellation(
+        let request = match agent.turn_request_with_structured_output_messages_and_cancellation(
             prompt,
             Some(structured_output),
             self.messages,
             self.cancellation,
-        );
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return ObjectStream {
+                    stream: None,
+                    schema,
+                    buffer: String::new(),
+                    last_partial: None,
+                    last_validated_partial: None,
+                    accepting_structured_deltas: true,
+                    pending: VecDeque::from([ObjectStreamItem::Error(error)]),
+                };
+            }
+        };
+        let accepting_structured_deltas = request.structured_output_execution
+            != bcode_model::CapabilityExecution::ToolFreeProviderRound
+            || request.tools.is_empty();
         let stream = TextStream::start(&agent, provider, request);
         ObjectStream {
             stream: Some(stream),
@@ -1684,6 +1720,7 @@ impl<T> StreamObjectBuilder<T> {
             buffer: String::new(),
             last_partial: None,
             last_validated_partial: None,
+            accepting_structured_deltas,
             pending: VecDeque::new(),
         }
     }
@@ -4446,12 +4483,21 @@ impl Bcode {
         };
         if let Some(report) = self.provider_registry.default_selection_report() {
             let selector = report.selector.clone();
-            let structured_output_execution = self
-                .provider_registry
-                .structured_output_execution(&selector, true);
+            let structured_output_support = self.provider_registry.feature_support(
+                &selector,
+                RequestedModelFeature::StructuredOutput(StructuredOutputMode::StrictJsonSchema),
+            );
+            let structured_output_execution = match &structured_output_support {
+                NegotiatedFeatureSupport::Guaranteed { execution, .. } => *execution,
+                NegotiatedFeatureSupport::Unsupported { .. }
+                | NegotiatedFeatureSupport::Unknown { .. } => {
+                    bcode_model::CapabilityExecution::Direct
+                }
+            };
             builder
                 .provider_context(self.provider_context.clone())
                 .selection_report(report)
+                .structured_output_support(structured_output_support)
                 .structured_output_execution(structured_output_execution)
                 .parallel_tool_capabilities(
                     self.provider_registry.parallel_tool_capabilities(&selector),
@@ -5062,6 +5108,8 @@ pub enum FrontendEvent {
         /// Provider-neutral output payload.
         event: bcode_model::ProviderOutputEvent,
     },
+    /// Final structured-output deltas are beginning after any tool/work rounds.
+    StructuredOutputFinalizationStarted,
     /// Visible assistant text delta from a legacy v1 provider.
     TextDelta(String),
     /// Ordered assistant text stream operation.
@@ -5165,6 +5213,9 @@ impl FrontendEvent {
                 position: *position,
                 event: event.clone(),
             }),
+            AgentEvent::StructuredOutputFinalizationStarted => {
+                Some(Self::StructuredOutputFinalizationStarted)
+            }
             AgentEvent::TextDelta(text) => Some(Self::TextDelta(text.clone())),
             AgentEvent::ReasoningDelta(text) => Some(Self::ReasoningDelta(text.clone())),
             AgentEvent::ReasoningActivity(event) => Some(Self::ReasoningActivity(event.clone())),
@@ -5406,6 +5457,7 @@ impl FrontendTurnSnapshot {
     fn apply(&mut self, event: &FrontendEvent) {
         match event {
             FrontendEvent::TurnStarted
+            | FrontendEvent::StructuredOutputFinalizationStarted
             | FrontendEvent::ToolCallStarted { .. }
             | FrontendEvent::ToolCallDelta { .. }
             | FrontendEvent::RetryScheduled { .. }
@@ -6516,6 +6568,7 @@ pub struct Agent {
     model_metadata_source: Option<ModelMetadataSource>,
     model_pricing: Option<ModelPricingInfo>,
     structured_output_execution: bcode_model::CapabilityExecution,
+    structured_output_support: Option<NegotiatedFeatureSupport>,
     provider_context: ProviderRequestContext,
     system_prompt: Option<String>,
     parameters: ModelParameters,
@@ -6570,6 +6623,7 @@ impl fmt::Debug for Agent {
                 "structured_output_execution",
                 &self.structured_output_execution,
             )
+            .field("structured_output_support", &self.structured_output_support)
             .field("provider_context", &self.provider_context)
             .field("system_prompt", &self.system_prompt)
             .field("parameters", &self.parameters)
@@ -6973,7 +7027,7 @@ impl Agent {
                     structured_output,
                     messages,
                     cancellation,
-                ),
+                )?,
             )?;
             let cache = self.response_cache.as_ref().and_then(|cache| {
                 let privacy_allows = cache.privacy(&request) != ModelResponseCachePrivacy::NoStore;
@@ -7077,7 +7131,8 @@ impl Agent {
                 None,
                 Vec::new(),
                 CancellationToken::new(),
-            ),
+            )
+            .expect("text requests do not require structured-output capability admission"),
         ))
     }
 
@@ -7101,7 +7156,8 @@ impl Agent {
                 None,
                 Vec::new(),
                 CancellationToken::new(),
-            ),
+            )
+            .expect("text requests do not require structured-output capability admission"),
         ))
     }
 
@@ -7638,12 +7694,20 @@ impl Agent {
         structured_output: Option<bcode_model::StructuredOutputRequest>,
         messages: Vec<ModelMessage>,
         cancellation: CancellationToken,
-    ) -> AgentTurnRequest {
+    ) -> Result<AgentTurnRequest> {
+        if structured_output.is_some()
+            && let Some(support) = &self.structured_output_support
+            && !support.is_guaranteed()
+        {
+            return Err(BcodeError::StructuredOutput(format!(
+                "selected provider/model cannot guarantee requested structured output: {support:?}"
+            )));
+        }
         let mut request = self.turn_request_with_cancellation(prompt, cancellation);
         request.structured_output = structured_output;
         request.structured_output_execution = self.structured_output_execution;
         request.messages = messages;
-        request
+        Ok(request)
     }
 
     fn turn_request_with_cancellation(
@@ -7798,6 +7862,7 @@ pub struct AgentBuilder {
     model_metadata_source: Option<ModelMetadataSource>,
     model_pricing: Option<ModelPricingInfo>,
     structured_output_execution: bcode_model::CapabilityExecution,
+    structured_output_support: Option<NegotiatedFeatureSupport>,
     provider_context: ProviderRequestContext,
     system_prompt: Option<String>,
     parameters: ModelParameters,
@@ -7855,6 +7920,7 @@ impl fmt::Debug for AgentBuilder {
                 "structured_output_execution",
                 &self.structured_output_execution,
             )
+            .field("structured_output_support", &self.structured_output_support)
             .field("provider_context", &self.provider_context)
             .field("system_prompt", &self.system_prompt)
             .field("parameters", &self.parameters)
@@ -7931,6 +7997,7 @@ impl Default for AgentBuilder {
             model_metadata_source: None,
             model_pricing: None,
             structured_output_execution: bcode_model::CapabilityExecution::Direct,
+            structured_output_support: None,
             provider_context: ProviderRequestContext::default(),
             system_prompt: None,
             parameters: ModelParameters::default(),
@@ -8027,6 +8094,7 @@ impl AgentBuilder {
         self.model_metadata_source = None;
         self.model_pricing = None;
         self.structured_output_execution = bcode_model::CapabilityExecution::Direct;
+        self.structured_output_support = None;
         self.parallel_tool_capabilities.model = Some(false);
         self
     }
@@ -8051,6 +8119,7 @@ impl AgentBuilder {
         self.model_metadata_source = None;
         self.model_pricing = None;
         self.structured_output_execution = bcode_model::CapabilityExecution::Direct;
+        self.structured_output_support = None;
         if self.provider_plugin_id.is_some() {
             self.selection_provenance.provider = Some(ModelSelectionSource::PerRequest);
         }
@@ -8069,6 +8138,7 @@ impl AgentBuilder {
         self.model_metadata_source = None;
         self.model_pricing = None;
         self.structured_output_execution = bcode_model::CapabilityExecution::Direct;
+        self.structured_output_support = None;
         self.parallel_tool_capabilities.provider = None;
         self.parallel_tool_capabilities.model = None;
         self
@@ -8090,6 +8160,14 @@ impl AgentBuilder {
         self.registration_source = report.registration_source;
         self.model_metadata_source = report.model_metadata_source;
         self.model_pricing = report.model_pricing;
+        self.structured_output_support = None;
+        self
+    }
+
+    /// Configure the selected provider/model's negotiated structured-output support.
+    #[must_use]
+    pub fn structured_output_support(mut self, support: NegotiatedFeatureSupport) -> Self {
+        self.structured_output_support = Some(support);
         self
     }
 
@@ -8753,6 +8831,7 @@ impl AgentBuilder {
             model_metadata_source: self.model_metadata_source,
             model_pricing: self.model_pricing,
             structured_output_execution: self.structured_output_execution,
+            structured_output_support: self.structured_output_support,
             provider_context: self.provider_context,
             system_prompt: self.system_prompt,
             parameters: self.parameters,
@@ -8963,6 +9042,9 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
                     ProviderOutputEvent::ToolCallStarted { .. }
                     | ProviderOutputEvent::ToolCallDelta { .. } => {}
                 }
+            }
+            AgentEvent::StructuredOutputFinalizationStarted => {
+                flush_generation_model(&mut steps, &mut model);
             }
             AgentEvent::TextDelta(delta) => {
                 model.started = true;

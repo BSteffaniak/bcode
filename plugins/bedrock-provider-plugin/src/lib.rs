@@ -1379,6 +1379,26 @@ async fn stream_bedrock_messages_turn(
     }))
 }
 
+fn bedrock_messages_structured_fallback_request(
+    request: &ModelTurnRequest,
+) -> Result<(ModelTurnRequest, SyntheticStructuredOutput), ProviderError> {
+    let structured = request.structured_output.as_ref().ok_or_else(|| {
+        provider_error(
+            "structured_output_fallback_missing_schema",
+            ProviderErrorCategory::InvalidRequest,
+            "structured-output fallback requires a schema",
+        )
+    })?;
+    let synthetic = SyntheticStructuredOutput::new(structured, !request.tools.is_empty())?;
+    let mut fallback = request.clone();
+    fallback.structured_output = None;
+    fallback.tools = vec![synthetic.tool()];
+    fallback.tool_schema_mode = None;
+    fallback.tool_call_policy.choice = ToolChoice::Required;
+    fallback.tool_call_policy.parallel = Some(false);
+    Ok((fallback, synthetic))
+}
+
 async fn stream_bedrock_messages_model(
     request: &ModelTurnRequest,
     client: &Client,
@@ -1394,17 +1414,7 @@ async fn stream_bedrock_messages_model(
             if request.structured_output.is_some()
                 && bedrock_messages_native_structured_output_rejected(&error) =>
         {
-            let structured = request
-                .structured_output
-                .as_ref()
-                .expect("checked structured output");
-            let synthetic = SyntheticStructuredOutput::new(structured, !request.tools.is_empty())?;
-            let mut fallback = request.clone();
-            fallback.structured_output = None;
-            fallback.tools.push(synthetic.tool());
-            fallback.tool_schema_mode = None;
-            fallback.tool_call_policy.choice = ToolChoice::Required;
-            fallback.tool_call_policy.parallel = Some(false);
+            let (fallback, synthetic) = bedrock_messages_structured_fallback_request(request)?;
             turn.push(ProviderTurnEvent::Warning {
                 message: "Bedrock model rejected native structured output; retrying with adapter-mediated schema enforcement"
                     .to_string(),
@@ -5895,16 +5905,19 @@ mod tests {
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         };
-        let synthetic = SyntheticStructuredOutput::new(&structured, false)
-            .expect("tool-free synthetic output should be supported");
         let mut request = test_model_turn_request();
-        request.structured_output = None;
-        request.tools.push(synthetic.tool());
-        request.tool_schema_mode = None;
-        request.tool_call_policy.choice = ToolChoice::Required;
-        request.tool_call_policy.parallel = Some(false);
+        request.structured_output = Some(structured);
+        request.tool_schema_mode = Some(bcode_model::ToolSchemaMode::Strict);
+        request.tool_call_policy.parallel = Some(true);
+        let (request, _synthetic) = bedrock_messages_structured_fallback_request(&request)
+            .expect("tool-free fallback request should build");
         let body = build_anthropic_messages_request_value(&request)
             .expect("fallback Messages request should build");
+        assert_eq!(request.tools.len(), 1);
+        assert!(request.structured_output.is_none());
+        assert_eq!(request.tool_schema_mode, None);
+        assert_eq!(request.tool_call_policy.parallel, Some(false));
+        assert_eq!(request.tool_call_policy.choice, ToolChoice::Required);
         assert!(
             body["tools"]
                 .as_array()
@@ -5919,6 +5932,28 @@ mod tests {
         );
         assert_eq!(body["tool_choice"]["type"], "any");
         assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn anthropic_messages_adapter_fallback_rejects_host_tools() {
+        let mut request = test_model_turn_request();
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        request.tools.push(bcode_model::ToolDefinition {
+            name: "real_tool".to_string(),
+            description: "host tool".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
+
+        let error = bedrock_messages_structured_fallback_request(&request)
+            .expect_err("fallback must reject mixed host and synthetic tools");
+        assert_eq!(
+            error.code,
+            "structured_output_emulation_requires_tool_free_round"
+        );
     }
 
     #[test]
@@ -5943,6 +5978,30 @@ mod tests {
                 .into_boxed_str(),
         );
         assert!(!bedrock_messages_native_structured_output_rejected(&error));
+    }
+
+    #[test]
+    fn structured_finalization_failure_diagnostics_are_secret_safe() {
+        let secret = "secret-finalization-token";
+        let upstream = format!(
+            "Bedrock finalization failed: authorization: Bearer {secret}; aws_secret_access_key={secret}"
+        );
+        let sanitized = sanitize_provider_diagnostic(&upstream);
+        let mut error = provider_error(
+            "bedrock_messages_request_failed",
+            ProviderErrorCategory::InvalidRequest,
+            &sanitized,
+        );
+        error.provider_message = Some(sanitized.clone().into_boxed_str());
+        error.sources.push(ProviderErrorSource {
+            source: "aws_bedrock_messages".to_string(),
+            code: Some("ValidationException".to_string()),
+            message: Some(sanitized),
+        });
+
+        let public = serde_json::to_string(&error).expect("provider error should serialize");
+        assert!(!public.contains(secret));
+        assert!(public.contains("[REDACTED]"));
     }
 
     #[test]

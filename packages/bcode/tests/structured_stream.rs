@@ -1,6 +1,7 @@
 use bcode::{
-    BcodeError, ModelProviderInvoker, ObjectStreamItem, RuntimeFuture, StopReason,
-    StructuredOutputOptions, stream_object_builder,
+    AgentEvent, BcodeError, ModelProviderInvoker, ObjectStreamItem, RuntimeFuture, StopReason,
+    StructuredOutputOptions, ToolCall, ToolDefinition, ToolInvocationResponse,
+    stream_object_builder,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -33,6 +34,26 @@ struct Output {
 struct ScriptedProvider {
     events: VecDeque<ProviderTurnEvent>,
     starts: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct MultiRoundStructuredProvider {
+    rounds: VecDeque<VecDeque<ProviderTurnEvent>>,
+    active: VecDeque<ProviderTurnEvent>,
+    starts: Arc<AtomicUsize>,
+}
+
+impl MultiRoundStructuredProvider {
+    fn new(
+        rounds: impl IntoIterator<Item = Vec<ProviderTurnEvent>>,
+        starts: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            rounds: rounds.into_iter().map(VecDeque::from).collect(),
+            active: VecDeque::new(),
+            starts,
+        }
+    }
 }
 
 impl ScriptedProvider {
@@ -88,6 +109,139 @@ impl ModelProviderInvoker for ScriptedProvider {
     ) -> RuntimeFuture<'a, AckResponse> {
         Box::pin(async { Ok(AckResponse::default()) })
     }
+}
+
+impl ModelProviderInvoker for MultiRoundStructuredProvider {
+    fn start_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a ModelTurnRequest,
+    ) -> RuntimeFuture<'a, StartTurnResponse> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.active = self.rounds.pop_front().expect("configured provider round");
+        Box::pin(async {
+            Ok(StartTurnResponse {
+                provider_turn_id: "structured-multi-round".to_string(),
+            })
+        })
+    }
+
+    fn poll_turn_events<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a PollTurnEventsRequest,
+    ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+        let events = self.active.drain(..).collect();
+        Box::pin(async move { Ok(PollTurnEventsResponse { events }) })
+    }
+
+    fn cancel_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a CancelTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        Box::pin(async { Ok(AckResponse::default()) })
+    }
+
+    fn finish_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a FinishTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        Box::pin(async { Ok(AckResponse::default()) })
+    }
+}
+
+fn tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "lookup".to_string(),
+        description: "look up data".to_string(),
+        input_schema: serde_json::json!({ "type": "object" }),
+    }
+}
+
+fn tool_response() -> ToolInvocationResponse {
+    ToolInvocationResponse {
+        output: "found".to_string(),
+        is_error: false,
+        content: Vec::new(),
+        full_output: None,
+        result: None,
+    }
+}
+
+#[tokio::test]
+async fn tool_free_finalization_stream_exposes_only_final_structured_deltas() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let provider = MultiRoundStructuredProvider::new(
+        [
+            vec![
+                ProviderTurnEvent::ToolCallFinished {
+                    call: ToolCall {
+                        id: "call-1".to_string(),
+                        name: "lookup".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::ToolCall,
+                },
+            ],
+            vec![
+                ProviderTurnEvent::TextDelta {
+                    text: "work phase prose".to_string(),
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderTurnEvent::TextDelta {
+                    text: r#"{"name":"Alice","count":2}"#.to_string(),
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ],
+        ],
+        Arc::clone(&starts),
+    );
+    let mut stream = stream_object_builder::<Output>()
+        .configure_agent(|agent| {
+            agent
+                .structured_output_execution(
+                    bcode_model::CapabilityExecution::ToolFreeProviderRound,
+                )
+                .inline_tool(tool_definition(), |_| Ok(tool_response()))
+        })
+        .prompt("produce output")
+        .run(provider);
+    let mut raw = Vec::new();
+    let mut saw_finalization = false;
+    let mut finished = None;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            ObjectStreamItem::RawDelta(delta) => raw.push(delta),
+            ObjectStreamItem::Event(AgentEvent::StructuredOutputFinalizationStarted) => {
+                saw_finalization = true;
+            }
+            ObjectStreamItem::Finished { object, .. } => finished = Some(object),
+            ObjectStreamItem::Error(error) => panic!("stream failed: {error}"),
+            _ => {}
+        }
+    }
+
+    assert!(saw_finalization);
+    assert_eq!(raw, [r#"{"name":"Alice","count":2}"#]);
+    assert_eq!(
+        finished,
+        Some(Output {
+            name: "Alice".to_string(),
+            count: 2,
+        })
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
