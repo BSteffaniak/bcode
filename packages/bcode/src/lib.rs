@@ -7028,7 +7028,8 @@ impl Agent {
             )?;
             let cache = self.response_cache.as_ref().and_then(|cache| {
                 let privacy_allows = cache.privacy(&request) != ModelResponseCachePrivacy::NoStore;
-                let tools_allow = request.tools.is_empty() || cache.allow_tool_responses();
+                let tools_allow = request.tools.is_empty()
+                    || (request.structured_output.is_none() && cache.allow_tool_responses());
                 let routing_identified = request.cache_routing_identity.is_some();
                 let stopping_identified = request.stop_condition.is_none();
                 (privacy_allows && tools_allow && routing_identified && stopping_identified)

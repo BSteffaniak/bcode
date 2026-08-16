@@ -661,6 +661,145 @@ impl ModelProviderInvoker for ToolLoopProvider {
     }
 }
 
+#[derive(Debug)]
+struct StructuredToolLoopProvider {
+    starts: Arc<AtomicUsize>,
+    events: Vec<ProviderTurnEvent>,
+}
+
+impl StructuredToolLoopProvider {
+    fn new(starts: Arc<AtomicUsize>) -> Self {
+        Self {
+            starts,
+            events: Vec::new(),
+        }
+    }
+}
+
+impl ModelProviderInvoker for StructuredToolLoopProvider {
+    fn start_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        request: &'a ModelTurnRequest,
+    ) -> RuntimeFuture<'a, StartTurnResponse> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.events = if request.structured_output.is_some() {
+            vec![
+                ProviderTurnEvent::TextDelta {
+                    text: r#"{"value":"final"}"#.to_string(),
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ]
+        } else if request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, bcode::ModelContentBlock::ToolResult { .. }))
+        }) {
+            vec![ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            }]
+        } else {
+            vec![
+                ProviderTurnEvent::ToolCallFinished {
+                    call: ToolCall {
+                        id: "structured-cache-call".to_string(),
+                        name: "cached_tool".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::ToolCall,
+                },
+            ]
+        };
+        Box::pin(async {
+            Ok(StartTurnResponse {
+                provider_turn_id: "structured-cache-turn".to_string(),
+            })
+        })
+    }
+
+    fn poll_turn_events<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a PollTurnEventsRequest,
+    ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+        Box::pin(async move {
+            Ok(PollTurnEventsResponse {
+                events: std::mem::take(&mut self.events),
+            })
+        })
+    }
+
+    fn cancel_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a CancelTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        Box::pin(async { Ok(AckResponse::default()) })
+    }
+
+    fn finish_turn<'a>(
+        &'a mut self,
+        _provider_plugin_id: Option<&'a str>,
+        _request: &'a FinishTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        Box::pin(async { Ok(AckResponse::default()) })
+    }
+}
+
+#[tokio::test]
+async fn structured_tool_work_is_never_bypassed_or_replayed_by_response_cache() {
+    let cache = Arc::new(
+        InMemoryModelResponseCache::new(
+            Duration::from_secs(60),
+            NonZeroUsize::new(4).expect("four is non-zero"),
+        )
+        .with_tool_responses(true),
+    );
+    let starts = Arc::new(AtomicUsize::new(0));
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let invocation_count = invocations.clone();
+    let agent = Agent::builder()
+        .structured_output_execution(bcode::CapabilityExecution::ToolFreeProviderRound)
+        .response_cache(cache)
+        .inline_tool(tool_definition(), move |_| {
+            invocation_count.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolInvocationResponse {
+                output: "tool output".to_string(),
+                is_error: false,
+                content: Vec::new(),
+                full_output: None,
+                result: None,
+            })
+        })
+        .metadata("tool-version", "structured-cache-v1")
+        .build();
+    let mut provider = StructuredToolLoopProvider::new(starts.clone());
+    let options = bcode::StructuredOutputOptions::json_schema(
+        "CachedObject",
+        serde_json::json!({
+            "type": "object",
+            "required": ["value"],
+            "properties": { "value": {"type": "string"} }
+        }),
+    );
+
+    for _ in 0..2 {
+        let object: CachedObject = agent
+            .generate_object_with_provider_and_options(&mut provider, "use tool", options.clone())
+            .await
+            .expect("structured tool request");
+        assert_eq!(object.value, "final");
+    }
+
+    assert_eq!(starts.load(Ordering::SeqCst), 6);
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn explicit_safe_tool_cache_preserves_complete_steps_without_reexecution() {
     let cache = Arc::new(
