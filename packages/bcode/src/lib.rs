@@ -1008,14 +1008,11 @@ impl StreamTextBuilder {
         P: ModelProviderInvoker + 'static,
     {
         let agent = self.agent.build();
-        let request = agent
-            .turn_request_with_structured_output_messages_and_cancellation(
-                self.prompt,
-                None,
-                self.messages,
-                self.cancellation,
-            )
-            .expect("text requests do not require structured-output capability admission");
+        let request = agent.turn_request_with_messages_and_cancellation(
+            self.prompt,
+            self.messages,
+            self.cancellation,
+        );
         TextStream::start(&agent, provider, request)
     }
 }
@@ -7126,13 +7123,11 @@ impl Agent {
         Ok(TextStream::start(
             self,
             provider,
-            self.turn_request_with_structured_output_messages_and_cancellation(
+            self.turn_request_with_messages_and_cancellation(
                 prompt.into(),
-                None,
                 Vec::new(),
                 CancellationToken::new(),
-            )
-            .expect("text requests do not require structured-output capability admission"),
+            ),
         ))
     }
 
@@ -7151,13 +7146,11 @@ impl Agent {
         Ok(TextStream::start(
             self,
             provider,
-            self.turn_request_with_structured_output_messages_and_cancellation(
+            self.turn_request_with_messages_and_cancellation(
                 prompt.into(),
-                None,
                 Vec::new(),
                 CancellationToken::new(),
-            )
-            .expect("text requests do not require structured-output capability admission"),
+            ),
         ))
     }
 
@@ -7686,6 +7679,17 @@ impl Agent {
             model_id: self.model_id.clone(),
             prompt,
         }
+    }
+
+    fn turn_request_with_messages_and_cancellation(
+        &self,
+        prompt: String,
+        messages: Vec<ModelMessage>,
+        cancellation: CancellationToken,
+    ) -> AgentTurnRequest {
+        let mut request = self.turn_request_with_cancellation(prompt, cancellation);
+        request.messages = messages;
+        request
     }
 
     fn turn_request_with_structured_output_messages_and_cancellation(

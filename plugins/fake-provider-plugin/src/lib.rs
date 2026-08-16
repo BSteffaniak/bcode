@@ -223,6 +223,19 @@ impl RustPlugin for FakeProviderPlugin {
     }
 }
 
+fn configured_structured_output_execution(
+    settings: &BTreeMap<String, String>,
+) -> bcode_model::CapabilityExecution {
+    if settings
+        .get("fake_structured_output_execution")
+        .is_some_and(|value| value == "tool_free_provider_round")
+    {
+        bcode_model::CapabilityExecution::ToolFreeProviderRound
+    } else {
+        bcode_model::CapabilityExecution::Direct
+    }
+}
+
 impl FakeProviderPlugin {
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if !matches!(
@@ -304,13 +317,8 @@ impl FakeProviderPlugin {
             .settings
             .get("fake_reasoning_subset")
             .is_some_and(|value| value == "true");
-        let structured_output_execution = request
-            .provider_context
-            .settings
-            .get("fake_structured_output_execution")
-            .is_some_and(|value| value == "tool_free_provider_round")
-            .then_some(bcode_model::CapabilityExecution::ToolFreeProviderRound)
-            .unwrap_or_default();
+        let structured_output_execution =
+            configured_structured_output_execution(&request.provider_context.settings);
         json_response(&models(
             has_context_window,
             subset_reasoning,
@@ -360,13 +368,7 @@ impl FakeProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        let execution = request
-            .provider_context
-            .settings
-            .get("fake_structured_output_execution")
-            .is_some_and(|value| value == "tool_free_provider_round")
-            .then_some(bcode_model::CapabilityExecution::ToolFreeProviderRound)
-            .unwrap_or_default();
+        let execution = configured_structured_output_execution(&request.provider_context.settings);
         json_response(&capabilities(execution))
     }
 
@@ -1728,6 +1730,7 @@ fn fake_feature_support() -> bcode_model::ModelFeatureSupport {
     fake_feature_support_for_execution(bcode_model::CapabilityExecution::Direct)
 }
 
+#[allow(clippy::too_many_lines)]
 fn fake_feature_support_for_execution(
     structured_output_execution: bcode_model::CapabilityExecution,
 ) -> bcode_model::ModelFeatureSupport {

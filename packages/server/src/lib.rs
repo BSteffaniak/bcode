@@ -64579,6 +64579,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn workflow_prompt_turn_executes_tool_then_finalizes_structured_output() {
         let sessions = SessionManager::default();
         let session_id = sessions
@@ -64590,7 +64591,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session")
             .id;
         let execution = bcode_session_models::TurnExecutionOptions {
-            tools: bcode_session_models::TurnToolPolicy::ReadOnly,
+            tools: bcode_session_models::TurnToolPolicy::Enabled,
             tool_allowlist: Some(vec!["filesystem.read".to_string()]),
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             model_id: Some("fake-echo".to_string()),

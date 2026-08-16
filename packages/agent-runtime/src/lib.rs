@@ -4909,6 +4909,7 @@ mod tests {
                 |content| matches!(content, ContentBlock::Text { text } if text == "work complete"),
             )
         }));
+        drop(requests);
     }
 
     #[tokio::test]
@@ -4977,6 +4978,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[1].tools.is_empty());
         assert!(requests[1].structured_output.is_some());
+        drop(requests);
     }
 
     #[tokio::test]
@@ -5248,6 +5250,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn structured_finalization_retry_preserves_phase_request_and_aggregates_usage() {
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let mut provider = MultiRoundProvider::new(
@@ -5364,6 +5367,7 @@ mod tests {
                 .count(),
             1
         );
+        drop(events);
     }
 
     #[derive(Debug, Default)]
