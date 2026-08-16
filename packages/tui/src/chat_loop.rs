@@ -133,6 +133,7 @@ struct RootPluginSurface {
     surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
     invalidation: bmux_tui_runtime::InvalidationSignal,
     pending_session_navigation: Option<bcode_session_models::SessionId>,
+    workflow_view_requests: Option<tokio::sync::mpsc::Sender<WorkflowViewRequest>>,
 }
 
 struct RootModelPicker {
@@ -219,7 +220,7 @@ pub struct ChatLoopState {
     streaming_configurator: Option<super::streaming_configurator::StreamingConfiguratorState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     plugin_surface: Option<RootPluginSurface>,
-    workflow_view_requests: Option<tokio::sync::mpsc::Sender<WorkflowViewRequest>>,
+    parent_plugin_surface: Option<RootPluginSurface>,
     provider_picker: Option<super::provider_picker::ProviderPickerApp>,
     model_picker: Option<RootModelPicker>,
     auth_pool_picker: Option<super::auth_pool_picker::AuthPoolPickerApp>,
@@ -270,7 +271,7 @@ impl ChatLoopState {
             streaming_configurator: None,
             timeline_dialog: None,
             plugin_surface: None,
-            workflow_view_requests: None,
+            parent_plugin_surface: None,
             provider_picker: None,
             model_picker: None,
             auth_pool_picker: None,
@@ -893,6 +894,9 @@ impl ChatLoopState {
         plugin_id: impl Into<String>,
         surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
     ) {
+        if let Some(active) = self.plugin_surface.take() {
+            self.parent_plugin_surface = Some(active);
+        }
         let invalidation = bmux_tui_runtime::InvalidationSignal::new();
         invalidation.request();
         self.plugin_surface = Some(RootPluginSurface {
@@ -900,6 +904,7 @@ impl ChatLoopState {
             surface,
             invalidation,
             pending_session_navigation: None,
+            workflow_view_requests: None,
         });
     }
 
@@ -993,14 +998,22 @@ impl ChatLoopState {
         updates: bcode_plugin_sdk::tui::PluginTuiSurfaceUpdateReceiver,
         workflow_view_requests: tokio::sync::mpsc::Sender<WorkflowViewRequest>,
     ) {
-        self.workflow_view_requests = Some(workflow_view_requests);
         if let Some(surface) = self.plugin_surface.as_mut() {
             surface.surface.attach_updates(updates);
+            surface.workflow_view_requests = Some(workflow_view_requests);
         }
     }
 
+    fn root_workflow_view_requests(
+        &self,
+    ) -> Option<&tokio::sync::mpsc::Sender<WorkflowViewRequest>> {
+        self.plugin_surface
+            .as_ref()
+            .and_then(|surface| surface.workflow_view_requests.as_ref())
+    }
+
     pub fn request_root_workflow_run(&self, run_id: String) {
-        if let Some(requests) = &self.workflow_view_requests {
+        if let Some(requests) = self.root_workflow_view_requests() {
             let _ = requests.try_send(WorkflowViewRequest::SelectRun(run_id));
         }
     }
@@ -1012,7 +1025,7 @@ impl ChatLoopState {
         group: bcode_workflow_view_models::WorkflowCatalogGroup,
         search: Option<String>,
     ) {
-        if let Some(requests) = &self.workflow_view_requests {
+        if let Some(requests) = self.root_workflow_view_requests() {
             let _ = requests.try_send(WorkflowViewRequest::UpdateQuery {
                 filter,
                 sort,
@@ -1026,7 +1039,7 @@ impl ChatLoopState {
         &self,
         cursor: bcode_workflow_view_models::WorkflowCatalogCursor,
     ) {
-        if let Some(requests) = &self.workflow_view_requests {
+        if let Some(requests) = self.root_workflow_view_requests() {
             let _ = requests.try_send(WorkflowViewRequest::LoadMore(cursor));
         }
     }
@@ -1036,13 +1049,20 @@ impl ChatLoopState {
         outcome: Option<serde_json::Value>,
     ) -> Option<(String, Option<serde_json::Value>)> {
         let surface = self.plugin_surface.take()?;
-        self.workflow_view_requests = None;
+        self.restore_suspended_root_plugin_surface();
         Some((surface.plugin_id, outcome))
     }
 
     pub fn close_root_plugin_surface(&mut self) {
         self.plugin_surface = None;
-        self.workflow_view_requests = None;
+        self.restore_suspended_root_plugin_surface();
+    }
+
+    fn restore_suspended_root_plugin_surface(&mut self) {
+        self.plugin_surface = self.parent_plugin_surface.take();
+        if let Some(surface) = self.plugin_surface.as_ref() {
+            surface.invalidation.request();
+        }
     }
 
     pub const fn has_model_picker(&self) -> bool {

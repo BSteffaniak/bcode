@@ -23,6 +23,7 @@ bcode_workflow = { workspace = true }
 bcode_workflow_store = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
 bmux_keyboard = { workspace = true }
+bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true }
 bmux_tui_components = { workspace = true, features = [
     "action-row",
@@ -30,6 +31,7 @@ bmux_tui_components = { workspace = true, features = [
     "pane",
     "table",
     "tab-bar",
+    "text-input-box",
     "text-view",
 ] }
 clap = { workspace = true, features = ["derive", "std"] }

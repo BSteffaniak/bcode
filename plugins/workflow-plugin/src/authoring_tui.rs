@@ -112,6 +112,8 @@ struct PendingConflict {
 enum AuthoringOperation {
     CatalogLoad,
     DraftLoad,
+    Fork,
+    Forking,
     BaseLoad,
     Edit,
     Publish,
@@ -129,6 +131,7 @@ enum AuthoringOperation {
 #[derive(Debug)]
 enum AuthoringAsyncResult {
     Draft(Result<Option<Box<PluginWorkflowAuthoringDraft>>, String>),
+    Fork(Result<Box<PluginWorkflowAuthoringDraft>, String>),
     BaseRevision(Result<Option<Box<PluginWorkflowAuthoringRevision>>, String>),
     Edit(Result<PluginWorkflowAuthoringEditResult, String>),
     Instantiate(Result<Box<PluginWorkflowAuthoringDraft>, String>),
@@ -233,6 +236,7 @@ struct WorkflowAuthorSurface {
     last_area: Rect,
     workflow_id: Option<String>,
     draft_id: Option<String>,
+    fork_revision: Option<u64>,
     base_revision: Option<u64>,
     base_document: Option<WorkflowAuthoringDocument>,
     generation: Option<u64>,
@@ -279,6 +283,9 @@ impl WorkflowAuthorSurface {
         let base_revision = draft
             .and_then(|draft| draft.get("base_revision"))
             .and_then(serde_json::Value::as_u64);
+        let fork_revision = options
+            .get("fork_revision")
+            .and_then(serde_json::Value::as_u64);
         let parent_session_id = options
             .get("session_id")
             .and_then(serde_json::Value::as_str)
@@ -321,6 +328,7 @@ impl WorkflowAuthorSurface {
             last_area: Rect::new(0, 0, 0, 0),
             workflow_id,
             draft_id,
+            fork_revision,
             base_revision,
             base_document: None,
             generation,
@@ -1582,7 +1590,34 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 let _ = sender.send(result);
             }));
         }
+        if !self.operations.contains(&AuthoringOperation::Fork)
+            && !self.operations.contains(&AuthoringOperation::Forking)
+            && self.generation.is_none()
+            && let (Some(workflow_id), Some(draft_id), Some(revision)) = (
+                self.workflow_id.clone(),
+                self.draft_id.clone(),
+                self.fork_revision,
+            )
+        {
+            self.operations.insert(AuthoringOperation::Forking);
+            self.status = format!("Forking immutable revision {revision} into draft {draft_id}…");
+            let future = host.fork_workflow_authoring_revision(
+                workflow_id,
+                revision,
+                draft_id,
+                editor_producer(),
+            );
+            let sender = self.authoring_sender.clone();
+            host.spawn(Box::pin(async move {
+                let result = future
+                    .await
+                    .map(Box::new)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(AuthoringAsyncResult::Fork(result));
+            }));
+        }
         if !self.operations.contains(&AuthoringOperation::DraftLoad)
+            && !self.operations.contains(&AuthoringOperation::Forking)
             && let (Some(workflow_id), Some(draft_id)) =
                 (self.workflow_id.clone(), self.draft_id.clone())
         {
@@ -1816,6 +1851,18 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 }
                 AuthoringAsyncResult::BaseRevision(Ok(None)) => {
                     self.status = "Base revision no longer exists".to_string();
+                }
+                AuthoringAsyncResult::Fork(Ok(draft)) => {
+                    self.operations.remove(&AuthoringOperation::Forking);
+                    self.operations.insert(AuthoringOperation::Fork);
+                    self.fork_revision = None;
+                    self.install_draft(*draft);
+                    self.status = "Forked immutable revision into a mutable draft".to_string();
+                }
+                AuthoringAsyncResult::Fork(Err(error)) => {
+                    self.operations.remove(&AuthoringOperation::Forking);
+                    self.operations.insert(AuthoringOperation::Fork);
+                    self.status = format!("Revision fork failed: {error}");
                 }
                 AuthoringAsyncResult::BaseRevision(Err(error)) => {
                     self.status = format!("Failed to load base revision: {error}");

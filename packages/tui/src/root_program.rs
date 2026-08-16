@@ -4977,6 +4977,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_plugin_surface_close_restores_parent_with_workflow_subscription() {
+        struct TestSurface(&'static str);
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for TestSurface {
+            fn id(&self) -> &'static str {
+                self.0
+            }
+
+            fn title(&self) -> &'static str {
+                self.0
+            }
+
+            fn render(
+                &mut self,
+                _area: bmux_tui::geometry::Rect,
+                _frame: &mut bmux_tui::frame::Frame<'_>,
+            ) {
+            }
+
+            fn handle_event(
+                &mut self,
+                _event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+            }
+        }
+
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        state.queue_root_plugin_surface("bcode.workflow", Box::new(TestSurface("workflow.status")));
+        let (_update_sender, updates) = tokio::sync::mpsc::channel(1);
+        let (request_sender, mut requests) = tokio::sync::mpsc::channel(1);
+        state.attach_root_plugin_surface_updates(updates, request_sender);
+
+        state.queue_root_plugin_surface("bcode.workflow", Box::new(TestSurface("workflow.author")));
+        assert_eq!(
+            state.active_root_plugin_surface_id(),
+            Some("workflow.author")
+        );
+        let closed = state
+            .close_root_plugin_surface_with_outcome(None)
+            .expect("authoring surface closes");
+        assert_eq!(closed.0, "bcode.workflow");
+        assert_eq!(
+            state.active_root_plugin_surface_id(),
+            Some("workflow.status")
+        );
+
+        state.request_root_workflow_run("run-7".to_string());
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(super::super::chat_loop::WorkflowViewRequest::SelectRun(run_id))
+                if run_id == "run-7"
+        ));
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn managed_runtime_commits_progressive_filesystem_write_frames_without_external_wakeup() {
         let session_id = bcode_session_models::SessionId::new();

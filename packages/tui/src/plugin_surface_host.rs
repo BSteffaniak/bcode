@@ -11,17 +11,18 @@ use bcode_plugin_sdk::tui::{
     PluginTuiHostError, PluginTuiSurfaceUpdate, PluginTuiSurfaceUpdateReceiver,
     PluginWorkflowAuthoringCatalogFuture, PluginWorkflowAuthoringDraft,
     PluginWorkflowAuthoringDraftFuture, PluginWorkflowAuthoringEditFuture,
-    PluginWorkflowAuthoringEditResult, PluginWorkflowAuthoringPreviewFuture,
-    PluginWorkflowAuthoringPublishFuture, PluginWorkflowAuthoringPublishResult,
-    PluginWorkflowAuthoringRevision, PluginWorkflowAuthoringRevisionFuture,
-    PluginWorkflowAuthoringStartFuture, PluginWorkflowAuthoringValidationFuture,
-    PluginWorkflowControlAction, PluginWorkflowControlFuture, PluginWorkflowControlResult,
-    PluginWorkflowGeneratedCandidate, PluginWorkflowGeneratedCandidateAcceptance,
-    PluginWorkflowGeneratedCandidateAcceptanceFuture, PluginWorkflowInspection,
-    PluginWorkflowInspectionFuture, PluginWorkflowLookup, PluginWorkflowLookupFuture,
-    PluginWorkflowPackageExportStartRequest, PluginWorkflowStartFuture, PluginWorkflowStartRequest,
-    PluginWorkflowStartResponse, PluginWorkflowStatus, PluginWorkflowSummary,
-    PluginWorkflowTemplateInstantiationFuture, PluginWorkflowTemplateInstantiationRequest,
+    PluginWorkflowAuthoringEditResult, PluginWorkflowAuthoringForkFuture,
+    PluginWorkflowAuthoringPreviewFuture, PluginWorkflowAuthoringPublishFuture,
+    PluginWorkflowAuthoringPublishResult, PluginWorkflowAuthoringRevision,
+    PluginWorkflowAuthoringRevisionFuture, PluginWorkflowAuthoringStartFuture,
+    PluginWorkflowAuthoringValidationFuture, PluginWorkflowControlAction,
+    PluginWorkflowControlFuture, PluginWorkflowControlResult, PluginWorkflowGeneratedCandidate,
+    PluginWorkflowGeneratedCandidateAcceptance, PluginWorkflowGeneratedCandidateAcceptanceFuture,
+    PluginWorkflowInspection, PluginWorkflowInspectionFuture, PluginWorkflowLookup,
+    PluginWorkflowLookupFuture, PluginWorkflowPackageExportStartRequest, PluginWorkflowStartFuture,
+    PluginWorkflowStartRequest, PluginWorkflowStartResponse, PluginWorkflowStatus,
+    PluginWorkflowSummary, PluginWorkflowTemplateInstantiationFuture,
+    PluginWorkflowTemplateInstantiationRequest,
 };
 use bcode_session_models::SessionId;
 use bcode_session_view::SessionView;
@@ -392,6 +393,28 @@ impl PluginTuiHost for BcodePluginTuiHost {
                 .workflow_draft(workflow_id, draft_id)
                 .await
                 .map(|draft| draft.map(plugin_workflow_authoring_draft))
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn fork_workflow_authoring_revision(
+        &self,
+        workflow_id: String,
+        revision: u64,
+        draft_id: String,
+        producer: bcode_workflow::WorkflowProducerProvenance,
+    ) -> PluginWorkflowAuthoringForkFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .fork_workflow_draft(bcode_ipc::ForkWorkflowDraftRequest {
+                    workflow_id,
+                    source: bcode_ipc::WorkflowDraftForkSource::Revision { revision },
+                    draft_id,
+                    producer,
+                })
+                .await
+                .map(plugin_workflow_authoring_draft)
                 .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
         })
     }

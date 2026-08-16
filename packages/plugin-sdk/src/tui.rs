@@ -244,6 +244,15 @@ pub type PluginWorkflowAuthoringDraftFuture = Pin<
     >,
 >;
 
+/// Async canonical fork of one exact immutable authored revision.
+pub type PluginWorkflowAuthoringForkFuture = Pin<
+    Box<
+        dyn Future<Output = Result<PluginWorkflowAuthoringDraft, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
 /// Portable immutable revision document used for semantic authoring review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginWorkflowAuthoringRevision {
@@ -642,6 +651,21 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Fork one exact immutable authored revision into a new mutable draft.
+    fn fork_workflow_authoring_revision(
+        &self,
+        _workflow_id: String,
+        _revision: u64,
+        _draft_id: String,
+        _producer: bcode_workflow::WorkflowProducerProvenance,
+    ) -> PluginWorkflowAuthoringForkFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow authoring revision forking is not available from this host".to_string(),
             ))
         })
     }
