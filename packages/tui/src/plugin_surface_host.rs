@@ -937,6 +937,16 @@ fn workflow_event_refreshes_selected_detail(
     selected_run_id == Some(changed_run_id)
 }
 
+fn workflow_catalog_selection(
+    selected_run_id: Option<&str>,
+    catalog: &bcode_workflow_view_models::WorkflowCatalogView,
+) -> Option<String> {
+    selected_run_id
+        .filter(|run_id| catalog.runs.iter().any(|run| run.run_id == *run_id))
+        .map(str::to_string)
+        .or_else(|| catalog.runs.first().map(|run| run.run_id.clone()))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn stream_plugin_workflow_views(
     client: BcodeClient,
@@ -1165,9 +1175,87 @@ async fn stream_plugin_workflow_views(
                     redraw.request();
                 }
                 Ok(bcode_client::WorkflowRunWatchEvent::ResyncRequired) => {
-                    let _ = sender.send(PluginTuiSurfaceUpdate::ResyncRequired).await;
+                    if sender
+                        .send(PluginTuiSurfaceUpdate::Resyncing)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if sender
+                        .send(PluginTuiSurfaceUpdate::WorkflowCatalogLoading { stale: true })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let replacement_watcher = match client.watch_workflow_runs().await {
+                        Ok(watcher) => watcher,
+                        Err(error) => {
+                            let _ = sender
+                                .send(PluginTuiSurfaceUpdate::Disconnected {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            redraw.request();
+                            return;
+                        }
+                    };
+                    let catalog = match client.workflow_catalog_view(catalog_request.clone()).await {
+                        Ok(catalog) => catalog,
+                        Err(error) => {
+                            let _ = sender
+                                .send(PluginTuiSurfaceUpdate::WorkflowCatalogError {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            redraw.request();
+                            continue;
+                        }
+                    };
+                    selected_run_id = workflow_catalog_selection(
+                        selected_run_id.as_deref(),
+                        &catalog,
+                    );
+                    if sender
+                        .send(PluginTuiSurfaceUpdate::WorkflowCatalog(catalog))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Some(run_id) = selected_run_id.clone() {
+                        if sender
+                            .send(PluginTuiSurfaceUpdate::WorkflowRunLoading {
+                                run_id: run_id.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        match client.workflow_run_view(run_id.clone(), RUN_DETAIL_LIMIT).await {
+                            Ok(view) => {
+                                if sender
+                                    .send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(view)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = sender
+                                    .send(PluginTuiSurfaceUpdate::WorkflowRunError {
+                                        run_id,
+                                        message: error.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    watcher = replacement_watcher;
                     redraw.request();
-                    return;
                 }
                 Ok(bcode_client::WorkflowRunWatchEvent::UnsupportedVersion { version }) => {
                     let _ = sender.send(PluginTuiSurfaceUpdate::Disconnected {
@@ -1206,7 +1294,7 @@ pub fn subscribe_workflow_views(
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginWorkflowPackageExportStartRequest, SessionId,
+        PluginWorkflowPackageExportStartRequest, SessionId, workflow_catalog_selection,
         workflow_event_refreshes_selected_detail, workflow_package_export_start_request,
     };
 
@@ -1248,6 +1336,52 @@ mod tests {
         assert_eq!(request.package_export.package_id, "example/package");
         assert_eq!(request.parent_session_id, parent_session_id);
         assert_eq!(request.input.expect("input")["subject"], "change");
+    }
+
+    #[test]
+    fn bounded_resync_preserves_exact_selection_or_uses_documented_first_fallback() {
+        let catalog = bcode_workflow_view_models::WorkflowCatalogView {
+            version: bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,
+            runs: ["run-a", "run-b"]
+                .into_iter()
+                .map(|run_id| bcode_workflow_view_models::WorkflowRunListItem {
+                    run_id: run_id.to_string(),
+                    display_title: run_id.to_string(),
+                    binding_label: None,
+                    definition_id: "definition".to_string(),
+                    definition_version: 1,
+                    authored_source: None,
+                    definition_disposition:
+                        bcode_workflow_view_models::WorkflowDefinitionDisposition::CompiledOnly,
+                    parent_run_id: None,
+                    descendant_count: 0,
+                    progress: bcode_workflow_view_models::WorkflowRunProgress::default(),
+                    attention: bcode_workflow_view_models::WorkflowAttentionSummary::default(),
+                    status: bcode_workflow_view_models::WorkflowRunStatus::Running,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                })
+                .collect(),
+            next_cursor: None,
+            has_more: false,
+            filter: bcode_workflow_view_models::WorkflowCatalogFilter::All,
+            sort: bcode_workflow_view_models::WorkflowCatalogSort::UpdatedAt,
+            group: bcode_workflow_view_models::WorkflowCatalogGroup::None,
+            search: None,
+        };
+
+        assert_eq!(
+            workflow_catalog_selection(Some("run-b"), &catalog).as_deref(),
+            Some("run-b")
+        );
+        assert_eq!(
+            workflow_catalog_selection(Some("removed"), &catalog).as_deref(),
+            Some("run-a")
+        );
+        assert_eq!(
+            workflow_catalog_selection(None, &catalog).as_deref(),
+            Some("run-a")
+        );
     }
 
     #[test]

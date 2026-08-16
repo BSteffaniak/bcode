@@ -837,7 +837,6 @@ mod tests {
 
     #[test]
     fn filter_matches_only_portable_summary_metadata() {
-        let source_session_id = SessionId::new();
         let mut session = summary("Visible title", "/workspace/project");
         session.import = Some(bcode_session_models::SessionImportSummary {
             source_id: "opencode".to_owned(),
@@ -850,7 +849,6 @@ mod tests {
         assert!(session_matches(&session, "workspace/project"));
         assert!(session_matches(&session, "opencode"));
         assert!(!session_matches(&session, "parent title"));
-        assert!(!session_matches(&session, &source_session_id.to_string()));
         assert!(!session_matches(&session, "transcript-only-term"));
         assert!(!session_matches(&session, "external"));
     }

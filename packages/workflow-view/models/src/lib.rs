@@ -625,6 +625,134 @@ mod live_event_tests {
         }
     }
 
+    fn run_view(version: u32) -> WorkflowRunView {
+        WorkflowRunView {
+            version,
+            run: WorkflowRunListItem {
+                run_id: "run-1".to_string(),
+                display_title: "Review change".to_string(),
+                binding_label: Some("PR 42".to_string()),
+                definition_id: "review".to_string(),
+                definition_version: 7,
+                authored_source: Some(WorkflowAuthoredSourceView {
+                    workflow_id: "workflow-1".to_string(),
+                    revision: 3,
+                }),
+                definition_disposition: WorkflowDefinitionDisposition::Published {
+                    workflow_id: "workflow-1".to_string(),
+                    revision: 3,
+                    editable_draft_id: None,
+                },
+                parent_run_id: None,
+                descendant_count: 0,
+                progress: WorkflowRunProgress {
+                    total_nodes: 1,
+                    active: 1,
+                    ..WorkflowRunProgress::default()
+                },
+                attention: WorkflowAttentionSummary {
+                    retryable_failures: 1,
+                    ..WorkflowAttentionSummary::default()
+                },
+                status: WorkflowRunStatus::Running,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            },
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            waits: Vec::new(),
+            mutation_approvals: Vec::new(),
+            attempts: Vec::new(),
+            outputs: Vec::new(),
+            descendant_runs: Vec::new(),
+            child_sessions: Vec::new(),
+            actions: vec![WorkflowActionAffordance {
+                kind: WorkflowActionKind::RetryNode,
+                target: WorkflowActionTarget::Attempt {
+                    run_id: "run-1".to_string(),
+                    node_id: "reviewer".to_string(),
+                    activation_id: "activation-2".to_string(),
+                    attempt: 4,
+                },
+                enabled: false,
+                unavailable_reason: Some("authoritative state changed".to_string()),
+            }],
+            terminal: None,
+            health: WorkflowProjectionHealth::Current,
+        }
+    }
+
+    #[test]
+    fn portable_run_projection_round_trips_exact_semantic_identity() {
+        let expected = run_view(WORKFLOW_VIEW_VERSION);
+        let encoded = serde_json::to_string(&expected).expect("serialize workflow run view");
+        let decoded = serde_json::from_str::<WorkflowRunView>(&encoded)
+            .expect("deserialize workflow run view");
+
+        assert_eq!(decoded, expected);
+        assert!(decoded.run.attention.needs_attention());
+        assert_eq!(
+            decoded.actions[0].target,
+            WorkflowActionTarget::Attempt {
+                run_id: "run-1".to_string(),
+                node_id: "reviewer".to_string(),
+                activation_id: "activation-2".to_string(),
+                attempt: 4,
+            }
+        );
+        assert!(!decoded.actions[0].enabled);
+        assert_eq!(
+            decoded.actions[0].unavailable_reason.as_deref(),
+            Some("authoritative state changed")
+        );
+    }
+
+    #[test]
+    fn run_projection_rejects_future_versions_and_unknown_fields() {
+        let future = run_view(WORKFLOW_VIEW_VERSION + 1);
+        assert_eq!(
+            future.validate_version(),
+            Err(UnsupportedWorkflowViewVersion {
+                version: WORKFLOW_VIEW_VERSION + 1,
+            })
+        );
+
+        let mut encoded = serde_json::to_value(run_view(WORKFLOW_VIEW_VERSION))
+            .expect("serialize workflow run view");
+        encoded
+            .as_object_mut()
+            .expect("run view object")
+            .insert("terminal_rows".to_string(), serde_json::json!([]));
+        assert!(serde_json::from_value::<WorkflowRunView>(encoded).is_err());
+    }
+
+    #[test]
+    fn catalog_request_round_trips_explicit_bound_and_query_identity() {
+        let request = WorkflowCatalogRequest {
+            limit: 100,
+            cursor: Some(WorkflowCatalogCursor {
+                sort: WorkflowCatalogSort::Status,
+                timestamp_ms: 27,
+                status_rank: 3,
+                run_id: "run-27".to_string(),
+            }),
+            filter: WorkflowCatalogFilter::NeedsAttention,
+            sort: WorkflowCatalogSort::Status,
+            group: WorkflowCatalogGroup::AuthoredWorkflow,
+            search: Some("review".to_string()),
+        };
+        let encoded = serde_json::to_string(&request).expect("serialize catalog request");
+        let decoded = serde_json::from_str::<WorkflowCatalogRequest>(&encoded)
+            .expect("deserialize catalog request");
+
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.limit, 100);
+        assert_eq!(
+            decoded.cursor.as_ref().map(|cursor| cursor.run_id.as_str()),
+            Some("run-27")
+        );
+    }
+
     #[test]
     fn live_sequence_detects_duplicates_gaps_and_future_versions() {
         let mut sequence = WorkflowLiveSequence::default();

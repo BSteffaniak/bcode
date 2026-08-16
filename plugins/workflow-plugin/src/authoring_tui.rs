@@ -114,6 +114,7 @@ enum AuthoringOperation {
     DraftLoad,
     Fork,
     Forking,
+    RevisionLoad,
     BaseLoad,
     Edit,
     Publish,
@@ -132,6 +133,7 @@ enum AuthoringOperation {
 enum AuthoringAsyncResult {
     Draft(Result<Option<Box<PluginWorkflowAuthoringDraft>>, String>),
     Fork(Result<Box<PluginWorkflowAuthoringDraft>, String>),
+    Revision(Result<Option<Box<PluginWorkflowAuthoringRevision>>, String>),
     BaseRevision(Result<Option<Box<PluginWorkflowAuthoringRevision>>, String>),
     Edit(Result<PluginWorkflowAuthoringEditResult, String>),
     Instantiate(Result<Box<PluginWorkflowAuthoringDraft>, String>),
@@ -236,6 +238,7 @@ struct WorkflowAuthorSurface {
     last_area: Rect,
     workflow_id: Option<String>,
     draft_id: Option<String>,
+    view_revision: Option<u64>,
     fork_revision: Option<u64>,
     base_revision: Option<u64>,
     base_document: Option<WorkflowAuthoringDocument>,
@@ -264,6 +267,7 @@ struct WorkflowAuthorSurface {
 }
 
 impl WorkflowAuthorSurface {
+    #[allow(clippy::too_many_lines)]
     fn new(options: &serde_json::Value) -> Self {
         let document = authoring_document(options);
         let draft = options.get("draft");
@@ -271,6 +275,11 @@ impl WorkflowAuthorSurface {
             .and_then(|draft| draft.get("identity"))
             .and_then(|identity| identity.get("workflow_id"))
             .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                options
+                    .get("workflow_id")
+                    .and_then(serde_json::Value::as_str)
+            })
             .map(str::to_string);
         let draft_id = draft
             .and_then(|draft| draft.get("identity"))
@@ -282,6 +291,9 @@ impl WorkflowAuthorSurface {
             .and_then(serde_json::Value::as_u64);
         let base_revision = draft
             .and_then(|draft| draft.get("base_revision"))
+            .and_then(serde_json::Value::as_u64);
+        let view_revision = options
+            .get("view_revision")
             .and_then(serde_json::Value::as_u64);
         let fork_revision = options
             .get("fork_revision")
@@ -304,13 +316,18 @@ impl WorkflowAuthorSurface {
         });
         let (catalog_sender, catalog_receiver) = mpsc::unbounded_channel();
         let (authoring_sender, authoring_receiver) = mpsc::unbounded_channel();
-        let status = if workflow_id.is_some() && draft_id.is_some() {
-            "Loading mutable authored draft and portable catalog…".to_string()
-        } else if document.is_some() {
-            "Template preview is read-only; instantiate it as a draft to edit".to_string()
-        } else {
-            "Select a maintainable authoring-document template or mutable draft".to_string()
-        };
+        let status = view_revision.map_or_else(
+            || {
+                if workflow_id.is_some() && draft_id.is_some() {
+                    "Loading mutable authored draft and portable catalog…".to_string()
+                } else if document.is_some() {
+                    "Template preview is read-only; instantiate it as a draft to edit".to_string()
+                } else {
+                    "Select a maintainable authoring-document template or mutable draft".to_string()
+                }
+            },
+            |revision| format!("Loading exact immutable authored revision {revision}…"),
+        );
         Self {
             document,
             catalog: None,
@@ -328,6 +345,7 @@ impl WorkflowAuthorSurface {
             last_area: Rect::new(0, 0, 0, 0),
             workflow_id,
             draft_id,
+            view_revision,
             fork_revision,
             base_revision,
             base_document: None,
@@ -635,7 +653,29 @@ impl WorkflowAuthorSurface {
             format!("Explicitly reapplying reviewed edits to generation {current_generation}");
     }
 
+    const fn is_read_only_revision(&self) -> bool {
+        self.view_revision.is_some()
+    }
+
+    fn fork_viewed_revision(&mut self) {
+        let (Some(workflow_id), Some(revision)) = (self.workflow_id.clone(), self.view_revision)
+        else {
+            self.status = "No immutable revision is open to fork".to_string();
+            return;
+        };
+        self.draft_id = Some(format!("revision-{revision}-fork"));
+        self.fork_revision = Some(revision);
+        self.generation = None;
+        self.operations.remove(&AuthoringOperation::Fork);
+        self.status = format!("Preparing an editable fork of {workflow_id} revision {revision}…");
+    }
+
     fn request_mutation(&mut self, mutation: PendingMutation) {
+        if self.is_read_only_revision() {
+            self.status =
+                "This published revision is immutable; press f to fork it into a draft".to_string();
+            return;
+        }
         if self.operations.contains(&AuthoringOperation::Edit) {
             self.status = "A semantic edit is already in progress".to_string();
             return;
@@ -1362,6 +1402,10 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
             Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')) => {
                 return PluginTuiAction::Close { outcome: None };
             }
+            Event::Key(key) if key.key == KeyCode::Char('f') && self.is_read_only_revision() => {
+                self.fork_viewed_revision();
+                true
+            }
             Event::Key(key) if key.key == KeyCode::Tab && key.modifiers.shift => {
                 self.focus = self.focus.previous();
                 true
@@ -1588,6 +1632,22 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
             host.spawn(Box::pin(async move {
                 let result = future.await.map_err(|error| error.to_string());
                 let _ = sender.send(result);
+            }));
+        }
+        if !self.operations.contains(&AuthoringOperation::RevisionLoad)
+            && self.document.is_none()
+            && let (Some(workflow_id), Some(revision)) =
+                (self.workflow_id.clone(), self.view_revision)
+        {
+            self.operations.insert(AuthoringOperation::RevisionLoad);
+            let future = host.workflow_authoring_revision(workflow_id, revision);
+            let sender = self.authoring_sender.clone();
+            host.spawn(Box::pin(async move {
+                let result = future
+                    .await
+                    .map(|revision| revision.map(Box::new))
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(AuthoringAsyncResult::Revision(result));
             }));
         }
         if !self.operations.contains(&AuthoringOperation::Fork)
@@ -1846,6 +1906,23 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 AuthoringAsyncResult::Draft(Err(error)) => {
                     self.status = format!("Failed to load mutable draft: {error}");
                 }
+                AuthoringAsyncResult::Revision(Ok(Some(revision))) => {
+                    let revision = *revision;
+                    self.view_revision = Some(revision.revision);
+                    self.base_revision = Some(revision.revision);
+                    self.document = Some(revision.document);
+                    self.refresh_preview();
+                    self.status = format!(
+                        "Viewing immutable published revision {}; press f to fork into a draft",
+                        revision.revision
+                    );
+                }
+                AuthoringAsyncResult::Revision(Ok(None)) => {
+                    self.status = "Published revision no longer exists".to_string();
+                }
+                AuthoringAsyncResult::Revision(Err(error)) => {
+                    self.status = format!("Failed to load published revision: {error}");
+                }
                 AuthoringAsyncResult::BaseRevision(Ok(Some(revision))) => {
                     self.install_base_revision(*revision);
                 }
@@ -1855,6 +1932,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 AuthoringAsyncResult::Fork(Ok(draft)) => {
                     self.operations.remove(&AuthoringOperation::Forking);
                     self.operations.insert(AuthoringOperation::Fork);
+                    self.view_revision = None;
                     self.fork_revision = None;
                     self.install_draft(*draft);
                     self.status = "Forked immutable revision into a mutable draft".to_string();
@@ -3948,6 +4026,25 @@ mod tests {
         )
         .expect("decoded candidate");
         assert!(!preview.validation.valid);
+    }
+
+    #[test]
+    fn immutable_revision_view_requires_explicit_fork_before_editing() {
+        let mut surface = WorkflowAuthorSurface::new(&serde_json::json!({
+            "workflow_id": "review-workflow",
+            "view_revision": 7,
+        }));
+        assert!(surface.is_read_only_revision());
+        assert_eq!(surface.generation, None);
+        surface.document = Some(document());
+        surface.request_mutation(PendingMutation::Duplicate);
+        assert!(surface.pending_mutation.is_none());
+        assert!(surface.status.contains("immutable"));
+
+        surface.fork_viewed_revision();
+        assert_eq!(surface.draft_id.as_deref(), Some("revision-7-fork"));
+        assert_eq!(surface.fork_revision, Some(7));
+        assert!(!surface.operations.contains(&AuthoringOperation::Fork));
     }
 
     #[test]

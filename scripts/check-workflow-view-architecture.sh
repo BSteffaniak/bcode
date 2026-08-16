@@ -19,6 +19,16 @@ if rg -n 'bcode_ipc|bcode_workflow_store|bmux|ratatui|crossterm' \
     fail 'portable workflow projection references IPC, persistence, or terminal types'
 fi
 
+if rg -n 'bcode_ipc|bcode_workflow_store|bmux|ratatui|crossterm|Terminal[<(]|Frame[<(]|\bRect\b|KeyCode|MouseEvent' \
+    packages/workflow-view/models/src; then
+    fail 'public portable workflow contracts contain frontend or implementation types'
+fi
+
+if rg -n 'bcode_session_models::SessionEvent|WorkflowEventKind|canonical_events|event_log' \
+    plugins/workflow-plugin/src/tui.rs; then
+    fail 'workflow TUI reinterprets raw workflow or session events'
+fi
+
 if rg -n 'bcode_workflow_view\s*=' packages/workflow-view/models/Cargo.toml; then
     fail 'workflow-view models depends on its parent implementation crate'
 fi
@@ -39,5 +49,17 @@ rg -q 'WorkflowActionTarget' packages/workflow-view/models/src/lib.rs \
     || fail 'workflow-view actions lack typed stable target identities'
 rg -q 'Presentation fields cannot authorize execution' packages/workflow-view/models/src/lib.rs \
     || fail 'workflow mutation approval presentation lost its authorization-neutral boundary'
+rg -q 'WorkflowLiveEventDisposition' packages/workflow-view/models/src/lib.rs \
+    || fail 'workflow live notifications lack explicit duplicate/gap/version semantics'
+rg -q 'workflow_run_status_is_terminal' plugins/workflow-plugin/src/tui.rs \
+    || fail 'workflow TUI lacks stable terminal-state protection'
+rg -q 'action_is_current' plugins/workflow-plugin/src/tui.rs \
+    || fail 'workflow TUI does not revalidate exact portable action targets'
+rg -q 'const CATALOG_PAGE_SIZE: usize = 100;' packages/tui/src/plugin_surface_host.rs \
+    || fail 'workflow catalog host path lacks a fixed bounded page size'
+rg -q 'const RUN_DETAIL_LIMIT: usize = 1_000;' packages/tui/src/plugin_surface_host.rs \
+    || fail 'workflow selected-detail host path lacks a fixed collection bound'
+rg -q 'WorkflowRunWatchEvent::ResyncRequired' packages/tui/src/plugin_surface_host.rs \
+    || fail 'workflow host lacks explicit bounded resynchronization handling'
 
 printf 'workflow-view architecture check passed\n'

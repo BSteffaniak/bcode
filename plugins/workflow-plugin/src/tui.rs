@@ -530,6 +530,26 @@ const fn workflow_run_status_is_terminal(
     )
 }
 
+const fn workflow_action_shortcut(
+    kind: bcode_workflow_view_models::WorkflowActionKind,
+) -> &'static str {
+    match kind {
+        bcode_workflow_view_models::WorkflowActionKind::Pause
+        | bcode_workflow_view_models::WorkflowActionKind::Resume => "p",
+        bcode_workflow_view_models::WorkflowActionKind::Cancel => "c",
+        bcode_workflow_view_models::WorkflowActionKind::ProvideInput => "i",
+        bcode_workflow_view_models::WorkflowActionKind::Approve
+        | bcode_workflow_view_models::WorkflowActionKind::ApproveMutation => "a",
+        bcode_workflow_view_models::WorkflowActionKind::Deny
+        | bcode_workflow_view_models::WorkflowActionKind::DenyMutation => "d",
+        bcode_workflow_view_models::WorkflowActionKind::RetryNode => "r",
+        bcode_workflow_view_models::WorkflowActionKind::OpenSession => "o",
+        bcode_workflow_view_models::WorkflowActionKind::ViewDefinition => "V",
+        bcode_workflow_view_models::WorkflowActionKind::EditDraft => "E",
+        bcode_workflow_view_models::WorkflowActionKind::ForkDefinition => "F",
+    }
+}
+
 impl WorkflowStatusSurface {
     fn action_is_current(
         &self,
@@ -558,6 +578,23 @@ impl WorkflowStatusSurface {
         self.inline_error = None;
         self.pending_action_target = Some((kind, target));
         self.live_status = "action submitted; waiting for authoritative refresh".to_string();
+        action
+    }
+
+    fn navigate_exact_action(
+        &mut self,
+        kind: bcode_workflow_view_models::WorkflowActionKind,
+        target: &bcode_workflow_view_models::WorkflowActionTarget,
+        action: PluginTuiAction,
+    ) -> PluginTuiAction {
+        if !self.action_is_current(kind, target) {
+            self.inline_error = Some(
+                "Navigation target is stale or unavailable; wait for authoritative refresh"
+                    .to_string(),
+            );
+            return PluginTuiAction::Redraw;
+        }
+        self.inline_error = None;
         action
     }
 
@@ -865,6 +902,7 @@ impl WorkflowStatusSurface {
             KeyHint::new("/", "search"),
             KeyHint::new("f/s/g", "filter/sort/group"),
             KeyHint::new("m", "more"),
+            KeyHint::new("D/T/N", "definitions/templates/new"),
         ];
         KeyHintBar::new(&hints)
             .styles(KeyHintBarStyles {
@@ -1196,7 +1234,12 @@ impl WorkflowStatusSurface {
             .actions
             .iter()
             .map(|action| {
-                ActionButton::new(format!("{:?}", action.kind), format!("{:?}", action.kind))
+                let label = format!(
+                    "{} {:?}",
+                    workflow_action_shortcut(action.kind),
+                    action.kind
+                );
+                ActionButton::new(format!("{:?}", action.kind), label)
             })
             .collect::<Vec<_>>();
         let row_area = Rect::new(area.x, area.y, area.width, 1.min(area.height));
@@ -1309,45 +1352,98 @@ impl WorkflowStatusSurface {
         PluginTuiAction::SelectWorkflowRun { run_id }
     }
 
-    fn definition_navigation_action(&self) -> PluginTuiAction {
-        let Some(run) = self.selected_run_view() else {
-            return PluginTuiAction::None;
+    fn authoring_command(command_id: &str) -> PluginTuiAction {
+        plugin_command(command_id, String::new())
+    }
+
+    fn selected_definition_action(
+        &self,
+        kind: bcode_workflow_view_models::WorkflowActionKind,
+    ) -> Option<bcode_workflow_view_models::WorkflowActionAffordance> {
+        self.selected_run_view()?
+            .actions
+            .iter()
+            .find(|action| action.kind == kind)
+            .cloned()
+    }
+
+    fn definition_action(
+        &mut self,
+        kind: bcode_workflow_view_models::WorkflowActionKind,
+    ) -> PluginTuiAction {
+        let Some(affordance) = self.selected_definition_action(kind) else {
+            self.inline_error = Some("Definition action is unavailable for this run".to_string());
+            return PluginTuiAction::Redraw;
         };
-        match &run.run.definition_disposition {
-            bcode_workflow_view_models::WorkflowDefinitionDisposition::Published {
-                workflow_id,
-                revision,
-                editable_draft_id,
-            } => PluginTuiAction::OpenSurface {
+        if !affordance.enabled {
+            self.inline_error = Some(
+                affordance
+                    .unavailable_reason
+                    .unwrap_or_else(|| "Definition action is currently unavailable".to_string()),
+            );
+            return PluginTuiAction::Redraw;
+        }
+        let action = match (&kind, &affordance.target) {
+            (
+                bcode_workflow_view_models::WorkflowActionKind::ViewDefinition,
+                bcode_workflow_view_models::WorkflowActionTarget::PublishedDefinition {
+                    workflow_id,
+                    revision,
+                },
+            ) => PluginTuiAction::OpenSurface {
                 plugin_id: "bcode.workflow".to_string(),
                 surface_id: WORKFLOW_AUTHOR_SURFACE_KIND.to_string(),
-                options: editable_draft_id.as_ref().map_or_else(
-                    || {
-                        let draft_id = format!("revision-{revision}-fork");
-                        serde_json::json!({
-                            "workflow_id": workflow_id,
-                            "draft": {
-                                "identity": {
-                                    "workflow_id": workflow_id,
-                                    "draft_id": draft_id,
-                                },
-                                "base_revision": revision,
-                            },
-                            "fork_revision": revision,
-                        })
-                    },
-                    |draft_id| {
-                        serde_json::json!({
-                            "workflow_id": workflow_id,
-                            "draft_id": draft_id,
-                        })
-                    },
-                ),
+                options: serde_json::json!({
+                    "workflow_id": workflow_id,
+                    "view_revision": revision,
+                }),
             },
-            bcode_workflow_view_models::WorkflowDefinitionDisposition::CompiledOnly => {
-                PluginTuiAction::None
+            (
+                bcode_workflow_view_models::WorkflowActionKind::EditDraft,
+                bcode_workflow_view_models::WorkflowActionTarget::Draft {
+                    workflow_id,
+                    draft_id,
+                },
+            ) => PluginTuiAction::OpenSurface {
+                plugin_id: "bcode.workflow".to_string(),
+                surface_id: WORKFLOW_AUTHOR_SURFACE_KIND.to_string(),
+                options: serde_json::json!({
+                    "workflow_id": workflow_id,
+                    "draft_id": draft_id,
+                }),
+            },
+            (
+                bcode_workflow_view_models::WorkflowActionKind::ForkDefinition,
+                bcode_workflow_view_models::WorkflowActionTarget::PublishedDefinition {
+                    workflow_id,
+                    revision,
+                },
+            ) => {
+                let draft_id = format!("revision-{revision}-fork");
+                PluginTuiAction::OpenSurface {
+                    plugin_id: "bcode.workflow".to_string(),
+                    surface_id: WORKFLOW_AUTHOR_SURFACE_KIND.to_string(),
+                    options: serde_json::json!({
+                        "workflow_id": workflow_id,
+                        "draft": {
+                            "identity": {
+                                "workflow_id": workflow_id,
+                                "draft_id": draft_id,
+                            },
+                            "base_revision": revision,
+                        },
+                        "fork_revision": revision,
+                    }),
+                }
             }
-        }
+            _ => {
+                self.inline_error = Some(
+                    "Definition action target does not match the visible affordance".to_string(),
+                );
+                return PluginTuiAction::Redraw;
+            }
+        };
+        self.navigate_exact_action(kind, &affordance.target, action)
     }
 
     fn select_adjacent_node(&mut self, offset: isize) -> PluginTuiAction {
@@ -1406,11 +1502,35 @@ impl WorkflowStatusSurface {
                 };
                 match form.validate() {
                     Ok(value) => {
+                        let run_id = form.run_id.clone();
+                        let node_id = form.node_id.clone();
+                        let activation_id = form.activation_id.clone();
+                        let target = bcode_workflow_view_models::WorkflowActionTarget::Activation {
+                            run_id: run_id.clone(),
+                            node_id: node_id.clone(),
+                            activation_id: activation_id.clone(),
+                        };
+                        if !self.action_is_current(
+                            bcode_workflow_view_models::WorkflowActionKind::ProvideInput,
+                            &target,
+                        ) {
+                            self.inline_error = Some(
+                                "Action target is stale or unavailable; wait for authoritative refresh"
+                                    .to_string(),
+                            );
+                            return PluginTuiAction::Redraw;
+                        }
+                        self.inline_error = None;
+                        self.pending_action_target = Some((
+                            bcode_workflow_view_models::WorkflowActionKind::ProvideInput,
+                            target,
+                        ));
+                        self.live_status =
+                            "action submitted; waiting for authoritative refresh".to_string();
                         return plugin_command(
                             "workflow.provide-input",
                             format!(
-                                "run_id={} node_id={} activation_id={} value={value}",
-                                form.run_id, form.node_id, form.activation_id
+                                "run_id={run_id} node_id={node_id} activation_id={activation_id} value={value}"
                             ),
                         );
                     }
@@ -1762,14 +1882,39 @@ impl WorkflowStatusSurface {
                     ),
                 )
             }
-            KeyCode::Char('o') => self
-                .selected_child_session_id
-                .as_deref()
-                .and_then(|session_id| session_id.parse().ok())
-                .map_or(PluginTuiAction::None, |session_id| {
-                    PluginTuiAction::OpenSession { session_id }
-                }),
-            KeyCode::Char('e') => self.definition_navigation_action(),
+            KeyCode::Char('o') => {
+                let Some(session_id) = self.selected_child_session_id.clone() else {
+                    return PluginTuiAction::None;
+                };
+                let Ok(parsed_session_id) = session_id.parse() else {
+                    self.inline_error =
+                        Some("Selected child session identity is invalid".to_string());
+                    return PluginTuiAction::Redraw;
+                };
+                let target =
+                    bcode_workflow_view_models::WorkflowActionTarget::Session { session_id };
+                self.navigate_exact_action(
+                    bcode_workflow_view_models::WorkflowActionKind::OpenSession,
+                    &target,
+                    PluginTuiAction::OpenSession {
+                        session_id: parsed_session_id,
+                    },
+                )
+            }
+            KeyCode::Char('V') => self
+                .definition_action(bcode_workflow_view_models::WorkflowActionKind::ViewDefinition),
+            KeyCode::Char('E') => {
+                self.definition_action(bcode_workflow_view_models::WorkflowActionKind::EditDraft)
+            }
+            KeyCode::Char('F') => self
+                .definition_action(bcode_workflow_view_models::WorkflowActionKind::ForkDefinition),
+            KeyCode::Char('D') => Self::authoring_command("workflow.list"),
+            KeyCode::Char('T') => Self::authoring_command("workflow.templates"),
+            KeyCode::Char('N') => PluginTuiAction::OpenSurface {
+                plugin_id: "bcode.workflow".to_string(),
+                surface_id: WORKFLOW_AUTHOR_SURFACE_KIND.to_string(),
+                options: serde_json::json!({"entry": "new_workflow"}),
+            },
             _ => PluginTuiAction::None,
         }
     }
@@ -2127,9 +2272,17 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                     if self.selected_run_id.as_deref() == Some(run_id.as_str()) {
                         self.detail_loading_run_id = None;
                         self.detail_errors.remove(&run_id);
-                        self.pending_action_target = None;
+                        let pending_input =
+                            self.pending_action_target
+                                .as_ref()
+                                .is_some_and(|(kind, _)| {
+                                    *kind
+                                    == bcode_workflow_view_models::WorkflowActionKind::ProvideInput
+                                });
+                        if !pending_input {
+                            self.pending_action_target = None;
+                        }
                         self.inline_error = None;
-                        self.input_form = None;
                         self.selected_node_id = self
                             .selected_node_id
                             .take()
@@ -2206,6 +2359,29 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                                     .first()
                                     .map(|session| session.session_id.clone())
                             });
+                        let pending_target_resolved = self.pending_action_target.as_ref().is_some_and(
+                            |(kind, target)| {
+                                *kind == bcode_workflow_view_models::WorkflowActionKind::ProvideInput
+                                    && matches!(
+                                        target,
+                                        bcode_workflow_view_models::WorkflowActionTarget::Activation {
+                                            run_id: target_run_id,
+                                            node_id,
+                                            activation_id,
+                                        } if target_run_id == &view.run.run_id
+                                            && !view.waits.iter().any(|wait| {
+                                                wait.node_id == *node_id
+                                                    && wait.activation_id == *activation_id
+                                                    && wait.kind
+                                                        == bcode_workflow_view_models::WorkflowWaitKind::Input
+                                            })
+                                    )
+                            },
+                        );
+                        if pending_target_resolved {
+                            self.input_form = None;
+                            self.pending_action_target = None;
+                        }
                     }
                     self.runs.clear();
                     self.runs.insert(run_id, *view);
@@ -2223,8 +2399,8 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                     self.detail_errors.insert(run_id, message);
                 }
                 PluginTuiSurfaceUpdate::SelectWorkflowRun { .. } => {}
-                PluginTuiSurfaceUpdate::ResyncRequired => {
-                    self.live_status = "resync required; reopen /workflow".to_string();
+                PluginTuiSurfaceUpdate::Resyncing => {
+                    self.live_status = "resynchronizing bounded workflow state…".to_string();
                 }
                 PluginTuiSurfaceUpdate::Disconnected { message } => {
                     self.live_status = format!("live updates unavailable: {message}");
@@ -3798,6 +3974,14 @@ mod tests {
                     enabled: true,
                     unavailable_reason: None,
                 },
+                bcode_workflow_view_models::WorkflowActionAffordance {
+                    kind: bcode_workflow_view_models::WorkflowActionKind::OpenSession,
+                    target: bcode_workflow_view_models::WorkflowActionTarget::Session {
+                        session_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                    },
+                    enabled: true,
+                    unavailable_reason: None,
+                },
             ],
             terminal: None,
             health: bcode_workflow_view_models::WorkflowProjectionHealth::Current,
@@ -3841,6 +4025,38 @@ mod tests {
             runs: std::collections::BTreeMap::from([("run-1".to_string(), run)]),
             live_status: "live".to_string(),
             subscription_requested: true,
+        }
+    }
+
+    #[test]
+    fn every_visible_action_has_a_documented_exact_target_shortcut() {
+        use bcode_workflow_view_models::WorkflowActionKind as Kind;
+        for (kind, shortcut) in [
+            (Kind::Pause, "p"),
+            (Kind::Resume, "p"),
+            (Kind::Cancel, "c"),
+            (Kind::ProvideInput, "i"),
+            (Kind::Approve, "a"),
+            (Kind::Deny, "d"),
+            (Kind::ApproveMutation, "a"),
+            (Kind::DenyMutation, "d"),
+            (Kind::RetryNode, "r"),
+            (Kind::OpenSession, "o"),
+            (Kind::ViewDefinition, "V"),
+            (Kind::EditDraft, "E"),
+            (Kind::ForkDefinition, "F"),
+        ] {
+            assert_eq!(workflow_action_shortcut(kind), shortcut);
+        }
+
+        let mut surface = projected_surface();
+        surface.narrow_page = WorkflowNarrowPage::Actions;
+        let rendered = render_workspace_text(&surface, 62, 24);
+        for expected in ["p Pause", "c Cancel", "a Approve", "r RetryNode"] {
+            assert!(
+                rendered.contains(expected),
+                "missing visible action {expected}"
+            );
         }
     }
 
@@ -3908,14 +4124,45 @@ mod tests {
             PluginTuiAction::InvokePluginCommand { ref command_id, .. }
                 if command_id == "workflow.approve"
         ));
+        surface.pending_action_target = None;
         assert!(matches!(
             surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
                 KeyCode::Char('o')
             ))),
             PluginTuiAction::OpenSession { .. }
         ));
+        assert!(surface.pending_action_target.is_none());
     }
+
     #[test]
+    fn stale_session_navigation_fails_closed_without_marking_a_mutation_pending() {
+        let mut surface = projected_surface();
+        surface
+            .runs
+            .get_mut("run-1")
+            .expect("run")
+            .actions
+            .retain(|action| {
+                action.kind != bcode_workflow_view_models::WorkflowActionKind::OpenSession
+            });
+
+        assert_eq!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Char('o')
+            ))),
+            PluginTuiAction::Redraw
+        );
+        assert!(
+            surface
+                .inline_error
+                .as_deref()
+                .is_some_and(|error| error.contains("stale or unavailable"))
+        );
+        assert!(surface.pending_action_target.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn input_form_validates_schema_and_retains_text_after_rejection() {
         let mut surface = projected_surface();
         let mut run = surface.runs.get("run-1").expect("run").clone();
@@ -3932,6 +4179,20 @@ mod tests {
             input: None,
             requested_at_ms: 1,
         }];
+        run.actions.retain(|action| {
+            action.kind != bcode_workflow_view_models::WorkflowActionKind::ProvideInput
+        });
+        run.actions
+            .push(bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::ProvideInput,
+                target: bcode_workflow_view_models::WorkflowActionTarget::Activation {
+                    run_id: "run-1".to_string(),
+                    node_id: "input".to_string(),
+                    activation_id: "input-1".to_string(),
+                },
+                enabled: true,
+                unavailable_reason: None,
+            });
         surface.runs.insert("run-1".to_string(), run);
         surface.selected_wait_id = Some(("input".to_string(), "input-1".to_string()));
         assert_eq!(
@@ -3977,6 +4238,41 @@ mod tests {
                 && arguments.contains("activation_id=input-1")
         ));
         assert!(surface.input_form.is_some());
+        assert!(matches!(
+            surface.pending_action_target,
+            Some((
+                bcode_workflow_view_models::WorkflowActionKind::ProvideInput,
+                bcode_workflow_view_models::WorkflowActionTarget::Activation { .. }
+            ))
+        ));
+
+        let still_waiting = surface.runs.get("run-1").expect("run").clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        surface.updates = Some(receiver);
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(still_waiting)))
+            .expect("rejected authoritative refresh");
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        let form = surface
+            .input_form
+            .as_ref()
+            .expect("form retained after rejection");
+        assert_eq!(form.fields[0].editor.buffer().text(), "true");
+        assert!(surface.pending_action_target.is_some());
+
+        let mut refreshed = surface.runs.get("run-1").expect("run").clone();
+        refreshed.waits.clear();
+        refreshed.actions.retain(|action| {
+            action.kind != bcode_workflow_view_models::WorkflowActionKind::ProvideInput
+        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        surface.updates = Some(receiver);
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(refreshed)))
+            .expect("authoritative refresh");
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert!(surface.input_form.is_none());
+        assert!(surface.pending_action_target.is_none());
     }
 
     #[test]
@@ -4032,6 +4328,35 @@ mod tests {
     }
 
     #[test]
+    fn top_level_authoring_entries_route_to_plugin_owned_capabilities() {
+        let mut surface = projected_surface();
+        let key =
+            |character| Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Char(character)));
+        assert!(matches!(
+            surface.handle_control_center_event(&key('D')),
+            PluginTuiAction::InvokePluginCommand { ref command_id, .. }
+                if command_id == "workflow.list"
+        ));
+        assert!(matches!(
+            surface.handle_control_center_event(&key('T')),
+            PluginTuiAction::InvokePluginCommand { ref command_id, .. }
+                if command_id == "workflow.templates"
+        ));
+        assert!(matches!(
+            surface.handle_control_center_event(&key('N')),
+            PluginTuiAction::OpenSurface {
+                ref plugin_id,
+                ref surface_id,
+                ref options,
+            } if plugin_id == "bcode.workflow"
+                && surface_id == WORKFLOW_AUTHOR_SURFACE_KIND
+                && options["entry"] == "new_workflow"
+        ));
+        let rendered = render_workspace_text(&surface, 240, 28);
+        assert!(rendered.contains("definitions/templates/new"));
+    }
+
+    #[test]
     fn definition_navigation_targets_exact_existing_draft_or_published_revision() {
         let mut surface = projected_surface();
         surface
@@ -4045,8 +4370,42 @@ mod tests {
                 revision: 7,
                 editable_draft_id: Some("draft-current".to_string()),
             };
+        let run = surface.runs.get_mut("run-1").expect("run");
+        run.actions.extend([
+            bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::ViewDefinition,
+                target: bcode_workflow_view_models::WorkflowActionTarget::PublishedDefinition {
+                    workflow_id: "review-workflow".to_string(),
+                    revision: 7,
+                },
+                enabled: true,
+                unavailable_reason: None,
+            },
+            bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::EditDraft,
+                target: bcode_workflow_view_models::WorkflowActionTarget::Draft {
+                    workflow_id: "review-workflow".to_string(),
+                    draft_id: "draft-current".to_string(),
+                },
+                enabled: true,
+                unavailable_reason: None,
+            },
+        ]);
         assert!(matches!(
-            surface.definition_navigation_action(),
+            surface.definition_action(
+                bcode_workflow_view_models::WorkflowActionKind::ViewDefinition
+            ),
+            PluginTuiAction::OpenSurface {
+                ref plugin_id,
+                ref surface_id,
+                ref options,
+            } if plugin_id == "bcode.workflow"
+                && surface_id == WORKFLOW_AUTHOR_SURFACE_KIND
+                && options["workflow_id"] == "review-workflow"
+                && options["view_revision"] == 7
+        ));
+        assert!(matches!(
+            surface.definition_action(bcode_workflow_view_models::WorkflowActionKind::EditDraft),
             PluginTuiAction::OpenSurface {
                 ref plugin_id,
                 ref surface_id,
@@ -4058,20 +4417,28 @@ mod tests {
                 && options.get("fork_revision").is_none()
         ));
 
-        if let bcode_workflow_view_models::WorkflowDefinitionDisposition::Published {
-            editable_draft_id,
-            ..
-        } = &mut surface
-            .runs
-            .get_mut("run-1")
-            .expect("run")
-            .run
-            .definition_disposition
-        {
-            *editable_draft_id = None;
-        }
+        let run = surface.runs.get_mut("run-1").expect("run");
+        run.actions.retain(|action| {
+            !matches!(
+                action.kind,
+                bcode_workflow_view_models::WorkflowActionKind::EditDraft
+                    | bcode_workflow_view_models::WorkflowActionKind::ForkDefinition
+            )
+        });
+        run.actions
+            .push(bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::ForkDefinition,
+                target: bcode_workflow_view_models::WorkflowActionTarget::PublishedDefinition {
+                    workflow_id: "review-workflow".to_string(),
+                    revision: 7,
+                },
+                enabled: true,
+                unavailable_reason: None,
+            });
         assert!(matches!(
-            surface.definition_navigation_action(),
+            surface.definition_action(
+                bcode_workflow_view_models::WorkflowActionKind::ForkDefinition
+            ),
             PluginTuiAction::OpenSurface {
                 ref options,
                 ..
@@ -4742,8 +5109,8 @@ mod tests {
         surface.catalog_stale = false;
         surface.live_status = "live updates unavailable: offline".to_string();
         assert!(render_workspace_text(&surface, 88, 24).contains("offline"));
-        surface.live_status = "resync required; reopen /workflow".to_string();
-        assert!(render_workspace_text(&surface, 88, 24).contains("resync required"));
+        surface.live_status = "resynchronizing bounded workflow state…".to_string();
+        assert!(render_workspace_text(&surface, 88, 24).contains("resynchronizing"));
         surface.live_status = "live".to_string();
         surface.runs.get_mut("run-1").expect("run").health =
             bcode_workflow_view_models::WorkflowProjectionHealth::Degraded {
@@ -5141,10 +5508,10 @@ mod tests {
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         surface.attach_updates(receiver);
         sender
-            .try_send(PluginTuiSurfaceUpdate::ResyncRequired)
+            .try_send(PluginTuiSurfaceUpdate::Resyncing)
             .expect("resync update");
         assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
-        assert!(surface.live_status.contains("resync required"));
+        assert!(surface.live_status.contains("resynchronizing"));
 
         sender
             .try_send(PluginTuiSurfaceUpdate::Disconnected {

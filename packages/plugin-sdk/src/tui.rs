@@ -856,7 +856,8 @@ pub enum PluginTuiSurfaceUpdate {
     /// Select one exact run whose bounded detail should be loaded by the host.
     SelectWorkflowRun { run_id: String },
     /// The observer requires bounded snapshot replacement.
-    ResyncRequired,
+    /// Canonical state replacement is underway after a bounded live gap.
+    Resyncing,
     /// Live observation stopped or entered a degraded state.
     Disconnected { message: String },
 }

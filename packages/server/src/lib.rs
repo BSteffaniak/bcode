@@ -59553,7 +59553,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn fixed_generation_workflow_start_requires_and_pins_exact_parent_generation() {
-        let sessions = SessionManager::default();
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions =
+            SessionManager::persistent(session_root.path()).expect("persistent sessions");
         let parent = sessions
             .create_session(Some("parent".to_string()), PathBuf::from("."))
             .await
