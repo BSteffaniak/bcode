@@ -10817,6 +10817,111 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
 }
 
 impl WorkflowPromptConfiguration {
+    /// Create a strict structured-result prompt using safe read-only defaults.
+    #[must_use]
+    pub fn structured(
+        agent_profile: impl Into<String>,
+        schema: ValueSchema,
+        system_prompt: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            agent_profile,
+            WorkflowPromptOutputPolicy::structured_result(schema),
+            system_prompt,
+        )
+    }
+
+    /// Create an input-preserving side-effect prompt using safe read-only defaults.
+    #[must_use]
+    pub fn preserve_input(
+        agent_profile: impl Into<String>,
+        system_prompt: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            agent_profile,
+            WorkflowPromptOutputPolicy::PreserveInput,
+            system_prompt,
+        )
+    }
+
+    fn new(
+        agent_profile: impl Into<String>,
+        output: WorkflowPromptOutputPolicy,
+        system_prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_target: PromptContextTarget::FreshIsolated,
+            agent_profile: agent_profile.into(),
+            provider: None,
+            model: None,
+            output,
+            read_only: true,
+            tool_capability: WorkflowToolCapability::ReadOnly,
+            tool_allowlist: Vec::new(),
+            timeout_ms: 300_000,
+            prompt_mode: "json_input".to_string(),
+            system_prompt: system_prompt.into(),
+        }
+    }
+
+    /// Select the prompt context target.
+    #[must_use]
+    pub const fn with_execution_target(mut self, target: PromptContextTarget) -> Self {
+        self.execution_target = target;
+        self
+    }
+
+    /// Select an exact provider plugin and model override.
+    #[must_use]
+    pub fn with_model_selection(
+        mut self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.provider = Some(provider.into());
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Configure read-only tool access and an exact allowlist.
+    #[must_use]
+    pub fn with_read_only_tools(mut self, tool_allowlist: Vec<String>) -> Self {
+        self.read_only = true;
+        self.tool_capability = WorkflowToolCapability::ReadOnly;
+        self.tool_allowlist = tool_allowlist;
+        self
+    }
+
+    /// Configure mutating tool access and an exact allowlist.
+    #[must_use]
+    pub fn with_mutating_tools(mut self, tool_allowlist: Vec<String>) -> Self {
+        self.read_only = false;
+        self.tool_capability = WorkflowToolCapability::Mutating;
+        self.tool_allowlist = tool_allowlist;
+        self
+    }
+
+    /// Configure the complete prompt timeout in milliseconds.
+    #[must_use]
+    pub const fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Configure bounded result-only corrections for a structured prompt.
+    ///
+    /// This has no effect on input-preserving prompts. [`Self::validate`] rejects values above the
+    /// supported bound.
+    #[must_use]
+    pub const fn with_max_result_corrections(mut self, max_attempts: u32) -> Self {
+        if let WorkflowPromptOutputPolicy::Structured { result } = &mut self.output {
+            result.correction =
+                WorkflowStructuredResultCorrectionPolicy::with_max_attempts(max_attempts);
+        }
+        self
+    }
+
     /// Validate bounded identity and policy rules.
     ///
     /// # Errors
@@ -13038,6 +13143,30 @@ where
         ))
     }
 
+    /// Create a typed, input-preserving daemon-hosted agent step.
+    ///
+    /// The model may perform authorized side effects, but successful completion forwards the exact
+    /// activation input and does not request structured-result finalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration is invalid or cannot be serialized.
+    pub fn input_preserving_agent(
+        name: impl Into<String>,
+        configuration: &WorkflowPromptConfiguration,
+    ) -> Result<Self, WorkflowError>
+    where
+        I: Into<O>,
+    {
+        if configuration.output != WorkflowPromptOutputPolicy::PreserveInput {
+            return Err(WorkflowError::Build {
+                path: "prompt.output".to_string(),
+                message: "input-preserving agent requires preserve_input output policy".to_string(),
+            });
+        }
+        Self::agent(name, configuration)
+    }
+
     /// Select where a daemon-hosted agent leaf executes.
     ///
     /// # Panics
@@ -15131,6 +15260,38 @@ mod tests {
             prompt_mode: "json_input".to_string(),
             system_prompt: String::new(),
         }
+    }
+
+    #[test]
+    fn prompt_configuration_builders_express_structured_and_input_preserving_contracts() {
+        let structured = WorkflowPromptConfiguration::structured(
+            "review",
+            ValueSchema::of::<u32>(),
+            "Review the input.",
+        )
+        .with_execution_target(PromptContextTarget::FixedGenerationFork)
+        .with_read_only_tools(vec!["filesystem.read".to_string()])
+        .with_timeout_ms(42_000)
+        .with_max_result_corrections(2);
+        structured.validate().expect("structured builder");
+        assert_eq!(structured.timeout_ms, 42_000);
+        assert_eq!(
+            structured
+                .output
+                .structured()
+                .expect("structured")
+                .correction
+                .max_attempts,
+            2
+        );
+
+        let preserve =
+            WorkflowPromptConfiguration::preserve_input("build", "Perform the requested mutation.")
+                .with_mutating_tools(vec!["filesystem.write".to_string()]);
+        preserve.validate().expect("preserve-input builder");
+        Step::<u32, u32>::input_preserving_agent("mutate", &preserve)
+            .expect("input-preserving step");
+        assert!(Step::<u32, u32>::input_preserving_agent("invalid", &structured).is_err());
     }
 
     #[test]
