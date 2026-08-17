@@ -14572,9 +14572,11 @@ mod tests {
                                 agent_profile: "review".to_string(),
                                 provider: None,
                                 model: None,
-                                structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                                    schema,
-                                    strict: true,
+                                output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                                    result: bcode_workflow::PromptStructuredOutputPolicy {
+                                        schema,
+                                        strict: true,
+                                    },
                                 },
                                 read_only: true,
                                 tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,

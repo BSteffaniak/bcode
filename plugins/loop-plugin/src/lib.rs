@@ -1232,9 +1232,11 @@ fn commit_message_agent_configuration(
         agent_profile: "plan".to_string(),
         provider: None,
         model: None,
-        structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-            schema: bcode_workflow::ValueSchema::of::<CommitMessageResult>(),
-            strict: true,
+        output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+            result: bcode_workflow::PromptStructuredOutputPolicy {
+                schema: bcode_workflow::ValueSchema::of::<CommitMessageResult>(),
+                strict: true,
+            },
         },
         read_only: true,
         tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
@@ -1283,9 +1285,11 @@ fn loop_agent_configuration<O: JsonSchema>(
         agent_profile: agent_profile.to_string(),
         provider: None,
         model: None,
-        structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-            schema: bcode_workflow::ValueSchema::of::<O>(),
-            strict: true,
+        output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+            result: bcode_workflow::PromptStructuredOutputPolicy {
+                schema: bcode_workflow::ValueSchema::of::<O>(),
+                strict: true,
+            },
         },
         read_only,
         tool_capability: if read_only {
@@ -1303,15 +1307,17 @@ fn loop_agent_configuration<O: JsonSchema>(
 fn loop_workflow_spec(
     input: &LoopWorkflowInput,
 ) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
+    let mut implementation_configuration = loop_agent_configuration::<LoopWorkflowIteration>(
+        "Implement the requested work. Complete the authorized work, then report ordinary completion; workflow state is preserved by the host.",
+        "build",
+        false,
+    );
+    implementation_configuration.output = bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput;
     let implementation = bcode_workflow::Step::configured_task(
         "loop.implementation",
         bcode_workflow::NodeKind::Agent,
-        serde_json::to_value(loop_agent_configuration::<LoopWorkflowIteration>(
-            "Implement the requested work. Preserve the workflow envelope fields including iteration, set condition_met false, and provide no evaluation evidence.",
-            "build",
-            false,
-        ))
-        .expect("loop agent configuration should serialize"),
+        serde_json::to_value(implementation_configuration)
+            .expect("loop agent configuration should serialize"),
         |state: LoopWorkflowIteration, _context| async move { Ok(state) },
     );
     let evaluation = bcode_workflow::Step::configured_task(
@@ -1514,7 +1520,12 @@ mod tests {
         assert_eq!(configuration.tool_allowlist, ["git.diff"]);
         assert!(configuration.system_prompt.contains("commit-message"));
         assert_eq!(
-            configuration.structured_output.schema.type_name,
+            configuration
+                .output
+                .structured()
+                .expect("structured result")
+                .schema
+                .type_name,
             std::any::type_name::<CommitMessageResult>()
         );
     }
@@ -1752,24 +1763,23 @@ mod tests {
             serde_json::json!(true)
         );
         assert_eq!(
-            definition.nodes["loop.evaluation"].configuration["structured_output"]["schema"]["schema"]
+            definition.nodes["loop.evaluation"].configuration["output"]["result"]["schema"]["schema"]
                 ["properties"]["evidence"]["minItems"],
             serde_json::json!(1)
         );
         assert_eq!(
-            definition.nodes["loop.evaluation"].configuration["structured_output"]["schema"]["schema"]
+            definition.nodes["loop.evaluation"].configuration["output"]["result"]["schema"]["schema"]
                 ["properties"]["summary"]["minLength"],
             serde_json::json!(1)
         );
-        assert!(definition.nodes["loop.implementation"].configuration["structured_output"]
-            ["schema"]["schema"]["properties"]["evidence"]["minItems"]
-            .is_null());
-        for node_id in ["loop.implementation", "loop.evaluation"] {
-            let schema =
-                &definition.nodes[node_id].configuration["structured_output"]["schema"]["schema"];
-            bcode_model_schema::normalize(schema, &bedrock_schema_dialect_for_test())
-                .unwrap_or_else(|error| panic!("{node_id} schema must fit Bedrock: {error}"));
-        }
+        assert_eq!(
+            definition.nodes["loop.implementation"].configuration["output"]["mode"],
+            serde_json::json!("preserve_input")
+        );
+        let evaluation_schema = &definition.nodes["loop.evaluation"].configuration["output"]["result"]
+            ["schema"]["schema"];
+        bcode_model_schema::normalize(evaluation_schema, &bedrock_schema_dialect_for_test())
+            .unwrap_or_else(|error| panic!("loop.evaluation schema must fit Bedrock: {error}"));
         assert!(
             definition.nodes["loop.implementation"].configuration["tools"].is_null(),
             "implementation keeps the current session's unrestricted tool policy"
@@ -1815,16 +1825,15 @@ mod tests {
         };
         let spec = loop_workflow_spec(&input).expect("loop workflow");
         let definition = spec.definition();
-        let implementation_schema = &definition.nodes["loop.implementation"].configuration["structured_output"]
+        assert_eq!(
+            definition.nodes["loop.implementation"].configuration["output"]["mode"],
+            serde_json::json!("preserve_input")
+        );
+        let evaluation_schema = &definition.nodes["loop.evaluation"].configuration["output"]["result"]
             ["schema"]["schema"];
-        let evaluation_schema = &definition.nodes["loop.evaluation"].configuration["structured_output"]
-            ["schema"]["schema"];
-        let implementation_validator =
-            jsonschema::validator_for(implementation_schema).expect("implementation schema");
         let evaluation_validator =
             jsonschema::validator_for(evaluation_schema).expect("evaluation schema");
 
-        assert!(implementation_validator.is_valid(&envelope));
         assert!(!evaluation_validator.is_valid(&envelope));
     }
 

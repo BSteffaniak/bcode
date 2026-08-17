@@ -4146,7 +4146,7 @@ pub struct WorkflowStructuredSourcePrompt {
     pub configuration: WorkflowPromptConfiguration,
     /// Exact typed agent input schema.
     pub input: ValueSchema,
-    /// Exact typed structured output schema. Must equal `configuration.structured_output.schema`.
+    /// Exact typed output schema. Must match the structured result or input-preserving policy.
     pub output: ValueSchema,
     /// Resources acquired atomically before agent dispatch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4208,9 +4208,11 @@ impl WorkflowStructuredSourceConcisePrompt {
             agent_profile: self.agent_profile.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
-            structured_output: PromptStructuredOutputPolicy {
-                schema: self.output.clone(),
-                strict: true,
+            output: WorkflowPromptOutputPolicy::Structured {
+                result: PromptStructuredOutputPolicy {
+                    schema: self.output.clone(),
+                    strict: true,
+                },
             },
             read_only: self.read_only,
             tool_capability,
@@ -7499,10 +7501,10 @@ impl WorkflowStructuredSourceDocument {
                         &format!("steps[{index}].prompt.output"),
                         &prompt.output,
                     )?;
-                    if prompt.configuration.structured_output.schema != prompt.output {
+                    if prompt.configuration.output.output_schema(&prompt.input) != &prompt.output {
                         return Err(authoring_error(
                             format!("steps[{index}].prompt.output"),
-                            "agent output must match its structured-output schema exactly",
+                            "agent output must match its configured output policy",
                         ));
                     }
                     NodeDefinition {
@@ -10621,7 +10623,8 @@ impl ResourceClaim {
 }
 
 /// Stable durable prompt-node configuration version.
-pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2;
+pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 3;
+const LEGACY_WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2;
 
 /// Typed structured-output policy for a durable prompt node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -10631,8 +10634,38 @@ pub struct PromptStructuredOutputPolicy {
     pub strict: bool,
 }
 
-/// Versioned serializable durable prompt-node configuration.
+/// Result behavior for a durable model-backed workflow node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowPromptOutputPolicy {
+    /// Replace the activation input with one schema-validated model result.
+    Structured {
+        /// Canonical workflow result contract.
+        result: PromptStructuredOutputPolicy,
+    },
+    /// Treat successful model completion as a side-effect-only operation and forward the input.
+    PreserveInput,
+}
+
+impl WorkflowPromptOutputPolicy {
+    /// Return the structured-result policy when this node produces one.
+    #[must_use]
+    pub const fn structured(&self) -> Option<&PromptStructuredOutputPolicy> {
+        match self {
+            Self::Structured { result } => Some(result),
+            Self::PreserveInput => None,
+        }
+    }
+
+    /// Return the canonical output schema for this policy.
+    #[must_use]
+    pub fn output_schema<'a>(&'a self, input: &'a ValueSchema) -> &'a ValueSchema {
+        self.structured().map_or(input, |result| &result.schema)
+    }
+}
+
+/// Versioned serializable durable prompt-node configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowPromptConfiguration {
     pub version: u32,
@@ -10640,13 +10673,89 @@ pub struct WorkflowPromptConfiguration {
     pub agent_profile: String,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub structured_output: PromptStructuredOutputPolicy,
+    pub output: WorkflowPromptOutputPolicy,
     pub read_only: bool,
     pub tool_capability: WorkflowToolCapability,
     pub tool_allowlist: Vec<String>,
     pub timeout_ms: u64,
     pub prompt_mode: String,
     pub system_prompt: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowPromptConfigurationWire {
+    version: u32,
+    execution_target: PromptContextTarget,
+    agent_profile: String,
+    provider: Option<String>,
+    model: Option<String>,
+    #[serde(default)]
+    output: Option<WorkflowPromptOutputPolicy>,
+    #[serde(default)]
+    structured_output: Option<PromptStructuredOutputPolicy>,
+    read_only: bool,
+    tool_capability: WorkflowToolCapability,
+    tool_allowlist: Vec<String>,
+    timeout_ms: u64,
+    prompt_mode: String,
+    system_prompt: String,
+}
+
+impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let wire = WorkflowPromptConfigurationWire::deserialize(deserializer)?;
+        let output = match wire.version {
+            LEGACY_WORKFLOW_PROMPT_CONFIGURATION_VERSION => {
+                if wire.output.is_some() {
+                    return Err(D::Error::custom(
+                        "prompt configuration version 2 must not contain output",
+                    ));
+                }
+                WorkflowPromptOutputPolicy::Structured {
+                    result: wire.structured_output.ok_or_else(|| {
+                        D::Error::custom(
+                            "prompt configuration version 2 requires structured_output",
+                        )
+                    })?,
+                }
+            }
+            WORKFLOW_PROMPT_CONFIGURATION_VERSION => {
+                if wire.structured_output.is_some() {
+                    return Err(D::Error::custom(
+                        "prompt configuration version 3 must not contain structured_output",
+                    ));
+                }
+                wire.output.ok_or_else(|| {
+                    D::Error::custom("prompt configuration version 3 requires output")
+                })?
+            }
+            version => {
+                return Err(D::Error::custom(format!(
+                    "unsupported prompt configuration version {version}; expected {WORKFLOW_PROMPT_CONFIGURATION_VERSION}"
+                )));
+            }
+        };
+        Ok(Self {
+            version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_target: wire.execution_target,
+            agent_profile: wire.agent_profile,
+            provider: wire.provider,
+            model: wire.model,
+            output,
+            read_only: wire.read_only,
+            tool_capability: wire.tool_capability,
+            tool_allowlist: wire.tool_allowlist,
+            timeout_ms: wire.timeout_ms,
+            prompt_mode: wire.prompt_mode,
+            system_prompt: wire.system_prompt,
+        })
+    }
 }
 
 impl WorkflowPromptConfiguration {
@@ -10722,12 +10831,14 @@ impl WorkflowPromptConfiguration {
                 message: "agent tool IDs must be non-empty and unique".to_string(),
             });
         }
-        jsonschema::validator_for(&self.structured_output.schema.schema).map_err(|error| {
-            WorkflowError::Build {
-                path: "prompt.structured_output".to_string(),
-                message: format!("invalid structured output schema: {error}"),
-            }
-        })?;
+        if let Some(structured) = self.output.structured() {
+            jsonschema::validator_for(&structured.schema.schema).map_err(|error| {
+                WorkflowError::Build {
+                    path: "prompt.output".to_string(),
+                    message: format!("invalid structured output schema: {error}"),
+                }
+            })?;
+        }
         Ok(())
     }
 }
@@ -14940,9 +15051,11 @@ mod tests {
             agent_profile: "build".to_string(),
             provider: None,
             model: None,
-            structured_output: PromptStructuredOutputPolicy {
-                schema: ValueSchema::of::<u32>(),
-                strict: true,
+            output: WorkflowPromptOutputPolicy::Structured {
+                result: PromptStructuredOutputPolicy {
+                    schema: ValueSchema::of::<u32>(),
+                    strict: true,
+                },
             },
             read_only: true,
             tool_capability: WorkflowToolCapability::ReadOnly,
@@ -15035,9 +15148,11 @@ mod tests {
                             agent_profile: "review".to_string(),
                             provider: None,
                             model: None,
-                            structured_output: PromptStructuredOutputPolicy {
-                                schema: value_schema,
-                                strict: true,
+                            output: WorkflowPromptOutputPolicy::Structured {
+                                result: PromptStructuredOutputPolicy {
+                                    schema: value_schema,
+                                    strict: true,
+                                },
                             },
                             read_only: true,
                             tool_capability: WorkflowToolCapability::ReadOnly,
@@ -16576,9 +16691,11 @@ steps:
             agent_profile: "review".to_string(),
             provider: None,
             model: None,
-            structured_output: PromptStructuredOutputPolicy {
-                schema: schema.clone(),
-                strict: true,
+            output: WorkflowPromptOutputPolicy::Structured {
+                result: PromptStructuredOutputPolicy {
+                    schema: schema.clone(),
+                    strict: true,
+                },
             },
             read_only: true,
             tool_capability: WorkflowToolCapability::ReadOnly,
@@ -20552,9 +20669,11 @@ steps:
             agent_profile: "build".to_string(),
             provider: Some("configured".to_string()),
             model: Some("configured".to_string()),
-            structured_output: PromptStructuredOutputPolicy {
-                schema: ValueSchema::of::<serde_json::Value>(),
-                strict: true,
+            output: WorkflowPromptOutputPolicy::Structured {
+                result: PromptStructuredOutputPolicy {
+                    schema: ValueSchema::of::<serde_json::Value>(),
+                    strict: true,
+                },
             },
             read_only: true,
             tool_capability: WorkflowToolCapability::ReadOnly,
@@ -20694,11 +20813,13 @@ steps:
             expanded.configuration.tool_capability,
             WorkflowToolCapability::ReadOnly
         );
-        assert_eq!(
-            expanded.configuration.structured_output.schema,
-            expanded.output
-        );
-        assert!(expanded.configuration.structured_output.strict);
+        let structured = expanded
+            .configuration
+            .output
+            .structured()
+            .expect("structured result");
+        assert_eq!(structured.schema, expanded.output);
+        assert!(structured.strict);
         assert!(
             expanded
                 .configuration
@@ -22499,9 +22620,11 @@ steps:
             agent_profile: "build".to_string(),
             provider: None,
             model: None,
-            structured_output: PromptStructuredOutputPolicy {
-                schema: schema.clone(),
-                strict: true,
+            output: WorkflowPromptOutputPolicy::Structured {
+                result: PromptStructuredOutputPolicy {
+                    schema: schema.clone(),
+                    strict: true,
+                },
             },
             read_only,
             tool_capability: if read_only {

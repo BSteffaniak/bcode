@@ -2454,9 +2454,11 @@ fn generic_node(
                 agent_profile: profile,
                 provider: None,
                 model: None,
-                structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                    schema: schema.clone(),
-                    strict: true,
+                output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                    result: bcode_workflow::PromptStructuredOutputPolicy {
+                        schema: schema.clone(),
+                        strict: true,
+                    },
                 },
                 read_only: true,
                 tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,

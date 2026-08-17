@@ -16546,7 +16546,11 @@ fn compile_workflow_template(
         }
         if node.output.type_name == template.configuration_schema().type_name {
             node.output = template.configuration_schema().clone();
-            agent.structured_output.schema = template.configuration_schema().clone();
+            if let bcode_workflow::WorkflowPromptOutputPolicy::Structured { result } =
+                &mut agent.output
+            {
+                result.schema = template.configuration_schema().clone();
+            }
         }
         node.configuration = serde_json::to_value(agent).map_err(|error| {
             WorkflowStoreError::InvalidData(format!(
@@ -31087,12 +31091,24 @@ fn workflow_attempt_observation_from_completion(
 ) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
     match completion.outcome {
         ModelTurnOutcome::Completed => {
-            let output = completion.output.ok_or_else(|| {
-                WorkflowStoreError::InvalidData(
-                    "completed workflow prompt turn has no structured output".to_string(),
-                )
-            })?;
-            let output: serde_json::Value = serde_json::from_str(&output)?;
+            let configuration = workflow_prompt_configuration_from_intent(request)?;
+            let output = match configuration.output {
+                bcode_workflow::WorkflowPromptOutputPolicy::Structured { .. } => {
+                    let output = completion.output.ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "completed workflow prompt turn has no structured output".to_string(),
+                        )
+                    })?;
+                    serde_json::from_str(&output)?
+                }
+                bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput => {
+                    request.activation.input.clone().ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "input-preserving workflow prompt has no activation input".to_string(),
+                        )
+                    })?
+                }
+            };
             let output_schema = workflow_prompt_output_schema(request)?;
             if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {
                 return Ok(bcode_workflow_store::AttemptObservation::Failed {
@@ -31571,7 +31587,7 @@ async fn observe_workflow_turn(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 store.definition(&run.definition_id, run.definition_version)?
             };
-            let configuration = stored_definition
+            let output_schema = stored_definition
                 .map(|stored| {
                     serde_json::from_str::<bcode_workflow::WorkflowDefinition>(
                         &stored.definition_json,
@@ -31579,14 +31595,12 @@ async fn observe_workflow_turn(
                 })
                 .transpose()?
                 .and_then(|definition| definition.node(&request.node_id).cloned())
-                .map(|node| node.configuration)
+                .map(|node| node.output)
                 .ok_or_else(|| {
                     WorkflowStoreError::InvalidData(
-                        "workflow prompt output configuration not found".to_string(),
+                        "workflow prompt output schema not found".to_string(),
                     )
                 })?;
-            let output_schema = workflow_prompt_configuration(&configuration)
-                .map(|configuration| configuration.structured_output.schema)?;
             if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {
                 return Ok(bcode_workflow_store::AttemptObservation::Failed {
                     message: format!("workflow prompt output failed schema validation: {error}"),
@@ -32683,9 +32697,7 @@ fn workflow_prompt_configuration_from_intent(
 fn workflow_prompt_output_schema(
     request: &bcode_workflow_store::PreparedActivationDispatch,
 ) -> Result<bcode_workflow::ValueSchema, WorkflowStoreError> {
-    Ok(workflow_prompt_configuration_from_intent(request)?
-        .structured_output
-        .schema)
+    Ok(request.activation.node.output.clone())
 }
 
 struct WorkflowPromptTurnOwner<'a> {
@@ -33198,12 +33210,14 @@ async fn dispatch_workflow_prompt_turn(
                 .then(|| configuration.tool_allowlist.clone()),
             provider_plugin_id: configuration.provider.clone(),
             model_id: configuration.model.clone(),
-            structured_output: Some(TurnStructuredOutputRequest {
-                name: bcode_session_models::structured_output_name(
-                    &request.activation.node.output.type_name,
-                ),
-                schema: configuration.structured_output.schema.schema.clone(),
-                strict: configuration.structured_output.strict,
+            structured_output: configuration.output.structured().map(|structured| {
+                TurnStructuredOutputRequest {
+                    name: bcode_session_models::structured_output_name(
+                        &request.activation.node.output.type_name,
+                    ),
+                    schema: structured.schema.schema.clone(),
+                    strict: structured.strict,
+                }
             }),
             ..TurnExecutionOptions::default()
         },
@@ -54816,9 +54830,11 @@ library = "test"
             agent_profile: "build".to_string(),
             provider: Some("bcode.fake-provider".to_string()),
             model: Some("fake-echo".to_string()),
-            structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                schema,
-                strict: true,
+            output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                result: bcode_workflow::PromptStructuredOutputPolicy {
+                    schema,
+                    strict: true,
+                },
             },
             read_only: true,
             tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
@@ -56622,9 +56638,11 @@ library = "test"
             agent_profile: "build".to_string(),
             provider: None,
             model: None,
-            structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                schema: schema.clone(),
-                strict: true,
+            output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                result: bcode_workflow::PromptStructuredOutputPolicy {
+                    schema: schema.clone(),
+                    strict: true,
+                },
             },
             read_only: false,
             tool_capability: bcode_workflow::WorkflowToolCapability::Mutating,
@@ -58171,11 +58189,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 agent_profile: "build".to_string(),
                 provider: None,
                 model: None,
-                structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                    schema: schema.clone(),
-                    strict: true,
+                output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                    result: bcode_workflow::PromptStructuredOutputPolicy {
+                        schema: schema.clone(),
+                        strict: true,
+                    },
+                    read_only,
                 },
-                read_only,
                 tool_capability: if read_only {
                     bcode_workflow::WorkflowToolCapability::ReadOnly
                 } else {
@@ -58352,11 +58372,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 agent_profile: "build".to_string(),
                 provider: None,
                 model: None,
-                structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                    schema: schema.clone(),
-                    strict: true,
+                output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                    result: bcode_workflow::PromptStructuredOutputPolicy {
+                        schema: schema.clone(),
+                        strict: true,
+                    },
+                    read_only,
                 },
-                read_only,
                 tool_capability: if read_only {
                     bcode_workflow::WorkflowToolCapability::ReadOnly
                 } else {
@@ -58639,9 +58661,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                 agent_profile: "plan".to_string(),
                                 provider: None,
                                 model: None,
-                                structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                                    schema: schema.clone(),
-                                    strict: true,
+                                output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                                    result: bcode_workflow::PromptStructuredOutputPolicy {
+                                        schema: schema.clone(),
+                                        strict: true,
+                                    },
                                 },
                                 read_only: true,
                                 tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
@@ -58796,9 +58820,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             agent_profile: "plan".to_string(),
             provider: None,
             model: None,
-            structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                schema: schema.clone(),
-                strict: true,
+            output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                result: bcode_workflow::PromptStructuredOutputPolicy {
+                    schema: schema.clone(),
+                    strict: true,
+                },
             },
             read_only: true,
             tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
@@ -59130,9 +59156,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             agent_profile: "build".to_string(),
                             provider: Some("bcode.fake-provider".to_string()),
                             model: Some("fake-echo".to_string()),
-                            structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                                schema,
-                                strict: true,
+                            output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                                result: bcode_workflow::PromptStructuredOutputPolicy {
+                                    schema,
+                                    strict: true,
+                                },
                             },
                             read_only: true,
                             tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
@@ -59318,15 +59346,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             agent_profile: "build".to_string(),
                             provider: Some("bcode.fake-provider".to_string()),
                             model: Some("fake-echo".to_string()),
-                            structured_output: bcode_workflow::PromptStructuredOutputPolicy {
-                                schema: bcode_workflow::ValueSchema {
-                                    type_name: "u32".to_string(),
-                                    schema: serde_json::json!({
-                                        "type": "integer",
-                                        "minimum": 0
-                                    }),
+                            output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
+                                result: bcode_workflow::PromptStructuredOutputPolicy {
+                                    schema: bcode_workflow::ValueSchema {
+                                        type_name: "u32".to_string(),
+                                        schema: serde_json::json!({
+                                            "type": "integer",
+                                            "minimum": 0
+                                        }),
+                                    },
+                                    strict: true,
                                 },
-                                strict: true,
                             },
                             read_only: true,
                             tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
