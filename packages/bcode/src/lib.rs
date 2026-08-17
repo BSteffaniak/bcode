@@ -3238,14 +3238,18 @@ fn decode_structured_output<T>(schema: &serde_json::Value, text: &str) -> Result
 where
     T: DeserializeOwned,
 {
-    let value = extract_structured_json(text)?;
+    let value = extract_structured_json(schema, text)?;
     validate_json_schema(schema, &value)?;
     serde_json::from_value(value).map_err(|error| BcodeError::StructuredDecode(error.to_string()))
 }
 
-fn extract_structured_json(text: &str) -> Result<serde_json::Value> {
-    bcode_model_provider_runtime::extract_structured_json_candidate(text)
-        .map_err(BcodeError::StructuredInvalidJson)
+fn extract_structured_json(schema: &serde_json::Value, text: &str) -> Result<serde_json::Value> {
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|error| BcodeError::StructuredInvalidSchema(error.to_string()))?;
+    bcode_model_provider_runtime::extract_structured_json_candidate(text, |value| {
+        validator.is_valid(value)
+    })
+    .map_err(BcodeError::StructuredInvalidJson)
 }
 
 fn json_object_slice(text: &str) -> Option<&str> {

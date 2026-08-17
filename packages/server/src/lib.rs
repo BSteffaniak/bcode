@@ -20699,14 +20699,14 @@ fn normalized_structured_result_candidate(
     request: &bcode_session_models::TurnStructuredOutputRequest,
     output: &str,
 ) -> Result<String, String> {
-    let value = bcode_model_provider_runtime::extract_structured_json_candidate(output)
-        .map_err(|error| bounded_structured_validation_message(&error))?;
     let validator = jsonschema::validator_for(&request.schema).map_err(|error| {
         bounded_structured_validation_message(&format!("invalid canonical schema: {error}"))
     })?;
-    if let Err(error) = validator.validate(&value) {
-        return Err(bounded_structured_validation_message(&error.to_string()));
-    }
+    let value = bcode_model_provider_runtime::extract_structured_json_candidate(output, |value| {
+        validator.is_valid(value)
+            && validate_structured_result_semantics(&request.schema, value).is_ok()
+    })
+    .map_err(|error| bounded_structured_validation_message(&error))?;
     validate_structured_result_semantics(&request.schema, &value)
         .map_err(|error| bounded_structured_validation_message(&error))?;
     serde_json::to_string(&value)
@@ -21929,7 +21929,7 @@ async fn run_model_turn_round(
     if request.structured_output.is_some()
         && let Some(segment) = assistant_text.as_mut()
         && let Ok(normalized) =
-            bcode_model_provider_runtime::extract_structured_json_candidate(&segment.text)
+            bcode_model_provider_runtime::extract_structured_json_candidate(&segment.text, |_| true)
                 .and_then(|value| serde_json::to_string(&value).map_err(|error| error.to_string()))
     {
         segment.text = normalized;
@@ -31727,8 +31727,6 @@ async fn observe_workflow_turn(
                     "completed workflow prompt turn has no assistant output".to_string(),
                 )
             })?;
-            let output = bcode_model_provider_runtime::extract_structured_json_candidate(&output)
-                .map_err(WorkflowStoreError::InvalidData)?;
             // Each store access takes and releases the lock in its own scope. Chaining the lookups
             // through combinators would keep the first guard alive while the closure locks the same
             // non-reentrant mutex again, which self-deadlocks.
@@ -31761,6 +31759,14 @@ async fn observe_workflow_turn(
                         "workflow prompt output schema not found".to_string(),
                     )
                 })?;
+            let validator = jsonschema::validator_for(&output_schema.schema)
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            let output =
+                bcode_model_provider_runtime::extract_structured_json_candidate(&output, |value| {
+                    validator.is_valid(value)
+                        && validate_workflow_output_semantics(&output_schema, value).is_ok()
+                })
+                .map_err(WorkflowStoreError::InvalidData)?;
             if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {
                 return Ok(bcode_workflow_store::AttemptObservation::Failed {
                     message: format!("workflow prompt output failed schema validation: {error}"),

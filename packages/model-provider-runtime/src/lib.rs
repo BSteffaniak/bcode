@@ -120,67 +120,282 @@ fn simple_provider_error(
     }
 }
 
-/// Safely extract one unambiguous JSON value from model output.
+const MAX_STRUCTURED_CANDIDATE_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_STRUCTURED_CANDIDATES: usize = 128;
+const MAX_STRUCTURED_CANDIDATE_BYTES: usize = 256 * 1024;
+
+/// Syntactic envelope in which a structured JSON candidate was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StructuredCandidateEnvelope {
+    /// The complete trimmed model output was one JSON value.
+    Exact,
+    /// One complete `json` Markdown fence contained the value.
+    JsonFence,
+    /// One complete unlabeled Markdown fence contained the value.
+    UnlabeledFence,
+    /// A JSON object or array was embedded in model prose.
+    Embedded,
+}
+
+/// One bounded parseable object or array discovered in model output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredJsonCandidate {
+    /// Byte range in the original model output.
+    pub range: std::ops::Range<usize>,
+    /// Parsed JSON value.
+    pub value: serde_json::Value,
+    /// Canonical compact JSON used to deduplicate equivalent candidates.
+    pub canonical_json: String,
+    /// Syntactic envelope used to discover the value.
+    pub envelope: StructuredCandidateEnvelope,
+}
+
+/// Catalog every bounded parseable JSON object or array in model output.
 ///
-/// Exact JSON is preferred. Markdown fences are accepted only when there is exactly one complete
-/// fence, its optional language is `json`, and all surrounding content is whitespace. As a final
-/// compatibility path, one balanced top-level object or array may be surrounded by prose, but
-/// multiple candidates or trailing JSON values fail closed.
+/// The cataloger never chooses a value and never interprets surrounding prose. It parses only
+/// complete objects and arrays, bounds both work and memory, and records containment ranges so the
+/// application can prefer maximal candidates after canonical schema validation.
 ///
 /// # Errors
 ///
-/// Returns an error when no complete JSON value is present, a Markdown fence is malformed or
-/// ambiguous, the fence language is not JSON, or trailing content contains another JSON candidate.
-pub fn extract_structured_json_candidate(text: &str) -> Result<serde_json::Value, String> {
-    let trimmed = text.trim();
-    if let Ok(value) = serde_json::from_str(trimmed) {
-        return Ok(value);
-    }
-    if let Some(body) = single_json_fence_body(trimmed)? {
-        return serde_json::from_str(body.trim())
-            .map_err(|error| format!("fenced structured output is invalid JSON: {error}"));
-    }
-    let Some(start) = trimmed
-        .char_indices()
-        .find_map(|(index, character)| matches!(character, '{' | '[').then_some(index))
-    else {
-        return Err("structured output contains no JSON value".to_string());
-    };
-    let mut stream = serde_json::Deserializer::from_str(&trimmed[start..]).into_iter();
-    let value = stream
-        .next()
-        .transpose()
-        .map_err(|error| format!("embedded structured output is invalid JSON: {error}"))?
-        .ok_or_else(|| "structured output contains no JSON value".to_string())?;
-    let consumed = stream.byte_offset();
-    let trailing = trimmed[start + consumed..].trim();
-    if !trailing.is_empty() {
-        return Err("structured output contains trailing content after embedded JSON".to_string());
-    }
-    Ok(value)
-}
-
-fn single_json_fence_body(text: &str) -> Result<Option<&str>, String> {
-    let Some(rest) = text.strip_prefix("```") else {
-        return Ok(None);
-    };
-    let newline = rest
-        .find('\n')
-        .ok_or_else(|| "structured output has an unterminated Markdown fence".to_string())?;
-    let language = rest[..newline].trim();
-    if !language.is_empty() && !language.eq_ignore_ascii_case("json") {
+/// Returns an error when the response exceeds its byte bound, candidate enumeration exceeds its
+/// bound, or a parsed candidate cannot be canonically encoded.
+pub fn catalog_structured_json_candidates(
+    text: &str,
+) -> Result<Vec<StructuredJsonCandidate>, String> {
+    if text.len() > MAX_STRUCTURED_CANDIDATE_INPUT_BYTES {
         return Err(format!(
-            "structured output uses unsupported Markdown fence language '{language}'"
+            "structured output exceeds {MAX_STRUCTURED_CANDIDATE_INPUT_BYTES} bytes"
         ));
     }
-    let fenced = &rest[newline + 1..];
-    let close = fenced
-        .rfind("```")
-        .ok_or_else(|| "structured output has an unterminated Markdown fence".to_string())?;
-    if !fenced[close + 3..].trim().is_empty() || fenced[..close].contains("```") {
-        return Err("structured output contains multiple or trailing Markdown fences".to_string());
+    let mut candidates = Vec::new();
+    let trimmed_start = text.len().saturating_sub(text.trim_start().len());
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && matches!(
+            value,
+            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+        )
+    {
+        push_structured_candidate(
+            &mut candidates,
+            trimmed_start..trimmed_start + trimmed.len(),
+            value,
+            StructuredCandidateEnvelope::Exact,
+        )?;
     }
-    Ok(Some(&fenced[..close]))
+    catalog_fenced_candidates(text, &mut candidates)?;
+    for (start, character) in text.char_indices() {
+        if !matches!(character, '{' | '[') {
+            continue;
+        }
+        if candidates.len() >= MAX_STRUCTURED_CANDIDATES {
+            return Err(format!(
+                "structured output exceeds {MAX_STRUCTURED_CANDIDATES} candidate starts"
+            ));
+        }
+        let mut stream = serde_json::Deserializer::from_str(&text[start..]).into_iter();
+        let Ok(Some(value)) = stream.next().transpose() else {
+            continue;
+        };
+        let consumed = stream.byte_offset();
+        if consumed == 0 || consumed > MAX_STRUCTURED_CANDIDATE_BYTES {
+            continue;
+        }
+        if !matches!(
+            value,
+            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+        ) {
+            continue;
+        }
+        if inside_non_json_fence(text, start) {
+            continue;
+        }
+        push_structured_candidate(
+            &mut candidates,
+            start..start + consumed,
+            value,
+            StructuredCandidateEnvelope::Embedded,
+        )?;
+    }
+    candidates.sort_by_key(|candidate| (candidate.range.start, candidate.range.end));
+    candidates.dedup_by(|left, right| {
+        left.range == right.range && left.canonical_json == right.canonical_json
+    });
+    Ok(candidates)
+}
+
+/// Select the uniquely strongest valid structured candidate.
+///
+/// Selection prefers an exact whole response, then a complete JSON/unlabeled fence, then a maximal
+/// embedded value. Equivalent canonical values are deduplicated. Distinct equally strong values
+/// fail closed rather than using prose, position, provider identity, or renderer metadata as a
+/// semantic tie-breaker.
+///
+/// # Errors
+///
+/// Returns an error when no candidate satisfies `is_valid` or multiple distinct strongest values
+/// remain after deterministic structural ranking and deduplication.
+pub fn select_structured_json_candidate(
+    candidates: &[StructuredJsonCandidate],
+    mut is_valid: impl FnMut(&serde_json::Value) -> bool,
+) -> Result<serde_json::Value, String> {
+    let valid = candidates
+        .iter()
+        .filter(|candidate| is_valid(&candidate.value))
+        .collect::<Vec<_>>();
+    if valid.is_empty() {
+        return Err("structured output contains no schema-valid JSON candidate".to_string());
+    }
+    let maximal = valid
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.envelope != StructuredCandidateEnvelope::Embedded
+                || !valid.iter().any(|other| {
+                    other.envelope == StructuredCandidateEnvelope::Embedded
+                        && other.range.start <= candidate.range.start
+                        && other.range.end >= candidate.range.end
+                        && other.range != candidate.range
+                })
+        })
+        .collect::<Vec<_>>();
+    let Some(best_rank) = maximal
+        .iter()
+        .map(|candidate| structured_candidate_rank(candidate.envelope))
+        .max()
+    else {
+        return Err("structured output contains no maximal schema-valid candidate".to_string());
+    };
+    let mut best = maximal
+        .into_iter()
+        .filter(|candidate| structured_candidate_rank(candidate.envelope) == best_rank)
+        .collect::<Vec<_>>();
+    best.sort_by(|left, right| left.canonical_json.cmp(&right.canonical_json));
+    best.dedup_by(|left, right| left.canonical_json == right.canonical_json);
+    if best.len() != 1 {
+        return Err(format!(
+            "structured output is ambiguous: {} distinct strongest candidates match the schema",
+            best.len()
+        ));
+    }
+    Ok(best[0].value.clone())
+}
+
+/// Catalog and select one structured candidate with deterministic ambiguity handling.
+///
+/// Primitive JSON contracts are intentionally unsupported for embedded scanning because arbitrary
+/// prose contains too many ambiguous primitive tokens. Callers that need primitive output should
+/// require exact JSON at their own boundary.
+///
+/// # Errors
+///
+/// Returns cataloging errors and the selection errors documented by
+/// [`select_structured_json_candidate`].
+pub fn extract_structured_json_candidate(
+    text: &str,
+    mut is_valid: impl FnMut(&serde_json::Value) -> bool,
+) -> Result<serde_json::Value, String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim())
+        && is_structured_result_shape(&value)
+        && is_valid(&value)
+    {
+        return Ok(value);
+    }
+    let candidates = catalog_structured_json_candidates(text)?;
+    select_structured_json_candidate(&candidates, is_valid)
+}
+
+const fn is_structured_result_shape(value: &serde_json::Value) -> bool {
+    matches!(
+        value,
+        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+    )
+}
+
+const fn structured_candidate_rank(envelope: StructuredCandidateEnvelope) -> u8 {
+    match envelope {
+        StructuredCandidateEnvelope::Exact => 3,
+        StructuredCandidateEnvelope::JsonFence | StructuredCandidateEnvelope::UnlabeledFence => 2,
+        StructuredCandidateEnvelope::Embedded => 1,
+    }
+}
+
+fn push_structured_candidate(
+    candidates: &mut Vec<StructuredJsonCandidate>,
+    range: std::ops::Range<usize>,
+    value: serde_json::Value,
+    envelope: StructuredCandidateEnvelope,
+) -> Result<(), String> {
+    if range.len() > MAX_STRUCTURED_CANDIDATE_BYTES {
+        return Ok(());
+    }
+    let canonical_json = serde_json::to_string(&value)
+        .map_err(|error| format!("failed to canonicalize structured candidate: {error}"))?;
+    candidates.push(StructuredJsonCandidate {
+        range,
+        value,
+        canonical_json,
+        envelope,
+    });
+    Ok(())
+}
+
+fn inside_non_json_fence(text: &str, candidate_start: usize) -> bool {
+    let prefix = &text[..candidate_start];
+    let Some(open) = prefix.rfind("```") else {
+        return false;
+    };
+    if prefix[open + 3..].contains("```") {
+        return false;
+    }
+    let Some(newline) = text[open + 3..].find('\n') else {
+        return false;
+    };
+    let language = text[open + 3..open + 3 + newline].trim();
+    !language.is_empty() && !language.eq_ignore_ascii_case("json")
+}
+
+fn catalog_fenced_candidates(
+    text: &str,
+    candidates: &mut Vec<StructuredJsonCandidate>,
+) -> Result<(), String> {
+    let mut offset = 0;
+    while let Some(relative_open) = text[offset..].find("```") {
+        let open = offset + relative_open;
+        let after_marker = open + 3;
+        let Some(relative_newline) = text[after_marker..].find('\n') else {
+            break;
+        };
+        let newline = after_marker + relative_newline;
+        let language = text[after_marker..newline].trim();
+        let body_start = newline + 1;
+        let Some(relative_close) = text[body_start..].find("```") else {
+            break;
+        };
+        let close = body_start + relative_close;
+        if (language.is_empty() || language.eq_ignore_ascii_case("json"))
+            && let Ok(value) =
+                serde_json::from_str::<serde_json::Value>(text[body_start..close].trim())
+            && matches!(
+                value,
+                serde_json::Value::Object(_) | serde_json::Value::Array(_)
+            )
+        {
+            push_structured_candidate(
+                candidates,
+                body_start..close,
+                value,
+                if language.is_empty() {
+                    StructuredCandidateEnvelope::UnlabeledFence
+                } else {
+                    StructuredCandidateEnvelope::JsonFence
+                },
+            )?;
+        }
+        offset = close + 3;
+    }
+    Ok(())
 }
 
 /// Outcome from a provider streaming turn.
@@ -1251,26 +1466,30 @@ mod output_position_tests {
     #[test]
     fn structured_candidate_extraction_accepts_one_safe_envelope_and_rejects_ambiguity() {
         assert_eq!(
-            extract_structured_json_candidate(" {\"ok\":true} ").expect("exact"),
+            extract_structured_json_candidate(" {\"ok\":true} ", |_| true).expect("exact"),
             serde_json::json!({"ok": true})
         );
         assert_eq!(
-            extract_structured_json_candidate("```json\n{\"ok\":true}\n```").expect("JSON fence"),
+            extract_structured_json_candidate("```json\n{\"ok\":true}\n```", |_| true)
+                .expect("JSON fence"),
             serde_json::json!({"ok": true})
         );
         assert_eq!(
-            extract_structured_json_candidate("Result:\n{\"ok\":true}")
+            extract_structured_json_candidate("Result:\n{\"ok\":true}", |_| true)
                 .expect("single embedded value"),
             serde_json::json!({"ok": true})
         );
         assert!(
             extract_structured_json_candidate(
-                "```json\n{\"one\":1}\n```\n```json\n{\"two\":2}\n```"
+                "```json\n{\"one\":1}\n```\n```json\n{\"two\":2}\n```",
+                |_| true,
             )
             .is_err()
         );
-        assert!(extract_structured_json_candidate("```rust\n{}\n```").is_err());
-        assert!(extract_structured_json_candidate("prefix {\"one\":1} {\"two\":2}").is_err());
+        assert!(extract_structured_json_candidate("```rust\n{}\n```", |_| true).is_err());
+        assert!(
+            extract_structured_json_candidate("prefix {\"one\":1} {\"two\":2}", |_| true).is_err()
+        );
     }
 
     #[test]
