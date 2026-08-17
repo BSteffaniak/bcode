@@ -4212,6 +4212,7 @@ impl WorkflowStructuredSourceConcisePrompt {
                 result: PromptStructuredOutputPolicy {
                     schema: self.output.clone(),
                     strict: true,
+                    correction: Default::default(),
                 },
             },
             read_only: self.read_only,
@@ -10626,12 +10627,61 @@ impl ResourceClaim {
 pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 3;
 const LEGACY_WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2;
 
+/// Maximum result-only correction rounds accepted by a workflow prompt contract.
+pub const MAX_WORKFLOW_STRUCTURED_RESULT_CORRECTIONS: u32 = 3;
+
+/// Bounded correction policy for a structured workflow result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStructuredResultCorrectionPolicy {
+    /// Maximum tool-free correction rounds after the initial candidate fails canonical validation.
+    pub max_attempts: u32,
+}
+
+impl WorkflowStructuredResultCorrectionPolicy {
+    /// Disable structured-result correction.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self { max_attempts: 0 }
+    }
+
+    /// Configure a bounded number of result-only correction rounds.
+    ///
+    /// Validation rejects values above [`MAX_WORKFLOW_STRUCTURED_RESULT_CORRECTIONS`].
+    #[must_use]
+    pub const fn with_max_attempts(max_attempts: u32) -> Self {
+        Self { max_attempts }
+    }
+}
+
 /// Typed structured-output policy for a durable prompt node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptStructuredOutputPolicy {
     pub schema: ValueSchema,
     pub strict: bool,
+    /// Result-only correction policy. This never authorizes replaying agent work or host tools.
+    #[serde(default)]
+    pub correction: WorkflowStructuredResultCorrectionPolicy,
+}
+
+impl PromptStructuredOutputPolicy {
+    /// Create a strict canonical structured-result policy without correction rounds.
+    #[must_use]
+    pub fn strict(schema: ValueSchema) -> Self {
+        Self {
+            schema,
+            strict: true,
+            correction: WorkflowStructuredResultCorrectionPolicy::disabled(),
+        }
+    }
+
+    /// Configure bounded result-only correction rounds.
+    #[must_use]
+    pub const fn with_max_corrections(mut self, max_attempts: u32) -> Self {
+        self.correction = WorkflowStructuredResultCorrectionPolicy::with_max_attempts(max_attempts);
+        self
+    }
 }
 
 /// Result behavior for a durable model-backed workflow node.
@@ -10648,6 +10698,14 @@ pub enum WorkflowPromptOutputPolicy {
 }
 
 impl WorkflowPromptOutputPolicy {
+    /// Create a strict structured-result policy for the canonical schema.
+    #[must_use]
+    pub fn structured_result(schema: ValueSchema) -> Self {
+        Self::Structured {
+            result: PromptStructuredOutputPolicy::strict(schema),
+        }
+    }
+
     /// Return the structured-result policy when this node produces one.
     #[must_use]
     pub const fn structured(&self) -> Option<&PromptStructuredOutputPolicy> {
@@ -10832,6 +10890,14 @@ impl WorkflowPromptConfiguration {
             });
         }
         if let Some(structured) = self.output.structured() {
+            if structured.correction.max_attempts > MAX_WORKFLOW_STRUCTURED_RESULT_CORRECTIONS {
+                return Err(WorkflowError::Build {
+                    path: "prompt.output.correction.max_attempts".to_string(),
+                    message: format!(
+                        "structured result correction attempts exceed {MAX_WORKFLOW_STRUCTURED_RESULT_CORRECTIONS}"
+                    ),
+                });
+            }
             jsonschema::validator_for(&structured.schema.schema).map_err(|error| {
                 WorkflowError::Build {
                     path: "prompt.output".to_string(),
@@ -15055,6 +15121,7 @@ mod tests {
                 result: PromptStructuredOutputPolicy {
                     schema: ValueSchema::of::<u32>(),
                     strict: true,
+                    correction: Default::default(),
                 },
             },
             read_only: true,
@@ -15093,6 +15160,15 @@ mod tests {
         assert_eq!(encoded["version"], serde_json::json!(3));
         assert_eq!(encoded["output"]["mode"], serde_json::json!("structured"));
         assert!(encoded.get("structured_output").is_none());
+
+        let mut excessive_correction = valid_prompt_configuration();
+        if let WorkflowPromptOutputPolicy::Structured { result } = &mut excessive_correction.output
+        {
+            result.correction = WorkflowStructuredResultCorrectionPolicy::with_max_attempts(
+                MAX_WORKFLOW_STRUCTURED_RESULT_CORRECTIONS + 1,
+            );
+        }
+        assert!(excessive_correction.validate().is_err());
 
         let mut mixed = legacy.clone();
         mixed["output"] = serde_json::json!({"mode": "preserve_input"});
@@ -15200,6 +15276,7 @@ mod tests {
                                 result: PromptStructuredOutputPolicy {
                                     schema: value_schema,
                                     strict: true,
+                                    correction: Default::default(),
                                 },
                             },
                             read_only: true,
@@ -16743,6 +16820,7 @@ steps:
                 result: PromptStructuredOutputPolicy {
                     schema: schema.clone(),
                     strict: true,
+                    correction: Default::default(),
                 },
             },
             read_only: true,
@@ -20721,6 +20799,7 @@ steps:
                 result: PromptStructuredOutputPolicy {
                     schema: ValueSchema::of::<serde_json::Value>(),
                     strict: true,
+                    correction: Default::default(),
                 },
             },
             read_only: true,
@@ -22672,6 +22751,7 @@ steps:
                 result: PromptStructuredOutputPolicy {
                     schema: schema.clone(),
                     strict: true,
+                    correction: Default::default(),
                 },
             },
             read_only,

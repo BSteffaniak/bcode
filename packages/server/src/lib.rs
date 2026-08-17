@@ -54834,6 +54834,7 @@ library = "test"
                 result: bcode_workflow::PromptStructuredOutputPolicy {
                     schema,
                     strict: true,
+                    correction: Default::default(),
                 },
             },
             read_only: true,
@@ -56642,6 +56643,7 @@ library = "test"
                 result: bcode_workflow::PromptStructuredOutputPolicy {
                     schema: schema.clone(),
                     strict: true,
+                    correction: Default::default(),
                 },
             },
             read_only: false,
@@ -58193,6 +58195,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     result: bcode_workflow::PromptStructuredOutputPolicy {
                         schema: schema.clone(),
                         strict: true,
+                        correction: Default::default(),
                     },
                 },
                 read_only,
@@ -58376,6 +58379,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     result: bcode_workflow::PromptStructuredOutputPolicy {
                         schema: schema.clone(),
                         strict: true,
+                        correction: Default::default(),
                     },
                 },
                 read_only,
@@ -58665,6 +58669,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                     result: bcode_workflow::PromptStructuredOutputPolicy {
                                         schema: schema.clone(),
                                         strict: true,
+                                        correction: Default::default(),
                                     },
                                 },
                                 read_only: true,
@@ -58824,6 +58829,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 result: bcode_workflow::PromptStructuredOutputPolicy {
                     schema: schema.clone(),
                     strict: true,
+                    correction: Default::default(),
                 },
             },
             read_only: true,
@@ -59160,6 +59166,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                 result: bcode_workflow::PromptStructuredOutputPolicy {
                                     schema,
                                     strict: true,
+                                    correction: Default::default(),
                                 },
                             },
                             read_only: true,

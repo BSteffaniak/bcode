@@ -14576,6 +14576,7 @@ mod tests {
                                     result: bcode_workflow::PromptStructuredOutputPolicy {
                                         schema,
                                         strict: true,
+                                        correction: Default::default(),
                                     },
                                 },
                                 read_only: true,

@@ -1236,6 +1236,7 @@ fn commit_message_agent_configuration(
             result: bcode_workflow::PromptStructuredOutputPolicy {
                 schema: bcode_workflow::ValueSchema::of::<CommitMessageResult>(),
                 strict: true,
+                correction: Default::default(),
             },
         },
         read_only: true,
@@ -1289,6 +1290,7 @@ fn loop_agent_configuration<O: JsonSchema>(
             result: bcode_workflow::PromptStructuredOutputPolicy {
                 schema: bcode_workflow::ValueSchema::of::<O>(),
                 strict: true,
+                correction: Default::default(),
             },
         },
         read_only,

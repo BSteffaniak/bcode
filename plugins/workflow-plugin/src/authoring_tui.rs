@@ -2458,6 +2458,7 @@ fn generic_node(
                     result: bcode_workflow::PromptStructuredOutputPolicy {
                         schema: schema.clone(),
                         strict: true,
+                        correction: Default::default(),
                     },
                 },
                 read_only: true,
