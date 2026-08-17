@@ -24,6 +24,8 @@ pub enum TextStreamEventKind {
     Output,
     /// Assistant text delta.
     TextDelta,
+    /// Dedicated structured-output finalization transition.
+    StructuredOutputFinalizationStarted,
     /// Legacy untyped reasoning delta.
     ReasoningDelta,
     /// Provider-neutral structured reasoning operation.
@@ -64,6 +66,9 @@ impl From<&AgentEvent> for TextStreamEventKind {
             AgentEvent::TurnStarted => Self::TurnStarted,
             AgentEvent::Output { .. } => Self::Output,
             AgentEvent::TextDelta(_) => Self::TextDelta,
+            AgentEvent::StructuredOutputFinalizationStarted => {
+                Self::StructuredOutputFinalizationStarted
+            }
             AgentEvent::ReasoningDelta(_) => Self::ReasoningDelta,
             AgentEvent::ReasoningActivity(_) => Self::ReasoningActivity,
             AgentEvent::ToolCallStarted { .. } => Self::ToolCallStarted,

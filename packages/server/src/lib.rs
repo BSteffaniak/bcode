@@ -19548,6 +19548,7 @@ struct ModelStreamAccumulator {
     pending_text_offset: usize,
     next_text_revision: u64,
     last_flush: Instant,
+    publish_live_text: bool,
     cancel_state: Arc<TurnCancelState>,
 }
 
@@ -19556,6 +19557,7 @@ impl ModelStreamAccumulator {
         session_id: SessionId,
         turn_id: &str,
         segment_order: u32,
+        publish_live_text: bool,
         cancel_state: Arc<TurnCancelState>,
     ) -> Self {
         Self {
@@ -19569,6 +19571,7 @@ impl ModelStreamAccumulator {
             pending_text_offset: 0,
             next_text_revision: 1,
             last_flush: Instant::now(),
+            publish_live_text,
             cancel_state,
         }
     }
@@ -19582,7 +19585,9 @@ impl ModelStreamAccumulator {
     }
 
     fn should_flush(&self) -> bool {
-        !self.pending_text.is_empty() && self.last_flush.elapsed() >= MODEL_STREAM_FLUSH_INTERVAL
+        self.publish_live_text
+            && !self.pending_text.is_empty()
+            && self.last_flush.elapsed() >= MODEL_STREAM_FLUSH_INTERVAL
     }
 
     async fn flush_if_ready(&mut self, state: &ServerState) {
@@ -19594,6 +19599,10 @@ impl ModelStreamAccumulator {
     async fn flush(&mut self, state: &ServerState) {
         if self.cancel_state.is_cancelled() {
             self.assistant_text.clear();
+            self.pending_text.clear();
+            return;
+        }
+        if !self.publish_live_text {
             self.pending_text.clear();
             return;
         }
@@ -20632,6 +20641,12 @@ async fn run_model_turn_inner(
                     .await;
                 } else if let Some(structured) = execution.structured_output.as_ref()
                     && let Some(output) = outcome.assistant_output.as_deref()
+                    && let Ok(normalized) =
+                        normalized_structured_result_candidate(structured, output)
+                {
+                    return ModelTurnCompletion::completed().with_output(normalized);
+                } else if let Some(structured) = execution.structured_output.as_ref()
+                    && let Some(output) = outcome.assistant_output.as_deref()
                     && let Err(error) = validate_structured_result_candidate(structured, output)
                 {
                     if structured_result_corrections >= structured.max_corrections {
@@ -20680,13 +20695,12 @@ async fn run_model_turn_inner(
     }
 }
 
-fn validate_structured_result_candidate(
+fn normalized_structured_result_candidate(
     request: &bcode_session_models::TurnStructuredOutputRequest,
     output: &str,
-) -> Result<(), String> {
-    let value = serde_json::from_str::<serde_json::Value>(output).map_err(|error| {
-        bounded_structured_validation_message(&format!("invalid JSON: {error}"))
-    })?;
+) -> Result<String, String> {
+    let value = bcode_model_provider_runtime::extract_structured_json_candidate(output)
+        .map_err(|error| bounded_structured_validation_message(&error))?;
     let validator = jsonschema::validator_for(&request.schema).map_err(|error| {
         bounded_structured_validation_message(&format!("invalid canonical schema: {error}"))
     })?;
@@ -20694,7 +20708,16 @@ fn validate_structured_result_candidate(
         return Err(bounded_structured_validation_message(&error.to_string()));
     }
     validate_structured_result_semantics(&request.schema, &value)
-        .map_err(|error| bounded_structured_validation_message(&error))
+        .map_err(|error| bounded_structured_validation_message(&error))?;
+    serde_json::to_string(&value)
+        .map_err(|error| bounded_structured_validation_message(&error.to_string()))
+}
+
+fn validate_structured_result_candidate(
+    request: &bcode_session_models::TurnStructuredOutputRequest,
+    output: &str,
+) -> Result<(), String> {
+    normalized_structured_result_candidate(request, output).map(|_| ())
 }
 
 fn validate_structured_result_semantics(
@@ -21849,7 +21872,7 @@ async fn run_model_turn_round(
     )
     .await;
 
-    let (assistant_text, mut outcome) = poll_model_turn_events(
+    let (mut assistant_text, mut outcome) = poll_model_turn_events(
         state,
         session_id,
         ModelPollContext {
@@ -21858,6 +21881,7 @@ async fn run_model_turn_round(
             next_output_position,
             provider_plugin_id,
             provider_turn_id: &start.provider_turn_id,
+            structured_output: request.structured_output.is_some(),
             streaming,
         },
         Arc::clone(&cancel_state),
@@ -21902,6 +21926,14 @@ async fn run_model_turn_round(
         .await;
     }
 
+    if request.structured_output.is_some()
+        && let Some(segment) = assistant_text.as_mut()
+        && let Ok(normalized) =
+            bcode_model_provider_runtime::extract_structured_json_candidate(&segment.text)
+                .and_then(|value| serde_json::to_string(&value).map_err(|error| error.to_string()))
+    {
+        segment.text = normalized;
+    }
     if let Some(segment) = assistant_text.as_ref()
         && !cancel_state.is_cancelled()
     {
@@ -22065,6 +22097,7 @@ struct ModelPollContext<'a> {
     next_output_position: &'a mut u64,
     provider_plugin_id: Option<&'a str>,
     provider_turn_id: &'a str,
+    structured_output: bool,
     streaming: &'a bcode_config::StreamingConfig,
 }
 
@@ -22082,12 +22115,14 @@ async fn poll_model_turn_events(
         next_output_position,
         provider_plugin_id,
         provider_turn_id,
+        structured_output,
         streaming,
     } = poll;
     let mut stream = ModelStreamAccumulator::new(
         session_id,
         turn_id,
         *next_assistant_segment_order,
+        !structured_output,
         Arc::clone(&cancel_state),
     );
     let mut outcome = ModelPollOutcome::default();
@@ -31692,7 +31727,8 @@ async fn observe_workflow_turn(
                     "completed workflow prompt turn has no assistant output".to_string(),
                 )
             })?;
-            let output: serde_json::Value = serde_json::from_str(&output)?;
+            let output = bcode_model_provider_runtime::extract_structured_json_candidate(&output)
+                .map_err(WorkflowStoreError::InvalidData)?;
             // Each store access takes and releases the lock in its own scope. Chaining the lookups
             // through combinators would keep the first guard alive while the closure locks the same
             // non-reentrant mutex again, which self-deadlocks.
@@ -44783,6 +44819,7 @@ library = "test"
             SessionId::new(),
             "turn-1",
             0,
+            true,
             Arc::new(TurnCancelState::default()),
         );
         stream.push_text(&"x".repeat(1024 * 1024));
@@ -44795,11 +44832,29 @@ library = "test"
     }
 
     #[test]
+    fn structured_model_stream_buffers_live_text_until_canonical_acceptance() {
+        let mut stream = ModelStreamAccumulator::new(
+            SessionId::new(),
+            "turn-1",
+            0,
+            false,
+            Arc::new(TurnCancelState::default()),
+        );
+        stream.push_text("```json\n{\"ok\":true}\n```");
+        stream.last_flush = Instant::now()
+            .checked_sub(MODEL_STREAM_FLUSH_INTERVAL)
+            .expect("flush interval fits monotonic clock");
+        assert!(!stream.should_flush());
+        assert!(stream.finish().is_some());
+    }
+
+    #[test]
     fn assistant_stream_accumulator_has_no_legacy_reasoning_output_path() {
         let stream = ModelStreamAccumulator::new(
             SessionId::new(),
             "turn-1",
             0,
+            true,
             Arc::new(TurnCancelState::default()),
         );
 
@@ -44862,8 +44917,13 @@ library = "test"
     #[test]
     fn assistant_segment_identity_rotates_only_after_commit() {
         let cancel_state = Arc::new(TurnCancelState::default());
-        let mut stream =
-            ModelStreamAccumulator::new(SessionId::new(), "turn-1", 0, Arc::clone(&cancel_state));
+        let mut stream = ModelStreamAccumulator::new(
+            SessionId::new(),
+            "turn-1",
+            0,
+            true,
+            Arc::clone(&cancel_state),
+        );
         stream.push_text("before tool");
 
         let first = stream
@@ -59015,6 +59075,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(validate_structured_result_candidate(&request, r#"{"value": 4}"#).is_err());
         validate_structured_result_candidate(&request, r#"{"value":"ok"}"#)
             .expect("valid structured result");
+        assert_eq!(
+            normalized_structured_result_candidate(&request, "```json\n{\"value\":\"ok\"}\n```")
+                .expect("fenced structured result"),
+            r#"{"value":"ok"}"#
+        );
+        assert!(
+            normalized_structured_result_candidate(
+                &request,
+                "```json\n{\"value\":\"first\"}\n```\n```json\n{\"value\":\"second\"}\n```"
+            )
+            .is_err()
+        );
 
         let semantic = bcode_session_models::TurnStructuredOutputRequest {
             schema: serde_json::json!({

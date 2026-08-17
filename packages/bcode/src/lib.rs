@@ -3244,21 +3244,8 @@ where
 }
 
 fn extract_structured_json(text: &str) -> Result<serde_json::Value> {
-    match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            let Some(slice) = json_object_slice(text) else {
-                return Err(BcodeError::StructuredInvalidJson(format!(
-                    "model output was not valid JSON: {error}; output: {text}"
-                )));
-            };
-            serde_json::from_str(slice).map_err(|slice_error| {
-                BcodeError::StructuredInvalidJson(format!(
-                    "failed to parse JSON object from model output: {slice_error}; output: {text}"
-                ))
-            })
-        }
-    }
+    bcode_model_provider_runtime::extract_structured_json_candidate(text)
+        .map_err(BcodeError::StructuredInvalidJson)
 }
 
 fn json_object_slice(text: &str) -> Option<&str> {

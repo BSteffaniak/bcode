@@ -51,6 +51,7 @@ bcode_fake_provider_plugin              = { workspace = true, optional = true }
 bcode_mermaid_render                    = { workspace = true, optional = true }
 bcode_metrics                           = { workspace = true, optional = true }
 bcode_model                             = { workspace = true }
+bcode_model_provider_runtime            = { workspace = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true, optional = true }
 bcode_plugin_sdk                        = { workspace = true }

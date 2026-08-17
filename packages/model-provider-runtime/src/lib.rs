@@ -120,6 +120,69 @@ fn simple_provider_error(
     }
 }
 
+/// Safely extract one unambiguous JSON value from model output.
+///
+/// Exact JSON is preferred. Markdown fences are accepted only when there is exactly one complete
+/// fence, its optional language is `json`, and all surrounding content is whitespace. As a final
+/// compatibility path, one balanced top-level object or array may be surrounded by prose, but
+/// multiple candidates or trailing JSON values fail closed.
+///
+/// # Errors
+///
+/// Returns an error when no complete JSON value is present, a Markdown fence is malformed or
+/// ambiguous, the fence language is not JSON, or trailing content contains another JSON candidate.
+pub fn extract_structured_json_candidate(text: &str) -> Result<serde_json::Value, String> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Ok(value);
+    }
+    if let Some(body) = single_json_fence_body(trimmed)? {
+        return serde_json::from_str(body.trim())
+            .map_err(|error| format!("fenced structured output is invalid JSON: {error}"));
+    }
+    let Some(start) = trimmed
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '{' | '[').then_some(index))
+    else {
+        return Err("structured output contains no JSON value".to_string());
+    };
+    let mut stream = serde_json::Deserializer::from_str(&trimmed[start..]).into_iter();
+    let value = stream
+        .next()
+        .transpose()
+        .map_err(|error| format!("embedded structured output is invalid JSON: {error}"))?
+        .ok_or_else(|| "structured output contains no JSON value".to_string())?;
+    let consumed = stream.byte_offset();
+    let trailing = trimmed[start + consumed..].trim();
+    if !trailing.is_empty() {
+        return Err("structured output contains trailing content after embedded JSON".to_string());
+    }
+    Ok(value)
+}
+
+fn single_json_fence_body(text: &str) -> Result<Option<&str>, String> {
+    let Some(rest) = text.strip_prefix("```") else {
+        return Ok(None);
+    };
+    let newline = rest
+        .find('\n')
+        .ok_or_else(|| "structured output has an unterminated Markdown fence".to_string())?;
+    let language = rest[..newline].trim();
+    if !language.is_empty() && !language.eq_ignore_ascii_case("json") {
+        return Err(format!(
+            "structured output uses unsupported Markdown fence language '{language}'"
+        ));
+    }
+    let fenced = &rest[newline + 1..];
+    let close = fenced
+        .rfind("```")
+        .ok_or_else(|| "structured output has an unterminated Markdown fence".to_string())?;
+    if !fenced[close + 3..].trim().is_empty() || fenced[..close].contains("```") {
+        return Err("structured output contains multiple or trailing Markdown fences".to_string());
+    }
+    Ok(Some(&fenced[..close]))
+}
+
 /// Outcome from a provider streaming turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamOutcome {
@@ -1184,6 +1247,31 @@ where
 mod output_position_tests {
     use super::*;
     use bcode_model::{ProviderOutputEvent, ToolCall};
+
+    #[test]
+    fn structured_candidate_extraction_accepts_one_safe_envelope_and_rejects_ambiguity() {
+        assert_eq!(
+            extract_structured_json_candidate(" {\"ok\":true} ").expect("exact"),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(
+            extract_structured_json_candidate("```json\n{\"ok\":true}\n```").expect("JSON fence"),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(
+            extract_structured_json_candidate("Result:\n{\"ok\":true}")
+                .expect("single embedded value"),
+            serde_json::json!({"ok": true})
+        );
+        assert!(
+            extract_structured_json_candidate(
+                "```json\n{\"one\":1}\n```\n```json\n{\"two\":2}\n```"
+            )
+            .is_err()
+        );
+        assert!(extract_structured_json_candidate("```rust\n{}\n```").is_err());
+        assert!(extract_structured_json_candidate("prefix {\"one\":1} {\"two\":2}").is_err());
+    }
 
     #[test]
     fn allocator_keeps_semantic_units_stable_and_monotonic() {

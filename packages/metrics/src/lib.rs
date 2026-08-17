@@ -2876,6 +2876,7 @@ mod tests {
             recovered.shutdown_persistence(),
             MetricsPersistenceStatus::default()
         );
+        drop(recovered);
         let report = MetricsRegistry::report_from_event_log_path(
             path,
             MetricsEventLogConfig::default(),
