@@ -313,19 +313,6 @@ fn validate_bedrock_request(
     request: &ModelTurnRequest,
     responses_surface: bool,
 ) -> Result<(), ProviderError> {
-    if request.structured_output.is_some()
-        && !responses_surface
-        && matches!(
-            Settings::resolve(Some(request)).transport,
-            Ok(BedrockTransport::MantleAnthropic)
-        )
-    {
-        return Err(provider_error(
-            "bedrock_structured_output_unsupported",
-            ProviderErrorCategory::UnsupportedFeature,
-            "the selected Bedrock surface does not support provider-native JSON Schema enforcement",
-        ));
-    }
     if request.parameters.reasoning_summary.is_some() && !responses_surface {
         return Err(provider_error(
             "bedrock_reasoning_summary_unsupported",
@@ -573,6 +560,12 @@ async fn stream_mantle_anthropic_turn(
     if settings.mantle_auth_header {
         request_builder = request_builder.bearer_auth(&token);
     }
+    let (provider_request, synthetic) = if request.structured_output.is_some() {
+        let (fallback, synthetic) = bedrock_messages_structured_fallback_request(request)?;
+        (fallback, Some(synthetic))
+    } else {
+        (request.clone(), None)
+    };
     let mut last_error = None;
     for model_id in &selection.model_ids {
         let response = request_builder
@@ -584,7 +577,10 @@ async fn stream_mantle_anthropic_turn(
                     "failed to prepare Bedrock Mantle request",
                 )
             })?
-            .json(&build_mantle_anthropic_request(request, model_id)?)
+            .json(&build_mantle_anthropic_request(
+                &provider_request,
+                model_id,
+            )?)
             .send()
             .await
             .map_err(|error| mantle_network_error("request_failed", &error))?;
@@ -597,7 +593,8 @@ async fn stream_mantle_anthropic_turn(
             last_error = Some(error);
             continue;
         }
-        return read_mantle_anthropic_stream(response, turn, name_map.clone()).await;
+        return read_mantle_anthropic_stream(response, turn, name_map.clone(), synthetic.clone())
+            .await;
     }
     Err(last_error.unwrap_or_else(|| {
         provider_error(
@@ -628,6 +625,15 @@ fn mantle_openai_support_hint() -> bcode_model::ModelCatalogSupportHint {
         provider: CATALOG_PROVIDER_ID.to_string(),
         auth_mode: "bearer_token".to_string(),
         api_surface: "responses".to_string(),
+        integration: Some("bcode".to_string()),
+    }
+}
+
+fn mantle_anthropic_support_hint() -> bcode_model::ModelCatalogSupportHint {
+    bcode_model::ModelCatalogSupportHint {
+        provider: CATALOG_PROVIDER_ID.to_string(),
+        auth_mode: "bearer_token".to_string(),
+        api_surface: "messages".to_string(),
         integration: Some("bcode".to_string()),
     }
 }
@@ -1319,9 +1325,10 @@ async fn read_mantle_anthropic_stream(
     mut response: reqwest::Response,
     turn: &TurnState,
     name_map: BTreeMap<String, String>,
+    synthetic: Option<SyntheticStructuredOutput>,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut decoder = MantleSseDecoder::default();
-    let mut accumulator = AnthropicMessagesAccumulator::new(name_map, None);
+    let mut accumulator = AnthropicMessagesAccumulator::new(name_map, synthetic);
     loop {
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
@@ -3650,7 +3657,7 @@ fn capabilities_for_context(context: &bcode_model::ProviderRequestContext) -> Pr
         || context.api_surface == Some(bcode_model::ModelApiSurface::Responses);
     let messages_surface =
         !responses_surface && context.api_surface == Some(bcode_model::ModelApiSurface::Messages);
-    let structured_output_unsupported = transport == Some(BedrockTransport::MantleAnthropic);
+    let structured_output_unsupported = false;
     ProviderCapabilities {
         provider_id: PROVIDER_ID.to_string(),
         display_name: "Amazon Bedrock".to_string(),
@@ -3696,21 +3703,27 @@ impl BedrockProviderPlugin {
             };
             let models = model_infos_from_ids(&model_ids, settings.default_model.as_deref());
             // An explicitly selected Mantle transport pins the surface, so expand only that one.
-            let policy = if settings
-                .transport
-                .as_ref()
-                .is_ok_and(|transport| *transport == BedrockTransport::MantleOpenAi)
-            {
-                bcode_model::ModelCatalogPolicy::ExpandSupported {
-                    provider_id: CATALOG_PROVIDER_ID.to_string(),
-                    target: mantle_openai_support_hint(),
-                    authority: bcode_model::ModelListAuthority::Authoritative,
+            let policy = match settings.transport.as_ref() {
+                Ok(BedrockTransport::MantleOpenAi) => {
+                    bcode_model::ModelCatalogPolicy::ExpandSupported {
+                        provider_id: CATALOG_PROVIDER_ID.to_string(),
+                        target: mantle_openai_support_hint(),
+                        authority: bcode_model::ModelListAuthority::Authoritative,
+                    }
                 }
-            } else {
-                bcode_model::ModelCatalogPolicy::EnrichOnly {
-                    provider_id: CATALOG_PROVIDER_ID.to_string(),
-                    target: None,
-                    authority: bcode_model::ModelListAuthority::Explicit,
+                Ok(BedrockTransport::MantleAnthropic) => {
+                    bcode_model::ModelCatalogPolicy::ExpandSupported {
+                        provider_id: CATALOG_PROVIDER_ID.to_string(),
+                        target: mantle_anthropic_support_hint(),
+                        authority: bcode_model::ModelListAuthority::Authoritative,
+                    }
+                }
+                Ok(BedrockTransport::Runtime) | Err(_) => {
+                    bcode_model::ModelCatalogPolicy::EnrichOnly {
+                        provider_id: CATALOG_PROVIDER_ID.to_string(),
+                        target: None,
+                        authority: bcode_model::ModelListAuthority::Explicit,
+                    }
                 }
             };
             return ModelList {
@@ -5856,23 +5869,25 @@ mod tests {
     }
 
     #[test]
-    fn mantle_anthropic_rejects_structured_output_but_converse_accepts_it() {
+    fn mantle_anthropic_structured_output_uses_tool_free_synthetic_fallback() {
         let mut request = test_model_turn_request();
         request.structured_output = Some(bcode_model::StructuredOutputRequest {
             name: "answer".to_string(),
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         });
-        validate_bedrock_request(&request, false)
-            .expect("Converse should support structured output");
-
         request
             .provider_context
             .settings
             .insert("transport".to_string(), "mantle_anthropic".to_string());
-        let error = validate_bedrock_request(&request, false)
-            .expect_err("Mantle Anthropic should reject structured output");
-        assert_eq!(error.code, "bedrock_structured_output_unsupported");
+        validate_bedrock_request(&request, false)
+            .expect("Mantle Anthropic adapter should support structured output");
+        let (fallback, synthetic) = bedrock_messages_structured_fallback_request(&request)
+            .expect("tool-free synthetic fallback");
+        assert!(fallback.structured_output.is_none());
+        assert_eq!(fallback.tools, [synthetic.tool()]);
+        assert_eq!(fallback.tool_call_policy.choice, ToolChoice::Required);
+        assert_eq!(fallback.tool_call_policy.parallel, Some(false));
     }
 
     #[test]
@@ -7811,9 +7826,8 @@ mod tests {
             .provider_context
             .settings
             .insert("transport".to_string(), "mantle_anthropic".to_string());
-        let error = validate_bedrock_request(&request, false)
-            .expect_err("Mantle Anthropic schema mode must fail");
-        assert_eq!(error.category, ProviderErrorCategory::UnsupportedFeature);
+        validate_bedrock_request(&request, false)
+            .expect("Mantle Anthropic schema mode uses adapter-mediated fallback");
         request.provider_context.settings.clear();
 
         request.structured_output = None;
@@ -8175,11 +8189,9 @@ mod tests {
     }
 
     #[test]
-    fn mantle_openai_transport_requests_catalog_expansion_for_the_picker() {
-        // The OpenAI Responses models are absent from `ListFoundationModels`, so the plugin must
-        // ask the host to expand membership from catalog entries rather than reporting only the
-        // configured id. Anthropic Mantle keeps enrich-only semantics because its model ids are
-        // configured explicitly.
+    fn mantle_transports_request_surface_specific_catalog_expansion_for_the_picker() {
+        // Mantle has no control-plane model listing, so each explicit surface expands matching
+        // authoritative catalog membership rather than exposing only a configured model ID.
         let hint = mantle_openai_support_hint();
         assert_eq!(hint.provider, "bedrock");
         assert_eq!(hint.auth_mode, "bearer_token");
@@ -8216,14 +8228,19 @@ mod tests {
             provider_context: context("mantle_anthropic", "anthropic.claude-opus-5"),
             selected_model_id: None,
         });
-        assert!(
-            matches!(
-                anthropic.catalog.policy,
-                bcode_model::ModelCatalogPolicy::EnrichOnly { .. }
-            ),
-            "mantle_anthropic keeps enrich-only membership, got {:?}",
-            anthropic.catalog.policy
-        );
+        let anthropic_hint = mantle_anthropic_support_hint();
+        match &anthropic.catalog.policy {
+            bcode_model::ModelCatalogPolicy::ExpandSupported {
+                provider_id,
+                target,
+                authority,
+            } => {
+                assert_eq!(provider_id, "bedrock");
+                assert_eq!(target, &anthropic_hint);
+                assert_eq!(authority, &bcode_model::ModelListAuthority::Authoritative);
+            }
+            other => panic!("mantle_anthropic must expand from the catalog, got {other:?}"),
+        }
     }
 
     #[test]

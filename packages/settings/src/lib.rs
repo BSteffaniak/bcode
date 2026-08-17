@@ -1236,7 +1236,9 @@ impl SetupConfigSummary {
     /// Build a setup summary from loaded Bcode config.
     #[must_use]
     pub fn from_config(config: &bcode_config::BcodeConfig) -> Self {
-        let selection = config.resolved_model_selection();
+        let selection = config.resolved_model_selection_with_environment(
+            &bcode_config::ConfigEnvironmentSnapshot::new(BTreeMap::new(), PathBuf::from(".")),
+        );
         let mut capabilities = BTreeSet::new();
         if selection.provider_plugin_id.is_some() {
             capabilities.insert(SetupConfigCapability::ProviderSelection);

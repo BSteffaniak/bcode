@@ -206,6 +206,14 @@ its synthetic tool must be intercepted inside the adapter and must never enter h
 authorization, or canonical tool history. Negotiated fidelity is persisted as a versioned canonical
 session event.
 
+Canonical validation and bounded correction remain application behavior rather than provider
+behavior. When an adapter-mediated or native candidate fails canonical validation, the host may run
+bounded result-only provider rounds in the same authoritative turn. Those rounds retain the
+structured-output request, disable every host tool, carry only bounded validation diagnostics, and
+must not replay completed tool work. Providers receive ordinary normalized requests and must not
+infer authorization or workflow semantics from correction metadata. Exhaustion terminates with one
+normalized error; an invalid candidate is never reported as successful structured output.
+
 ## Tool calls and continuation
 
 Tool-call IDs and names are non-empty. IDs are unique within one provider round and correlate all

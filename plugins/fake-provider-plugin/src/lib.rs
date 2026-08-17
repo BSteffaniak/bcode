@@ -152,9 +152,10 @@ pub struct FakeProviderPlugin {
 struct FakeProviderState {
     next_turn: u64,
     tool_rounds_emitted: u64,
+    tool_rounds_by_turn: BTreeMap<String, u64>,
     turns: BTreeMap<String, FakeTurn>,
     overflow_emitted: bool,
-    max_tokens_emitted: bool,
+    max_tokens_by_turn: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -436,6 +437,7 @@ impl FakeProviderPlugin {
         if emit_overflow {
             state.overflow_emitted = true;
         }
+        let max_tokens_key = request.session_id.to_string();
         let emit_max_tokens = (request
             .provider_context
             .settings
@@ -448,9 +450,9 @@ impl FakeProviderPlugin {
                     .get("fake_max_tokens_structured_once")
                     .is_some_and(|value| value == "true")))
             && !is_compaction_request
-            && !state.max_tokens_emitted;
+            && !state.max_tokens_by_turn.contains(&max_tokens_key);
         if emit_max_tokens {
-            state.max_tokens_emitted = true;
+            state.max_tokens_by_turn.insert(max_tokens_key);
         }
         let forced_stop = if emit_overflow {
             Some(StopReason::Error)
@@ -770,11 +772,16 @@ fn fake_response_text(
     let Some(structured) = request.structured_output.as_ref() else {
         return Ok(format!("fake: {user_text}"));
     };
-    if request
+    let malformed_mode = request
         .provider_context
         .settings
         .get("fake_malformed_structured_output")
-        .is_some_and(|value| value == "true")
+        .map(String::as_str);
+    if malformed_mode == Some("true")
+        || (malformed_mode == Some("once")
+            && !request
+                .metadata
+                .contains_key("bcode_structured_result_correction_attempt"))
     {
         return Ok("{malformed".to_string());
     }
@@ -1943,10 +1950,17 @@ fn repeated_fake_tool_call(
     request: &ModelTurnRequest,
     is_compaction_request: bool,
 ) -> Option<ToolCall> {
-    if is_compaction_request || state.tool_rounds_emitted >= configured_fake_tool_rounds(request) {
+    let configured_rounds = configured_fake_tool_rounds(request);
+    if is_compaction_request || configured_rounds == 0 {
         return None;
     }
-    state.tool_rounds_emitted += 1;
+    let round_key = request.session_id.to_string();
+    let emitted = state.tool_rounds_by_turn.entry(round_key).or_default();
+    if *emitted >= configured_rounds {
+        return None;
+    }
+    *emitted = emitted.saturating_add(1);
+    state.tool_rounds_emitted = state.tool_rounds_emitted.saturating_add(1);
     Some(ToolCall {
         id: format!("fake-tool-{}", state.next_turn),
         name: "fake.missing-tool".to_string(),

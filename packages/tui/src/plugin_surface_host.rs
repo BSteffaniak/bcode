@@ -228,6 +228,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
                                 name: request.output_name,
                                 schema: request.output_schema,
                                 strict: true,
+                                max_corrections: 0,
                             },
                         ),
                         ..bcode_session_models::TurnExecutionOptions::default()

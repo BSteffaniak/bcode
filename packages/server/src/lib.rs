@@ -18339,6 +18339,25 @@ async fn handle_resume_workflow_run(
 }
 
 async fn resume_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<bool, ServerError> {
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(run_id)?
+        .ok_or_else(|| WorkflowStoreError::RunNotFound {
+            run_id: run_id.to_string(),
+        })?;
+    if !matches!(
+        run.status,
+        bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused
+    ) {
+        return state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resume_run(run_id, current_unix_millis())
+            .map_err(ServerError::from);
+    }
     let _authority = workflow_execution_authority(state, run_id)
         .await?
         .ok_or_else(|| {
@@ -19339,6 +19358,7 @@ const MAX_TOKENS_CONTINUATION_INSTRUCTION: &str = "Continue exactly where the pr
 /// already done.
 const MAX_TOKENS_INCOMPLETE_TOOL_CALL_INSTRUCTION: &str = "The previous model turn ran out of output tokens while emitting a tool call, so that tool call was discarded and never ran. Reissue the intended tool call. Do not repeat narration that already appeared, and do not assume the tool produced any result.";
 const MAX_TOKENS_CONTINUATION_LIMIT: u32 = 8;
+const STRUCTURED_RESULT_CORRECTION_INSTRUCTION: &str = "The previous structured result failed canonical validation. Return a corrected final result only. Do not call host tools or repeat completed work.";
 
 #[derive(Debug, Clone, Default)]
 struct ModelPollOutcome {
@@ -20142,6 +20162,8 @@ async fn run_model_turn_inner(
     };
     let mut rounds = ModelTurnRoundState::new(turn_config.model.effective_max_tool_rounds());
     let mut structured_output_finalization = false;
+    let mut structured_result_corrections = 0_u32;
+    let mut structured_result_correction_error: Option<String> = None;
     let mut next_assistant_segment_order = 0_u32;
     let mut next_output_position = 0_u64;
     let mut recovery = ModelTurnRecoveryState::default();
@@ -20211,6 +20233,19 @@ async fn run_model_turn_inner(
             structured_output_execution,
             structured_output_phase,
         );
+        if structured_result_corrections > 0 {
+            request.tools.clear();
+            request.tool_call_policy = bcode_model::ToolCallRequestPolicy {
+                parallel: Some(false),
+                choice: bcode_model::ToolChoice::None,
+            };
+            request.tool_schema_mode = None;
+            request.structured_output = desired_structured_output.clone();
+            request.metadata.insert(
+                "bcode_structured_result_correction_attempt".to_string(),
+                structured_result_corrections.to_string(),
+            );
+        }
         if structured_output_finalization {
             context_projection = projected_request_context(
                 state,
@@ -20219,6 +20254,16 @@ async fn run_model_turn_inner(
                 &request,
             )
             .await;
+        }
+        if let Some(error) = structured_result_correction_error.take() {
+            request.messages.push(ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: format!(
+                        "{STRUCTURED_RESULT_CORRECTION_INSTRUCTION}\n\nCanonical validation error: {error}"
+                    ),
+                }],
+            });
         }
         let should_evaluate_proactive =
             compaction_decision.strategy == AutomaticCompactionStrategy::LocalProactive;
@@ -20585,6 +20630,38 @@ async fn run_model_turn_inner(
                         )),
                     )
                     .await;
+                } else if let Some(structured) = execution.structured_output.as_ref()
+                    && let Some(output) = outcome.assistant_output.as_deref()
+                    && let Err(error) = validate_structured_result_candidate(structured, output)
+                {
+                    if structured_result_corrections >= structured.max_corrections {
+                        let message = format!(
+                            "structured result remained invalid after {structured_result_corrections} correction attempts: {error}"
+                        );
+                        append_provider_event_trace(
+                            state,
+                            session_id,
+                            &request.turn_id,
+                            "structured_result_correction_exhausted",
+                            Some(message.clone()),
+                        )
+                        .await;
+                        return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
+                    }
+                    structured_result_corrections = structured_result_corrections.saturating_add(1);
+                    structured_output_finalization = true;
+                    structured_result_correction_error = Some(error.clone());
+                    append_provider_event_trace(
+                        state,
+                        session_id,
+                        &request.turn_id,
+                        "structured_result_correction_started",
+                        Some(format!(
+                            "attempt={structured_result_corrections}; max_attempts={}; validation_error={error}",
+                            structured.max_corrections
+                        )),
+                    )
+                    .await;
                 } else {
                     return outcome
                         .assistant_output
@@ -20601,6 +20678,77 @@ async fn run_model_turn_inner(
         }
         rounds.complete_provider_round();
     }
+}
+
+fn validate_structured_result_candidate(
+    request: &bcode_session_models::TurnStructuredOutputRequest,
+    output: &str,
+) -> Result<(), String> {
+    let value = serde_json::from_str::<serde_json::Value>(output).map_err(|error| {
+        bounded_structured_validation_message(&format!("invalid JSON: {error}"))
+    })?;
+    let validator = jsonschema::validator_for(&request.schema).map_err(|error| {
+        bounded_structured_validation_message(&format!("invalid canonical schema: {error}"))
+    })?;
+    if let Err(error) = validator.validate(&value) {
+        return Err(bounded_structured_validation_message(&error.to_string()));
+    }
+    validate_structured_result_semantics(&request.schema, &value)
+        .map_err(|error| bounded_structured_validation_message(&error))
+}
+
+fn validate_structured_result_semantics(
+    schema: &serde_json::Value,
+    output: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    for (field, field_schema) in properties {
+        let Some(value) = output.get(field) else {
+            continue;
+        };
+        let valid = match value {
+            serde_json::Value::String(value)
+                if field_schema
+                    .get("minLength")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|minimum| minimum > 0) =>
+            {
+                !value.trim().is_empty()
+            }
+            serde_json::Value::Array(values)
+                if field_schema
+                    .get("minItems")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|minimum| minimum > 0) =>
+            {
+                !values.is_empty()
+                    && values
+                        .iter()
+                        .all(|value| value.as_str().is_none_or(|value| !value.trim().is_empty()))
+            }
+            _ => true,
+        };
+        if !valid {
+            return Err(format!(
+                "structured result field '{field}' must contain a non-empty value"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bounded_structured_validation_message(message: &str) -> String {
+    const MAX_VALIDATION_MESSAGE_BYTES: usize = 1_024;
+    let mut end = message.len().min(MAX_VALIDATION_MESSAGE_BYTES);
+    while !message.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    message[..end].to_string()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -31109,7 +31257,7 @@ fn workflow_attempt_observation_from_completion(
                     })?
                 }
             };
-            let output_schema = workflow_prompt_output_schema(request)?;
+            let output_schema = workflow_prompt_output_schema(request);
             if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {
                 return Ok(bcode_workflow_store::AttemptObservation::Failed {
                     message: format!("workflow prompt output failed schema validation: {error}"),
@@ -31244,46 +31392,8 @@ fn validate_workflow_output_semantics(
     schema: &bcode_workflow::ValueSchema,
     output: &serde_json::Value,
 ) -> Result<(), String> {
-    let Some(properties) = schema
-        .schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Ok(());
-    };
-    for (field, field_schema) in properties {
-        let Some(value) = output.get(field) else {
-            continue;
-        };
-        let valid = match value {
-            serde_json::Value::String(value)
-                if field_schema
-                    .get("minLength")
-                    .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|minimum| minimum > 0) =>
-            {
-                !value.trim().is_empty()
-            }
-            serde_json::Value::Array(values)
-                if field_schema
-                    .get("minItems")
-                    .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|minimum| minimum > 0) =>
-            {
-                !values.is_empty()
-                    && values
-                        .iter()
-                        .all(|value| value.as_str().is_none_or(|value| !value.trim().is_empty()))
-            }
-            _ => true,
-        };
-        if !valid {
-            return Err(format!(
-                "workflow prompt output field '{field}' must be non-empty"
-            ));
-        }
-    }
-    Ok(())
+    validate_structured_result_semantics(&schema.schema, output)
+        .map_err(|message| message.replace("structured result", "workflow prompt output"))
 }
 
 impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObserver<'_> {
@@ -31330,37 +31440,44 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
             {
                 return observe_workflow_plugin_receipt(request);
             }
-            let session_id = request
-                .receipt
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(
-                        "workflow prompt receipt has no session_id".to_string(),
-                    )
-                })
-                .and_then(|value| {
-                    SessionId::from_str(value)
-                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
-                })?;
-            let turn_id = request
-                .receipt
-                .get("turn_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(
-                        "workflow prompt receipt has no turn_id".to_string(),
-                    )
-                })?;
-            let output_schema_id = request
-                .receipt
-                .get("output_schema_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(
-                        "workflow prompt receipt has no output_schema_id".to_string(),
-                    )
-                })?;
+            let observation = (|| {
+                let session_id = request
+                    .receipt
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "workflow prompt receipt has no session_id".to_string(),
+                        )
+                    })
+                    .and_then(|value| {
+                        SessionId::from_str(value)
+                            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
+                    })?;
+                let turn_id = request
+                    .receipt
+                    .get("turn_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "workflow prompt receipt has no turn_id".to_string(),
+                        )
+                    })?;
+                let output_schema_id = request
+                    .receipt
+                    .get("output_schema_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "workflow prompt receipt has no output_schema_id".to_string(),
+                        )
+                    })?;
+                Ok((session_id, turn_id, output_schema_id))
+            })();
+            let (session_id, turn_id, output_schema_id) = match observation {
+                Ok(values) => values,
+                Err(error) => return structural_observation_or_unknown(Err(error), request),
+            };
             let observation =
                 observe_workflow_turn(self.state, session_id, turn_id, output_schema_id, request)
                     .await;
@@ -31516,6 +31633,13 @@ fn observe_workflow_plugin_receipt(
 }
 
 #[allow(clippy::too_many_lines)]
+const fn mutating_workflow_attempt(
+    request: &bcode_workflow_store::AttemptReconciliationRequest,
+) -> bool {
+    request.may_mutate()
+}
+
+#[allow(clippy::too_many_lines)]
 async fn observe_workflow_turn(
     state: &ServerState,
     session_id: SessionId,
@@ -31663,10 +31787,17 @@ async fn observe_workflow_turn(
                 }),
             })
         }
-        ModelTurnOutcome::Error => Ok(bcode_workflow_store::AttemptObservation::Failed {
-            message: message
-                .unwrap_or_else(|| "workflow model turn ended with an error".to_string()),
-        }),
+        ModelTurnOutcome::Error => {
+            let message =
+                message.unwrap_or_else(|| "workflow model turn ended with an error".to_string());
+            if message.starts_with("daemon stopped before runtime work finished: model turn ")
+                && mutating_workflow_attempt(request)
+            {
+                Ok(bcode_workflow_store::AttemptObservation::Unknown)
+            } else {
+                Ok(bcode_workflow_store::AttemptObservation::Failed { message })
+            }
+        }
     }
 }
 
@@ -32696,8 +32827,8 @@ fn workflow_prompt_configuration_from_intent(
 
 fn workflow_prompt_output_schema(
     request: &bcode_workflow_store::PreparedActivationDispatch,
-) -> Result<bcode_workflow::ValueSchema, WorkflowStoreError> {
-    Ok(request.activation.node.output.clone())
+) -> bcode_workflow::ValueSchema {
+    request.activation.node.output.clone()
 }
 
 struct WorkflowPromptTurnOwner<'a> {
@@ -33217,6 +33348,7 @@ async fn dispatch_workflow_prompt_turn(
                     ),
                     schema: structured.schema.schema.clone(),
                     strict: structured.strict,
+                    max_corrections: structured.correction.max_attempts,
                 }
             }),
             ..TurnExecutionOptions::default()
@@ -49224,6 +49356,15 @@ library = "test"
         );
     }
 
+    fn test_workflow_execution_authority() -> bcode_workflow_store::WorkflowExecutionAuthority {
+        bcode_workflow_store::WorkflowExecutionAuthority {
+            target_artifact_id: bcode_ipc::ArtifactId::current().to_string(),
+            daemon_instance_id: "test-workflow-daemon".to_string(),
+            generation: 1,
+            fencing_token: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
     fn test_server_state(sessions: SessionManager) -> ServerState {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
@@ -49535,6 +49676,49 @@ library = "test"
                 .expect("attach after recovery")
                 .live_checkpoints
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_mutating_workflow_turn_observes_unknown_for_explicit_repair() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("abandoned workflow".to_string()), PathBuf::from("."))
+            .await
+            .expect("session")
+            .id;
+        let turn_id = "abandoned-turn";
+        sessions
+            .append_model_turn_started(session_id, turn_id.to_string())
+            .await
+            .expect("started");
+        sessions
+            .append_model_turn_finished(
+                session_id,
+                turn_id.to_string(),
+                ModelTurnOutcome::Error,
+                Some(format!(
+                    "daemon stopped before runtime work finished: model turn {turn_id}"
+                )),
+            )
+            .await
+            .expect("finished");
+        let state = test_server_state(sessions);
+        let request = bcode_workflow_store::AttemptReconciliationRequest {
+            run_id: "run".to_string(),
+            node_id: "node".to_string(),
+            activation_id: "activation".to_string(),
+            attempt: 1,
+            dispatch_identity: "dispatch".to_string(),
+            side_effect: bcode_workflow_store::DispatchSideEffect::Mutating,
+            receipt: serde_json::Value::Null,
+        };
+
+        assert_eq!(
+            observe_workflow_turn(&state, session_id, turn_id, "output", &request)
+                .await
+                .expect("observation"),
+            bcode_workflow_store::AttemptObservation::Unknown
         );
     }
 
@@ -54834,7 +55018,7 @@ library = "test"
                 result: bcode_workflow::PromptStructuredOutputPolicy {
                     schema,
                     strict: true,
-                    correction: Default::default(),
+                    correction: bcode_workflow::WorkflowStructuredResultCorrectionPolicy::default(),
                 },
             },
             read_only: true,
@@ -55398,6 +55582,7 @@ library = "test"
                     session_event_schema_version: Some(
                         bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                     ),
+                    instance_id: "test-workflow-daemon".to_string(),
                     ..DaemonStatus::default()
                 },
                 daemon_record_path: None,
@@ -55528,7 +55713,7 @@ library = "test"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
-                execution_authority: None,
+                execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -55719,7 +55904,7 @@ library = "test"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
-                execution_authority: None,
+                execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -56074,7 +56259,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
-                    execution_authority: None,
+                    execution_authority: Some(test_workflow_execution_authority()),
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -56110,6 +56295,9 @@ library = "test"
                     attempt: 1,
                     dispatch_identity: prepared.dispatch_identity,
                     receipt: serde_json::json!({
+                        "owner": "bcode.server.agent-turn/v1",
+                        "owner_artifact_id": bcode_ipc::ArtifactId::current().to_string(),
+                        "owner_daemon_instance_id": "test-workflow-daemon",
                         "session_id": child.id,
                         "turn_id": turn_id,
                         "output_schema_id": "u32",
@@ -56212,7 +56400,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
-                    execution_authority: None,
+                    execution_authority: Some(test_workflow_execution_authority()),
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -56248,6 +56436,9 @@ library = "test"
                     attempt: 1,
                     dispatch_identity: prepared.dispatch_identity,
                     receipt: serde_json::json!({
+                        "owner": "bcode.server.agent-turn/v1",
+                        "owner_artifact_id": bcode_ipc::ArtifactId::current().to_string(),
+                        "owner_daemon_instance_id": "test-workflow-daemon",
                         "session_id": child.id,
                         "turn_id": turn_id,
                         "output_schema_id": "u32",
@@ -56381,7 +56572,7 @@ library = "test"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!({"condition_met": false})),
-                    execution_authority: None,
+                    execution_authority: Some(test_workflow_execution_authority()),
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -56444,6 +56635,9 @@ library = "test"
                     attempt: prepared.attempt,
                     dispatch_identity: prepared.dispatch_identity.clone(),
                     receipt: serde_json::json!({
+                        "owner": "bcode.server.agent-turn/v1",
+                        "owner_artifact_id": bcode_ipc::ArtifactId::current().to_string(),
+                        "owner_daemon_instance_id": "test-workflow-daemon",
                         "session_id": parent.id,
                         "turn_id": turn_id,
                         "output_schema_id": "bcode.loop.iteration/v1",
@@ -56643,7 +56837,7 @@ library = "test"
                 result: bcode_workflow::PromptStructuredOutputPolicy {
                     schema: schema.clone(),
                     strict: true,
-                    correction: Default::default(),
+                    correction: bcode_workflow::WorkflowStructuredResultCorrectionPolicy::default(),
                 },
             },
             read_only: false,
@@ -57102,7 +57296,8 @@ library = "test"
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // A task node has `null` configuration, so the prompt contract cannot be decoded.
+            // The receipt deliberately omits required prompt-output identity so reconciliation
+            // cannot decode the owner contract and must surface ambiguous mutation for repair.
             let definition = bcode_workflow::WorkflowBuilder::new(
                 "undecodable",
                 bcode_workflow::Step::<u32, u32>::task("agent", |value, _context| async move {
@@ -57163,9 +57358,12 @@ library = "test"
                     attempt: 1,
                     dispatch_identity: prepared.dispatch_identity,
                     receipt: serde_json::json!({
+                        "owner": "bcode.server.agent-turn/v1",
+                        "owner_artifact_id": bcode_ipc::ArtifactId::current().to_string(),
+                        "owner_daemon_instance_id": "test-workflow-daemon",
                         "session_id": parent.id,
                         "turn_id": turn_id,
-                        "output_schema_id": "u32",
+                        "damaged_output_schema_id": "u32",
                     }),
                     admitted_at_ms: 3,
                 })
@@ -58195,7 +58393,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     result: bcode_workflow::PromptStructuredOutputPolicy {
                         schema: schema.clone(),
                         strict: true,
-                        correction: Default::default(),
+                        correction:
+                            bcode_workflow::WorkflowStructuredResultCorrectionPolicy::default(),
                     },
                 },
                 read_only,
@@ -58379,7 +58578,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     result: bcode_workflow::PromptStructuredOutputPolicy {
                         schema: schema.clone(),
                         strict: true,
-                        correction: Default::default(),
+                        correction:
+                            bcode_workflow::WorkflowStructuredResultCorrectionPolicy::default(),
                     },
                 },
                 read_only,
@@ -58669,7 +58869,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                     result: bcode_workflow::PromptStructuredOutputPolicy {
                                         schema: schema.clone(),
                                         strict: true,
-                                        correction: Default::default(),
+                                        correction: bcode_workflow::WorkflowStructuredResultCorrectionPolicy::default(),
                                     },
                                 },
                                 read_only: true,
@@ -58799,6 +58999,35 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[test]
+    fn structured_result_candidate_validation_rejects_malformed_and_schema_invalid_values() {
+        let request = bcode_session_models::TurnStructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "required": ["value"],
+                "properties": {"value": {"type": "string"}},
+                "additionalProperties": false
+            }),
+            strict: true,
+            max_corrections: 2,
+        };
+        assert!(validate_structured_result_candidate(&request, "not json").is_err());
+        assert!(validate_structured_result_candidate(&request, r#"{"value": 4}"#).is_err());
+        validate_structured_result_candidate(&request, r#"{"value":"ok"}"#)
+            .expect("valid structured result");
+
+        let semantic = bcode_session_models::TurnStructuredOutputRequest {
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"summary": {"type": "string", "minLength": 1}},
+                "required": ["summary"]
+            }),
+            ..request
+        };
+        assert!(validate_structured_result_candidate(&semantic, r#"{"summary":"   "}"#).is_err());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn workflow_prompt_completion_maps_provider_cancellation_and_schema_failures() {
         let sessions = SessionManager::default();
@@ -58829,7 +59058,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 result: bcode_workflow::PromptStructuredOutputPolicy {
                     schema: schema.clone(),
                     strict: true,
-                    correction: Default::default(),
+                    correction: bcode_workflow::WorkflowStructuredResultCorrectionPolicy::default(),
                 },
             },
             read_only: true,
@@ -59166,7 +59395,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                 result: bcode_workflow::PromptStructuredOutputPolicy {
                                     schema,
                                     strict: true,
-                                    correction: Default::default(),
+                                    correction: bcode_workflow::WorkflowStructuredResultCorrectionPolicy::default(),
                                 },
                             },
                             read_only: true,
@@ -59307,7 +59536,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("attempt")
             .pop()
             .expect("row");
-        assert_eq!(attempt.status, "cancelled");
+        assert!(matches!(
+            attempt.status.as_str(),
+            "cancelling" | "cancelled"
+        ));
     }
 
     #[tokio::test]
@@ -59363,6 +59595,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                         }),
                                     },
                                     strict: true,
+                                    correction: bcode_workflow::WorkflowStructuredResultCorrectionPolicy::default(),
                                 },
                             },
                             read_only: true,
@@ -60197,7 +60430,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
-                execution_authority: None,
+                execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -60300,7 +60533,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 }),
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
-                execution_authority: None,
+                execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -60496,7 +60729,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     }),
                     authored_provenance: None,
                     input: Some(serde_json::json!(false)),
-                    execution_authority: None,
+                    execution_authority: Some(test_workflow_execution_authority()),
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -64923,6 +65156,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                         "properties": {"done": {"type": "boolean"}}
                                     }),
                                     strict: true,
+                                    max_corrections: 0,
                                 },
                             ),
                             ..bcode_session_models::TurnExecutionOptions::default()
@@ -65025,6 +65259,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     }
                 }),
                 strict: true,
+                max_corrections: 1,
             }),
             ..bcode_session_models::TurnExecutionOptions::default()
         };
@@ -65051,6 +65286,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let provider_context = bcode_model::ProviderRequestContext {
             settings: BTreeMap::from([
                 ("fake_tool_rounds".to_string(), "1".to_string()),
+                (
+                    "fake_malformed_structured_output".to_string(),
+                    "once".to_string(),
+                ),
                 (
                     "fake_structured_output_execution".to_string(),
                     "tool_free_provider_round".to_string(),
@@ -65106,8 +65345,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ))
                 .count(),
             1,
-            "history: {history:#?}"
+            "correction must not replay committed host tools: {history:#?}"
         );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(&trace.payload, SessionTracePayload::ProviderEvent { event_type, .. }
+                    if event_type == "structured_result_correction_started")
+        )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ModelFeatureFidelityNegotiated { feature, .. }
@@ -65156,6 +65401,170 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn structured_result_correction_repairs_without_host_tools() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("structured result correction".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let structured_request = bcode_session_models::TurnStructuredOutputRequest {
+            name: "answer".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            }),
+            strict: true,
+            max_corrections: 1,
+        };
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "return a corrected result".to_string(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        execution: bcode_session_models::TurnExecutionOptions {
+                            structured_output: Some(structured_request.clone()),
+                            ..bcode_session_models::TurnExecutionOptions::default()
+                        },
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
+                },
+            )
+            .await
+            .expect("trigger");
+        let mut state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        state.selected_provider_context.settings.insert(
+            "fake_malformed_structured_output".to_string(),
+            "once".to_string(),
+        );
+
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                selected_model_id: Some("fake-echo".to_string()),
+                provider_context: state.selected_provider_context.clone(),
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            completion.outcome,
+            ModelTurnOutcome::Completed,
+            "{completion:?}"
+        );
+        let output = completion.output.expect("corrected output");
+        validate_structured_result_candidate(&structured_request, &output)
+            .expect("corrected output validates");
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(&trace.payload, bcode_session_models::SessionTracePayload::ProviderEvent { event_type, .. }
+                    if event_type == "structured_result_correction_started")
+        )));
+    }
+
+    #[tokio::test]
+    async fn structured_result_correction_exhaustion_is_terminal() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("structured correction exhaustion".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "return an invalid result".to_string(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        execution: bcode_session_models::TurnExecutionOptions {
+                            structured_output: Some(
+                                bcode_session_models::TurnStructuredOutputRequest {
+                                    name: "answer".to_string(),
+                                    schema: serde_json::json!({
+                                        "type": "object",
+                                        "properties": {"value": {"type": "string"}},
+                                        "required": ["value"]
+                                    }),
+                                    strict: true,
+                                    max_corrections: 1,
+                                },
+                            ),
+                            ..bcode_session_models::TurnExecutionOptions::default()
+                        },
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
+                },
+            )
+            .await
+            .expect("trigger");
+        let state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        let mut provider_context = state.selected_provider_context.clone();
+        provider_context.settings.insert(
+            "fake_malformed_structured_output".to_string(),
+            "true".to_string(),
+        );
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                selected_model_id: Some("fake-echo".to_string()),
+                provider_context,
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Error);
+        assert!(completion.output.is_none());
+        assert!(
+            completion
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("after 1 correction attempts"))
+        );
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ModelTurnFinished { .. }))
+                .count(),
+            1
+        );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(&trace.payload, bcode_session_models::SessionTracePayload::ProviderEvent { event_type, .. }
+                    if event_type == "structured_result_correction_exhausted")
+        )));
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn workflow_evaluation_executes_read_only_tool_then_finalizes_structured_output() {
         let sessions = SessionManager::default();
@@ -65189,6 +65598,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     }
                 }),
                 strict: true,
+                max_corrections: 0,
             }),
             ..bcode_session_models::TurnExecutionOptions::default()
         };
@@ -66692,6 +67102,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                 name: "review_result".to_string(),
                                 schema: serde_json::json!({"type": "object"}),
                                 strict: true,
+                                max_corrections: 0,
                             },
                         ),
                         ..bcode_session_models::TurnExecutionOptions::default()
@@ -66858,6 +67269,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     "required": ["value"]
                 }),
                 strict: true,
+                max_corrections: 0,
             }),
             ..bcode_session_models::TurnExecutionOptions::default()
         };

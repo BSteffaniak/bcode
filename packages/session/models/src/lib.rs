@@ -1435,6 +1435,9 @@ pub struct TurnStructuredOutputRequest {
     /// Whether provider-native strict validation should be requested where supported.
     #[serde(default)]
     pub strict: bool,
+    /// Maximum result-only correction rounds after canonical JSON Schema validation fails.
+    #[serde(default)]
+    pub max_corrections: u32,
 }
 
 /// Provider-neutral reasoning request overrides applied to one admitted turn.
@@ -1485,7 +1488,7 @@ pub struct TurnExecutionOptions {
 /// Earliest persisted turn execution-options schema version accepted by this build.
 pub const MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 1;
 /// Current persisted turn execution-options schema version.
-pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 2;
+pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 3;
 
 const fn turn_execution_options_schema_version() -> u32 {
     TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
@@ -1743,8 +1746,15 @@ impl TurnAdmissionMetadata {
         {
             return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
         }
+        if self.execution.schema_version < 2 && self.execution.reasoning.is_some() {
+            return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
+        }
         if self.execution.schema_version < TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
-            && self.execution.reasoning.is_some()
+            && self
+                .execution
+                .structured_output
+                .as_ref()
+                .is_some_and(|request| request.max_corrections > 0)
         {
             return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
         }
@@ -3801,6 +3811,7 @@ mod tests {
                         "required": ["approved"]
                     }),
                     strict: true,
+                    max_corrections: 0,
                 }),
                 ..TurnExecutionOptions::default()
             },
@@ -3915,6 +3926,7 @@ mod tests {
                     name: "crate::Result".to_string(),
                     schema: serde_json::json!({"type": "object"}),
                     strict: false,
+                    max_corrections: 0,
                 }),
                 ..TurnExecutionOptions::default()
             },
@@ -3931,6 +3943,7 @@ mod tests {
                     name: "result".to_string(),
                     schema: serde_json::Value::Bool(true),
                     strict: false,
+                    max_corrections: 0,
                 }),
                 ..TurnExecutionOptions::default()
             },

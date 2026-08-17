@@ -4212,7 +4212,7 @@ impl WorkflowStructuredSourceConcisePrompt {
                 result: PromptStructuredOutputPolicy {
                     schema: self.output.clone(),
                     strict: true,
-                    correction: Default::default(),
+                    correction: WorkflowStructuredResultCorrectionPolicy::default(),
                 },
             },
             read_only: self.read_only,
@@ -10668,7 +10668,7 @@ pub struct PromptStructuredOutputPolicy {
 impl PromptStructuredOutputPolicy {
     /// Create a strict canonical structured-result policy without correction rounds.
     #[must_use]
-    pub fn strict(schema: ValueSchema) -> Self {
+    pub const fn strict(schema: ValueSchema) -> Self {
         Self {
             schema,
             strict: true,
@@ -10700,7 +10700,7 @@ pub enum WorkflowPromptOutputPolicy {
 impl WorkflowPromptOutputPolicy {
     /// Create a strict structured-result policy for the canonical schema.
     #[must_use]
-    pub fn structured_result(schema: ValueSchema) -> Self {
+    pub const fn structured_result(schema: ValueSchema) -> Self {
         Self::Structured {
             result: PromptStructuredOutputPolicy::strict(schema),
         }
@@ -15250,7 +15250,7 @@ mod tests {
                 result: PromptStructuredOutputPolicy {
                     schema: ValueSchema::of::<u32>(),
                     strict: true,
-                    correction: Default::default(),
+                    correction: WorkflowStructuredResultCorrectionPolicy::default(),
                 },
             },
             read_only: true,
@@ -15437,7 +15437,7 @@ mod tests {
                                 result: PromptStructuredOutputPolicy {
                                     schema: value_schema,
                                     strict: true,
-                                    correction: Default::default(),
+                                    correction: WorkflowStructuredResultCorrectionPolicy::default(),
                                 },
                             },
                             read_only: true,
@@ -16981,7 +16981,7 @@ steps:
                 result: PromptStructuredOutputPolicy {
                     schema: schema.clone(),
                     strict: true,
-                    correction: Default::default(),
+                    correction: WorkflowStructuredResultCorrectionPolicy::default(),
                 },
             },
             read_only: true,
@@ -20960,7 +20960,7 @@ steps:
                 result: PromptStructuredOutputPolicy {
                     schema: ValueSchema::of::<serde_json::Value>(),
                     strict: true,
-                    correction: Default::default(),
+                    correction: WorkflowStructuredResultCorrectionPolicy::default(),
                 },
             },
             read_only: true,
@@ -22912,7 +22912,7 @@ steps:
                 result: PromptStructuredOutputPolicy {
                     schema: schema.clone(),
                     strict: true,
-                    correction: Default::default(),
+                    correction: WorkflowStructuredResultCorrectionPolicy::default(),
                 },
             },
             read_only,

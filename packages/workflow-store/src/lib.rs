@@ -831,6 +831,14 @@ pub struct AttemptReconciliationRequest {
     pub receipt: serde_json::Value,
 }
 
+impl AttemptReconciliationRequest {
+    /// Return whether this attempt may have committed mutations.
+    #[must_use]
+    pub const fn may_mutate(&self) -> bool {
+        matches!(self.side_effect, DispatchSideEffect::Mutating)
+    }
+}
+
 /// Recoverable owner outcome that pauses a workflow attempt without treating it as success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -14576,7 +14584,7 @@ mod tests {
                                     result: bcode_workflow::PromptStructuredOutputPolicy {
                                         schema,
                                         strict: true,
-                                        correction: Default::default(),
+                                        correction: bcode_workflow::WorkflowStructuredResultCorrectionPolicy::default(),
                                     },
                                 },
                                 read_only: true,
