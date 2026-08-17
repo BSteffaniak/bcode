@@ -5013,7 +5013,11 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
 }
 
 fn statusline_status_text(app: &BmuxApp) -> String {
-    app.status().to_owned()
+    match app.execution_mode_indicator() {
+        Some(indicator) if app.status().is_empty() => indicator.to_owned(),
+        Some(indicator) => format!("{indicator} · {}", app.status()),
+        None => app.status().to_owned(),
+    }
 }
 
 fn compact_statusline_token_segments(summary: &str) -> Vec<(String, u8)> {

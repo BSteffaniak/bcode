@@ -190,6 +190,7 @@ pub fn format_skill_manifest_markdown(manifest: &bcode_skill_models::SkillManife
 
 pub fn start_skill_action(
     launch_working_directory: &std::path::Path,
+    launch_options: super::TuiLaunchOptions,
     chat: &mut ActiveChat,
     action: SkillActionKind,
     skill_id: SkillId,
@@ -235,6 +236,7 @@ pub fn start_skill_action(
             reasoning_effort_generation: (action == SkillActionKind::Invoke)
                 .then(|| chat.app.pending_reasoning_effort_generation())
                 .flatten(),
+            execution: launch_options.turn_execution_options(),
             event_sender: chat.event_sender.clone(),
         }),
     });

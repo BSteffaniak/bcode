@@ -34,12 +34,14 @@ pub async fn run_event_loop_with_static_bundled<W: Write>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    launch_options: super::TuiLaunchOptions,
 ) -> Result<(), TuiError> {
     Box::pin(run_event_loop_with_startup_and_static_bundled(
         terminal,
         session_id,
         StartupTuiAction::None,
         static_plugins,
+        launch_options,
     ))
     .await
 }
@@ -56,6 +58,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
         session_id,
         startup_action,
         &[],
+        super::TuiLaunchOptions::default(),
     ))
     .await
 }
@@ -71,7 +74,12 @@ pub async fn run_standalone_plugin_surface<W: Write>(
     plugin_id: impl Into<String>,
     surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
 ) -> Result<Option<serde_json::Value>, TuiError> {
-    let initialized = initialize_tui(terminal.area(), None, &super::static_bundled_plugins());
+    let initialized = initialize_tui(
+        terminal.area(),
+        None,
+        &super::static_bundled_plugins(),
+        super::TuiLaunchOptions::default(),
+    );
     let passive_client = initialized
         .client
         .clone()
@@ -100,8 +108,9 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     session_id: Option<SessionId>,
     startup_action: StartupTuiAction,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    launch_options: super::TuiLaunchOptions,
 ) -> Result<(), TuiError> {
-    let initialized = initialize_tui(terminal.area(), session_id, static_plugins);
+    let initialized = initialize_tui(terminal.area(), session_id, static_plugins, launch_options);
     Box::pin(run_root(terminal, initialized, startup_action)).await
 }
 
@@ -117,6 +126,7 @@ fn initialize_tui(
     terminal_area: Rect,
     session_id: Option<SessionId>,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    launch_options: super::TuiLaunchOptions,
 ) -> InitializedTui {
     let config = bcode_config::load_config();
     let streaming_presentation_override = bcode_config::load_tui_streaming_presentation_override();
@@ -132,6 +142,17 @@ fn initialize_tui(
         .with_interaction_adapters(super::bundled_interaction_adapters("tui"));
     let (event_sender, event_receiver) = history_flow::session_stream_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
+    app.set_execution_mode_indicator(
+        match (launch_options.permission_mode, launch_options.tool_policy) {
+            (bcode_session_models::TurnPermissionMode::Bypass, _) => {
+                Some("DANGER: PERMISSION BYPASS ACTIVE".to_owned())
+            }
+            (_, bcode_session_models::TurnToolPolicy::Disabled) => {
+                Some("TOOLS DISABLED".to_owned())
+            }
+            _ => None,
+        },
+    );
     let presentation_config = config.as_ref().ok();
     let plugin_selection =
         presentation_config.map_or_else(bcode_plugin::PluginSelection::all_enabled, |config| {
@@ -155,7 +176,8 @@ fn initialize_tui(
     agents.refresh_app_agent_metadata(&mut app);
     let launch_working_directory = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let mut settings =
-        chat_loop::TuiRuntimeSettings::bootstrap(launch_working_directory.clone(), static_plugins);
+        chat_loop::TuiRuntimeSettings::bootstrap(launch_working_directory.clone(), static_plugins)
+            .with_launch_options(launch_options);
     if let Ok(config) = &config {
         settings.set_metrics_enabled(config.metrics.enabled);
     }

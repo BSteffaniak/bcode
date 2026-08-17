@@ -27237,6 +27237,7 @@ struct ServerAuthorizationCoordinator<'a> {
     cancel_state: &'a TurnCancelState,
     call_count: usize,
     tool_policy: bcode_session_models::TurnToolPolicy,
+    permission_mode: bcode_session_models::TurnPermissionMode,
     agent_id: &'a str,
 }
 
@@ -27247,6 +27248,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
         cancel_state: &'a TurnCancelState,
         call_count: usize,
         tool_policy: bcode_session_models::TurnToolPolicy,
+        permission_mode: bcode_session_models::TurnPermissionMode,
         agent_id: &'a str,
     ) -> Self {
         Self {
@@ -27255,6 +27257,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             cancel_state,
             call_count,
             tool_policy,
+            permission_mode,
             agent_id,
         }
     }
@@ -27284,6 +27287,24 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
                 "server cannot authorize a non-plugin tool".to_string(),
             );
         };
+        if self.permission_mode == bcode_session_models::TurnPermissionMode::Bypass {
+            append_trace_event(
+                self.state,
+                self.session_id,
+                None,
+                SessionTracePhase::ToolPolicyEvaluated,
+                SessionTracePayload::ToolPolicyEvaluated {
+                    tool_call_id: request.call.id.clone(),
+                    agent_id: self.agent_id.to_string(),
+                    decision: "bypassed_by_turn_permission_mode".to_string(),
+                    reason: Some(
+                        "discretionary permission policy bypassed for this turn".to_string(),
+                    ),
+                },
+            )
+            .await;
+            return ToolAuthorizationDecision::Allow;
+        }
         let agent_decision = evaluate_agent_tool_policy_with_metadata(
             self.state,
             self.session_id,
@@ -27632,6 +27653,7 @@ fn execute_model_tool_batch<'a>(
     tool_execution: bcode_tool::ToolExecutionOptions,
 ) -> ProviderCallFuture<'a, bool> {
     let tool_policy = execution.tools;
+    let permission_mode = execution.permission_mode;
     let tool_allowlist = execution
         .tool_allowlist
         .as_ref()
@@ -27694,6 +27716,7 @@ fn execute_model_tool_batch<'a>(
             cancel_state.as_ref(),
             calls.len(),
             tool_policy,
+            permission_mode,
             &agent_id,
         );
         let permission_context = bcode_agent_runtime::RuntimePermissionContext {
@@ -50540,6 +50563,7 @@ library = "test"
             cancel_state,
             1,
             bcode_session_models::TurnToolPolicy::Enabled,
+            bcode_session_models::TurnPermissionMode::Enforce,
             &agent_id,
         )
         .authorize_one(&request, None)

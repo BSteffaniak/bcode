@@ -2,6 +2,21 @@
 
 Bcode uses an agent-scoped permission model with three verbs: `allow`, `ask`, and `deny`. Declarative rules live in `bcode.toml` under `[agent.<agent_id>]` sections. Runtime rules written by the TUI "always allow" prompt live in a separate state file (see [Runtime rule persistence](#runtime-rule-persistence) below), so a read-only declarative config (for example on NixOS / home-manager) is never mutated.
 
+## Per-launch execution modes
+
+Bcode provides two mutually exclusive CLI modes for turns admitted by the current launch:
+
+```text
+bcode --dangerously-bypass-all-permissions  # alias: --yolo
+bcode --disable-all-tools                   # alias: --no-tools
+```
+
+The flags work with the default TUI, `--new`, `tui`, and `send`. They are rejected by commands that do not admit ordinary agent turns. They do not modify `bcode.toml`, runtime permission state, or a permanent session setting; relaunching without a flag restores normal behavior for future turns.
+
+`--dangerously-bypass-all-permissions` allows otherwise valid, available tool operations without evaluating configured agent or skill permission rules and without prompting. It can enable destructive commands, data loss, secret exposure, repository modification, and arbitrary effects from enabled tools. Canonical operation validation, tool and plugin availability, read-only or disabled turn/workflow ceilings, path confinement, provider authentication, and operating-system privileges still apply.
+
+`--disable-all-tools` exposes no agent tools to the model and rejects a tool call if a provider emits one anyway. Model generation, session context, project instructions, and non-tool application behavior remain available, so this mode is intentionally not described as hermetic.
+
 ## Config shape
 
 ```toml

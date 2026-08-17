@@ -431,6 +431,7 @@ pub struct BmuxApp {
     activity: ActivityState,
     activity_started_at: Instant,
     daemon_connection: DaemonConnectionState,
+    execution_mode_indicator: Option<String>,
     status: String,
     key_hints: String,
     jump_to_latest_key_label: String,
@@ -643,6 +644,7 @@ impl BmuxApp {
             activity: ActivityState::Idle,
             activity_started_at: now,
             daemon_connection: DaemonConnectionState::Connecting,
+            execution_mode_indicator: None,
             status: String::from("Connecting to daemon… Enter submits; Esc/Ctrl-C exits."),
             key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
             jump_to_latest_key_label: "ctrl+end".to_owned(),
@@ -2277,6 +2279,17 @@ impl BmuxApp {
     /// Store daemon connection state for startup/readiness chrome.
     pub const fn set_daemon_connection(&mut self, daemon_connection: DaemonConnectionState) {
         self.daemon_connection = daemon_connection;
+    }
+
+    /// Return the persistent launch execution-mode indicator.
+    #[must_use]
+    pub fn execution_mode_indicator(&self) -> Option<&str> {
+        self.execution_mode_indicator.as_deref()
+    }
+
+    /// Set the persistent launch execution-mode indicator.
+    pub fn set_execution_mode_indicator(&mut self, indicator: Option<String>) {
+        self.execution_mode_indicator = indicator;
     }
 
     /// Return the current status line.

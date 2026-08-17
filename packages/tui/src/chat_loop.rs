@@ -2180,6 +2180,7 @@ pub struct TuiRuntimeSettings {
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
     tui_extensions: Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension>,
     launch_working_directory: std::path::PathBuf,
+    launch_options: super::TuiLaunchOptions,
 }
 
 impl TuiRuntimeSettings {
@@ -2198,7 +2199,14 @@ impl TuiRuntimeSettings {
             static_plugins: static_plugins.to_vec(),
             tui_extensions: super::bundled_tui_extensions(),
             launch_working_directory,
+            launch_options: super::TuiLaunchOptions::default(),
         }
+    }
+
+    #[must_use]
+    pub const fn with_launch_options(mut self, launch_options: super::TuiLaunchOptions) -> Self {
+        self.launch_options = launch_options;
+        self
     }
 
     pub fn apply_tui_config(&mut self, tui_config: &TuiConfig) {
@@ -2245,6 +2253,10 @@ impl TuiRuntimeSettings {
 
     pub fn launch_working_directory(&self) -> &std::path::Path {
         &self.launch_working_directory
+    }
+
+    pub const fn launch_options(&self) -> super::TuiLaunchOptions {
+        self.launch_options
     }
 }
 
@@ -3427,6 +3439,7 @@ fn apply_root_slash_command_outcome(
                     reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
                     reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
                     reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),
+                    execution: settings.launch_options().turn_execution_options(),
                     event_sender: chat.event_sender.clone(),
                 }),
             });

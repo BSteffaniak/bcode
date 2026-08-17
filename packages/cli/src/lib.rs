@@ -274,11 +274,17 @@ fn config_override_from_matches(
 
 async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     let _ = (&cli.profile, cli.request_timeout_secs);
+    let launch_options = cli.launch_options();
+    if launch_options != bcode_tui::TuiLaunchOptions::default() && !cli.supports_execution_mode() {
+        return Err(CliError::InvalidArguments(
+            "execution-mode flags are supported only for TUI launches, --new, and send".to_owned(),
+        ));
+    }
     if cli.new {
         if cli.command.is_some() {
             return Err(CliError::NewSessionWithCommand);
         }
-        Box::pin(run_new_session_tui(cli.worktree)).await?;
+        Box::pin(run_new_session_tui(cli.worktree, launch_options)).await?;
         return Ok(());
     }
     if cli.onboard {
@@ -334,7 +340,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
         Commands::Workflow { command } => handle_workflow_command(Box::new(command)).await?,
-        command => Box::pin(handle_session_io_command(command)).await?,
+        command => Box::pin(handle_session_io_command(command, launch_options)).await?,
     }
     Ok(())
 }
@@ -2292,7 +2298,10 @@ fn onboard_section_from_str(value: &str) -> Option<bcode_settings::SetupSectionI
         .find(|section| section.as_str() == value)
 }
 
-async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
+async fn handle_session_io_command(
+    command: Commands,
+    launch_options: bcode_tui::TuiLaunchOptions,
+) -> Result<(), CliError> {
     match command {
         Commands::Cancel {
             session_id,
@@ -2300,17 +2309,18 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         } => cancel_session_turn(session_id, clear_queue).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
-            bcode_tui::run_with_static_bundled(
+            bcode_tui::run_with_static_bundled_and_options(
                 session_id,
                 &static_bundled_plugins(),
                 build_info().clone(),
+                launch_options,
             )
             .await?;
         }
         Commands::Send {
             session_id,
             message,
-        } => send_message(session_id, message).await?,
+        } => send_message(session_id, message, launch_options).await?,
         Commands::Onboard { .. }
         | Commands::ArtifactId
         | Commands::Server { .. }
@@ -2506,8 +2516,43 @@ struct Cli {
     /// Force the onboarding/setup-map flow.
     #[arg(long = "onboard", global = true)]
     onboard: bool,
+    /// Allow structurally valid tool operations without agent or skill permission prompts.
+    #[arg(
+        long = "dangerously-bypass-all-permissions",
+        visible_alias = "yolo",
+        global = true,
+        conflicts_with = "disable_all_tools"
+    )]
+    dangerously_bypass_all_permissions: bool,
+    /// Do not expose or execute agent tools.
+    #[arg(long = "disable-all-tools", visible_alias = "no-tools", global = true)]
+    disable_all_tools: bool,
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+impl Cli {
+    fn launch_options(&self) -> bcode_tui::TuiLaunchOptions {
+        bcode_tui::TuiLaunchOptions {
+            permission_mode: if self.dangerously_bypass_all_permissions {
+                bcode_session_models::TurnPermissionMode::Bypass
+            } else {
+                bcode_session_models::TurnPermissionMode::Enforce
+            },
+            tool_policy: if self.disable_all_tools {
+                bcode_session_models::TurnToolPolicy::Disabled
+            } else {
+                bcode_session_models::TurnToolPolicy::Enabled
+            },
+        }
+    }
+
+    fn supports_execution_mode(&self) -> bool {
+        self.new
+            || self.command.as_ref().is_none_or(|command| {
+                matches!(command, Commands::Tui { .. } | Commands::Send { .. })
+            })
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -9675,7 +9720,10 @@ fn server_is_unreachable(error: &ClientError) -> bool {
     }
 }
 
-async fn run_new_session_tui(worktree: Option<String>) -> Result<(), CliError> {
+async fn run_new_session_tui(
+    worktree: Option<String>,
+    launch_options: bcode_tui::TuiLaunchOptions,
+) -> Result<(), CliError> {
     ensure_server_running().await?;
     let client = BcodeClient::default_endpoint();
     let session = if let Some(name) = worktree {
@@ -9701,10 +9749,11 @@ async fn run_new_session_tui(worktree: Option<String>) -> Result<(), CliError> {
     } else {
         client.create_session(None).await?
     };
-    bcode_tui::run_with_static_bundled(
+    bcode_tui::run_with_static_bundled_and_options(
         Some(session.id),
         &static_bundled_plugins(),
         build_info().clone(),
+        launch_options,
     )
     .await?;
     Ok(())
@@ -12317,10 +12366,19 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
     }
 }
 
-async fn send_message(session_id: SessionId, message: String) -> Result<(), CliError> {
+async fn send_message(
+    session_id: SessionId,
+    message: String,
+    launch_options: bcode_tui::TuiLaunchOptions,
+) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     client
-        .send_user_message(session_id, message, bcode_ipc::PromptPlacement::FollowUp)
+        .send_user_message_with_execution(
+            session_id,
+            message,
+            bcode_ipc::PromptPlacement::FollowUp,
+            launch_options.turn_execution_options(),
+        )
         .await?;
     Ok(())
 }
@@ -16813,6 +16871,37 @@ mod client_timeout_cli_tests {
             .expect("positive timeout should parse");
 
         assert_eq!(cli.request_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn execution_mode_flags_map_to_typed_launch_options() {
+        let yolo =
+            Cli::try_parse_from(["bcode", "tui", "--yolo"]).expect("yolo alias should parse");
+        assert_eq!(
+            yolo.launch_options(),
+            bcode_tui::TuiLaunchOptions {
+                permission_mode: bcode_session_models::TurnPermissionMode::Bypass,
+                tool_policy: bcode_session_models::TurnToolPolicy::Enabled,
+            }
+        );
+
+        let no_tools = Cli::try_parse_from(["bcode", "--disable-all-tools"])
+            .expect("no-tools canonical flag should parse");
+        assert_eq!(
+            no_tools.launch_options(),
+            bcode_tui::TuiLaunchOptions {
+                permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
+                tool_policy: bcode_session_models::TurnToolPolicy::Disabled,
+            }
+        );
+    }
+
+    #[test]
+    fn execution_mode_flags_conflict_and_are_scoped_to_turn_entry_points() {
+        assert!(Cli::try_parse_from(["bcode", "--yolo", "--no-tools"]).is_err());
+        let maintenance = Cli::try_parse_from(["bcode", "server", "status", "--yolo"])
+            .expect("global flag parses before applicability validation");
+        assert!(!maintenance.supports_execution_mode());
     }
 
     #[test]

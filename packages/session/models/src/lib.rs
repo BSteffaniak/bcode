@@ -1451,6 +1451,17 @@ pub struct TurnReasoningOptions {
     pub summary: Option<String>,
 }
 
+/// Permission authorization behavior for one admitted turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPermissionMode {
+    /// Evaluate configured agent and skill permission policy normally.
+    #[default]
+    Enforce,
+    /// Bypass discretionary agent and skill permission policy after structural authorization.
+    Bypass,
+}
+
 /// Generic execution options applied to one admitted turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnExecutionOptions {
@@ -1459,6 +1470,9 @@ pub struct TurnExecutionOptions {
     pub schema_version: u32,
     #[serde(default)]
     pub tools: TurnToolPolicy,
+    /// Permission authorization behavior captured immutably for this turn.
+    #[serde(default)]
+    pub permission_mode: TurnPermissionMode,
     /// Optional generic external-execution correlation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation: Option<TurnExecutionCorrelation>,
@@ -1488,7 +1502,7 @@ pub struct TurnExecutionOptions {
 /// Earliest persisted turn execution-options schema version accepted by this build.
 pub const MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 1;
 /// Current persisted turn execution-options schema version.
-pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 3;
+pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 4;
 
 const fn turn_execution_options_schema_version() -> u32 {
     TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
@@ -1499,6 +1513,7 @@ impl Default for TurnExecutionOptions {
         Self {
             schema_version: TURN_EXECUTION_OPTIONS_SCHEMA_VERSION,
             tools: TurnToolPolicy::default(),
+            permission_mode: TurnPermissionMode::default(),
             correlation: None,
             agent_profile: None,
             tool_allowlist: None,
@@ -1749,7 +1764,12 @@ impl TurnAdmissionMetadata {
         if self.execution.schema_version < 2 && self.execution.reasoning.is_some() {
             return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
         }
-        if self.execution.schema_version < TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
+        if self.execution.schema_version < 4
+            && self.execution.permission_mode != TurnPermissionMode::Enforce
+        {
+            return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
+        }
+        if self.execution.schema_version < 3
             && self
                 .execution
                 .structured_output
@@ -3759,6 +3779,10 @@ mod tests {
         assert_eq!(metadata.idempotency_key, None);
         assert_eq!(metadata.execution.tools, TurnToolPolicy::Enabled);
         assert_eq!(
+            metadata.execution.permission_mode,
+            TurnPermissionMode::Enforce
+        );
+        assert_eq!(
             metadata.execution.schema_version,
             TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
         );
@@ -3769,6 +3793,51 @@ mod tests {
         assert_eq!(metadata.execution.model_id, None);
         assert_eq!(metadata.execution.structured_output, None);
         assert_eq!(metadata.validate(), Ok(()));
+    }
+
+    #[test]
+    fn turn_permission_mode_is_versioned_and_defaults_to_enforcement() {
+        let historical: TurnExecutionOptions = serde_json::from_value(serde_json::json!({
+            "schema_version": 3,
+            "tools": "enabled"
+        }))
+        .expect("historical options should decode");
+        assert_eq!(historical.permission_mode, TurnPermissionMode::Enforce);
+        assert_eq!(
+            TurnAdmissionMetadata {
+                execution: historical,
+                ..TurnAdmissionMetadata::default()
+            }
+            .validate(),
+            Ok(())
+        );
+
+        let invalid_historical_bypass = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                schema_version: 3,
+                permission_mode: TurnPermissionMode::Bypass,
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            invalid_historical_bypass.validate(),
+            Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion)
+        );
+
+        let current = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                permission_mode: TurnPermissionMode::Bypass,
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(current.validate(), Ok(()));
+        let decoded: TurnAdmissionMetadata = serde_json::from_str(
+            &serde_json::to_string(&current).expect("current metadata should encode"),
+        )
+        .expect("current metadata should decode");
+        assert_eq!(decoded, current);
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub enum RootSubmission {
 
 pub fn stage_root_submission(
     launch_working_directory: &std::path::Path,
+    launch_options: super::TuiLaunchOptions,
     chat: &mut ActiveChat,
     placement: bcode_ipc::PromptPlacement,
 ) -> RootSubmission {
@@ -38,6 +39,7 @@ pub fn stage_root_submission(
     chat.app.stage_submission();
     RootSubmission::MessageStaged(stage_session_message(
         launch_working_directory,
+        launch_options,
         chat,
         placement,
     ))
@@ -45,6 +47,7 @@ pub fn stage_root_submission(
 
 pub fn stage_session_message(
     launch_working_directory: &std::path::Path,
+    launch_options: super::TuiLaunchOptions,
     chat: &mut ActiveChat,
     placement: bcode_ipc::PromptPlacement,
 ) -> bool {
@@ -93,6 +96,7 @@ pub fn stage_session_message(
             reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
             reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
             reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),
+            execution: launch_options.turn_execution_options(),
             event_sender: chat.event_sender.clone(),
         }),
     });

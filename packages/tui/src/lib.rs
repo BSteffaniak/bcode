@@ -493,11 +493,33 @@ pub async fn run_ralph_home(repo_path: std::path::PathBuf) -> Result<(), TuiErro
             None,
             startup_action::StartupTuiAction::OpenRalphHome { repo_path },
             &static_bundled_plugins(),
+            TuiLaunchOptions::default(),
         ))
         .await
     };
     let _writer = guard.leave()?;
     result
+}
+
+/// Launch-scoped defaults copied into every turn admitted by this TUI.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TuiLaunchOptions {
+    /// Permission authorization behavior for admitted turns.
+    pub permission_mode: bcode_session_models::TurnPermissionMode,
+    /// Tool availability for admitted turns.
+    pub tool_policy: bcode_session_models::TurnToolPolicy,
+}
+
+impl TuiLaunchOptions {
+    /// Build portable execution options for one admitted turn.
+    #[must_use]
+    pub fn turn_execution_options(self) -> bcode_session_models::TurnExecutionOptions {
+        bcode_session_models::TurnExecutionOptions {
+            permission_mode: self.permission_mode,
+            tools: self.tool_policy,
+            ..bcode_session_models::TurnExecutionOptions::default()
+        }
+    }
 }
 
 /// Run the terminal user interface.
@@ -512,10 +534,11 @@ pub async fn run(
     build_info: bcode_build_info::BuildInfo,
 ) -> Result<(), TuiError> {
     markdown_activation_adapter_linkage();
-    Box::pin(run_with_static_bundled(
+    Box::pin(run_with_static_bundled_and_options(
         session_id,
         &static_bundled_plugins(),
         build_info,
+        TuiLaunchOptions::default(),
     ))
     .await
 }
@@ -532,6 +555,28 @@ pub async fn run_with_static_bundled(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     build_info: bcode_build_info::BuildInfo,
 ) -> Result<(), TuiError> {
+    Box::pin(run_with_static_bundled_and_options(
+        session_id,
+        static_plugins,
+        build_info,
+        TuiLaunchOptions::default(),
+    ))
+    .await
+}
+
+/// Run the terminal user interface with static plugins and launch-scoped turn defaults.
+///
+/// # Errors
+///
+/// Returns I/O errors from terminal setup, event polling, drawing, or Bcode client/plugin
+/// operations.
+#[allow(clippy::future_not_send)]
+pub async fn run_with_static_bundled_and_options(
+    session_id: Option<SessionId>,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    build_info: bcode_build_info::BuildInfo,
+    launch_options: TuiLaunchOptions,
+) -> Result<(), TuiError> {
     set_build_info(build_info);
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;
@@ -546,6 +591,7 @@ pub async fn run_with_static_bundled(
             &mut terminal,
             session_id,
             static_plugins,
+            launch_options,
         ))
         .await
     };

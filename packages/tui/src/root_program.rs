@@ -1192,6 +1192,7 @@ impl BcodeRuntimeModel {
     ) {
         super::skill_flow::start_skill_action(
             self.settings.launch_working_directory(),
+            self.settings.launch_options(),
             &mut self.chat,
             action,
             skill_id,
@@ -1307,6 +1308,7 @@ impl BcodeRuntimeModel {
         let launch_working_directory = self.settings.launch_working_directory().to_path_buf();
         match super::composer_flow::stage_root_submission(
             &launch_working_directory,
+            self.settings.launch_options(),
             &mut self.chat,
             placement,
         ) {

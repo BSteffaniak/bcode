@@ -44,6 +44,8 @@ pub struct SubmitMessageRequest {
     pub reasoning_summary: Option<String>,
     /// Reasoning effort generation captured by this submission, if locally pending.
     pub reasoning_effort_generation: Option<u64>,
+    /// Launch-scoped execution defaults for this exact turn.
+    pub execution: bcode_session_models::TurnExecutionOptions,
     /// Event sender for a newly-created session stream.
     pub event_sender: mpsc::Sender<super::history_flow::SessionStreamUpdate>,
 }
@@ -83,6 +85,8 @@ pub struct SkillActionRequest {
     pub reasoning_summary: Option<String>,
     /// Pending reasoning effort generation captured by the invocation.
     pub reasoning_effort_generation: Option<u64>,
+    /// Launch-scoped execution defaults for an invoked turn.
+    pub execution: bcode_session_models::TurnExecutionOptions,
     /// Event sender for a newly-created session stream.
     pub event_sender: mpsc::Sender<super::history_flow::SessionStreamUpdate>,
 }
@@ -2081,8 +2085,13 @@ async fn skill_action(
         reasoning_effort,
         reasoning_summary,
         reasoning_effort_generation,
+        mut execution,
         event_sender,
     } = request;
+    execution.reasoning = Some(Box::new(bcode_session_models::TurnReasoningOptions {
+        effort: reasoning_effort.clone(),
+        summary: reasoning_summary.clone(),
+    }));
     let (session_id, created_session, event_task, event_stream_release) =
         ensure_session_for_foreground_action(
             client,
@@ -2137,13 +2146,7 @@ async fn skill_action(
                     skill_id: skill_id.to_string(),
                     arguments,
                     display_text,
-                    execution: Box::new(bcode_session_models::TurnExecutionOptions {
-                        reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
-                            effort: reasoning_effort.clone(),
-                            summary: reasoning_summary.clone(),
-                        })),
-                        ..bcode_session_models::TurnExecutionOptions::default()
-                    }),
+                    execution: Box::new(execution),
                 },
             )
             .await?;
@@ -2266,8 +2269,13 @@ async fn submit_message(
         reasoning_effort,
         reasoning_summary,
         reasoning_effort_generation,
+        mut execution,
         event_sender,
     } = request;
+    execution.reasoning = Some(Box::new(bcode_session_models::TurnReasoningOptions {
+        effort: reasoning_effort.clone(),
+        summary: reasoning_summary.clone(),
+    }));
     let mut message = message;
     let mut created_session = None;
     let mut event_task = None;
@@ -2334,13 +2342,7 @@ async fn submit_message(
             launch_working_directory: None,
             text: message,
             placement,
-            execution: Box::new(bcode_session_models::TurnExecutionOptions {
-                reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
-                    effort: reasoning_effort.clone(),
-                    summary: reasoning_summary.clone(),
-                })),
-                ..bcode_session_models::TurnExecutionOptions::default()
-            }),
+            execution: Box::new(execution),
         },
     )
     .await?;
