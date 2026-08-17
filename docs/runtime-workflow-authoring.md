@@ -174,7 +174,9 @@ outcomes. A client can ignore an unknown presentation namespace and still unders
 UI, CLI, SDK, plugin, and generated producers discover the same bounded portable catalogs and submit
 the same authoring document. Catalogs describe durable node kinds, block contracts, prompt profiles,
 skills, predicates, transforms, schema dialects, production capabilities, and limit bounds without
-leaking implementation objects.
+leaking implementation objects. Model-backed prompt nodes explicitly choose a canonical structured
+result or input-preserving side-effect completion; provider capability negotiation determines how a
+structured result is produced and is not part of authoring semantics.
 
 Structured diagnostics contain stable codes, severity, source-document paths, and bounded remediation
 guidance. A form or graph editor may map paths to controls; an AI producer may revise source from the

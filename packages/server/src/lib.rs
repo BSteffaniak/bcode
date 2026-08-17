@@ -58194,8 +58194,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         schema: schema.clone(),
                         strict: true,
                     },
-                    read_only,
                 },
+                read_only,
                 tool_capability: if read_only {
                     bcode_workflow::WorkflowToolCapability::ReadOnly
                 } else {
@@ -58377,8 +58377,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         schema: schema.clone(),
                         strict: true,
                     },
-                    read_only,
                 },
+                read_only,
                 tool_capability: if read_only {
                     bcode_workflow::WorkflowToolCapability::ReadOnly
                 } else {

@@ -15067,6 +15067,54 @@ mod tests {
     }
 
     #[test]
+    fn prompt_configuration_decodes_version_two_and_rejects_mixed_or_future_contracts() {
+        let legacy = serde_json::json!({
+            "version": 2,
+            "execution_target": "fresh_isolated",
+            "agent_profile": "build",
+            "provider": null,
+            "model": null,
+            "structured_output": {
+                "schema": {"type_name": "u32", "schema": {"type": "integer"}},
+                "strict": true
+            },
+            "read_only": true,
+            "tool_capability": "read_only",
+            "tool_allowlist": [],
+            "timeout_ms": 30000,
+            "prompt_mode": "json_input",
+            "system_prompt": ""
+        });
+        let decoded: WorkflowPromptConfiguration =
+            serde_json::from_value(legacy.clone()).expect("version 2 remains readable");
+        assert_eq!(decoded.version, WORKFLOW_PROMPT_CONFIGURATION_VERSION);
+        assert!(decoded.output.structured().is_some());
+        let encoded = serde_json::to_value(decoded).expect("version 3 serializes");
+        assert_eq!(encoded["version"], serde_json::json!(3));
+        assert_eq!(encoded["output"]["mode"], serde_json::json!("structured"));
+        assert!(encoded.get("structured_output").is_none());
+
+        let mut mixed = legacy.clone();
+        mixed["output"] = serde_json::json!({"mode": "preserve_input"});
+        assert!(serde_json::from_value::<WorkflowPromptConfiguration>(mixed).is_err());
+        let mut future = legacy;
+        future["version"] = serde_json::json!(4);
+        assert!(serde_json::from_value::<WorkflowPromptConfiguration>(future).is_err());
+    }
+
+    #[test]
+    fn preserve_input_agent_requires_matching_input_and_output_schemas() {
+        let mut configuration = valid_prompt_configuration();
+        configuration.output = WorkflowPromptOutputPolicy::PreserveInput;
+        let step = Step::<u32, u32>::agent("side-effect", &configuration)
+            .expect("typed preserve-input agent");
+        assert_eq!(
+            step.fragment.nodes[0].configuration["output"]["mode"],
+            serde_json::json!("preserve_input")
+        );
+    }
+
+    #[test]
     fn agent_step_builds_an_agent_node_carrying_its_prompt_contract() {
         let configuration = valid_prompt_configuration();
         let step =

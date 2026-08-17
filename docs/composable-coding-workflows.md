@@ -19,10 +19,14 @@ typed result. Workflow and server code transport that contract without interpret
 review, or command-specific state.
 
 A prompt step is the generic adaptive-operation boundary. It starts an ordinary bounded Bcode turn
-with explicit context target, structured input and output, tool policy, model selection, timeout, and
-resources. Prompt output is untrusted and schema-validated. Workflow authors decide whether and how
-to verify observable side effects according to their workflow's requirements; production admission
-does not prescribe a post-prompt topology.
+with explicit context target, structured input, tool policy, model selection, timeout, and resources.
+Its versioned output policy either requires a canonical structured result or preserves the activation
+input after successful side-effect-only completion. Structured prompt output is untrusted and
+schema-validated; provider capability negotiation selects native structured output or a normalized
+tool-free finalization shape without changing the workflow contract. Input-preserving prompts do not
+request structured output merely to echo workflow-owned state. Workflow authors decide whether and
+how to verify observable side effects according to their workflow's requirements; production
+admission does not prescribe a post-prompt topology.
 
 Typed plugin blocks remain an extension point for capabilities that genuinely require a domain owner,
 such as authenticated external APIs or specialized devices. They are not the default mechanism for
