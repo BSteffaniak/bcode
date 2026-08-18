@@ -2300,7 +2300,9 @@ dependencies = [
  "bcode_prompt_profile",
  "bcode_session_models",
  "bcode_tool",
+ "serde",
  "serde_json",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]

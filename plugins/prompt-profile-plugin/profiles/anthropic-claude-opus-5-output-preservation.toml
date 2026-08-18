@@ -1,0 +1,12 @@
+id = "anthropic-claude-opus-5-output-preservation"
+
+[target]
+catalog_entry = "anthropic.claude-opus-5"
+
+[profile]
+system_prompt      = "Do not pipe tool output through head, tail, sed, or similar commands merely to shorten it. Bcode already bounds model-visible tool output while retaining complete output for the user, so self-truncation only hides output from the user."
+system_prompt_mode = "append"
+
+[profile.tool_description."shell.run"]
+mode = "append"
+text = "Do not pipe tool output through head, tail, sed, or similar commands merely to shorten it. Bcode already bounds model-visible tool output while retaining complete output for the user, so self-truncation only hides output from the user."

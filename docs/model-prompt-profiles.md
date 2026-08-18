@@ -35,8 +35,17 @@ The default applies only when catalog resolution identifies
 with `prompt_profile.model.<effective-model-id>`.
 
 Set `system_prompt.sections.model_profile = false` to disable all profile application for coding
-turns, or disable the `bcode.prompt-profile` plugin to remove the bundled behavior without affecting
-unrelated Bcode capabilities.
+turns, or disable the `bcode.prompt-profile` plugin to remove all bundled behavior without affecting
+unrelated Bcode capabilities. A single shipped profile can be disabled independently:
+
+```toml
+[prompt_profile.bundled]
+disabled = ["anthropic-claude-opus-5-output-preservation"]
+```
+
+Bundled profile documents live under `plugins/prompt-profile-plugin/profiles/`; the Opus 5 prompt
+text and target are defined in
+`anthropic-claude-opus-5-output-preservation.toml`, separately from runtime code.
 
 Prompt profiles are applied to ordinary coding turns. Utility prompts such as invariant selection,
 compaction, title generation, or other internal model requests are intentionally outside this

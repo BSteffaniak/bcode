@@ -6,18 +6,16 @@
 
 use std::collections::BTreeSet;
 
-use bcode_config::{
-    PromptProfileConfig, PromptProfileLayerConfig, PromptProfileTextMode,
-    ToolDescriptionOverrideConfig,
-};
+use bcode_config::{PromptProfileLayerConfig, PromptProfileTextMode};
 use bcode_plugin_sdk::prelude::*;
 use bcode_prompt_profile::{
     OP_RESOLVE_PROMPT_PROFILE, PROMPT_PROFILE_INTERFACE_ID, PromptProfileResponse,
     ResolvePromptProfileRequest, TextOverrideMode, ToolDescriptionOverride,
 };
 
+mod bundled_profiles;
+
 const MAX_PROFILE_TEXT_CHARS: usize = 16_384;
-const OUTPUT_GUIDANCE: &str = "Do not pipe tool output through head, tail, sed, or similar commands merely to shorten it. Bcode already bounds model-visible tool output while retaining complete output for the user, so self-truncation only hides output from the user.";
 
 /// Bundled prompt-profile plugin.
 #[derive(Default)]
@@ -57,7 +55,8 @@ fn resolve_profile(request: &ResolvePromptProfileRequest) -> PromptProfileRespon
         .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
         .map(|config| config.prompt_profile)
         .unwrap_or_default();
-    install_bundled_defaults(&mut config);
+    let mut response = PromptProfileResponse::default();
+    bundled_profiles::install(&mut config, &mut response.diagnostics);
 
     let target = &request.target;
     let layers = [
@@ -88,7 +87,6 @@ fn resolve_profile(request: &ResolvePromptProfileRequest) -> PromptProfileRespon
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<BTreeSet<_>>();
-    let mut response = PromptProfileResponse::default();
     for (name, layer) in layers.into_iter().flatten() {
         apply_layer(&mut response, layer, &known_tools);
         if layer.system_prompt.is_some() || !layer.tool_description.is_empty() {
@@ -96,23 +94,6 @@ fn resolve_profile(request: &ResolvePromptProfileRequest) -> PromptProfileRespon
         }
     }
     response
-}
-
-fn install_bundled_defaults(config: &mut PromptProfileConfig) {
-    let layer = config
-        .catalog_entry
-        .entry("anthropic.claude-opus-5".to_string())
-        .or_default();
-    if layer.system_prompt.is_none() {
-        layer.system_prompt = Some(OUTPUT_GUIDANCE.to_string());
-    }
-    layer
-        .tool_description
-        .entry("shell.run".to_string())
-        .or_insert_with(|| ToolDescriptionOverrideConfig {
-            mode: PromptProfileTextMode::Append,
-            text: OUTPUT_GUIDANCE.to_string(),
-        });
 }
 
 fn apply_layer(
@@ -278,7 +259,7 @@ mod tests {
         let mut config = bcode_config::BcodeConfig::default();
         config.prompt_profile.default.tool_description.insert(
             "missing.tool".to_string(),
-            ToolDescriptionOverrideConfig {
+            bcode_config::ToolDescriptionOverrideConfig {
                 mode: PromptProfileTextMode::Replace,
                 text: "bad".to_string(),
             },
@@ -286,6 +267,23 @@ mod tests {
         let response = resolve_profile(&request_with_config(None, Some(&config)));
         assert!(response.tool_description_overrides.is_empty());
         assert_eq!(response.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn individual_bundled_profile_can_be_disabled() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config
+            .prompt_profile
+            .bundled
+            .disabled
+            .insert("anthropic-claude-opus-5-output-preservation".to_string());
+        assert_eq!(
+            resolve_profile(&request_with_config(
+                Some("anthropic.claude-opus-5"),
+                Some(&config),
+            )),
+            PromptProfileResponse::default()
+        );
     }
 
     #[test]

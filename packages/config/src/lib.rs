@@ -1233,6 +1233,10 @@ const fn default_invariant_max_selected() -> std::num::NonZeroUsize {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "prompt_profile")]
 pub struct PromptProfileConfig {
+    /// Selection controls for profiles shipped with Bcode.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub bundled: BundledPromptProfileConfig,
     /// Base layer applied to every model.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1249,6 +1253,15 @@ pub struct PromptProfileConfig {
     /// Layers keyed by exact effective model ID.
     #[serde(default)]
     pub model: BTreeMap<String, PromptProfileLayerConfig>,
+}
+
+/// Selection controls for prompt profiles shipped with Bcode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "bundled")]
+pub struct BundledPromptProfileConfig {
+    /// Bundled profile IDs that must not contribute to resolved prompts.
+    #[serde(default)]
+    pub disabled: BTreeSet<String>,
 }
 
 /// One prompt-profile precedence layer.
