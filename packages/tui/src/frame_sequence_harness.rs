@@ -675,6 +675,252 @@ mod tests {
         );
     }
 
+    /// Bedrock-shaped raw reasoning must reach drawn terminal rows and survive turn completion.
+    ///
+    /// This is the rendered-frame counterpart to the provider-boundary verification: the plugin
+    /// emits `PartDelta` for each `thinking_delta`, then an authoritative `PartCompleted` at
+    /// `content_block_stop`. Both must leave readable text on screen.
+    #[test]
+    fn bedrock_raw_reasoning_streams_and_persists_in_drawn_frames() {
+        let session_id = SessionId::new();
+        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let activity_id = "bedrock-messages-reasoning-0";
+        let part_id = "raw-0";
+        let delta = |label: &'static str, revision: u64, expected_offset: usize, text: &str| {
+            TranscriptFrameStep {
+                label,
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                        output_position: None,
+                        turn_id: "turn-1".to_owned(),
+                        activity_id: activity_id.to_owned(),
+                        activity_order: 0,
+                        part_id: part_id.to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        role: bcode_session_models::ReasoningContentRole::Detail,
+                        part_order: 0,
+                        update: TextStreamUpdate {
+                            generation: 0,
+                            first_revision: revision,
+                            revision,
+                            operation: TextStreamOperation::Append {
+                                expected_offset,
+                                text: text.to_owned(),
+                            },
+                        },
+                    },
+                }),
+            }
+        };
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+            delta("thinking-delta-1", 1, 0, "Solving for the ball price"),
+            delta("thinking-delta-2", 2, 26, " algebraically"),
+            // `content_block_stop` finishes the activity; readable text must remain.
+            TranscriptFrameStep {
+                label: "reasoning-finished",
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningActivity {
+                        output_position: None,
+                        turn_id: "turn-1".to_owned(),
+                        event: bcode_session_models::ReasoningActivityEvent::Finished {
+                            activity_id: activity_id.to_owned(),
+                            activity_order: 0,
+                            status: bcode_session_models::ReasoningActivityStatus::Completed,
+                        },
+                    },
+                }),
+            },
+        ]);
+
+        assert!(
+            frames[0].text.contains("Solving for the ball price"),
+            "first reasoning delta must be drawn: {}",
+            frames[0].text
+        );
+        assert!(
+            frames[1]
+                .text
+                .contains("Solving for the ball price algebraically"),
+            "appended reasoning must be drawn: {}",
+            frames[1].text
+        );
+        assert!(
+            frames[2]
+                .text
+                .contains("Solving for the ball price algebraically"),
+            "finishing the activity must not erase readable reasoning: {}",
+            frames[2].text
+        );
+        // No frame may show the bare heading with an empty body, which was the original defect.
+        assert!(
+            !frames.iter().any(|frame| frame.text.contains("Reasoning")
+                && !frame.text.contains("Solving for the ball price")),
+            "no frame may render reasoning chrome without its readable body"
+        );
+    }
+
+    /// Replayed durable reasoning must render from canonical history alone.
+    ///
+    /// This covers the reattach path: a fresh app with no live stream state receives the persisted
+    /// `AssistantReasoningActivity` and must draw its readable parts.
+    #[test]
+    fn replayed_durable_reasoning_renders_without_live_stream_state() {
+        let session_id = SessionId::new();
+        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+            label: "durable-reasoning-replay",
+            input: TranscriptFrameInput::Durable(SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::AssistantReasoningActivity {
+                    turn_id: "turn-1".to_owned(),
+                    activity: bcode_session_models::ReasoningActivity {
+                        activity_id: "bedrock-messages-reasoning-0".to_owned(),
+                        order: 0,
+                        status: bcode_session_models::ReasoningActivityStatus::Completed,
+                        parts: vec![bcode_session_models::ReasoningPart {
+                            part_id: "raw-0".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Raw,
+                            role: bcode_session_models::ReasoningContentRole::Detail,
+                            order: 0,
+                            text: "Replayed reasoning detail".to_owned(),
+                        }],
+                        opaque: false,
+                    },
+                },
+            }),
+        }]);
+
+        assert!(
+            frames[0].text.contains("Replayed reasoning detail"),
+            "durable reasoning must replay into drawn rows: {}",
+            frames[0].text
+        );
+    }
+
+    /// An opaque-only activity must render an explanation, never a bare heading.
+    ///
+    /// This is the rendered-frame proof for the withheld-reasoning case: the provider recorded
+    /// opaque evidence and no readable text, so the transcript must say so.
+    #[test]
+    fn opaque_only_reasoning_renders_explanatory_chrome_in_drawn_frames() {
+        let session_id = SessionId::new();
+        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+            label: "opaque-only-reasoning",
+            input: TranscriptFrameInput::Durable(SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::AssistantReasoningActivity {
+                    turn_id: "turn-1".to_owned(),
+                    activity: bcode_session_models::ReasoningActivity {
+                        activity_id: "bedrock-messages-reasoning-0".to_owned(),
+                        order: 0,
+                        status: bcode_session_models::ReasoningActivityStatus::Completed,
+                        parts: Vec::new(),
+                        opaque: true,
+                    },
+                },
+            }),
+        }]);
+
+        assert!(
+            frames[0].text.contains("did not return readable reasoning"),
+            "opaque-only reasoning must be explained on screen: {}",
+            frames[0].text
+        );
+    }
+
+    /// `/thinking` display modes must change drawn reasoning output, and never blank it silently.
+    ///
+    /// Summary/raw filtering and `hide` are local presentation choices, so a filtered activity must
+    /// say the content is hidden by the display setting rather than render an empty heading.
+    #[test]
+    fn thinking_display_modes_change_drawn_reasoning_without_blank_frames() {
+        let session_id = SessionId::new();
+        let reasoning = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "bedrock-messages-reasoning-0".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![bcode_session_models::ReasoningPart {
+                        part_id: "raw-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        role: bcode_session_models::ReasoningContentRole::Detail,
+                        order: 0,
+                        text: "Raw chain of thought".to_owned(),
+                    }],
+                    opaque: false,
+                },
+            },
+        };
+
+        // `all` and `raw` both select raw parts, so the text is drawn.
+        for mode in [
+            bcode_config::TuiThinkingMode::All,
+            bcode_config::TuiThinkingMode::Raw,
+        ] {
+            let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+            app.set_reasoning_display_mode(mode);
+            let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+                label: "reasoning-visible",
+                input: TranscriptFrameInput::Durable(reasoning.clone()),
+            }]);
+            assert!(
+                frames[0].text.contains("Raw chain of thought"),
+                "{mode:?} must draw raw reasoning: {}",
+                frames[0].text
+            );
+        }
+
+        // `summary` excludes raw parts: the activity must explain the local filter, not go blank.
+        let mut summary_app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        summary_app.set_reasoning_display_mode(bcode_config::TuiThinkingMode::Summary);
+        let frames =
+            TranscriptFrameSequence::new(summary_app, 100, 40).run([TranscriptFrameStep {
+                label: "reasoning-filtered-by-summary-mode",
+                input: TranscriptFrameInput::Durable(reasoning.clone()),
+            }]);
+        assert!(
+            !frames[0].text.contains("Raw chain of thought"),
+            "summary mode must not draw raw reasoning: {}",
+            frames[0].text
+        );
+        assert!(
+            frames[0].text.contains("display setting"),
+            "filtered reasoning must explain the local display choice: {}",
+            frames[0].text
+        );
+
+        // `/thinking hide` removes the reasoning item entirely.
+        let mut hidden_app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        hidden_app.set_reasoning_visible(false);
+        let frames = TranscriptFrameSequence::new(hidden_app, 100, 40).run([TranscriptFrameStep {
+            label: "reasoning-hidden",
+            input: TranscriptFrameInput::Durable(reasoning),
+        }]);
+        assert!(
+            !frames[0].text.contains("Raw chain of thought"),
+            "hidden reasoning must not draw its text: {}",
+            frames[0].text
+        );
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // One transition fixture proves every draft-to-result frame.
     fn filesystem_handoff_has_no_blank_or_raw_json_frame() {

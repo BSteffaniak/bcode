@@ -2718,6 +2718,11 @@ fn anthropic_tool_choice(request: &ModelTurnRequest) -> Result<serde_json::Value
 /// redacts thinking content and returns only opaque continuation state. Bcode always asks for
 /// readable thinking so reasoning presentation has content to show; the signature still travels
 /// back for multi-turn continuity either way.
+///
+/// This applies to the adaptive thinking shape only. Budget-thinking models reject the field with
+/// `thinking.enabled.display: Extra inputs are not permitted` (verified against
+/// `us.anthropic.claude-sonnet-4-20250514-v1:0` on Converse), and they already return readable
+/// `reasoningContent` without it.
 const ANTHROPIC_THINKING_DISPLAY_SUMMARIZED: &str = "summarized";
 
 /// Whether the resolved target rejects the Anthropic `thinking.display` field.
@@ -2772,9 +2777,9 @@ fn apply_anthropic_thinking_fields(
                 let mut thinking = serde_json::Map::new();
                 thinking.insert("type".to_string(), serde_json::json!("enabled"));
                 thinking.insert("budget_tokens".to_string(), serde_json::json!(budget));
-                if let Some(display) = display {
-                    thinking.insert("display".to_string(), serde_json::json!(display));
-                }
+                // `display` is adaptive-only. Budget-thinking models reject it with
+                // "thinking.enabled.display: Extra inputs are not permitted", so it is never
+                // sent on this shape.
                 body.insert("thinking".to_string(), serde_json::Value::Object(thinking));
             }
         }
@@ -2957,8 +2962,9 @@ fn resolve_reasoning_budget_tokens(params: &bcode_model::ModelParameters) -> Opt
 ///   `{"output_config": {"effort": "..."}}` object. Newer Claude models reject the budget shape,
 ///   and `effort` must not be nested inside `thinking`.
 ///
-/// `display` carries the requested thinking-content visibility and is omitted entirely on targets
-/// that reject the field. See [`anthropic_thinking_display`].
+/// `display` carries the requested thinking-content visibility for the adaptive shape only.
+/// Budget-thinking models reject `thinking.enabled.display`, so it is never sent there. See
+/// [`anthropic_thinking_display`].
 fn bedrock_thinking_fields(
     params: &bcode_model::ModelParameters,
     display: Option<&str>,
@@ -2973,9 +2979,8 @@ fn bedrock_thinking_fields(
         "budget_tokens".to_string(),
         Document::Number(Number::PosInt(u64::from(budget))),
     );
-    if let Some(display) = display {
-        thinking.insert("display".to_string(), Document::String(display.to_string()));
-    }
+    // `display` is adaptive-only. Budget-thinking models reject it with
+    // "thinking.enabled.display: Extra inputs are not permitted", so it is never sent here.
     let mut fields = HashMap::new();
     fields.insert("thinking".to_string(), Document::Object(thinking));
     Some(Document::Object(fields))
@@ -8275,29 +8280,48 @@ mod tests {
             reasoning_effort_value: Some("high".to_string()),
             ..Default::default()
         };
+        let Some(Document::Object(root)) = bedrock_thinking_fields(
+            &adaptive,
+            anthropic_thinking_display(Some(DEFAULT_REGION), "anthropic.claude-opus-5"),
+        ) else {
+            panic!("thinking fields must be an object");
+        };
+        let Some(Document::Object(thinking)) = root.get("thinking") else {
+            panic!("thinking key must be an object");
+        };
+        assert_eq!(
+            thinking.get("display"),
+            Some(&Document::String(
+                ANTHROPIC_THINKING_DISPLAY_SUMMARIZED.to_string()
+            )),
+            "adaptive thinking must request readable content explicitly"
+        );
+
+        // Budget-thinking models reject the field: Bedrock returns
+        // `thinking.enabled.display: Extra inputs are not permitted`. They already return
+        // readable `reasoningContent` without it, so it must never be sent on this shape.
         let budget = bcode_model::ModelParameters {
             reasoning_control: Some(bcode_model::ReasoningControl::Budget),
             reasoning_effort: Some(bcode_model::ReasoningEffort::High),
             ..Default::default()
         };
-        for params in [adaptive, budget] {
-            let Some(Document::Object(root)) = bedrock_thinking_fields(
-                &params,
-                anthropic_thinking_display(Some(DEFAULT_REGION), "anthropic.claude-opus-4-7"),
-            ) else {
-                panic!("thinking fields must be an object");
-            };
-            let Some(Document::Object(thinking)) = root.get("thinking") else {
-                panic!("thinking key must be an object");
-            };
-            assert_eq!(
-                thinking.get("display"),
-                Some(&Document::String(
-                    ANTHROPIC_THINKING_DISPLAY_SUMMARIZED.to_string()
-                )),
-                "readable thinking must be requested explicitly"
-            );
-        }
+        let Some(Document::Object(root)) = bedrock_thinking_fields(
+            &budget,
+            anthropic_thinking_display(Some(DEFAULT_REGION), "anthropic.claude-sonnet-4"),
+        ) else {
+            panic!("thinking fields must be an object");
+        };
+        let Some(Document::Object(thinking)) = root.get("thinking") else {
+            panic!("thinking key must be an object");
+        };
+        assert!(
+            !thinking.contains_key("display"),
+            "budget thinking rejects thinking.enabled.display"
+        );
+        assert_eq!(
+            thinking.get("type"),
+            Some(&Document::String("enabled".to_string()))
+        );
     }
 
     #[test]
@@ -8377,9 +8401,10 @@ mod tests {
             body["thinking"]["budget_tokens"],
             serde_json::json!(REASONING_EFFORT_HIGH_BUDGET)
         );
-        assert_eq!(
-            body["thinking"]["display"],
-            ANTHROPIC_THINKING_DISPLAY_SUMMARIZED
+        // Budget thinking rejects `thinking.enabled.display`.
+        assert!(
+            body["thinking"].get("display").is_none(),
+            "budget thinking must not carry a display field"
         );
     }
 
