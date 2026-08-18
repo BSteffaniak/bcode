@@ -66016,12 +66016,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         );
         let state = test_server_state(sessions);
+        // This test covers explicit skill-context preservation, not model-specific prompt
+        // profiles, so the target carries no catalog identity and selects no profile layers.
+        let model_target = model_request_target::ResolvedModelRequestTarget {
+            provider_plugin_id: None,
+            requested_model_id: None,
+            model_id: "model".to_owned(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            catalog_provider_id: None,
+            catalog_identity: None,
+        };
         let prepared = prepare_static_model_turn_context(
             &state,
             session_id,
             trigger.sequence,
             &execution,
             &state.session_config(session_id).await,
+            &model_target,
         )
         .await
         .expect("static turn context");
