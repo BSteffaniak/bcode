@@ -1146,14 +1146,8 @@ impl SessionView {
                 let id = TranscriptViewItemId::new(format!(
                     "assistant-turn:{turn_id}:segment:{segment_id}"
                 ));
-                if self
-                    .snapshot
-                    .text_streams
-                    .get(&id)
-                    .is_some_and(|state| state.status == TextStreamViewStatus::Degraded)
-                {
-                    return;
-                }
+                // The durable segment is canonical. It replaces degraded live presentation state
+                // rather than deferring to it; the state overwrite below restores coherence.
                 self.finish_or_push_message(
                     id.clone(),
                     event.sequence,
@@ -1194,14 +1188,8 @@ impl SessionView {
                 let id = TranscriptViewItemId::new(format!(
                     "assistant-turn:{turn_id}:segment:{segment_id}"
                 ));
-                if self
-                    .snapshot
-                    .text_streams
-                    .get(&id)
-                    .is_some_and(|state| state.status == TextStreamViewStatus::Degraded)
-                {
-                    return;
-                }
+                // The durable segment is canonical. It replaces degraded live presentation state
+                // rather than deferring to it; the state overwrite below restores coherence.
                 self.finish_or_push_message(
                     id.clone(),
                     event.sequence,
@@ -4016,6 +4004,12 @@ impl SessionView {
         );
     }
 
+    /// Finish a streaming transcript message, or push it when no stream is open.
+    ///
+    /// Every caller delivers canonical durable event content. A degraded live stream must not
+    /// block that text: the durable event is authoritative and the live projection is derived,
+    /// disposable presentation state. Refusing the update here left renderers showing text
+    /// truncated at the point live delivery was lost.
     fn finish_or_push_message(
         &mut self,
         id: TranscriptViewItemId,
@@ -4024,14 +4018,6 @@ impl SessionView {
         kind: StreamingMessageKind,
         text: &str,
     ) {
-        if self
-            .snapshot
-            .text_streams
-            .get(&id)
-            .is_some_and(|state| state.status == TextStreamViewStatus::Degraded)
-        {
-            return;
-        }
         if let Some(pending) = self.pending_text_presentations.get_mut(&id) {
             if text.starts_with(&pending.target) {
                 text.clone_into(&mut pending.target);
@@ -11219,8 +11205,18 @@ mod tests {
         );
     }
 
+    /// Canonical durable text must repair a degraded live stream.
+    ///
+    /// This previously asserted the opposite: a degraded stream stayed truncated forever because
+    /// the durable segment was refused. That concealed the real outcome, since dropped live events
+    /// (the live broker is a bounded broadcast channel) left renderers showing text cut off at the
+    /// point delivery was lost, even though the complete text was persisted.
+    ///
+    /// The event store is canonical and `text_streams` is derived, disposable presentation state,
+    /// so authoritative content wins. A live `Checkpoint` already repairs a degraded stream the
+    /// same way; this brings the durable segment in line with that precedent.
     #[test]
-    fn durable_segment_cannot_silently_repair_a_degraded_live_stream() {
+    fn durable_segment_repairs_a_degraded_live_stream() {
         let session_id = SessionId::new();
         let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-0");
         let mut view = SessionView::new();
@@ -11263,11 +11259,76 @@ mod tests {
 
         assert_eq!(
             transcript_item_text(view.snapshot(), &id),
-            Some("healthy bytes")
+            Some("durable replacement")
         );
         assert_eq!(
             view.snapshot().text_streams[&id].status,
-            TextStreamViewStatus::Degraded
+            TextStreamViewStatus::Terminal(
+                bcode_session_models::TextStreamTerminalStatus::Completed
+            )
+        );
+        assert_eq!(view.snapshot().text_streams[&id].accepted_bytes, 19);
+        assert!(!view.snapshot().text_streams[&id].truncated);
+    }
+
+    /// Reproduces the reported truncation: lost live deltas must not survive the durable event.
+    ///
+    /// A gap in `first_revision` degrades the stream mid-response, which is what happens when the
+    /// bounded live broadcast channel drops events during a long turn. The canonical segment must
+    /// still render in full.
+    #[test]
+    fn dropped_live_deltas_do_not_leave_truncated_text_after_durable_segment() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-0");
+        let mut view = SessionView::new();
+        let append = |revision: u64, expected_offset: usize, text: &str| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    first_revision: revision,
+                    revision,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset,
+                        text: text.to_owned(),
+                    },
+                },
+            },
+        };
+
+        view.apply_live_event(&append(1, 0, "the beginning "));
+        // Revisions 2..=9 were dropped by the bounded live channel, so this arrives with a gap.
+        view.apply_live_event(&append(10, 14, "the tail"));
+        assert_eq!(
+            view.snapshot().text_streams[&id].status,
+            TextStreamViewStatus::Degraded,
+            "a revision gap must degrade the stream"
+        );
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("the beginning "),
+            "degraded live text is truncated at the point delivery was lost"
+        );
+
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                text: "the beginning the middle the tail".to_owned(),
+            },
+        ));
+
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("the beginning the middle the tail"),
+            "the canonical durable segment must render in full"
         );
     }
 
