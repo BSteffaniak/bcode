@@ -252,7 +252,7 @@ pub fn test_layout_signature(
     let pending = [];
     let input = TranscriptLayoutInput {
         width,
-        transcript: TranscriptItems::new(&transcript, &[]),
+        transcript: TranscriptItems::from_canonical(&transcript),
         plugin_host,
         diff_viewer_config: TuiDiffViewerConfig::default(),
         pending: &pending,
@@ -280,7 +280,7 @@ pub fn test_layout_signature_with_interaction_height(
     let pending = [];
     let input = TranscriptLayoutInput {
         width,
-        transcript: TranscriptItems::new(&transcript, &[]),
+        transcript: TranscriptItems::from_canonical(&transcript),
         plugin_host: None,
         diff_viewer_config: TuiDiffViewerConfig::default(),
         pending: &pending,
@@ -307,7 +307,7 @@ pub fn test_layout_signature_with_theme(
     let pending = [];
     let input = TranscriptLayoutInput {
         width,
-        transcript: TranscriptItems::new(&transcript, &[]),
+        transcript: TranscriptItems::from_canonical(&transcript),
         plugin_host: None,
         diff_viewer_config: TuiDiffViewerConfig::default(),
         pending: &pending,
