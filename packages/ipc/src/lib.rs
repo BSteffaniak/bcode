@@ -17,8 +17,8 @@ use bcode_session_models::{
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
-    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse,
-    WorktreeRemoveRequest, WorktreeRemoveResponse,
+    WorktreeCreateOperationStatus, WorktreeCreateRequest, WorktreeCreateResponse,
+    WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
@@ -916,7 +916,21 @@ pub enum Request {
         working_directory: PathBuf,
     },
     ListWorktrees(WorktreeListRequest),
-    CreateWorktree(WorktreeCreateRequest),
+    /// Start or recover an idempotent daemon-owned worktree creation operation.
+    WorktreeCreateStart {
+        operation_id: String,
+        request: WorktreeCreateRequest,
+    },
+    /// Read a worktree creation operation snapshot.
+    WorktreeCreateStatus {
+        operation_id: String,
+    },
+    /// Wait for a newer worktree creation operation revision.
+    WorktreeCreateWait {
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    },
     RemoveWorktree(WorktreeRemoveRequest),
     RalphStatus(RalphStatusRequest),
     RunRalphLoop(RalphRunRequest),
@@ -2714,7 +2728,6 @@ pub enum ResponsePayload {
         changed: bool,
     },
     WorktreeList(WorktreeListResponse),
-    WorktreeCreated(WorktreeCreateResponse),
     WorktreeRemoved(WorktreeRemoveResponse),
     RalphStatus(RalphStatusResponse),
     RalphRunStarted(RalphRunResponse),
@@ -3092,6 +3105,9 @@ pub enum ResponsePayload {
     },
     SessionBulkMigrationOperation {
         status: SessionBulkMigrationOperationStatus,
+    },
+    WorktreeCreateOperation {
+        status: bcode_worktree_models::WorktreeCreateOperationStatus,
     },
     PresentationNoteAppended,
 }

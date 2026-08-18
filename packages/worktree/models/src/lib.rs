@@ -93,6 +93,64 @@ pub struct WorktreeCreateRequest {
     pub no_setup: bool,
 }
 
+/// Worktree creation operation phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeCreateOperationState {
+    /// Waiting for exclusive repository mutation access.
+    Queued,
+    /// Git is creating and checking out the worktree.
+    Creating,
+    /// Configured setup is running.
+    ApplyingSetup,
+    /// Requested session changes are being finalized.
+    FinalizingSession,
+    /// Creation and requested finalization succeeded.
+    Succeeded,
+    /// Creation or finalization failed.
+    Failed,
+}
+
+/// Structured terminal worktree creation failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeCreateOperationError {
+    /// Stable error category.
+    pub code: String,
+    /// Secret-safe diagnostic message.
+    pub message: String,
+    /// Worktree path when Git creation succeeded before a later failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_path: Option<PathBuf>,
+}
+
+/// Addressable daemon-owned worktree creation snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeCreateOperationStatus {
+    /// Client-generated idempotency identity.
+    pub operation_id: String,
+    /// Monotonically increasing snapshot revision.
+    pub revision: u64,
+    /// Current operation phase.
+    pub state: WorktreeCreateOperationState,
+    /// Terminal success response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<WorktreeCreateResponse>,
+    /// Terminal failure details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<WorktreeCreateOperationError>,
+}
+
+impl WorktreeCreateOperationStatus {
+    /// Return whether this snapshot is terminal.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            WorktreeCreateOperationState::Succeeded | WorktreeCreateOperationState::Failed
+        )
+    }
+}
+
 /// Worktree creation response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeCreateResponse {

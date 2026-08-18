@@ -914,6 +914,7 @@ fn client_error_message(error: &ClientError) -> String {
             "The local Bcode service returned an unexpected response. Restart Bcode and try again."
                 .to_owned()
         }
+        ClientError::WorktreeCreate { message, .. } => message.clone(),
         ClientError::Server { code, .. } => match code.as_str() {
             "session_not_found" => "This session is no longer available.".to_owned(),
             "session_active_elsewhere" => {

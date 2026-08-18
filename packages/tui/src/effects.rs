@@ -11,7 +11,7 @@ use bcode_session_models::{
 use bcode_session_view::execute_session_view_action;
 use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
 use bcode_skill_models::SkillId;
-use bcode_worktree_models::{WorktreeCreateRequest, WorktreeCreateResponse};
+use bcode_worktree_models::WorktreeCreateRequest;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -370,8 +370,15 @@ pub enum TuiEffect {
     },
     /// Create a worktree.
     CreateWorktree {
+        /// Stable idempotency identity retained across bounded waits.
+        operation_id: String,
         /// Request payload.
         request: WorktreeCreateRequest,
+    },
+    /// Wait for worktree creation progress.
+    WaitWorktreeCreate {
+        operation_id: String,
+        after_revision: u64,
     },
     /// Request cancellation of the active turn for a session.
     CancelTurn { session_id: SessionId },
@@ -753,8 +760,8 @@ pub enum TuiEffectResult {
     },
     /// Worktree creation completed.
     CreateWorktree {
-        /// Worktree creation result.
-        result: Result<WorktreeCreateResponse, ClientError>,
+        /// Worktree operation snapshot.
+        result: Result<bcode_worktree_models::WorktreeCreateOperationStatus, ClientError>,
     },
     /// Result for active turn cancellation.
     CancelTurn {
@@ -1080,9 +1087,11 @@ impl TuiEffect {
                 path,
                 result: Err(client_error),
             },
-            Self::CreateWorktree { .. } => TuiEffectResult::CreateWorktree {
-                result: Err(client_error),
-            },
+            Self::CreateWorktree { .. } | Self::WaitWorktreeCreate { .. } => {
+                TuiEffectResult::CreateWorktree {
+                    result: Err(client_error),
+                }
+            }
             Self::CancelTurn { session_id } => TuiEffectResult::CancelTurn {
                 session_id,
                 result: Err(client_error),
@@ -1159,6 +1168,7 @@ impl TuiEffect {
             | Self::CompactContext { .. }
             | Self::AttachWorktree { .. }
             | Self::CreateWorktree { .. }
+            | Self::WaitWorktreeCreate { .. }
             | Self::CancelTurn { .. }
             | Self::ResolvePermission { .. }
             | Self::InvokePluginCommand { .. } => EffectDaemonIntent::Foreground,
@@ -1444,7 +1454,9 @@ impl TuiEffect {
             Self::CancelRuntimeWork { session_id, .. } => EffectKey::CancelRuntimeWork(*session_id),
             Self::CompactContext { session_id } => EffectKey::CompactContext(*session_id),
             Self::AttachWorktree { session_id, .. } => EffectKey::AttachWorktree(*session_id),
-            Self::CreateWorktree { .. } => EffectKey::CreateWorktree,
+            Self::CreateWorktree { .. } | Self::WaitWorktreeCreate { .. } => {
+                EffectKey::CreateWorktree
+            }
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
             Self::ResolvePermission { permission_id, .. } => {
                 EffectKey::ResolvePermission(permission_id.clone())
@@ -1942,8 +1954,19 @@ impl TuiEffect {
                     Err(error) => Err(error),
                 },
             },
-            Self::CreateWorktree { request } => TuiEffectResult::CreateWorktree {
-                result: client.create_worktree(request).await,
+            Self::CreateWorktree {
+                operation_id,
+                request,
+            } => TuiEffectResult::CreateWorktree {
+                result: client.start_worktree_create(operation_id, request).await,
+            },
+            Self::WaitWorktreeCreate {
+                operation_id,
+                after_revision,
+            } => TuiEffectResult::CreateWorktree {
+                result: client
+                    .wait_worktree_create(operation_id, after_revision, 30_000)
+                    .await,
             },
             Self::CancelTurn { session_id } => TuiEffectResult::CancelTurn {
                 session_id,

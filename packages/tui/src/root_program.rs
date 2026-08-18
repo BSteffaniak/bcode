@@ -872,6 +872,14 @@ impl BcodeRuntimeModel {
                     };
                     self.chat
                         .start_effect(super::effects::TuiEffect::CreateWorktree {
+                            operation_id: format!(
+                                "tui-worktree-{}-{}",
+                                std::process::id(),
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos()
+                            ),
                             request: bcode_worktree_models::WorktreeCreateRequest {
                                 name,
                                 cwd: Some(

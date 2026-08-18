@@ -182,6 +182,7 @@ pub fn classify_client_error(error: &ClientError) -> TuiDaemonIssue {
             TuiDaemonIssue::UnexpectedDaemonResponse
         }
         ClientError::Protocol(_)
+        | ClientError::WorktreeCreate { .. }
         | ClientError::Transport(_)
         | ClientError::Codec(_)
         | ClientError::DaemonStart(_) => TuiDaemonIssue::Other(error.to_string()),

@@ -18,6 +18,7 @@ mod model_request_target;
 mod request_routing;
 mod runtime_work;
 mod session_bulk_migration;
+mod worktree_creation;
 
 use model_request_target::{ModelRequestTargetInput, resolve_model_request_target};
 use request_routing::{
@@ -348,6 +349,13 @@ struct SessionBulkMigrationOperation {
 }
 
 #[derive(Debug)]
+struct WorktreeCreateOperation {
+    request: WorktreeCreateRequest,
+    status: bcode_worktree_models::WorktreeCreateOperationStatus,
+    changed: Arc<Notify>,
+}
+
+#[derive(Debug)]
 pub struct ServerState {
     pub sessions: SessionManager,
     session_migrations: bcode_session_migration::SessionMigrationService,
@@ -360,6 +368,8 @@ pub struct ServerState {
     session_search_work: session_search::SessionSearchWorkScheduler,
     session_search_backfills: Mutex<BTreeMap<String, SessionSearchBackfillOperation>>,
     session_bulk_migrations: Mutex<BTreeMap<String, SessionBulkMigrationOperation>>,
+    worktree_creations: Mutex<BTreeMap<String, WorktreeCreateOperation>>,
+    worktree_creation_gate: Arc<tokio::sync::Semaphore>,
     next_session_search_backfill_id: std::sync::atomic::AtomicU64,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
     selected_provider_plugin_id: Option<String>,
@@ -1596,6 +1606,8 @@ impl ServerState {
             session_search_work: session_search::SessionSearchWorkScheduler::default(),
             session_search_backfills: Mutex::default(),
             session_bulk_migrations: Mutex::default(),
+            worktree_creations: Mutex::default(),
+            worktree_creation_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             next_session_search_backfill_id: std::sync::atomic::AtomicU64::new(1),
             model_catalog: init
                 .model_catalog
@@ -4094,7 +4106,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::UpdateClientRuntimeContext { .. } => "update_client_runtime_context",
         Request::ChangeSessionWorkingDirectory { .. } => "change_session_working_directory",
         Request::ListWorktrees(_) => "list_worktrees",
-        Request::CreateWorktree(_) => "create_worktree",
+        Request::WorktreeCreateStart { .. } => "worktree_create_start",
+        Request::WorktreeCreateStatus { .. } => "worktree_create_status",
+        Request::WorktreeCreateWait { .. } => "worktree_create_wait",
         Request::RemoveWorktree(_) => "remove_worktree",
         Request::RalphStatus(_) => "ralph_status",
         Request::RunRalphLoop(_) => "run_ralph_loop",
@@ -4465,8 +4479,36 @@ async fn handle_request_inner(
         SessionLifecycleRequest::ListWorktrees(request) => {
             handle_list_worktrees(request_id, state, writer, request).await
         }
-        SessionLifecycleRequest::CreateWorktree(request) => {
-            handle_create_worktree(request_id, state, writer, request).await
+        SessionLifecycleRequest::WorktreeCreateStart {
+            operation_id,
+            request,
+        } => {
+            worktree_creation::handle_start(
+                request_id,
+                Arc::clone(state),
+                writer,
+                operation_id,
+                request,
+            )
+            .await
+        }
+        SessionLifecycleRequest::WorktreeCreateStatus { operation_id } => {
+            worktree_creation::handle_status(request_id, state, writer, &operation_id).await
+        }
+        SessionLifecycleRequest::WorktreeCreateWait {
+            operation_id,
+            after_revision,
+            timeout_ms,
+        } => {
+            worktree_creation::handle_wait(
+                request_id,
+                state,
+                writer,
+                &operation_id,
+                after_revision,
+                timeout_ms,
+            )
+            .await
         }
         SessionLifecycleRequest::RemoveWorktree(request) => {
             handle_remove_worktree(request_id, state, writer, request).await
@@ -8770,91 +8812,6 @@ async fn handle_record_ralph_lifecycle(
                 request_id,
                 Response::Err(ErrorResponse::new(
                     "ralph_lifecycle_record_failed",
-                    error.to_string(),
-                )),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_create_worktree(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    request: WorktreeCreateRequest,
-) -> Result<(), ServerError> {
-    if let Some(session_id) = request.attach_session_id
-        && state.session_has_active_turn(session_id).await
-    {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "session_busy",
-                format!("session has an active model turn: {session_id}"),
-            )),
-        )
-        .await;
-    }
-    let Some(cwd) = request.cwd.clone() else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "worktree_cwd_required",
-                "worktree requests must include the caller working directory",
-            )),
-        )
-        .await;
-    };
-    let config_paths = bcode_config::default_config_paths_from(&cwd);
-    let config = bcode_config::load_config_from_paths(&config_paths)?;
-    match bcode_worktree::create_worktree(&config, &request, &cwd) {
-        Ok(mut response) => {
-            if let Some(session_id) = request.attach_session_id {
-                let changed = if let Some(event) = state
-                    .sessions
-                    .change_session_working_directory(session_id, response.path.clone())
-                    .await?
-                {
-                    publish_session_event(state, &event).await;
-                    true
-                } else {
-                    false
-                };
-                let session = state.sessions.session_summary(session_id).await?;
-                if changed {
-                    state
-                        .session_catalog
-                        .upsert_native_session(session.clone())
-                        .await;
-                }
-                response.session = Some(session);
-            } else if request.new_session {
-                let session = state
-                    .sessions
-                    .create_session(Some(request.name), response.path.clone())
-                    .await?;
-                state
-                    .session_catalog
-                    .upsert_native_session(session.clone())
-                    .await;
-                response.session = Some(session);
-            }
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorktreeCreated(response)),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "worktree_create_command_failed",
                     error.to_string(),
                 )),
             )

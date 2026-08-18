@@ -93,7 +93,18 @@ pub enum SessionLifecycleRequest {
         working_directory: PathBuf,
     },
     ListWorktrees(WorktreeListRequest),
-    CreateWorktree(WorktreeCreateRequest),
+    WorktreeCreateStart {
+        operation_id: String,
+        request: WorktreeCreateRequest,
+    },
+    WorktreeCreateStatus {
+        operation_id: String,
+    },
+    WorktreeCreateWait {
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    },
     RemoveWorktree(WorktreeRemoveRequest),
     RalphStatus(RalphStatusRequest),
     RunRalphLoop(RalphRunRequest),
@@ -1375,9 +1386,27 @@ impl RoutedRequest {
             Request::ListWorktrees(payload) => {
                 Self::SessionLifecycle(SessionLifecycleRequest::ListWorktrees(payload))
             }
-            Request::CreateWorktree(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::CreateWorktree(payload))
+            Request::WorktreeCreateStart {
+                operation_id,
+                request,
+            } => Self::SessionLifecycle(SessionLifecycleRequest::WorktreeCreateStart {
+                operation_id,
+                request,
+            }),
+            Request::WorktreeCreateStatus { operation_id } => {
+                Self::SessionLifecycle(SessionLifecycleRequest::WorktreeCreateStatus {
+                    operation_id,
+                })
             }
+            Request::WorktreeCreateWait {
+                operation_id,
+                after_revision,
+                timeout_ms,
+            } => Self::SessionLifecycle(SessionLifecycleRequest::WorktreeCreateWait {
+                operation_id,
+                after_revision,
+                timeout_ms,
+            }),
             Request::RemoveWorktree(payload) => {
                 Self::SessionLifecycle(SessionLifecycleRequest::RemoveWorktree(payload))
             }

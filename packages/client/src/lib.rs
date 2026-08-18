@@ -17,10 +17,10 @@ use bcode_ipc::{
     ResponsePayload, ServerStopMode, SessionBulkMigrationOperationStatus,
     SessionBulkMigrationStartRequest, SessionCatalogSourceStatus, SessionCatalogStatus,
     SessionCompatibilityInventoryRequest, SessionCompatibilityInventoryResponse,
-    SessionImportWarning, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
-    WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory,
-    decode_event, decode_response, default_endpoint, recv_envelope, request_envelope,
-    send_envelope,
+    SessionImportWarning, WorktreeCreateOperationStatus, WorktreeCreateRequest,
+    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
+    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
+    default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionDerivationPromptPage,
@@ -200,6 +200,12 @@ pub enum ClientError {
     IncompatibleDaemon { message: String },
     #[error("client protocol error: {0}")]
     Protocol(String),
+    #[error("worktree creation failed ({code}): {message}")]
+    WorktreeCreate {
+        code: String,
+        message: String,
+        created_path: Option<std::path::PathBuf>,
+    },
     #[error("unexpected response payload")]
     UnexpectedResponse,
     #[error("unexpected IPC envelope kind")]
@@ -243,6 +249,7 @@ impl ClientError {
             | Self::Transport(_)
             | Self::Codec(_)
             | Self::Server { .. }
+            | Self::WorktreeCreate { .. }
             | Self::IncompatibleDaemon { .. }
             | Self::Protocol(_)
             | Self::UnexpectedResponse
@@ -1565,19 +1572,113 @@ impl BcodeClient {
         }
     }
 
-    /// Create a Git worktree.
+    /// Start an idempotent daemon-owned worktree creation operation.
     ///
     /// # Errors
     ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
+    /// Returns an error when the daemon cannot be reached or rejects the operation.
+    pub async fn start_worktree_create(
+        &self,
+        operation_id: String,
+        mut request: WorktreeCreateRequest,
+    ) -> Result<WorktreeCreateOperationStatus, ClientError> {
+        request.cwd = Some(resolve_caller_path(request.cwd));
+        match self
+            .send_request(Request::WorktreeCreateStart {
+                operation_id,
+                request,
+            })
+            .await?
+        {
+            ResponsePayload::WorktreeCreateOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read one transient worktree creation operation snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the operation is unavailable.
+    pub async fn worktree_create_status(
+        &self,
+        operation_id: String,
+    ) -> Result<WorktreeCreateOperationStatus, ClientError> {
+        match self
+            .send_request(Request::WorktreeCreateStatus { operation_id })
+            .await?
+        {
+            ResponsePayload::WorktreeCreateOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Wait for a newer worktree creation operation revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the operation is unavailable.
+    pub async fn wait_worktree_create(
+        &self,
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    ) -> Result<WorktreeCreateOperationStatus, ClientError> {
+        let server_wait = Duration::from_millis(timeout_ms);
+        let response_timeout = self
+            .request_timeout
+            .max(server_wait.saturating_add(LONG_POLL_TRANSPORT_GRACE));
+        match self
+            .send_request_with_timeout(
+                Request::WorktreeCreateWait {
+                    operation_id,
+                    after_revision,
+                    timeout_ms,
+                },
+                response_timeout,
+            )
+            .await?
+        {
+            ResponsePayload::WorktreeCreateOperation { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Create a Git worktree, waiting through bounded long-poll requests until completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or creation reaches a failed terminal
+    /// state.
     pub async fn create_worktree(
         &self,
-        mut request: WorktreeCreateRequest,
+        request: WorktreeCreateRequest,
     ) -> Result<WorktreeCreateResponse, ClientError> {
-        request.cwd = Some(resolve_caller_path(request.cwd));
-        match self.send_request(Request::CreateWorktree(request)).await? {
-            ResponsePayload::WorktreeCreated(response) => Ok(response),
-            _ => Err(ClientError::UnexpectedResponse),
+        let operation_id = format!(
+            "worktree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let mut status = self
+            .start_worktree_create(operation_id.clone(), request)
+            .await?;
+        loop {
+            if let Some(response) = status.response {
+                return Ok(response);
+            }
+            if let Some(error) = status.error {
+                return Err(ClientError::WorktreeCreate {
+                    code: error.code,
+                    message: error.message,
+                    created_path: error.created_path,
+                });
+            }
+            status = self
+                .wait_worktree_create(operation_id.clone(), status.revision, 30_000)
+                .await?;
         }
     }
 

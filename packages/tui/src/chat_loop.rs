@@ -3799,14 +3799,52 @@ fn apply_attach_worktree_result(
 
 fn apply_create_worktree_result(
     chat: &mut ActiveChat,
-    result: Result<bcode_worktree_models::WorktreeCreateResponse, ClientError>,
+    result: Result<bcode_worktree_models::WorktreeCreateOperationStatus, ClientError>,
 ) {
-    let response = match result {
-        Ok(response) => response,
+    let status = match result {
+        Ok(status) => status,
         Err(error) => {
             daemon_issue::report_client_issue(&mut chat.app, "worktree create failed", &error);
             return;
         }
+    };
+    if !status.is_terminal() {
+        let label = match status.state {
+            bcode_worktree_models::WorktreeCreateOperationState::Queued => {
+                "worktree creation queued"
+            }
+            bcode_worktree_models::WorktreeCreateOperationState::Creating => "creating worktree…",
+            bcode_worktree_models::WorktreeCreateOperationState::ApplyingSetup => {
+                "applying worktree setup…"
+            }
+            bcode_worktree_models::WorktreeCreateOperationState::FinalizingSession => {
+                "finalizing worktree session…"
+            }
+            bcode_worktree_models::WorktreeCreateOperationState::Succeeded
+            | bcode_worktree_models::WorktreeCreateOperationState::Failed => unreachable!(),
+        };
+        chat.app.set_status(label.to_owned());
+        chat.replace_effect(TuiEffect::WaitWorktreeCreate {
+            operation_id: status.operation_id,
+            after_revision: status.revision,
+        });
+        return;
+    }
+    if let Some(error) = status.error {
+        let suffix = error.created_path.map_or_else(String::new, |path| {
+            format!(
+                "; worktree was created at {} before finalization failed",
+                display_from_current_dir(&path)
+            )
+        });
+        chat.app
+            .set_status(format!("worktree create failed: {}{suffix}", error.message));
+        return;
+    }
+    let Some(response) = status.response else {
+        chat.app
+            .set_status("worktree operation ended without a result".to_owned());
+        return;
     };
     let path = response.path.clone();
     if let Some(session) = response.session {
