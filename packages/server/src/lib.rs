@@ -50230,6 +50230,8 @@ library = "test"
         ));
 
         let follow_up_execution = bcode_session_models::TurnExecutionOptions {
+            permission_mode: bcode_session_models::TurnPermissionMode::Bypass,
+            tools: bcode_session_models::TurnToolPolicy::Disabled,
             reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
                 effort: Some("high".to_owned()),
                 summary: Some("detailed".to_owned()),
@@ -50261,6 +50263,24 @@ library = "test"
             panic!("follow-up should retain its admitted execution options");
         };
         assert_eq!(turn_execution_options(&user_event), follow_up_execution);
+        let durable_history = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("durable admission history");
+        let durable_follow_up = durable_history
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::UserMessage { text, .. } if text == "explicit follow-up"
+                )
+            })
+            .expect("durable follow-up event");
+        assert_eq!(
+            turn_execution_options(durable_follow_up),
+            follow_up_execution
+        );
 
         let low_execution = bcode_session_models::TurnExecutionOptions {
             reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
@@ -67685,6 +67705,26 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::TurnToolPolicy::Enabled,
             Some(&write)
         ));
+    }
+
+    #[tokio::test]
+    async fn disabled_turn_exposes_no_model_tools() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("no tools".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = test_server_state_with_filesystem_plugin(sessions);
+
+        let tools = collect_model_tools(
+            &state,
+            session.id,
+            None,
+            bcode_session_models::TurnToolPolicy::Disabled,
+        )
+        .await;
+
+        assert!(tools.is_empty());
     }
 
     #[tokio::test]
