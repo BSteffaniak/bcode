@@ -25,7 +25,22 @@ The default production session root is resolved only by
 tests, imports, and isolated stores, but all production default paths use the same canonical root.
 `bcode_session::db::session_dir_path` and `session_db_path` own per-session path construction.
 
-### Positioned durable transcript events
+### Turn execution options
+
+Each admitted user turn persists its provider-neutral `TurnExecutionOptions` inside the canonical
+`user_message` event before scheduling. The nested execution-options schema is versioned
+independently because adding a defaulted option does not alter the outer event kind or binary enum
+layout. Version 4 adds `permission_mode`; payloads from supported earlier versions decode the
+missing field as `enforce`, while a bypass value paired with an earlier nested version is rejected.
+This additive nested change does not advance the session event schema or writer epoch: current
+writers still preserve every canonical event and older current-format turns retain an unambiguous
+safe meaning. No read-path migration, repair, or replay is needed.
+
+Launch-selected permission and tool modes are therefore ephemeral only until admission. Once a
+turn is admitted, queued execution and supported recovery use the canonical event value rather than
+client connection, renderer, environment, configuration, or daemon-global state.
+
+## Positioned durable transcript events
 
 Session event schema 42 and writer epoch 6 introduced positioned durable assistant segments,
 reasoning activities, and tool requests. The corrected model-context projection uses schema version

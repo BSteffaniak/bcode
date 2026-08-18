@@ -27453,6 +27453,15 @@ impl ToolAuthorizationCoordinator for ServerAuthorizationCoordinator<'_> {
         _scope: &'a TurnScope,
     ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
         Box::pin(async move {
+            if self.permission_mode == bcode_session_models::TurnPermissionMode::Bypass {
+                let decisions = futures::future::join_all(
+                    requests
+                        .iter()
+                        .map(|request| self.authorize_one(request, None)),
+                )
+                .await;
+                return Ok(decisions);
+            }
             let batch_id = next_permission_batch_id(self.state).await;
             let batch_state = Arc::new(PendingPermissionBatch::new(self.session_id));
             let _registration = PendingPermissionBatchRegistration::register(
@@ -67675,6 +67684,90 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(!tool_policy_denies_tool(
             bcode_session_models::TurnToolPolicy::Enabled,
             Some(&write)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bypass_authorization_preserves_structural_checks_without_permission_state() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("bypass".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = test_server_state(sessions);
+        let call = bcode_model::ToolCall {
+            id: "bypass-call".to_owned(),
+            name: "test.mutate".to_owned(),
+            arguments: serde_json::json!({}),
+        };
+        let tool = RegisteredTool::plugin(
+            bcode_tool::ToolDefinition {
+                name: call.name.clone(),
+                description: "test mutation".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            "bcode.test",
+        );
+        let metadata = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Mutating);
+        let facts = vec![bcode_tool::ToolAuthorizationFact {
+            namespace: bcode_agent_profile::TOOL_POLICY_AUTHORIZATION_NAMESPACE.to_owned(),
+            schema_version: bcode_agent_profile::TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION,
+            action: bcode_agent_profile::TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE.to_owned(),
+            resource: Some(call.name.clone()),
+            metadata: serde_json::to_value(metadata).expect("metadata"),
+        }];
+        let request = ToolAuthorizationRequest {
+            index: 0,
+            call,
+            tool,
+            facts,
+            context: bcode_agent_runtime::RuntimePermissionContext {
+                session_id: session.id,
+                agent_id: "build".to_owned(),
+            },
+        };
+        let cancel = TurnCancelState::default();
+        let bypass = ServerAuthorizationCoordinator::new(
+            &state,
+            session.id,
+            &cancel,
+            1,
+            bcode_session_models::TurnToolPolicy::Enabled,
+            bcode_session_models::TurnPermissionMode::Bypass,
+            "build",
+        );
+        assert_eq!(
+            bypass.authorize_one(&request, None).await,
+            ToolAuthorizationDecision::Allow
+        );
+        assert!(state.pending_permissions.lock().await.is_empty());
+        assert!(
+            state
+                .pending_permission_batches
+                .lock()
+                .expect("batches")
+                .is_empty()
+        );
+
+        let disabled = ServerAuthorizationCoordinator::new(
+            &state,
+            session.id,
+            &cancel,
+            1,
+            bcode_session_models::TurnToolPolicy::Disabled,
+            bcode_session_models::TurnPermissionMode::Bypass,
+            "build",
+        );
+        assert!(matches!(
+            disabled.authorize_one(&request, None).await,
+            ToolAuthorizationDecision::Deny(reason) if reason.contains("read-only inspection policy")
+        ));
+
+        let mut malformed = request;
+        malformed.facts.clear();
+        assert!(matches!(
+            bypass.authorize_one(&malformed, None).await,
+            ToolAuthorizationDecision::Deny(reason) if reason.contains("authorization facts invalid")
         ));
     }
 

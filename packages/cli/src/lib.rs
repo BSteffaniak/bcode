@@ -184,9 +184,16 @@ pub async fn run_with_static_bundled(
     command = command.version(build_info().display_version());
     let matches = command.get_matches();
     let _config_override = config_override_from_matches(&matches);
+    let exceptional_execution_mode = matches.get_flag("dangerously_bypass_all_permissions")
+        || matches.get_flag("disable_all_tools");
     if let Some(plugin) = plugin_cli::matched(&matches, &registrations)
         && let Some((_, subcommand_matches)) = matches.subcommand()
     {
+        if exceptional_execution_mode {
+            return Err(CliError::InvalidArguments(
+                "execution-mode flags are not supported by plugin CLI commands".to_owned(),
+            ));
+        }
         if plugin.requires_daemon {
             ensure_server_running().await?;
         }

@@ -16,7 +16,8 @@ use bcode_session_models::{
     ClientId, RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionLiveEvent, SessionLiveEventKind, SessionProjectionKind, SessionSummary,
     SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolArtifact, ToolArtifactRef, ToolInvocationResult, WorkId,
+    SessionTracePhase, ToolArtifact, ToolArtifactRef, ToolInvocationResult, TurnPermissionMode,
+    TurnToolPolicy, WorkId,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -24,6 +25,31 @@ use bmux_tui::buffer::Buffer;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+
+#[test]
+fn launch_options_build_exact_portable_turn_options() {
+    let options = crate::TuiLaunchOptions {
+        permission_mode: TurnPermissionMode::Bypass,
+        tool_policy: TurnToolPolicy::Disabled,
+    }
+    .turn_execution_options();
+
+    assert_eq!(options.permission_mode, TurnPermissionMode::Bypass);
+    assert_eq!(options.tools, TurnToolPolicy::Disabled);
+    assert_eq!(options.agent_profile, None);
+}
+
+#[test]
+fn execution_mode_indicator_remains_visible_with_transient_status() {
+    let mut app = crate::app::BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_execution_mode_indicator(Some("DANGER: PERMISSION BYPASS ACTIVE".to_owned()));
+    app.set_status("starting daemon…".to_owned());
+
+    assert_eq!(
+        crate::render::statusline_status_text(&app),
+        "DANGER: PERMISSION BYPASS ACTIVE · starting daemon…"
+    );
+}
 
 fn context_occupancy(tokens: u64) -> bcode_session_models::RequestContextOccupancy {
     bcode_session_models::RequestContextOccupancy {

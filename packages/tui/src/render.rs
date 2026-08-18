@@ -5012,7 +5012,7 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     line.spans(width)
 }
 
-fn statusline_status_text(app: &BmuxApp) -> String {
+pub(crate) fn statusline_status_text(app: &BmuxApp) -> String {
     match app.execution_mode_indicator() {
         Some(indicator) if app.status().is_empty() => indicator.to_owned(),
         Some(indicator) => format!("{indicator} · {}", app.status()),
