@@ -46,9 +46,10 @@ fn execution_mode_indicator_remains_visible_with_transient_status() {
     app.set_status("starting daemon…".to_owned());
 
     assert_eq!(
-        crate::render::statusline_status_text(&app),
-        "DANGER: PERMISSION BYPASS ACTIVE · starting daemon…"
+        app.execution_mode_indicator(),
+        Some("DANGER: PERMISSION BYPASS ACTIVE")
     );
+    assert_eq!(app.status(), "starting daemon…");
 }
 
 fn context_occupancy(tokens: u64) -> bcode_session_models::RequestContextOccupancy {

@@ -2523,6 +2523,14 @@ struct Cli {
     /// Force the onboarding/setup-map flow.
     #[arg(long = "onboard", global = true)]
     onboard: bool,
+    #[command(flatten)]
+    execution_mode: ExecutionModeArgs,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, clap::Args)]
+struct ExecutionModeArgs {
     /// Allow structurally valid tool operations without agent or skill permission prompts.
     #[arg(
         long = "dangerously-bypass-all-permissions",
@@ -2534,19 +2542,17 @@ struct Cli {
     /// Do not expose or execute agent tools.
     #[arg(long = "disable-all-tools", visible_alias = "no-tools", global = true)]
     disable_all_tools: bool,
-    #[command(subcommand)]
-    command: Option<Commands>,
 }
 
 impl Cli {
-    fn launch_options(&self) -> bcode_tui::TuiLaunchOptions {
+    const fn launch_options(&self) -> bcode_tui::TuiLaunchOptions {
         bcode_tui::TuiLaunchOptions {
-            permission_mode: if self.dangerously_bypass_all_permissions {
+            permission_mode: if self.execution_mode.dangerously_bypass_all_permissions {
                 bcode_session_models::TurnPermissionMode::Bypass
             } else {
                 bcode_session_models::TurnPermissionMode::Enforce
             },
-            tool_policy: if self.disable_all_tools {
+            tool_policy: if self.execution_mode.disable_all_tools {
                 bcode_session_models::TurnToolPolicy::Disabled
             } else {
                 bcode_session_models::TurnToolPolicy::Enabled
