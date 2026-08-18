@@ -219,6 +219,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(code_review_plugin());
     #[cfg(feature = "static-bundled-default-agents-plugin")]
     plugins.push(default_agents_plugin());
+    #[cfg(feature = "static-bundled-prompt-profile-plugin")]
+    plugins.push(prompt_profile_plugin());
     #[cfg(feature = "static-bundled-document-plugin")]
     plugins.push(document_plugin());
     #[cfg(feature = "static-bundled-eval-plugin")]
@@ -292,6 +294,14 @@ fn code_review_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml"),
         bcode_code_review_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-prompt-profile-plugin")]
+fn prompt_profile_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
+        bcode_prompt_profile_plugin::static_plugin(),
     )
 }
 
@@ -784,6 +794,7 @@ mod tests {
         feature = "static-bundled-blims-plugin",
         feature = "static-bundled-code-review-plugin",
         feature = "static-bundled-default-agents-plugin",
+        feature = "static-bundled-prompt-profile-plugin",
         feature = "static-bundled-document-plugin",
         feature = "static-bundled-eval-plugin",
         feature = "static-bundled-fake-provider-plugin",

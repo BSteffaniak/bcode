@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bundled model-scoped prompt profile plugin for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "model", "plugin", "prompt"]
+license     = { workspace = true }
+name        = "bcode_prompt_profile_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_config         = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
+bcode_prompt_profile = { workspace = true }
+serde_json           = { workspace = true }
+
+[dev-dependencies]
+bcode_session_models = { workspace = true }
+bcode_tool           = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

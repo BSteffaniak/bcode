@@ -18,6 +18,7 @@ members = [
     "plugins/bedrock-provider-plugin",
     "plugins/blims-plugin",
     "plugins/default-agents-plugin",
+    "plugins/prompt-profile-plugin",
     "plugins/fake-provider-plugin",
     "plugins/openai-compatible-provider-plugin",
     "plugins/opencode-session-import-plugin",
@@ -39,6 +40,7 @@ members = [
     "packages/agent-permissions",
     "packages/code-review/models",
     "packages/agent-profile",
+    "packages/prompt-profile",
     "packages/agent-runtime",
     "packages/bcode",
     "packages/build-info",
@@ -169,6 +171,8 @@ bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-f
 bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bcode_project_instructions              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/project-instructions" }
+bcode_prompt_profile                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/prompt-profile" }
+bcode_prompt_profile_plugin             = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/prompt-profile-plugin" }
 bcode_provider_auth                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth" }
 bcode_provider_auth_models              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth/models" }
 bcode_question_dynamic_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "examples/question-dynamic-plugin" }

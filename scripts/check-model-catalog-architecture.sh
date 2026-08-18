@@ -82,4 +82,17 @@ if ! grep -F 'invocation_operations = ["native_web_search"]' plugins/fake-provid
   exit 1
 fi
 
+if rg -n '(model_id|effective_model_id)[^\n]*(contains|starts_with|ends_with)\(' \
+  packages/server/src plugins/prompt-profile-plugin/src \
+  >/tmp/bcode-prompt-profile-model-id-matching.txt; then
+  echo "prompt profiles must use exact catalog-resolved identity, not model-id substring matching" >&2
+  cat /tmp/bcode-prompt-profile-model-id-matching.txt >&2
+  exit 1
+fi
+
+if ! grep -F 'model_identity(' packages/server/src/model_request_target.rs >/dev/null; then
+  echo "prompt profile identity must come from centralized model request-target resolution" >&2
+  exit 1
+fi
+
 echo "model catalog architecture guard passed"

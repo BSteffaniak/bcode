@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Model-scoped prompt profile contract types for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "model", "profile", "prompt"]
+license     = { workspace = true }
+name        = "bcode_prompt_profile"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_model          = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_tool           = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

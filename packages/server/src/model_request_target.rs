@@ -17,8 +17,11 @@ pub struct ModelRequestTargetInput<'a> {
 #[derive(Debug, Clone)]
 pub struct ResolvedModelRequestTarget {
     pub provider_plugin_id: Option<String>,
+    pub requested_model_id: Option<String>,
     pub model_id: String,
     pub provider_context: bcode_model::ProviderRequestContext,
+    pub catalog_provider_id: Option<String>,
+    pub catalog_identity: Option<bcode_model_catalog::ModelCatalogIdentity>,
 }
 
 /// Failure to resolve a usable model request target.
@@ -69,10 +72,22 @@ pub async fn resolve_model_request_target(
     let mut provider_context = input.provider_context.clone();
     provider_context.api_surface = api_surface;
     select_host_auth_pool_candidate(state, input.provider_plugin_id, &mut provider_context).await;
+    let catalog_provider_id = catalog_provider_id_for_policy(&models.catalog.policy);
+    let catalog_identity = if let Some(provider_id) = catalog_provider_id.as_deref() {
+        state
+            .model_catalog
+            .model_identity(provider_id, &model_id)
+            .await
+    } else {
+        None
+    };
     Ok(ResolvedModelRequestTarget {
         provider_plugin_id: input.provider_plugin_id.map(ToOwned::to_owned),
+        requested_model_id: input.selected_model_id.map(ToOwned::to_owned),
         model_id,
         provider_context,
+        catalog_provider_id,
+        catalog_identity,
     })
 }
 

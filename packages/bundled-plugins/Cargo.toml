@@ -31,6 +31,7 @@ bcode_opencode_session_import_plugin    = { workspace = true, optional = true }
 bcode_pi_session_import_plugin          = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true }
 bcode_plugin_sdk                        = { workspace = true, features = ["tui"] }
+bcode_prompt_profile_plugin             = { workspace = true, optional = true }
 bcode_question_plugin                   = { workspace = true, optional = true }
 bcode_ralph_plugin                      = { workspace = true, optional = true }
 bcode_read_plugin                       = { workspace = true, optional = true }
@@ -150,6 +151,7 @@ static-bundled-plugins = [
     "static-bundled-code-review-plugin",
     "static-bundled-compressed-session-search-plugin",
     "static-bundled-default-agents-plugin",
+    "static-bundled-prompt-profile-plugin",
     "static-bundled-document-plugin",
     "static-bundled-eval-plugin",
     "static-bundled-metrics-plugin",
@@ -174,6 +176,10 @@ static-bundled-plugins = [
     "static-bundled-web-search-plugin",
     "static-bundled-worktree-plugin",
     "static-bundled-workflow-plugin",
+]
+static-bundled-prompt-profile-plugin = [
+    "dep:bcode_prompt_profile_plugin",
+    "bcode_prompt_profile_plugin/static-bundled",
 ]
 static-bundled-question-plugin = [
     "dep:bcode_question_plugin",

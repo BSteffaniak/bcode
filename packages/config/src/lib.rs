@@ -232,6 +232,9 @@ pub struct BcodeConfig {
     pub invariants: InvariantsConfig,
     #[serde(default)]
     pub system_prompt: SystemPromptConfig,
+    /// Model-scoped prompt and tool-description profile configuration.
+    #[serde(default)]
+    pub prompt_profile: PromptProfileConfig,
     /// Renderer-neutral presentation configuration.
     #[serde(default)]
     pub presentation: PresentationConfig,
@@ -267,6 +270,7 @@ impl Default for BcodeConfig {
             workflows: WorkflowsConfig::default(),
             invariants: InvariantsConfig::default(),
             system_prompt: SystemPromptConfig::default(),
+            prompt_profile: PromptProfileConfig::default(),
             presentation: PresentationConfig::default(),
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
@@ -328,6 +332,10 @@ impl ConfigDocSchema for BcodeConfig {
             schema_section_doc::<SystemPromptConfig>(
                 "system_prompt",
                 "System prompt mode and section controls.",
+            ),
+            schema_section_doc::<PromptProfileConfig>(
+                "prompt_profile",
+                "Model-scoped system prompt and tool-description profiles.",
             ),
             schema_section_doc::<PresentationConfig>(
                 "presentation",
@@ -1221,6 +1229,67 @@ const fn default_invariant_max_selected() -> std::num::NonZeroUsize {
     std::num::NonZeroUsize::new(6).expect("invariant selection count is non-zero")
 }
 
+/// Model-scoped prompt profile configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "prompt_profile")]
+pub struct PromptProfileConfig {
+    /// Base layer applied to every model.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub default: PromptProfileLayerConfig,
+    /// Layers keyed by exact model-provider plugin ID.
+    #[serde(default)]
+    pub provider: BTreeMap<String, PromptProfileLayerConfig>,
+    /// Layers keyed by exact catalog family.
+    #[serde(default)]
+    pub family: BTreeMap<String, PromptProfileLayerConfig>,
+    /// Layers keyed by exact stable catalog entry ID.
+    #[serde(default)]
+    pub catalog_entry: BTreeMap<String, PromptProfileLayerConfig>,
+    /// Layers keyed by exact effective model ID.
+    #[serde(default)]
+    pub model: BTreeMap<String, PromptProfileLayerConfig>,
+}
+
+/// One prompt-profile precedence layer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "profile_layer")]
+pub struct PromptProfileLayerConfig {
+    /// System-prompt composition behavior.
+    #[serde(default)]
+    pub system_prompt_mode: PromptProfileTextMode,
+    /// Text composed into the stable system prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Tool-description overrides keyed by exact tool name.
+    #[serde(default)]
+    pub tool_description: BTreeMap<String, ToolDescriptionOverrideConfig>,
+}
+
+/// Text composition mode used by prompt profiles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptProfileTextMode {
+    /// Add text after the current value.
+    #[default]
+    Append,
+    /// Add text before the current value.
+    Prepend,
+    /// Replace the current value.
+    Replace,
+}
+
+/// Declarative tool-description override.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "tool_description")]
+pub struct ToolDescriptionOverrideConfig {
+    /// Description composition behavior.
+    #[serde(default)]
+    pub mode: PromptProfileTextMode,
+    /// Text composed with the original description.
+    pub text: String,
+}
+
 /// System prompt assembly configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "system_prompt")]
@@ -1321,6 +1390,9 @@ pub struct SystemPromptSectionsConfig {
     /// Include the skill catalog.
     #[serde(default = "default_true")]
     pub skill_catalog: bool,
+    /// Apply model-scoped prompt-profile text.
+    #[serde(default = "default_true")]
+    pub model_profile: bool,
 }
 
 impl Default for SystemPromptSectionsConfig {
@@ -1340,6 +1412,7 @@ impl Default for SystemPromptSectionsConfig {
             dynamic_repository_context: true,
             agent_suffix: true,
             skill_catalog: true,
+            model_profile: true,
         }
     }
 }
@@ -5433,6 +5506,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_workflows_toml(&mut output, &config.workflows);
     write_invariants_toml(&mut output, &config.invariants);
     write_system_prompt_toml(&mut output, &config.system_prompt);
+    write_prompt_profile_toml(&mut output, &config.prompt_profile);
     write_presentation_toml(&mut output, config.presentation);
     write_tui_toml(&mut output, &config.tui);
     write_client_toml(&mut output, &config.client);
@@ -6072,8 +6146,30 @@ fn write_system_prompt_toml(output: &mut String, system_prompt: &SystemPromptCon
         if !system_prompt.sections.skill_catalog {
             output.push_str("skill_catalog = false\n");
         }
+        if !system_prompt.sections.model_profile {
+            output.push_str("model_profile = false\n");
+        }
         output.push('\n');
     }
+}
+
+fn write_prompt_profile_toml(output: &mut String, profile: &PromptProfileConfig) {
+    if profile == &PromptProfileConfig::default() {
+        return;
+    }
+    let encoded = toml::to_string(profile).expect("prompt profile encodes as TOML");
+    for line in encoded.lines() {
+        if let Some(table) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            writeln!(output, "[prompt_profile.{table}]").expect("write to string");
+        } else if !line.is_empty() {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output.push('\n');
 }
 
 const fn system_prompt_mode_name(mode: SystemPromptMode) -> &'static str {
@@ -7210,13 +7306,13 @@ mod tests {
         AuthConfig, AuthPoolConfig, BCODE_CONFIG_ENV, BcodeConfig, CompactionBackend,
         CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot, ConfigError,
         ConfigLoadOverrides, ContextStrategyMode, FieldDoc, InvariantGuidanceMode,
-        InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc,
-        RuntimeAuthSubscriptionPool, RuntimeAuthSubscriptions, TuiAccentTransitionCurve,
-        TuiAgentAccentPolicy, TuiInteractionOffscreenFocus, TuiInteractionPlacement,
-        TuiMouseConfig, TuiRenderConfig, TuiThemeVariant, TuiVisualAdapterConfig,
-        clear_tui_streaming_presentation_override, clear_tui_theme_selection,
-        default_config_paths_from, default_permissions_state_path, load_config_from_paths,
-        load_config_from_paths_with_overrides, load_permissions_state_from,
+        InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc, PromptProfileLayerConfig,
+        PromptProfileTextMode, RuntimeAuthSubscriptionPool, RuntimeAuthSubscriptions,
+        ToolDescriptionOverrideConfig, TuiAccentTransitionCurve, TuiAgentAccentPolicy,
+        TuiInteractionOffscreenFocus, TuiInteractionPlacement, TuiMouseConfig, TuiRenderConfig,
+        TuiThemeVariant, TuiVisualAdapterConfig, clear_tui_streaming_presentation_override,
+        clear_tui_theme_selection, default_config_paths_from, default_permissions_state_path,
+        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, load_tui_streaming_presentation_override_from,
         load_tui_theme_selection_from, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
@@ -10080,6 +10176,45 @@ extends = ["a"]
 
         assert!(paths.contains(&root.join("bcode.toml")));
         assert!(paths.contains(&root.join(".bcode").join("bcode.toml")));
+    }
+
+    #[test]
+    fn prompt_profile_config_round_trips_and_is_documented() {
+        let mut config = BcodeConfig::default();
+        config.prompt_profile.catalog_entry.insert(
+            "anthropic.claude-opus-5".to_string(),
+            PromptProfileLayerConfig {
+                system_prompt_mode: PromptProfileTextMode::Append,
+                system_prompt: Some("Use complete output.".to_string()),
+                tool_description: BTreeMap::from([(
+                    "shell.run".to_string(),
+                    ToolDescriptionOverrideConfig {
+                        mode: PromptProfileTextMode::Prepend,
+                        text: "Preserve output.".to_string(),
+                    },
+                )]),
+            },
+        );
+        config.system_prompt.sections.model_profile = false;
+
+        let rendered = super::config_to_toml(&config);
+        let decoded: BcodeConfig = toml::from_str(&rendered).expect("decode rendered config");
+        assert_eq!(decoded.prompt_profile, config.prompt_profile);
+        assert!(!decoded.system_prompt.sections.model_profile);
+        assert!(rendered.contains("[prompt_profile.catalog_entry."));
+        assert!(rendered.contains("anthropic.claude-opus-5"));
+        assert!(
+            BcodeConfig::field_docs()
+                .iter()
+                .any(|field| field.toml_key == "prompt_profile")
+        );
+    }
+
+    #[test]
+    fn default_config_does_not_render_prompt_profile_tables() {
+        let rendered = super::config_to_toml(&BcodeConfig::default());
+        assert!(!rendered.contains("prompt_profile"));
+        assert!(!rendered.contains("model_profile"));
     }
 
     #[test]

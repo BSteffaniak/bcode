@@ -1472,6 +1472,7 @@ dependencies = [
  "bcode_pi_session_import_plugin",
  "bcode_plugin",
  "bcode_plugin_sdk",
+ "bcode_prompt_profile_plugin",
  "bcode_question_plugin",
  "bcode_ralph_plugin",
  "bcode_read_plugin",
@@ -2280,6 +2281,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_prompt_profile"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_model",
+ "bcode_session_models",
+ "bcode_tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_prompt_profile_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_config",
+ "bcode_plugin_sdk",
+ "bcode_prompt_profile",
+ "bcode_session_models",
+ "bcode_tool",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_provider_auth"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2405,6 +2429,8 @@ dependencies = [
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_project_instructions",
+ "bcode_prompt_profile",
+ "bcode_prompt_profile_plugin",
  "bcode_provider_auth",
  "bcode_question_plugin",
  "bcode_ralph",

@@ -27,6 +27,7 @@ bcode_model_provider_runtime = { workspace = true }
 bcode_plugin = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_project_instructions = { workspace = true }
+bcode_prompt_profile = { workspace = true }
 bcode_provider_auth = { workspace = true }
 bcode_ralph = { workspace = true }
 bcode_session = { workspace = true }
@@ -92,6 +93,9 @@ bcode_hyperchad = { workspace = true, features = [
     "static-bundled-question-plugin",
 ] }
 bcode_hyperchad_ui = { workspace = true }
+bcode_prompt_profile_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_session_view = { workspace = true }
 bcode_session_view_models = { workspace = true }

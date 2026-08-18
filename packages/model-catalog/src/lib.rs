@@ -127,6 +127,19 @@ pub enum ModelListView {
     UserVisible,
 }
 
+/// Stable identity facts for one catalog-resolved model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCatalogIdentity {
+    /// Catalog provider used for resolution.
+    pub provider_id: String,
+    /// Stable entry key within the provider catalog.
+    pub catalog_entry_id: String,
+    /// Catalog model family, when declared.
+    pub family: Option<String>,
+    /// Required provider API surface, when declared.
+    pub api_surface: Option<bcode_model::ModelApiSurface>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelCatalogResolver {
     catalog: std::sync::Arc<tokio::sync::RwLock<std::sync::Arc<ModelCatalog>>>,
@@ -289,6 +302,31 @@ impl ModelCatalogResolver {
             .await
             .model(provider_id, model_id)
             .and_then(|entry| model_api_surface_from_catalog(entry.api_surface))
+    }
+
+    /// Resolve stable identity facts for one model with bounded catalog work.
+    pub async fn model_identity(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<ModelCatalogIdentity> {
+        let catalog = self.catalog.read().await;
+        let identity = {
+            let provider = catalog.provider(provider_id)?;
+            let entry = find_provider_model(provider, model_id)?;
+            let catalog_entry_id = provider
+                .models
+                .iter()
+                .find_map(|(key, candidate)| std::ptr::eq(candidate, entry).then(|| key.clone()))?;
+            ModelCatalogIdentity {
+                provider_id: provider_id.to_string(),
+                catalog_entry_id,
+                family: entry.family.clone(),
+                api_surface: model_api_surface_from_catalog(entry.api_surface),
+            }
+        };
+        drop(catalog);
+        Some(identity)
     }
 
     /// Resolve catalog-known reasoning capabilities for one model.
@@ -1682,6 +1720,21 @@ pub fn default_source_dir() -> PathBuf {
 mod tests {
     use super::*;
     use bcode_model::{ModelCacheInfo, ModelCapability, ModelVisibility};
+
+    #[tokio::test]
+    async fn resolver_identity_maps_region_prefixed_opus_five_to_stable_entry() {
+        let resolver = ModelCatalogResolver::embedded();
+        let identity = resolver
+            .model_identity("bedrock", "us.anthropic.claude-opus-5-v1:0")
+            .await
+            .expect("Opus 5 identity");
+        assert_eq!(identity.catalog_entry_id, "anthropic.claude-opus-5");
+        assert_eq!(identity.family.as_deref(), Some("claude"));
+        assert_eq!(
+            identity.api_surface,
+            Some(bcode_model::ModelApiSurface::Messages)
+        );
+    }
 
     #[test]
     fn bedrock_openai_responses_models_resolve_with_region_prefixes() {

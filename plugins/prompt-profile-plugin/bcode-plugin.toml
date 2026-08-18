@@ -1,0 +1,14 @@
+id      = "bcode.prompt-profile"
+name    = "Bcode Prompt Profiles"
+version = "0.0.1"
+
+[[services]]
+description  = "Model-scoped system prompt and tool-description profiles"
+interface_id = "bcode.prompt-profile/v1"
+name         = "Prompt Profiles"
+
+[runtime]
+abi_version  = 3
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_prompt_profile_plugin.dylib"
+type         = "native"

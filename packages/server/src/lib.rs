@@ -20153,15 +20153,32 @@ async fn run_model_turn_inner(
     let provider_retry_rules = provider_retry_rules(state, provider_plugin_id.as_deref()).await;
     let remote_catalog_retry_rules =
         remote_catalog_retry_rules(provider_plugin_id.as_deref(), &turn_config.model.retry).await;
-    let static_context = match prepare_static_model_turn_context(
+    let target = Box::pin(resolve_model_request_target(
         state,
-        session_id,
-        trigger_event.sequence,
-        &execution,
-        &turn_config,
-    )
-    .await
-    {
+        ModelRequestTargetInput {
+            provider_plugin_id: provider_plugin_id.as_deref(),
+            selected_model_id: selection.model_id.as_deref(),
+            provider_context: &selection.provider_context,
+        },
+    ))
+    .await;
+    let static_context = match target {
+        Ok(target) => {
+            prepare_static_model_turn_context(
+                state,
+                session_id,
+                trigger_event.sequence,
+                &execution,
+                &turn_config,
+                &target,
+            )
+            .await
+        }
+        Err(error) => Err(bcode_session::SessionError::EventSerialization(format!(
+            "failed to resolve model request target: {error}"
+        ))),
+    };
+    let static_context = match static_context {
         Ok(context) => context,
         Err(error) => {
             let message = format!("model turn preparation error: {error}");
@@ -24471,6 +24488,9 @@ struct StaticModelTurnContext {
     system_prompt: String,
     system_messages: Vec<ModelMessage>,
     tools: Vec<bcode_model::ToolDefinition>,
+    prompt_profile_layers: Vec<String>,
+    prompt_profile_diagnostics: Vec<String>,
+    tool_description_overrides: Vec<String>,
 }
 
 fn turn_execution_options(
@@ -24506,6 +24526,7 @@ async fn prepare_static_model_turn_context(
     trigger_event_sequence: u64,
     execution: &bcode_session_models::TurnExecutionOptions,
     config: &bcode_config::BcodeConfig,
+    model_target: &model_request_target::ResolvedModelRequestTarget,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
     let agent_id = execution
         .agent_profile
@@ -24614,11 +24635,26 @@ async fn prepare_static_model_turn_context(
             .and_then(|context| context.enabled_tools.clone()),
         execution.tool_allowlist.as_ref(),
     );
-    let tools = collect_model_tools(state, session_id, enabled_tools, execution.tools).await;
+    let base_tools = collect_model_tools(state, session_id, enabled_tools, execution.tools).await;
+    let profile = resolve_prompt_profile(
+        state,
+        session_id,
+        &agent_id,
+        config,
+        model_target,
+        &base_tools,
+    )
+    .await;
+    let system_prompt = apply_system_prompt_profile(system_prompt, &profile);
+    let tools = apply_tool_description_profile(base_tools, &profile);
+    let tool_description_overrides = profile.tool_description_overrides.keys().cloned().collect();
     Ok(StaticModelTurnContext {
         system_prompt,
         system_messages,
         tools,
+        prompt_profile_layers: profile.applied_layers,
+        prompt_profile_diagnostics: profile.diagnostics,
+        tool_description_overrides,
     })
 }
 
@@ -24807,6 +24843,24 @@ async fn build_model_turn_request(
     insert_reasoning_metadata(&mut metadata, &parameters);
     if let Some(cache_info) = &model_cache_info {
         insert_model_cache_metadata(&mut metadata, cache_info);
+    }
+    if !static_context.prompt_profile_layers.is_empty() {
+        metadata.insert(
+            "prompt_profile_layers".to_string(),
+            static_context.prompt_profile_layers.join(","),
+        );
+    }
+    if !static_context.prompt_profile_diagnostics.is_empty() {
+        metadata.insert(
+            "prompt_profile_diagnostics".to_string(),
+            static_context.prompt_profile_diagnostics.join("; "),
+        );
+    }
+    if !static_context.tool_description_overrides.is_empty() {
+        metadata.insert(
+            "tool_description_overrides".to_string(),
+            static_context.tool_description_overrides.join(","),
+        );
     }
     metadata.insert(
         "bcode_context_through_sequence".to_string(),
@@ -26684,6 +26738,122 @@ fn intersect_tool_allowlists(
             )
         }
     }
+}
+
+async fn resolve_prompt_profile(
+    state: &ServerState,
+    session_id: SessionId,
+    agent_id: &str,
+    config: &bcode_config::BcodeConfig,
+    target: &model_request_target::ResolvedModelRequestTarget,
+    tools: &[bcode_model::ToolDefinition],
+) -> bcode_prompt_profile::PromptProfileResponse {
+    if !config.system_prompt.sections.model_profile {
+        return bcode_prompt_profile::PromptProfileResponse::default();
+    }
+    let Some(provider_plugin_id) = target.provider_plugin_id.clone() else {
+        return bcode_prompt_profile::PromptProfileResponse::default();
+    };
+    let catalog_provider_id = target
+        .catalog_provider_id
+        .clone()
+        .unwrap_or_else(|| provider_plugin_id.clone());
+    let request = bcode_prompt_profile::ResolvePromptProfileRequest {
+        session_id,
+        agent_id: agent_id.to_string(),
+        target: bcode_prompt_profile::PromptModelTarget {
+            provider_plugin_id,
+            catalog_provider_id,
+            catalog_entry_id: target
+                .catalog_identity
+                .as_ref()
+                .map(|identity| identity.catalog_entry_id.clone()),
+            requested_model_id: target.requested_model_id.clone(),
+            effective_model_id: target.model_id.clone(),
+            family: target
+                .catalog_identity
+                .as_ref()
+                .and_then(|identity| identity.family.clone()),
+            api_surface: target
+                .catalog_identity
+                .as_ref()
+                .and_then(|identity| identity.api_surface),
+        },
+        tools: tools
+            .iter()
+            .map(|tool| bcode_tool::ToolDefinition {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.clone(),
+            })
+            .collect(),
+        effective_config_toml: bcode_config::encode_effective_config(config)
+            .ok()
+            .map(Box::new),
+    };
+    match state
+        .plugins
+        .invoke_service_by_interface_json::<_, bcode_prompt_profile::PromptProfileResponse>(
+            bcode_prompt_profile::PROMPT_PROFILE_INTERFACE_ID,
+            bcode_prompt_profile::OP_RESOLVE_PROMPT_PROFILE,
+            &request,
+        )
+        .await
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            tracing::warn!(%error, "prompt profile unavailable; using unmodified model context");
+            bcode_prompt_profile::PromptProfileResponse {
+                diagnostics: vec![
+                    "prompt profile unavailable: service resolution or invocation failed"
+                        .to_string(),
+                ],
+                ..bcode_prompt_profile::PromptProfileResponse::default()
+            }
+        }
+    }
+}
+
+fn apply_system_prompt_profile(
+    original: String,
+    profile: &bcode_prompt_profile::PromptProfileResponse,
+) -> String {
+    let mut parts = profile.system_prompt_prepends.clone();
+    parts.push(
+        profile
+            .system_prompt_replacement
+            .clone()
+            .unwrap_or(original),
+    );
+    parts.extend(profile.system_prompt_appends.iter().cloned());
+    parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn apply_tool_description_profile(
+    mut tools: Vec<bcode_model::ToolDefinition>,
+    profile: &bcode_prompt_profile::PromptProfileResponse,
+) -> Vec<bcode_model::ToolDefinition> {
+    for tool in &mut tools {
+        let Some(operations) = profile.tool_description_overrides.get(&tool.name) else {
+            continue;
+        };
+        for description in operations {
+            tool.description = match description.mode {
+                bcode_prompt_profile::TextOverrideMode::Append => {
+                    format!("{}\n\n{}", tool.description, description.text)
+                }
+                bcode_prompt_profile::TextOverrideMode::Prepend => {
+                    format!("{}\n\n{}", description.text, tool.description)
+                }
+                bcode_prompt_profile::TextOverrideMode::Replace => description.text.clone(),
+            };
+        }
+    }
+    tools
 }
 
 async fn collect_model_tools(
@@ -55634,6 +55804,150 @@ library = "test"
         )
     }
 
+    fn test_server_state_with_prompt_profile(sessions: SessionManager) -> ServerState {
+        let profile = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
+            bcode_prompt_profile_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.prompt-profile".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[profile],
+        )
+        .expect("load prompt profile plugin");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state
+    }
+
+    #[tokio::test]
+    async fn prompt_profile_applies_only_to_catalog_resolved_opus_five() {
+        let state = test_server_state_with_prompt_profile(SessionManager::default());
+        let config = bcode_config::BcodeConfig::default();
+        let tools = vec![bcode_model::ToolDefinition {
+            name: "shell.run".to_string(),
+            description: "Run a command".to_string(),
+            input_schema: serde_json::json!({}),
+        }];
+        let opus_target = model_request_target::ResolvedModelRequestTarget {
+            provider_plugin_id: Some("bcode.bedrock".to_string()),
+            requested_model_id: Some("us.anthropic.claude-opus-5-v1:0".to_string()),
+            model_id: "us.anthropic.claude-opus-5-v1:0".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            catalog_provider_id: Some("bedrock".to_string()),
+            catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
+                provider_id: "bedrock".to_string(),
+                catalog_entry_id: "anthropic.claude-opus-5".to_string(),
+                family: Some("claude".to_string()),
+                api_surface: Some(bcode_model::ModelApiSurface::Messages),
+            }),
+        };
+        let response = resolve_prompt_profile(
+            &state,
+            SessionId::new(),
+            "build",
+            &config,
+            &opus_target,
+            &tools,
+        )
+        .await;
+        assert_eq!(
+            response.applied_layers,
+            ["catalog_entry:anthropic.claude-opus-5"]
+        );
+        let prompt = apply_system_prompt_profile("base".to_string(), &response);
+        assert!(prompt.contains("Do not pipe tool output"));
+        let patched = apply_tool_description_profile(tools.clone(), &response);
+        assert!(patched[0].description.contains("Do not pipe tool output"));
+        assert_eq!(patched[0].name, tools[0].name);
+        assert_eq!(patched[0].input_schema, tools[0].input_schema);
+
+        let mut sonnet_target = opus_target;
+        sonnet_target.model_id = "anthropic.claude-sonnet-4".to_string();
+        sonnet_target.catalog_identity = Some(bcode_model_catalog::ModelCatalogIdentity {
+            provider_id: "bedrock".to_string(),
+            catalog_entry_id: "anthropic.claude-sonnet-4".to_string(),
+            family: Some("claude".to_string()),
+            api_surface: Some(bcode_model::ModelApiSurface::Messages),
+        });
+        let unmodified = resolve_prompt_profile(
+            &state,
+            SessionId::new(),
+            "build",
+            &config,
+            &sonnet_target,
+            &tools,
+        )
+        .await;
+        assert_eq!(
+            unmodified,
+            bcode_prompt_profile::PromptProfileResponse::default()
+        );
+        assert_eq!(
+            apply_system_prompt_profile("base".to_string(), &unmodified),
+            "base"
+        );
+        assert_eq!(
+            apply_tool_description_profile(tools.clone(), &unmodified),
+            tools
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_profile_kill_switch_and_absent_plugin_preserve_context() {
+        let mut state = test_server_state_with_prompt_profile(SessionManager::default());
+        let tools = vec![bcode_model::ToolDefinition {
+            name: "shell.run".to_string(),
+            description: "Run a command".to_string(),
+            input_schema: serde_json::json!({}),
+        }];
+        let target = model_request_target::ResolvedModelRequestTarget {
+            provider_plugin_id: Some("bcode.bedrock".to_string()),
+            requested_model_id: None,
+            model_id: "anthropic.claude-opus-5".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            catalog_provider_id: Some("bedrock".to_string()),
+            catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
+                provider_id: "bedrock".to_string(),
+                catalog_entry_id: "anthropic.claude-opus-5".to_string(),
+                family: Some("claude".to_string()),
+                api_surface: Some(bcode_model::ModelApiSurface::Messages),
+            }),
+        };
+        let mut config = bcode_config::BcodeConfig::default();
+        config.system_prompt.sections.model_profile = false;
+        assert_eq!(
+            resolve_prompt_profile(&state, SessionId::new(), "build", &config, &target, &tools)
+                .await,
+            bcode_prompt_profile::PromptProfileResponse::default()
+        );
+        state.plugins =
+            bcode_plugin::PluginRuntimeHost::load_defaults(&bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::new(),
+                disabled: BTreeSet::new(),
+            })
+            .expect("load empty plugin host");
+        config.system_prompt.sections.model_profile = true;
+        let absent =
+            resolve_prompt_profile(&state, SessionId::new(), "build", &config, &target, &tools)
+                .await;
+        assert!(absent.applied_layers.is_empty());
+        assert!(absent.tool_description_overrides.is_empty());
+        assert_eq!(
+            apply_system_prompt_profile("base".to_string(), &absent),
+            "base"
+        );
+        assert_eq!(
+            apply_tool_description_profile(tools.clone(), &absent),
+            tools
+        );
+        assert_eq!(absent.diagnostics.len(), 1);
+    }
+
     /// Server state whose plugin host serves `bcode.agent-profile/v1`.
     ///
     /// Starting a workflow resolves its authorization profile and fails closed when no plugin serves
@@ -67526,6 +67840,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             system_prompt: String::new(),
             system_messages: Vec::new(),
             tools: Vec::new(),
+            prompt_profile_layers: Vec::new(),
+            prompt_profile_diagnostics: Vec::new(),
+            tool_description_overrides: Vec::new(),
         };
         let compaction_policy =
             automatic_compaction_policy(&state, &selection, &state.startup_config.model.compaction)
