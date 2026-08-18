@@ -1354,6 +1354,33 @@ impl MantleSseDecoder {
     }
 }
 
+/// Build the error reported when a Bedrock stream ends before a terminal event.
+///
+/// A stream that stops mid-response must never be reported as a clean `EndTurn`: the host would
+/// terminalize the turn and present a partial answer as complete. Categorizing this as a
+/// retryable network fault lets the host's transient-retry path recover the turn instead, matching
+/// how the Mantle `OpenAI` reader and the `OpenAI`-compatible provider already treat an
+/// unexpected end of stream.
+fn bedrock_incomplete_stream_error(surface: &str, saw_output: bool) -> ProviderError {
+    let mut error = provider_error(
+        format!("bedrock_{surface}_stream_incomplete"),
+        ProviderErrorCategory::Network,
+        "Bedrock stream ended before reporting a terminal stop reason",
+    );
+    error
+        .diagnostic_context
+        .insert("api_surface".to_string(), surface.to_string());
+    error
+        .diagnostic_context
+        .insert("saw_output".to_string(), saw_output.to_string());
+    error.sources.push(ProviderErrorSource {
+        source: "bedrock_stream".to_string(),
+        code: Some("unexpected_eof".to_string()),
+        message: None,
+    });
+    error
+}
+
 async fn read_mantle_anthropic_stream(
     mut response: reqwest::Response,
     turn: &TurnState,
@@ -1380,6 +1407,13 @@ async fn read_mantle_anthropic_stream(
                         if let Some(outcome) = accumulator.process(&event, turn)? {
                             return Ok(outcome);
                         }
+                    }
+                    // End of stream without a terminal stop reason means the response was cut off.
+                    if !accumulator.saw_terminal_stop_reason() {
+                        return Err(bedrock_incomplete_stream_error(
+                            "mantle_anthropic",
+                            accumulator.saw_output(),
+                        ));
                     }
                     return Ok(accumulator.finish());
                 }
@@ -1727,6 +1761,15 @@ async fn read_anthropic_messages_stream(
         tokio::select! {
             event = stream.recv() => {
                 let Some(event) = event.map_err(|error| bedrock_messages_stream_error(&error))? else {
+                    // End of stream without `message_stop`/`message_delta` means the response was
+                    // cut off. Reporting `finish()` here would surface a partial answer as a clean
+                    // `EndTurn` and let the host terminalize the turn.
+                    if !accumulator.saw_terminal_stop_reason() {
+                        return Err(bedrock_incomplete_stream_error(
+                            "messages",
+                            accumulator.saw_output(),
+                        ));
+                    }
                     return Ok(accumulator.finish());
                 };
                 if let ResponseStream::Chunk(chunk) = event
@@ -2100,6 +2143,18 @@ impl AnthropicMessagesAccumulator {
             StreamOutcome::Finished
         }
     }
+
+    /// Return true once the provider reported a terminal stop reason for this turn.
+    ///
+    /// End of stream without one means the response was cut off, not completed.
+    const fn saw_terminal_stop_reason(&self) -> bool {
+        self.stop_reason.is_some()
+    }
+
+    /// Return true once any assistant-visible output was observed on this stream.
+    const fn saw_output(&self) -> bool {
+        self.saw_tool_call || self.synthetic_output_emitted
+    }
 }
 
 fn event_index(event: &serde_json::Value) -> Result<u32, ProviderError> {
@@ -2147,6 +2202,15 @@ async fn read_bedrock_stream(
         tokio::select! {
             event = stream.recv() => {
                 let Some(event) = event.map_err(|error| bedrock_stream_error(&error))? else {
+                    // Converse ends with `messageStop` followed by `metadata`. Reaching end of
+                    // stream without `messageStop` means the response was cut off, so it must not
+                    // be reported as a clean completion.
+                    if !accumulator.saw_terminal_stop_reason() {
+                        return Err(bedrock_incomplete_stream_error(
+                            "converse",
+                            accumulator.saw_output(),
+                        ));
+                    }
                     return Ok(accumulator.finish_outcome());
                 };
                 if let Some(outcome) = accumulator.process_event(event, turn)? {
@@ -2411,6 +2475,18 @@ impl StreamAccumulator {
             StreamOutcome::Finished
         }
     }
+
+    /// Return true once Converse reported `messageStop` for this turn.
+    ///
+    /// End of stream without it means the response was cut off, not completed.
+    const fn saw_terminal_stop_reason(&self) -> bool {
+        self.saw_message_stop
+    }
+
+    /// Return true once any assistant-visible output was observed on this stream.
+    const fn saw_output(&self) -> bool {
+        self.saw_tool_call
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2457,6 +2533,28 @@ fn bedrock_tool_input_schema(tool: &ToolDefinition) -> Result<&serde_json::Value
     Ok(&tool.input_schema)
 }
 
+/// Resolve the `max_tokens` value the Anthropic Messages surface requires.
+///
+/// The Messages API rejects a request without `max_tokens`, so this value cannot simply be
+/// omitted the way the Responses surface omits its ceiling. It must not be guessed either: a
+/// provider-local default silently caps output far below the model's real capability and
+/// truncates long responses mid-answer or mid-tool-call. The host resolves the selected model's
+/// limit centrally, so an absent limit is an unresolved-state failure and fails closed.
+///
+/// # Errors
+///
+/// Returns an error when the host did not resolve an output-token limit for the turn.
+fn anthropic_messages_max_tokens(request: &ModelTurnRequest) -> Result<u32, ProviderError> {
+    request.parameters.max_output_tokens.ok_or_else(|| {
+        provider_error(
+            "bedrock_messages_max_output_tokens_unresolved",
+            ProviderErrorCategory::InvalidRequest,
+            "Bedrock Anthropic Messages requires a resolved max_output_tokens for the selected \
+             model; refusing to substitute a provider-local default that would truncate output",
+        )
+    })
+}
+
 fn build_anthropic_messages_request_value(
     request: &ModelTurnRequest,
     model_id: &str,
@@ -2469,7 +2567,7 @@ fn build_anthropic_messages_request_value(
     );
     body.insert(
         "max_tokens".to_string(),
-        serde_json::json!(request.parameters.max_output_tokens.unwrap_or(4_096)),
+        serde_json::json!(anthropic_messages_max_tokens(request)?),
     );
     if let Some(system) = anthropic_system_content(request) {
         body.insert("system".to_string(), system);
@@ -7275,6 +7373,122 @@ mod tests {
         assert_eq!(accumulator.finish(), StreamOutcome::Finished);
     }
 
+    /// A stream cut off before any terminal stop reason must not look like a completed turn.
+    ///
+    /// This is the condition the stream readers check at end of stream. Reporting `EndTurn` here
+    /// would let the host terminalize the turn and present a partial answer as complete, which is
+    /// exactly the silent truncation this guards against.
+    #[test]
+    fn anthropic_messages_stream_without_stop_reason_is_not_terminal() {
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "partial answer"},
+                }),
+                &turn,
+            )
+            .expect("text delta should process");
+
+        assert!(
+            !accumulator.saw_terminal_stop_reason(),
+            "a stream with only text deltas has no terminal stop reason"
+        );
+        // `finish()` alone would misreport this cut-off stream as a clean completion.
+        assert_eq!(accumulator.finish(), StreamOutcome::Finished);
+
+        accumulator.record_message_delta_stop_reason(&serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+        }));
+        assert!(accumulator.saw_terminal_stop_reason());
+    }
+
+    /// Converse must treat a stream that never delivered `messageStop` as cut off.
+    #[test]
+    fn converse_stream_without_message_stop_is_not_terminal() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+
+        assert!(!accumulator.saw_terminal_stop_reason());
+
+        accumulator
+            .process_event(
+                converse_message_stop_event(BedrockStopReason::EndTurn),
+                &turn,
+            )
+            .expect("message stop should process");
+
+        assert!(
+            accumulator.saw_terminal_stop_reason(),
+            "messageStop is Converse's terminal marker"
+        );
+    }
+
+    /// The incomplete-stream error must be retryable so the host's transient path can recover.
+    ///
+    /// Reporting a non-retryable error, or a clean completion, would surface truncated output to
+    /// the user instead of retrying the cut-off turn.
+    #[test]
+    fn incomplete_stream_error_is_retryable_and_secret_safe() {
+        let error = bedrock_incomplete_stream_error("messages", true);
+
+        assert_eq!(error.code, "bedrock_messages_stream_incomplete");
+        assert_eq!(error.category, ProviderErrorCategory::Network);
+        assert!(
+            error.retryable,
+            "a cut-off stream must be retryable so the turn is recovered rather than truncated"
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("api_surface")
+                .map(String::as_str),
+            Some("messages")
+        );
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("saw_output")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(error.provider_message.is_none());
+    }
+
+    /// The Messages surface must fail closed rather than substitute a truncating default.
+    ///
+    /// Anthropic requires `max_tokens`, so it cannot be omitted; guessing a small value silently
+    /// caps output far below the model's real limit.
+    #[test]
+    fn anthropic_messages_request_fails_closed_without_resolved_max_output_tokens() {
+        let mut request = test_model_turn_request();
+        request.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Messages);
+        request.parameters.max_output_tokens = None;
+
+        let error = build_anthropic_messages_request_value(&request, "model", Some(DEFAULT_REGION))
+            .expect_err("an unresolved output limit must not fall back to a provider default");
+
+        assert_eq!(error.code, "bedrock_messages_max_output_tokens_unresolved");
+        assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+    }
+
+    /// The resolved model limit must reach the wire unchanged.
+    #[test]
+    fn anthropic_messages_request_sends_resolved_max_output_tokens() {
+        let mut request = test_model_turn_request();
+        request.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Messages);
+        request.parameters.max_output_tokens = Some(128_000);
+
+        let body = build_anthropic_messages_request_value(&request, "model", Some(DEFAULT_REGION))
+            .expect("Messages request should build with a resolved limit");
+
+        assert_eq!(body["max_tokens"], 128_000);
+    }
+
     #[test]
     fn converse_truncated_tool_call_reports_max_tokens() {
         let mut accumulator = StreamAccumulator::new(BTreeMap::new());
@@ -8615,7 +8829,12 @@ mod tests {
             tools: Vec::new(),
             tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
             tool_schema_mode: None,
-            parameters: bcode_model::ModelParameters::default(),
+            // The host resolves the selected model's output limit for every turn, so the shared
+            // fixture carries one. Messages-surface request building fails closed without it.
+            parameters: bcode_model::ModelParameters {
+                max_output_tokens: Some(64_000),
+                ..bcode_model::ModelParameters::default()
+            },
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
