@@ -50283,16 +50283,19 @@ library = "test"
         );
 
         let low_execution = bcode_session_models::TurnExecutionOptions {
+            permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
+            tools: bcode_session_models::TurnToolPolicy::Enabled,
             reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
                 effort: Some("low".to_owned()),
                 summary: Some("concise".to_owned()),
             })),
             ..bcode_session_models::TurnExecutionOptions::default()
         };
+        let second_client_id = ClientId::new();
         let second_follow_up = enqueue_user_message_command(
             &state,
             session.id,
-            client_id,
+            second_client_id,
             None,
             "second explicit follow-up".to_owned(),
             bcode_ipc::PromptPlacement::FollowUp,
@@ -50318,6 +50321,14 @@ library = "test"
         };
         assert_eq!(turn_execution_options(&user_event), follow_up_execution);
         assert_eq!(turn_execution_options(&second_event), low_execution);
+        assert_eq!(
+            turn_execution_options(&user_event).permission_mode,
+            bcode_session_models::TurnPermissionMode::Bypass
+        );
+        assert_eq!(
+            turn_execution_options(&second_event).permission_mode,
+            bcode_session_models::TurnPermissionMode::Enforce
+        );
 
         *handle.phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
         *handle.current_turn.lock().await = None;
@@ -65696,6 +65707,107 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn disabled_tools_preserve_explicit_skill_context() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("skill context".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let context = "skill instructions".to_owned();
+        let execution = bcode_session_models::TurnExecutionOptions {
+            tools: bcode_session_models::TurnToolPolicy::Disabled,
+            skill_contexts: vec![bcode_skill_models::SkillContextResponse {
+                skill_id: bcode_skill_models::SkillId::new("test-skill"),
+                bytes_loaded: context.len(),
+                context: context.clone(),
+                source: bcode_skill_models::SkillSource {
+                    kind: bcode_skill_models::SkillSourceKind::Bundled,
+                    label: "test".to_owned(),
+                    path: None,
+                    precedence: 0,
+                },
+                truncated: false,
+                model_policy: None,
+            }],
+            ..bcode_session_models::TurnExecutionOptions::default()
+        };
+        let trigger = session_event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "use context".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata {
+                    execution: execution.clone(),
+                    ..bcode_session_models::TurnAdmissionMetadata::default()
+                },
+            },
+        );
+        let state = test_server_state(sessions);
+        let prepared = prepare_static_model_turn_context(
+            &state,
+            session_id,
+            trigger.sequence,
+            &execution,
+            &state.session_config(session_id).await,
+        )
+        .await
+        .expect("static turn context");
+
+        assert!(prepared.tools.is_empty());
+        assert!(prepared.system_messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == &context))
+        }));
+    }
+
+    #[tokio::test]
+    async fn disabled_tools_complete_a_model_only_turn() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("model only".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state_with_fake_provider(sessions);
+        let execution = bcode_session_models::TurnExecutionOptions {
+            tools: bcode_session_models::TurnToolPolicy::Disabled,
+            permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
+            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            model_id: Some("fake-echo".to_owned()),
+            ..bcode_session_models::TurnExecutionOptions::default()
+        };
+        let trigger = session_event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "model only response".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata {
+                    execution,
+                    ..bcode_session_models::TurnAdmissionMetadata::default()
+                },
+            },
+        );
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                selected_model_id: Some("fake-echo".to_owned()),
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn workflow_evaluation_executes_read_only_tool_then_finalizes_structured_output() {
         let sessions = SessionManager::default();
@@ -67708,6 +67820,77 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn cancelled_bypass_authorized_tool_does_not_invoke_plugin() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(
+                Some("cancelled bypass".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let state = test_server_state_with_shell_plugin(sessions);
+        let call = bcode_model::ToolCall {
+            id: "cancelled-bypass".to_owned(),
+            name: "shell.run".to_owned(),
+            arguments: serde_json::json!({"command": "echo should-not-run"}),
+        };
+        let (tool, preparation) = prepare_server_tool(&state, session.id, &call)
+            .await
+            .expect("prepared shell tool");
+        let agent_id = session_agent_selection(&state, session.id).await;
+        let request = ToolAuthorizationRequest {
+            index: 0,
+            call: call.clone(),
+            tool: tool.clone(),
+            facts: preparation.authorization.clone(),
+            context: bcode_agent_runtime::RuntimePermissionContext {
+                session_id: session.id,
+                agent_id: agent_id.clone(),
+            },
+        };
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let coordinator = ServerAuthorizationCoordinator::new(
+            &state,
+            session.id,
+            cancel_state.as_ref(),
+            1,
+            bcode_session_models::TurnToolPolicy::Enabled,
+            bcode_session_models::TurnPermissionMode::Bypass,
+            &agent_id,
+        );
+        assert_eq!(
+            coordinator.authorize_one(&request, None).await,
+            ToolAuthorizationDecision::Allow
+        );
+        cancel_state.close();
+
+        let result = execute_model_tool(
+            &state,
+            session.id,
+            call,
+            test_working_directory(),
+            tool,
+            preparation,
+            cancel_state,
+        )
+        .await;
+
+        assert!(result.is_none());
+        let history = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("cancelled history");
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationLifecycle { event }
+                if event.invocation_id == "cancelled-bypass"
+                    && event.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
+        )));
+    }
+
+    #[tokio::test]
     async fn disabled_turn_exposes_no_model_tools() {
         let sessions = SessionManager::default();
         let session = sessions
@@ -67728,6 +67911,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn bypass_authorization_preserves_structural_checks_without_permission_state() {
         let sessions = SessionManager::default();
         let session = sessions
@@ -67748,7 +67932,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
             "bcode.test",
         );
-        let metadata = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Mutating);
+        let mut metadata = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Mutating);
+        metadata.requires_permission = true;
         let facts = vec![bcode_tool::ToolAuthorizationFact {
             namespace: bcode_agent_profile::TOOL_POLICY_AUTHORIZATION_NAMESPACE.to_owned(),
             schema_version: bcode_agent_profile::TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION,
@@ -67780,6 +67965,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bypass.authorize_one(&request, None).await,
             ToolAuthorizationDecision::Allow
         );
+        let history = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("bypass trace history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(
+                    &trace.payload,
+                    SessionTracePayload::ToolPolicyEvaluated { decision, reason, .. }
+                        if decision == "bypassed_by_turn_permission_mode"
+                            && reason.as_deref() == Some("discretionary permission policy bypassed for this turn")
+                )
+        )));
         assert!(state.pending_permissions.lock().await.is_empty());
         assert!(
             state
@@ -67802,12 +68002,32 @@ event_symbol = "bcode_plugin_handle_event_v1"
             disabled.authorize_one(&request, None).await,
             ToolAuthorizationDecision::Deny(reason) if reason.contains("read-only inspection policy")
         ));
+        let read_only = ServerAuthorizationCoordinator::new(
+            &state,
+            session.id,
+            &cancel,
+            1,
+            bcode_session_models::TurnToolPolicy::ReadOnly,
+            bcode_session_models::TurnPermissionMode::Bypass,
+            "build",
+        );
+        assert!(matches!(
+            read_only.authorize_one(&request, None).await,
+            ToolAuthorizationDecision::Deny(reason) if reason.contains("read-only inspection policy")
+        ));
 
-        let mut malformed = request;
+        let mut malformed = request.clone();
         malformed.facts.clear();
         assert!(matches!(
             bypass.authorize_one(&malformed, None).await,
             ToolAuthorizationDecision::Deny(reason) if reason.contains("authorization facts invalid")
+        ));
+
+        let mut inline = request;
+        inline.tool.source = ToolSource::Inline;
+        assert!(matches!(
+            bypass.authorize_one(&inline, None).await,
+            ToolAuthorizationDecision::Deny(reason) if reason.contains("non-plugin tool")
         ));
     }
 

@@ -1273,6 +1273,15 @@ impl TuiEffectQueue {
         })
     }
 
+    #[cfg(test)]
+    pub fn queued_execution_options(&self) -> Option<&bcode_session_models::TurnExecutionOptions> {
+        self.effects.values().find_map(|(_, effect)| match effect {
+            TuiEffect::SubmitMessage { request } => Some(&request.execution),
+            TuiEffect::SkillAction { request } => Some(&request.execution),
+            _ => None,
+        })
+    }
+
     /// Return whether a plugin surface-open effect is queued for the given plugin and kind.
     /// Return the projection request queued for one open session.
     #[cfg(test)]

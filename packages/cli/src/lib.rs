@@ -2544,27 +2544,38 @@ struct ExecutionModeArgs {
     disable_all_tools: bool,
 }
 
+const fn execution_mode_launch_options(
+    dangerously_bypass_all_permissions: bool,
+    disable_all_tools: bool,
+) -> bcode_tui::TuiLaunchOptions {
+    bcode_tui::TuiLaunchOptions {
+        permission_mode: if dangerously_bypass_all_permissions {
+            bcode_session_models::TurnPermissionMode::Bypass
+        } else {
+            bcode_session_models::TurnPermissionMode::Enforce
+        },
+        tool_policy: if disable_all_tools {
+            bcode_session_models::TurnToolPolicy::Disabled
+        } else {
+            bcode_session_models::TurnToolPolicy::Enabled
+        },
+    }
+}
+
 impl Cli {
     const fn launch_options(&self) -> bcode_tui::TuiLaunchOptions {
-        bcode_tui::TuiLaunchOptions {
-            permission_mode: if self.execution_mode.dangerously_bypass_all_permissions {
-                bcode_session_models::TurnPermissionMode::Bypass
-            } else {
-                bcode_session_models::TurnPermissionMode::Enforce
-            },
-            tool_policy: if self.execution_mode.disable_all_tools {
-                bcode_session_models::TurnToolPolicy::Disabled
-            } else {
-                bcode_session_models::TurnToolPolicy::Enabled
-            },
-        }
+        execution_mode_launch_options(
+            self.execution_mode.dangerously_bypass_all_permissions,
+            self.execution_mode.disable_all_tools,
+        )
     }
 
     fn supports_execution_mode(&self) -> bool {
-        self.new
-            || self.command.as_ref().is_none_or(|command| {
-                matches!(command, Commands::Tui { .. } | Commands::Send { .. })
-            })
+        !self.onboard
+            && (self.new
+                || self.command.as_ref().is_none_or(|command| {
+                    matches!(command, Commands::Tui { .. } | Commands::Send { .. })
+                }))
     }
 }
 
@@ -16855,7 +16866,7 @@ mod context_compaction_tests {
 
 #[cfg(test)]
 mod client_timeout_cli_tests {
-    use super::{Cli, config_override_from_matches};
+    use super::{Cli, config_override_from_matches, execution_mode_launch_options};
     use clap::{CommandFactory as _, Parser as _};
     use std::sync::Mutex;
 
@@ -16915,6 +16926,29 @@ mod client_timeout_cli_tests {
         let maintenance = Cli::try_parse_from(["bcode", "server", "status", "--yolo"])
             .expect("global flag parses before applicability validation");
         assert!(!maintenance.supports_execution_mode());
+        let onboarding = Cli::try_parse_from(["bcode", "--onboard", "--yolo"])
+            .expect("global onboarding flag should parse before applicability validation");
+        assert!(!onboarding.supports_execution_mode());
+    }
+
+    #[test]
+    fn direct_send_uses_the_same_exact_execution_options() {
+        assert_eq!(
+            execution_mode_launch_options(true, false).turn_execution_options(),
+            bcode_session_models::TurnExecutionOptions {
+                permission_mode: bcode_session_models::TurnPermissionMode::Bypass,
+                tools: bcode_session_models::TurnToolPolicy::Enabled,
+                ..bcode_session_models::TurnExecutionOptions::default()
+            }
+        );
+        assert_eq!(
+            execution_mode_launch_options(false, true).turn_execution_options(),
+            bcode_session_models::TurnExecutionOptions {
+                permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
+                tools: bcode_session_models::TurnToolPolicy::Disabled,
+                ..bcode_session_models::TurnExecutionOptions::default()
+            }
+        );
     }
 
     #[test]

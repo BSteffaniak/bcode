@@ -40,6 +40,108 @@ fn launch_options_build_exact_portable_turn_options() {
 }
 
 #[test]
+fn launch_options_compose_without_overwriting_other_turn_options() {
+    let launch = crate::TuiLaunchOptions {
+        permission_mode: TurnPermissionMode::Bypass,
+        tool_policy: TurnToolPolicy::Disabled,
+    };
+    let mut options = launch.turn_execution_options();
+    options.agent_profile = Some("plan".to_owned());
+    options.provider_plugin_id = Some("provider".to_owned());
+    options.model_id = Some("model".to_owned());
+    options.reasoning = Some(Box::new(bcode_session_models::TurnReasoningOptions {
+        effort: Some("high".to_owned()),
+        summary: Some("detailed".to_owned()),
+    }));
+
+    assert_eq!(options.permission_mode, TurnPermissionMode::Bypass);
+    assert_eq!(options.tools, TurnToolPolicy::Disabled);
+    assert_eq!(options.agent_profile.as_deref(), Some("plan"));
+    assert_eq!(options.provider_plugin_id.as_deref(), Some("provider"));
+    assert_eq!(options.model_id.as_deref(), Some("model"));
+    assert_eq!(
+        options
+            .reasoning
+            .as_ref()
+            .and_then(|value| value.effort.as_deref()),
+        Some("high")
+    );
+}
+
+#[test]
+fn composer_submission_carries_launch_execution_defaults() {
+    let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
+    let mut chat = crate::session_flow::ActiveChat {
+        app: crate::app::BmuxApp::new_with_history(None, &[], &[], false),
+        agents: crate::session_flow::AgentCatalog::default(),
+        session_id: None,
+        event_sender,
+        event_receiver,
+        event_task: None,
+        opening_session_id: None,
+        opening_session_progress: None,
+        opening_session_anchor_sequence: None,
+        pending_effects: crate::effects::TuiEffectQueue::default(),
+    };
+    chat.app.replace_composer_with("test mode");
+    chat.app.stage_submission();
+    let launch = crate::TuiLaunchOptions {
+        permission_mode: TurnPermissionMode::Bypass,
+        tool_policy: TurnToolPolicy::Disabled,
+    };
+
+    assert!(crate::composer_flow::stage_session_message(
+        std::path::Path::new("."),
+        launch,
+        &mut chat,
+        bcode_ipc::PromptPlacement::FollowUp,
+    ));
+    let execution = chat
+        .pending_effects
+        .queued_execution_options()
+        .expect("queued submit execution options");
+    assert_eq!(execution.permission_mode, TurnPermissionMode::Bypass);
+    assert_eq!(execution.tools, TurnToolPolicy::Disabled);
+}
+
+#[test]
+fn skill_invocation_carries_launch_execution_defaults() {
+    let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
+    let session_id = SessionId::new();
+    let mut chat = crate::session_flow::ActiveChat {
+        app: crate::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        agents: crate::session_flow::AgentCatalog::default(),
+        session_id: Some(session_id),
+        event_sender,
+        event_receiver,
+        event_task: None,
+        opening_session_id: None,
+        opening_session_progress: None,
+        opening_session_anchor_sequence: None,
+        pending_effects: crate::effects::TuiEffectQueue::default(),
+    };
+    let launch = crate::TuiLaunchOptions {
+        permission_mode: TurnPermissionMode::Bypass,
+        tool_policy: TurnToolPolicy::Disabled,
+    };
+
+    crate::skill_flow::start_skill_action(
+        std::path::Path::new("."),
+        launch,
+        &mut chat,
+        crate::effects::SkillActionKind::Invoke,
+        bcode_skill_models::SkillId::new("test-skill"),
+        "arguments".to_owned(),
+    );
+    let execution = chat
+        .pending_effects
+        .queued_execution_options()
+        .expect("queued skill execution options");
+    assert_eq!(execution.permission_mode, TurnPermissionMode::Bypass);
+    assert_eq!(execution.tools, TurnToolPolicy::Disabled);
+}
+
+#[test]
 fn execution_mode_indicator_remains_visible_with_transient_status() {
     let mut app = crate::app::BmuxApp::new_with_history(None, &[], &[], false);
     app.set_execution_mode_indicator(Some("DANGER: PERMISSION BYPASS ACTIVE".to_owned()));
