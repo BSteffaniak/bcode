@@ -455,20 +455,51 @@ async fn stream_bedrock_turn_inner(
     }
     let client = bedrock_client(&settings).await;
     if request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Messages) {
-        return stream_bedrock_messages_turn(request, &client, &selection, turn, name_map).await;
+        return stream_bedrock_messages_turn(
+            request,
+            &client,
+            &selection,
+            settings.region.as_deref(),
+            turn,
+            name_map,
+        )
+        .await;
     }
+    stream_bedrock_converse_turn(
+        request, &client, &settings, &selection, turn, &discovery, name_map,
+    )
+    .await
+}
+
+/// Stream one Converse turn, walking discovered model candidates until one succeeds.
+///
+/// Each candidate may be retried or rerouted by [`handle_bedrock_turn_error`]; only a structurally
+/// incompatible model advances to the next candidate.
+async fn stream_bedrock_converse_turn(
+    request: &ModelTurnRequest,
+    client: &Client,
+    settings: &Settings,
+    selection: &ModelSelection,
+    turn: &TurnState,
+    discovery: &Arc<Mutex<DiscoveryCache>>,
+    name_map: BTreeMap<String, String>,
+) -> Result<StreamOutcome, ProviderError> {
     let mut last_error = None;
     for model_id in &selection.model_ids {
         let mut effective_request;
         let request_for_model =
-            if prompt_cache_known_unsupported(&discovery, selection.cache_key.as_ref(), model_id) {
+            if prompt_cache_known_unsupported(discovery, selection.cache_key.as_ref(), model_id) {
                 effective_request = request.clone();
                 effective_request.prompt_cache = bcode_model::PromptCacheHints::default();
                 &effective_request
             } else {
                 request
             };
-        let bedrock_request = build_converse_request(request_for_model, model_id.clone())?;
+        let bedrock_request = build_converse_request(
+            request_for_model,
+            model_id.clone(),
+            settings.region.as_deref(),
+        )?;
         let mut builder = client
             .converse_stream()
             .model_id(bedrock_request.model_id)
@@ -499,10 +530,11 @@ async fn stream_bedrock_turn_inner(
                     request,
                     request_for_model,
                     model_id,
-                    &selection,
+                    selection,
+                    settings.region.as_deref(),
                     turn,
-                    &client,
-                    &discovery,
+                    client,
+                    discovery,
                     name_map.clone(),
                 )
                 .await
@@ -580,6 +612,7 @@ async fn stream_mantle_anthropic_turn(
             .json(&build_mantle_anthropic_request(
                 &provider_request,
                 model_id,
+                settings.region.as_deref(),
             )?)
             .send()
             .await
@@ -1360,12 +1393,21 @@ async fn stream_bedrock_messages_turn(
     request: &ModelTurnRequest,
     client: &Client,
     selection: &ModelSelection,
+    region: Option<&str>,
     turn: &TurnState,
     name_map: BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut last_error = None;
     for model_id in &selection.model_ids {
-        match stream_bedrock_messages_model(request, client, model_id, turn, name_map.clone()).await
+        match stream_bedrock_messages_model(
+            request,
+            client,
+            model_id,
+            region,
+            turn,
+            name_map.clone(),
+        )
+        .await
         {
             Ok(outcome) => return Ok(outcome),
             Err(error) => {
@@ -1410,11 +1452,20 @@ async fn stream_bedrock_messages_model(
     request: &ModelTurnRequest,
     client: &Client,
     model_id: &str,
+    region: Option<&str>,
     turn: &TurnState,
     name_map: BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
-    match send_bedrock_messages_request(request, client, model_id, turn, name_map.clone(), None)
-        .await
+    match send_bedrock_messages_request(
+        request,
+        client,
+        model_id,
+        region,
+        turn,
+        name_map.clone(),
+        None,
+    )
+    .await
     {
         Ok(outcome) => Ok(outcome),
         Err(error)
@@ -1430,6 +1481,7 @@ async fn stream_bedrock_messages_model(
                 &fallback,
                 client,
                 model_id,
+                region,
                 turn,
                 name_map,
                 Some(synthetic),
@@ -1444,11 +1496,12 @@ async fn send_bedrock_messages_request(
     request: &ModelTurnRequest,
     client: &Client,
     model_id: &str,
+    region: Option<&str>,
     turn: &TurnState,
     name_map: BTreeMap<String, String>,
     synthetic: Option<SyntheticStructuredOutput>,
 ) -> Result<StreamOutcome, ProviderError> {
-    let body = build_anthropic_messages_request(request)?;
+    let body = build_anthropic_messages_request(request, model_id, region)?;
     let response = client
         .invoke_model_with_response_stream()
         .model_id(model_id)
@@ -1488,6 +1541,7 @@ async fn handle_bedrock_turn_error(
     request_for_model: &ModelTurnRequest,
     model_id: &str,
     selection: &ModelSelection,
+    region: Option<&str>,
     turn: &TurnState,
     client: &Client,
     discovery: &Arc<Mutex<DiscoveryCache>>,
@@ -1506,7 +1560,8 @@ async fn handle_bedrock_turn_error(
             &error.message,
         );
         return TurnAttempt::Completed(
-            retry_bedrock_without_prompt_cache(client, request, model_id, turn, name_map).await,
+            retry_bedrock_without_prompt_cache(client, request, model_id, region, turn, name_map)
+                .await,
         );
     }
     let is_last = selection.model_ids.last().map(String::as_str) == Some(model_id);
@@ -1531,7 +1586,7 @@ async fn handle_bedrock_turn_error(
             ),
         });
         return TurnAttempt::Completed(
-            stream_bedrock_messages_model(request, client, model_id, turn, name_map).await,
+            stream_bedrock_messages_model(request, client, model_id, region, turn, name_map).await,
         );
     }
     TurnAttempt::Completed(Err(error))
@@ -1541,12 +1596,13 @@ async fn retry_bedrock_without_prompt_cache(
     client: &Client,
     request: &ModelTurnRequest,
     model_id: &str,
+    region: Option<&str>,
     turn: &TurnState,
     name_map: BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut retry_request = request.clone();
     retry_request.prompt_cache = bcode_model::PromptCacheHints::default();
-    let bedrock_request = build_converse_request(&retry_request, model_id.to_string())?;
+    let bedrock_request = build_converse_request(&retry_request, model_id.to_string(), region)?;
     let mut retry_builder = client
         .converse_stream()
         .model_id(bedrock_request.model_id)
@@ -1717,6 +1773,10 @@ fn anthropic_messages_event_error(event: &serde_json::Value) -> ProviderError {
 struct AnthropicMessagesAccumulator {
     tool_calls: BTreeMap<u32, ToolCallAccumulator>,
     reasoning_blocks: BTreeMap<u32, String>,
+    /// Content-block indexes whose reasoning was redacted by the provider.
+    ///
+    /// These carry opaque evidence only and must never produce a readable part.
+    redacted_reasoning_blocks: BTreeSet<u32>,
     saw_tool_call: bool,
     synthetic_output_emitted: bool,
     synthetic_call_indexes: BTreeSet<u32>,
@@ -1737,6 +1797,7 @@ impl AnthropicMessagesAccumulator {
         Self {
             tool_calls: BTreeMap::new(),
             reasoning_blocks: BTreeMap::new(),
+            redacted_reasoning_blocks: BTreeSet::new(),
             saw_tool_call: false,
             synthetic_output_emitted: false,
             synthetic_call_indexes: BTreeSet::new(),
@@ -1808,14 +1869,27 @@ impl AnthropicMessagesAccumulator {
                     },
                 );
             }
-            Some("thinking" | "redacted_thinking") => {
+            Some(block_type @ ("thinking" | "redacted_thinking")) => {
                 self.reasoning_blocks.insert(index, String::new());
+                let activity_id = format!("bedrock-messages-reasoning-{index}");
                 turn.push(ProviderTurnEvent::ReasoningActivity {
                     event: bcode_session_models::ReasoningActivityEvent::Started {
-                        activity_id: format!("bedrock-messages-reasoning-{index}"),
+                        activity_id: activity_id.clone(),
                         order: index,
                     },
                 });
+                if block_type == "redacted_thinking" {
+                    // Redacted thinking never streams a `thinking_delta`, so without opaque
+                    // evidence the activity would finish with no parts and no explanation.
+                    // Only the fact of redaction is recorded; provider bytes never leave here.
+                    self.redacted_reasoning_blocks.insert(index);
+                    turn.push(ProviderTurnEvent::ReasoningActivity {
+                        event: bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
+                            activity_id,
+                            activity_order: index,
+                        },
+                    });
+                }
             }
             _ => {}
         }
@@ -1939,10 +2013,28 @@ impl AnthropicMessagesAccumulator {
                 turn.push(ProviderTurnEvent::ToolCallFinished { call });
             }
         }
-        if self.reasoning_blocks.remove(&index).is_some() {
+        if let Some(text) = self.reasoning_blocks.remove(&index) {
+            let activity_id = format!("bedrock-messages-reasoning-{index}");
+            let redacted = self.redacted_reasoning_blocks.remove(&index);
+            // Completion authoritatively replaces the streamed part so a dropped or rejected
+            // incremental append cannot leave the activity permanently empty. Redacted blocks
+            // have no readable text and must not fabricate an empty part.
+            if !redacted && !text.is_empty() {
+                turn.push(ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                        activity_id: activity_id.clone(),
+                        activity_order: index,
+                        part_id: format!("raw-{index}"),
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        role: bcode_session_models::ReasoningContentRole::Detail,
+                        part_order: index,
+                        text,
+                    },
+                });
+            }
             turn.push(ProviderTurnEvent::ReasoningActivity {
                 event: bcode_session_models::ReasoningActivityEvent::Finished {
-                    activity_id: format!("bedrock-messages-reasoning-{index}"),
+                    activity_id,
                     activity_order: index,
                     status: bcode_session_models::ReasoningActivityStatus::Completed,
                 },
@@ -2367,6 +2459,8 @@ fn bedrock_tool_input_schema(tool: &ToolDefinition) -> Result<&serde_json::Value
 
 fn build_anthropic_messages_request_value(
     request: &ModelTurnRequest,
+    model_id: &str,
+    region: Option<&str>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, ProviderError> {
     let mut body = serde_json::Map::new();
     body.insert(
@@ -2453,20 +2547,31 @@ fn build_anthropic_messages_request_value(
             }),
         );
     }
-    apply_anthropic_thinking_fields(&mut body, &request.parameters);
+    apply_anthropic_thinking_fields(
+        &mut body,
+        &request.parameters,
+        anthropic_thinking_display(region, model_id),
+    );
     Ok(body)
 }
 
-fn build_anthropic_messages_request(request: &ModelTurnRequest) -> Result<Vec<u8>, ProviderError> {
-    serde_json::to_vec(&build_anthropic_messages_request_value(request)?)
-        .map_err(|error| build_error(&error))
+fn build_anthropic_messages_request(
+    request: &ModelTurnRequest,
+    model_id: &str,
+    region: Option<&str>,
+) -> Result<Vec<u8>, ProviderError> {
+    serde_json::to_vec(&build_anthropic_messages_request_value(
+        request, model_id, region,
+    )?)
+    .map_err(|error| build_error(&error))
 }
 
 fn build_mantle_anthropic_request(
     request: &ModelTurnRequest,
     model_id: &str,
+    region: Option<&str>,
 ) -> Result<serde_json::Value, ProviderError> {
-    let mut body = build_anthropic_messages_request_value(request)?;
+    let mut body = build_anthropic_messages_request_value(request, model_id, region)?;
     body.remove("anthropic_version");
     body.insert("model".to_string(), serde_json::json!(model_id));
     body.insert("stream".to_string(), serde_json::Value::Bool(true));
@@ -2607,16 +2712,54 @@ fn anthropic_tool_choice(request: &ModelTurnRequest) -> Result<serde_json::Value
     }
 }
 
+/// Anthropic thinking-content visibility requested for a turn.
+///
+/// Newer Claude generations (Opus 4.8 and the Mythos preview line) default to `omitted`, which
+/// redacts thinking content and returns only opaque continuation state. Bcode always asks for
+/// readable thinking so reasoning presentation has content to show; the signature still travels
+/// back for multi-turn continuity either way.
+const ANTHROPIC_THINKING_DISPLAY_SUMMARIZED: &str = "summarized";
+
+/// Whether the resolved target rejects the Anthropic `thinking.display` field.
+///
+/// `GovCloud` Bedrock has not adopted the `display` field yet and fails the request when it is
+/// present, so the field is omitted there and the provider's own default applies.
+fn govcloud_bedrock_target(region: Option<&str>, model_id: &str) -> bool {
+    if region.is_some_and(|region| {
+        region
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with(GOVCLOUD_REGION_PREFIX)
+    }) {
+        return true;
+    }
+    let model_id = model_id.trim().to_ascii_lowercase();
+    model_id.starts_with(GOVCLOUD_MODEL_ID_PREFIX)
+        || model_id.starts_with(GOVCLOUD_MODEL_ARN_PREFIX)
+}
+
+const GOVCLOUD_REGION_PREFIX: &str = "us-gov-";
+const GOVCLOUD_MODEL_ID_PREFIX: &str = "us-gov.";
+const GOVCLOUD_MODEL_ARN_PREFIX: &str = "arn:aws-us-gov:";
+
+/// Resolve the `thinking.display` value to send, or `None` when the target rejects the field.
+fn anthropic_thinking_display(region: Option<&str>, model_id: &str) -> Option<&'static str> {
+    (!govcloud_bedrock_target(region, model_id)).then_some(ANTHROPIC_THINKING_DISPLAY_SUMMARIZED)
+}
+
 fn apply_anthropic_thinking_fields(
     body: &mut serde_json::Map<String, serde_json::Value>,
     params: &bcode_model::ModelParameters,
+    display: Option<&str>,
 ) {
     match params.reasoning_control {
         Some(bcode_model::ReasoningControl::Adaptive) => {
-            body.insert(
-                "thinking".to_string(),
-                serde_json::json!({"type": "adaptive"}),
-            );
+            let mut thinking = serde_json::Map::new();
+            thinking.insert("type".to_string(), serde_json::json!("adaptive"));
+            if let Some(display) = display {
+                thinking.insert("display".to_string(), serde_json::json!(display));
+            }
+            body.insert("thinking".to_string(), serde_json::Value::Object(thinking));
             if let Some(effort) = adaptive_reasoning_effort(params) {
                 body.insert(
                     "output_config".to_string(),
@@ -2626,10 +2769,13 @@ fn apply_anthropic_thinking_fields(
         }
         Some(bcode_model::ReasoningControl::Budget) | None => {
             if let Some(budget) = resolve_reasoning_budget_tokens(params) {
-                body.insert(
-                    "thinking".to_string(),
-                    serde_json::json!({"type": "enabled", "budget_tokens": budget}),
-                );
+                let mut thinking = serde_json::Map::new();
+                thinking.insert("type".to_string(), serde_json::json!("enabled"));
+                thinking.insert("budget_tokens".to_string(), serde_json::json!(budget));
+                if let Some(display) = display {
+                    thinking.insert("display".to_string(), serde_json::json!(display));
+                }
+                body.insert("thinking".to_string(), serde_json::Value::Object(thinking));
             }
         }
     }
@@ -2750,15 +2896,20 @@ fn bedrock_output_config(
 fn build_converse_request(
     request: &ModelTurnRequest,
     model_id: String,
+    region: Option<&str>,
 ) -> Result<BedrockConverseRequest, ProviderError> {
+    let thinking_display = anthropic_thinking_display(region, &model_id);
     Ok(BedrockConverseRequest {
-        model_id,
         messages: model_messages_to_bedrock_messages(request)?,
         system: system_blocks(request),
         tool_config: model_tools_to_bedrock_tool_config(request)?,
         inference_config: model_parameters_to_inference_config(request),
         output_config: bedrock_output_config(request)?,
-        additional_model_request_fields: bedrock_thinking_fields(&request.parameters),
+        additional_model_request_fields: bedrock_thinking_fields(
+            &request.parameters,
+            thinking_display,
+        ),
+        model_id,
     })
 }
 
@@ -2805,9 +2956,15 @@ fn resolve_reasoning_budget_tokens(params: &bcode_model::ModelParameters) -> Opt
 /// * [`ReasoningControl::Adaptive`] sends `{"thinking": {"type": "adaptive"}}` plus a sibling
 ///   `{"output_config": {"effort": "..."}}` object. Newer Claude models reject the budget shape,
 ///   and `effort` must not be nested inside `thinking`.
-fn bedrock_thinking_fields(params: &bcode_model::ModelParameters) -> Option<Document> {
+///
+/// `display` carries the requested thinking-content visibility and is omitted entirely on targets
+/// that reject the field. See [`anthropic_thinking_display`].
+fn bedrock_thinking_fields(
+    params: &bcode_model::ModelParameters,
+    display: Option<&str>,
+) -> Option<Document> {
     if params.reasoning_control == Some(bcode_model::ReasoningControl::Adaptive) {
-        return Some(bedrock_adaptive_thinking_fields(params));
+        return Some(bedrock_adaptive_thinking_fields(params, display));
     }
     let budget = resolve_reasoning_budget_tokens(params)?;
     let mut thinking = HashMap::new();
@@ -2816,6 +2973,9 @@ fn bedrock_thinking_fields(params: &bcode_model::ModelParameters) -> Option<Docu
         "budget_tokens".to_string(),
         Document::Number(Number::PosInt(u64::from(budget))),
     );
+    if let Some(display) = display {
+        thinking.insert("display".to_string(), Document::String(display.to_string()));
+    }
     let mut fields = HashMap::new();
     fields.insert("thinking".to_string(), Document::Object(thinking));
     Some(Document::Object(fields))
@@ -2826,9 +2986,15 @@ fn bedrock_thinking_fields(params: &bcode_model::ModelParameters) -> Option<Docu
 /// Adaptive thinking is requested whenever the model uses it, even without a named effort, so the
 /// model still allocates its own reasoning depth. A budget is never emitted; if only a budget was
 /// requested it is dropped rather than translated, because the model chooses its own depth.
-fn bedrock_adaptive_thinking_fields(params: &bcode_model::ModelParameters) -> Document {
+fn bedrock_adaptive_thinking_fields(
+    params: &bcode_model::ModelParameters,
+    display: Option<&str>,
+) -> Document {
     let mut thinking = HashMap::new();
     thinking.insert("type".to_string(), Document::String("adaptive".to_string()));
+    if let Some(display) = display {
+        thinking.insert("display".to_string(), Document::String(display.to_string()));
+    }
     let mut fields = HashMap::new();
     fields.insert("thinking".to_string(), Document::Object(thinking));
     if let Some(effort) = adaptive_reasoning_effort(params) {
@@ -5863,7 +6029,7 @@ mod tests {
             serde_json::json!(["iteration", "summary"])
         );
 
-        let built = build_converse_request(&request, "model".to_string())
+        let built = build_converse_request(&request, "model".to_string(), Some(DEFAULT_REGION))
             .expect("Converse request should build");
         assert!(built.output_config.is_some());
     }
@@ -5904,7 +6070,7 @@ mod tests {
         });
         validate_bedrock_request(&request, false)
             .expect("Bedrock Runtime Messages should support structured output");
-        let body = build_anthropic_messages_request_value(&request)
+        let body = build_anthropic_messages_request_value(&request, "model", Some(DEFAULT_REGION))
             .expect("Messages request should build");
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         assert_eq!(
@@ -5926,7 +6092,7 @@ mod tests {
         request.tool_call_policy.parallel = Some(true);
         let (request, _synthetic) = bedrock_messages_structured_fallback_request(&request)
             .expect("tool-free fallback request should build");
-        let body = build_anthropic_messages_request_value(&request)
+        let body = build_anthropic_messages_request_value(&request, "model", Some(DEFAULT_REGION))
             .expect("fallback Messages request should build");
         assert_eq!(request.tools.len(), 1);
         assert!(request.structured_output.is_none());
@@ -6095,8 +6261,12 @@ mod tests {
         request.parameters.reasoning_control = Some(bcode_model::ReasoningControl::Adaptive);
         request.parameters.reasoning_effort_value = Some("high".to_string());
 
-        let value = build_mantle_anthropic_request(&request, "anthropic.claude-opus-5")
-            .expect("Mantle request should serialize");
+        let value = build_mantle_anthropic_request(
+            &request,
+            "anthropic.claude-opus-5",
+            Some(DEFAULT_REGION),
+        )
+        .expect("Mantle request should serialize");
 
         assert_eq!(value["model"], "anthropic.claude-opus-5");
         assert_eq!(value["stream"], true);
@@ -6552,7 +6722,7 @@ mod tests {
             }),
         }];
 
-        let error = build_anthropic_messages_request(&request)
+        let error = build_anthropic_messages_request(&request, "model", Some(DEFAULT_REGION))
             .expect_err("unsupported root combinator must fail locally");
         assert_eq!(error.code, "bedrock_tool_schema_unsupported");
         assert!(error.message.contains("custom.choice"));
@@ -6586,7 +6756,7 @@ mod tests {
         }];
         request.tool_schema_mode = Some(bcode_model::ToolSchemaMode::Strict);
 
-        let body = build_anthropic_messages_request_value(&request)
+        let body = build_anthropic_messages_request_value(&request, "model", Some(DEFAULT_REGION))
             .expect("Messages request should serialize without strict tool metadata");
 
         assert!(
@@ -6620,7 +6790,8 @@ mod tests {
         }];
 
         let value: serde_json::Value = serde_json::from_slice(
-            &build_anthropic_messages_request(&request).expect("request should serialize"),
+            &build_anthropic_messages_request(&request, "model", Some(DEFAULT_REGION))
+                .expect("request should serialize"),
         )
         .expect("request should be JSON");
 
@@ -6659,7 +6830,8 @@ mod tests {
         }];
 
         let value: serde_json::Value = serde_json::from_slice(
-            &build_anthropic_messages_request(&request).expect("request should serialize"),
+            &build_anthropic_messages_request(&request, "model", Some(DEFAULT_REGION))
+                .expect("request should serialize"),
         )
         .expect("request should be JSON");
         assert_eq!(
@@ -6724,7 +6896,8 @@ mod tests {
         }];
 
         let value: serde_json::Value = serde_json::from_slice(
-            &build_anthropic_messages_request(&request).expect("request should serialize"),
+            &build_anthropic_messages_request(&request, "model", Some(DEFAULT_REGION))
+                .expect("request should serialize"),
         )
         .expect("request should be JSON");
 
@@ -6756,7 +6929,8 @@ mod tests {
         }];
 
         let value: serde_json::Value = serde_json::from_slice(
-            &build_anthropic_messages_request(&request).expect("request should serialize"),
+            &build_anthropic_messages_request(&request, "model", Some(DEFAULT_REGION))
+                .expect("request should serialize"),
         )
         .expect("request should be JSON");
 
@@ -6787,7 +6961,8 @@ mod tests {
         }];
 
         let value: serde_json::Value = serde_json::from_slice(
-            &build_anthropic_messages_request(&request).expect("request should serialize"),
+            &build_anthropic_messages_request(&request, "model", Some(DEFAULT_REGION))
+                .expect("request should serialize"),
         )
         .expect("request should be JSON");
 
@@ -7503,6 +7678,157 @@ mod tests {
     }
 
     #[test]
+    fn messages_reasoning_text_completes_authoritative_part() {
+        // Mirrors the Converse contract: streamed deltas are followed by an authoritative
+        // completion so a dropped incremental append cannot leave the activity empty.
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking"},
+                }),
+                &turn,
+            )
+            .expect("thinking start should process");
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "step one "},
+                }),
+                &turn,
+            )
+            .expect("thinking delta should process");
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "step two"},
+                }),
+                &turn,
+            )
+            .expect("thinking delta should process");
+        accumulator
+            .process(
+                &serde_json::json!({"type": "content_block_stop", "index": 0}),
+                &turn,
+            )
+            .expect("thinking stop should process");
+
+        let events = turn.drain();
+        let deltas = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. },
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deltas,
+            vec!["step one ".to_string(), "step two".to_string()]
+        );
+
+        let completed = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::ReasoningActivity {
+                    event:
+                        bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                            part_id,
+                            kind,
+                            text,
+                            ..
+                        },
+                } => Some((part_id.clone(), *kind, text.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed,
+            vec![(
+                "raw-0".to_string(),
+                bcode_session_models::ReasoningContentKind::Raw,
+                "step one step two".to_string()
+            )],
+            "completion must carry the full accumulated text under the streamed part identity"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::Finished {
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    ..
+                }
+            }
+        )));
+    }
+
+    #[test]
+    fn messages_redacted_thinking_reports_opaque_evidence_only() {
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "redacted_thinking", "data": "secret-opaque-payload"},
+                }),
+                &turn,
+            )
+            .expect("redacted thinking start should process");
+        accumulator
+            .process(
+                &serde_json::json!({"type": "content_block_stop", "index": 0}),
+                &turn,
+            )
+            .expect("redacted thinking stop should process");
+
+        let events = turn.drain();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::OpaqueObserved { .. }
+                }
+            )),
+            "redacted thinking must record opaque evidence"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartDelta { .. }
+                        | bcode_session_models::ReasoningActivityEvent::PartCompleted { .. }
+                }
+            )),
+            "redacted thinking has no readable content and must not fabricate a part"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::Finished {
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    ..
+                }
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .all(|event| !format!("{event:?}").contains("secret-opaque-payload")),
+            "opaque provider bytes must never enter neutral reasoning events"
+        );
+    }
+
+    #[test]
     fn tool_use_delta_emits_progress_event_when_call_id_is_known() {
         let turn = TurnState::default();
         let mut accumulator = StreamAccumulator::new(BTreeMap::new());
@@ -7851,13 +8177,16 @@ mod tests {
     #[test]
     fn bedrock_thinking_fields_from_reasoning_effort() {
         let params = bcode_model::ModelParameters::default();
-        assert!(bedrock_thinking_fields(&params).is_none());
+        assert!(
+            bedrock_thinking_fields(&params, Some(ANTHROPIC_THINKING_DISPLAY_SUMMARIZED)).is_none()
+        );
 
         let params = bcode_model::ModelParameters {
             reasoning_effort: Some(bcode_model::ReasoningEffort::High),
             ..Default::default()
         };
-        let fields = bedrock_thinking_fields(&params).expect("thinking fields");
+        let fields = bedrock_thinking_fields(&params, Some(ANTHROPIC_THINKING_DISPLAY_SUMMARIZED))
+            .expect("thinking fields");
         let Document::Object(root) = fields else {
             panic!("thinking fields must be an object");
         };
@@ -7883,7 +8212,9 @@ mod tests {
             reasoning_effort_value: Some("xhigh".to_string()),
             ..Default::default()
         };
-        let Some(Document::Object(root)) = bedrock_thinking_fields(&params) else {
+        let Some(Document::Object(root)) =
+            bedrock_thinking_fields(&params, Some(ANTHROPIC_THINKING_DISPLAY_SUMMARIZED))
+        else {
             panic!("adaptive thinking fields must be an object");
         };
         let Some(Document::Object(thinking)) = root.get("thinking") else {
@@ -7917,7 +8248,9 @@ mod tests {
             reasoning_budget_tokens: Some(8_192),
             ..Default::default()
         };
-        let Some(Document::Object(root)) = bedrock_thinking_fields(&params) else {
+        let Some(Document::Object(root)) =
+            bedrock_thinking_fields(&params, Some(ANTHROPIC_THINKING_DISPLAY_SUMMARIZED))
+        else {
             panic!("adaptive models still request adaptive thinking");
         };
         let Some(Document::Object(thinking)) = root.get("thinking") else {
@@ -7934,13 +8267,177 @@ mod tests {
     }
 
     #[test]
+    fn converse_thinking_fields_request_readable_thinking_display() {
+        // Opus 4.8 and the Mythos preview line default to `omitted`, which redacts thinking
+        // content. Both request shapes must ask for readable thinking explicitly.
+        let adaptive = bcode_model::ModelParameters {
+            reasoning_control: Some(bcode_model::ReasoningControl::Adaptive),
+            reasoning_effort_value: Some("high".to_string()),
+            ..Default::default()
+        };
+        let budget = bcode_model::ModelParameters {
+            reasoning_control: Some(bcode_model::ReasoningControl::Budget),
+            reasoning_effort: Some(bcode_model::ReasoningEffort::High),
+            ..Default::default()
+        };
+        for params in [adaptive, budget] {
+            let Some(Document::Object(root)) = bedrock_thinking_fields(
+                &params,
+                anthropic_thinking_display(Some(DEFAULT_REGION), "anthropic.claude-opus-4-7"),
+            ) else {
+                panic!("thinking fields must be an object");
+            };
+            let Some(Document::Object(thinking)) = root.get("thinking") else {
+                panic!("thinking key must be an object");
+            };
+            assert_eq!(
+                thinking.get("display"),
+                Some(&Document::String(
+                    ANTHROPIC_THINKING_DISPLAY_SUMMARIZED.to_string()
+                )),
+                "readable thinking must be requested explicitly"
+            );
+        }
+    }
+
+    #[test]
+    fn converse_thinking_fields_omit_display_on_govcloud() {
+        // GovCloud Bedrock rejects `thinking.display`; the field must be absent there while the
+        // rest of the request shape is unchanged.
+        let params = bcode_model::ModelParameters {
+            reasoning_control: Some(bcode_model::ReasoningControl::Adaptive),
+            reasoning_effort_value: Some("high".to_string()),
+            ..Default::default()
+        };
+        for (region, model_id) in [
+            (Some("us-gov-west-1"), "anthropic.claude-opus-4-7"),
+            (Some("US-GOV-WEST-1"), "anthropic.claude-opus-4-7"),
+            (Some(DEFAULT_REGION), "us-gov.anthropic.claude-opus-4-7"),
+            (
+                Some(DEFAULT_REGION),
+                "arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/anthropic.claude-opus-4-7",
+            ),
+        ] {
+            let Some(Document::Object(root)) =
+                bedrock_thinking_fields(&params, anthropic_thinking_display(region, model_id))
+            else {
+                panic!("thinking fields must still be sent on GovCloud");
+            };
+            let Some(Document::Object(thinking)) = root.get("thinking") else {
+                panic!("thinking key must be an object");
+            };
+            assert!(
+                !thinking.contains_key("display"),
+                "GovCloud rejects thinking.display ({region:?}, {model_id})"
+            );
+            assert_eq!(
+                thinking.get("type"),
+                Some(&Document::String("adaptive".to_string())),
+                "the adaptive shape must survive the GovCloud carve-out"
+            );
+            let Some(Document::Object(output_config)) = root.get("output_config") else {
+                panic!("adaptive effort must still be sent on GovCloud");
+            };
+            assert_eq!(
+                output_config.get("effort"),
+                Some(&Document::String("high".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn messages_surface_requests_readable_thinking_display() {
+        let mut request = test_model_turn_request();
+        request.parameters.reasoning_control = Some(bcode_model::ReasoningControl::Adaptive);
+        request.parameters.reasoning_effort_value = Some("high".to_string());
+        let body = build_anthropic_messages_request_value(
+            &request,
+            "anthropic.claude-opus-4-7",
+            Some(DEFAULT_REGION),
+        )
+        .expect("request should build");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(
+            body["thinking"]["display"],
+            ANTHROPIC_THINKING_DISPLAY_SUMMARIZED
+        );
+        assert_eq!(body["output_config"]["effort"], "high");
+
+        let mut budget = test_model_turn_request();
+        budget.parameters.reasoning_control = Some(bcode_model::ReasoningControl::Budget);
+        budget.parameters.reasoning_effort = Some(bcode_model::ReasoningEffort::High);
+        let body = build_anthropic_messages_request_value(
+            &budget,
+            "anthropic.claude-opus-4-1",
+            Some(DEFAULT_REGION),
+        )
+        .expect("request should build");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(
+            body["thinking"]["budget_tokens"],
+            serde_json::json!(REASONING_EFFORT_HIGH_BUDGET)
+        );
+        assert_eq!(
+            body["thinking"]["display"],
+            ANTHROPIC_THINKING_DISPLAY_SUMMARIZED
+        );
+    }
+
+    #[test]
+    fn messages_surface_omits_thinking_display_on_govcloud() {
+        let mut request = test_model_turn_request();
+        request.parameters.reasoning_control = Some(bcode_model::ReasoningControl::Adaptive);
+        request.parameters.reasoning_effort_value = Some("high".to_string());
+        let body = build_anthropic_messages_request_value(
+            &request,
+            "anthropic.claude-opus-4-7",
+            Some("us-gov-west-1"),
+        )
+        .expect("request should build");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(
+            body["thinking"].get("display").is_none(),
+            "GovCloud rejects thinking.display"
+        );
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn govcloud_target_detection_matches_region_and_model_identity() {
+        assert!(govcloud_bedrock_target(
+            Some("us-gov-east-1"),
+            "anthropic.claude-opus-5"
+        ));
+        assert!(govcloud_bedrock_target(
+            Some(DEFAULT_REGION),
+            "us-gov.anthropic.claude-opus-5"
+        ));
+        assert!(govcloud_bedrock_target(
+            None,
+            "arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/anthropic.claude-opus-5"
+        ));
+        assert!(!govcloud_bedrock_target(
+            Some(DEFAULT_REGION),
+            "anthropic.claude-opus-5"
+        ));
+        assert!(!govcloud_bedrock_target(None, "anthropic.claude-opus-5"));
+        // A commercial region whose name merely contains the GovCloud token is not GovCloud.
+        assert!(!govcloud_bedrock_target(
+            Some("eu-central-1"),
+            "arn:aws:bedrock:eu-central-1::foundation-model/anthropic.claude-opus-5"
+        ));
+    }
+
+    #[test]
     fn bedrock_budget_control_keeps_enabled_thinking_shape() {
         let params = bcode_model::ModelParameters {
             reasoning_control: Some(bcode_model::ReasoningControl::Budget),
             reasoning_effort_value: Some("high".to_string()),
             ..Default::default()
         };
-        let Some(Document::Object(root)) = bedrock_thinking_fields(&params) else {
+        let Some(Document::Object(root)) =
+            bedrock_thinking_fields(&params, Some(ANTHROPIC_THINKING_DISPLAY_SUMMARIZED))
+        else {
             panic!("budget thinking fields must be an object");
         };
         let Some(Document::Object(thinking)) = root.get("thinking") else {

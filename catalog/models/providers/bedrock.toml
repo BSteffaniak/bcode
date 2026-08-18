@@ -165,6 +165,15 @@ text_output = true
 tool_use = true
 reasoning = true
 
+# Adaptive-thinking models must advertise effort values: the host only sends
+# `output_config.effort` when the requested value is one the model declares, and adaptive Claude
+# allocates its own depth from that effort. `xhigh` is accepted by the Opus 4.7+, Sonnet 5, and
+# Fable 5 generations; the narrower lines below stop at `high`.
+[models."anthropic.claude-opus-4-7".reasoning]
+effort_values = ["low", "medium", "high", "xhigh"]
+default_effort = "high"
+raw_reasoning_supported = true
+
 [models."anthropic.claude-sonnet-5"]
 model_id = "anthropic.claude-sonnet-5"
 display_name = "Claude Sonnet 5"
@@ -183,6 +192,11 @@ image_input = true
 text_output = true
 tool_use = true
 reasoning = true
+
+[models."anthropic.claude-sonnet-5".reasoning]
+effort_values = ["low", "medium", "high", "xhigh"]
+default_effort = "high"
+raw_reasoning_supported = true
 
 [models."anthropic.claude-haiku-5"]
 model_id = "anthropic.claude-haiku-5"
@@ -203,6 +217,11 @@ text_output = true
 tool_use = true
 reasoning = true
 
+[models."anthropic.claude-haiku-5".reasoning]
+effort_values = ["low", "medium", "high"]
+default_effort = "high"
+raw_reasoning_supported = true
+
 [models."anthropic.claude-fable-5"]
 model_id = "anthropic.claude-fable-5"
 display_name = "Claude Fable 5"
@@ -222,6 +241,11 @@ text_output = true
 tool_use = true
 reasoning = true
 
+[models."anthropic.claude-fable-5".reasoning]
+effort_values = ["low", "medium", "high", "xhigh"]
+default_effort = "high"
+raw_reasoning_supported = true
+
 [models."anthropic.claude-mythos-5"]
 model_id = "anthropic.claude-mythos-5"
 display_name = "Claude Mythos 5"
@@ -240,6 +264,11 @@ image_input = true
 text_output = true
 tool_use = true
 reasoning = true
+
+[models."anthropic.claude-mythos-5".reasoning]
+effort_values = ["low", "medium", "high"]
+default_effort = "high"
+raw_reasoning_supported = true
 
 [models."anthropic.claude-sonnet-4"]
 model_id = "anthropic.claude-sonnet-4"

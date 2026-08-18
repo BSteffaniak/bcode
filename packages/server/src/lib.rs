@@ -67551,6 +67551,74 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    #[tokio::test]
+    async fn bedrock_adaptive_messages_models_resolve_a_requested_effort_value() {
+        // Adaptive models only receive `output_config.effort` when the catalog advertises the
+        // requested effort. An empty `effort_values` list silently drops the effort, leaving the
+        // model to choose its own depth.
+        let catalog = bcode_model_catalog::ModelCatalogResolver::embedded();
+        for (model_id, effort) in [
+            ("us.anthropic.claude-opus-4-7-20250101-v1:0", "xhigh"),
+            ("us.anthropic.claude-sonnet-5-20250101-v1:0", "high"),
+            ("us.anthropic.claude-fable-5-20250101-v1:0", "xhigh"),
+            ("us.anthropic.claude-haiku-5-20250101-v1:0", "high"),
+            ("us.anthropic.claude-mythos-5-20250101-v1:0", "medium"),
+        ] {
+            let reasoning = catalog
+                .model_reasoning("bedrock", model_id)
+                .await
+                .unwrap_or_else(|| panic!("{model_id} must advertise reasoning"));
+            let selection = SessionModelSelection {
+                provider_plugin_id: Some("bcode.bedrock".to_string()),
+                requested_model_id: Some(model_id.to_string()),
+                model_id: Some(model_id.to_string()),
+                reasoning_effort: Some(effort.to_owned()),
+                ..SessionModelSelection::default()
+            };
+            let parameters = resolve_model_reasoning_parameters(&selection, Some(&reasoning), None);
+            assert_eq!(
+                parameters.reasoning_control,
+                Some(bcode_model::ReasoningControl::Adaptive),
+                "{model_id} must request adaptive thinking"
+            );
+            assert_eq!(
+                parameters.reasoning_effort_value.as_deref(),
+                Some(effort),
+                "{model_id} must forward the requested effort to the provider"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bedrock_adaptive_models_fall_back_to_catalog_default_effort() {
+        // With no session-selected effort the provider still needs a depth signal, which comes
+        // from the catalog default rather than from provider-local guessing.
+        let catalog = bcode_model_catalog::ModelCatalogResolver::embedded();
+        let model_id = "us.anthropic.claude-opus-4-7-20250101-v1:0";
+        let reasoning = catalog
+            .model_reasoning("bedrock", model_id)
+            .await
+            .expect("Opus 4.7 must advertise reasoning");
+        assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.bedrock".to_string()),
+            requested_model_id: Some(model_id.to_string()),
+            model_id: Some(model_id.to_string()),
+            ..SessionModelSelection::default()
+        };
+        let parameters = resolve_model_reasoning_parameters(&selection, Some(&reasoning), None);
+        assert_eq!(
+            parameters.reasoning_control,
+            Some(bcode_model::ReasoningControl::Adaptive)
+        );
+        // An unsupported or absent request resolves to no explicit effort value; the provider
+        // then falls back to the catalog default when building the request.
+        assert!(
+            parameters.reasoning_effort_value.is_none(),
+            "no session selection means no explicitly requested effort value"
+        );
+    }
+
     #[test]
     fn exact_turn_tool_allowlist_intersects_profile_tools() {
         assert_eq!(

@@ -21,6 +21,14 @@ Supported modes:
 
 Every mode retains neutral activity chrome when reasoning activity evidence exists, including opaque-only, interrupted, and failed activity. Filtering is silent: Bcode does not announce unavailable representations and does not fall back from summary to raw or from raw to summary.
 
+An activity that carries no selected readable content is explained rather than shown empty. Bcode distinguishes three cases so frontends never present a bare heading:
+
+* readable content was hidden by the local display mode or `show = false`;
+* the provider withheld readable reasoning and recorded only opaque continuation evidence;
+* nothing has arrived yet, which carries no claim either way.
+
+The distinction is renderer-neutral: each frontend chooses its own wording and affordances from the shared classification, and no frontend re-derives it from raw parts or provider flags.
+
 ## TUI commands
 
 ```text

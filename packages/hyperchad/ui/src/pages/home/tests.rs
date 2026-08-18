@@ -781,12 +781,18 @@ fn structured_reasoning_activity_renders_terminal_status_chrome() {
                 status,
                 parts: Vec::new(),
                 opaque: true,
+                readable_parts_filtered: false,
             },
         };
         let rendered = format!("{:?}", transcript_item_body(&kind));
         assert!(rendered.contains(expected));
         assert!(!rendered.contains("Empty message"));
         assert!(!rendered.contains(sentinel));
+        // An opaque-only activity must explain itself rather than render bare chrome.
+        assert!(
+            rendered.contains("did not return readable reasoning content"),
+            "withheld reasoning must be explained: {rendered}"
+        );
     }
 }
 

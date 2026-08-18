@@ -837,7 +837,7 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
         ),
         TranscriptViewItemKind::ReasoningActivity { activity } => TranscriptItem::with_identity(
             reasoning_activity_title(activity.status),
-            activity.text(),
+            reasoning_activity_body(activity),
             item.streaming,
             bcode_session_view_models::TextFormat::Markdown,
             TranscriptItemKind::ReasoningMessage,
@@ -913,6 +913,27 @@ const fn reasoning_activity_title(
         bcode_session_models::ReasoningActivityStatus::Completed => "Reasoning",
         bcode_session_models::ReasoningActivityStatus::Interrupted => "Reasoning interrupted",
         bcode_session_models::ReasoningActivityStatus::Failed => "Reasoning failed",
+    }
+}
+
+/// Render the terminal body for one reasoning activity.
+///
+/// An activity with no selected readable text still needs an explanation: a bare heading is
+/// indistinguishable from a bug. The shared availability classification decides which explanation
+/// applies, so the terminal never reinterprets raw parts or opaque flags itself.
+fn reasoning_activity_body(activity: &bcode_session_view_models::ReasoningActivityView) -> String {
+    use bcode_session_view_models::ReasoningContentAvailability;
+
+    match activity.content_availability() {
+        ReasoningContentAvailability::Readable => activity.text(),
+        ReasoningContentAvailability::Filtered => {
+            "_Reasoning content hidden by the current `/thinking` display setting._".to_owned()
+        }
+        ReasoningContentAvailability::Withheld => {
+            "_The model reasoned about this step but did not return readable reasoning content._"
+                .to_owned()
+        }
+        ReasoningContentAvailability::Pending => String::new(),
     }
 }
 
@@ -1586,15 +1607,70 @@ mod tests {
                         status,
                         parts: Vec::new(),
                         opaque: true,
+                        readable_parts_filtered: false,
                     },
                 },
             };
 
             let terminal = terminal_item_from_shared(&item);
             assert_eq!(terminal.role(), expected);
-            assert!(terminal.text().is_empty());
+            // An opaque-only activity must explain itself rather than render an empty body.
+            assert!(
+                terminal
+                    .text()
+                    .contains("did not return readable reasoning"),
+                "opaque-only reasoning must be explained, got {:?}",
+                terminal.text()
+            );
             assert!(!format!("{terminal:?}").contains(sentinel));
         }
+    }
+
+    #[test]
+    fn reasoning_activity_body_explains_every_availability_state() {
+        let readable_part = |text: &str| bcode_session_models::ReasoningPart {
+            part_id: "raw-0".to_owned(),
+            kind: bcode_session_models::ReasoningContentKind::Raw,
+            role: bcode_session_models::ReasoningContentRole::Detail,
+            order: 0,
+            text: text.to_owned(),
+        };
+        let activity = |parts: Vec<bcode_session_models::ReasoningPart>,
+                        opaque: bool,
+                        readable_parts_filtered: bool| {
+            bcode_session_view_models::ReasoningActivityView {
+                turn_id: "turn-1".to_owned(),
+                activity_id: "reasoning-1".to_owned(),
+                order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+                parts,
+                opaque,
+                readable_parts_filtered,
+            }
+        };
+
+        assert_eq!(
+            reasoning_activity_body(&activity(
+                vec![readable_part("visible thought")],
+                false,
+                false
+            )),
+            "visible thought"
+        );
+        assert!(
+            reasoning_activity_body(&activity(Vec::new(), true, false))
+                .contains("did not return readable reasoning"),
+            "withheld reasoning must be explained"
+        );
+        assert!(
+            reasoning_activity_body(&activity(Vec::new(), true, true)).contains("`/thinking`"),
+            "locally filtered reasoning must point at the display setting"
+        );
+        // Nothing has arrived yet: no chrome to explain, and no misleading claim.
+        assert!(
+            reasoning_activity_body(&activity(Vec::new(), false, false)).is_empty(),
+            "pending reasoning must not claim the provider withheld anything"
+        );
     }
 
     #[test]

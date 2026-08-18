@@ -2637,16 +2637,39 @@ status = "stable"
     }
 
     #[test]
-    fn bedrock_adaptive_models_without_reasoning_table_keep_adaptive_control() {
+    fn adaptive_thinking_mode_survives_without_a_reasoning_table() {
+        // A `thinking_mode = "adaptive"` entry that omits the optional `[reasoning]` table must
+        // still advertise adaptive control, otherwise the provider falls back to
+        // `thinking.type = "enabled"` with a budget, which adaptive models reject with a
+        // ValidationException. Exercised directly so the guarantee holds regardless of which
+        // bundled entries currently declare an effort table.
+        let reasoning = reasoning_from_catalog_parts(
+            None,
+            Some(bcode_model_catalog_models::CatalogThinkingMode::Adaptive),
+        )
+        .expect("an adaptive thinking mode must advertise reasoning on its own");
+        assert_eq!(
+            reasoning.control,
+            Some(bcode_model::ReasoningControl::Adaptive)
+        );
+        assert!(
+            reasoning.effort_values.is_empty(),
+            "no effort table means no advertised effort values"
+        );
+    }
+
+    #[test]
+    fn bedrock_adaptive_models_advertise_adaptive_control_and_effort_values() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
-        // These catalog entries declare `thinking_mode = "adaptive"` but intentionally omit the
-        // optional `[reasoning]` effort table. The thinking mode must still survive enrichment,
-        // otherwise the provider falls back to `thinking.type = "enabled"` with a budget, which
-        // these models reject with a ValidationException.
-        for model_id in [
-            "us.anthropic.claude-sonnet-5-20250101-v1:0",
-            "us.anthropic.claude-haiku-5-20250101-v1:0",
-            "us.anthropic.claude-opus-4-7-20250101-v1:0",
+        // Adaptive Claude generations must advertise both adaptive control and effort values.
+        // Without effort values the host cannot resolve a supported effort, so no
+        // `output_config.effort` is sent and the model chooses an unrequested depth.
+        for (model_id, expected_xhigh) in [
+            ("us.anthropic.claude-opus-4-7-20250101-v1:0", true),
+            ("us.anthropic.claude-sonnet-5-20250101-v1:0", true),
+            ("us.anthropic.claude-fable-5-20250101-v1:0", true),
+            ("us.anthropic.claude-haiku-5-20250101-v1:0", false),
+            ("us.anthropic.claude-mythos-5-20250101-v1:0", false),
         ] {
             let discovered = bcode_model::ModelInfo {
                 model_id: model_id.to_string(),
@@ -2674,6 +2697,24 @@ status = "stable"
                 reasoning.control,
                 Some(bcode_model::ReasoningControl::Adaptive),
                 "{model_id} must request adaptive thinking"
+            );
+            assert!(
+                !reasoning.effort_values.is_empty(),
+                "{model_id} must advertise effort values so an effort can be requested"
+            );
+            assert_eq!(
+                reasoning.default_effort.as_deref(),
+                Some("high"),
+                "{model_id} must declare a default effort"
+            );
+            assert!(
+                reasoning.raw_reasoning_supported,
+                "{model_id} exposes readable reasoning content"
+            );
+            assert_eq!(
+                reasoning.effort_values.iter().any(|value| value == "xhigh"),
+                expected_xhigh,
+                "{model_id} must only advertise xhigh when the generation accepts it"
             );
         }
     }

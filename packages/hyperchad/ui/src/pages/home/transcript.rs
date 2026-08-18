@@ -261,6 +261,8 @@ fn transcript_item_body_with_context(
                 @let text = activity.text();
                 @if !text.is_empty() {
                     div margin-top=((space::SM)) { (message_content(&ChatMessageView::markdown(text))) }
+                } @else if let Some(note) = reasoning_activity_note(activity) {
+                    div margin-top=((space::SM)) color=(color::MUTED) { (note) }
                 }
             }
         },
@@ -311,6 +313,26 @@ const fn reasoning_activity_label(
         bcode_session_models::ReasoningActivityStatus::Completed => "Reasoning",
         bcode_session_models::ReasoningActivityStatus::Interrupted => "Reasoning interrupted",
         bcode_session_models::ReasoningActivityStatus::Failed => "Reasoning failed",
+    }
+}
+
+/// Explain a reasoning activity that carries no selected readable content.
+///
+/// Returns `None` while an activity is still pending, so the web renderer does not assert anything
+/// about content that may still arrive.
+fn reasoning_activity_note(
+    activity: &bcode_session_view_models::ReasoningActivityView,
+) -> Option<&'static str> {
+    use bcode_session_view_models::ReasoningContentAvailability;
+
+    match activity.content_availability() {
+        ReasoningContentAvailability::Readable | ReasoningContentAvailability::Pending => None,
+        ReasoningContentAvailability::Filtered => {
+            Some("Reasoning content hidden by the current display setting.")
+        }
+        ReasoningContentAvailability::Withheld => Some(
+            "The model reasoned about this step but did not return readable reasoning content.",
+        ),
     }
 }
 

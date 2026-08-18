@@ -486,6 +486,7 @@ fn structured_reasoning_activity_round_trips_through_renderer_wire_model() {
                     text: "milestone".to_owned(),
                 }],
                 opaque: true,
+                readable_parts_filtered: false,
             },
         },
     };
@@ -497,6 +498,77 @@ fn structured_reasoning_activity_round_trips_through_renderer_wire_model() {
     assert!(!encoded.contains("encrypted_content"));
     assert!(!encoded.contains("provider_state"));
     assert!(!encoded.contains(sentinel));
+}
+
+#[test]
+fn reasoning_content_availability_distinguishes_withheld_from_filtered() {
+    let readable_part = |text: &str| bcode_session_models::ReasoningPart {
+        part_id: "raw-0".to_owned(),
+        kind: bcode_session_models::ReasoningContentKind::Raw,
+        role: bcode_session_models::ReasoningContentRole::Detail,
+        order: 0,
+        text: text.to_owned(),
+    };
+    let activity = |parts: Vec<bcode_session_models::ReasoningPart>,
+                    opaque: bool,
+                    readable_parts_filtered: bool| ReasoningActivityView {
+        turn_id: "turn-1".to_owned(),
+        activity_id: "reasoning-1".to_owned(),
+        order: 0,
+        status: bcode_session_models::ReasoningActivityStatus::Completed,
+        parts,
+        opaque,
+        readable_parts_filtered,
+    };
+
+    assert_eq!(
+        activity(vec![readable_part("thought")], false, false).content_availability(),
+        ReasoningContentAvailability::Readable
+    );
+    // The provider recorded opaque evidence and no readable content: genuinely withheld.
+    assert_eq!(
+        activity(Vec::new(), true, false).content_availability(),
+        ReasoningContentAvailability::Withheld
+    );
+    // Local policy removed readable parts, so the absence is the user's own choice even when
+    // opaque evidence also exists.
+    assert_eq!(
+        activity(Vec::new(), false, true).content_availability(),
+        ReasoningContentAvailability::Filtered
+    );
+    assert_eq!(
+        activity(Vec::new(), true, true).content_availability(),
+        ReasoningContentAvailability::Filtered
+    );
+    // No evidence either way yet.
+    assert_eq!(
+        activity(Vec::new(), false, false).content_availability(),
+        ReasoningContentAvailability::Pending
+    );
+    // A part that exists but carries no text is not readable content.
+    assert_eq!(
+        activity(vec![readable_part("")], true, false).content_availability(),
+        ReasoningContentAvailability::Withheld
+    );
+}
+
+#[test]
+fn reasoning_content_availability_has_stable_wire_values() {
+    for (availability, wire) in [
+        (ReasoningContentAvailability::Readable, r#""readable""#),
+        (ReasoningContentAvailability::Filtered, r#""filtered""#),
+        (ReasoningContentAvailability::Withheld, r#""withheld""#),
+        (ReasoningContentAvailability::Pending, r#""pending""#),
+    ] {
+        let encoded =
+            serde_json::to_string(&availability).expect("serialize reasoning availability");
+        assert_eq!(encoded, wire);
+        assert_eq!(
+            serde_json::from_str::<ReasoningContentAvailability>(&encoded)
+                .expect("deserialize reasoning availability"),
+            availability
+        );
+    }
 }
 
 #[test]

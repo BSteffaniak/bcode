@@ -1092,6 +1092,31 @@ pub struct ReasoningActivityView {
     pub parts: Vec<bcode_session_models::ReasoningPart>,
     /// Whether opaque activity evidence exists.
     pub opaque: bool,
+    /// Whether readable parts exist for this activity but were excluded by local presentation
+    /// policy.
+    ///
+    /// This distinguishes "the user chose not to display reasoning" from "the provider withheld
+    /// readable reasoning", which renderers must not conflate.
+    #[serde(default)]
+    pub readable_parts_filtered: bool,
+}
+
+/// Why a reasoning activity currently has no selected readable content.
+///
+/// Renderers use this to explain an activity that carries no readable text instead of presenting
+/// an empty reasoning item. It is renderer-neutral: each frontend chooses its own wording and
+/// affordances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningContentAvailability {
+    /// Selected readable reasoning content is available.
+    Readable,
+    /// Readable reasoning exists but local presentation policy excluded it.
+    Filtered,
+    /// The provider withheld readable reasoning and recorded opaque evidence only.
+    Withheld,
+    /// Neither readable content nor opaque evidence has arrived yet.
+    Pending,
 }
 
 impl ReasoningActivityView {
@@ -1104,6 +1129,27 @@ impl ReasoningActivityView {
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+
+    /// Classify why this activity has, or lacks, selected readable content.
+    ///
+    /// Ordering is deliberate: a locally filtered activity reports [`Filtered`] even when opaque
+    /// evidence also exists, because the absence of text is the user's own presentation choice
+    /// rather than a provider decision.
+    ///
+    /// [`Filtered`]: ReasoningContentAvailability::Filtered
+    #[must_use]
+    pub fn content_availability(&self) -> ReasoningContentAvailability {
+        if !self.text().is_empty() {
+            return ReasoningContentAvailability::Readable;
+        }
+        if self.readable_parts_filtered {
+            return ReasoningContentAvailability::Filtered;
+        }
+        if self.opaque {
+            return ReasoningContentAvailability::Withheld;
+        }
+        ReasoningContentAvailability::Pending
     }
 }
 

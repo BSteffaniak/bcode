@@ -4407,11 +4407,14 @@ fn live_reasoning_activity_view(
 ) -> bcode_session_view_models::ReasoningActivityView {
     let mut parts = activity.parts.values().cloned().collect::<Vec<_>>();
     parts.sort_by_key(|part| (part.order, part.kind, part.part_id.clone()));
+    let had_readable_parts = parts.iter().any(|part| !part.text.is_empty());
     if visible {
         parts.retain(|part| reasoning_part_selected(part.kind, mode));
     } else {
         parts.clear();
     }
+    let readable_parts_filtered =
+        had_readable_parts && !parts.iter().any(|part| !part.text.is_empty());
     bcode_session_view_models::ReasoningActivityView {
         turn_id: turn_id.to_owned(),
         activity_id: activity_id.to_owned(),
@@ -4423,6 +4426,7 @@ fn live_reasoning_activity_view(
         },
         parts,
         opaque: activity.opaque,
+        readable_parts_filtered,
     }
 }
 
@@ -4451,11 +4455,14 @@ fn reasoning_activity_view(
 ) -> bcode_session_view_models::ReasoningActivityView {
     let mut parts = activity.parts.clone();
     parts.sort_by_key(|part| (part.order, part.kind, part.part_id.clone()));
+    let had_readable_parts = parts.iter().any(|part| !part.text.is_empty());
     if visible {
         parts.retain(|part| reasoning_part_selected(part.kind, mode));
     } else {
         parts.clear();
     }
+    let readable_parts_filtered =
+        had_readable_parts && !parts.iter().any(|part| !part.text.is_empty());
     bcode_session_view_models::ReasoningActivityView {
         turn_id: turn_id.to_owned(),
         activity_id: activity.activity_id.clone(),
@@ -4463,6 +4470,7 @@ fn reasoning_activity_view(
         status: activity.status,
         parts,
         opaque: activity.opaque,
+        readable_parts_filtered,
     }
 }
 
@@ -8418,6 +8426,172 @@ mod tests {
             assert_eq!(snapshot.transcript.items.len(), 1);
             assert_reasoning_text(&snapshot.transcript.items[0], "", false);
         }
+    }
+
+    #[test]
+    fn replayed_opaque_activity_reports_withheld_rather_than_filtered() {
+        // An activity carrying only opaque evidence must be distinguishable from one the local
+        // display policy emptied, so renderers can explain why no text is present.
+        let session_id = SessionId::new();
+        let snapshot = build_session_view_snapshot(&[event(
+            session_id,
+            1,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-opaque".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: Vec::new(),
+                    opaque: true,
+                },
+            },
+        )]);
+
+        let TranscriptViewItemKind::ReasoningActivity { activity } =
+            &snapshot.transcript.items[0].kind
+        else {
+            panic!("expected a reasoning activity item");
+        };
+        assert!(!activity.readable_parts_filtered);
+        assert_eq!(
+            activity.content_availability(),
+            bcode_session_view_models::ReasoningContentAvailability::Withheld
+        );
+    }
+
+    #[test]
+    fn display_mode_filtering_reports_filtered_rather_than_withheld() {
+        // Raw-only content hidden by `summary` mode is a local presentation choice, not a
+        // provider decision, even when opaque evidence also exists.
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.set_reasoning_display_mode(bcode_session_view_models::ReasoningDisplayMode::Summary);
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-raw".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![bcode_session_models::ReasoningPart {
+                        part_id: "raw-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        role: bcode_session_models::ReasoningContentRole::Detail,
+                        order: 0,
+                        text: "raw detail".to_owned(),
+                    }],
+                    opaque: true,
+                },
+            },
+        ));
+
+        let TranscriptViewItemKind::ReasoningActivity { activity } =
+            &view.snapshot().transcript.items[0].kind
+        else {
+            panic!("expected a reasoning activity item");
+        };
+        assert!(activity.readable_parts_filtered);
+        assert_eq!(
+            activity.content_availability(),
+            bcode_session_view_models::ReasoningContentAvailability::Filtered
+        );
+    }
+
+    #[test]
+    fn hidden_reasoning_reports_filtered_and_readable_content_reports_readable() {
+        let session_id = SessionId::new();
+        let reasoning_event = event(
+            session_id,
+            1,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![bcode_session_models::ReasoningPart {
+                        part_id: "raw-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        role: bcode_session_models::ReasoningContentRole::Detail,
+                        order: 0,
+                        text: "raw detail".to_owned(),
+                    }],
+                    opaque: false,
+                },
+            },
+        );
+
+        let mut visible = SessionView::new();
+        visible.apply_event(&reasoning_event);
+        let TranscriptViewItemKind::ReasoningActivity { activity } =
+            &visible.snapshot().transcript.items[0].kind
+        else {
+            panic!("expected a reasoning activity item");
+        };
+        assert!(!activity.readable_parts_filtered);
+        assert_eq!(
+            activity.content_availability(),
+            bcode_session_view_models::ReasoningContentAvailability::Readable
+        );
+
+        let mut hidden = SessionView::new();
+        hidden.set_reasoning_visible(false);
+        hidden.apply_event(&reasoning_event);
+        let TranscriptViewItemKind::ReasoningActivity { activity } =
+            &hidden.snapshot().transcript.items[0].kind
+        else {
+            panic!("expected a reasoning activity item");
+        };
+        assert!(activity.readable_parts_filtered);
+        assert_eq!(
+            activity.content_availability(),
+            bcode_session_view_models::ReasoningContentAvailability::Filtered
+        );
+    }
+
+    #[test]
+    fn live_opaque_only_activity_reports_withheld() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        for reasoning_event in [
+            bcode_session_models::ReasoningActivityEvent::Started {
+                activity_id: "reasoning-live".to_owned(),
+                order: 0,
+            },
+            bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
+                activity_id: "reasoning-live".to_owned(),
+                activity_order: 0,
+            },
+            bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id: "reasoning-live".to_owned(),
+                activity_order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        ] {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantReasoningActivity {
+                    output_position: None,
+                    turn_id: "turn-1".to_owned(),
+                    event: reasoning_event,
+                },
+            });
+        }
+
+        let TranscriptViewItemKind::ReasoningActivity { activity } =
+            &view.snapshot().transcript.items[0].kind
+        else {
+            panic!("expected a reasoning activity item");
+        };
+        assert!(activity.opaque);
+        assert!(!activity.readable_parts_filtered);
+        assert_eq!(
+            activity.content_availability(),
+            bcode_session_view_models::ReasoningContentAvailability::Withheld
+        );
     }
 
     #[test]
