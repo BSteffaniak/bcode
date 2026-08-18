@@ -2752,7 +2752,7 @@ pub fn apply_effect_result(
         TuiEffectResult::SkillPickerLoaded { result } => match result {
             Ok(skills) if skills.skills.is_empty() => {
                 chat.app.set_status("no skills available".to_owned());
-                chat.push_presentation_note(
+                chat.append_durable_presentation_note(
                     "bcode.host",
                     "No skills are available.".to_owned(),
                     bcode_command::CommandTextFormat::PlainText,
@@ -2767,7 +2767,7 @@ pub fn apply_effect_result(
         },
         TuiEffectResult::SkillDescribed { skill_id, result } => match result {
             Ok(manifest) => {
-                chat.push_presentation_note(
+                chat.append_durable_presentation_note(
                     "bcode.host",
                     super::skill_flow::format_skill_manifest_markdown(&manifest),
                     bcode_command::CommandTextFormat::Markdown,
@@ -2822,7 +2822,7 @@ pub fn apply_effect_result(
                             chat.app.set_status(message);
                         }
                         bcode_command::CommandEffect::AppendText { text, format } => {
-                            chat.push_presentation_note(plugin_id.clone(), text, format);
+                            chat.append_durable_presentation_note(plugin_id.clone(), text, format);
                         }
                         bcode_command::CommandEffect::ToggleSurface { surface_id } => chat
                             .app
@@ -3263,12 +3263,12 @@ fn apply_root_slash_command_outcome(
     use super::slash_commands::SlashCommandOutcome;
     match outcome {
         SlashCommandOutcome::Handled(status) => chat.app.set_status(status),
-        SlashCommandOutcome::SystemMarkdown(text) => chat.push_presentation_note(
+        SlashCommandOutcome::SystemMarkdown(text) => chat.append_durable_presentation_note(
             "bcode.host",
             text,
             bcode_command::CommandTextFormat::Markdown,
         ),
-        SlashCommandOutcome::SystemPlain(text) => chat.push_presentation_note(
+        SlashCommandOutcome::SystemPlain(text) => chat.append_durable_presentation_note(
             "bcode.host",
             text,
             bcode_command::CommandTextFormat::PlainText,
@@ -3489,7 +3489,7 @@ fn apply_root_slash_command_outcome(
             let markdown = super::slash_commands::format_theme_catalog_markdown(
                 &super::theme::catalog_view(&mut chat.app),
             );
-            chat.push_presentation_note(
+            chat.append_durable_presentation_note(
                 "bcode.host",
                 markdown,
                 bcode_command::CommandTextFormat::Markdown,

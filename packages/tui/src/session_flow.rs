@@ -35,8 +35,11 @@ impl ActiveChat {
         self.pending_effects.queued_effect_count()
     }
 
-    /// Queue a renderer-neutral presentation note, persisting it when a session is active.
-    pub fn push_presentation_note(
+    /// Append a renderer-neutral durable presentation note when a session is active.
+    ///
+    /// Without an active canonical session, this falls back to an explicitly ephemeral
+    /// notice owned by the current TUI presentation context.
+    pub fn append_durable_presentation_note(
         &mut self,
         source_id: impl Into<String>,
         text: String,
@@ -59,14 +62,24 @@ impl ActiveChat {
             return;
         }
         match format {
-            bcode_command::CommandTextFormat::PlainText => self.app.push_system_plain(text),
-            bcode_command::CommandTextFormat::Markdown => self.app.push_system_markdown(text),
-            bcode_command::CommandTextFormat::Json => self.app.push_system_json(text),
+            bcode_command::CommandTextFormat::PlainText => {
+                self.app.push_ephemeral_system_plain(text);
+            }
+            bcode_command::CommandTextFormat::Markdown => {
+                self.app.push_ephemeral_system_markdown(text);
+            }
+            bcode_command::CommandTextFormat::Json => {
+                self.app.push_ephemeral_system_json(text);
+            }
         }
     }
 
     pub fn push_presentation_markdown(&mut self, source_id: impl Into<String>, text: String) {
-        self.push_presentation_note(source_id, text, bcode_command::CommandTextFormat::Markdown);
+        self.append_durable_presentation_note(
+            source_id,
+            text,
+            bcode_command::CommandTextFormat::Markdown,
+        );
     }
 
     /// Queue a background effect to start when the chat loop effect runner is available.
@@ -258,6 +271,8 @@ pub fn complete_switch_session(
             );
             chat.app.take_cross_session_state_from(&previous_app);
             chat.app
+                .take_same_session_transcript_state_from(&previous_app);
+            chat.app
                 .take_same_session_reasoning_state_from(&previous_app);
             chat.agents.refresh_app_agent_metadata(&mut chat.app);
             if !draft_text.is_empty() {
@@ -286,7 +301,7 @@ pub fn complete_switch_session(
         Err(error) => {
             chat.app.set_status(format!("session open failed: {error}"));
             chat.app
-                .push_system_plain(format!("session open failed: {error}"));
+                .push_ephemeral_system_plain(format!("session open failed: {error}"));
         }
     }
 }

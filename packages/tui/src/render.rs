@@ -835,22 +835,22 @@ fn markdown_details_expand_and_collapse() {
 #[test]
 fn local_plain_markdown_and_json_system_notes_keep_distinct_formats() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    app.push_system_plain("* literal".to_owned());
-    app.push_system_markdown("* rendered".to_owned());
-    app.push_system_json(r#"{"value":1}"#.to_owned());
+    app.push_ephemeral_system_plain("* literal".to_owned());
+    app.push_ephemeral_system_markdown("* rendered".to_owned());
+    app.push_ephemeral_system_json(r#"{"value":1}"#.to_owned());
 
-    assert_eq!(app.local_notices().len(), 3);
+    assert_eq!(app.transcript().len(), 3);
     assert!(app.session_view_snapshot().transcript.items.is_empty());
     assert_eq!(
-        app.local_notices()[0].text_format(),
+        app.transcript()[0].text_format(),
         bcode_session_view_models::TextFormat::PlainText
     );
     assert_eq!(
-        app.local_notices()[1].text_format(),
+        app.transcript()[1].text_format(),
         bcode_session_view_models::TextFormat::Markdown
     );
     assert_eq!(
-        app.local_notices()[2].text_format(),
+        app.transcript()[2].text_format(),
         bcode_session_view_models::TextFormat::Json
     );
 }
@@ -893,7 +893,7 @@ fn streamed_text_integrity_is_visible_without_rewriting_source_bytes() {
 #[test]
 fn transcript_layout_and_semantics_share_one_markdown_projection() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    app.push_system_markdown("# Heading\n\n[guide](https://example.com)".to_owned());
+    app.push_ephemeral_system_markdown("# Heading\n\n[guide](https://example.com)".to_owned());
     let area = Rect::new(0, 0, 80, 24);
 
     prepare_frame(&mut app, area).expect("prepared frame");
@@ -909,7 +909,7 @@ fn transcript_layout_and_semantics_share_one_markdown_projection() {
 #[test]
 fn pure_scroll_reuses_markdown_projection_without_rendering() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    app.push_system_markdown(
+    app.push_ephemeral_system_markdown(
         (0..80)
             .map(|index| format!("## Heading {index}\n\nParagraph {index}."))
             .collect::<Vec<_>>()

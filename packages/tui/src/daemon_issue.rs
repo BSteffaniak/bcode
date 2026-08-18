@@ -282,12 +282,12 @@ pub fn report_tui_issue(app: &mut BmuxApp, label: &str, error: &TuiError) {
             || format!("{}\n\n{diagnostic}", message.status),
             |detail| format!("{}\n\n{detail}\n\n{diagnostic}", message.status),
         );
-        app.push_system_plain(note);
+        app.push_ephemeral_system_plain(note);
         return;
     }
     let diagnostic = error_diagnostic(error);
     app.set_status(format!("{label}: {}", diagnostic.replace('\n', "; ")));
-    app.push_system_plain(format!("{label}\n\n{diagnostic}"));
+    app.push_ephemeral_system_plain(format!("{label}\n\n{diagnostic}"));
 }
 
 fn report_issue(
@@ -307,7 +307,7 @@ fn report_issue(
         || format!("{}\n\n{diagnostic}", message.status),
         |detail| format!("{}\n\n{detail}\n\n{diagnostic}", message.status),
     );
-    app.push_system_plain(note);
+    app.push_ephemeral_system_plain(note);
 }
 
 #[cfg(test)]
@@ -317,7 +317,29 @@ mod tests {
 
     use bcode_ipc::CodecError;
 
-    use super::{TuiDaemonIssue, classify_client_error, client_issue_status, error_diagnostic};
+    use super::{
+        TuiDaemonIssue, classify_client_error, client_issue_status, error_diagnostic,
+        report_client_issue,
+    };
+    use crate::app::BmuxApp;
+
+    #[test]
+    fn timeout_report_is_ephemeral_and_absent_from_canonical_session_view() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let error = bcode_client::ClientError::ConnectTimeout {
+            timeout: Duration::from_secs(5),
+        };
+
+        report_client_issue(&mut app, "send failed", &error);
+
+        assert_eq!(app.transcript().len(), 1);
+        assert!(
+            app.transcript()[0]
+                .text()
+                .contains("daemon did not respond")
+        );
+        assert!(app.session_view_snapshot().transcript.items.is_empty());
+    }
 
     #[test]
     fn connection_timeout_is_recoverable_timeout_not_unavailability() {

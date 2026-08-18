@@ -2,10 +2,13 @@
 
 use bmux_tui::geometry::Rect;
 
-use super::app::{BmuxApp, TranscriptItems};
+use super::app::BmuxApp;
 use super::pending_submission::PendingSubmission;
 use super::render;
 use super::transcript::TranscriptItem;
+#[cfg(test)]
+use super::transcript_document::TranscriptDocument;
+use super::transcript_document::TranscriptItems;
 use super::transcript_layout::{
     TranscriptLayoutFingerprint, TranscriptLayoutRows, TranscriptLayoutSignature,
     TranscriptLayoutSpec,
@@ -248,11 +251,12 @@ pub fn test_layout_signature(
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) -> TranscriptLayoutSignature {
-    let transcript = [item.clone()];
+    let mut transcript = TranscriptDocument::default();
+    transcript.push_ephemeral("test".to_owned(), item.clone());
     let pending = [];
     let input = TranscriptLayoutInput {
         width,
-        transcript: TranscriptItems::from_canonical(&transcript),
+        transcript: transcript.items(),
         plugin_host,
         diff_viewer_config: TuiDiffViewerConfig::default(),
         pending: &pending,
@@ -276,11 +280,12 @@ pub fn test_layout_signature_with_interaction_height(
     interaction_id: &str,
     height: u16,
 ) -> TranscriptLayoutSignature {
-    let transcript = [item.clone()];
+    let mut transcript = TranscriptDocument::default();
+    transcript.push_ephemeral("test".to_owned(), item.clone());
     let pending = [];
     let input = TranscriptLayoutInput {
         width,
-        transcript: TranscriptItems::from_canonical(&transcript),
+        transcript: transcript.items(),
         plugin_host: None,
         diff_viewer_config: TuiDiffViewerConfig::default(),
         pending: &pending,
@@ -303,11 +308,12 @@ pub fn test_layout_signature_with_theme(
     width: u16,
     theme_fingerprint: u64,
 ) -> TranscriptLayoutSignature {
-    let transcript = [item.clone()];
+    let mut transcript = TranscriptDocument::default();
+    transcript.push_ephemeral("test".to_owned(), item.clone());
     let pending = [];
     let input = TranscriptLayoutInput {
         width,
-        transcript: TranscriptItems::from_canonical(&transcript),
+        transcript: transcript.items(),
         plugin_host: None,
         diff_viewer_config: TuiDiffViewerConfig::default(),
         pending: &pending,

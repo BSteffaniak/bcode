@@ -1382,7 +1382,7 @@ impl BcodeRuntimeModel {
                     self.loop_state.open_streaming_configurator(&mut self.chat);
                 }
                 "help" => {
-                    self.chat.push_presentation_note(
+                    self.chat.append_durable_presentation_note(
                         "bcode.host",
                         "# TUI help\n\n* Use the command palette for sessions, cancellation, and context compaction."
                             .to_owned(),

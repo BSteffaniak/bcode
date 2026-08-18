@@ -38,8 +38,11 @@ use super::theme::discovery::DiscoveredThemes;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{TranscriptItem, terminal_item_from_shared};
+#[cfg(test)]
+use super::transcript_document::TranscriptPresentationOrigin;
 use super::transcript_document::{
-    SessionViewTerminalAdapter, TranscriptDocument, TranscriptDocumentDamage,
+    SessionViewTerminalAdapter, TranscriptDocument, TranscriptDocumentDamage, TranscriptItems,
+    TranscriptPresentationEntryId,
 };
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
 use super::transcript_resident_window::{TranscriptResidentWindow, TranscriptWindowPolicy};
@@ -290,7 +293,7 @@ pub struct TranscriptFrameObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StableTranscriptAnchor {
-    pub item_id: bcode_session_view_models::TranscriptViewItemId,
+    pub item_id: TranscriptPresentationEntryId,
     pub row_in_item: usize,
 }
 
@@ -298,182 +301,6 @@ pub struct StableTranscriptAnchor {
 struct PendingReasoningEffort {
     value: String,
     generation: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LocalNoticeAnchor {
-    after_item: Option<bcode_session_view_models::TranscriptViewItemId>,
-    after_sequence: Option<u64>,
-    fallback_index: usize,
-}
-
-/// Zero-copy ordered terminal transcript view over canonical items and TUI-local notices.
-#[derive(Debug, Clone, Copy)]
-pub struct TranscriptItems<'a> {
-    canonical: &'a [TranscriptItem],
-    notices: &'a [TranscriptItem],
-    notice_anchors: &'a [LocalNoticeAnchor],
-}
-
-impl<'a> TranscriptItems<'a> {
-    #[cfg(test)]
-    pub(crate) const fn from_canonical(canonical: &'a [TranscriptItem]) -> Self {
-        Self {
-            canonical,
-            notices: &[],
-            notice_anchors: &[],
-        }
-    }
-
-    const fn new(
-        canonical: &'a [TranscriptItem],
-        notices: &'a [TranscriptItem],
-        notice_anchors: &'a [LocalNoticeAnchor],
-    ) -> Self {
-        Self {
-            canonical,
-            notices,
-            notice_anchors,
-        }
-    }
-
-    /// Return the number of visible transcript items.
-    #[must_use]
-    pub const fn len(self) -> usize {
-        self.canonical.len() + self.notices.len()
-    }
-
-    /// Return whether no transcript items are visible.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.canonical.is_empty() && self.notices.is_empty()
-    }
-
-    fn notice_slot(self, notice_index: usize) -> usize {
-        let anchor = &self.notice_anchors[notice_index];
-        if let Some(after_item) = &anchor.after_item
-            && let Some(index) = self
-                .canonical
-                .iter()
-                .position(|item| item.source_view_item_id() == Some(after_item))
-        {
-            return index.saturating_add(1);
-        }
-        if let Some(after_sequence) = anchor.after_sequence {
-            return self
-                .canonical
-                .iter()
-                .rposition(|item| {
-                    item.event_sequence()
-                        .is_some_and(|sequence| sequence <= after_sequence)
-                })
-                .map_or(0, |index| index.saturating_add(1));
-        }
-        anchor.fallback_index.min(self.canonical.len())
-    }
-
-    /// Return one visible item by index.
-    #[must_use]
-    pub fn get(self, index: usize) -> Option<&'a TranscriptItem> {
-        if index >= self.len() {
-            return None;
-        }
-        let mut visible_index = 0;
-        for slot in 0..=self.canonical.len() {
-            for (notice_index, notice) in self.notices.iter().enumerate() {
-                if self.notice_slot(notice_index) == slot {
-                    if visible_index == index {
-                        return Some(notice);
-                    }
-                    visible_index = visible_index.saturating_add(1);
-                }
-            }
-            if let Some(item) = self.canonical.get(slot) {
-                if visible_index == index {
-                    return Some(item);
-                }
-                visible_index = visible_index.saturating_add(1);
-            }
-        }
-        None
-    }
-
-    /// Iterate visible items in chronological presentation order.
-    pub const fn iter(
-        self,
-    ) -> impl ExactSizeIterator<Item = &'a TranscriptItem> + DoubleEndedIterator {
-        TranscriptItemsIter {
-            items: self,
-            front: 0,
-            back: self.len(),
-        }
-    }
-}
-
-/// Iterator over an ordered terminal transcript view.
-pub struct TranscriptItemsIter<'a> {
-    items: TranscriptItems<'a>,
-    front: usize,
-    back: usize,
-}
-
-impl<'a> Iterator for TranscriptItemsIter<'a> {
-    type Item = &'a TranscriptItem;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.front >= self.back {
-            return None;
-        }
-        let item = self.items.get(self.front);
-        self.front = self.front.saturating_add(1);
-        item
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.back.saturating_sub(self.front);
-        (remaining, Some(remaining))
-    }
-}
-
-impl DoubleEndedIterator for TranscriptItemsIter<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.front >= self.back {
-            return None;
-        }
-        self.back = self.back.saturating_sub(1);
-        self.items.get(self.back)
-    }
-}
-
-impl ExactSizeIterator for TranscriptItemsIter<'_> {}
-
-impl<'a> IntoIterator for TranscriptItems<'a> {
-    type Item = &'a TranscriptItem;
-    type IntoIter = TranscriptItemsIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        TranscriptItemsIter {
-            items: self,
-            front: 0,
-            back: self.len(),
-        }
-    }
-}
-
-#[cfg(test)]
-impl PartialEq<&[TranscriptItem]> for TranscriptItems<'_> {
-    fn eq(&self, other: &&[TranscriptItem]) -> bool {
-        self.iter().eq(other.iter())
-    }
-}
-
-impl std::ops::Index<usize> for TranscriptItems<'_> {
-    type Output = TranscriptItem;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        self.get(index)
-            .expect("transcript item index out of bounds")
-    }
 }
 
 /// State owned by the terminal user interface.
@@ -506,8 +333,6 @@ pub struct BmuxApp {
     composer: TextInputState,
     input_history: InputHistory,
     transcript: TranscriptDocument,
-    local_notices: Vec<TranscriptItem>,
-    local_notice_anchors: Vec<LocalNoticeAnchor>,
     transcript_projection_revision: u64,
     active_interaction_layout: Option<(String, u16)>,
     session_view_terminal_adapter: SessionViewTerminalAdapter,
@@ -520,7 +345,7 @@ pub struct BmuxApp {
     transcript_markdown_cache: crate::transcript_markdown_cache::TranscriptMarkdownCache,
     elapsed_layout_revision: u64,
     elapsed_dirty_visuals: BTreeSet<String>,
-    transcript_dirty_items: BTreeSet<usize>,
+    transcript_dirty_items: BTreeSet<TranscriptPresentationEntryId>,
     viewport: TranscriptViewport,
     manual_transcript_scroll_until: Option<Instant>,
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
@@ -719,8 +544,6 @@ impl BmuxApp {
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
-            local_notices: Vec::new(),
-            local_notice_anchors: Vec::new(),
             transcript_projection_revision: 0,
             active_interaction_layout: None,
             session_view_terminal_adapter: SessionViewTerminalAdapter::default(),
@@ -792,6 +615,15 @@ impl BmuxApp {
             self.theme_catalog_discovery_count = source.theme_catalog_discovery_count;
         }
         self.take_theme_transition_state_from(source);
+    }
+
+    /// Preserve process-local transcript presentation across reconstruction of the same session.
+    pub(crate) fn take_same_session_transcript_state_from(&mut self, source: &Self) {
+        if self.session_id != source.session_id || self.session_id.is_none() {
+            return;
+        }
+        self.transcript.copy_ephemeral_from(&source.transcript);
+        self.transcript_projection_revision = self.transcript_projection_revision.saturating_add(1);
     }
 
     /// Preserve pending reasoning presentation across a reconnect to the same session.
@@ -1035,10 +867,7 @@ impl BmuxApp {
                 (line.source == VisibleTranscriptSource::Transcript)
                     .then(|| {
                         self.transcript
-                            .items()
-                            .get(line.entry_index)?
-                            .source_view_item_id()
-                            .cloned()
+                            .presentation_id(line.entry_index)
                             .map(|item_id| StableTranscriptAnchor {
                                 item_id,
                                 row_in_item: line.row_in_entry,
@@ -1835,18 +1664,7 @@ impl BmuxApp {
     /// Return terminal presentation items, including TUI-owned ephemeral notices.
     #[must_use]
     pub fn transcript(&self) -> TranscriptItems<'_> {
-        TranscriptItems::new(
-            self.transcript.items(),
-            &self.local_notices,
-            &self.local_notice_anchors,
-        )
-    }
-
-    /// Return TUI-owned ephemeral notices rendered outside the canonical transcript.
-    #[cfg(test)]
-    #[must_use]
-    pub fn local_notices(&self) -> &[TranscriptItem] {
-        &self.local_notices
+        self.transcript.items()
     }
 
     /// Return whether one invocation has reached authoritative terminal state.
@@ -1878,14 +1696,19 @@ impl BmuxApp {
         self.transcript_projection_revision
     }
 
-    /// Drain at most `limit` transcript invocation identifiers whose elapsed-time label changed.
+    /// Drain dirty presentation identities and resolve them against current document order.
     pub fn drain_transcript_dirty_items(&mut self) -> BTreeSet<usize> {
         std::mem::take(&mut self.transcript_dirty_items)
+            .into_iter()
+            .filter_map(|id| self.transcript.presentation_index(id))
+            .collect()
     }
 
     #[cfg(test)]
     #[must_use]
-    pub const fn transcript_dirty_items_for_test(&self) -> &BTreeSet<usize> {
+    pub const fn transcript_dirty_items_for_test(
+        &self,
+    ) -> &BTreeSet<TranscriptPresentationEntryId> {
         &self.transcript_dirty_items
     }
 
@@ -2112,10 +1935,10 @@ impl BmuxApp {
         self.apply_context_occupancy(status.context_occupancy.map(|occupancy| *occupancy));
     }
 
-    /// Mark one stable transcript index dirty after a presentation completion.
+    /// Mark one transcript presentation entry dirty after a presentation completion.
     pub fn mark_transcript_item_dirty(&mut self, index: usize) {
-        if index < self.transcript().len() {
-            self.transcript_dirty_items.insert(index);
+        if let Some(id) = self.transcript.presentation_id(index) {
+            self.transcript_dirty_items.insert(id);
             self.transcript_projection_revision =
                 self.transcript_projection_revision.saturating_add(1);
         }
@@ -2550,50 +2373,30 @@ impl BmuxApp {
         KeyActivationOutcome::Pending
     }
 
-    /// Append a plain-text system-style transcript note.
-    pub fn push_system_plain(&mut self, text: String) {
-        self.push_renderer_local_system_notice(
-            text,
-            bcode_session_view_models::TextFormat::PlainText,
-        );
+    /// Append a process-local plain-text system notice that is not canonical history.
+    pub fn push_ephemeral_system_plain(&mut self, text: String) {
+        self.push_ephemeral_system_notice(text, bcode_session_view_models::TextFormat::PlainText);
     }
 
-    /// Append a JSON system-style transcript note.
-    pub fn push_system_json(&mut self, text: String) {
-        self.push_renderer_local_system_notice(text, bcode_session_view_models::TextFormat::Json);
+    /// Append a process-local JSON system notice that is not canonical history.
+    pub fn push_ephemeral_system_json(&mut self, text: String) {
+        self.push_ephemeral_system_notice(text, bcode_session_view_models::TextFormat::Json);
     }
 
-    /// Append a Markdown system-style transcript note.
-    pub fn push_system_markdown(&mut self, text: String) {
-        self.push_renderer_local_system_notice(
-            text,
-            bcode_session_view_models::TextFormat::Markdown,
-        );
+    /// Append a process-local Markdown system notice that is not canonical history.
+    pub fn push_ephemeral_system_markdown(&mut self, text: String) {
+        self.push_ephemeral_system_notice(text, bcode_session_view_models::TextFormat::Markdown);
     }
 
-    fn push_renderer_local_system_notice(
+    fn push_ephemeral_system_notice(
         &mut self,
         text: String,
         format: bcode_session_view_models::TextFormat,
     ) {
-        let after_item = self
-            .transcript
-            .items()
-            .last()
-            .and_then(|item| item.source_view_item_id().cloned());
-        let after_sequence = self
-            .transcript
-            .items()
-            .iter()
-            .filter_map(TranscriptItem::event_sequence)
-            .max();
-        self.local_notice_anchors.push(LocalNoticeAnchor {
-            after_item,
-            after_sequence,
-            fallback_index: self.transcript.items().len(),
-        });
-        self.local_notices
-            .push(TranscriptItem::with_format("System", text, format));
+        self.transcript.push_ephemeral(
+            "bcode.tui".to_owned(),
+            TranscriptItem::with_format("System", text, format),
+        );
         self.transcript_projection_revision = self.transcript_projection_revision.saturating_add(1);
     }
 
@@ -3977,12 +3780,7 @@ impl BmuxApp {
         if line.source != VisibleTranscriptSource::Transcript {
             return;
         }
-        let Some(item_id) = self
-            .transcript
-            .get(line.entry_index)
-            .and_then(TranscriptItem::source_view_item_id)
-            .cloned()
-        else {
+        let Some(item_id) = self.transcript.presentation_id(line.entry_index) else {
             return;
         };
         self.pending_stable_transcript_anchor = Some(StableTranscriptAnchor {
@@ -3995,7 +3793,7 @@ impl BmuxApp {
         let Some(anchor) = self.pending_stable_transcript_anchor.take() else {
             return;
         };
-        let Some(index) = self.transcript.source_index(&anchor.item_id) else {
+        let Some(index) = self.transcript.presentation_index(anchor.item_id) else {
             return;
         };
         let Some(start_row) = self
@@ -4016,7 +3814,11 @@ impl BmuxApp {
             .apply(snapshot, &mut self.transcript);
         if let TranscriptDocumentDamage::Items(ids) = &damage {
             self.transcript_dirty_items
-                .extend(ids.iter().filter_map(|id| self.transcript.source_index(id)));
+                .extend(ids.iter().filter_map(|id| {
+                    self.transcript
+                        .source_index(id)
+                        .and_then(|index| self.transcript.presentation_id(index))
+                }));
         }
         #[cfg(test)]
         {
@@ -5028,7 +4830,7 @@ mod tests {
         let mut app =
             BmuxApp::new_with_history(Some(session_id), &[event(1, "before")], &[], false);
 
-        app.push_system_plain("send failed".to_owned());
+        app.push_ephemeral_system_plain("send failed".to_owned());
         app.absorb_session_event(&event(2, "after"));
 
         assert_eq!(
@@ -5055,9 +4857,9 @@ mod tests {
         };
         let mut app = BmuxApp::new_with_history(Some(session_id), &[event(1, "first")], &[], false);
 
-        app.push_system_plain("notice one".to_owned());
+        app.push_ephemeral_system_plain("notice one".to_owned());
         app.absorb_session_event(&event(2, "second"));
-        app.push_system_plain("notice two".to_owned());
+        app.push_ephemeral_system_plain("notice two".to_owned());
         app.absorb_session_event(&event(3, "third"));
 
         assert_eq!(
@@ -5067,6 +4869,151 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "notice one", "second", "notice two", "third"]
         );
+    }
+
+    #[test]
+    fn ephemeral_notice_keeps_chronology_when_older_history_is_prepended() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: text.to_owned(),
+            },
+        };
+        let later = event(2, "later");
+        let mut app =
+            BmuxApp::new_with_history(Some(session_id), std::slice::from_ref(&later), &[], true);
+        app.push_ephemeral_system_plain("local issue".to_owned());
+
+        app.replace_latest_transcript_window(&[event(1, "earlier"), later], false);
+
+        assert_eq!(
+            app.transcript()
+                .iter()
+                .map(TranscriptItem::text)
+                .collect::<Vec<_>>(),
+            ["earlier", "later", "local issue"]
+        );
+    }
+
+    #[test]
+    fn ephemeral_notice_uses_sequence_fallback_when_exact_anchor_leaves_window() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: text.to_owned(),
+            },
+        };
+        let mut app = BmuxApp::new_with_history(
+            Some(session_id),
+            &[event(1, "one"), event(2, "two")],
+            &[],
+            false,
+        );
+        app.push_ephemeral_system_plain("local issue".to_owned());
+
+        app.replace_latest_transcript_window(&[event(1, "one"), event(3, "three")], false);
+
+        assert_eq!(
+            app.transcript()
+                .iter()
+                .map(TranscriptItem::text)
+                .collect::<Vec<_>>(),
+            ["one", "local issue", "three"]
+        );
+    }
+
+    #[test]
+    fn sequence_lookup_returns_visible_index_across_ephemeral_notice() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: text.to_owned(),
+            },
+        };
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[event(1, "one")], &[], false);
+        app.push_ephemeral_system_plain("local issue".to_owned());
+        app.absorb_session_event(&event(2, "two"));
+
+        assert_eq!(app.transcript_index_for_sequence(2), Some(2));
+    }
+
+    #[test]
+    fn ephemeral_notice_has_explicit_local_provenance() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+        app.push_ephemeral_system_plain("local issue".to_owned());
+
+        assert!(matches!(
+            app.transcript.origin(0),
+            Some(TranscriptPresentationOrigin::Ephemeral { source, .. })
+                if source == "bcode.tui"
+        ));
+        assert!(app.session_view_snapshot().transcript.items.is_empty());
+    }
+
+    #[test]
+    fn same_session_reconstruction_preserves_ephemeral_notices() {
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "before".to_owned(),
+            },
+        }];
+        let mut source = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        source.push_ephemeral_system_plain("local issue".to_owned());
+        let mut reconstructed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+
+        reconstructed.take_same_session_transcript_state_from(&source);
+
+        assert_eq!(
+            reconstructed
+                .transcript()
+                .iter()
+                .map(TranscriptItem::text)
+                .collect::<Vec<_>>(),
+            ["before", "local issue"]
+        );
+    }
+
+    #[test]
+    fn cross_session_reconstruction_does_not_transfer_ephemeral_notices() {
+        let mut source = BmuxApp::new_with_history(
+            Some(bcode_session_models::SessionId::new()),
+            &[],
+            &[],
+            false,
+        );
+        source.push_ephemeral_system_plain("local issue".to_owned());
+        let mut reconstructed = BmuxApp::new_with_history(
+            Some(bcode_session_models::SessionId::new()),
+            &[],
+            &[],
+            false,
+        );
+
+        reconstructed.take_same_session_transcript_state_from(&source);
+
+        assert!(reconstructed.transcript().is_empty());
     }
 
     #[test]
@@ -5460,18 +5407,44 @@ mod tests {
         app.set_pending_interactions(vec![interaction("first"), interaction("second")]);
         let first = app.interaction_transcript_index("first").expect("first");
         let second = app.interaction_transcript_index("second").expect("second");
+        let first_id = app.transcript.presentation_id(first).expect("first id");
+        let second_id = app.transcript.presentation_id(second).expect("second id");
 
         app.set_active_interaction_layout(Some(("first".to_owned(), 5)));
         assert_eq!(
             app.transcript_dirty_items_for_test(),
-            &BTreeSet::from([first])
+            &BTreeSet::from([first_id])
         );
         app.drain_transcript_dirty_items();
         app.set_active_interaction_layout(Some(("second".to_owned(), 7)));
         assert_eq!(
             app.transcript_dirty_items_for_test(),
-            &BTreeSet::from([first, second])
+            &BTreeSet::from([first_id, second_id])
         );
+    }
+
+    #[test]
+    fn dirty_presentation_identity_resolves_after_earlier_insertion() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: text.to_owned(),
+            },
+        };
+        let later = event(2, "later");
+        let mut app =
+            BmuxApp::new_with_history(Some(session_id), std::slice::from_ref(&later), &[], true);
+        app.mark_transcript_item_dirty(0);
+
+        app.replace_latest_transcript_window(&[event(1, "earlier"), later], false);
+
+        assert_eq!(app.drain_transcript_dirty_items(), BTreeSet::from([1]));
+        assert_eq!(app.transcript()[1].text(), "later");
     }
 
     fn interaction(id: &str) -> bcode_session_view_models::InteractionViewSummary {

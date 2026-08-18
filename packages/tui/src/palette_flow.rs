@@ -76,7 +76,7 @@ pub fn apply_plugin_surface_outcome(
     }
     if let Some(text) = outcome.append_text {
         let (text, format) = text.into_parts();
-        chat.push_presentation_note(plugin_id.to_owned(), text, format);
+        chat.append_durable_presentation_note(plugin_id.to_owned(), text, format);
     }
     if let Some(bcode_command::CommandAction::Plugin {
         plugin_id,
