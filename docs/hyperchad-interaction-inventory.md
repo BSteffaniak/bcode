@@ -1,6 +1,6 @@
 # HyperChad Application Interaction Inventory
 
-This inventory classifies the current Bcode HyperChad application paths by canonical framework mechanism. It is an implementation aid for `local-web-renderer-progress.md`, not a separate product architecture.
+This inventory classifies the current Bcode HyperChad application paths by canonical framework mechanism. It is an implementation aid for `local-web-renderer-progress.md`, not a separate product architecture. The cross-frontend semantic operation and CLI coverage matrix lives in [Application operation parity](application-operation-parity.md).
 
 ## Governing Rule
 

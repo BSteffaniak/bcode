@@ -28,6 +28,7 @@ bcode_tool                 = { workspace = true }
 bcode_workflow             = { workspace = true }
 bcode_workflow_store       = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
+serde                      = { workspace = true, features = ["derive"] }
 serde_json                 = { workspace = true }
 sshenv_vault               = { workspace = true }
 thiserror                  = { workspace = true }

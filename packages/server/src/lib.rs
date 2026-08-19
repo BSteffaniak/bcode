@@ -12,6 +12,7 @@
 pub(crate) mod context_accounting;
 pub(crate) mod context_compaction;
 mod image_input;
+mod interaction_operations;
 mod invariant_guidance;
 mod model_ignores;
 mod model_request_target;
@@ -19025,13 +19026,7 @@ async fn handle_list_permissions(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let permissions = state
-        .pending_permissions
-        .lock()
-        .await
-        .values()
-        .map(|permission| permission.summary.clone())
-        .collect();
+    let permissions = interaction_operations::list_permissions(state).await;
     send_response(
         writer,
         request_id,
@@ -19045,33 +19040,13 @@ async fn handle_list_pending_tool_exchanges(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let exchanges = state
-        .pending_tool_exchanges
-        .lock()
-        .await
-        .values()
-        .map(|request| request.summary.clone())
-        .collect();
+    let exchanges = interaction_operations::list_pending_tool_exchanges(state).await;
     send_response(
         writer,
         request_id,
         Response::Ok(ResponsePayload::PendingToolExchangeList { exchanges }),
     )
     .await
-}
-
-async fn complete_pending_tool_exchange(
-    state: &ServerState,
-    request: &PendingToolExchange,
-    resolution: ToolExchangeResolution,
-) {
-    state
-        .pending_tool_exchanges
-        .lock()
-        .await
-        .remove(&request.summary.request.exchange_id);
-    *request.resolution.lock().await = Some(resolution);
-    request.notify.notify_waiters();
 }
 
 async fn handle_resolve_tool_exchange(
@@ -19082,54 +19057,34 @@ async fn handle_resolve_tool_exchange(
     interaction_id: &str,
     resolution: ToolExchangeResolution,
 ) -> Result<(), ServerError> {
-    let pending = state
-        .pending_tool_exchanges
-        .lock()
-        .await
-        .get(interaction_id)
-        .cloned();
-    let Some(pending) = pending else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::ToolExchangeResolved { resolved: false }),
-        )
-        .await;
-    };
-    if !state
-        .client_supports_exchange(client_id, &pending.summary.request)
-        .await
-    {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "incompatible_exchange_consumer",
-                "client did not advertise a compatible exchange adapter",
-            )),
-        )
-        .await;
-    }
-    let Some(request) = state
-        .pending_tool_exchanges
-        .lock()
-        .await
-        .remove(interaction_id)
-    else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::ToolExchangeResolved { resolved: false }),
-        )
-        .await;
-    };
-    complete_pending_tool_exchange(state, &request, resolution).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::ToolExchangeResolved { resolved: true }),
+    match interaction_operations::resolve_tool_exchange(
+        state,
+        client_id,
+        interaction_id,
+        resolution,
     )
     .await
+    {
+        Ok(resolved) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::ToolExchangeResolved { resolved }),
+            )
+            .await
+        }
+        Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "incompatible_exchange_consumer",
+                    "client did not advertise a compatible exchange adapter",
+                )),
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_add_permission_rule(
@@ -19230,25 +19185,21 @@ async fn handle_resolve_permission(
     approved: bool,
     remember: bool,
 ) -> Result<(), ServerError> {
-    let Some(permission) = take_pending_permission_for_individual(state, permission_id).await
-    else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::PermissionResolved { resolved: false }),
-        )
-        .await;
-    };
-    resolve_pending_permission(state, permission, approved, remember).await;
+    let resolved =
+        interaction_operations::resolve_permission(state, permission_id, approved, remember).await;
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::PermissionResolved { resolved: true }),
+        Response::Ok(ResponsePayload::PermissionResolved { resolved }),
     )
     .await
 }
 
-async fn resolve_permission_batch(state: &ServerState, batch_id: &str, approved: bool) -> usize {
+async fn resolve_permission_batch_operation(
+    state: &ServerState,
+    batch_id: &str,
+    approved: bool,
+) -> usize {
     let Some(batch) = state
         .pending_permission_batches
         .lock()
@@ -19303,7 +19254,8 @@ async fn handle_resolve_permission_batch(
     batch_id: &str,
     approved: bool,
 ) -> Result<(), ServerError> {
-    let resolved = resolve_permission_batch(state, batch_id, approved).await;
+    let resolved =
+        interaction_operations::resolve_permission_batch(state, batch_id, approved).await;
     send_response(
         writer,
         request_id,
@@ -49770,6 +49722,130 @@ library = "test"
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
 
+    fn pending_tool_exchange(
+        exchange_id: &str,
+        producer_id: &str,
+        schema: &str,
+    ) -> PendingToolExchange {
+        PendingToolExchange {
+            summary: bcode_ipc::PendingToolExchangeSummary {
+                session_id: SessionId::new(),
+                request: ToolExchangeRequest {
+                    invocation_id: "invocation".to_owned(),
+                    exchange_id: exchange_id.to_owned(),
+                    producer_id: producer_id.to_owned(),
+                    schema: schema.to_owned(),
+                    schema_version: 1,
+                    payload: serde_json::json!({"prompt": "continue?"}),
+                    response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+                },
+            },
+            resolution: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn interaction_operations_list_and_resolve_without_transport_writing() {
+        let state = test_server_state(SessionManager::default());
+        let client_id = ClientId::new();
+        state.register_client(client_id).await;
+        state
+            .set_client_runtime_context(
+                client_id,
+                Some(ClientRuntimeContext {
+                    interaction_adapters: vec![
+                        bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+                            producer_id: "example.plugin".to_owned(),
+                            exchange_schema: "example.request".to_owned(),
+                            min_schema_version: 1,
+                            max_schema_version: 1,
+                            platform_id: "cli".to_owned(),
+                            priority: 1,
+                            interaction_kind: "example.interaction".to_owned(),
+                            tui_surface_kind: None,
+                        },
+                    ],
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        let pending = pending_tool_exchange("exchange-1", "example.plugin", "example.request");
+        let resolution = Arc::clone(&pending.resolution);
+        state
+            .pending_tool_exchanges
+            .lock()
+            .await
+            .insert("exchange-1".to_owned(), pending);
+
+        let listed = interaction_operations::list_pending_tool_exchanges(&state).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].request.exchange_id, "exchange-1");
+
+        assert!(
+            interaction_operations::resolve_tool_exchange(
+                &state,
+                client_id,
+                "exchange-1",
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"accepted": true}),
+                },
+            )
+            .await
+            .expect("compatible resolution")
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
+        assert_eq!(
+            *resolution.lock().await,
+            Some(ToolExchangeResolution::Responded {
+                payload: serde_json::json!({"accepted": true}),
+            })
+        );
+        assert!(
+            !interaction_operations::resolve_tool_exchange(
+                &state,
+                client_id,
+                "exchange-1",
+                ToolExchangeResolution::Cancelled,
+            )
+            .await
+            .expect("duplicate resolution")
+        );
+    }
+
+    #[tokio::test]
+    async fn interaction_operations_reject_incompatible_consumers_without_mutation() {
+        let state = test_server_state(SessionManager::default());
+        let client_id = ClientId::new();
+        state.register_client(client_id).await;
+        let pending = pending_tool_exchange("exchange-1", "example.plugin", "example.request");
+        let resolution = Arc::clone(&pending.resolution);
+        state
+            .pending_tool_exchanges
+            .lock()
+            .await
+            .insert("exchange-1".to_owned(), pending);
+
+        assert_eq!(
+            interaction_operations::resolve_tool_exchange(
+                &state,
+                client_id,
+                "exchange-1",
+                ToolExchangeResolution::Cancelled,
+            )
+            .await,
+            Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer)
+        );
+        assert!(
+            state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key("exchange-1")
+        );
+        assert_eq!(*resolution.lock().await, None);
+    }
+
     #[tokio::test]
     async fn explicit_ownership_release_reports_success_and_actor_blockers() {
         let root = tempfile::tempdir().expect("session root");
@@ -51001,7 +51077,10 @@ library = "test"
             .await
             .expect("per-call decision should win before batch latch");
         resolve_pending_permission(&state, individual, false, false).await;
-        assert_eq!(resolve_permission_batch(&state, "batch-1", true).await, 1);
+        assert_eq!(
+            resolve_permission_batch_operation(&state, "batch-1", true).await,
+            1
+        );
         assert_eq!(*first.decision.lock().await, Some(false));
         assert_eq!(*second.decision.lock().await, Some(true));
         assert_eq!(*unrelated.decision.lock().await, None);
@@ -51010,7 +51089,10 @@ library = "test"
             Some(true)
         );
         assert_eq!(permission_batch_decision(&state, "batch-2").await, None);
-        assert_eq!(resolve_permission_batch(&state, "batch-1", false).await, 0);
+        assert_eq!(
+            resolve_permission_batch_operation(&state, "batch-1", false).await,
+            0
+        );
         assert_eq!(
             state
                 .pending_permissions
@@ -52218,7 +52300,7 @@ library = "test"
             .batch_id
             .clone();
         assert_eq!(
-            resolve_permission_batch(state.as_ref(), &batch_id, true).await,
+            resolve_permission_batch_operation(state.as_ref(), &batch_id, true).await,
             1
         );
 
@@ -54725,16 +54807,16 @@ library = "test"
         .expect("another session must not wait for the pending question")
         .expect("other session tool preparation should succeed");
 
-        let pending = state
+        let _pending = state
             .pending_tool_exchanges
             .lock()
             .await
             .get(&interaction_id)
             .cloned()
             .expect("question exchange remains pending");
-        complete_pending_tool_exchange(
+        interaction_operations::complete_pending_tool_exchange(
             state.as_ref(),
-            &pending,
+            &interaction_id,
             ToolExchangeResolution::Responded {
                 payload: serde_json::json!({
                     "status": "answered",

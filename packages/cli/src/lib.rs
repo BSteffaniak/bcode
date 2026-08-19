@@ -346,6 +346,8 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Auth { command } => handle_auth_command(command).await?,
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
+        Commands::Interaction { command } => handle_interaction_command(command).await?,
+        Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
         Commands::Workflow { command } => handle_workflow_command(Box::new(command)).await?,
         command => Box::pin(handle_session_io_command(command, launch_options)).await?,
@@ -1999,6 +2001,152 @@ fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
     Ok(())
 }
 
+fn print_json_line<T: Serialize>(value: &T) -> Result<(), CliError> {
+    println!("{}", serde_json::to_string(value)?);
+    Ok(())
+}
+
+async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    let client = BcodeClient::default_endpoint();
+    match command {
+        WorktreeCommand::List { cwd, json } => {
+            let response = client
+                .list_worktrees(bcode_worktree_models::WorktreeListRequest { cwd })
+                .await?;
+            if json {
+                print_json(&response)?;
+            } else {
+                for worktree in response.worktrees {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        worktree.path.display(),
+                        worktree.branch.as_deref().unwrap_or("-"),
+                        worktree.commit.as_deref().unwrap_or("-"),
+                        if worktree.is_main { "main" } else { "linked" },
+                    );
+                }
+            }
+        }
+        WorktreeCommand::Create {
+            name,
+            cwd,
+            path,
+            branch,
+            new_branch,
+            detach,
+            force,
+            attach_session_id,
+            new_session,
+            no_setup,
+            json,
+        } => {
+            let response = client
+                .create_worktree(bcode_worktree_models::WorktreeCreateRequest {
+                    name,
+                    cwd,
+                    path,
+                    branch,
+                    new_branch,
+                    base_ref: None,
+                    detach,
+                    force,
+                    attach_session_id,
+                    new_session,
+                    no_setup,
+                })
+                .await?;
+            if json {
+                print_json(&response)?;
+            } else {
+                println!("{}", response.path.display());
+            }
+        }
+        WorktreeCommand::Remove {
+            path,
+            cwd,
+            force,
+            yes,
+            json,
+        } => {
+            if !yes {
+                return Err(CliError::InvalidArguments(
+                    "worktree removal requires --yes".to_owned(),
+                ));
+            }
+            let response = client
+                .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest { cwd, path, force })
+                .await?;
+            if json {
+                print_json(&response)?;
+            } else {
+                println!("{}", response.path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_interaction_command(command: InteractionCommand) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    let client = BcodeClient::default_endpoint();
+    match command {
+        InteractionCommand::List { json } => {
+            let exchanges = client.list_pending_tool_exchanges().await?;
+            if json {
+                print_json(&exchanges)?;
+            } else if exchanges.is_empty() {
+                println!("no pending interactions");
+            } else {
+                for exchange in exchanges {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{:?}",
+                        exchange.request.exchange_id,
+                        exchange.session_id,
+                        exchange.request.producer_id,
+                        exchange.request.schema,
+                        exchange.request.schema_version,
+                        exchange.request.response_policy,
+                    );
+                }
+            }
+        }
+        InteractionCommand::Respond {
+            exchange_id,
+            payload,
+            json,
+        } => {
+            let payload = read_bounded_json(&payload)?;
+            let resolved = client
+                .resolve_tool_exchange(
+                    exchange_id,
+                    bcode_session_models::ToolExchangeResolution::Responded { payload },
+                )
+                .await?;
+            print_interaction_resolution(resolved, json)?;
+        }
+        InteractionCommand::Cancel { exchange_id, json } => {
+            let resolved = client
+                .resolve_tool_exchange(
+                    exchange_id,
+                    bcode_session_models::ToolExchangeResolution::Cancelled,
+                )
+                .await?;
+            print_interaction_resolution(resolved, json)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_interaction_resolution(resolved: bool, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(&serde_json::json!({ "resolved": resolved }))
+    } else {
+        println!("resolved: {resolved}");
+        Ok(())
+    }
+}
+
 async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
     match command {
         PluginCommand::List { root } => list_plugins(&root)?,
@@ -2314,7 +2462,8 @@ async fn handle_session_io_command(
         Commands::Cancel {
             session_id,
             clear_queue,
-        } => cancel_session_turn(session_id, clear_queue).await?,
+            json,
+        } => cancel_session_turn(session_id, clear_queue, json).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
             bcode_tui::run_with_static_bundled_and_options(
@@ -2328,7 +2477,32 @@ async fn handle_session_io_command(
         Commands::Send {
             session_id,
             message,
-        } => send_message(session_id, message, launch_options).await?,
+            file,
+            stdin,
+            follow_up,
+            producer,
+            idempotency_key,
+            background,
+            json,
+        } => {
+            Box::pin(send_message(
+                session_id,
+                SendOptions {
+                    input: PromptInput {
+                        message,
+                        file,
+                        stdin,
+                    },
+                    follow_up,
+                    producer,
+                    idempotency_key,
+                    background,
+                    json,
+                    launch_options,
+                },
+            ))
+            .await?;
+        }
         Commands::Onboard { .. }
         | Commands::ArtifactId
         | Commands::Server { .. }
@@ -2339,6 +2513,8 @@ async fn handle_session_io_command(
         | Commands::Auth { .. }
         | Commands::Login { .. }
         | Commands::Permission { .. }
+        | Commands::Interaction { .. }
+        | Commands::Worktree { .. }
         | Commands::RuntimeWork { .. }
         | Commands::Workflow { .. } => unreachable!("handled by handle_cli"),
         #[cfg(feature = "web-renderer")]
@@ -2349,12 +2525,30 @@ async fn handle_session_io_command(
 
 async fn handle_permission_command(command: PermissionCommand) -> Result<(), CliError> {
     match command {
-        PermissionCommand::List => list_permissions().await?,
-        PermissionCommand::Approve { permission_id } => {
-            resolve_permission(permission_id, true).await?;
+        PermissionCommand::List { session_id, json } => {
+            list_permissions(session_id, json).await?;
         }
-        PermissionCommand::Deny { permission_id } => {
-            resolve_permission(permission_id, false).await?;
+        PermissionCommand::Approve {
+            permission_id,
+            remember,
+            json,
+        } => {
+            resolve_permission(permission_id, true, remember, json).await?;
+        }
+        PermissionCommand::Deny {
+            permission_id,
+            json,
+        } => {
+            resolve_permission(permission_id, false, false, json).await?;
+        }
+        PermissionCommand::ResolveBatch {
+            batch_id,
+            approve,
+            deny,
+            json,
+        } => {
+            debug_assert_ne!(approve, deny);
+            resolve_permission_batch(batch_id, approve, json).await?;
         }
         PermissionCommand::Add {
             agent,
@@ -2653,6 +2847,16 @@ enum Commands {
         #[command(subcommand)]
         command: PermissionCommand,
     },
+    /// Inspect and resolve renderer-neutral pending tool interactions.
+    Interaction {
+        #[command(subcommand)]
+        command: InteractionCommand,
+    },
+    /// Manage Git worktrees through the daemon-owned worktree application API.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -2665,6 +2869,9 @@ enum Commands {
         session_id: SessionId,
         #[arg(long)]
         clear_queue: bool,
+        /// Print the cancellation request result as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Attach {
         session_id: SessionId,
@@ -2674,7 +2881,29 @@ enum Commands {
     },
     Send {
         session_id: SessionId,
-        message: String,
+        /// Prompt text. Omit when using --file or --stdin.
+        message: Option<String>,
+        /// Read the prompt from a bounded UTF-8 file.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["message", "stdin"])]
+        file: Option<PathBuf>,
+        /// Read the prompt from bounded UTF-8 stdin.
+        #[arg(long, conflicts_with_all = ["message", "file"])]
+        stdin: bool,
+        /// Queue explicitly as a follow-up instead of default steering semantics.
+        #[arg(long)]
+        follow_up: bool,
+        /// Stable producer namespace for durable turn admission.
+        #[arg(long, default_value = "bcode.cli")]
+        producer: String,
+        /// Optional producer-owned idempotency key.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Admit the turn at background scheduling priority.
+        #[arg(long)]
+        background: bool,
+        /// Print exact canonical `TurnAdmission` as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -3217,18 +3446,27 @@ enum WorkflowPresetCommand {
 enum RuntimeWorkCommand {
     List {
         session_id: SessionId,
+        #[arg(long)]
+        json: bool,
     },
     Cancel {
         session_id: SessionId,
         work_id: String,
+        #[arg(long)]
+        json: bool,
     },
     History {
         session_id: SessionId,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
     },
     Watch {
         session_id: SessionId,
+        /// Emit one JSON object per line.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -3283,6 +3521,85 @@ enum SessionCommand {
     },
     Delete {
         session_id: SessionId,
+    },
+    /// Change the canonical working directory for one session.
+    SetWorkingDirectory {
+        session_id: SessionId,
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the active agent profile for one session.
+    SetAgent {
+        session_id: SessionId,
+        agent_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the model selection for one session.
+    SetModel {
+        session_id: SessionId,
+        model_id: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set provider-neutral reasoning selections for one session.
+    SetReasoning {
+        session_id: SessionId,
+        #[arg(long)]
+        effort: Option<String>,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set or clear the interactive preferred profile for an auth pool.
+    SetAuthPool {
+        pool: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        clear: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Return active skill contexts for one session.
+    ActiveSkills {
+        session_id: SessionId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Activate one skill for a session.
+    ActivateSkill {
+        session_id: SessionId,
+        skill_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deactivate one skill for a session.
+    DeactivateSkill {
+        session_id: SessionId,
+        skill_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly compact one session's model context.
+    Compact {
+        session_id: SessionId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Watch bounded initial state followed by ordered durable/live session events.
+    Watch {
+        session_id: SessionId,
+        /// Maximum initial durable events.
+        #[arg(long, default_value_t = SESSION_CLI_PAGE_LIMIT)]
+        limit: usize,
+        /// Emit one JSON object per line.
+        #[arg(long)]
+        json: bool,
     },
     History {
         session_id: SessionId,
@@ -4145,12 +4462,39 @@ enum OpenAiLoginFlow {
 
 #[derive(Debug, Subcommand)]
 enum PermissionCommand {
-    List,
+    List {
+        /// Restrict pending permissions to one canonical session.
+        #[arg(long)]
+        session_id: Option<SessionId>,
+        /// Print complete structured permission summaries as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     Approve {
         permission_id: String,
+        /// Persist the approved operation as a policy rule when supported.
+        #[arg(long)]
+        remember: bool,
+        /// Print the resolution result as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Deny {
         permission_id: String,
+        /// Print the resolution result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve every still-pending member of one canonical permission batch.
+    ResolveBatch {
+        batch_id: String,
+        #[arg(long, conflicts_with = "deny", required_unless_present = "deny")]
+        approve: bool,
+        #[arg(long, conflicts_with = "approve", required_unless_present = "approve")]
+        deny: bool,
+        /// Print the resolution result as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Add or replace a permission rule under `[agent.<agent_id>.permission.<category>]`.
     Add {
@@ -4166,6 +4510,80 @@ enum PermissionCommand {
         /// Action: `allow`, `ask`, or `deny`.
         #[arg(long)]
         action: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InteractionCommand {
+    /// List pending renderer-neutral tool exchanges.
+    List {
+        /// Print the complete structured exchange envelopes as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Respond to one exchange with producer-schema JSON from a file or stdin (`-`).
+    Respond {
+        exchange_id: String,
+        #[arg(long, value_name = "FILE")]
+        payload: PathBuf,
+        /// Print the resolution result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel one pending exchange.
+    Cancel {
+        exchange_id: String,
+        /// Print the resolution result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeCommand {
+    /// List registered worktrees for a repository discovered from `--cwd`.
+    List {
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a worktree and optionally attach or create a canonical session.
+    Create {
+        name: String,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["new_branch", "detach"])]
+        branch: Option<String>,
+        #[arg(long, conflicts_with_all = ["branch", "detach"])]
+        new_branch: Option<String>,
+        #[arg(long, conflicts_with_all = ["branch", "new_branch"])]
+        detach: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, conflicts_with = "new_session")]
+        attach_session_id: Option<SessionId>,
+        #[arg(long, conflicts_with = "attach_session_id")]
+        new_session: bool,
+        #[arg(long)]
+        no_setup: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one registered worktree.
+    Remove {
+        path: PathBuf,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+        /// Required confirmation for worktree removal.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4243,6 +4661,60 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
         SessionCommand::List { json } => list_sessions(json).await?,
         SessionCommand::Rename { session_id, name } => rename_session(session_id, name).await?,
         SessionCommand::Delete { session_id } => delete_session(session_id).await?,
+        SessionCommand::SetWorkingDirectory {
+            session_id,
+            path,
+            json,
+        } => Box::pin(set_session_working_directory(session_id, path, json)).await?,
+        SessionCommand::SetAgent {
+            session_id,
+            agent_id,
+            json,
+        } => Box::pin(set_session_agent(session_id, agent_id, json)).await?,
+        SessionCommand::SetModel {
+            session_id,
+            model_id,
+            provider,
+            json,
+        } => {
+            Box::pin(set_session_model_selection(
+                session_id, provider, model_id, json,
+            ))
+            .await?;
+        }
+        SessionCommand::SetReasoning {
+            session_id,
+            effort,
+            summary,
+            json,
+        } => Box::pin(set_session_reasoning(session_id, effort, summary, json)).await?,
+        SessionCommand::SetAuthPool {
+            pool,
+            profile,
+            clear,
+            json,
+        } => Box::pin(set_auth_pool_preference(pool, profile, clear, json)).await?,
+        SessionCommand::ActiveSkills { session_id, json } => {
+            Box::pin(list_active_skills(session_id, json)).await?;
+        }
+        SessionCommand::ActivateSkill {
+            session_id,
+            skill_id,
+            json,
+        } => Box::pin(set_session_skill(session_id, skill_id, true, json)).await?,
+        SessionCommand::DeactivateSkill {
+            session_id,
+            skill_id,
+            json,
+        } => Box::pin(set_session_skill(session_id, skill_id, false, json)).await?,
+        SessionCommand::Compact { session_id, json } => {
+            Box::pin(compact_session(session_id, json)).await?;
+        }
+        SessionCommand::Watch {
+            session_id,
+            limit,
+            json,
+        } => Box::pin(watch_session(session_id, limit, json)).await?,
         SessionCommand::History {
             session_id,
             after,
@@ -9898,6 +10370,158 @@ async fn delete_session(session_id: SessionId) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn set_session_working_directory(
+    session_id: SessionId,
+    path: PathBuf,
+    json: bool,
+) -> Result<(), CliError> {
+    let session = BcodeClient::default_endpoint()
+        .change_session_working_directory(session_id, path)
+        .await?;
+    print_session_operation_result("working_directory_changed", &session, json)
+}
+
+async fn set_session_agent(
+    session_id: SessionId,
+    agent_id: String,
+    json: bool,
+) -> Result<(), CliError> {
+    BcodeClient::default_endpoint()
+        .set_session_agent(session_id, agent_id)
+        .await?;
+    print_unit_session_result("agent_set", session_id, json)
+}
+
+async fn set_session_model_selection(
+    session_id: SessionId,
+    provider: Option<String>,
+    model_id: String,
+    json: bool,
+) -> Result<(), CliError> {
+    BcodeClient::default_endpoint()
+        .set_session_model(session_id, provider, model_id)
+        .await?;
+    print_unit_session_result("model_set", session_id, json)
+}
+
+async fn set_session_reasoning(
+    session_id: SessionId,
+    effort: Option<String>,
+    summary: Option<String>,
+    json: bool,
+) -> Result<(), CliError> {
+    BcodeClient::default_endpoint()
+        .set_session_reasoning(session_id, effort, summary)
+        .await?;
+    print_unit_session_result("reasoning_set", session_id, json)
+}
+
+async fn set_auth_pool_preference(
+    pool: String,
+    profile: Option<String>,
+    clear: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    if clear == profile.is_some() {
+        return Err(CliError::InvalidArguments(
+            "set-auth-pool requires exactly one of --profile or --clear".to_owned(),
+        ));
+    }
+    BcodeClient::default_endpoint()
+        .set_auth_pool_preference(pool.clone(), profile.clone())
+        .await?;
+    if json {
+        print_json(&serde_json::json!({
+            "status": "auth_pool_preference_set",
+            "pool": pool,
+            "profile": profile,
+        }))
+    } else {
+        println!("auth pool preference set");
+        Ok(())
+    }
+}
+
+async fn list_active_skills(session_id: SessionId, json: bool) -> Result<(), CliError> {
+    let skills = BcodeClient::default_endpoint()
+        .active_skills(session_id)
+        .await?;
+    if json {
+        print_json(&skills)
+    } else {
+        for skill in skills {
+            println!("{}", skill.skill_id);
+        }
+        Ok(())
+    }
+}
+
+async fn set_session_skill(
+    session_id: SessionId,
+    skill_id: String,
+    activate: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let skill_id = bcode_skill_models::SkillId::new(skill_id);
+    if activate {
+        client.activate_skill(session_id, skill_id).await?;
+    } else {
+        client.deactivate_skill(session_id, skill_id).await?;
+    }
+    print_unit_session_result(
+        if activate {
+            "skill_activated"
+        } else {
+            "skill_deactivated"
+        },
+        session_id,
+        json,
+    )
+}
+
+async fn compact_session(session_id: SessionId, json: bool) -> Result<(), CliError> {
+    let message = BcodeClient::default_endpoint()
+        .compact_session(session_id)
+        .await?;
+    if json {
+        print_json(&serde_json::json!({
+            "status": "context_compacted",
+            "session_id": session_id,
+            "message": message,
+        }))
+    } else {
+        println!("{message}");
+        Ok(())
+    }
+}
+
+fn print_unit_session_result(
+    status: &str,
+    session_id: SessionId,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        print_json(&serde_json::json!({ "status": status, "session_id": session_id }))
+    } else {
+        println!("{status}: {session_id}");
+        Ok(())
+    }
+}
+
+fn print_session_operation_result(
+    status: &str,
+    session: &bcode_session_models::SessionSummary,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        print_json(&serde_json::json!({ "status": status, "session": session }))
+    } else {
+        println!("{status}: {}", session.id);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 struct PagedSessionHistory {
     events: Vec<SessionEvent>,
@@ -12348,83 +12972,155 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
 async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     match command {
-        RuntimeWorkCommand::List { session_id } => {
-            for work in client.list_runtime_work(session_id).await? {
-                println!(
-                    "{} {:?} {:?} {} cancellable={}",
-                    work.work_id, work.kind, work.status, work.label, work.cancellable
-                );
+        RuntimeWorkCommand::List { session_id, json } => {
+            let work = client.list_runtime_work(session_id).await?;
+            if json {
+                print_json(&work)?;
+            } else {
+                for work in work {
+                    println!(
+                        "{} {:?} {:?} {} cancellable={}",
+                        work.work_id, work.kind, work.status, work.label, work.cancellable
+                    );
+                }
             }
         }
         RuntimeWorkCommand::Cancel {
             session_id,
             work_id,
+            json,
         } => {
-            if client
+            let cancelled = client
                 .cancel_runtime_work(session_id, bcode_session_models::WorkId::new(work_id))
-                .await?
-            {
-                println!("runtime work cancellation requested");
+                .await?;
+            print_cancellation_result("runtime_work", cancelled, json)?;
+        }
+        RuntimeWorkCommand::History {
+            session_id,
+            limit,
+            json,
+        } => {
+            let spans = client.runtime_work_spans(session_id, limit).await?;
+            if json {
+                print_json(&spans)?;
             } else {
-                println!("no active runtime work");
+                for span in spans {
+                    println!(
+                        "{} status={:?} cancelled={} duration_ms={:?} parent={} label={}{}",
+                        span.work_id,
+                        span.status,
+                        span.cancelled,
+                        span.duration_ms(),
+                        span.parent_work_id
+                            .as_ref()
+                            .map_or_else(|| "-".to_string(), ToString::to_string),
+                        span.label,
+                        span.message
+                            .as_ref()
+                            .map_or_else(String::new, |message| format!(" message={message}"))
+                    );
+                }
             }
         }
-        RuntimeWorkCommand::History { session_id, limit } => {
-            for span in client.runtime_work_spans(session_id, limit).await? {
-                println!(
-                    "{} status={:?} cancelled={} duration_ms={:?} parent={} label={}{}",
-                    span.work_id,
-                    span.status,
-                    span.cancelled,
-                    span.duration_ms(),
-                    span.parent_work_id
-                        .as_ref()
-                        .map_or_else(|| "-".to_string(), ToString::to_string),
-                    span.label,
-                    span.message
-                        .as_ref()
-                        .map_or_else(String::new, |message| format!(" message={message}"))
-                );
-            }
-        }
-        RuntimeWorkCommand::Watch { session_id } => {
+        RuntimeWorkCommand::Watch { session_id, json } => {
             let mut watcher = client.watch_runtime_work(session_id).await?;
             loop {
                 let event = watcher.next_event().await?;
-                print_session_event(&event);
+                if json {
+                    print_json_line(&serde_json::json!({
+                        "type": "runtime_work_event",
+                        "session_id": session_id,
+                        "event": event,
+                    }))?;
+                } else {
+                    print_session_event(&event);
+                }
             }
         }
     }
     Ok(())
 }
 
-async fn cancel_session_turn(session_id: SessionId, clear_queue: bool) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
-    if client
+async fn cancel_session_turn(
+    session_id: SessionId,
+    clear_queue: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let cancelled = BcodeClient::default_endpoint()
         .cancel_session_turn_with_options(session_id, clear_queue)
-        .await?
-    {
-        println!("turn cancellation requested");
-    } else {
-        println!("no active turn");
-    }
-    Ok(())
-}
-
-async fn list_permissions() -> Result<(), CliError> {
-    let permissions = BcodeClient::default_endpoint().list_permissions().await?;
-    for permission in permissions {
-        print_permission(&permission);
-    }
-    Ok(())
-}
-
-async fn resolve_permission(permission_id: String, approved: bool) -> Result<(), CliError> {
-    let resolved = BcodeClient::default_endpoint()
-        .resolve_permission(permission_id, approved)
         .await?;
-    println!("resolved: {resolved}");
+    print_cancellation_result("turn", cancelled, json)
+}
+
+fn print_cancellation_result(kind: &str, cancelled: bool, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(&serde_json::json!({
+            "kind": kind,
+            "cancellation_requested": cancelled,
+        }))
+    } else {
+        println!(
+            "{}",
+            if cancelled {
+                format!("{kind} cancellation requested")
+            } else {
+                format!("no active {kind}")
+            }
+        );
+        Ok(())
+    }
+}
+
+async fn list_permissions(session_id: Option<SessionId>, json: bool) -> Result<(), CliError> {
+    let mut permissions = BcodeClient::default_endpoint().list_permissions().await?;
+    if let Some(session_id) = session_id {
+        permissions.retain(|permission| permission.session_id == session_id);
+    }
+    if json {
+        print_json(&permissions)?;
+    } else {
+        for permission in permissions {
+            print_permission(&permission);
+        }
+    }
     Ok(())
+}
+
+async fn resolve_permission(
+    permission_id: String,
+    approved: bool,
+    remember: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let resolved = BcodeClient::default_endpoint()
+        .resolve_permission_with_remember(permission_id, approved, remember)
+        .await?;
+    print_permission_resolution(resolved, json)
+}
+
+async fn resolve_permission_batch(
+    batch_id: String,
+    approved: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let resolved_count = BcodeClient::default_endpoint()
+        .resolve_permission_batch(batch_id, approved)
+        .await?;
+    if json {
+        print_json(&serde_json::json!({ "resolved_count": resolved_count }))
+    } else {
+        println!("resolved: {resolved_count}");
+        Ok(())
+    }
+}
+
+fn print_permission_resolution(resolved: bool, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(&serde_json::json!({ "resolved": resolved }))
+    } else {
+        println!("resolved: {resolved}");
+        Ok(())
+    }
 }
 
 async fn add_permission_rule(
@@ -12455,6 +13151,66 @@ fn print_permission(permission: &PermissionSummary) {
         permission.agent_id,
         permission.arguments_json
     );
+}
+
+async fn watch_session(session_id: SessionId, limit: usize, json: bool) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let mut watcher = client.watch_session(session_id, limit).await?;
+    let initial = watcher
+        .take_initial()
+        .expect("new session watcher must include bounded initial state");
+    if json {
+        print_json_line(&serde_json::json!({
+            "type": "snapshot",
+            "session_id": session_id,
+            "session": initial.session,
+            "history": initial.history,
+            "runtime_selection": initial.runtime_selection,
+            "projection_window": initial.projection_window,
+        }))?;
+    } else {
+        for event in initial.history {
+            print_session_event(&event);
+        }
+    }
+
+    loop {
+        match watcher.next_event().await? {
+            SessionWatchEvent::Durable(event) => {
+                if json {
+                    print_json_line(&serde_json::json!({
+                        "type": "durable_event",
+                        "session_id": session_id,
+                        "event": event,
+                    }))?;
+                } else {
+                    print_session_event(&event);
+                }
+            }
+            SessionWatchEvent::Live(event) => {
+                if json {
+                    print_json_line(&serde_json::json!({
+                        "type": "live_event",
+                        "session_id": session_id,
+                        "event": event,
+                    }))?;
+                } else {
+                    print_session_live_event(&event);
+                }
+            }
+            SessionWatchEvent::ResyncRequired => {
+                if json {
+                    print_json_line(&serde_json::json!({
+                        "type": "resync_required",
+                        "session_id": session_id,
+                    }))?;
+                } else {
+                    eprintln!("session view resync required; reconnect to replace bounded state");
+                }
+                return Ok(());
+            }
+        }
+    }
 }
 
 async fn attach_session(session_id: SessionId) -> Result<(), CliError> {
@@ -12574,20 +13330,133 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
     }
 }
 
-async fn send_message(
-    session_id: SessionId,
-    message: String,
+const MAX_CLI_PROMPT_BYTES: usize = 1024 * 1024;
+
+struct PromptInput {
+    message: Option<String>,
+    file: Option<PathBuf>,
+    stdin: bool,
+}
+
+struct SendOptions {
+    input: PromptInput,
+    follow_up: bool,
+    producer: String,
+    idempotency_key: Option<String>,
+    background: bool,
+    json: bool,
     launch_options: bcode_tui::TuiLaunchOptions,
-) -> Result<(), CliError> {
+}
+
+impl PromptInput {
+    fn read(self) -> Result<String, CliError> {
+        let supplied = usize::from(self.message.is_some())
+            + usize::from(self.file.is_some())
+            + usize::from(self.stdin);
+        if supplied != 1 {
+            return Err(CliError::InvalidArguments(
+                "send requires exactly one prompt source: MESSAGE, --file, or --stdin".to_owned(),
+            ));
+        }
+        let text = if let Some(message) = self.message {
+            message
+        } else {
+            let mut bytes = Vec::new();
+            if self.stdin {
+                std::io::stdin()
+                    .take((MAX_CLI_PROMPT_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)?;
+            } else if let Some(path) = self.file {
+                let metadata = fs::metadata(&path)?;
+                if metadata.len() > MAX_CLI_PROMPT_BYTES as u64 {
+                    return Err(prompt_too_large_error());
+                }
+                bytes = fs::read(path)?;
+            }
+            if bytes.len() > MAX_CLI_PROMPT_BYTES {
+                return Err(prompt_too_large_error());
+            }
+            String::from_utf8(bytes).map_err(|_| {
+                CliError::InvalidArguments("prompt input must be valid UTF-8".to_owned())
+            })?
+        };
+        if text.is_empty() {
+            return Err(CliError::InvalidArguments(
+                "prompt input must not be empty".to_owned(),
+            ));
+        }
+        if text.len() > MAX_CLI_PROMPT_BYTES {
+            return Err(prompt_too_large_error());
+        }
+        Ok(text)
+    }
+}
+
+fn prompt_too_large_error() -> CliError {
+    CliError::InvalidArguments(format!("prompt input exceeds {MAX_CLI_PROMPT_BYTES} bytes"))
+}
+
+async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(), CliError> {
+    let SendOptions {
+        input,
+        follow_up,
+        producer,
+        idempotency_key,
+        background,
+        json,
+        launch_options,
+    } = options;
+    let text = input.read()?;
     let client = BcodeClient::default_endpoint();
-    client
-        .send_user_message_with_execution(
-            session_id,
-            message,
-            bcode_ipc::PromptPlacement::FollowUp,
-            launch_options.turn_execution_options(),
-        )
-        .await?;
+    if follow_up {
+        let acceptance = client
+            .send_user_message_with_execution(
+                session_id,
+                text,
+                bcode_ipc::PromptPlacement::FollowUp,
+                launch_options.turn_execution_options(),
+            )
+            .await?;
+        if json {
+            print_json(&serde_json::json!({
+                "session_id": session_id,
+                "queued": acceptance.queued,
+                "queue_position": acceptance.queue_position,
+                "disposition": acceptance.disposition,
+            }))?;
+        } else {
+            println!("{:?}", acceptance.disposition);
+        }
+    } else {
+        let admission = client
+            .submit_turn(
+                session_id,
+                text,
+                bcode_session_models::TurnAdmissionMetadata {
+                    origin: Some(bcode_session_models::TurnOrigin {
+                        producer,
+                        correlation_id: None,
+                        display_label: Some("Bcode CLI".to_owned()),
+                    }),
+                    priority: if background {
+                        bcode_session_models::TurnPriority::Background
+                    } else {
+                        bcode_session_models::TurnPriority::Interactive
+                    },
+                    idempotency_key,
+                    execution: launch_options.turn_execution_options(),
+                },
+            )
+            .await?;
+        if json {
+            print_json(&serde_json::json!({
+                "session_id": session_id,
+                "admission": admission,
+            }))?;
+        } else {
+            println!("{admission:?}");
+        }
+    }
     Ok(())
 }
 
@@ -17099,6 +17968,454 @@ mod context_compaction_tests {
             assert!(!description.contains("private_draft_cli"));
             assert!(description.len() < 512);
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_cli_tests {
+    use super::{Cli, Commands, RuntimeWorkCommand};
+    use clap::Parser as _;
+
+    #[test]
+    fn turn_and_runtime_work_commands_parse_structured_results() {
+        let session_id = bcode_session_models::SessionId::new();
+        let session = session_id.to_string();
+        let turn = Cli::try_parse_from(["bcode", "cancel", &session, "--clear-queue", "--json"])
+            .expect("turn cancellation parses");
+        assert!(matches!(
+            turn.command,
+            Some(Commands::Cancel {
+                clear_queue: true,
+                json: true,
+                ..
+            })
+        ));
+
+        for arguments in [
+            vec!["bcode", "runtime-work", "list", &session, "--json"],
+            vec![
+                "bcode",
+                "runtime-work",
+                "cancel",
+                &session,
+                "work-1",
+                "--json",
+            ],
+            vec![
+                "bcode",
+                "runtime-work",
+                "history",
+                &session,
+                "--limit",
+                "10",
+                "--json",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(arguments).expect("runtime work command parses");
+            assert!(matches!(parsed.command, Some(Commands::RuntimeWork { .. })));
+        }
+        let cancel = Cli::try_parse_from([
+            "bcode",
+            "runtime-work",
+            "cancel",
+            &session,
+            "work-1",
+            "--json",
+        ])
+        .expect("runtime cancellation parses");
+        assert!(matches!(
+            cancel.command,
+            Some(Commands::RuntimeWork {
+                command: RuntimeWorkCommand::Cancel { json: true, .. }
+            })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod send_cli_tests {
+    use super::{Cli, Commands};
+    use clap::Parser as _;
+
+    #[test]
+    fn send_accepts_exact_prompt_sources_and_admission_controls() {
+        let session_id = bcode_session_models::SessionId::new();
+        let session = session_id.to_string();
+        let direct = Cli::try_parse_from([
+            "bcode",
+            "send",
+            &session,
+            "hello",
+            "--idempotency-key",
+            "request-1",
+            "--background",
+            "--json",
+        ])
+        .expect("direct prompt parses");
+        assert!(matches!(
+            direct.command,
+            Some(Commands::Send {
+                message: Some(message),
+                idempotency_key: Some(key),
+                background: true,
+                json: true,
+                ..
+            }) if message == "hello" && key == "request-1"
+        ));
+
+        let file = Cli::try_parse_from([
+            "bcode",
+            "send",
+            &session,
+            "--file",
+            "prompt.txt",
+            "--follow-up",
+        ])
+        .expect("file prompt parses");
+        assert!(matches!(
+            file.command,
+            Some(Commands::Send {
+                message: None,
+                file: Some(_),
+                follow_up: true,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["bcode", "send", &session, "hello", "--stdin"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod watch_cli_tests {
+    use super::{Cli, Commands, RuntimeWorkCommand, SessionCommand};
+    use clap::Parser as _;
+
+    #[test]
+    fn session_and_runtime_watch_commands_parse_json_lines_mode() {
+        let session_id = bcode_session_models::SessionId::new();
+        let session = session_id.to_string();
+        let watch = Cli::try_parse_from([
+            "bcode", "session", "watch", &session, "--limit", "25", "--json",
+        ])
+        .expect("session watch parses");
+        assert!(matches!(
+            watch.command,
+            Some(Commands::Session {
+                command: SessionCommand::Watch {
+                    session_id: parsed,
+                    limit: 25,
+                    json: true,
+                }
+            }) if parsed == session_id
+        ));
+
+        let runtime = Cli::try_parse_from(["bcode", "runtime-work", "watch", &session, "--json"])
+            .expect("runtime watch parses");
+        assert!(matches!(
+            runtime.command,
+            Some(Commands::RuntimeWork {
+                command: RuntimeWorkCommand::Watch {
+                    session_id: parsed,
+                    json: true,
+                }
+            }) if parsed == session_id
+        ));
+    }
+}
+
+#[cfg(test)]
+mod worktree_cli_tests {
+    use super::{Cli, Commands, WorktreeCommand};
+    use clap::Parser as _;
+
+    #[test]
+    fn worktree_commands_parse_bounded_daemon_operations() {
+        let list = Cli::try_parse_from(["bcode", "worktree", "list", "--cwd", ".", "--json"])
+            .expect("worktree list parses");
+        assert!(matches!(
+            list.command,
+            Some(Commands::Worktree {
+                command: WorktreeCommand::List { json: true, .. }
+            })
+        ));
+
+        let session_id = bcode_session_models::SessionId::new();
+        let create = Cli::try_parse_from([
+            "bcode",
+            "worktree",
+            "create",
+            "task",
+            "--new-branch",
+            "feature/task",
+            "--attach-session-id",
+            &session_id.to_string(),
+            "--json",
+        ])
+        .expect("worktree create parses");
+        assert!(matches!(
+            create.command,
+            Some(Commands::Worktree {
+                command: WorktreeCommand::Create {
+                    attach_session_id: Some(parsed),
+                    new_session: false,
+                    json: true,
+                    ..
+                }
+            }) if parsed == session_id
+        ));
+
+        let remove =
+            Cli::try_parse_from(["bcode", "worktree", "remove", "../task", "--yes", "--json"])
+                .expect("worktree remove parses");
+        assert!(matches!(
+            remove.command,
+            Some(Commands::Worktree {
+                command: WorktreeCommand::Remove {
+                    yes: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "bcode", "worktree", "create", "task", "--branch", "existing", "--detach",
+            ])
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_configuration_cli_tests {
+    use super::{Cli, Commands, SessionCommand};
+    use clap::Parser as _;
+
+    #[test]
+    fn session_configuration_commands_parse_machine_paths() {
+        let session_id = bcode_session_models::SessionId::new();
+        let session = session_id.to_string();
+        let cases = [
+            vec![
+                "bcode",
+                "session",
+                "set-working-directory",
+                &session,
+                ".",
+                "--json",
+            ],
+            vec!["bcode", "session", "set-agent", &session, "build", "--json"],
+            vec![
+                "bcode",
+                "session",
+                "set-model",
+                &session,
+                "model-1",
+                "--provider",
+                "provider",
+                "--json",
+            ],
+            vec![
+                "bcode",
+                "session",
+                "set-reasoning",
+                &session,
+                "--effort",
+                "high",
+                "--summary",
+                "detailed",
+                "--json",
+            ],
+            vec!["bcode", "session", "active-skills", &session, "--json"],
+            vec![
+                "bcode",
+                "session",
+                "activate-skill",
+                &session,
+                "skill-1",
+                "--json",
+            ],
+            vec![
+                "bcode",
+                "session",
+                "deactivate-skill",
+                &session,
+                "skill-1",
+                "--json",
+            ],
+            vec!["bcode", "session", "compact", &session, "--json"],
+        ];
+        for arguments in cases {
+            let parsed = Cli::try_parse_from(arguments).expect("session configuration parses");
+            assert!(matches!(parsed.command, Some(Commands::Session { .. })));
+        }
+
+        let pool = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "set-auth-pool",
+            "openai",
+            "--profile",
+            "openai-2",
+            "--json",
+        ])
+        .expect("auth pool preference parses");
+        assert!(matches!(
+            pool.command,
+            Some(Commands::Session {
+                command: SessionCommand::SetAuthPool {
+                    pool,
+                    profile: Some(profile),
+                    clear: false,
+                    json: true,
+                }
+            }) if pool == "openai" && profile == "openai-2"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod permission_cli_tests {
+    use super::{Cli, Commands, PermissionCommand};
+    use clap::Parser as _;
+    use std::str::FromStr as _;
+
+    #[test]
+    fn permission_commands_parse_scoped_json_remember_and_batch_paths() {
+        let session_id = bcode_session_models::SessionId::new();
+        let list = Cli::try_parse_from([
+            "bcode",
+            "permission",
+            "list",
+            "--session-id",
+            &session_id.to_string(),
+            "--json",
+        ])
+        .expect("scoped permission list parses");
+        assert!(matches!(
+            list.command,
+            Some(Commands::Permission {
+                command: PermissionCommand::List {
+                    session_id: Some(parsed),
+                    json: true,
+                }
+            }) if parsed == session_id
+        ));
+
+        let approve = Cli::try_parse_from([
+            "bcode",
+            "permission",
+            "approve",
+            "permission-1",
+            "--remember",
+            "--json",
+        ])
+        .expect("remembered approval parses");
+        assert!(matches!(
+            approve.command,
+            Some(Commands::Permission {
+                command: PermissionCommand::Approve {
+                    permission_id,
+                    remember: true,
+                    json: true,
+                }
+            }) if permission_id == "permission-1"
+        ));
+
+        let batch = Cli::try_parse_from([
+            "bcode",
+            "permission",
+            "resolve-batch",
+            "batch-1",
+            "--deny",
+            "--json",
+        ])
+        .expect("batch denial parses");
+        assert!(matches!(
+            batch.command,
+            Some(Commands::Permission {
+                command: PermissionCommand::ResolveBatch {
+                    batch_id,
+                    approve: false,
+                    deny: true,
+                    json: true,
+                }
+            }) if batch_id == "batch-1"
+        ));
+        assert!(Cli::try_parse_from(["bcode", "permission", "resolve-batch", "batch-1",]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "permission",
+                "resolve-batch",
+                "batch-1",
+                "--approve",
+                "--deny",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn session_id_round_trip_used_by_parser_is_canonical() {
+        let session_id = bcode_session_models::SessionId::new();
+        assert_eq!(
+            bcode_session_models::SessionId::from_str(&session_id.to_string())
+                .expect("session id round trip"),
+            session_id
+        );
+    }
+}
+
+#[cfg(test)]
+mod interaction_cli_tests {
+    use super::{Cli, Commands, InteractionCommand};
+    use clap::Parser as _;
+
+    #[test]
+    fn interaction_commands_parse_structured_list_respond_and_cancel_paths() {
+        let list = Cli::try_parse_from(["bcode", "interaction", "list", "--json"])
+            .expect("interaction list parses");
+        assert!(matches!(
+            list.command,
+            Some(Commands::Interaction {
+                command: InteractionCommand::List { json: true }
+            })
+        ));
+
+        let respond = Cli::try_parse_from([
+            "bcode",
+            "interaction",
+            "respond",
+            "exchange-1",
+            "--payload",
+            "-",
+            "--json",
+        ])
+        .expect("interaction response parses");
+        assert!(matches!(
+            respond.command,
+            Some(Commands::Interaction {
+                command: InteractionCommand::Respond {
+                    exchange_id,
+                    payload,
+                    json: true,
+                }
+            }) if exchange_id == "exchange-1" && payload == std::path::Path::new("-")
+        ));
+
+        let cancel =
+            Cli::try_parse_from(["bcode", "interaction", "cancel", "exchange-1", "--json"])
+                .expect("interaction cancel parses");
+        assert!(matches!(
+            cancel.command,
+            Some(Commands::Interaction {
+                command: InteractionCommand::Cancel {
+                    exchange_id,
+                    json: true,
+                }
+            }) if exchange_id == "exchange-1"
+        ));
     }
 }
 

@@ -103,7 +103,7 @@ mod artifact_range_tests {
 }
 
 /// Grouped runtime-work lifecycle span.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RuntimeWorkSpan {
     pub work_id: WorkId,
     pub parent_work_id: Option<WorkId>,
